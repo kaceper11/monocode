@@ -32,6 +32,7 @@ jobs:
           components: rustfmt, clippy
 
       - run: npm ci
+      - run: node --test scripts/execution-boundary-spike.mjs
       - run: npm test
       - run: npx tsc --noEmit
       - run: cargo fmt --check
