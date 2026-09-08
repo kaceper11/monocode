@@ -1,3 +1,8 @@
+import {
+  githubBinding,
+  githubRequest,
+  projectConnections,
+} from "./connections";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { slash } from "./paths";
@@ -188,16 +193,25 @@ export function gitStagedContext(cwd: string): Promise<GitStagedContext> {
   return invoke<GitStagedContext>("git_staged_context", { cwd });
 }
 
-export function gitPush(cwd: string): Promise<void> {
-  return invoke<void>("git_push", { cwd });
+export async function gitPush(cwd: string): Promise<void> {
+  return invoke<void>("git_push", {
+    cwd,
+    remote: projectConnections(cwd).gitRemote,
+  });
 }
 
-export function gitPull(cwd: string): Promise<void> {
-  return invoke<void>("git_pull", { cwd });
+export async function gitPull(cwd: string): Promise<void> {
+  return invoke<void>("git_pull", {
+    cwd,
+    remote: projectConnections(cwd).gitRemote,
+  });
 }
 
-export function gitSync(cwd: string): Promise<void> {
-  return invoke<void>("git_sync", { cwd });
+export async function gitSync(cwd: string): Promise<void> {
+  return invoke<void>("git_sync", {
+    cwd,
+    remote: projectConnections(cwd).gitRemote,
+  });
 }
 
 export type GitRangeContext = {
@@ -219,18 +233,32 @@ export type GitPr = {
   state: string;
 };
 
-export function gitPrStatus(cwd: string): Promise<GitPr | null> {
-  return invoke<GitPr | null>("git_pr_status", { cwd });
+export async function gitPrStatus(cwd: string): Promise<GitPr | null> {
+  const source = projectConnections(cwd).prs;
+  if (source === false) return Promise.resolve(null);
+  const binding = source ? githubBinding(source) : undefined;
+  return githubRequest<GitPr | null>("git_pr_status", { cwd, binding });
 }
 
-export function gitPrCreate(
+export async function gitPrCreate(
   cwd: string,
   title: string,
   body: string,
   base: string,
   head: string,
 ): Promise<string> {
-  return invoke<string>("git_pr_create", { cwd, title, body, base, head });
+  const source = projectConnections(cwd).prs;
+  if (source === false)
+    return Promise.reject(new Error("PR integration is disabled"));
+  const binding = source ? githubBinding(source) : undefined;
+  return githubRequest<string>("git_pr_create", {
+    cwd,
+    title,
+    body,
+    base,
+    head,
+    binding,
+  });
 }
 
 export type GitBranchInfo = {

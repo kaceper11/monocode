@@ -421,17 +421,19 @@ pub async fn git_commit(cwd: String, message: String) -> Result<(), String> {
 
 /// Push the current branch to its upstream, or set upstream on first push.
 #[tauri::command]
-pub async fn git_push(cwd: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || git_push_for(&expand_home(&cwd)))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn git_push(cwd: String, remote: Option<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_remote_action(&expand_home(&cwd), remote.as_deref(), "push")
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Fast-forward the current branch from its upstream.
 #[tauri::command]
-pub async fn git_pull(cwd: String) -> Result<(), String> {
+pub async fn git_pull(cwd: String, remote: Option<String>) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        git_checked(&expand_home(&cwd), &["pull", "--ff-only"])
+        git_remote_action(&expand_home(&cwd), remote.as_deref(), "pull")
     })
     .await
     .map_err(|e| e.to_string())?
@@ -439,10 +441,12 @@ pub async fn git_pull(cwd: String) -> Result<(), String> {
 
 /// Pull incoming commits, then push local commits.
 #[tauri::command]
-pub async fn git_sync(cwd: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || git_sync_changes_for(&expand_home(&cwd)))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn git_sync(cwd: String, remote: Option<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_remote_action(&expand_home(&cwd), remote.as_deref(), "sync")
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -474,10 +478,15 @@ pub struct GitPr {
 
 /// Latest pull request for the current branch, if `gh` can see one.
 #[tauri::command]
-pub async fn git_pr_status(cwd: String) -> Result<Option<GitPr>, String> {
-    tauri::async_runtime::spawn_blocking(move || Ok(git_pr_status_for(&expand_home(&cwd))))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn git_pr_status(
+    cwd: String,
+    binding: Option<GithubBinding>,
+) -> Result<Option<GitPr>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_pr_status_for(&expand_home(&cwd), binding.as_ref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[derive(Deserialize)]
@@ -496,10 +505,15 @@ pub async fn git_pr_create(
     body: String,
     base: String,
     head: String,
+    binding: Option<GithubBinding>,
 ) -> Result<String, String> {
+    if binding.as_ref().is_some_and(|selected| !selected.writes) {
+        return Err("Writes are disabled for this account".into());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         git_pr_create_for(
             &expand_home(&cwd),
+            binding.as_ref(),
             &GitPrCreateInput {
                 title,
                 body,
@@ -541,12 +555,71 @@ pub struct GitHubWorkItem {
     pub repo: String,
 }
 
+#[derive(Deserialize, Clone)]
+pub struct GithubBinding {
+    hostname: String,
+    account: String,
+    repository: String,
+    writes: bool,
+}
+
+impl GithubBinding {
+    fn validate(&self) -> Result<(), String> {
+        let valid = |text: &str, slash: bool| {
+            !text.is_empty()
+                && text.len() <= 256
+                && !text.starts_with('-')
+                && text.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || b"._-".contains(&b) || (slash && b == b'/')
+                })
+        };
+        if !valid(&self.hostname, false)
+            || !valid(&self.account, false)
+            || !valid(&self.repository, true)
+            || self.repository.split('/').count() != 2
+            || self
+                .repository
+                .split('/')
+                .any(|part| matches!(part, "" | "." | ".."))
+        {
+            return Err("Invalid GitHub account or full repository identity".into());
+        }
+        Ok(())
+    }
+}
+
+#[tauri::command]
+pub async fn github_connection_test(binding: GithubBinding) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = std::env::temp_dir();
+        gh_bound(
+            &root,
+            Some(&binding),
+            &[
+                "repo",
+                "view",
+                "--json",
+                "viewerPermission",
+                "--jq",
+                ".viewerPermission",
+            ],
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// `owner/repo` for the GitHub remote of this working copy, via `gh`.
 #[tauri::command]
-pub async fn git_github_repo(cwd: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || git_github_repo_for(&expand_home(&cwd)))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn git_github_repo(
+    cwd: String,
+    binding: Option<GithubBinding>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_github_repo_for(&expand_home(&cwd), binding.as_ref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Open issues or pull requests for the current GitHub remote, via `gh`.
@@ -558,6 +631,7 @@ pub async fn git_github_work_items(
     state: String,
     search: String,
     limit: Option<u32>,
+    binding: Option<GithubBinding>,
 ) -> Result<Vec<GitHubWorkItem>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         git_github_work_items_for(
@@ -567,6 +641,7 @@ pub async fn git_github_work_items(
             &state,
             &search,
             limit.unwrap_or(40),
+            binding.as_ref(),
         )
     })
     .await
@@ -590,9 +665,10 @@ pub async fn git_github_work_item_details(
     cwd: String,
     kind: String,
     number: i64,
+    binding: Option<GithubBinding>,
 ) -> Result<GitHubWorkItemDetails, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        git_github_work_item_details_for(&expand_home(&cwd), &kind, number)
+        git_github_work_item_details_for(&expand_home(&cwd), &kind, number, binding.as_ref())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -632,9 +708,10 @@ pub async fn git_github_work_item_thread(
     cwd: String,
     kind: String,
     number: i64,
+    binding: Option<GithubBinding>,
 ) -> Result<GitHubWorkItemThread, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        git_github_work_item_thread_for(&expand_home(&cwd), &kind, number)
+        git_github_work_item_thread_for(&expand_home(&cwd), &kind, number, binding.as_ref())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -648,9 +725,20 @@ pub async fn git_github_work_item_comment(
     number: i64,
     body: String,
     in_reply_to: String,
+    binding: Option<GithubBinding>,
 ) -> Result<String, String> {
+    if binding.as_ref().is_some_and(|selected| !selected.writes) {
+        return Err("Writes are disabled for this GitHub account".into());
+    }
     tauri::async_runtime::spawn_blocking(move || {
-        git_github_work_item_comment_for(&expand_home(&cwd), &kind, number, &body, &in_reply_to)
+        git_github_work_item_comment_for(
+            &expand_home(&cwd),
+            &kind,
+            number,
+            &body,
+            &in_reply_to,
+            binding.as_ref(),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -678,10 +766,16 @@ const MAX_PR_DIFF_BYTES: usize = 2 * 1024 * 1024;
 
 /// Unified diff and file stats for a pull request, via `gh`.
 #[tauri::command]
-pub async fn git_github_pr_diff(cwd: String, number: i64) -> Result<GitHubPrDiff, String> {
-    tauri::async_runtime::spawn_blocking(move || git_github_pr_diff_for(&expand_home(&cwd), number))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn git_github_pr_diff(
+    cwd: String,
+    number: i64,
+    binding: Option<GithubBinding>,
+) -> Result<GitHubPrDiff, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_github_pr_diff_for(&expand_home(&cwd), number, binding.as_ref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -1508,6 +1602,37 @@ fn git_commit_for(root: &Path, message: &str) -> Result<(), String> {
     git_checked(root, &["commit", "--cleanup=strip", "-m", message])
 }
 
+fn git_remote_action(root: &Path, remote: Option<&str>, action: &str) -> Result<(), String> {
+    let Some(remote) = remote else {
+        return match action {
+            "push" => git_push_for(root),
+            "pull" => git_checked(root, &["pull", "--ff-only"]),
+            "sync" => git_sync_changes_for(root),
+            _ => Err("Unknown Git operation".into()),
+        };
+    };
+    let remotes = git_run(root, &["remote"]).ok_or("Cannot list Git remotes")?;
+    if remote.starts_with('-') || !remotes.lines().any(|name| name == remote) {
+        return Err("Selected Git remote no longer exists".into());
+    }
+    let branch = git_branch(root).ok_or("Select a branch before synchronizing")?;
+    match action {
+        "push" => git_checked(
+            root,
+            &["push", remote, &format!("HEAD:refs/heads/{branch}")],
+        ),
+        "pull" => git_checked(root, &["pull", "--ff-only", remote, &branch]),
+        "sync" => {
+            git_checked(root, &["pull", "--ff-only", remote, &branch])?;
+            git_checked(
+                root,
+                &["push", remote, &format!("HEAD:refs/heads/{branch}")],
+            )
+        }
+        _ => Err("Unknown Git operation".into()),
+    }
+}
+
 fn git_push_for(root: &Path) -> Result<(), String> {
     if git_stdout(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_some() {
         return git_checked(root, &["push"]);
@@ -1554,12 +1679,18 @@ fn git_range_context_for(root: &Path) -> Result<GitRangeContext, String> {
     })
 }
 
-fn git_pr_status_for(root: &Path) -> Option<GitPr> {
-    let branch = git_branch(root)?;
-    let repo = git_github_repo_for(root).ok()?;
-    let head = github_pr_head_filter(&repo, &branch)?;
-    let json = gh_stdout(
+fn git_pr_status_for(
+    root: &Path,
+    binding: Option<&GithubBinding>,
+) -> Result<Option<GitPr>, String> {
+    let Some(branch) = git_branch(root) else {
+        return Ok(None);
+    };
+    let repo = git_github_repo_for(root, binding)?;
+    let head = github_pr_head_filter(&repo, &branch).ok_or("Invalid repository")?;
+    let json = gh_bound(
         root,
+        binding,
         &[
             "pr",
             "list",
@@ -1573,7 +1704,7 @@ fn git_pr_status_for(root: &Path) -> Option<GitPr> {
             "all",
         ],
     )?;
-    parse_gh_pr_list(&json)
+    Ok(parse_gh_pr_list(&json))
 }
 
 fn github_pr_head_filter(repo: &str, branch: &str) -> Option<String> {
@@ -1581,8 +1712,12 @@ fn github_pr_head_filter(repo: &str, branch: &str) -> Option<String> {
     Some(format!("{owner}:{branch}"))
 }
 
-fn git_github_repo_for(root: &Path) -> Result<String, String> {
-    let json = gh_checked(root, &["repo", "view", "--json", "nameWithOwner"])?;
+fn git_github_repo_for(root: &Path, binding: Option<&GithubBinding>) -> Result<String, String> {
+    if let Some(binding) = binding {
+        binding.validate()?;
+        return Ok(binding.repository.clone());
+    }
+    let json = gh_bound(root, binding, &["repo", "view", "--json", "nameWithOwner"])?;
     #[derive(Deserialize)]
     struct View {
         #[serde(rename = "nameWithOwner")]
@@ -1603,6 +1738,7 @@ fn git_github_work_items_for(
     state: &str,
     search: &str,
     limit: u32,
+    binding: Option<&GithubBinding>,
 ) -> Result<Vec<GitHubWorkItem>, String> {
     let kind = kind.trim();
     if kind != "issue" && kind != "pr" {
@@ -1639,8 +1775,8 @@ fn git_github_work_items_for(
         args.push(search.to_string());
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let json = gh_checked(root, &refs)?;
-    let repo = git_github_repo_for(root).unwrap_or_default();
+    let json = gh_bound(root, binding, &refs)?;
+    let repo = git_github_repo_for(root, binding).unwrap_or_default();
     parse_github_work_items(&json, kind, &repo)
 }
 
@@ -1648,6 +1784,7 @@ fn git_github_work_item_details_for(
     root: &Path,
     kind: &str,
     number: i64,
+    binding: Option<&GithubBinding>,
 ) -> Result<GitHubWorkItemDetails, String> {
     let kind = kind.trim();
     if kind != "issue" && kind != "pr" {
@@ -1659,7 +1796,7 @@ fn git_github_work_item_details_for(
     } else {
         "body,author"
     };
-    let json = gh_checked(root, &[kind, "view", &number, "--json", fields])?;
+    let json = gh_bound(root, binding, &[kind, "view", &number, "--json", fields])?;
     parse_github_work_item_details(&json)
 }
 
@@ -1787,6 +1924,7 @@ fn git_github_work_item_thread_for(
     root: &Path,
     kind: &str,
     number: i64,
+    binding: Option<&GithubBinding>,
 ) -> Result<GitHubWorkItemThread, String> {
     let kind = kind.trim();
     if kind != "issue" && kind != "pr" {
@@ -1795,7 +1933,7 @@ fn git_github_work_item_thread_for(
     if number <= 0 {
         return Err("Invalid GitHub item number".into());
     }
-    let repo = git_github_repo_for(root)?;
+    let repo = git_github_repo_for(root, binding)?;
     let (owner, name) = split_github_repo(&repo)?;
     let query = if kind == "pr" {
         GITHUB_PR_THREAD_QUERY
@@ -1805,8 +1943,9 @@ fn git_github_work_item_thread_for(
     let owner_field = format!("owner={owner}");
     let name_field = format!("name={name}");
     let number_field = format!("number={number}");
-    let json = gh_checked(
+    let json = gh_bound(
         root,
+        binding,
         &[
             "api",
             "graphql",
@@ -1848,28 +1987,52 @@ fn git_github_work_item_comment_for(
     number: i64,
     body: &str,
     in_reply_to: &str,
+    binding: Option<&GithubBinding>,
 ) -> Result<String, String> {
     let (kind, body) = github_comment_input(kind, number, body)?;
     let reply = in_reply_to.trim();
     if !reply.is_empty() {
-        return git_github_review_reply_for(root, reply, body);
+        if binding.is_some() {
+            let thread = git_github_work_item_thread_for(root, kind, number, binding)?;
+            if kind != "pr"
+                || !thread
+                    .comments
+                    .iter()
+                    .any(|comment| comment.thread_id == reply)
+            {
+                return Err(
+                    "The review thread no longer belongs to the selected pull request".into(),
+                );
+            }
+        }
+        return git_github_review_reply_for(root, reply, body, binding);
     }
     let number = number.to_string();
     with_temp_markdown(body, |path| {
-        let output = gh_checked(root, &[kind, "comment", &number, "--body-file", path])?;
+        let output = gh_bound(
+            root,
+            binding,
+            &[kind, "comment", &number, "--body-file", path],
+        )?;
         github_url_from_output(&output, "GitHub did not return a comment URL")
     })
 }
 
-fn git_github_review_reply_for(root: &Path, thread_id: &str, body: &str) -> Result<String, String> {
+fn git_github_review_reply_for(
+    root: &Path,
+    thread_id: &str,
+    body: &str,
+    binding: Option<&GithubBinding>,
+) -> Result<String, String> {
     if !valid_github_node_id(thread_id) {
         return Err("Invalid review thread".into());
     }
     let thread_field = format!("threadId={thread_id}");
     with_temp_markdown(body, |path| {
         let body_field = format!("body=@{path}");
-        let json = gh_checked(
+        let json = gh_bound(
             root,
+            binding,
             &[
                 "api",
                 "graphql",
@@ -2292,18 +2455,30 @@ fn github_avatar_url(login: &str) -> String {
     format!("https://avatars.githubusercontent.com/{encoded}?s=64")
 }
 
-fn git_github_pr_diff_for(root: &Path, number: i64) -> Result<GitHubPrDiff, String> {
+fn git_github_pr_diff_for(
+    root: &Path,
+    number: i64,
+    binding: Option<&GithubBinding>,
+) -> Result<GitHubPrDiff, String> {
     if number <= 0 {
         return Err("Invalid pull request number".into());
     }
     let number = number.to_string();
-    let json = gh_run(
+    let json = gh_run_bound(
         root,
+        binding,
         &["pr", "view", &number, "--json", "files,additions,deletions"],
         false,
     )?;
     let mut diff = parse_github_pr_diff_meta(&json)?;
-    let patch = gh_run(root, &["pr", "diff", &number], true)?;
+    let patch = match gh_run_bound(root, binding, &["pr", "diff", &number], true) {
+        Ok(patch) => patch,
+        Err(error) if error == "Command output exceeded its limit" => {
+            diff.truncated = true;
+            String::new()
+        }
+        Err(error) => return Err(error),
+    };
     if patch.len() > MAX_PR_DIFF_BYTES {
         diff.truncated = true;
     } else {
@@ -2442,10 +2617,47 @@ fn parse_gh_pr_list(json: &str) -> Option<GitPr> {
     best
 }
 
-fn git_pr_create_for(root: &Path, input: &GitPrCreateInput) -> Result<String, String> {
+fn verify_pr_head(root: &Path, head: &str, remote_head: &str) -> Result<(), String> {
+    let local_head = git_stdout(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{head}^{{commit}}"),
+        ],
+    )
+    .ok_or("Cannot resolve the selected PR head locally")?;
+    if local_head != remote_head.trim() {
+        return Err("The selected PR repository has a different head commit. Push the intended branch and review the mapping before creating a PR.".into());
+    }
+    Ok(())
+}
+
+fn git_pr_create_for(
+    root: &Path,
+    binding: Option<&GithubBinding>,
+    input: &GitPrCreateInput,
+) -> Result<String, String> {
     let title = input.title.trim();
     if title.is_empty() {
         return Err("Pull request title cannot be empty".into());
+    }
+    if let Some(binding) = binding {
+        let reference: String = input
+            .head
+            .bytes()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || b"._-".contains(&byte) {
+                    (byte as char).to_string()
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect();
+        let endpoint = format!("repos/{}/commits/{reference}", binding.repository);
+        let remote_head = gh_bound(root, Some(binding), &["api", &endpoint, "--jq", ".sha"])?;
+        verify_pr_head(root, &input.head, &remote_head)?;
     }
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2453,8 +2665,9 @@ fn git_pr_create_for(root: &Path, input: &GitPrCreateInput) -> Result<String, St
         .unwrap_or(0);
     let body_path = std::env::temp_dir().join(format!("monocode-pr-{stamp}.md"));
     std::fs::write(&body_path, input.body.trim()).map_err(|e| e.to_string())?;
-    let result = gh_checked(
+    let result = gh_bound(
         root,
+        binding,
         &[
             "pr",
             "create",
@@ -2485,31 +2698,108 @@ fn git_pr_create_for(root: &Path, input: &GitPrCreateInput) -> Result<String, St
     })
 }
 
-fn gh_stdout(root: &Path, args: &[&str]) -> Option<String> {
-    gh_run(root, args, false).ok()
+fn gh_bound(root: &Path, binding: Option<&GithubBinding>, args: &[&str]) -> Result<String, String> {
+    gh_run_bound(root, binding, args, false)
 }
 
-fn gh_checked(root: &Path, args: &[&str]) -> Result<String, String> {
-    gh_run(root, args, false)
-}
-
-fn gh_run(root: &Path, args: &[&str], allow_empty: bool) -> Result<String, String> {
+fn gh_run_bound(
+    root: &Path,
+    binding: Option<&GithubBinding>,
+    args: &[&str],
+    allow_empty: bool,
+) -> Result<String, String> {
     let program = crate::harness::resolve_gui_binary("gh")
         .ok_or_else(|| "GitHub CLI (`gh`) is not installed.".to_string())?;
-    let mut cmd = Command::new(&program);
+    gh_run_program(root, binding, args, allow_empty, &program)
+}
+
+fn gh_run_program(
+    root: &Path,
+    binding: Option<&GithubBinding>,
+    args: &[&str],
+    allow_empty: bool,
+    program: &Path,
+) -> Result<String, String> {
+    let mut cmd = Command::new(program);
     cmd.current_dir(root)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GH_PAGER", "cat")
         .env("GIT_PAGER", "cat");
     crate::harness::apply_gui_env(&mut cmd);
-    let output = cmd.output().map_err(|error| {
-        if error.kind() == ErrorKind::NotFound {
-            "GitHub CLI (`gh`) is not installed.".to_string()
-        } else {
-            error.to_string()
+    if let Some(binding) = binding {
+        binding.validate()?;
+        let mut auth = Command::new(program);
+        crate::harness::apply_gui_env(&mut auth);
+        crate::hide_window_console(&mut auth);
+        auth.args([
+            "auth",
+            "token",
+            "--hostname",
+            &binding.hostname,
+            "--user",
+            &binding.account,
+        ]);
+        for key in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        ] {
+            auth.env_remove(key);
+            cmd.env_remove(key);
         }
-    })?;
+        let credential = crate::bounded_process::output(
+            &mut auth,
+            std::time::Duration::from_secs(10),
+            16 * 1024,
+        )
+        .map_err(|_| "Cannot read the selected GitHub CLI account")?;
+        if !credential.status.success() {
+            return Err("Selected GitHub account has no usable credential. Reauthenticate that account with gh auth login.".into());
+        }
+        let token =
+            String::from_utf8(credential.stdout).map_err(|_| "Invalid credential encoding")?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("Selected GitHub account has no credential".into());
+        }
+        cmd.env("GH_HOST", &binding.hostname)
+            .env(
+                "GH_REPO",
+                format!("{}/{}", binding.hostname, binding.repository),
+            )
+            .env("GH_TOKEN", token)
+            .env("GH_ENTERPRISE_TOKEN", token);
+        let mut viewer = Command::new(program);
+        viewer
+            .current_dir(root)
+            .args(["api", "user", "--jq", ".login"]);
+        crate::harness::apply_gui_env(&mut viewer);
+        for (key, value) in cmd.get_envs() {
+            if let Some(value) = value {
+                viewer.env(key, value);
+            } else {
+                viewer.env_remove(key);
+            }
+        }
+        let identity =
+            crate::bounded_process::output(&mut viewer, std::time::Duration::from_secs(10), 1024)?;
+        if !identity.status.success() {
+            return Err("Selected GitHub credential is expired or cannot read its account identity. Reauthenticate and test the connection.".into());
+        }
+        if !String::from_utf8_lossy(&identity.stdout)
+            .trim()
+            .eq_ignore_ascii_case(&binding.account)
+        {
+            return Err("Selected credential belongs to a different GitHub account".into());
+        }
+    }
+    let output = crate::bounded_process::output(
+        &mut cmd,
+        std::time::Duration::from_secs(30),
+        2 * 1024 * 1024,
+    )?;
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if text.is_empty() {
@@ -2519,6 +2809,9 @@ fn gh_run(root: &Path, args: &[&str], allow_empty: bool) -> Result<String, Strin
             return Err("gh returned no output".into());
         }
         return Ok(text);
+    }
+    if binding.is_some() {
+        return Err("GitHub request failed for the selected account and repository. Test its connection and read/write permissions in Settings.".into());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -4850,6 +5143,122 @@ mod tests {
         assert!(b.0.join("c.txt").exists());
         git_sync_changes_for(&a.0).unwrap();
         assert!(a.0.join("b.txt").exists());
+    }
+
+    #[test]
+    #[ignore = "Requires an explicitly selected existing GitHub CLI account; read-only"]
+    fn live_selected_github_account_read() {
+        let account =
+            std::env::var("MONOCODE_GITHUB_LIVE_ACCOUNT").expect("Select the account explicitly");
+        let repository = std::env::var("MONOCODE_GITHUB_LIVE_REPOSITORY")
+            .expect("Select the repository explicitly");
+        let root = tmp("github-live-read");
+        assert!(init_git(&root.0, "main", None));
+        let binding = GithubBinding {
+            hostname: "github.com".into(),
+            account,
+            repository,
+            writes: false,
+        };
+        let mut times = Vec::new();
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let items =
+                git_github_work_items_for(&root.0, "issue", false, "open", "", 40, Some(&binding))
+                    .unwrap();
+            times.push(start.elapsed().as_millis());
+            assert!(items.iter().all(|item| item.repo == binding.repository));
+            assert!(!items.is_empty());
+        }
+        times.sort();
+        eprintln!(
+            "Selected-account production read: median {} ms, max {} ms (3 calls, up to 40 items)",
+            times[1], times[2]
+        );
+    }
+
+    #[test]
+    fn explicit_remote_push_does_not_change_upstream_or_other_remote() {
+        let repo = tmp("explicit-remote");
+        let origin = tmp("explicit-origin");
+        let selected = tmp("explicit-selected");
+        assert!(init_git(&repo.0, "main", None));
+        assert!(git(&repo.0, &["commit", "--allow-empty", "-m", "base"]));
+        assert!(git(&origin.0, &["init", "--bare"]));
+        assert!(git(&selected.0, &["init", "--bare"]));
+        assert!(git(
+            &repo.0,
+            &["remote", "add", "origin", &origin.0.to_string_lossy()]
+        ));
+        assert!(git(
+            &repo.0,
+            &["remote", "add", "selected", &selected.0.to_string_lossy()]
+        ));
+        git_remote_action(&repo.0, Some("selected"), "push").unwrap();
+        assert!(git_stdout(&selected.0, &["rev-parse", "--verify", "refs/heads/main"]).is_some());
+        assert!(git_stdout(&origin.0, &["rev-parse", "--verify", "refs/heads/main"]).is_none());
+        assert!(git_stdout(&repo.0, &["config", "branch.main.remote"]).is_none());
+        let head = git_stdout(&repo.0, &["rev-parse", "HEAD"]).unwrap();
+        assert!(verify_pr_head(&repo.0, "main", &head).is_ok());
+        assert!(verify_pr_head(&repo.0, "main", "different").is_err());
+        assert!(git_remote_action(&repo.0, Some("missing"), "push").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_boundary_binds_accounts_rotation_scopes_and_repository() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("github-boundary");
+        let program = dir.0.join("fake-gh");
+        // Only the external executable is replaced; routing, credential lookup,
+        // viewer validation, limits and error redaction are production logic.
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+if [ "$1" = auth ]; then
+  case "$6" in
+    missing) echo 'SECRET failure' >&2; exit 1;;
+    *) printf '%s' "$6"; exit 0;;
+  esac
+fi
+if [ "$1" = api ] && [ "$2" = user ]; then
+  case "$GH_TOKEN" in
+    expired) echo 'SECRET expired' >&2; exit 1;;
+    rotated) echo different-user; exit 0;;
+    *) echo "$GH_TOKEN"; exit 0;;
+  esac
+fi
+if [ "$1" = denied ]; then echo 'SECRET denied' >&2; exit 1; fi
+printf '%s|%s|%s' "$GH_HOST" "$GH_REPO" "$GH_TOKEN"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let make = |account: &str| GithubBinding {
+            hostname: "github.example".into(),
+            account: account.into(),
+            repository: "org/repo".into(),
+            writes: false,
+        };
+        for account in ["alice", "bob"] {
+            let binding = make(account);
+            let result =
+                gh_run_program(&dir.0, Some(&binding), &["repo"], false, &program).unwrap();
+            assert_eq!(
+                result,
+                format!("github.example|github.example/org/repo|{account}")
+            );
+        }
+        for account in ["missing", "expired", "rotated"] {
+            let error = gh_run_program(&dir.0, Some(&make(account)), &["repo"], false, &program)
+                .unwrap_err();
+            assert!(!error.contains("SECRET"));
+        }
+        let denied =
+            gh_run_program(&dir.0, Some(&make("alice")), &["denied"], false, &program).unwrap_err();
+        assert!(denied.contains("permissions"));
+        assert!(!denied.contains("SECRET"));
+        assert!(make("--bad").validate().is_err());
     }
 
     #[test]

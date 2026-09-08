@@ -1,3 +1,4 @@
+import { inheritWorktreeConnections } from "../lib/connections";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { notifyGitChanged } from "../lib/fs";
@@ -118,13 +119,24 @@ export function WorktreePanel({
     "flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-content hover:bg-content/5 disabled:opacity-40";
   const inputClass =
     "min-w-0 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/40 disabled:opacity-60";
+  const openWorktree = (path: string) => {
+    try {
+      inheritWorktreeConnections(cwd, path);
+    } catch (error) {
+      setError(
+        `Worktree is available, but its connection settings could not be copied: ${error}`,
+      );
+      return;
+    }
+    onOpen(path);
+    onClose();
+  };
   const openEntry = (entry: Worktree) => {
     if (entry.users.length) {
       setConfirmation({ entry, action: "open" });
       return;
     }
-    onOpen(entry.path);
-    onClose();
+    openWorktree(entry.path);
   };
   const createAndOpen = () => {
     if (!selected || !branch || !path) return;
@@ -140,8 +152,7 @@ export function WorktreePanel({
       notifyGitChanged();
     }).then(() => {
       if (created) {
-        onOpen(created);
-        onClose();
+        openWorktree(created);
       }
     });
   };
@@ -193,8 +204,7 @@ export function WorktreePanel({
               onClick={() => {
                 const { entry, action } = confirmation;
                 if (action === "open") {
-                  onOpen(entry.path);
-                  onClose();
+                  openWorktree(entry.path);
                   return;
                 }
                 void run(async () => {

@@ -1,3 +1,4 @@
+mod bounded_process;
 use tauri::Manager;
 
 mod chat_background;
@@ -225,6 +226,7 @@ pub fn run() {
             fs::git_range_context,
             fs::git_pr_status,
             fs::git_pr_create,
+            fs::github_connection_test,
             fs::git_github_repo,
             fs::git_github_work_items,
             fs::git_github_work_item_details,

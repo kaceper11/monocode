@@ -1,5 +1,5 @@
 use std::io;
-use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::OnceLock;
 use windows_sys::Win32::System::{
     JobObjects::{
@@ -57,15 +57,6 @@ fn create_job() -> io::Result<OwnedHandle> {
     }
 }
 
-/// The app owns the only job handle. OS handle cleanup kills registered trees
-/// after a crash; unrelated children are never enrolled in this job.
-pub(crate) fn assign_child(process: RawHandle) -> io::Result<()> {
-    if unsafe { AssignProcessToJobObject(managed_job()?.as_raw_handle(), process) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 pub(crate) fn spawn_pty(
     slave: &dyn portable_pty::SlavePty,
     command: portable_pty::CommandBuilder,
@@ -79,16 +70,36 @@ pub(crate) fn spawn_pty(
 pub(crate) fn spawn_managed(
     command: &mut std::process::Command,
 ) -> io::Result<std::process::Child> {
+    spawn_in_job(command, managed_job()?)
+}
+
+pub(crate) fn spawn_scoped(
+    command: &mut std::process::Command,
+) -> io::Result<(std::process::Child, OwnedHandle)> {
+    let job = create_job()?;
+    let child = spawn_in_job(command, &job)?;
+    Ok((child, job))
+}
+
+fn spawn_in_job(
+    command: &mut std::process::Command,
+    job: &OwnedHandle,
+) -> io::Result<std::process::Child> {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{
         CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
     };
-    managed_job()?;
     // Probes can exit or create descendants before spawn returns. Enroll them
     // while suspended, then let the first thread run.
     command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
     let mut child = command.spawn()?;
-    if let Err(err) = assign_child(child.as_raw_handle()).and_then(|()| resume_child(child.id())) {
+    let assigned = unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) };
+    let result = if assigned == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        resume_child(child.id())
+    };
+    if let Err(err) = result {
         let _ = child.kill();
         let _ = child.wait();
         return Err(err);

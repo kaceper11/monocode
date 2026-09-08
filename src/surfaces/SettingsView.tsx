@@ -1,3 +1,16 @@
+import { normalizeProjectPath as connectionProjectPath } from "../lib/recents";
+import {
+  loadConnections,
+  inboxConnectionsKey,
+  saveConnections,
+  projectConnections,
+  testGithubAccount,
+  type Connections,
+  type ConnectionAccount,
+  type ConnectionProvider,
+  type ProjectConnections,
+  type ServiceBinding,
+} from "../lib/connections";
 import {
   ArrowDownCircle,
   Check,
@@ -278,6 +291,9 @@ export function SettingsView({
           ) : null}
           {section === "keybindings" ? <KeybindingsPage /> : null}
           {section === "providers" ? <ProvidersPage /> : null}
+          {section === "connections" ? (
+            <ConnectionsPage key={cwd} cwd={cwd} />
+          ) : null}
           {section === "archive" ? (
             <ArchivePage
               cwd={cwd}
@@ -767,12 +783,12 @@ function UpdateRow({
         </SecondaryButton>
         <SecondaryButton onClick={() => void onClick()} disabled={busy}>
           {busy ? (
-          <Loader className="size-3.5 animate-spin" aria-hidden />
-        ) : hasUpdate ? (
-          <ArrowDownCircle className="size-3.5 text-accent" aria-hidden />
-        ) : (
-          <RefreshCw className="size-3.5" strokeWidth={1.75} aria-hidden />
-        )}
+            <Loader className="size-3.5 animate-spin" aria-hidden />
+          ) : hasUpdate ? (
+            <ArrowDownCircle className="size-3.5 text-accent" aria-hidden />
+          ) : (
+            <RefreshCw className="size-3.5" strokeWidth={1.75} aria-hidden />
+          )}
           {hasUpdate ? "Download" : "Check for updates"}
         </SecondaryButton>
       </div>
@@ -1629,7 +1645,9 @@ function Segmented<T extends string>({
       role="radiogroup"
       aria-label={label}
       className="inline-grid shrink-0 gap-0.5 rounded-md border border-content/10 p-0.5 text-[12px]"
-      style={{ gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))` }}
+      style={{
+        gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))`,
+      }}
     >
       {options.map((option) => (
         <button
@@ -1801,5 +1819,520 @@ function SecondaryButton({
     >
       {children}
     </button>
+  );
+}
+
+function ConnectionsPage({ cwd }: { cwd: string }) {
+  const [config, setConfig] = useState<Connections | null>(() => {
+    try {
+      return loadConnections();
+    } catch {
+      return null;
+    }
+  });
+  const [project, setProject] = useState<ProjectConnections>(() => {
+    try {
+      return projectConnections(cwd);
+    } catch {
+      return {
+        tickets: [],
+        prs: false,
+        ci: [],
+        gitRemote: null,
+        executionHost: { kind: "local" },
+      };
+    }
+  });
+  const [provider, setProvider] = useState<ConnectionProvider>("github");
+  const [hostname, setHostname] = useState("github.com");
+  const [login, setLogin] = useState("");
+  const [repository, setRepository] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const field =
+    "h-7 min-w-0 w-full rounded-md border border-content/10 bg-transparent px-2 text-[12px] text-content outline-none";
+  const names: Record<ConnectionProvider, string> = {
+    github: "GitHub",
+    linear: "Linear",
+    jira: "Jira",
+    "azure-boards": "Azure Boards",
+    "azure-repos": "Azure Repos",
+    "github-actions": "GitHub Actions",
+    "azure-pipelines": "Azure Pipelines",
+  };
+  const mark = (value: ConnectionProvider) =>
+    value === "github" || value === "linear" || value === "github-actions" ? (
+      <InboxProviderMark
+        provider={value === "linear" ? "linear" : "github"}
+        className="size-4 shrink-0"
+      />
+    ) : null;
+  if (!config)
+    return (
+      <p role="alert">
+        Connection settings could not be read. The saved settings and backup
+        have been preserved.
+      </p>
+    );
+  const persist = (next: Connections) => {
+    try {
+      saveConnections(next, config);
+      setConfig(next);
+      if (inboxConnectionsKey(config) !== inboxConnectionsKey(next))
+        clearInboxCache();
+      setMessage("Saved");
+      return true;
+    } catch (error) {
+      setMessage(String(error));
+      return false;
+    }
+  };
+  const accountAction = async (account: ConnectionAccount, connect = false) => {
+    if (busy) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      const testRepo =
+        repository ||
+        [
+          ...(project.tickets ?? []),
+          ...(project.prs ? [project.prs] : []),
+        ].find((source) => source.accountId === account.id)?.project ||
+        "";
+      const permission = await testGithubAccount(account, testRepo);
+      if (
+        connect &&
+        !persist({
+          ...config,
+          accounts: [
+            ...config.accounts.filter((item) => item.id !== account.id),
+            account,
+          ],
+        })
+      )
+        return;
+      setMessage(
+        `${account.login} · ${account.hostname}: ${permission.toLowerCase()} access`,
+      );
+    } catch (error) {
+      setMessage(`${account.login}: ${String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const makeBinding = (value: ConnectionProvider): ServiceBinding => {
+    const accounts = config.accounts.filter(
+      (account) =>
+        account.provider === value ||
+        (value === "github-actions" && account.provider === "github"),
+    );
+    return {
+      provider: value,
+      accountId: accounts.length === 1 ? accounts[0].id : "",
+      project: "",
+    };
+  };
+  const bindingEditor = (
+    label: string,
+    binding: ServiceBinding | null | false,
+    choices: ConnectionProvider[],
+    change: (next: ServiceBinding | null | false) => void,
+    automatic = false,
+  ) => (
+    <Row
+      key={label}
+      label={
+        <span className="flex items-center gap-2">
+          {binding
+            ? mark(binding.provider)
+            : automatic && binding === null
+              ? mark("github")
+              : null}
+          {label}
+        </span>
+      }
+      description={
+        binding
+          ? binding.provider === "linear"
+            ? "Uses your Linear account and team filters."
+            : binding.provider !== "github"
+              ? "Mapping only · connector not available yet"
+              : undefined
+          : binding === null
+            ? "Current Git remote and CLI account"
+            : "Off"
+      }
+    >
+      <div className="grid w-64 grid-cols-2 gap-2">
+        <select
+          aria-label={`${label} provider`}
+          className={`${field} col-span-2`}
+          value={
+            binding ? binding.provider : binding === null ? "automatic" : "none"
+          }
+          onChange={(e) =>
+            change(
+              e.target.value === "automatic"
+                ? null
+                : e.target.value === "none"
+                  ? false
+                  : makeBinding(e.target.value as ConnectionProvider),
+            )
+          }
+        >
+          {automatic && (
+            <option value="automatic">Use existing settings</option>
+          )}
+          <option value="none">None</option>
+          {choices.map((value) => (
+            <option key={value} value={value}>
+              {names[value]}
+            </option>
+          ))}
+        </select>
+        {binding && binding.provider !== "linear" && (
+          <>
+            <select
+              aria-label={`${label} account`}
+              className={field}
+              value={binding.accountId}
+              onChange={(e) =>
+                change({ ...binding, accountId: e.target.value })
+              }
+            >
+              <option value="">Account</option>
+              {config.accounts
+                .filter(
+                  (account) =>
+                    account.provider === binding.provider ||
+                    (binding.provider === "github-actions" &&
+                      account.provider === "github"),
+                )
+                .map((account) => (
+                  <option key={account.id} value={account.id}>
+                    {account.login} · {account.hostname}
+                  </option>
+                ))}
+            </select>
+            <input
+              aria-label={`${label} project`}
+              className={field}
+              placeholder={
+                binding.provider === "github"
+                  ? "owner/repository"
+                  : "Organization/project"
+              }
+              value={binding.project}
+              onChange={(e) => change({ ...binding, project: e.target.value })}
+            />
+          </>
+        )}
+      </div>
+    </Row>
+  );
+  const ticketRows = project.tickets?.length
+    ? project.tickets
+    : ([project.tickets === null ? null : false] as const);
+  const ciRows = project.ci.length ? project.ci : ([false] as const);
+  const dirty =
+    JSON.stringify(project) !== JSON.stringify(projectConnections(cwd, config));
+  return (
+    <>
+      <Heading title="Project" first />
+      <p className="break-all text-[12px] text-content/45">
+        {cwd || "Open a project to configure its services."}
+      </p>
+      {ticketRows.map((binding, index) =>
+        bindingEditor(
+          index ? `Tickets ${index + 1}` : "Tickets",
+          binding,
+          ["github", "linear", "jira", "azure-boards"],
+          (next) =>
+            setProject({
+              ...project,
+              tickets:
+                next === null
+                  ? null
+                  : next === false
+                    ? (project.tickets ?? []).filter((_, i) => i !== index)
+                    : (project.tickets?.length ? project.tickets : [next]).map(
+                        (item, i) => (i === index ? next : item),
+                      ),
+            }),
+          index === 0,
+        ),
+      )}
+      {project.tickets === null && (
+        <p className="py-1 text-[11px] text-content/40">
+          Includes your connected Linear account.
+        </p>
+      )}
+      {project.tickets && project.tickets.length > 0 && (
+        <div className="flex justify-end py-1">
+          <SecondaryButton
+            disabled={project.tickets.length >= 8}
+            onClick={() =>
+              setProject({
+                ...project,
+                tickets: [...project.tickets!, makeBinding("github")],
+              })
+            }
+          >
+            Add ticket source
+          </SecondaryButton>
+        </div>
+      )}
+      {bindingEditor(
+        "Pull requests",
+        project.prs,
+        ["github", "azure-repos"],
+        (prs) => setProject({ ...project, prs }),
+        true,
+      )}
+      {ciRows.map((binding, index) =>
+        bindingEditor(
+          index ? `CI ${index + 1}` : "CI",
+          binding,
+          ["github-actions", "azure-pipelines"],
+          (next) =>
+            setProject({
+              ...project,
+              ci: !next
+                ? project.ci.filter((_, i) => i !== index)
+                : (project.ci.length ? project.ci : [next]).map((item, i) =>
+                    i === index ? next : item,
+                  ),
+            }),
+        ),
+      )}
+      {project.ci.length > 0 && (
+        <div className="flex justify-end py-1">
+          <SecondaryButton
+            disabled={project.ci.length >= 8}
+            onClick={() =>
+              setProject({
+                ...project,
+                ci: [...project.ci, makeBinding("azure-pipelines")],
+              })
+            }
+          >
+            Add CI source
+          </SecondaryButton>
+        </div>
+      )}
+      <Row
+        label="Git remote"
+        description="Push, pull and sync. Empty uses the branch upstream."
+      >
+        <div className="w-64">
+          <input
+            aria-label="Git remote"
+            className={field}
+            placeholder="Branch upstream"
+            value={project.gitRemote ?? ""}
+            onChange={(e) =>
+              setProject({ ...project, gitRemote: e.target.value || null })
+            }
+          />
+        </div>
+      </Row>
+      <Row
+        label="Execution host"
+        description="Where repositories, Git and agents run."
+      >
+        <div className="w-64">
+          <select
+            aria-label="Execution host"
+            className={field}
+            value={project.executionHost.kind}
+            onChange={() =>
+              setProject({ ...project, executionHost: { kind: "local" } })
+            }
+          >
+            <option value="local">This computer</option>
+            <option value="wsl" disabled>
+              WSL · connector pending
+            </option>
+          </select>
+        </div>
+      </Row>
+      <div className="flex justify-end py-3">
+        <SecondaryButton
+          disabled={!cwd || busy || !dirty}
+          onClick={() =>
+            persist({
+              ...config,
+              projects: {
+                ...config.projects,
+                [connectionProjectPath(cwd)]: project,
+              },
+            })
+          }
+        >
+          Save changes
+        </SecondaryButton>
+      </div>
+      <Heading title="Accounts" />
+      {config.accounts.map((account) => (
+        <Row
+          key={account.id}
+          label={
+            <span className="flex items-center gap-2">
+              {mark(account.provider)}
+              {account.login}
+            </span>
+          }
+          description={`${account.hostname} · this computer${account.provider !== "github" ? " · connector pending" : ""}`}
+        >
+          <div className="flex w-64 flex-wrap items-center justify-end gap-2">
+            {account.provider === "github" && (
+              <>
+                <span className="text-[11px] text-content/45">
+                  Allow writes
+                </span>
+                <Toggle
+                  label={`Allow writes for ${account.login}`}
+                  on={account.writes}
+                  onChange={(writes) =>
+                    persist({
+                      ...config,
+                      accounts: config.accounts.map((item) =>
+                        item.id === account.id ? { ...item, writes } : item,
+                      ),
+                    })
+                  }
+                />
+                <SecondaryButton
+                  disabled={busy}
+                  onClick={() => void accountAction(account)}
+                >
+                  Test
+                </SecondaryButton>
+              </>
+            )}
+            <SecondaryButton
+              disabled={busy}
+              onClick={() =>
+                persist({
+                  ...config,
+                  accounts: config.accounts.filter(
+                    (item) => item.id !== account.id,
+                  ),
+                })
+              }
+            >
+              Disconnect
+            </SecondaryButton>
+          </div>
+        </Row>
+      ))}
+      <Row
+        label={
+          <span className="flex items-center gap-2">
+            {mark(provider)}Connect account
+          </span>
+        }
+        description="Credentials stay with GitHub CLI on this computer."
+      >
+        <div className="grid w-64 grid-cols-2 gap-2">
+          <select
+            aria-label="Account provider"
+            className={field}
+            value={provider}
+            onChange={(e) => setProvider(e.target.value as ConnectionProvider)}
+          >
+            {[
+              "github",
+              "jira",
+              "azure-boards",
+              "azure-repos",
+              "azure-pipelines",
+            ].map((value) => (
+              <option key={value} value={value}>
+                {names[value as ConnectionProvider]}
+              </option>
+            ))}
+          </select>
+          <input
+            aria-label="Account login"
+            className={field}
+            placeholder="Login"
+            value={login}
+            onChange={(e) => setLogin(e.target.value)}
+          />
+          <input
+            aria-label="Account hostname"
+            className={field}
+            value={hostname}
+            onChange={(e) => setHostname(e.target.value)}
+          />
+          <input
+            aria-label="Repository for connection test"
+            className={field}
+            placeholder="owner/repository"
+            value={repository}
+            onChange={(e) => setRepository(e.target.value)}
+          />
+          <div className="col-span-2 flex justify-end">
+            <SecondaryButton
+              disabled={
+                busy ||
+                !login ||
+                !hostname ||
+                (provider === "github" && !repository)
+              }
+              onClick={() => {
+                const account: ConnectionAccount = {
+                  id: `${provider}:${hostname.toLowerCase()}:${login.toLowerCase()}`,
+                  provider,
+                  hostname,
+                  login,
+                  credentialHost: "local",
+                  writes: false,
+                };
+                if (provider === "github") void accountAction(account, true);
+                else
+                  persist({
+                    ...config,
+                    accounts: [
+                      ...config.accounts.filter(
+                        (item) => item.id !== account.id,
+                      ),
+                      account,
+                    ],
+                  });
+              }}
+            >
+              {busy
+                ? "Testing…"
+                : provider === "github"
+                  ? "Connect"
+                  : "Save mapping"}
+            </SecondaryButton>
+          </div>
+        </div>
+      </Row>
+      {message && (
+        <p role="status" className="py-2 text-[12px] text-content/60">
+          {message}
+        </p>
+      )}
+      <details className="py-2 text-[12px] leading-relaxed text-content/45">
+        <summary className="cursor-pointer">
+          Sign in, permissions and disconnecting
+        </summary>
+        <p className="pt-2">
+          Sign in or rotate credentials with gh auth login --hostname HOST, then
+          connect the same login here. Repository reads require repository
+          access; writes also require issue/PR write permission. Disconnect
+          removes only MonoCode's selection. Revoke credentials in the provider
+          account settings or use gh auth logout to remove its CLI login.
+          In-flight requests may finish. Credentials are never copied to another
+          execution host.
+        </p>
+      </details>
+      <Heading title="Linear" />
+      <LinearSettings />
+    </>
   );
 }

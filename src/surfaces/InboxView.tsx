@@ -1,3 +1,4 @@
+import { CONNECTIONS_CHANGED } from "../lib/connections";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   CheckCheck,
@@ -384,7 +385,11 @@ export function InboxView({
       setRefresh((value) => value + 1);
     };
     window.addEventListener(LINEAR_CHANGE_EVENT, onChange);
-    return () => window.removeEventListener(LINEAR_CHANGE_EVENT, onChange);
+    window.addEventListener(CONNECTIONS_CHANGED, onChange);
+    return () => {
+      window.removeEventListener(LINEAR_CHANGE_EVENT, onChange);
+      window.removeEventListener(CONNECTIONS_CHANGED, onChange);
+    };
   }, []);
 
   // The roster has to come from Linear, not from the fetched issues: hiding a
@@ -823,7 +828,11 @@ function InboxCard({
   const time = formatRelativeTime(item.updatedAt);
   const name = projectName(item.projectPath);
   const linear = item.provider === "linear";
-  const source = linear ? item.teamName || item.repo : item.repo || name;
+  const source = linear
+    ? item.teamName || item.repo
+    : item.binding
+      ? `${item.binding.account} · ${item.binding.hostname}/${item.binding.repository}`
+      : item.repo || name;
   const unseen = isInboxEntryUnseen({
     key: inboxItemKey(item),
     updatedAt: item.updatedAt,
@@ -926,15 +935,25 @@ function InboxDetail({
   const cached = linear
     ? peekLinearIssueDetails(item.id ?? "")
     : githubKind
-      ? peekGithubWorkItemDetails(item.projectPath, githubKind, item.number)
+      ? peekGithubWorkItemDetails(
+          item.projectPath,
+          githubKind,
+          item.number,
+          item.binding,
+        )
       : null;
   const cachedDiff = isPr
-    ? peekGithubPrDiff(item.projectPath, item.number)
+    ? peekGithubPrDiff(item.projectPath, item.number, item.binding)
     : null;
   const cachedThread = linear
     ? peekLinearIssueThread(item.id ?? "")
     : githubKind
-      ? peekGithubWorkItemThread(item.projectPath, githubKind, item.number)
+      ? peekGithubWorkItemThread(
+          item.projectPath,
+          githubKind,
+          item.number,
+          item.binding,
+        )
       : null;
   const [details, setDetails] = useState<GithubWorkItemDetails | null>(cached);
   const [loading, setLoading] = useState(cached == null);
@@ -965,7 +984,9 @@ function InboxDetail({
 
   const source = linear
     ? item.teamName || item.repo
-    : item.repo || projectName(item.projectPath);
+    : item.binding
+      ? `${item.binding.account} · ${item.binding.hostname}/${item.binding.repository}`
+      : item.repo || projectName(item.projectPath);
   const markdownCwd = linear ? startProject || cwd : item.projectPath || cwd;
   const authorName = details?.author?.trim() ?? "";
   const extraAssignees = item.assignees.filter(
@@ -994,7 +1015,12 @@ function InboxDetail({
     const cachedDetails = linear
       ? peekLinearIssueDetails(item.id ?? "")
       : githubKind
-        ? peekGithubWorkItemDetails(item.projectPath, githubKind, item.number)
+        ? peekGithubWorkItemDetails(
+            item.projectPath,
+            githubKind,
+            item.number,
+            item.binding,
+          )
         : null;
     if (cachedDetails) {
       setDetails(cachedDetails);
@@ -1010,7 +1036,12 @@ function InboxDetail({
         ? linearIssueDetails(item.id)
         : Promise.reject(new Error("Missing Linear issue"))
       : githubKind
-        ? githubWorkItemDetails(item.projectPath, githubKind, item.number)
+        ? githubWorkItemDetails(
+            item.projectPath,
+            githubKind,
+            item.number,
+            item.binding,
+          )
         : Promise.reject(new Error("Unknown inbox item"));
     void pending
       .then((next) => {
@@ -1078,7 +1109,9 @@ function InboxDetail({
       setThreadError(null);
       setThread(null);
     }
-    void githubWorkItemThread(item.projectPath, githubKind, item.number)
+    void githubWorkItemThread(item.projectPath, githubKind, item.number, {
+      binding: item.binding,
+    })
       .then((next) => {
         if (cancelled) return;
         setThread(next);
@@ -1100,7 +1133,11 @@ function InboxDetail({
   useEffect(() => {
     if (!isPr || tab !== "code") return;
     let cancelled = false;
-    const cachedDiff = peekGithubPrDiff(item.projectPath, item.number);
+    const cachedDiff = peekGithubPrDiff(
+      item.projectPath,
+      item.number,
+      item.binding,
+    );
     if (cachedDiff) {
       setPrDiff(cachedDiff);
       setDiffLoading(false);
@@ -1110,7 +1147,7 @@ function InboxDetail({
       setDiffError(null);
       setPrDiff(null);
     }
-    void githubPrDiff(item.projectPath, item.number)
+    void githubPrDiff(item.projectPath, item.number, item.binding)
       .then((next) => {
         if (cancelled) return;
         setPrDiff(next);
@@ -1150,7 +1187,7 @@ function InboxDetail({
         githubKind,
         item.number,
         body,
-        { inReplyTo: replyTo?.threadId },
+        { inReplyTo: replyTo?.threadId, binding: item.binding },
       );
       setReplyTo(null);
       try {
@@ -1161,6 +1198,7 @@ function InboxDetail({
             item.number,
             {
               force: true,
+              binding: item.binding,
             },
           ),
         );

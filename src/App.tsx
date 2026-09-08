@@ -2534,7 +2534,7 @@ export default function App({
         session = {
           ...newDefaultSession(cwd),
           title: `Ask · ${item.title}`,
-          inboxAsk: { key, title: item.title, url: item.url, provider: item.provider, description },
+          inboxAsk: { key, title: item.title, url: item.url, provider: item.provider, description, binding: item.binding },
         };
         sessionsRef.current = [...sessionsRef.current, session];
         setSessions(sessionsRef.current);

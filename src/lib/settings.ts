@@ -3,13 +3,24 @@ import { ALT, IS_MAC, MOD, SHIFT } from "./platform";
 const SECTION_KEY = "monocode.settingsSection";
 
 export type SettingsSectionId =
-  "general" | "appearance" | "keybindings" | "providers" | "archive";
+  | "connections"
+  | "general"
+  | "appearance"
+  | "keybindings"
+  | "providers"
+  | "archive";
 
 export const SETTINGS_SECTIONS: {
   id: SettingsSectionId;
   label: string;
   description: string;
 }[] = [
+  {
+    id: "connections",
+    label: "Connections",
+    description:
+      "Independent services, accounts and execution host for this project.",
+  },
   {
     id: "general",
     label: "General",

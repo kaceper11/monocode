@@ -122,7 +122,9 @@ describe("githubReviewDecisionLabel", () => {
     expect(githubReviewDecisionLabel("changes_requested")).toBe(
       "Changes requested",
     );
-    expect(githubReviewDecisionLabel("REVIEW_REQUIRED")).toBe("Review required");
+    expect(githubReviewDecisionLabel("REVIEW_REQUIRED")).toBe(
+      "Review required",
+    );
     expect(githubReviewDecisionLabel("")).toBe("");
   });
 });
@@ -170,14 +172,14 @@ describe("inboxListCacheKey", () => {
 });
 
 describe("collectInboxResults", () => {
-  it("keeps items from projects that succeeded", () => {
+  it("keeps successful accounts visible while reporting independent failures", () => {
     const kept = item({ number: 4, updatedAt: "2026-08-27T11:00:00Z" });
     expect(
       collectInboxResults([
         { status: "fulfilled", value: [kept] },
         { status: "rejected", reason: new Error("gh missing") },
       ]),
-    ).toEqual({ items: [kept] });
+    ).toEqual({ items: [kept], error: "gh missing" });
   });
 
   it("reports an error when every project fetch failed", () => {
@@ -186,7 +188,7 @@ describe("collectInboxResults", () => {
         { status: "rejected", reason: new Error("not a github repo") },
         { status: "rejected", reason: "command not found" },
       ]),
-    ).toEqual({ items: [], error: "not a github repo" });
+    ).toEqual({ items: [], error: "not a github repo; command not found" });
   });
 });
 
@@ -206,7 +208,10 @@ describe("dedupeInboxItems", () => {
         repo: "HardBeat920/monocode",
       }),
     ];
-    const deduped = dedupeInboxItems(rows, ["/tmp/monocode", "/tmp/agent-terminal"]);
+    const deduped = dedupeInboxItems(rows, [
+      "/tmp/monocode",
+      "/tmp/agent-terminal",
+    ]);
     expect(deduped).toHaveLength(1);
     expect(deduped[0]?.projectPath).toBe("/tmp/monocode");
     expect(inboxItemKey(deduped[0]!)).toBe(
@@ -278,9 +283,9 @@ describe("filterInboxItems", () => {
   });
 
   it("matches title, number, kind, repo, and labels", () => {
-    expect(filterInboxItems(items, "checkout").map((row) => row.number)).toEqual(
-      [12],
-    );
+    expect(
+      filterInboxItems(items, "checkout").map((row) => row.number),
+    ).toEqual([12]);
     expect(filterInboxItems(items, "#4").map((row) => row.number)).toEqual([4]);
     expect(filterInboxItems(items, "pull").map((row) => row.number)).toEqual([
       12,
