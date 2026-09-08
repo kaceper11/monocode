@@ -71,6 +71,21 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("independent connections", () => {
+  it("preserves independent CI settings while PRs are disabled and reconnected", () => {
+    const config = fixture();
+    const original = structuredClone(config.projects["/repo"]);
+    config.projects["/repo"].prs = false;
+    saveConnections(config);
+    const paused = projectConnections("/repo");
+    expect(paused).toEqual({ ...original, prs: false });
+    const resumed = loadConnections();
+    resumed.projects["/repo"].prs = original.prs;
+    saveConnections(resumed);
+    expect(projectConnections("/repo")).toEqual(original);
+    expect(projectConnections("/repo").ci[0].provider).toBe("azure-pipelines");
+    expect(projectConnections("/repo").prs).toMatchObject({ provider: "github" });
+  });
+
   it("preserves legacy defaults and changes CI without changing other bindings", () => {
     expect(projectConnections("/old")).toEqual(DEFAULT_PROJECT_CONNECTIONS);
     const config = fixture();

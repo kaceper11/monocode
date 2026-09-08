@@ -1978,6 +1978,22 @@ function ConnectionsPage({ cwd }: { cwd: string }) {
       project: "",
     };
   };
+  const bindingLabel = (binding: ServiceBinding) => {
+    const account = config.accounts.find(
+      (item) => item.id === binding.accountId,
+    );
+    return [
+      names[binding.provider],
+      binding.provider === "linear"
+        ? null
+        : account
+          ? `${account.login} · ${account.hostname}`
+          : "Choose account",
+      binding.project,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  };
   const dirty =
     JSON.stringify(project) !== JSON.stringify(projectConnections(cwd, config));
   const bindingEditor = (
@@ -2033,14 +2049,10 @@ function ConnectionsPage({ cwd }: { cwd: string }) {
           >
             <span
               className="min-w-0 break-words text-[12px] text-content/60"
-              title={
-                binding
-                  ? `${names[binding.provider]} · ${config.accounts.find((account) => account.id === binding.accountId)?.login ?? "Choose account"} · ${binding.project}`
-                  : undefined
-              }
+              title={binding ? bindingLabel(binding) : undefined}
             >
               {binding
-                ? `${names[binding.provider]}${binding.provider === "linear" ? "" : ` · ${config.accounts.find((account) => account.id === binding.accountId)?.login ?? "Choose account"} · ${config.accounts.find((account) => account.id === binding.accountId)?.hostname ?? ""}`}${binding.project ? ` · ${binding.project}` : ""}`
+                ? bindingLabel(binding)
                 : binding === null
                   ? "Existing settings"
                   : "Not configured"}
@@ -2267,39 +2279,85 @@ function ConnectionsPage({ cwd }: { cwd: string }) {
         (prs) => ({ ...project, prs }),
         true,
       )}
-      {ciRows.map((binding, index) =>
-        bindingEditor(
-          index ? `CI ${index + 1}` : "CI",
-          binding,
-          ["github-actions", "azure-pipelines"],
-          (next) => ({
-            ...project,
-            ci: !next
-              ? project.ci.filter((_, i) => i !== index)
-              : (project.ci.length ? project.ci : [next]).map((item, i) =>
-                  i === index ? next : item,
-                ),
-          }),
-        ),
-      )}
-      {project.ci.length > 0 && (
-        <div className="flex justify-end py-1">
-          <SecondaryButton
-            disabled={project.ci.length >= 8 || editing !== null || dirty}
-            onClick={() => {
-              setBeforeEdit(project);
-              setEditing(`CI ${project.ci.length + 1}`);
-              setDraftBinding(makeBinding("azure-pipelines"));
-              setProject({
-                ...project,
-                ci: [...project.ci, makeBinding("azure-pipelines")],
-              });
-            }}
+      <div
+        role="group"
+        aria-label="Pull request checks"
+        className="ml-3 border-l border-content/10 pl-4"
+      >
+        {project.prs === false ? (
+          <Row
+            label="CI"
+            description={
+              project.ci.length
+                ? "Saved CI choices are paused. Choose pull requests; CI connectors are not available yet."
+                : "Choose a pull request connection to configure its checks."
+            }
           >
-            Add CI source
-          </SecondaryButton>
-        </div>
-      )}
+            <div className="flex max-w-64 flex-wrap justify-end gap-2">
+              {project.ci.length > 0 && (
+                <span className="w-full text-[12px] text-content/60">
+                  {project.ci.map(bindingLabel).join(", ")}
+                </span>
+              )}
+              {project.ci.length > 0 && (
+                <SecondaryButton
+                  disabled={editing !== null || dirty}
+                  onClick={() => setProject({ ...project, ci: [] })}
+                >
+                  Clear CI
+                </SecondaryButton>
+              )}
+              <SecondaryButton
+                disabled={editing !== null || dirty}
+                onClick={() => {
+                  setBeforeEdit(project);
+                  setDraftBinding(project.prs);
+                  focusLabel.current = "Pull requests";
+                  setEditing("Pull requests");
+                }}
+              >
+                Choose pull requests
+              </SecondaryButton>
+            </div>
+          </Row>
+        ) : (
+          <>
+            {ciRows.map((binding, index) =>
+              bindingEditor(
+                index ? `CI ${index + 1}` : "CI",
+                binding,
+                ["github-actions", "azure-pipelines"],
+                (next) => ({
+                  ...project,
+                  ci: !next
+                    ? project.ci.filter((_, i) => i !== index)
+                    : (project.ci.length ? project.ci : [next]).map(
+                        (item, i) => (i === index ? next : item),
+                      ),
+                }),
+              ),
+            )}
+            {project.ci.length > 0 && (
+              <div className="flex justify-end py-1">
+                <SecondaryButton
+                  disabled={project.ci.length >= 8 || editing !== null || dirty}
+                  onClick={() => {
+                    setBeforeEdit(project);
+                    setEditing(`CI ${project.ci.length + 1}`);
+                    setDraftBinding(makeBinding("azure-pipelines"));
+                    setProject({
+                      ...project,
+                      ci: [...project.ci, makeBinding("azure-pipelines")],
+                    });
+                  }}
+                >
+                  Add CI source
+                </SecondaryButton>
+              </div>
+            )}
+          </>
+        )}
+      </div>
       <Row
         label="Git remote"
         description="Push, pull and sync. Empty uses the branch upstream."

@@ -10,6 +10,10 @@ GitHub and Linear reuse the existing provider marks and settings controls.
 
 **Use existing settings** preserves the existing GitHub remote/CLI-account
 behavior and the connected Linear account. **None** disables that project service.
+CI is grouped under pull requests. Configure a PR connection before adding checks;
+its CI provider remains independent (for example GitHub PRs + Azure Pipelines).
+Disabling PRs preserves existing CI mappings but shows them as paused, with actions
+to choose pull requests or clear CI. It never switches providers automatically.
 Explicit GitHub bindings use `hostname + account + owner/repository`; issue and PR
 sources can differ from each other and from the Git remote. New worktrees inherit
 the opening project's bindings only when they have no saved bindings of their own.
