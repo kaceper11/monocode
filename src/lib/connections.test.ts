@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import {
   assertGithubBinding,
+  connectionAccountMatches,
+  ciForPullRequests,
+  withPullRequestConnection,
   DEFAULT_PROJECT_CONNECTIONS,
   githubBinding,
   githubBindingKey,
@@ -71,6 +74,48 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("independent connections", () => {
+  it("shares a visibly chosen PR connection with CI without coupling independent settings", () => {
+    const original = fixture().projects["/repo"];
+    const github = {
+      provider: "github" as const,
+      accountId: "b",
+      project: "org/other",
+    };
+    expect(withPullRequestConnection(original, github, false)).toEqual({
+      ...original,
+      prs: github,
+    });
+    const shared = withPullRequestConnection(original, github, true);
+    expect(shared).toEqual({
+      ...original,
+      prs: github,
+      ci: [{ ...github, provider: "github-actions" }],
+    });
+    expect(withPullRequestConnection(shared, false, true)).toEqual({
+      ...shared,
+      prs: false,
+    });
+    expect(ciForPullRequests(null)).toBeNull();
+    expect(ciForPullRequests({ ...github, provider: "jira" })).toBeNull();
+    const azure = {
+      ...github,
+      provider: "azure-repos" as const,
+      accountId: "azure",
+      project: "org/project",
+    };
+    expect(withPullRequestConnection(original, azure, true).ci).toEqual([
+      { ...azure, provider: "azure-pipelines" },
+    ]);
+    expect(original.ci[0].provider).toBe("azure-pipelines");
+    expect(connectionAccountMatches("azure-boards", "azure-pipelines")).toBe(
+      true,
+    );
+    expect(connectionAccountMatches("azure-repos", "azure-boards")).toBe(true);
+    expect(connectionAccountMatches("github", "github-actions")).toBe(true);
+    expect(connectionAccountMatches("jira", "github")).toBe(false);
+    expect(connectionAccountMatches("github", "azure-repos")).toBe(false);
+  });
+
   it("preserves independent CI settings while PRs are disabled and reconnected", () => {
     const config = fixture();
     const original = structuredClone(config.projects["/repo"]);
@@ -83,7 +128,9 @@ describe("independent connections", () => {
     saveConnections(resumed);
     expect(projectConnections("/repo")).toEqual(original);
     expect(projectConnections("/repo").ci[0].provider).toBe("azure-pipelines");
-    expect(projectConnections("/repo").prs).toMatchObject({ provider: "github" });
+    expect(projectConnections("/repo").prs).toMatchObject({
+      provider: "github",
+    });
   });
 
   it("preserves legacy defaults and changes CI without changing other bindings", () => {

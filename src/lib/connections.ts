@@ -62,6 +62,39 @@ const providers: ConnectionProvider[] = [
 ];
 const empty = (): Connections => ({ version: 1, accounts: [], projects: {} });
 
+/** Reuse one provider account across its services, including saved Azure accounts. */
+export function connectionAccountMatches(
+  account: ConnectionProvider,
+  service: ConnectionProvider,
+): boolean {
+  return (
+    account === service ||
+    (account === "github" && service === "github-actions") ||
+    (account.startsWith("azure-") && service.startsWith("azure-"))
+  );
+}
+
+export function ciForPullRequests(
+  prs: ProjectConnections["prs"],
+): ServiceBinding | null {
+  if (!prs || (prs.provider !== "github" && prs.provider !== "azure-repos"))
+    return null;
+  return {
+    ...prs,
+    provider: prs.provider === "github" ? "github-actions" : "azure-pipelines",
+  };
+}
+
+/** Sharing is an explicit editor choice; clearing PRs never clears CI. */
+export function withPullRequestConnection(
+  project: ProjectConnections,
+  prs: ProjectConnections["prs"],
+  shareCi: boolean,
+): ProjectConnections {
+  const ci = shareCi ? ciForPullRequests(prs) : null;
+  return { ...project, prs, ci: ci ? [ci] : project.ci };
+}
+
 export function validateConnections(value: Connections): void {
   if (
     value.version !== 1 ||

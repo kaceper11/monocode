@@ -1,7 +1,7 @@
 # Connections
 
-Use **Settings → Connections** for the current project. Tickets, pull requests,
-CI, Git remote and execution host are separate rows in **Integrations**. Select
+Use **Settings → Connections** for the current project. Tickets, **PRs and CI**, Git remote and execution host use compact rows in
+**Integrations**. Select
 **Change** on a role, choose its provider/account and full project identity, then
 **Save**. **Cancel** leaves the saved role unchanged. **Change connection** in the
 inbox opens this same surface for the selected item's project. Git remote uses
@@ -10,10 +10,18 @@ GitHub and Linear reuse the existing provider marks and settings controls.
 
 **Use existing settings** preserves the existing GitHub remote/CLI-account
 behavior and the connected Linear account. **None** disables that project service.
-CI is grouped under pull requests. Configure a PR connection before adding checks;
-its CI provider remains independent (for example GitHub PRs + Azure Pipelines).
-Disabling PRs preserves existing CI mappings but shows them as paused, with actions
-to choose pull requests or clear CI. It never switches providers automatically.
+PRs and CI share setup by default: **Use this connection for CI** visibly saves
+GitHub Actions with the selected GitHub account/repository, or Azure Pipelines
+with the selected Azure connection. Existing different CI choices are preserved
+unless sharing is explicitly selected. No pipeline ID is guessed; future connectors
+still need their own pipeline selection and access checks.
+**CI settings** expands the independent provider/account/project controls and
+additional sources, including GitHub PRs + Azure Pipelines. Clearing PRs leaves CI
+unchanged: branch builds can run without PRs. CI connectors remain unavailable in
+this slice; a saved mapping never implies that checks have run.
+Azure DevOps uses one account selection across Boards, Repos and Pipelines; existing
+role-specific Azure account entries remain readable without rewriting credentials.
+Jira appears only among ticket providers.
 Explicit GitHub bindings use `hostname + account + owner/repository`; issue and PR
 sources can differ from each other and from the Git remote. New worktrees inherit
 the opening project's bindings only when they have no saved bindings of their own.
@@ -90,7 +98,11 @@ Use disposable Git repositories and authorized service resources:
    GitHub or Azure Repos. Confirm the other saved values and Git config are unchanged.
 5. Push to a disposable second remote. Confirm only that remote changes and no
    upstream config is added. Open a worktree and verify inherited/explicit mappings.
-6. Change a role, select None, then Cancel; reopen it and verify its saved value.
+6. Save a GitHub PR connection with **Use this connection for CI** selected and
+   verify the shared account/repository. Set an Azure CI override, reopen the PR
+   editor and confirm sharing is off. Cancel a changed shared connection; neither
+   saved role may change. Clear PRs and confirm CI stays editable.
+   Change a role, select None, then Cancel; reopen it and verify its saved value.
    Repeat with Save and confirm only that role is cleared. Add a second ticket/CI
    source, cancel it, then add and save it. Connect an account while editing, cancel
    the role, and confirm the account remains connected but the mapping is unchanged.
