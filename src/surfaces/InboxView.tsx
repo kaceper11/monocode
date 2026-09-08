@@ -273,6 +273,7 @@ type Props = {
   besideRail?: boolean;
   onClose?: () => void;
   onToggleSidebar?: () => void;
+  onChangeConnection?: (cwd: string) => void;
   onStart?: (item: InboxItem, body?: string) => void | Promise<void>;
 };
 
@@ -285,6 +286,7 @@ export function InboxView({
   besideRail = false,
   onClose,
   onToggleSidebar,
+  onChangeConnection,
   onStart,
 }: Props) {
   const [discussionOpen, setDiscussionOpen] = useState(false);
@@ -577,6 +579,7 @@ export function InboxView({
         <button
           type="button"
           aria-label="Refresh"
+          disabled={loading || revalidating}
           onClick={() => setRefresh((value) => value + 1)}
           className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
         >
@@ -647,6 +650,15 @@ export function InboxView({
             })}
           </ul>
         )}
+        {sourceError && onChangeConnection && (
+          <button
+            type="button"
+            className={`${ACTION_GHOST} mx-2`}
+            onClick={() => onChangeConnection(cwd)}
+          >
+            Check connection
+          </button>
+        )}
       </div>
       <div
         role="separator"
@@ -699,6 +711,16 @@ export function InboxView({
           />
           <span className="min-w-0 truncate text-content">Inbox</span>
         </div>
+        {onChangeConnection && (
+          <button
+            type="button"
+            data-tauri-drag-region="false"
+            className={`${ACTION_GHOST} mr-2`}
+            onClick={() => onChangeConnection(selected?.projectPath || cwd)}
+          >
+            Change connection
+          </button>
+        )}
         {IS_MAC ? null : <WindowControls />}
       </div>
 

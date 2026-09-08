@@ -591,22 +591,31 @@ impl GithubBinding {
 #[tauri::command]
 pub async fn github_connection_test(binding: GithubBinding) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let root = std::env::temp_dir();
-        gh_bound(
-            &root,
-            Some(&binding),
-            &[
-                "repo",
-                "view",
-                "--json",
-                "viewerPermission",
-                "--jq",
-                ".viewerPermission",
-            ],
-        )
+        let program = crate::harness::resolve_gui_binary("gh")
+            .ok_or_else(|| "GitHub CLI (`gh`) is not installed.".to_string())?;
+        github_connection_test_for(&binding, &program)
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn github_connection_test_for(binding: &GithubBinding, program: &Path) -> Result<String, String> {
+    gh_run_program(
+        &std::env::temp_dir(),
+        Some(binding),
+        &[
+            "repo",
+            "view",
+            // Unlike issue/PR commands, repo view does not use GH_REPO.
+            &format!("{}/{}", binding.hostname, binding.repository),
+            "--json",
+            "viewerPermission",
+            "--jq",
+            ".viewerPermission",
+        ],
+        false,
+        program,
+    )
 }
 
 /// `owner/repo` for the GitHub remote of this working copy, via `gh`.
@@ -5160,6 +5169,11 @@ mod tests {
             repository,
             writes: false,
         };
+        // Connect starts outside a checkout. Exercise that exact command as well
+        // as repository reads so it cannot accidentally depend on a Git remote.
+        let permission =
+            tauri::async_runtime::block_on(github_connection_test(binding.clone())).unwrap();
+        assert!(["ADMIN", "MAINTAIN", "WRITE", "TRIAGE", "READ"].contains(&permission.as_str()));
         let mut times = Vec::new();
         for _ in 0..3 {
             let start = std::time::Instant::now();
@@ -5228,6 +5242,10 @@ if [ "$1" = api ] && [ "$2" = user ]; then
     *) echo "$GH_TOKEN"; exit 0;;
   esac
 fi
+if [ "$1" = repo ] && [ "$2" = view ]; then
+  [ "$3" = "$GH_REPO" ] || { echo 'explicit repository required' >&2; exit 1; }
+  echo READ; exit 0
+fi
 if [ "$1" = denied ]; then echo 'SECRET denied' >&2; exit 1; fi
 printf '%s|%s|%s' "$GH_HOST" "$GH_REPO" "$GH_TOKEN"
 "#,
@@ -5242,6 +5260,10 @@ printf '%s|%s|%s' "$GH_HOST" "$GH_REPO" "$GH_TOKEN"
         };
         for account in ["alice", "bob"] {
             let binding = make(account);
+            assert_eq!(
+                github_connection_test_for(&binding, &program).unwrap(),
+                "READ"
+            );
             let result =
                 gh_run_program(&dir.0, Some(&binding), &["repo"], false, &program).unwrap();
             assert_eq!(

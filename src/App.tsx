@@ -625,6 +625,9 @@ export default function App({
     () => true,
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [connectionSettingsCwd, setConnectionSettingsCwd] = useState<string | null>(
+    null,
+  );
   const [updateNotice, setUpdateNotice] = useState(installedUpdate);
   const [whatsNewVersion, setWhatsNewVersion] = useState<string | null>(null);
   const [settingsSection, setSettingsSection] =
@@ -4598,6 +4601,7 @@ export default function App({
   }, []);
 
   const openSettings = useCallback((section?: SettingsSectionId) => {
+    setConnectionSettingsCwd(null);
     setFilePickerOpen(false);
     setSearchViewOpen(false);
     setInboxViewOpen(false);
@@ -5414,6 +5418,10 @@ export default function App({
             onAsk={onAskInboxItem}
             onAskRestart={onRestartInboxAsk}
             onAskMount={setInboxAskPortal}
+            onChangeConnection={(cwd) => {
+              openSettings("connections");
+              setConnectionSettingsCwd(cwd);
+            }}
           />
         ) : null}
         {notesViewOpen ? (
@@ -5427,7 +5435,11 @@ export default function App({
         {settingsOpen ? (
           <SettingsView
             section={settingsSection}
-            cwd={sidebarCwd}
+            cwd={
+              settingsSection === "connections"
+                ? (connectionSettingsCwd ?? sidebarCwd)
+                : sidebarCwd
+            }
             sessions={sidebarHistory}
             besideRail
             onClose={onCloseSettings}

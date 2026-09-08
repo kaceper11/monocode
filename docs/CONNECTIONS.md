@@ -1,8 +1,11 @@
 # Connections
 
 Use **Settings → Connections** for the current project. Tickets, pull requests,
-CI, Git remote and execution host are separate rows. Choose a provider directly,
-select its account and enter its full project identity, then **Save changes**.
+CI, Git remote and execution host are separate rows in **Integrations**. Select
+**Change** on a role, choose its provider/account and full project identity, then
+**Save**. **Cancel** leaves the saved role unchanged. **Change connection** in the
+inbox opens this same surface for the selected item's project. Git remote uses
+**Save changes**; changing a mapping never edits the Git remote URL.
 GitHub and Linear reuse the existing provider marks and settings controls.
 
 **Use existing settings** preserves the existing GitHub remote/CLI-account
@@ -18,7 +21,8 @@ and never changes the CLI's active login. Writes are separately enabled per
 account and still require provider-side permissions. Reads need repository access;
 comments and PR creation need their corresponding write permissions.
 
-Disconnect removes MonoCode's selection, not the CLI credential or provider grant.
+Disconnect first shows how many projects use the account and allows cancellation.
+It removes MonoCode's selection, not the CLI credential or provider grant.
 Use `gh auth logout` to remove the CLI login, or revoke it in the provider's account
 settings. In-flight requests may complete. Queued requests recheck their original
 binding before starting; changing/disconnecting a source does not retarget an open
@@ -82,7 +86,11 @@ Use disposable Git repositories and authorized service resources:
    GitHub or Azure Repos. Confirm the other saved values and Git config are unchanged.
 5. Push to a disposable second remote. Confirm only that remote changes and no
    upstream config is added. Open a worktree and verify inherited/explicit mappings.
-6. Review narrow-window layout, keyboard access and connect/test/disconnect using
+6. Change a role, select None, then Cancel; reopen it and verify its saved value.
+   Repeat with Save and confirm only that role is cleared. Add a second ticket/CI
+   source, cancel it, then add and save it. Connect an account while editing, cancel
+   the role, and confirm the account remains connected but the mapping is unchanged.
+7. Review narrow-window layout, keyboard access and connect/test/disconnect using
    the native Mac app; repeat credential-owner checks on native Windows.
 
 Fixtures and builds do not certify live second-account, provider-write, native
