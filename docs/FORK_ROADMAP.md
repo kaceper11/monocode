@@ -10,6 +10,8 @@ Issue numbers are stable; title prefixes show delivery order. Start with #2. Har
 
 Start [#28: Windows/WSL and Jira/Azure acceptance readiness](https://github.com/kaceper11/monocode/issues/28) alongside #2. Its `[00]` prefix denotes a readiness lane, not a renumbering of the 26 feature steps. It owns test-machine/service access, safe fixture authority and reproducible handoff. Missing access blocks only the relevant live acceptance; fixtures and unrelated implementation can proceed. Readiness is not proof that a feature works.
 
+See the [acceptance readiness matrix](ACCEPTANCE_READINESS.md) for verified resources, blocked boundaries, fixture authority and tester handoff.
+
 ## 01 - WSL-first foundations and core actions
 
 | Order | Work item | Hard prerequisites |
