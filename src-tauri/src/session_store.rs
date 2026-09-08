@@ -1132,6 +1132,10 @@ pub(crate) fn now_millis() -> i64 {
 }
 
 #[cfg(test)]
+#[path = "session_store_performance.rs"]
+mod performance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
