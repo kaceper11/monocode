@@ -17,6 +17,7 @@ import {
   File,
   Plus,
   Search,
+  SquarePlus,
   Settings,
   Trash2,
 } from "./icons";
@@ -128,6 +129,11 @@ function projectMenuExtraItems(
 ): TabGroupMenuExtraItem[] {
   const items: TabGroupMenuExtraItem[] = [
     {
+      id: "new-task",
+      label: "New task…",
+      icon: SquarePlus,
+    },
+    {
       id: "repositories",
       label: "Project repositories…",
       icon: FolderTree,
@@ -170,6 +176,7 @@ type Props = {
   onTogglePanel?: () => void;
   onSelectProject: (path: string) => void;
   onOpenProject: () => void;
+  onNewTask?: (path: string, projectId?: string) => void;
   onRemoveProject?: (path: string, options: { purgeData: boolean }) => void;
   liveAgents?: LiveAgent[];
   activeSessionId?: string;
@@ -203,6 +210,7 @@ export function ProjectRail({
   onTogglePanel,
   onSelectProject,
   onOpenProject,
+  onNewTask,
   onRemoveProject,
   liveAgents = [],
   activeSessionId,
@@ -467,6 +475,7 @@ export function ProjectRail({
       menuProject?.name ??
       resolveTabGroupLabel(projectKey, groupLabels, basename(path));
     if (action === "pin" || action === "unpin") onTogglePin(path);
+    else if (action === "new-task") onNewTask?.(path, projectId);
     else if (action === "repositories") {
       setRepositoriesProject({ path, projectId });
     } else if (action === "background") {

@@ -4,16 +4,18 @@ import { createPortal } from "react-dom";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import { LAYER, PopoverLayerOffset } from "../lib/layers";
 
-export type ModalSize = "sm" | "md";
+export type ModalSize = "sm" | "md" | "lg";
 
 const WIDTH: Record<ModalSize, string> = {
   sm: "w-[min(420px,calc(100vw-24px))]",
   md: "w-[min(560px,calc(100vw-24px))]",
+  lg: "w-[min(680px,calc(100vw-24px))]",
 };
 
 const TOP: Record<ModalSize, string> = {
   sm: "top-[22%]",
   md: "top-[10%]",
+  lg: "top-[6%]",
 };
 
 type Props = {

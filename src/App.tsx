@@ -211,6 +211,7 @@ import {
 import {
   displayPath,
   isEqualOrInside,
+  pathKey,
   projectName,
   rebasePath,
   resolveWorkspacePath,
@@ -218,6 +219,21 @@ import {
   prettyCwd,
 } from "./lib/paths";
 import { removeProjectData } from "./lib/projectData";
+import { TaskCreateSheet } from "./chrome/TaskCreateSheet";
+import {
+  composeTaskPrompt,
+  loadTaskWorkspaces,
+  projectForTask,
+  recordTaskActiveChild,
+  updateTaskChild,
+} from "./lib/taskWorkspaces";
+import {
+  ensureProjectForPath,
+  loadProjects,
+  repositoryDisplayName,
+} from "./lib/projects";
+import { getVerifiedFamilies } from "./lib/repositoryFamilies";
+import { probeRepositoryFamily } from "./hooks/useRepositoryFamilies";
 import {
   archiveProject,
   forgetProject,
@@ -4411,6 +4427,169 @@ export default function App({
     return () => window.removeEventListener(OPEN_REPAIR, open);
   }, [onSelectHistorySession]);
 
+  const [taskSheet, setTaskSheet] = useState<{ projectId: string } | null>(
+    null,
+  );
+  const onNewTask = useCallback(
+    (path: string, projectId?: string) => {
+      const stored = projectId
+        ? loadProjects().find((entry) => entry.id === projectId)
+        : undefined;
+      // An implicit rail row materializes so the task has a durable project.
+      const project =
+        stored ??
+        ensureProjectForPath(path, getVerifiedFamilies().get(pathKey(path)));
+      setTaskSheet({ projectId: project.id });
+    },
+    [],
+  );
+
+  /**
+   * Per-child independent launch: create the reviewed worktree, open one
+   * ordinary single-cwd session, submit the shared brief. `ready` children
+   * are skipped so Retry never replays successful Git or agent operations.
+   */
+  const taskLaunching = useRef(new Set<string>());
+  const launchTaskChildren = useCallback(
+    async (taskId: string, childIds?: readonly string[]) => {
+      const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+      if (!task) return;
+      const project = projectForTask(task);
+      let firstTab: { tabId: string; childId: string } | null = null;
+      for (const child of task.children) {
+        if (childIds && !childIds.includes(child.id)) continue;
+        const launchKey = `${taskId}:${child.id}`;
+        if (taskLaunching.current.has(launchKey)) continue;
+        const current = loadTaskWorkspaces()
+          .find((entry) => entry.id === taskId)
+          ?.children.find((entry) => entry.id === child.id);
+        if (!current) continue;
+        if (current.launch.state === "ready" && current.sessionIds.length)
+          continue;
+        taskLaunching.current.add(launchKey);
+        updateTaskChild(taskId, child.id, { launch: { state: "working" } });
+        try {
+          const repo = project?.repositories.find(
+            (entry) => entry.id === child.repositoryId,
+          );
+          // A retry after a failed submit reuses the existing session —
+          // worktrees and sessions are never replayed.
+          if (current.sessionIds.length) {
+            const sent = await onSubmit(
+              current.sessionIds[0],
+              composeTaskPrompt(task, child, repo),
+            );
+            if (sent === false)
+              throw new Error("The session did not accept the brief.");
+            updateTaskChild(taskId, child.id, {
+              launch: { state: "ready" },
+            });
+            continue;
+          }
+          let cwd = current.workingCopy;
+          if (current.baseRef && current.baseCommit && current.branch) {
+            // Creating in the project anchor would target the wrong
+            // repository — the member record is required.
+            if (!repo)
+              throw new Error(
+                "This repository is no longer in the project; re-add it, then retry.",
+              );
+            const anchor = repo.anchor;
+            try {
+              const created = await invoke<string>("git_worktree_create", {
+                cwd: anchor,
+                base: current.baseRef,
+                commit: current.baseCommit,
+                branch: current.branch,
+                // Host-qualified path — the backend resolves WSL internally.
+                path: current.workingCopy,
+              });
+              cwd = created || current.workingCopy;
+            } catch (error) {
+              // A partial earlier attempt may already have created the copy —
+              // re-probe and reuse it rather than failing on "already exists".
+              const family = await probeRepositoryFamily(anchor);
+              const exists = family?.worktrees.some(
+                (entry) =>
+                  current.workingCopy &&
+                  pathKey(entry.path) === pathKey(current.workingCopy) &&
+                  !entry.missing,
+              );
+              if (!exists) throw error;
+              cwd = current.workingCopy;
+            }
+            notifyGitChanged(anchor);
+          } else if (cwd) {
+            // Existing/main copy: re-verify it still exists before starting a
+            // session at a path that may have been moved or deleted.
+            const target = cwd;
+            const family = await probeRepositoryFamily(
+              repo?.anchor ?? target,
+            );
+            const exists =
+              family &&
+              (pathKey(family.checkout) === pathKey(target) ||
+                family.worktrees.some(
+                  (entry) =>
+                    pathKey(entry.path) === pathKey(target) &&
+                    !entry.missing &&
+                    !entry.prunable,
+                ));
+            if (!exists)
+              throw new Error(
+                "Working copy is no longer on disk — choose a replacement or remove this repository from the task.",
+              );
+          }
+          if (!cwd) {
+            // Prepare-later child — stays actionable with no session.
+            updateTaskChild(taskId, child.id, {
+              launch: { state: "pending" },
+            });
+            continue;
+          }
+          const session = {
+            ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
+            title: repo
+              ? `${task.name} · ${repositoryDisplayName(repo)}`
+              : task.name,
+            ...(task.ticket ? { linkedWorkItem: task.ticket } : {}),
+          };
+          const next = [...sessionsRef.current, session];
+          sessionsRef.current = next;
+          setSessions(next);
+          const tab = newTab(session.id);
+          appendTab(tab, cwd);
+          if (!firstTab) firstTab = { tabId: tab.id, childId: child.id };
+          setRecents(rememberProject(cwd));
+          updateTaskChild(taskId, child.id, {
+            workingCopy: cwd,
+            sessionIds: [...current.sessionIds, session.id],
+            launch: { state: "ready" },
+          });
+          const sent = await onSubmit(
+            session.id,
+            composeTaskPrompt(task, child, repo),
+          );
+          if (sent === false)
+            throw new Error("The session did not accept the brief.");
+        } catch (error) {
+          updateTaskChild(taskId, child.id, {
+            launch: { state: "failed", error: String(error) },
+          });
+        } finally {
+          taskLaunching.current.delete(launchKey);
+        }
+      }
+      // Activating the first child's session lands the user on the task; the
+      // remaining sessions stay reachable as ordinary tabs/history entries.
+      if (firstTab && !childIds) {
+        setActiveTabId(firstTab.tabId);
+        recordTaskActiveChild(taskId, firstTab.childId);
+      }
+    },
+    [appendTab, onSubmit, sessionDefaults?.runtimeMode],
+  );
+
   const onUpdatePlan = useCallback(
     (sessionId: string, blockId: string, text: string) => {
       setSessions((prev) =>
@@ -5755,6 +5934,7 @@ export default function App({
         onSelectAgent={onSelectLiveAgent}
         onSelectProject={onSelectProject}
         onOpenProject={pickProject}
+        onNewTask={onNewTask}
         onRemoveProject={onRemoveProject}
         onNew={onNew}
         openSessions={openProjectSessions}
@@ -5782,6 +5962,16 @@ export default function App({
       />
 
       {wslPickerOpen && <WslProjectDialog cwd={projectCwd} onOpen={selectProject} onClose={() => setWslPickerOpen(false)} />}
+      {taskSheet && (
+        <TaskCreateSheet
+          projectId={taskSheet.projectId}
+          onLaunchChildren={(taskId, childIds) =>
+            void launchTaskChildren(taskId, childIds)
+          }
+          onOpenPath={onSelectProject}
+          onClose={() => setTaskSheet(null)}
+        />
+      )}
       <div className="body-glass flex min-h-0 min-w-0 flex-1 flex-col">
         {wslOpening && (
           <div role={wslOpening.error ? "alert" : "status"} className="flex shrink-0 items-center gap-3 border-b border-content/10 px-4 py-2 text-[12px]">
