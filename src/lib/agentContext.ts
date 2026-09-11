@@ -51,6 +51,12 @@ export type AgentContextRequest = {
   cwd?: string;
   repair?: import("./repair").RepairEvidence;
   prepareInSource?: boolean;
+  /** Route the context to a task's session instead of a picked
+   * conversation — the task is started if it has no session yet. */
+  taskId?: string;
+  /** Route to a new task — opens the create sheet with the context
+   * summarized into its shared brief. */
+  newTask?: boolean;
   requireDestinationSelection?: boolean;
   onPrepared?: () => void;
   onRefreshEvidence?: (instruction: string) => void;

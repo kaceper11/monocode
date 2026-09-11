@@ -31,6 +31,8 @@ import type { HarnessEvent } from "./types";
 import { newSession, type RuntimeMode, type TurnIntent } from "../session";
 import { applyHarnessEvent } from "./apply";
 
+const { modelsFor, resetHarnessModelOverlays } = await import("../models");
+
 function parse() {
   return sent.map((line) => JSON.parse(line) as Record<string, unknown>);
 }
@@ -113,6 +115,7 @@ describe("codex live turn sequence", () => {
     vi.restoreAllMocks();
     await stopCodexSession("codex-live");
     __codexTestReset();
+    resetHarnessModelOverlays();
   });
 
   it.each([false, true])(
@@ -989,5 +992,57 @@ describe("codex live turn sequence", () => {
     });
     await compact;
     expect(settled).toBe(true);
+  });
+
+  it("warms the picker catalog from the session's own app-server", async () => {
+    const { turn } = await startTurn("codex-live");
+    // The session's initialize already paid for the process; account/read and
+    // model/list reuse that connection instead of spawning a probe.
+    await waitFor(
+      () => parse().some((m) => m.method === "account/read"),
+      "account/read",
+    );
+    reply(
+      parse().find((m) => m.method === "account/read")!.id as number,
+      { account: { type: "chatgpt" } },
+    );
+    await waitFor(
+      () => parse().some((m) => m.method === "model/list"),
+      "model/list",
+    );
+    reply(parse().find((m) => m.method === "model/list")!.id as number, {
+      data: [
+        {
+          id: "gpt-fixture",
+          displayName: "GPT Fixture",
+          supportedReasoningEfforts: ["low"],
+        },
+      ],
+    });
+    await waitFor(
+      () => modelsFor("codex").some((m) => m.nativeId === "gpt-fixture"),
+      "catalog models",
+    );
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
+  });
+
+  it("marks the catalog signed out when the session has no account", async () => {
+    const { modelCatalogError } = await import("../models");
+    const { turn } = await startTurn("codex-live");
+    await waitFor(
+      () => parse().some((m) => m.method === "account/read"),
+      "account/read",
+    );
+    reply(parse().find((m) => m.method === "account/read")!.id as number, {
+      requiresOpenaiAuth: true,
+    });
+    await waitFor(
+      () => modelCatalogError("codex") !== undefined,
+      "catalog auth error",
+    );
+    expect(modelCatalogError("codex")).toContain("not authenticated");
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
   });
 });

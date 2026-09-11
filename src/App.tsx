@@ -5,7 +5,7 @@ import { RepairStatus } from "./chrome/RepairStatus";
 import { assertRepairOwner, repairOwnerError, reserveRepair, updateRepair, validateRepair, OPEN_REPAIR, repairRecords, type RepairDelivery } from "./lib/repair";
 import { composeAgentContext } from "./lib/agentContext";
 import { AgentContextPicker } from "./chrome/AgentContextPicker";
-import { PREPARE_AGENT_CONTEXT, removeContextItem, contextFromTicketDescriptions, linkTicketContext, prepareSessionContext, contextFromTickets, type AgentContextRequest } from "./lib/agentContext";
+import { PREPARE_AGENT_CONTEXT, removeContextItem, contextFromTicketDescriptions, linkTicketContext, prepareSessionContext, type AgentContextRequest } from "./lib/agentContext";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -198,6 +198,7 @@ import { nudgeWatchedFiles } from "./lib/fileWatch";
 import { type EditorNavigationTarget, type OpenFileFn } from "./lib/search";
 import {
   mergeModelSettings,
+  modelCatalogKey,
   preferredModelSettings,
   resolveModel,
   saveLastModelSettings,
@@ -221,16 +222,31 @@ import {
 import { removeProjectData } from "./lib/projectData";
 import { TaskCreateSheet } from "./chrome/TaskCreateSheet";
 import {
+  addTaskChildren,
   composeTaskPrompt,
+  composeTaskSessionPrompt,
+  linkTicketToTask,
   loadTaskWorkspaces,
+  markTaskChildLaunching,
   projectForTask,
+  pruneTaskSession,
   recordTaskActiveChild,
+  subscribeTaskWorkspaces,
+  taskForSession,
+  taskWorkspacesSnapshot,
+  unmarkTaskChildLaunching,
+  updateTask,
   updateTaskChild,
+  type TaskChildDraft,
 } from "./lib/taskWorkspaces";
 import {
   ensureProjectForPath,
+  familyForRepository,
+  findProjectByCommonDir,
+  isProjectRailKey,
   loadProjects,
-  repositoryDisplayName,
+  projectContainsPath,
+  projectRailKey,
 } from "./lib/projects";
 import { getVerifiedFamilies } from "./lib/repositoryFamilies";
 import { probeRepositoryFamily } from "./hooks/useRepositoryFamilies";
@@ -365,8 +381,9 @@ import { InboxView } from "./surfaces/InboxView";
 import type { InboxSessionPortal } from "./surfaces/InboxDiscussionPanel";
 import { inboxAskKey, inboxAskPrompt } from "./lib/inboxAsk";
 import { NotesView } from "./surfaces/NotesView";
-import { inboxComposerCard, type InboxItem } from "./lib/githubTasks";
+import type { InboxItem } from "./lib/githubTasks";
 import {
+  addSessionWorkItems,
   linkedWorkItemFromInboxItem,
   OPEN_INBOX_WORK_ITEM,
   removeSessionWorkItem,
@@ -591,6 +608,12 @@ function titleTabsEqual(a: TitleTab[], b: TitleTab[]): boolean {
 
 // Register capabilities before composer hooks choose their discovery strategy.
 registerBuiltinHarnesses();
+
+/** Prefill a task name from an inbox item: "ENG-41 Fix login redirect". */
+function inboxItemTaskName(item: InboxItem): string {
+  const ref = item.identifier?.trim() || `#${item.number}`;
+  return `${ref} ${item.title}`.trim();
+}
 
 export default function App({
   windowTransfer = null,
@@ -944,9 +967,27 @@ export default function App({
     void probeHarnessAvailability();
     // Only the harnesses already in this window. Probing every installed CLI
     // at boot left unused agents (especially Pi) running in the background.
-    const harnesses = [
-      ...new Set(sessionsRef.current.map((session) => session.harness)),
-    ];
+    // Each WSL session probes inside its own distribution; a WSL session must
+    // not spawn the provider on the Windows host to learn its models.
+    const contexts = new Map<
+      string,
+      { cwd?: string; harnesses: Set<HarnessId> }
+    >();
+    for (const session of sessionsRef.current) {
+      const cwd = sessionWorkCwd(session);
+      const key = modelCatalogKey(cwd);
+      const context = contexts.get(key) ?? {
+        cwd: wslLocation(cwd) ? cwd : undefined,
+        harnesses: new Set<HarnessId>(),
+      };
+      context.harnesses.add(session.harness);
+      contexts.set(key, context);
+    }
+    for (const context of contexts.values()) {
+      if (!context.cwd) continue;
+      void refreshHarnessCatalogs([...context.harnesses], context.cwd);
+    }
+    const harnesses = [...(contexts.get("native")?.harnesses ?? [])];
     void refreshHarnessCatalogs(harnesses).then(() => {
       setSessions((prev) =>
         prev.map((session) => {
@@ -1520,6 +1561,10 @@ export default function App({
   useEffect(() => {
     const receive = (event: Event) => {
       const request = (event as CustomEvent<AgentContextRequest>).detail;
+      if (request.taskId || request.newTask) {
+        void routeContextToTaskRef.current(request);
+        return;
+      }
       const source = sessionsRef.current.find(
         (session) =>
           session.id === (request.sourceSessionId ?? activeSessionIdRef.current),
@@ -1644,74 +1689,6 @@ export default function App({
       pendingPersist.current.set(sessionId, next);
     }
   };
-  const onStartInboxItem = useCallback(
-    async (item: InboxItem, body?: string, context?: import("./lib/githubTasks").InboxComposerCard) => {
-      const start = (description?: string) => {
-        setInboxViewOpen(false);
-        setNotesViewOpen(false);
-        setSidebarTab("sessions");
-        const cwd =
-          item.projectPath || active?.cwd || sessionDefaults?.cwd || projectCwd;
-        const ref =
-          item.provider === "linear" || item.provider === "jira" || item.provider === "azure"
-            ? item.identifier?.trim() || `#${item.number}`
-            : `#${item.number}`;
-        const linkedWorkItem = linkedWorkItemFromInboxItem(item);
-        const session = {
-          ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
-          title: `${ref} ${item.title}`,
-          inboxCard: context ?? inboxComposerCard(item, description),
-          ...(linkedWorkItem ? { linkedWorkItem } : {}),
-        };
-        const tab = newTab(session.id);
-        setSessions((prev) => [...prev, session]);
-        appendTab(tab, cwd);
-        setActiveTabId(tab.id);
-        setComposerFocused(true);
-      };
-
-      if (context) {
-        setContextRequest({ context: contextFromTickets([item], context), tickets: [item], cwd: item.projectPath || active?.cwd });
-        return;
-      }
-      if (item.provider === "azure") {
-        if (!item.projectPath) throw new Error("Choose a local project before sending to an agent");
-        start(body ?? (peekAzureDetails(item) ?? await azureDetails(item)).body);
-        return;
-      }
-      if (item.provider === "jira") {
-        if (!item.projectPath) throw new Error("Choose a local project before sending to an agent");
-        start(body ?? (peekJiraDetails(item) ?? await jiraDetails(item)).body);
-        return;
-      }
-      if (item.provider !== "linear") {
-        start();
-        return;
-      }
-      if (!item.id) {
-        throw new Error("Missing Linear issue");
-      }
-      if (body !== undefined) {
-        start(body);
-        return;
-      }
-      const cached = peekLinearIssueDetails(item.id);
-      if (cached) {
-        start(cached.body);
-        return;
-      }
-      const details = await linearIssueDetails(item.id);
-      start(details.body);
-    },
-    [
-      active?.cwd,
-      appendTab,
-      sessionDefaults?.cwd,
-      sessionDefaults?.runtimeMode,
-      projectCwd,
-    ],
-  );
-
   const onAddNoteToChat = useCallback(
     (card: NoteComposerCard) => {
       if (!card.id) return;
@@ -3175,6 +3152,9 @@ export default function App({
               setHistory((current) =>
                 current.filter((entry) => entry.id !== sessionId),
               );
+              // A deleted conversation must not stay referenced by tasks —
+              // a stale id would dead-end "Open task" forever.
+              pruneTaskSession(sessionId);
               void refreshHistory(sidebarCwd);
             }
           },
@@ -3486,6 +3466,18 @@ export default function App({
   );
 
   const onSelectProject = useCallback((path: string) => {
+    // Group rows key on `project:<id>` — open their last member copy instead
+    // of treating the key as a folder.
+    if (isProjectRailKey(path)) {
+      const project = loadProjects().find(
+        (entry) => projectRailKey(entry.id) === path,
+      );
+      const target = project?.lastPath;
+      if (target && project && projectContainsPath(project, target)) {
+        onSelectProject(target);
+      }
+      return;
+    }
     wslOpenRequest.current?.abort();
     if (!wslLocation(path)) {
       setWslOpening(null);
@@ -4427,9 +4419,35 @@ export default function App({
     return () => window.removeEventListener(OPEN_REPAIR, open);
   }, [onSelectHistorySession]);
 
-  const [taskSheet, setTaskSheet] = useState<{ projectId: string } | null>(
-    null,
+  // The task just created — the rail's "current" task until a task session
+  // takes over. Never launches work on its own.
+  const [focusTaskId, setFocusTaskId] = useState<string>();
+  // The just-created highlight lifts once another task's session becomes
+  // the rail's current task, or the task is archived/deleted. Focusing an
+  // unrelated non-task session keeps it — it still marks your current task.
+  const taskStoreSnapshot = useSyncExternalStore(
+    subscribeTaskWorkspaces,
+    taskWorkspacesSnapshot,
   );
+  useEffect(() => {
+    if (!focusTaskId) return;
+    const task = loadTaskWorkspaces().find(
+      (entry) => entry.id === focusTaskId && !entry.archived,
+    );
+    const activeTask = active?.id
+      ? taskForSession(active.id, sessionWorkCwd(active))
+      : undefined;
+    if (!task || (activeTask && activeTask.task.id !== focusTaskId))
+      setFocusTaskId(undefined);
+  }, [focusTaskId, active?.id, taskStoreSnapshot]);
+  const [taskSheet, setTaskSheet] = useState<{
+    projectId: string;
+    editingTaskId?: string;
+    initialTickets?: LinkedWorkItem[];
+    initialName?: string;
+    initialBrief?: string;
+    initialChildren?: TaskChildDraft[];
+  } | null>(null);
   const onNewTask = useCallback(
     (path: string, projectId?: string) => {
       const stored = projectId
@@ -4444,49 +4462,91 @@ export default function App({
     [],
   );
 
+  const onEditTask = useCallback((taskId: string) => {
+    const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+    if (task) setTaskSheet({ projectId: task.projectId, editingTaskId: taskId });
+  }, []);
+
+  /** True when a task-linked session can still be opened — open now, or
+   * loadable (archived sessions restore). A deleted id is pruned off the
+   * task so the next open relaunches instead of silently dead-ending. */
+  const taskSessionAlive = useCallback(
+    async (sessionId: string): Promise<boolean> => {
+      if (sessionsRef.current.some((entry) => entry.id === sessionId))
+        return true;
+      const loaded = await getSession(sessionId).catch(() => null);
+      if (loaded) return true;
+      pruneTaskSession(sessionId);
+      return false;
+    },
+    [],
+  );
+
+  /** Full-launch dedupe: concurrent callers share one in-flight launch so a
+   * second open can't create the task session while children still prepare. */
+  const taskLaunchInflight = useRef(
+    new Map<string, Promise<string | undefined>>(),
+  );
   /**
-   * Per-child independent launch: create the reviewed worktree, open one
-   * ordinary single-cwd session, submit the shared brief. `ready` children
-   * are skipped so Retry never replays successful Git or agent operations.
+   * Prepares each unresolved child's working copy — creating the reviewed
+   * worktree or re-verifying an existing one — then ensures the task's
+   * single session exists, rooted at a ready host child's copy. The prompt
+   * names every repository's copy, branch and responsibility; the agent
+   * works across them from one conversation.
    */
-  const taskLaunching = useRef(new Set<string>());
   const launchTaskChildren = useCallback(
-    async (taskId: string, childIds?: readonly string[]) => {
+    (
+      taskId: string,
+      childIds?: readonly string[],
+    ): Promise<string | undefined> => {
+      if (!childIds) {
+        const inflight = taskLaunchInflight.current.get(taskId);
+        if (inflight) return inflight;
+      }
+      const run = (async (): Promise<string | undefined> => {
       const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-      if (!task) return;
+      if (!task) return undefined;
       const project = projectForTask(task);
-      let firstTab: { tabId: string; childId: string } | null = null;
       for (const child of task.children) {
         if (childIds && !childIds.includes(child.id)) continue;
-        const launchKey = `${taskId}:${child.id}`;
-        if (taskLaunching.current.has(launchKey)) continue;
         const current = loadTaskWorkspaces()
           .find((entry) => entry.id === taskId)
           ?.children.find((entry) => entry.id === child.id);
         if (!current) continue;
-        if (current.launch.state === "ready" && current.sessionIds.length)
+        if (current.launch.state === "ready") continue;
+        if (!markTaskChildLaunching(taskId, child.id)) continue;
+        if (
+          !updateTaskChild(taskId, child.id, {
+            launch: { state: "working" },
+          })
+        ) {
+          unmarkTaskChildLaunching(taskId, child.id);
           continue;
-        taskLaunching.current.add(launchKey);
-        updateTaskChild(taskId, child.id, { launch: { state: "working" } });
+        }
         try {
           const repo = project?.repositories.find(
             (entry) => entry.id === child.repositoryId,
           );
-          // A retry after a failed submit reuses the existing session —
-          // worktrees and sessions are never replayed.
-          if (current.sessionIds.length) {
+          // A legacy child may own a session already — retry just resubmits
+          // its brief; worktrees and sessions are never replayed. A deleted
+          // session is pruned off the child so the copy relaunches cleanly.
+          if (
+            current.sessionIds.length &&
+            (await taskSessionAlive(current.sessionIds[0]))
+          ) {
             const sent = await onSubmit(
               current.sessionIds[0],
               composeTaskPrompt(task, child, repo),
             );
-            if (sent === false)
+            // `onSubmit` returns undefined when the session can't take it
+            // (deleted mid-flight counts) — only `true` means delivered.
+            if (sent !== true)
               throw new Error("The session did not accept the brief.");
             updateTaskChild(taskId, child.id, {
               launch: { state: "ready" },
             });
             continue;
           }
-          let cwd = current.workingCopy;
           if (current.baseRef && current.baseCommit && current.branch) {
             // Creating in the project anchor would target the wrong
             // repository — the member record is required.
@@ -4496,7 +4556,7 @@ export default function App({
               );
             const anchor = repo.anchor;
             try {
-              const created = await invoke<string>("git_worktree_create", {
+              await invoke<string>("git_worktree_create", {
                 cwd: anchor,
                 base: current.baseRef,
                 commit: current.baseCommit,
@@ -4504,7 +4564,6 @@ export default function App({
                 // Host-qualified path — the backend resolves WSL internally.
                 path: current.workingCopy,
               });
-              cwd = created || current.workingCopy;
             } catch (error) {
               // A partial earlier attempt may already have created the copy —
               // re-probe and reuse it rather than failing on "already exists".
@@ -4516,13 +4575,12 @@ export default function App({
                   !entry.missing,
               );
               if (!exists) throw error;
-              cwd = current.workingCopy;
             }
             notifyGitChanged(anchor);
-          } else if (cwd) {
+          } else if (current.workingCopy) {
             // Existing/main copy: re-verify it still exists before starting a
             // session at a path that may have been moved or deleted.
-            const target = cwd;
+            const target = current.workingCopy;
             const family = await probeRepositoryFamily(
               repo?.anchor ?? target,
             );
@@ -4539,55 +4597,445 @@ export default function App({
               throw new Error(
                 "Working copy is no longer on disk — choose a replacement or remove this repository from the task.",
               );
-          }
-          if (!cwd) {
-            // Prepare-later child — stays actionable with no session.
+          } else {
+            // Prepare-later child — stays actionable with no copy.
             updateTaskChild(taskId, child.id, {
               launch: { state: "pending" },
             });
             continue;
           }
-          const session = {
-            ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
-            title: repo
-              ? `${task.name} · ${repositoryDisplayName(repo)}`
-              : task.name,
-            ...(task.ticket ? { linkedWorkItem: task.ticket } : {}),
-          };
-          const next = [...sessionsRef.current, session];
-          sessionsRef.current = next;
-          setSessions(next);
-          const tab = newTab(session.id);
-          appendTab(tab, cwd);
-          if (!firstTab) firstTab = { tabId: tab.id, childId: child.id };
-          setRecents(rememberProject(cwd));
           updateTaskChild(taskId, child.id, {
-            workingCopy: cwd,
-            sessionIds: [...current.sessionIds, session.id],
             launch: { state: "ready" },
           });
-          const sent = await onSubmit(
-            session.id,
-            composeTaskPrompt(task, child, repo),
-          );
-          if (sent === false)
-            throw new Error("The session did not accept the brief.");
         } catch (error) {
           updateTaskChild(taskId, child.id, {
             launch: { state: "failed", error: String(error) },
           });
         } finally {
-          taskLaunching.current.delete(launchKey);
+          unmarkTaskChildLaunching(taskId, child.id);
         }
       }
-      // Activating the first child's session lands the user on the task; the
-      // remaining sessions stay reachable as ordinary tabs/history entries.
-      if (firstTab && !childIds) {
-        setActiveTabId(firstTab.tabId);
-        recordTaskActiveChild(taskId, firstTab.childId);
+      // One session per task — rooted at the host child's working copy.
+      const fresh = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+      if (!fresh) return undefined;
+      const recorded =
+        fresh.sessionIds?.[0] ??
+        fresh.children.find((entry) => entry.sessionIds.length)
+          ?.sessionIds[0];
+      // A deleted conversation is pruned and replaced, not reused.
+      const taskSessionId =
+        recorded && (await taskSessionAlive(recorded)) ? recorded : undefined;
+      if (taskSessionId) {
+        // Redeliver the shared brief when it never landed on this session —
+        // e.g. the first submit failed, or this session replaced a deleted
+        // one. Retries (`childIds`) only resubmit their own child briefs.
+        if (!childIds && fresh.briefSentFor !== taskSessionId) {
+          const sent = await onSubmit(
+            taskSessionId,
+            composeTaskSessionPrompt(fresh, project),
+          );
+          if (sent === true)
+            updateTask(taskId, (current) => ({
+              ...current,
+              briefSentFor: taskSessionId,
+            }));
+        }
+        if (!childIds) void onSelectHistorySession(taskSessionId);
+        return taskSessionId;
       }
+      // The session only exists once a child is verifiably ready — never
+      // rooted at a failed or not-yet-created working copy.
+      const host =
+        fresh.children.find(
+          (entry) =>
+            entry.id === fresh.lastActiveChildId &&
+            entry.launch.state === "ready" &&
+            entry.workingCopy,
+        ) ??
+        fresh.children.find(
+          (entry) => entry.launch.state === "ready" && entry.workingCopy,
+        );
+      if (!host?.workingCopy) return undefined;
+      const session = {
+        ...newDefaultSession(host.workingCopy, sessionDefaults?.runtimeMode),
+        title: fresh.name,
+        ...(fresh.ticket ? { linkedWorkItem: fresh.ticket } : {}),
+      };
+      const next = [...sessionsRef.current, session];
+      sessionsRef.current = next;
+      setSessions(next);
+      const tab = newTab(session.id);
+      appendTab(tab, host.workingCopy);
+      setRecents(rememberProject(host.workingCopy));
+      updateTask(taskId, (current) => ({
+        ...current,
+        sessionIds: [session.id],
+        lastActiveChildId: host.id,
+      }));
+      setActiveTabId(tab.id);
+      // The brief lands as the session's first message; a failed send is
+      // recorded by leaving briefSentFor unset so a later open resends it.
+      const sent = await onSubmit(
+        session.id,
+        composeTaskSessionPrompt(fresh, project),
+      );
+      if (sent === true)
+        updateTask(taskId, (current) => ({
+          ...current,
+          briefSentFor: session.id,
+        }));
+      return session.id;
+      })();
+      if (!childIds) {
+        taskLaunchInflight.current.set(taskId, run);
+        void run.finally(() => {
+          if (taskLaunchInflight.current.get(taskId) === run)
+            taskLaunchInflight.current.delete(taskId);
+        });
+      }
+      return run;
     },
-    [appendTab, onSubmit, sessionDefaults?.runtimeMode],
+    [
+      appendTab,
+      onSelectHistorySession,
+      onSubmit,
+      sessionDefaults?.runtimeMode,
+      taskSessionAlive,
+    ],
+  );
+
+  /** Sessions whose pending approval or question needs the user now. */
+  const needsInputSessionIds = useMemo(
+    () =>
+      new Set(
+        sessions.filter(sessionNeedsInput).map((session) => session.id),
+      ),
+    [sessions],
+  );
+
+  /** Opens one task child: its ordinary session, focused like any session
+   * pick. Children without a session fall back to their working copy. */
+  const onRetryTaskChild = useCallback(
+    (taskId: string, childId: string) => {
+      void launchTaskChildren(taskId, [childId]);
+    },
+    [launchTaskChildren],
+  );
+
+  const onOpenTaskChild = useCallback(
+    async (taskId: string, childId: string) => {
+      const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+      const child = task?.children.find((entry) => entry.id === childId);
+      if (!task || !child) return;
+      // The task's single session wins; a legacy child may own its own.
+      const sessionId = task.sessionIds?.[0] ?? child.sessionIds[0];
+      // Only re-attribute the active child when it actually owns the
+      // session we're opening — the shared task session stays rooted at
+      // its host's copy regardless of which child was clicked.
+      if (!task.sessionIds?.length && child.sessionIds.length)
+        recordTaskActiveChild(taskId, childId);
+      if (sessionId && (await taskSessionAlive(sessionId))) {
+        await onSelectHistorySession(sessionId);
+        return;
+      }
+      // No usable session — prepare this child's copy; that also creates
+      // the task session when it becomes the host.
+      void launchTaskChildren(taskId, [childId]);
+    },
+    [launchTaskChildren, onSelectHistorySession, taskSessionAlive],
+  );
+
+  /** Opens a task's last active child, or its first session-owning child. */
+  const onOpenTask = useCallback(
+    (taskId: string) => {
+      const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+      if (!task) return;
+      // The task's own session wins over per-child lookups — but a dead id
+      // (deleted conversation) must not dead-end the task: prune it and
+      // fall through to relaunch.
+      if (task.sessionIds?.length) {
+        void (async () => {
+          if (await taskSessionAlive(task.sessionIds![0])) {
+            void onSelectHistorySession(task.sessionIds![0]);
+            return;
+          }
+          void launchTaskChildren(taskId);
+        })();
+        return;
+      }
+      // No sessions yet — opening the task is what starts the work.
+      if (!task.children.some((entry) => entry.sessionIds.length)) {
+        void launchTaskChildren(taskId);
+        return;
+      }
+      const child =
+        task.children.find(
+          (entry) =>
+            entry.id === task.lastActiveChildId && entry.sessionIds.length,
+        ) ??
+        task.children.find((entry) => entry.sessionIds.length) ??
+        task.children.find((entry) => entry.workingCopy) ??
+        task.children[0];
+      if (child) void onOpenTaskChild(taskId, child.id);
+    },
+    [launchTaskChildren, onOpenTaskChild, onSelectHistorySession, taskSessionAlive],
+  );
+
+  /** Resolves the owning project for a send-to-task path without inventing
+   * rows: unverified worktree/subdirectory paths are probed so the real
+   * project is found by `commonDir`, and a path that isn't a Git repository
+   * yields no project rather than a junk anchor. */
+  const ensureTaskProject = useCallback(async (path: string | undefined) => {
+    if (!path || !looksLikeProject(path)) return undefined;
+    const keyed = pathKey(path);
+    let family = getVerifiedFamilies().get(keyed);
+    if (!family)
+      family = (await probeRepositoryFamily(path)) ?? undefined;
+    const existing = family
+      ? findProjectByCommonDir(family.commonDir)?.project
+      : loadProjects().find(
+          (entry) => entry.anchor && pathKey(entry.anchor) === keyed,
+        );
+    if (existing) return existing;
+    if (!family) return undefined;
+    // Anchor at the real checkout, not a worktree or subdirectory the send
+    // happened to originate from.
+    return ensureProjectForPath(family.checkout || path, family);
+  }, []);
+
+  /** Prepared change/file context routed to a task: stage it on the task's
+   * session — starting the task first when it has none — or open the create
+   * sheet with a file-list brief for a new task. */
+  const routeContextToTask = useCallback(
+    async (request: AgentContextRequest) => {
+      const done = () => request.onPrepared?.();
+      if (request.newTask || !request.taskId) {
+        const path =
+          request.cwd || active?.cwd || sessionDefaults?.cwd || projectCwd;
+        const project = await ensureTaskProject(path);
+        if (!project) {
+          // Nothing to hang the task on — fall back to the context picker.
+          setContextRequest((current) => current ?? request);
+          return;
+        }
+        // The changes live in request.cwd — that working copy becomes the
+        // task's child so the work stays where the files already changed.
+        const families = getVerifiedFamilies();
+        const cwdKey = request.cwd ? pathKey(request.cwd) : "";
+        const changedRepo = cwdKey
+          ? project.repositories.find((repo) => {
+              if (pathKey(repo.anchor) === cwdKey) return true;
+              const family = familyForRepository(repo, families);
+              return (
+                family &&
+                (pathKey(family.checkout) === cwdKey ||
+                  family.worktrees.some(
+                    (entry) => pathKey(entry.path) === cwdKey,
+                  ))
+              );
+            })
+          : undefined;
+        const files = request.context.entries
+          .map((entry) => `- ${entry.title}`)
+          .join("\n");
+        setTaskSheet({
+          projectId: project.id,
+          ...(files
+            ? {
+                initialBrief: `Selected changes${request.cwd ? ` in ${prettyCwd(request.cwd)}` : ""}:\n${files}`,
+              }
+            : {}),
+          ...(changedRepo && request.cwd
+            ? {
+                initialChildren: [
+                  {
+                    repositoryId: changedRepo.id,
+                    mode: "existing" as const,
+                    workingCopy: request.cwd,
+                  },
+                ],
+              }
+            : {}),
+        });
+        done();
+        return;
+      }
+      const task = loadTaskWorkspaces().find(
+        (entry) => entry.id === request.taskId && !entry.archived,
+      );
+      if (!task) {
+        // Target vanished — release the selection rather than stranding it.
+        done();
+        return;
+      }
+      // Record the worktree holding the changes on the task when its
+      // repository isn't a child yet — the task then lists where the
+      // selected change actually lives.
+      const taskProject = projectForTask(task);
+      const changedRepo = request.cwd
+        ? taskProject?.repositories.find((repo) => {
+            const cwdKey = pathKey(request.cwd!);
+            if (pathKey(repo.anchor) === cwdKey) return true;
+            const family = familyForRepository(repo, getVerifiedFamilies());
+            return (
+              family &&
+              (pathKey(family.checkout) === cwdKey ||
+                family.worktrees.some(
+                  (entry) => pathKey(entry.path) === cwdKey,
+                ))
+            );
+          })
+        : undefined;
+      if (
+        changedRepo &&
+        !task.children.some(
+          (child) => child.repositoryId === changedRepo.id,
+        )
+      ) {
+        try {
+          addTaskChildren(task.id, [
+            {
+              repositoryId: changedRepo.id,
+              mode: "existing",
+              workingCopy: request.cwd,
+            },
+          ]);
+        } catch (error) {
+          // A conflicting copy claim — the staged context still carries
+          // the change, but say so instead of silently skipping the repo.
+          request = {
+            ...request,
+            context: {
+              ...request.context,
+              entries: [
+                ...request.context.entries,
+                {
+                  id: crypto.randomUUID(),
+                  title: "Repository not added to the task",
+                  origin: "Send to task",
+                  text: `The working copy holding these changes was not added to "${task.name}": ${String(error)}`,
+                },
+              ],
+            },
+          };
+        }
+      }
+      let sessionId =
+        task.sessionIds?.[0] ??
+        task.children.find((entry) => entry.sessionIds.length)
+          ?.sessionIds[0];
+      // A deleted conversation id must not shadow a relaunch.
+      if (sessionId && !(await taskSessionAlive(sessionId)))
+        sessionId = undefined;
+      // No session yet — the send starts the task, then stages the context.
+      if (!sessionId) sessionId = await launchTaskChildren(task.id);
+      if (!sessionId) {
+        done();
+        return;
+      }
+      const target = sessionsRef.current.find(
+        (session) => session.id === sessionId,
+      );
+      if (target) {
+        const next = prepareSessionContext(target, request.context, true);
+        const updated = sessionsRef.current.map((session) =>
+          session.id === next.id ? next : session,
+        );
+        sessionsRef.current = updated;
+        setSessions(updated);
+      }
+      await onSelectHistorySession(sessionId);
+      done();
+    },
+    [
+      active?.cwd,
+      ensureTaskProject,
+      launchTaskChildren,
+      onSelectHistorySession,
+      projectCwd,
+      sessionDefaults?.cwd,
+      taskSessionAlive,
+    ],
+  );
+  const routeContextToTaskRef = useRef(routeContextToTask);
+  routeContextToTaskRef.current = routeContextToTask;
+
+  /** Send-to-agent routing through the task model: link the item onto an
+   * existing task and open it, or open the create sheet with the item
+   * pre-linked. `null` taskId means a new task. */
+  const onStartItemToTask = useCallback(
+    async (item: InboxItem, taskId: string | null) => {
+      const linked = linkedWorkItemFromInboxItem(item);
+      if (taskId) {
+        if (linked) {
+          linkTicketToTask(taskId, linked);
+          // Reflect the link on the task's existing session too — otherwise
+          // the issue never shows in that conversation's Issues row.
+          const task = loadTaskWorkspaces().find(
+            (entry) => entry.id === taskId,
+          );
+          const sessionIds = [
+            ...(task?.sessionIds ?? []),
+            ...(task?.children.flatMap((entry) => entry.sessionIds) ?? []),
+          ];
+          if (sessionIds.length) {
+            const next = sessionsRef.current.map((session) =>
+              sessionIds.includes(session.id)
+                ? addSessionWorkItems(session, [linked])
+                : session,
+            );
+            sessionsRef.current = next;
+            setSessions(next);
+          }
+        }
+        setInboxViewOpen(false);
+        onOpenTask(taskId);
+        return;
+      }
+      const path =
+        item.projectPath || active?.cwd || sessionDefaults?.cwd || projectCwd;
+      const project = await ensureTaskProject(path);
+      if (!project)
+        throw new Error("Choose a local project before sending to an agent");
+      setInboxViewOpen(false);
+      setTaskSheet({
+        projectId: project.id,
+        initialName: inboxItemTaskName(item),
+        ...(linked ? { initialTickets: [linked] } : {}),
+      });
+    },
+    [
+      active?.cwd,
+      ensureTaskProject,
+      onOpenTask,
+      projectCwd,
+      sessionDefaults?.cwd,
+    ],
+  );
+
+  /** Inbox multi-select — every picked item links onto the new task; the
+   * sheet opens with them all in its Issues row. */
+  const onSendItemsToTask = useCallback(
+    async (items: InboxItem[]) => {
+      const linked = items
+        .map(linkedWorkItemFromInboxItem)
+        .filter((entry): entry is LinkedWorkItem => !!entry);
+      const path =
+        items[0]?.projectPath ||
+        active?.cwd ||
+        sessionDefaults?.cwd ||
+        projectCwd;
+      const project = await ensureTaskProject(path);
+      if (!project)
+        throw new Error("Choose a local project before sending to an agent");
+      setInboxViewOpen(false);
+      setTaskSheet({
+        projectId: project.id,
+        ...(items[0] ? { initialName: inboxItemTaskName(items[0]) } : {}),
+        ...(linked.length ? { initialTickets: linked } : {}),
+      });
+    },
+    [active?.cwd, ensureTaskProject, projectCwd, sessionDefaults?.cwd],
   );
 
   const onUpdatePlan = useCallback(
@@ -5854,6 +6302,9 @@ export default function App({
     onSteerQueuedMessage,
     onResumeQueue,
     onAddIssues: async (sessionId: string) => { await onOpenInboxSession(sessionId); setInboxSelectionRevision(value => value + 1); },
+    onOpenTaskChild,
+    onRetryTaskChild,
+    needsInputSessionIds,
     onInboxCardDismiss,
     onNoteCardDismiss,
     onHandoffCardDismiss,
@@ -5935,6 +6386,10 @@ export default function App({
         onSelectProject={onSelectProject}
         onOpenProject={pickProject}
         onNewTask={onNewTask}
+        onOpenTask={onOpenTask}
+        focusTaskId={focusTaskId}
+        onEditTask={onEditTask}
+        needsInputSessionIds={needsInputSessionIds}
         onRemoveProject={onRemoveProject}
         onNew={onNew}
         openSessions={openProjectSessions}
@@ -5965,10 +6420,36 @@ export default function App({
       {taskSheet && (
         <TaskCreateSheet
           projectId={taskSheet.projectId}
-          onLaunchChildren={(taskId, childIds) =>
-            void launchTaskChildren(taskId, childIds)
-          }
-          onOpenPath={onSelectProject}
+          editingTaskId={taskSheet.editingTaskId}
+          initialTickets={taskSheet.initialTickets}
+          initialName={taskSheet.initialName}
+          initialBrief={taskSheet.initialBrief}
+          initialChildren={taskSheet.initialChildren}
+          onCreated={(taskId) => {
+            setFocusTaskId(taskId);
+            setProjectRailOpen((open) => {
+              if (open) return open;
+              saveProjectRailOpen(true);
+              return true;
+            });
+          }}
+          onEdited={(task) => {
+            // A rename/ticket change should reach the conversation that
+            // shows the task — otherwise history and pickers keep the
+            // stale title and issue.
+            const ids = new Set([
+              ...(task.sessionIds ?? []),
+              ...task.children.flatMap((child) => child.sessionIds),
+            ]);
+            if (!ids.size) return;
+            const next = sessionsRef.current.map((session) =>
+              ids.has(session.id)
+                ? { ...session, title: task.name, linkedWorkItem: task.ticket }
+                : session,
+            );
+            sessionsRef.current = next;
+            setSessions(next);
+          }}
           onClose={() => setTaskSheet(null)}
         />
       )}
@@ -6203,7 +6684,7 @@ export default function App({
             besideRail={projectRailOpen}
             onClose={onLeaveInbox}
             onToggleSidebar={onToggleSidebar}
-            onStart={onStartInboxItem}
+            onStartTask={onStartItemToTask}
             onOpenSettings={() => openSettings("inbox")}
             onAsk={onAskInboxItem}
             onAskRestart={onRestartInboxAsk}
@@ -6218,7 +6699,7 @@ export default function App({
             selectionRevision={inboxSelectionRevision}
             onCloseConversation={() => setInboxConversationId(undefined)}
             onToggleConversationTicket={onToggleConversationTicket}
-            onSelectTickets={items => setContextRequest({ context: contextFromTickets(items), tickets: items, cwd: sidebarCwd })}
+            onSendToTask={onSendItemsToTask}
             onOpenIntegrations={onOpenInboxIntegrations}
           />
         </div> : null}

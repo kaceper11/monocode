@@ -77,7 +77,7 @@ it("retains the selected Jira ticket and explicit project through handoff and re
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
-  const onStart = vi.fn().mockRejectedValue(new Error("Handoff failed"));
+  const onStartTask = vi.fn().mockRejectedValue(new Error("Handoff failed"));
   const button = (text: string) =>
     [...document.querySelectorAll("button")].find(
       (button) => button.textContent?.trim() === text,
@@ -96,7 +96,7 @@ it("retains the selected Jira ticket and explicit project through handoff and re
           onAsk: async () => "",
           onAskRestart: async () => "",
           onAskMount: () => {},
-          onStart,
+          onStartTask,
         }),
       );
     });
@@ -108,17 +108,14 @@ it("retains the selected Jira ticket and explicit project through handoff and re
     );
     await click(button("Send to agent"));
     expect(document.querySelector('[role="dialog"]')).toBeNull();
-    expect(onStart).toHaveBeenCalledWith(
+    expect(onStartTask).toHaveBeenCalledWith(
       expect.objectContaining({
         identifier: "ENG-41",
         site: "https://team.atlassian.net",
         projectPath: "/local/project",
         repo: "",
       }),
-      undefined,
-      expect.objectContaining({
-        prompt: expect.stringContaining("Ticket"),
-      }),
+      null,
     );
     expect(document.body.textContent).toContain("Handoff failed");
     await click(button("GitHub"));

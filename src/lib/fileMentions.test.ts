@@ -8,6 +8,7 @@ import {
   fileMentionsInText,
   mentionLabel,
   mentionTokenAt,
+  rankAttachFiles,
   rankMentionFiles,
   replaceMentionToken,
   withMentionDirectories,
@@ -320,6 +321,48 @@ describe("rankMentionFiles", () => {
       expect.arrayContaining(["apps", "docs", "src", "src/chrome"]),
     );
     expect(ranked[0].isDir).toBe(true);
+  });
+});
+
+describe("rankAttachFiles", () => {
+  it("offers files that could not be written as @ tokens", () => {
+    const scoped: ProjectFile[] = [
+      {
+        name: "x.d.ts",
+        path: "/p/src/@types/x.d.ts",
+        relative: "src/@types/x.d.ts",
+      },
+      { name: "logo@2x.png", path: "/p/logo@2x.png", relative: "logo@2x.png" },
+    ];
+    // Mentions can only offer the token-safe `src` parent, never the files.
+    expect(rankMentionFiles(scoped, "", []).every((file) => file.isDir)).toBe(
+      true,
+    );
+    const ranked = rankAttachFiles(scoped, "", []);
+    expect(ranked.map((file) => file.relative)).toEqual(
+      expect.arrayContaining(["src/@types/x.d.ts", "logo@2x.png"]),
+    );
+    expect(rankAttachFiles(scoped, "types", [])[0].relative).toBe(
+      "src/@types/x.d.ts",
+    );
+  });
+
+  it("excludes directories without letting them consume the limit", () => {
+    const many: ProjectFile[] = [];
+    for (let i = 0; i < 40; i++) {
+      many.push({
+        name: "f.ts",
+        path: `/p/d${i}/f.ts`,
+        relative: `d${i}/f.ts`,
+      });
+    }
+    const ranked = rankAttachFiles(many, "", []);
+    expect(ranked).toHaveLength(30);
+    expect(ranked.every((file) => !file.isDir)).toBe(true);
+    // Mentions would hand half the slots to synthesized parent folders.
+    expect(
+      rankMentionFiles(many, "", []).some((file) => file.isDir),
+    ).toBe(true);
   });
 });
 

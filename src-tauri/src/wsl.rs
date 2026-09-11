@@ -154,6 +154,14 @@ pub fn wsl_resolve_harness(cwd: String, provider: String) -> Result<Value, Strin
     request(&location, "resolve_agent", json!({"provider":provider}))
 }
 
+/// One round trip that resolves every provider and reports a best-effort
+/// credential signal, instead of eight serialized resolver requests.
+#[tauri::command(async)]
+pub fn wsl_resolve_agents(cwd: String) -> Result<Value, String> {
+    let location = location(&cwd)?.ok_or("Choose a WSL project")?;
+    request(&location, "resolve_agents", json!({}))
+}
+
 impl LinuxProcess {
     pub fn protocol_line(&self, line: String) -> Result<String, String> {
         translate_agent_cwd(&self.location, line)
@@ -250,9 +258,40 @@ pub fn agent_command(
             config,
         ],
     ));
-    let environment: Value = request(location, "agent_environment", json!({}))?;
+    let environment = agent_environment(location)?;
     let acknowledgement = json!({"nonce": nonce, "environment": environment}).to_string();
     Ok((cmd, nonce, acknowledgement))
+}
+
+/// The login-shell environment changes only through refresh_environment, which
+/// bumps the bridge generation, so launches reuse the cached payload.
+fn agent_environment(location: &Location) -> Result<Arc<Value>, String> {
+    let bridge = bridge_for(location)?;
+    let generation = bridge.generation.load(Ordering::SeqCst);
+    {
+        let cache = bridge
+            .agent_environment
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((cached, environment)) = cache.as_ref() {
+            if *cached == generation {
+                return Ok(environment.clone());
+            }
+        }
+    }
+    let environment = bridge.request(json!({
+        "op": "agent_environment",
+        "path": location.path,
+    }))?;
+    if !environment.is_object() {
+        return Err("Invalid WSL environment response".into());
+    }
+    let environment = Arc::new(environment);
+    *bridge
+        .agent_environment
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some((generation, environment.clone()));
+    Ok(environment)
 }
 
 pub fn agent_handshake(
@@ -379,6 +418,9 @@ struct Bridge {
     process: Arc<Mutex<Process>>,
     alive: Arc<AtomicBool>,
     owner: Option<(tauri::AppHandle, String)>,
+    /// Login-shell environment captured per generation; agent launches reuse it
+    /// instead of round-tripping the whole environment on every spawn.
+    agent_environment: Mutex<Option<(usize, Arc<Value>)>>,
 }
 impl Bridge {
     fn start(command: &mut Command) -> Result<Self, String> {
@@ -415,6 +457,7 @@ impl Bridge {
             })),
             alive: Arc::new(AtomicBool::new(true)),
             owner: None,
+            agent_environment: Mutex::new(None),
         })
     }
     fn request(&self, request: Value) -> Result<Value, String> {
@@ -437,8 +480,13 @@ impl Bridge {
                         | "line_counts"
                         | "files"
                         | "canonical"
+                        | "canonical_directory"
                         | "home"
                         | "skill_entries"
+                        | "resolve_agent"
+                        | "resolve_agents"
+                        | "agent_exec"
+                        | "agent_environment"
                 )
             ) {
                 let result = reads.request(request);
@@ -599,13 +647,17 @@ impl Bridge {
     }
 }
 
+fn bridge_for(location: &Location) -> Result<Arc<Bridge>, String> {
+    HOSTS.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner()).get(&location.distribution.to_lowercase()).cloned()
+        .ok_or("WSL is not connected. Open the project location and reconnect; Windows execution was not used.".into())
+}
+
 pub fn request<T: DeserializeOwned>(
     location: &Location,
     op: &str,
     mut arguments: Value,
 ) -> Result<T, String> {
-    let bridge = HOSTS.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner()).get(&location.distribution.to_lowercase()).cloned()
-        .ok_or("WSL is not connected. Open the project location and reconnect; Windows execution was not used.")?;
+    let bridge = bridge_for(location)?;
     arguments["op"] = op.into();
     arguments["path"] = location.path.clone().into();
     serde_json::from_value(bridge.request(arguments)?)
@@ -896,20 +948,45 @@ with tempfile.TemporaryDirectory(prefix='monocode-env-') as directory:
     windows.write_text('#!/bin/sh\nexit 0\n')
     windows.chmod(0o755)
     (tools / 'claude').symlink_to(windows)
+    fx = tools / 'fx'
+    fx.write_text('#!/bin/sh\necho "fx: acp ask gateway modes"\n')
+    fx.chmod(0o755)
+    pi = tools / 'pi-coding-agent'
+    pi.write_text('#!/bin/sh\ntrue\n')
+    pi.chmod(0o755)
+    (home / '.codex').mkdir()
+    (home / '.codex/auth.json').write_text('{}')
     with patch.object(pwd, 'getpwuid', return_value=types.SimpleNamespace(pw_shell=str(shell))), patch.object(Path, 'home', return_value=home):
         prepare_environment()
         assert '/mnt/' not in os.environ['PATH']
         assert ENVIRONMENT_READY
-        assert handle({'op':'resolve_agent','provider':'codex','path':directory})['path'] == str(cli)
+        assert handle({'op':'resolve_agent','provider':'codex','path':directory}) == {'path': str(cli), 'authenticated': True}
         assert handle({'op':'agent_exec','command':str(cli),'args':[],'path':directory}).strip() == 'linux-interpreter'
         try:
             handle({'op':'resolve_agent','provider':'claude','path':directory})
             raise AssertionError('Windows executable accepted')
         except ValueError:
             pass
+        # One batched request resolves every provider with its auth signal; fx
+        # is an ACP agent, not a `--mode rpc` one.
+        resolved = handle({'op':'resolve_agents','path':directory})
+        assert resolved['codex'] == {'path': str(cli), 'authenticated': True}
+        assert resolved['fx'] == {'path': str(fx), 'authenticated': None}
+        assert resolved['pi'] == {'path': str(pi), 'authenticated': False}
+        assert 'error' in resolved['claude']
+        assert 'error' in resolved['opencode']
         # The environment is reused without evaluating the shell on every probe.
         shell.unlink()
         assert handle({'op':'agent_environment','path':directory})['PATH'] == os.environ['PATH']
+    # A configured shell that cannot answer falls back to a POSIX shell.
+    broken = home / 'broken-shell'
+    broken.write_text('#!/bin/sh\nexit 42\n')
+    broken.chmod(0o755)
+    ENVIRONMENT_READY = False
+    with patch.object(pwd, 'getpwuid', return_value=types.SimpleNamespace(pw_shell=str(broken))), patch.object(Path, 'home', return_value=home):
+        prepare_environment()
+        assert ENVIRONMENT_READY
+        assert os.environ.get('PATH')
 "#;
         let script = format!(
             "__name__ = 'fixture'\nexec({})\n{}",

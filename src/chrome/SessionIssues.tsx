@@ -13,7 +13,7 @@ export function SessionIssues({
   onAdd?: () => void;
 }) {
   const links = sessionWorkItems(session);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(() => links.length > 0);
   if (!links.length && !onAdd) return null;
   return (
     <div className="shrink-0 border-b border-content/10 text-[12px]">

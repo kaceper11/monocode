@@ -32,13 +32,19 @@ export type ProjectRecord = {
   /** Explicit project name; falls back to the tab-group label/folder name. */
   name?: string;
   /** Stable rail key: order, pins and appearance stay keyed on this path even
-   * if its repository later leaves the project. */
-  anchor: string;
+   * if its repository later leaves the project. A project can also be a pure
+   * group — no anchor — when its repositories share no single folder. */
+  anchor?: string;
   repositories: ProjectRepository[];
   sets: SavedRepositorySet[];
   /** Last-active working copy inside the project — the open target. */
   lastPath?: string;
 };
+
+/** Synthetic rail key for a project with no folder anchor. Never a real
+ * path — real recents are absolute — so ordering/pins can reuse it. */
+export const projectRailKey = (id: string) => `project:${id}`;
+export const isProjectRailKey = (path: string) => path.startsWith("project:");
 
 export type RailProjectItem = RecentProject & { project?: ProjectRecord };
 
@@ -97,12 +103,15 @@ function sanitizeProject(value: unknown): ProjectRecord | null {
   if (
     typeof record.id !== "string" ||
     !record.id ||
-    typeof record.anchor !== "string" ||
-    !record.anchor ||
-    !looksLikeProject(record.anchor) ||
     !Array.isArray(record.repositories)
   )
     return null;
+  const anchor =
+    typeof record.anchor === "string" &&
+    record.anchor &&
+    looksLikeProject(record.anchor)
+      ? normalizePath(record.anchor)
+      : undefined;
   const repositories = record.repositories
     .map(sanitizeRepository)
     .filter((repo): repo is ProjectRepository => !!repo)
@@ -129,7 +138,7 @@ function sanitizeProject(value: unknown): ProjectRecord | null {
     ...(typeof record.name === "string" && record.name
       ? { name: record.name.slice(0, 200) }
       : {}),
-    anchor: normalizePath(record.anchor),
+    ...(anchor ? { anchor } : {}),
     repositories: deduped,
     sets,
     ...(typeof record.lastPath === "string" && record.lastPath
@@ -277,7 +286,8 @@ export function ensureProjectForPath(
   }
   const anchor = normalizePath(anchorPath);
   const existing = loadProjects().find(
-    (project) => pathKey(project.anchor) === pathKey(anchor),
+    (project) =>
+      project.anchor && pathKey(project.anchor) === pathKey(anchor),
   );
   if (existing) return existing;
   const project: ProjectRecord = {
@@ -294,6 +304,20 @@ export function ensureProjectForPath(
       : [],
     sets: [],
     lastPath: anchor,
+  };
+  saveProjects([...loadProjects(), project]);
+  return project;
+}
+
+/** Creates a project that is only a group — no folder anchor. Its rail row
+ * keys on `projectRailKey(id)`; repositories are added afterwards. */
+export function createProjectGroup(name?: string): ProjectRecord {
+  const trimmed = name?.trim().slice(0, 200);
+  const project: ProjectRecord = {
+    id: crypto.randomUUID(),
+    ...(trimmed ? { name: trimmed } : {}),
+    repositories: [],
+    sets: [],
   };
   saveProjects([...loadProjects(), project]);
   return project;
@@ -399,7 +423,7 @@ export function locateRepository(
   );
   if (conflict)
     return {
-      error: `This repository already belongs to ${conflict.name ?? basename(conflict.anchor)}.`,
+      error: `This repository already belongs to ${conflict.name ?? (conflict.anchor ? basename(conflict.anchor) : "another project")}.`,
     };
   updateProject(projectId, (current) => ({
     ...current,
@@ -504,7 +528,8 @@ export function recordProjectLastPath(
   const normalized = normalizePath(path);
   const project = projects.find(
     (entry) =>
-      pathKey(entry.anchor) === pathKey(normalized) ||
+      (entry.anchor &&
+        pathKey(entry.anchor) === pathKey(normalized)) ||
       projectContainsPath(entry, normalized, families),
   );
   if (!project || project.lastPath === normalized) return;
@@ -525,7 +550,8 @@ export function groupRailProjectsByMembership(
   if (!projects.length) return sections;
   const byAnchor = new Map<string, ProjectRecord>();
   for (const project of projects)
-    byAnchor.set(pathKey(project.anchor), project);
+    if (project.anchor)
+      byAnchor.set(pathKey(project.anchor), project);
   const represented = new Set<string>();
   const group = (items: RailProjectItem[]) => {
     const out: RailProjectItem[] = [];
@@ -543,13 +569,18 @@ export function groupRailProjectsByMembership(
       // The anchor's own slot is the row's saved position: when it is in the
       // list, earlier member recents are absorbed into it instead.
       if (
+        project.anchor &&
         keysInItems.has(pathKey(project.anchor)) &&
         itemKey !== pathKey(project.anchor)
       )
         continue;
       if (represented.has(project.id)) continue;
       represented.add(project.id);
-      out.push({ ...item, path: project.anchor, project });
+      out.push({
+        ...item,
+        path: project.anchor ?? projectRailKey(project.id),
+        project,
+      });
     }
     return out;
   };
@@ -559,7 +590,11 @@ export function groupRailProjectsByMembership(
   // a recent — the project is the durable boundary, not the recents list.
   for (const project of projects) {
     if (represented.has(project.id)) continue;
-    unpinned.push({ path: project.anchor, openedAt: 0, project });
+    unpinned.push({
+      path: project.anchor ?? projectRailKey(project.id),
+      openedAt: 0,
+      project,
+    });
   }
   return { pinned, projects: unpinned };
 }

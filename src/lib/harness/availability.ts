@@ -5,19 +5,23 @@ import {
   resolveClaudeBinary,
   resolveCodexBinary,
   resolveCursorBinary,
+  resolveDevinBinary,
   resolveFxBinary,
   resolveGrokBinary,
   resolveOmpBinary,
   resolveOpenCodeBinary,
   resolvePiBinary,
+  resolveWslAgents,
 } from "./child";
 import { isLiveHarness } from "./registry";
 
 export type HarnessAvailability = Record<HarnessId, boolean>;
 
 /**
- * We only ever check whether the binary exists, never whether it is
- * authenticated, so the hint must not blame a login.
+ * Availability only means the binary exists; authentication is reported
+ * separately so an installed but signed-out provider is not mislabelled as
+ * missing. A missing auth signal means the provider's credential location is
+ * unknown, not that it is signed out.
  */
 const CLI: Record<HarnessId, { name: string; install?: string }> = {
   claude: { name: "Claude Code CLI" },
@@ -31,6 +35,7 @@ const CLI: Record<HarnessId, { name: string; install?: string }> = {
   pi: { name: "Pi CLI", install: "npm i -g @earendil-works/pi-coding-agent" },
   omp: { name: "omp CLI", install: "curl -fsSL https://omp.sh/install | sh" },
   fx: { name: "fx CLI", install: "curl -fsSL https://fx.sh/setup.sh | bash" },
+  devin: { name: "Devin CLI" },
 };
 
 const emptyAvailability: HarnessAvailability = {
@@ -42,9 +47,20 @@ const emptyAvailability: HarnessAvailability = {
   pi: false,
   omp: false,
   fx: false,
+  devin: false,
 };
+const SIGN_IN: Partial<Record<HarnessId, string>> = {
+  claude: "claude auth login",
+  codex: "codex login",
+  cursor: "agent login",
+  grok: "grok login",
+  fx: "fx login",
+  devin: "devin auth login",
+};
+
 type Probe = {
   availability: HarnessAvailability;
+  authenticated: Partial<Record<HarnessId, boolean>>;
   errors: Partial<Record<HarnessId, string>>;
   probedAt: number;
   inflight: Promise<void> | null;
@@ -114,6 +130,18 @@ export function harnessUnavailableHint(id: HarnessId, cwd?: string): string {
   return `${name} not found${how}. Install it, or restart MonoCode if it is already installed.`;
 }
 
+/** Sign-in guidance when the provider is installed but provably signed out. */
+export function harnessAuthHint(id: HarnessId, cwd?: string): string | undefined {
+  const location = cwd ? wslLocation(cwd) : undefined;
+  if (probes.get(hostKey(cwd))?.authenticated[id] !== false) return undefined;
+  const where = location ? ` in ${location.distribution}` : "";
+  const command = SIGN_IN[id];
+  const how = command
+    ? `Run \`${command}\`${location ? " inside the distribution" : ""}, then refresh.`
+    : `Sign in to the provider${where}, then refresh.`;
+  return `${CLI[id].name} is installed${where} but not signed in. ${how}`;
+}
+
 export function probeHarnessAvailability(options?: {
   force?: boolean;
   cwd?: string;
@@ -131,6 +159,7 @@ export function probeHarnessAvailability(options?: {
     }
     probe = {
       availability: { ...emptyAvailability },
+      authenticated: {},
       errors: {},
       probedAt: 0,
       inflight: null,
@@ -145,6 +174,44 @@ export function probeHarnessAvailability(options?: {
   )
     return Promise.resolve();
   const current = probe;
+  current.errors = {};
+  current.authenticated = {};
+  const finish = () => {
+    current.probedAt = Date.now();
+    current.inflight = null;
+    emit();
+  };
+  const location = options?.cwd ? wslLocation(options.cwd) : undefined;
+  if (options?.cwd && location) {
+    const cwd = options.cwd;
+    // One bridged round trip replaces eight serialized resolver requests.
+    current.inflight = resolveWslAgents(cwd)
+      .then((resolved) => {
+        if (probes.get(key) !== current) return;
+        for (const id of HARNESSES) {
+          const entry = resolved[id];
+          current.availability[id] = isLiveHarness(id) && Boolean(entry?.path);
+          if (entry?.path) {
+            if (entry.authenticated != null)
+              current.authenticated[id] = entry.authenticated;
+          } else {
+            current.errors[id] =
+              entry?.error ??
+              `${CLI[id].name} is unavailable in ${location.distribution}.`;
+          }
+        }
+      })
+      .catch((error: unknown) => {
+        if (probes.get(key) !== current) return;
+        const message = String(error);
+        for (const id of HARNESSES) {
+          current.availability[id] = false;
+          current.errors[id] = message;
+        }
+      })
+      .finally(finish);
+    return current.inflight;
+  }
   const resolvers = {
     cursor: resolveCursorBinary,
     claude: resolveClaudeBinary,
@@ -154,8 +221,8 @@ export function probeHarnessAvailability(options?: {
     omp: resolveOmpBinary,
     fx: resolveFxBinary,
     grok: resolveGrokBinary,
+    devin: resolveDevinBinary,
   };
-  current.errors = {};
   current.inflight = Promise.all(
     HARNESSES.map(async (id) => {
       if (!isLiveHarness(id)) return [id, false] as const;
@@ -171,16 +238,11 @@ export function probeHarnessAvailability(options?: {
   )
     .then((entries) => {
       if (probes.get(key) !== current) return;
-      current.probedAt = Date.now();
       current.availability = {
         ...emptyAvailability,
         ...Object.fromEntries(entries),
       };
-      emit();
     })
-    .finally(() => {
-      current.probedAt = Date.now();
-      current.inflight = null;
-    });
+    .finally(finish);
   return current.inflight;
 }

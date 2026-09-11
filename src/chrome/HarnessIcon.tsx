@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import claude from "../assets/providers/claude.svg";
 import codex from "../assets/providers/codex.svg";
 import cursor from "../assets/providers/cursor.svg";
+import devin from "../assets/providers/devin.svg";
 import fx from "../assets/providers/fx.svg";
 import grok from "../assets/providers/grok.svg";
 import omp from "../assets/providers/omp.svg";
@@ -18,6 +19,7 @@ export const HARNESS_ICONS: Record<HarnessId, string> = {
   pi,
   omp,
   fx,
+  devin,
 };
 
 /** White marks that must follow `currentColor` so they stay visible in light mode. */

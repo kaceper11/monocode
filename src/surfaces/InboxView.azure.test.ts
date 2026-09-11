@@ -90,8 +90,8 @@ it("keeps Azure identity, selected context and local project through Ask, Send a
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
-  const onStart = vi.fn().mockRejectedValue(new Error("Handoff failed"));
-  const onSelectTickets = vi.fn();
+  const onStartTask = vi.fn().mockRejectedValue(new Error("Handoff failed"));
+  const onSendToTask = vi.fn();
   const onAsk = vi.fn().mockResolvedValue("ask-session");
   const button = (text: string) =>
     [...document.querySelectorAll("button")].find(
@@ -109,8 +109,8 @@ it("keeps Azure identity, selected context and local project through Ask, Send a
           onAsk,
           onAskRestart: async () => "",
           onAskMount: () => {},
-          onStart,
-          onSelectTickets,
+          onStartTask,
+          onSendToTask,
           conversationId: "existing",
         }),
       ),
@@ -133,7 +133,7 @@ it("keeps Azure identity, selected context and local project through Ask, Send a
     expect(container.querySelector('[aria-label="Conversation"]')).toBeNull();
     await click(button("Send to agent"));
     expect(document.querySelector('[role="dialog"]')).toBeNull();
-    expect(onStart).toHaveBeenCalledWith(
+    expect(onStartTask).toHaveBeenCalledWith(
       expect.objectContaining({
         provider: "azure",
         identifier: "Bug 141",
@@ -141,10 +141,7 @@ it("keeps Azure identity, selected context and local project through Ask, Send a
         repo: "",
         site: "https://dev.azure.com/team",
       }),
-      undefined,
-      expect.objectContaining({
-        prompt: expect.stringContaining("Ticket"),
-      }),
+      null,
     );
     expect(document.body.textContent).toContain("Handoff failed");
     await click(button("GitHub"));
@@ -156,10 +153,9 @@ it("keeps Azure identity, selected context and local project through Ask, Send a
     expect(container.textContent).toContain("1 selected");
     await click(button("Azure"));
     expect((container.querySelector('input[aria-label="Select azure Bug 141 Ticket 141"]') as HTMLInputElement).checked).toBe(true);
-    await click(button("Open conversation"));
-    expect(onSelectTickets).toHaveBeenCalledWith([expect.objectContaining({ provider: "azure", account: "ada", id: "141" })]);
-    expect(container.textContent).toContain("1 selected");
-    await click(container.querySelector('[aria-label="Done selecting tickets"]')!);
+    await click(button("Send to task"));
+    expect(onSendToTask).toHaveBeenCalledWith([expect.objectContaining({ provider: "azure", account: "ada", id: "141" })]);
+    // Sending exits select mode and clears the selection.
     expect(container.querySelector('input[type="checkbox"]')).toBeNull();
     fail = true;
     await click(container.querySelector('[aria-label="Refresh"]')!);
@@ -172,7 +168,7 @@ it("keeps Azure identity, selected context and local project through Ask, Send a
       expect.objectContaining({ provider: "azure", id: "141" }),
       expect.objectContaining({ contextSummary: expect.any(String) }),
     );
-    let linked = { id: "existing", cwd: "/local/project", title: "Existing", linkedWorkItem: linkedWorkItemFromInboxItem(onSelectTickets.mock.calls[0][0][0])! };
+    let linked = { id: "existing", cwd: "/local/project", title: "Existing", linkedWorkItem: linkedWorkItemFromInboxItem(onSendToTask.mock.calls[0][0][0])! };
     let finishToggle: (() => void) | undefined;
     let holdToggle = false;
     const onToggle = vi.fn(async (_id, item, selected) => {
@@ -184,7 +180,7 @@ it("keeps Azure identity, selected context and local project through Ask, Send a
     const onCloseConversation = vi.fn();
     const onOpenDelivery = vi.fn().mockResolvedValue(undefined);
     const renderLinked = () => root.render(createElement(InboxView, {
-      cwd: "/local/project", recents: [], onAsk, onAskRestart: async () => "", onAskMount: () => {}, onStart, onSelectTickets,
+      cwd: "/local/project", recents: [], onAsk, onAskRestart: async () => "", onAskMount: () => {}, onStartTask, onSendToTask,
       onOpenDelivery, conversationId: "existing", sessions: [linked as import("../lib/sessionStore").SessionSummary], onToggleConversationTicket: onToggle, onCloseConversation,
     }));
     await act(async () => renderLinked());
@@ -252,17 +248,17 @@ it("keeps Azure identity, selected context and local project through Ask, Send a
     await click(button("Show issues"));
     expect((container.querySelector("#inbox-ticket-list") as HTMLElement).hidden).toBe(false);
     await click(container.querySelector('[aria-label="Select tickets"]')!);
-    expect(button("Open conversation")).toBeUndefined();
+    expect(button("Send to task")).toBeUndefined();
     await click(button("Done"));
 
     await act(async () => root.render(createElement(InboxView, {
-      cwd: "/local/project", recents: [], onAsk, onAskRestart: async () => "", onAskMount: () => {}, onStart,
+      cwd: "/local/project", recents: [], onAsk, onAskRestart: async () => "", onAskMount: () => {}, onStartTask,
       conversationId: "existing", target: { ...linked.linkedWorkItem },
     })));
     expect(container.querySelector('[aria-label="Conversation"]')).toBeNull();
     expect(container.querySelector("h1")?.textContent).toBe("Ticket 141");
     const renderVisible = (visible: boolean) => root.render(createElement(InboxView, {
-      cwd: "/local/project", recents: [], onAsk, onAskRestart: async () => "", onAskMount: () => {}, onStart, onSelectTickets, visible,
+      cwd: "/local/project", recents: [], onAsk, onAskRestart: async () => "", onAskMount: () => {}, onStartTask, onSendToTask, visible,
     }));
     await act(async () => renderVisible(true));
     await click(container.querySelector('[aria-label="Select tickets"]')!);
@@ -276,7 +272,7 @@ it("keeps Azure identity, selected context and local project through Ask, Send a
     expect(container.querySelector('[aria-label="Conversation"]')).toBeNull();
     await click(button("Done"));
     await act(async () => root.render(createElement(InboxView, {
-      cwd: "/local/project", recents: [], onAsk, onAskRestart: async () => "", onAskMount: () => {}, onStart, onSelectTickets,
+      cwd: "/local/project", recents: [], onAsk, onAskRestart: async () => "", onAskMount: () => {}, onStartTask, onSendToTask,
       conversationId: "existing", selectionRevision: 1,
     })));
     expect(container.querySelector('input[type="checkbox"]')).not.toBeNull();
@@ -285,7 +281,7 @@ it("keeps Azure identity, selected context and local project through Ask, Send a
     await click(button("GitHub"));
     const target = { ...linked.linkedWorkItem, number: 142, identifier: "Bug 142", url: linked.linkedWorkItem.url.replace("141", "142") };
     const renderTarget = (visible: boolean) => root.render(createElement(InboxView, {
-      cwd: "/local/project", recents: [], onAsk, onAskRestart: async () => "", onAskMount: () => {}, onStart, visible, target,
+      cwd: "/local/project", recents: [], onAsk, onAskRestart: async () => "", onAskMount: () => {}, onStartTask, visible, target,
     }));
     await act(async () => renderTarget(false));
     await act(async () => renderTarget(true));

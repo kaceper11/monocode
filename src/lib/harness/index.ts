@@ -119,6 +119,7 @@ export { registerBuiltinHarnesses } from "./register";
 export {
   getHarnessAvailabilitySnapshot,
   hasProbedHarnessAvailability,
+  harnessAuthHint,
   harnessUnavailableHint,
   isHarnessAvailable,
   probeHarnessAvailability,

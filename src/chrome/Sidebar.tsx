@@ -1,6 +1,12 @@
 import { prettyCwd } from "../lib/paths";
 import type { DeliveryTabSource } from "../lib/layout";
 import { sessionWorkItems } from "../lib/sessionWorkItem";
+import {
+  subscribeTaskWorkspaces,
+  taskChildRepoLabel,
+  taskForSession,
+  taskWorkspacesSnapshot,
+} from "../lib/taskWorkspaces";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Archive,
@@ -19,6 +25,7 @@ import {
   Search,
   Settings,
   StickyNote,
+  Task,
 } from "./icons";
 import {
   memo,
@@ -233,6 +240,11 @@ type Props = {
   onSelectProject?: (path: string) => void;
   onOpenProject?: () => void;
   onNewTask?: (path: string, projectId?: string) => void;
+  onOpenTask?: (taskId: string) => void;
+  /** Just-created task — the rail's current task until a session takes over. */
+  focusTaskId?: string;
+  onEditTask?: (taskId: string) => void;
+  needsInputSessionIds?: ReadonlySet<string>;
   onRemoveProject?: (path: string, options: { purgeData: boolean }) => void;
   onNew?: () => string | void;
   onNewTerminal?: () => void;
@@ -310,6 +322,10 @@ function SidebarComponent({
   onSelectProject,
   onOpenProject,
   onNewTask,
+  onOpenTask,
+  focusTaskId,
+  onEditTask,
+  needsInputSessionIds,
   onRemoveProject,
   onNew,
   onSearch,
@@ -1601,6 +1617,10 @@ function SidebarComponent({
           onSelectProject={onSelectProject}
           onOpenProject={onOpenProject}
           onNewTask={onNewTask}
+          onOpenTask={onOpenTask}
+          focusTaskId={focusTaskId}
+          onEditTask={onEditTask}
+          needsInputSessionIds={needsInputSessionIds}
           onRemoveProject={onRemoveProject}
           settingsOpen={settingsOpen}
           settingsSection={settingsSection}
@@ -2227,6 +2247,54 @@ function FolderRenameRow({
   );
 }
 
+type TaskScope = NonNullable<ReturnType<typeof taskForSession>>;
+
+/** Task scope for a session, live against the task store. `cwd` pins the
+ * displayed host child to the copy the session actually runs in. */
+function useTaskScope(sessionId: string, cwd?: string) {
+  useSyncExternalStore(subscribeTaskWorkspaces, taskWorkspacesSnapshot);
+  return taskForSession(sessionId, cwd);
+}
+
+/** Task marker on a session card — the session belongs to a task rather
+ * than a bare repository. */
+function SessionTaskChip({ scope }: { scope: TaskScope }) {
+  return (
+    <span
+      title={`Task: ${scope.task.name}`}
+      aria-label={`Task ${scope.task.name}`}
+      className="flex shrink-0 items-center gap-0.5 rounded bg-accent/10 px-1 py-px text-[11px] tabular-nums text-accent"
+    >
+      <Task className="size-3" strokeWidth={1.75} />
+      <span className="max-w-36 truncate">{scope.task.name}</span>
+    </span>
+  );
+}
+
+/** Sibling repositories of a multi-repo task — a compact branch list under
+ * the session's own repo·branch row so every involved copy is visible. */
+function SessionTaskBranches({ scope }: { scope: TaskScope }) {
+  const rest = scope.task.children.filter(
+    (child) => child.id !== scope.child?.id,
+  );
+  if (!rest.length) return null;
+  return (
+    <span className="relative mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+      {rest.map((child) => (
+        <span
+          key={child.id}
+          className="flex min-w-0 items-center gap-1 text-[11px] text-content/35"
+        >
+          <GitBranch className="size-3 shrink-0" strokeWidth={1.75} />
+          <span className="min-w-0 truncate">
+            {taskChildRepoLabel(scope.task, child)}
+          </span>
+        </span>
+      ))}
+    </span>
+  );
+}
+
 function SessionCard({
   session,
   isActive,
@@ -2272,6 +2340,8 @@ function SessionCard({
   const [dragging, setDragging] = useState(false);
   const title = sessionDisplayTitle(session.title, session.harness);
   const gitLabel = formatGitLabel(session.repo, session.branch);
+  const taskScope = useTaskScope(session.id, sessionWorkCwd(session));
+
   const time = formatRelative(session.updatedAt, now);
   const model = compact
     ? null
@@ -2535,7 +2605,19 @@ function SessionCard({
             </span>
           ) : null}
         </span>
-        {workItemBadge.length ? <span aria-label="Linked tickets" className="relative mt-1 flex flex-wrap items-center gap-1.5">{workItemBadge}</span> : null}
+        {taskScope || workItemBadge.length ? (
+          <span className="relative mt-1 flex flex-wrap items-center gap-1.5">
+            {taskScope ? <SessionTaskChip scope={taskScope} /> : null}
+            {workItemBadge.length ? (
+              <span
+                aria-label="Linked tickets"
+                className="flex flex-wrap items-center gap-1.5"
+              >
+                {workItemBadge}
+              </span>
+            ) : null}
+          </span>
+        ) : null}
         <span className="relative mt-1 flex items-center gap-2">
           {gitLabel ? (
             <span className="flex min-w-0 flex-1 items-center gap-1 text-[11px] text-content/45">
@@ -2558,6 +2640,7 @@ function SessionCard({
             />
           </span>
         </span>
+        {taskScope ? <SessionTaskBranches scope={taskScope} /> : null}
       </div>
       {onArchive ? (
         <button

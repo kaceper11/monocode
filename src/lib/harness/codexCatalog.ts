@@ -83,13 +83,11 @@ async function discoverCodexModels(projectCwd?: string): Promise<AgentModel[]> {
         }>("account/read", {}, REQUEST_TIMEOUT_MS)
         .catch(() => null);
 
-      if (account && !account.account && account.requiresOpenaiAuth) {
-        throw new Error(
-          "Codex CLI is not authenticated. Run `codex login` and try again.",
-        );
+      if (codexAccountSignedOut(account)) {
+        throw new Error(CODEX_SIGN_IN_ERROR);
       }
 
-      return await listAllModels(rpc);
+      return await listCodexModels(rpc);
     }, () => {
       void stop();
     });
@@ -98,7 +96,21 @@ async function discoverCodexModels(projectCwd?: string): Promise<AgentModel[]> {
   }
 }
 
-async function listAllModels(rpc: JsonRpcClient): Promise<AgentModel[]> {
+export const CODEX_SIGN_IN_ERROR =
+  "Codex CLI is not authenticated. Run `codex login` and try again.";
+
+export function codexAccountSignedOut(account: unknown): boolean {
+  const record = asRecord(account);
+  return (
+    record != null && !record.account && record.requiresOpenaiAuth === true
+  );
+}
+
+/** Model listing on an existing app-server connection (catalog probe or a live session). */
+export async function listCodexModels(
+  rpc: JsonRpcClient,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<AgentModel[]> {
   const models: AgentModel[] = [];
   const rows: unknown[] = [];
   let cursor: string | null | undefined;
@@ -106,7 +118,7 @@ async function listAllModels(rpc: JsonRpcClient): Promise<AgentModel[]> {
     const response = await rpc.request<{
       data?: unknown[];
       nextCursor?: string | null;
-    }>("model/list", cursor ? { cursor } : {}, REQUEST_TIMEOUT_MS);
+    }>("model/list", cursor ? { cursor } : {}, timeoutMs);
     const page = Array.isArray(response.data) ? response.data : [];
     rows.push(...page);
     for (const row of page) {

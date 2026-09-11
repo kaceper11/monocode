@@ -1,4 +1,4 @@
-import { nativeModelId } from "../models";
+import { nativeModelId, setCatalogError, setHarnessModels } from "../models";
 import type { Attachment, RuntimeMode } from "../session";
 import { questionPromptTitle, type UserQuestionReply } from "../userQuestion";
 import {
@@ -21,6 +21,11 @@ import {
   type CodexApprovalKind,
 } from "./codexProtocol";
 import { JsonRpcClient, type JsonRpcId } from "./jsonRpc";
+import {
+  CODEX_SIGN_IN_ERROR,
+  codexAccountSignedOut,
+  listCodexModels,
+} from "./codexCatalog";
 import { codexQuestions, codexQuestionResponse } from "./codexQuestions";
 import { codexMcpConfirmation } from "./codexElicitation";
 import { joinStreamText, snapshotRemainder } from "./streamText";
@@ -455,11 +460,40 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       providerSessionId: threadId,
     });
     live.onEvent({ type: "session.started" });
+    void populateCatalog(input.sessionId, live);
     return live;
   } catch (error) {
     rpc.close(error instanceof Error ? error : new Error(String(error)));
     await stopCodexSession(input.sessionId);
     throw error;
+  }
+}
+
+/**
+ * The session's app-server already answers account/read and model/list, so the
+ * picker catalog can be warmed from it instead of booting a second Codex
+ * process. Best-effort: catalog work must never fail a live session.
+ */
+async function populateCatalog(sessionId: string, live: Live): Promise<void> {
+  try {
+    // No per-request timers: the session close rejects any pending reuse work.
+    const account = await live.rpc
+      .request<{ account?: unknown; requiresOpenaiAuth?: boolean }>(
+        "account/read",
+        {},
+      )
+      .catch(() => null);
+    if (liveByThread.get(sessionId) !== live) return;
+    if (codexAccountSignedOut(account)) {
+      setCatalogError("codex", CODEX_SIGN_IN_ERROR, live.cwd);
+      return;
+    }
+    const models = await listCodexModels(live.rpc, 0);
+    if (liveByThread.get(sessionId) === live) {
+      setHarnessModels("codex", models, live.cwd);
+    }
+  } catch {
+    // A turn in flight is never interrupted by catalog reuse.
   }
 }
 

@@ -17,7 +17,7 @@ it("keeps reopened mixed-provider references at the top and offers adding issues
   try {
     await act(async () => root.render(createElement(SessionIssues, { session, onAdd })));
     expect(host.textContent).toContain("Issues · #8, ENG-13");
-    await act(async () => (host.querySelector('[aria-expanded]') as HTMLButtonElement).click());
+    // Linked issues start expanded — no toggle click needed.
     expect(host.querySelector('[aria-label="Open Issue #8 in Inbox"]')).not.toBeNull();
     expect(host.querySelector('[aria-label="Open Issue ENG-13 in Inbox"]')).not.toBeNull();
     const opened = vi.fn();

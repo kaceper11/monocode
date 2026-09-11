@@ -2,6 +2,7 @@ import { looksLikeProject, pathKey, slash } from "./paths";
 import {
   groupRailProjectsByMembership,
   loadProjects,
+  projectRailKey,
   type ProjectRecord,
   type RailProjectItem,
 } from "./projects";
@@ -340,9 +341,12 @@ export function projectRailSections(
   // Stored projects keep their rail row from the anchor even when no member
   // path is a recent; the anchor keys saved order, pins and appearance.
   for (const project of storedProjects) {
-    const key = pathKey(project.anchor);
+    const key = pathKey(project.anchor ?? projectRailKey(project.id));
     if (!projects.has(key))
-      projects.set(key, { path: project.anchor, openedAt: 0 });
+      projects.set(key, {
+        path: project.anchor ?? projectRailKey(project.id),
+        openedAt: 0,
+      });
   }
   const syncedOrder = syncProjectRailOrder(order, projects);
   const pinnedSet = new Set(pinnedPaths.map(pathKey));

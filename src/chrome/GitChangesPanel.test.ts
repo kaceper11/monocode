@@ -86,24 +86,181 @@ it("keeps changes selected until the chosen recipient accepts context", async ()
         ) as HTMLButtonElement
       ).click(),
     );
+    localStorage.setItem(
+      "monocode.taskWorkspaces.v1",
+      JSON.stringify([
+        {
+          id: "t1",
+          projectId: "p1",
+          name: "Fix billing",
+          children: [
+            {
+              id: "c1",
+              repositoryId: "r1",
+              sessionIds: [],
+              launch: { state: "pending" },
+            },
+          ],
+          sessionIds: [],
+          createdAt: 1,
+        },
+      ]),
+    );
     const checkbox = () =>
       host.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    const menuItem = (text: string) =>
+      [...document.body.querySelectorAll('[role="menuitem"]')].find(
+        (item) => item.textContent?.trim() === text,
+      ) as HTMLButtonElement;
     await act(async () => checkbox().click());
-    await act(async () => button("Send to agent…").click());
+    // The task menu opens; the selection stays until a target accepts it.
+    await act(async () => button("Send to task").click());
+    expect(checkbox().checked).toBe(true);
+    await act(async () => menuItem("Fix billing").click());
     expect(checkbox().checked).toBe(true);
     expect(requestAgentContext).toHaveBeenCalledWith(
       expect.objectContaining({
         sourceSessionId: "original",
-        prepareInSource: false,
+        taskId: "t1",
       }),
     );
-    // Closing the picker has no success callback: the selected files remain available.
-    await act(async () => button("Send to agent…").click());
-    expect(checkbox().checked).toBe(true);
     await act(async () =>
       vi.mocked(requestAgentContext).mock.calls.at(-1)![0].onPrepared!(),
     );
     expect(checkbox()).toBeNull();
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    localStorage.removeItem("monocode.taskWorkspaces.v1");
+    vi.unstubAllGlobals();
+  }
+});
+
+it("moves a staged file immediately and refreshes the index once", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const { invoke } = await import("@tauri-apps/api/core");
+  let staged = false;
+  let indexCalls = 0;
+  let release: (() => void) | undefined;
+  const snapshot = () => ({
+    branch: "feature",
+    ahead: 0,
+    behind: 0,
+    files: [
+      {
+        path: "/repo-stage/a.ts",
+        relative: "a.ts",
+        status: "modified",
+        staged,
+        unstaged: !staged,
+        additions: 1,
+        deletions: 0,
+      },
+    ],
+  });
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "git_stage_file") {
+      staged = true;
+      return null;
+    }
+    if (command === "git_diff_index") {
+      indexCalls += 1;
+      if (indexCalls === 2) {
+        // Hold the post-mutation refresh open so the optimistic move is
+        // observable before the refreshed index lands.
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      }
+      return snapshot();
+    }
+    return original(command, args);
+  });
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const stageButton = () =>
+    host.querySelector('button[aria-label="Stage Changes"]');
+  const unstageButton = () =>
+    host.querySelector('button[aria-label="Unstage Changes"]');
+  try {
+    await act(async () =>
+      root.render(
+        createElement(GitChangesPanel, {
+          cwd: "/repo-stage",
+          sourceSessionId: "owner",
+          enabled: true,
+          onOpenFile: vi.fn(),
+          onOpenAllChanges: vi.fn(),
+          onOpenCommit: vi.fn(),
+        }),
+      ),
+    );
+    expect(stageButton()).not.toBeNull();
+    expect(unstageButton()).toBeNull();
+    await act(async () => {
+      (stageButton() as HTMLButtonElement).click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    // The row moved to the staged section before the refreshed index
+    // resolved, and the mutation triggered exactly one index reload
+    // (notify + no duplicate reload pass).
+    expect(stageButton()).toBeNull();
+    expect(unstageButton()).not.toBeNull();
+    expect(indexCalls).toBe(2);
+    await act(async () => release?.());
+    expect(unstageButton()).not.toBeNull();
+    expect(indexCalls).toBe(2);
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    vi.mocked(invoke).mockImplementation(original);
+    vi.unstubAllGlobals();
+  }
+});
+
+it("toggles selection from the row and hides row actions while selecting", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const checkbox = () =>
+    host.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+  const onOpenFile = vi.fn();
+  try {
+    await act(async () =>
+      root.render(
+        createElement(GitChangesPanel, {
+          cwd: "/repo-row",
+          sourceSessionId: "owner",
+          enabled: true,
+          onOpenFile,
+          onOpenAllChanges: vi.fn(),
+          onOpenCommit: vi.fn(),
+        }),
+      ),
+    );
+    await act(async () =>
+      (
+        host.querySelector(
+          'button[aria-label="Select files for agent"]',
+        ) as HTMLButtonElement
+      ).click(),
+    );
+    // Clicking the row body (not the checkbox) toggles selection and does
+    // not open the file.
+    await act(async () =>
+      (host.querySelector('button[title="a.ts"]') as HTMLButtonElement).click(),
+    );
+    expect(checkbox()?.checked).toBe(true);
+    expect(onOpenFile).not.toHaveBeenCalled();
+    // Stage/unstage/discard icons stay out of the way in selection mode.
+    expect(host.querySelector('button[aria-label="Stage Changes"]')).toBeNull();
+    await act(async () =>
+      (host.querySelector('button[title="a.ts"]') as HTMLButtonElement).click(),
+    );
+    expect(checkbox()?.checked).toBe(false);
   } finally {
     await act(async () => root.unmount());
     host.remove();

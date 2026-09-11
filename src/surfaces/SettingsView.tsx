@@ -95,6 +95,7 @@ import {
 } from "../lib/uiScale";
 import {
   getHarnessAvailabilitySnapshot,
+  harnessAuthHint,
   harnessUnavailableHint,
   isHarnessAvailable,
   probeHarnessAvailability,
@@ -1800,7 +1801,7 @@ function ProviderRow({
       }
       description={
         available
-          ? `${models.length} ${models.length === 1 ? "model" : "models"} available.`
+          ? `${models.length} ${models.length === 1 ? "model" : "models"} available.${harnessAuthHint(harness, cwd) ? ` ${harnessAuthHint(harness, cwd)}` : ""}`
           : harnessUnavailableHint(harness, cwd)
       }
     >

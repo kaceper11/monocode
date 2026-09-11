@@ -15,6 +15,7 @@ import {
   findProjectByCommonDir,
   loadProjects,
   locateRepository,
+  isProjectRailKey,
   moveRepositorySet,
   projectsSnapshot,
   removeRepositoryFromProject,
@@ -100,7 +101,9 @@ export function ProjectRepositories({
     (family
       ? findProjectByCommonDir(family.commonDir, projects)?.project
       : undefined) ??
-    projects.find((entry) => pathKey(entry.anchor) === pathKey(path));
+    projects.find(
+      (entry) => entry.anchor && pathKey(entry.anchor) === pathKey(path),
+    );
 
   // An implicit one-repository project still lists its verified repository so
   // it can join saved sets and the sheet can materialize on first edit.
@@ -113,6 +116,7 @@ export function ProjectRepositories({
 
   const title = useMemo(() => {
     if (project?.name) return project.name;
+    if (isProjectRailKey(path)) return "Project";
     const key = projectKey(project?.anchor ?? path);
     return resolveTabGroupLabel(
       key,
@@ -164,9 +168,14 @@ export function ProjectRepositories({
       return;
     }
     const target = ensureProject();
+    const anchor = found.checkout || target.anchor;
+    if (!anchor) {
+      setError("Pick a working-copy folder for this repository.");
+      return;
+    }
     const result = addRepositoryToProject(target.id, {
       commonDir: found.commonDir,
-      anchor: found.checkout || target.anchor,
+      anchor,
     });
     setError(result.error ?? "");
   };
@@ -269,7 +278,11 @@ export function ProjectRepositories({
     <Modal
       onClose={onClose}
       title={title}
-      description={prettyCwd(project?.anchor ?? path)}
+      description={
+        isProjectRailKey(path)
+          ? "A group of repositories — no folder of its own"
+          : prettyCwd(project?.anchor ?? path)
+      }
       size="md"
     >
       <div className="flex flex-col gap-3 px-4 pb-4 pt-1">
@@ -448,7 +461,10 @@ export function ProjectRepositories({
                           </span>
                           {owner ? (
                             <span className="shrink-0 text-[10px] text-content/45">
-                              Moves from {owner.name ?? basename(owner.anchor)}
+                              Moves from {owner.name ??
+                                (owner.anchor
+                                  ? basename(owner.anchor)
+                                  : "another project")}
                             </span>
                           ) : null}
                         </button>

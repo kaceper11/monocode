@@ -18,6 +18,7 @@ import {
   Plus,
   Search,
   SquarePlus,
+  Task,
   Settings,
   Trash2,
 } from "./icons";
@@ -40,6 +41,9 @@ import {
   subscribeProjects,
   deleteProject,
   familyForRepository,
+  projectRailKey,
+  isProjectRailKey,
+  createProjectGroup,
   renameProject,
   type ProjectRecord,
 } from "../lib/projects";
@@ -115,6 +119,19 @@ import { TabGroupMenu, type TabGroupMenuExtraItem } from "./TabGroupMenu";
 import { TerminalSpinner } from "./TerminalSpinner";
 import { Popover } from "./Popover";
 import { WorktreePanel } from "./WorktreePicker";
+import {
+  archiveTask,
+  removeTask,
+  repositoryForChild,
+  subscribeTaskWorkspaces,
+  taskChildRepoLabel,
+  taskForSession,
+  taskWorkspacesSnapshot,
+  loadTaskWorkspaces,
+  projectForTask,
+  type TaskChild,
+  type TaskWorkspace,
+} from "../lib/taskWorkspaces";
 import type { SettingsSectionId } from "../lib/settings";
 
 const REVEAL_LABEL = IS_MAC
@@ -126,6 +143,7 @@ const REVEAL_LABEL = IS_MAC
 function projectMenuExtraItems(
   pinned: boolean,
   canRemove: boolean,
+  hasFolder: boolean,
 ): TabGroupMenuExtraItem[] {
   const items: TabGroupMenuExtraItem[] = [
     {
@@ -146,7 +164,9 @@ function projectMenuExtraItems(
     pinned
       ? { id: "unpin", label: "Unpin project", icon: PinOff }
       : { id: "pin", label: "Pin project", icon: Pin },
-    { id: "reveal", label: REVEAL_LABEL, icon: FolderOpen },
+    ...(hasFolder
+      ? [{ id: "reveal", label: REVEAL_LABEL, icon: FolderOpen }]
+      : []),
   ];
   if (canRemove) {
     items.push(
@@ -177,6 +197,13 @@ type Props = {
   onSelectProject: (path: string) => void;
   onOpenProject: () => void;
   onNewTask?: (path: string, projectId?: string) => void;
+  onOpenTask?: (taskId: string) => void;
+  /** Just-created task — highlighted as current until a task session takes
+   * over. Purely presentational; never launches work. */
+  focusTaskId?: string;
+  onEditTask?: (taskId: string) => void;
+  /** Sessions currently needing input (approval or question) — per-child dots. */
+  needsInputSessionIds?: ReadonlySet<string>;
   onRemoveProject?: (path: string, options: { purgeData: boolean }) => void;
   liveAgents?: LiveAgent[];
   activeSessionId?: string;
@@ -211,6 +238,10 @@ export function ProjectRail({
   onSelectProject,
   onOpenProject,
   onNewTask,
+  onOpenTask,
+  focusTaskId,
+  onEditTask,
+  needsInputSessionIds,
   onRemoveProject,
   liveAgents = [],
   activeSessionId,
@@ -258,6 +289,80 @@ export function ProjectRail({
     path: string;
     projectId?: string;
   } | null>(null);
+  const [taskMenu, setTaskMenu] = useState<{
+    x: number;
+    y: number;
+    task: TaskWorkspace;
+  } | null>(null);
+  const tasksRaw = useSyncExternalStore(
+    subscribeTaskWorkspaces,
+    taskWorkspacesSnapshot,
+  );
+
+
+  /** Task owning the focused session — drives the scope highlight across all
+   * of its repository rows, not just the host cwd. */
+  const activeTask = useMemo(
+    () => (activeSessionId ? taskForSession(activeSessionId)?.task : undefined),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeSessionId, tasksRaw],
+  );
+  // The session's task wins; a just-created task fills the gap so it reads
+  // as current in the rail before any session exists.
+  const currentTaskId = activeTask?.id ?? focusTaskId;
+  const scopeRepoIds = useMemo(
+    () =>
+      new Set(activeTask?.children.map((entry) => entry.repositoryId) ?? []),
+    [activeTask],
+  );
+  const taskBusyIds = useMemo(() => {
+    const busyIds = new Set(
+      liveAgents.filter((agent) => !agent.done).map((agent) => agent.id),
+    );
+    const set = new Set<string>();
+    for (const task of loadTaskWorkspaces()) {
+      if (task.archived) continue;
+      const ids = [
+        ...(task.sessionIds ?? []),
+        ...task.children.flatMap((entry) => entry.sessionIds),
+      ];
+      if (ids.some((id) => busyIds.has(id))) set.add(task.id);
+    }
+    return set;
+    // tasksRaw changes on every store write.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tasksRaw, liveAgents]);
+  const railTasks = useMemo(() => {
+    const live = loadTaskWorkspaces().filter((task) => !task.archived);
+    const rank = (task: TaskWorkspace) =>
+      task.id === currentTaskId
+        ? 0
+        : taskBusyIds.has(task.id)
+          ? 1
+          : 2;
+    return [...live].sort(
+      (a, b) => rank(a) - rank(b) || b.createdAt - a.createdAt,
+    );
+    // tasksRaw changes on every store write.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tasksRaw, currentTaskId, taskBusyIds]);
+  const archivedTasks = useMemo(
+    () =>
+      loadTaskWorkspaces()
+        .filter((task) => task.archived)
+        .sort((a, b) => b.createdAt - a.createdAt),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [tasksRaw],
+  );
+  const taskBySessionId = useMemo(() => {
+    const map = new Map<string, { task: TaskWorkspace; child: TaskChild }>();
+    for (const agent of liveAgents) {
+      const scope = taskForSession(agent.id);
+      if (scope) map.set(agent.id, scope);
+    }
+    return map;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tasksRaw, liveAgents]);
   const [removing, setRemoving] = useState<{
     path: string;
     name: string;
@@ -277,9 +382,12 @@ export function ProjectRail({
     // Stored projects keep a rail row from their anchor even when no member
     // path is a recent; the anchor keys order, pins and appearance.
     for (const project of storedProjects) {
-      const key = pathKey(project.anchor);
+      const key = pathKey(project.anchor ?? projectRailKey(project.id));
       if (!map.has(key))
-        map.set(key, { path: project.anchor, openedAt: 0 });
+        map.set(key, {
+          path: project.anchor ?? projectRailKey(project.id),
+          openedAt: 0,
+        });
     }
     return map;
   }, [cwd, recents, storedProjects]);
@@ -359,6 +467,27 @@ export function ProjectRail({
     event.preventDefault();
     event.stopPropagation();
     openProjectMenu(item, event.clientX, event.clientY);
+  };
+
+  const openTaskMenu = (task: TaskWorkspace, x: number, y: number) => {
+    setTaskMenu({ task, x, y });
+  };
+
+  const [addMenu, setAddMenu] = useState<{ x: number; y: number } | null>(
+    null,
+  );
+
+  const closeAddMenu = () => setAddMenu(null);
+
+  /** A pathless project — a pure group; opens its repositories sheet so the
+   * user can add members right away. The group is unnamed until renamed via
+   * its project menu. */
+  const submitGroup = () => {
+    const project = createProjectGroup();
+    setRepositoriesProject({
+      path: projectRailKey(project.id),
+      projectId: project.id,
+    });
   };
 
   const onProjectRename = (groupId: string, label: string) => {
@@ -465,7 +594,8 @@ export function ProjectRail({
     const members = memberRecentPaths(project);
     for (const member of members)
       onRemoveProject?.(member, { purgeData });
-    if (!members.includes(path)) onRemoveProject?.(path, { purgeData });
+    if (!members.includes(path) && !isProjectRailKey(path))
+      onRemoveProject?.(path, { purgeData });
   };
 
   const onProjectMenuPick = (action: string) => {
@@ -483,7 +613,9 @@ export function ProjectRail({
         project: projectKey,
         name: displayName,
       });
-    } else if (action === "reveal") void revealPath(path);
+    } else if (action === "reveal") {
+      if (!isProjectRailKey(path)) void revealPath(path);
+    }
     else if (action === "archive") {
       removeProjectEntry(path, projectId, false);
     } else if (action === "delete") {
@@ -573,6 +705,29 @@ export function ProjectRail({
             }}
             className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-none pb-2"
           >
+            <TasksSection
+              tasks={railTasks}
+              archivedTasks={archivedTasks}
+              currentTaskId={currentTaskId}
+              busyIds={taskBusyIds}
+              needsInputIds={needsInputSessionIds}
+              onOpen={onOpenTask}
+              onMenu={openTaskMenu}
+              onNewTask={
+                storedProjects.length
+                  ? () => {
+                      const current = storedProjects.find((project) =>
+                        projectContainsPath(project, cwd, families),
+                      );
+                      const project = current ?? storedProjects[0];
+                      onNewTask?.(
+                        project.anchor ?? projectRailKey(project.id),
+                        project.id,
+                      );
+                    }
+                  : undefined
+              }
+            />
             {sections.pinned.length > 0 ? (
               <ProjectSection
                 label="Pinned"
@@ -587,6 +742,7 @@ export function ProjectRail({
                 onTogglePin={onTogglePin}
                 onContextMenu={onProjectContextMenu}
                 onOpenMenu={openProjectMenu}
+                scopeRepoIds={scopeRepoIds}
                 groupLabels={groupLabels}
                 groupColors={groupColors}
                 groupCustomColors={groupCustomColors}
@@ -600,7 +756,9 @@ export function ProjectRail({
               items={sections.projects}
               families={families}
               emptyLabel="No projects yet"
-              onAdd={onOpenProject}
+              onAdd={(event) =>
+                setAddMenu({ x: event.clientX, y: event.clientY })
+              }
               cwd={cwd}
               busy={busy}
               sortable={projectSortable}
@@ -610,6 +768,7 @@ export function ProjectRail({
               onTogglePin={onTogglePin}
               onContextMenu={onProjectContextMenu}
               onOpenMenu={openProjectMenu}
+              scopeRepoIds={scopeRepoIds}
               groupLabels={groupLabels}
               groupColors={groupColors}
               groupCustomColors={groupCustomColors}
@@ -620,6 +779,7 @@ export function ProjectRail({
           <LiveAgentsPreview
             agents={liveAgents}
             activeSessionId={activeSessionId}
+            taskBySessionId={taskBySessionId}
             onSelect={onSelectAgent}
             groupLabels={groupLabels}
             groupColors={groupColors}
@@ -690,6 +850,7 @@ export function ProjectRail({
               sameProjectPath(pinned, projectMenu.path),
             ),
             Boolean(onRemoveProject),
+            !isProjectRailKey(projectMenu.path),
           )}
           onExtraPick={onProjectMenuPick}
         />
@@ -721,6 +882,103 @@ export function ProjectRail({
           onClose={() => setRepositoriesProject(null)}
         />
       ) : null}
+      {addMenu ? (
+        <Popover
+          anchor={{ x: addMenu.x, y: addMenu.y }}
+          onDismiss={closeAddMenu}
+          role="menu"
+          aria-label="Add project"
+          className="overflow-hidden"
+        >
+          <div className="px-1.5 py-1.5">
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+              onClick={() => {
+                closeAddMenu();
+                onOpenProject();
+              }}
+            >
+              Open folder…
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+              onClick={() => {
+                closeAddMenu();
+                submitGroup();
+              }}
+            >
+              New project group…
+            </button>
+          </div>
+        </Popover>
+      ) : null}
+      {taskMenu ? (
+        <Popover
+          anchor={{ x: taskMenu.x, y: taskMenu.y }}
+          side="right"
+          onDismiss={() => setTaskMenu(null)}
+          role="menu"
+          aria-label={`Task ${taskMenu.task.name}`}
+          className="overflow-hidden"
+        >
+          <div className="px-1.5 py-1.5">
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+              onClick={() => {
+                onOpenTask?.(taskMenu.task.id);
+                setTaskMenu(null);
+              }}
+            >
+              Open task
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+              onClick={() => {
+                onEditTask?.(taskMenu.task.id);
+                setTaskMenu(null);
+              }}
+            >
+              Edit task…
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+              onClick={() => {
+                archiveTask(taskMenu.task.id, !taskMenu.task.archived);
+                setTaskMenu(null);
+              }}
+            >
+              {taskMenu.task.archived ? "Unarchive task" : "Archive task"}
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-red-400 hover:bg-content/5"
+              onClick={() => {
+                // Sessions and working copies survive — only the record goes.
+                if (
+                  window.confirm(
+                    `Delete task “${taskMenu.task.name}”? Its sessions and working copies stay.`,
+                  )
+                )
+                  removeTask(taskMenu.task.id);
+                setTaskMenu(null);
+              }}
+            >
+              Delete task
+            </button>
+          </div>
+        </Popover>
+      ) : null}
       <div
         role="separator"
         aria-orientation="vertical"
@@ -746,6 +1004,7 @@ const LIVE_AGENT_CAP = 4;
 function LiveAgentsPreview({
   agents,
   activeSessionId,
+  taskBySessionId,
   onSelect,
   groupLabels,
   groupColors,
@@ -754,6 +1013,10 @@ function LiveAgentsPreview({
 }: {
   agents: LiveAgent[];
   activeSessionId?: string;
+  taskBySessionId?: ReadonlyMap<
+    string,
+    { task: TaskWorkspace; child: TaskChild }
+  >;
   onSelect?: (sessionId: string) => void;
   groupLabels: Record<string, string>;
   groupColors: Record<string, number>;
@@ -810,6 +1073,7 @@ function LiveAgentsPreview({
               agent={agent}
               now={now}
               selected={agent.id === activeSessionId}
+              taskScope={taskBySessionId?.get(agent.id)}
               onSelect={onSelect}
               groupLabels={groupLabels}
               groupColors={groupColors}
@@ -842,6 +1106,7 @@ function LiveAgentCard({
   agent,
   now,
   selected,
+  taskScope,
   onSelect,
   groupLabels,
   groupColors,
@@ -851,6 +1116,7 @@ function LiveAgentCard({
   agent: LiveAgent;
   now: number;
   selected: boolean;
+  taskScope?: { task: TaskWorkspace; child: TaskChild };
   onSelect?: (sessionId: string) => void;
   groupLabels: Record<string, string>;
   groupColors: Record<string, number>;
@@ -892,13 +1158,20 @@ function LiveAgentCard({
       }`}
     >
       <span className="flex min-w-0 items-center gap-2">
-        <ProjectMascot
-          project={seed}
-          color={color}
-          name={resolveTabGroupMascot(key, groupMascots)}
-          className="size-2 shrink-0"
-          active={live}
-        />
+        {taskScope ? (
+          <Task
+            className={`size-3 shrink-0 ${live ? "text-accent" : "text-content/40"}`}
+            strokeWidth={1.75}
+          />
+        ) : (
+          <ProjectMascot
+            project={seed}
+            color={color}
+            name={resolveTabGroupMascot(key, groupMascots)}
+            className="size-2 shrink-0"
+            active={live}
+          />
+        )}
         {live ? (
           <p className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-snug">
             {agent.title}
@@ -929,7 +1202,16 @@ function LiveAgentCard({
       </span>
       <span className="mt-1 flex min-w-0 items-center gap-1.5 pl-4 text-[11px] leading-tight text-content/45">
         <HarnessIcon harness={agent.harness} className="size-3 shrink-0" />
-        <span className="min-w-0 flex-1 truncate">{project}</span>
+        <span className="min-w-0 flex-1 truncate">
+          {taskScope
+            ? [
+                taskScope.task.name,
+                ...taskScope.task.children.map((child) =>
+                  taskChildRepoLabel(taskScope.task, child),
+                ),
+              ].join(" · ")
+            : project}
+        </span>
         {elapsed ? (
           <span className="shrink-0 tabular-nums">{elapsed}</span>
         ) : null}
@@ -953,6 +1235,7 @@ function ProjectSection({
   onTogglePin,
   onContextMenu,
   onOpenMenu,
+  scopeRepoIds,
   groupLabels,
   groupColors,
   groupCustomColors,
@@ -963,7 +1246,7 @@ function ProjectSection({
   items: RailProjectItem[];
   families: ReadonlyMap<string, RepositoryFamily>;
   emptyLabel?: string;
-  onAdd?: () => void;
+  onAdd?: (event: MouseEvent<HTMLButtonElement>) => void;
   cwd: string;
   busy: Set<string>;
   sortable: SortableHandle;
@@ -977,6 +1260,7 @@ function ProjectSection({
     x: number,
     y: number,
   ) => void;
+  scopeRepoIds?: ReadonlySet<string>;
   groupLabels: Record<string, string>;
   groupColors: Record<string, number>;
   groupCustomColors: Record<string, string>;
@@ -1024,6 +1308,7 @@ function ProjectSection({
             onTogglePin={onTogglePin}
             onContextMenu={onContextMenu}
             onOpenMenu={onOpenMenu}
+            scopeRepoIds={scopeRepoIds}
             groupLabels={groupLabels}
             groupColors={groupColors}
             groupCustomColors={groupCustomColors}
@@ -1162,9 +1447,13 @@ function ProjectRepositoryRow({
   cwd,
   busyPaths,
   recents,
+  scoped = false,
   onSelect,
 }: {
   repo: ProjectRecord["repositories"][number];
+  /** The focused session's task spans this repository — secondary scope
+   * highlight alongside the host's `active` state. */
+  scoped?: boolean;
   families: ReadonlyMap<string, RepositoryFamily>;
   hidden: string[];
   cwd: string;
@@ -1173,8 +1462,9 @@ function ProjectRepositoryRow({
   onSelect: (path: string) => void;
 }) {
   const anchor = useRef<HTMLButtonElement>(null);
-  const managePath = useRef<string | undefined>(undefined);
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [menu, setMenu] = useState<{ create: boolean; path?: string } | null>(
+    null,
+  );
   const [working, setWorking] = useState(false);
   const family = familyForRepository(repo, families);
   const [expanded, setExpanded] = useExpandedRow(
@@ -1214,16 +1504,18 @@ function ProjectRepositoryRow({
           type="button"
           title={prettyCwd(repo.anchor)}
           aria-current={active ? "true" : undefined}
-          className={`flex h-7 w-full min-w-0 items-center gap-1.5 rounded-md pl-2 pr-7 text-left text-xs outline-none focus-visible:ring-1 focus-visible:ring-content/30 ${active ? "bg-content/10 text-content" : "text-content/55 hover:bg-content/5 hover:text-content/85"}`}
+          className={`flex h-7 w-full min-w-0 items-center gap-1.5 rounded-md pl-2 pr-7 text-left text-xs outline-none focus-visible:ring-1 focus-visible:ring-content/30 group-hover/repository:pr-12 ${active ? "bg-content/10 text-content" : scoped ? "bg-accent/10 text-content/80 hover:bg-accent/15" : "text-content/55 hover:bg-content/5 hover:text-content/85"}`}
           onClick={openRepository}
         >
           <Folder
-            className="size-3 shrink-0 text-content/40"
+            className={`size-3 shrink-0 ${scoped ? "text-accent/70" : "text-content/40"}`}
             strokeWidth={1.5}
           />
           <span className="min-w-0 flex-1 truncate">{name}</span>
           {wsl ? (
-            <span className="shrink-0 text-[10px] text-content/40">WSL</span>
+            <span className="shrink-0 text-[10px] text-content/40 group-hover/repository:invisible">
+              WSL
+            </span>
           ) : null}
           {active ? (
             <Check
@@ -1232,18 +1524,34 @@ function ProjectRepositoryRow({
             />
           ) : null}
         </button>
-        <button
-          type="button"
-          title="Repository worktrees"
-          aria-label={`Manage ${name} worktrees`}
-          className="invisible absolute right-1 top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded-md text-content/40 hover:bg-content/10 hover:text-content group-hover/repository:visible group-focus-within/repository:visible focus-visible:ring-1 focus-visible:ring-content/30"
-          onClick={(event) => {
-            anchor.current = event.currentTarget;
-            setMenuOpen(true);
-          }}
-        >
-          <MoreHorizontal className="size-3" />
-        </button>
+        <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
+          {family ? (
+            <button
+              type="button"
+              title={`New worktree in ${name}`}
+              aria-label={`New worktree in ${name}`}
+              className="invisible grid size-5 place-items-center rounded-md text-content/40 hover:bg-content/10 hover:text-content group-hover/repository:visible group-focus-within/repository:visible focus-visible:ring-1 focus-visible:ring-content/30"
+              onClick={(event) => {
+                anchor.current = event.currentTarget;
+                setMenu({ create: true });
+              }}
+            >
+              <Plus className="size-3" strokeWidth={1.75} />
+            </button>
+          ) : null}
+          <button
+            type="button"
+            title="Repository worktrees"
+            aria-label={`Manage ${name} worktrees`}
+            className="invisible grid size-5 place-items-center rounded-md text-content/40 hover:bg-content/10 hover:text-content group-hover/repository:visible group-focus-within/repository:visible focus-visible:ring-1 focus-visible:ring-content/30"
+            onClick={(event) => {
+              anchor.current = event.currentTarget;
+              setMenu({ create: false });
+            }}
+          >
+            <MoreHorizontal className="size-3" />
+          </button>
+        </div>
       </div>
       {visible && family ? (
         <div className="my-0.5 ml-5">
@@ -1256,13 +1564,12 @@ function ProjectRepositoryRow({
             onSelect={onSelect}
             onManage={(event, path) => {
               anchor.current = event.currentTarget;
-              setMenuOpen(true);
-              managePath.current = path;
+              setMenu({ create: false, path });
             }}
           />
         </div>
       ) : null}
-      {menuOpen && (
+      {menu && (
         <Popover
           anchor={anchor}
           side="right"
@@ -1270,7 +1577,7 @@ function ProjectRepositoryRow({
           maxHeight={380}
           onDismiss={() => {
             if (!working) {
-              setMenuOpen(false);
+              setMenu(null);
               anchor.current?.focus();
             }
           }}
@@ -1279,9 +1586,9 @@ function ProjectRepositoryRow({
           className="flex flex-col overflow-hidden"
         >
           <WorktreePanel
-            key={managePath.current ?? ""}
-            initialCreate={false}
-            initialPath={managePath.current}
+            key={`${menu.create}:${menu.path ?? ""}`}
+            initialCreate={menu.create}
+            initialPath={menu.path}
             activeCwd={cwd}
             cwd={
               family?.worktrees.find(
@@ -1289,7 +1596,7 @@ function ProjectRepositoryRow({
               )?.path ?? repo.anchor
             }
             onClose={() => {
-              setMenuOpen(false);
+              setMenu(null);
               anchor.current?.focus();
             }}
             onOpen={onSelect}
@@ -1301,19 +1608,253 @@ function ProjectRepositoryRow({
   );
 }
 
+const TASK_RAIL_CAP = 8;
+
+/** The rail's one home for tasks — a dedicated section listing every active
+ * task with live status, instead of rows buried inside each project.
+ * Archived tasks collapse under a toggle so they stay recoverable. */
+function TasksSection({
+  tasks,
+  archivedTasks,
+  currentTaskId,
+  busyIds,
+  needsInputIds,
+  onOpen,
+  onMenu,
+  onNewTask,
+}: {
+  tasks: TaskWorkspace[];
+  archivedTasks: TaskWorkspace[];
+  currentTaskId?: string;
+  busyIds: ReadonlySet<string>;
+  needsInputIds?: ReadonlySet<string>;
+  onOpen?: (taskId: string) => void;
+  onMenu: (task: TaskWorkspace, x: number, y: number) => void;
+  onNewTask?: () => void;
+}) {
+  const [showArchived, setShowArchived] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+  if (!tasks.length && !archivedTasks.length) return null;
+  // The rail stays compact — current and working tasks sort first, the
+  // long tail hides behind a toggle like the archived list.
+  const visibleTasks =
+    showAll || tasks.length <= TASK_RAIL_CAP ? tasks : tasks.slice(0, TASK_RAIL_CAP);
+  const row = (task: TaskWorkspace, archived = false) => {
+    const project = projectForTask(task);
+    return (
+      <TaskRailRow
+        key={task.id}
+        task={task}
+        archived={archived}
+        active={task.id === currentTaskId}
+        busy={busyIds.has(task.id)}
+        needsInput={
+          task.sessionIds?.some((id) => needsInputIds?.has(id)) ||
+          task.children.some((entry) =>
+            entry.sessionIds.some((id) => needsInputIds?.has(id)),
+          ) ||
+          false
+        }
+        project={project}
+        onOpen={() => onOpen?.(task.id)}
+        onMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onMenu(task, event.clientX, event.clientY);
+        }}
+      />
+    );
+  };
+  return (
+    <div className="mb-2 shrink-0">
+      <div className="flex items-center gap-1 px-3 pb-1.5 pt-1">
+        <span className="min-w-0 flex-1 truncate px-1 text-xs text-content/50">
+          Tasks
+        </span>
+        {onNewTask ? (
+          <button
+            type="button"
+            title="New task"
+            aria-label="New task"
+            onClick={onNewTask}
+            className="grid size-5 shrink-0 place-items-center rounded-md text-content/50 hover:bg-content/8 hover:text-content"
+          >
+            <Plus className="size-3.5" strokeWidth={1.75} />
+          </button>
+        ) : null}
+      </div>
+      <div className="flex flex-col gap-px px-2">
+        {visibleTasks.map((task) => row(task))}
+        {tasks.length > visibleTasks.length ? (
+          <button
+            type="button"
+            onClick={() => setShowAll(true)}
+            className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-[11px] text-content/40 hover:bg-content/5 hover:text-content/60"
+          >
+            {tasks.length - visibleTasks.length} more tasks
+          </button>
+        ) : null}
+      </div>
+      {archivedTasks.length ? (
+        <div className="px-2 pt-1">
+          <button
+            type="button"
+            aria-expanded={showArchived}
+            onClick={() => setShowArchived((value) => !value)}
+            className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-[11px] text-content/40 hover:bg-content/5 hover:text-content/60"
+          >
+            <ChevronDown
+              className={`size-3 shrink-0 transition-transform ${showArchived ? "" : "-rotate-90"}`}
+              strokeWidth={1.75}
+            />
+            Archived · {archivedTasks.length}
+          </button>
+          {showArchived ? (
+            <div className="flex flex-col gap-px">
+              {archivedTasks.map((task) => row(task, true))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** One task row in the Tasks section — name, ticket ref, project +
+ * repository meta, needs-input and working markers. Opens the task. */
+function TaskRailRow({
+  task,
+  active = false,
+  busy = false,
+  archived = false,
+  needsInput,
+  project,
+  onOpen,
+  onMenu,
+}: {
+  task: TaskWorkspace;
+  /** Its session is the focused one — persistent row highlight. */
+  active?: boolean;
+  /** Its agent is mid-turn — pulsing marker. */
+  busy?: boolean;
+  /** Dimmed row under the section's archived expander. */
+  archived?: boolean;
+  needsInput: boolean;
+  /** Owning project — already resolved by the caller, shown for context. */
+  project?: ProjectRecord;
+  onOpen: () => void;
+  onMenu: (event: MouseEvent<HTMLElement>) => void;
+}) {
+  const ticket = task.ticket?.identifier;
+  const projectLabel = project
+    ? project.name?.trim() ||
+      (project.anchor ? projectName(project.anchor) : "Project")
+    : "";
+  const repoNames = task.children
+    .map((entry) => {
+      const repo = repositoryForChild(task, entry, project);
+      return repo ? repositoryDisplayName(repo) : "Repository";
+    })
+    .join(" · ");
+  const title = [
+    ticket,
+    task.name,
+    repoNames || `${task.children.length} repos`,
+    needsInput ? "Needs input" : undefined,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <div className="group/task relative flex min-w-0 items-center">
+      <button
+        type="button"
+        title={title}
+        aria-label={title}
+        onClick={onOpen}
+        onContextMenu={onMenu}
+        className={`flex w-full min-w-0 flex-col rounded-md px-2 py-1.5 pr-7 text-left outline-none hover:bg-content/8 focus-visible:ring-1 focus-visible:ring-content/30 ${
+          active ? "bg-content/10" : ""
+        } ${archived ? "opacity-55" : ""}`}
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <Task
+            className={`size-3 shrink-0 ${
+              busy
+                ? "animate-pulse text-accent"
+                : active
+                  ? "text-accent/80"
+                  : "text-content/40"
+            }`}
+            strokeWidth={1.5}
+          />
+          <span className="min-w-0 flex-1 truncate text-[13px] font-medium leading-snug text-content">
+            {task.name}
+          </span>
+          {busy ? (
+            <span className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-accent">
+              Working
+            </span>
+          ) : ticket ? (
+            <span className="shrink-0 text-[11px] text-content/40">
+              {ticket}
+            </span>
+          ) : projectLabel ? (
+            <span className="shrink-0 truncate text-[10px] text-content/40">
+              {projectLabel}
+            </span>
+          ) : null}
+        </span>
+        <span className="mt-0.5 flex min-w-0 items-center gap-1.5 pl-5 text-[11px] leading-tight">
+          {needsInput ? (
+            <span className="size-1.5 shrink-0 rounded-full bg-amber-400" />
+          ) : null}
+          <span
+            className={`min-w-0 flex-1 truncate ${
+              needsInput ? "text-amber-400" : "text-content/45"
+            }`}
+          >
+            {needsInput ? "Needs input" : ""}
+            {needsInput && repoNames ? " · " : ""}
+            {repoNames || `${task.children.length} repos`}
+            {projectLabel ? ` · ${projectLabel}` : ""}
+          </span>
+        </span>
+      </button>
+      <button
+        type="button"
+        title="Task menu"
+        aria-label={`Menu for task ${task.name}`}
+        className="invisible absolute right-1 top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded-md text-content/40 hover:bg-content/10 hover:text-content focus-visible:ring-1 focus-visible:ring-content/30 group-hover/task:visible group-focus-within/task:visible"
+        onClick={onMenu}
+      >
+        <MoreHorizontal className="size-3" />
+      </button>
+    </div>
+  );
+}
+
 function ProjectFamilyCard(
   props: Parameters<typeof ProjectCard>[0] & {
     family?: RepositoryFamily;
     families: ReadonlyMap<string, RepositoryFamily>;
     cwd: string;
     busyPaths: Set<string>;
+    scopeRepoIds?: ReadonlySet<string>;
   },
 ) {
-  const { family, families, cwd, busyPaths, onSelect } = props;
+  const {
+    family,
+    families,
+    cwd,
+    busyPaths,
+    onSelect,
+    scopeRepoIds,
+  } = props;
   const project = props.item.project;
   const multiRepo = (project?.repositories.length ?? 0) > 1;
+  /** Anchorless group — no own folder; the row exists to hold members. */
+  const isGroup = !!project && !project.anchor;
   const anchor = useRef<HTMLButtonElement>(null);
-  const managePath = useRef<string | undefined>(undefined);
   const [menu, setMenu] = useState<{ create: boolean; path?: string } | null>(
     null,
   );
@@ -1334,12 +1875,12 @@ function ProjectFamilyCard(
       sameProjectPath(child.path, cwd) ||
       !hidden.some((path) => sameProjectPath(path, child.path)),
   );
-  const visible = multiRepo
-    ? (expanded ?? false)
-    : (expanded ?? children.length > 1);
-  const selected = multiRepo
-    ? !!project && projectContainsPath(project, cwd, families)
-    : children.some((child) => sameProjectPath(child.path, cwd));
+  const visible =
+    expanded ?? (isGroup || (!multiRepo && children.length > 1));
+  const selected =
+    multiRepo || isGroup
+      ? !!project && projectContainsPath(project, cwd, families)
+      : children.some((child) => sameProjectPath(child.path, cwd));
   const busy =
     props.busy ||
     (!!project &&
@@ -1376,6 +1917,11 @@ function ProjectFamilyCard(
       onSelect(project.lastPath);
       return;
     }
+    // A group has no folder of its own — clicking it just expands.
+    if (isGroup) {
+      setExpanded(!visible);
+      return;
+    }
     onSelect(
       lastWorkingCopyPath(family?.commonDir ?? "", family) ?? props.item.path,
     );
@@ -1388,16 +1934,23 @@ function ProjectFamilyCard(
         busy={busy}
         onSelect={openLast}
         worktreeControls={
-          family || multiRepo
+          family || multiRepo || isGroup
             ? {
                 expanded: visible,
                 toggle: () => setExpanded(!visible),
-                create: (event) => { anchor.current = event.currentTarget; managePath.current = undefined; setMenu({ create: true }); },
+                ...(multiRepo || isGroup
+                  ? {}
+                  : {
+                      create: (event) => {
+                        anchor.current = event.currentTarget;
+                        setMenu({ create: true });
+                      },
+                    }),
               }
             : undefined
         }
       />
-      {visible && multiRepo && project && (
+      {visible && (multiRepo || isGroup) && project && (
         <div className="my-0.5 ml-5">
           {project.repositories.map((repo) => (
             <ProjectRepositoryRow
@@ -1408,12 +1961,13 @@ function ProjectFamilyCard(
               cwd={cwd}
               busyPaths={busyPaths}
               recents={recents}
+              scoped={scopeRepoIds?.has(repo.id) ?? false}
               onSelect={onSelect}
             />
           ))}
         </div>
       )}
-      {visible && !multiRepo && family && (
+      {visible && !multiRepo && !isGroup && family && (
         <div className="my-0.5 ml-5">
           <WorkingCopyRows
             family={family}
@@ -1424,17 +1978,16 @@ function ProjectFamilyCard(
             onSelect={onSelect}
             onManage={(event, path) => {
               anchor.current = event.currentTarget;
-              managePath.current = path;
               setMenu({ create: false, path });
             }}
           />
         </div>
       )}
-      {visible && !multiRepo && allChildren.length > children.length && (
+      {visible && !multiRepo && !isGroup && allChildren.length > children.length && (
         <button
           type="button"
           className="w-full rounded px-2 py-1 text-left text-[10px] text-content/50 hover:bg-content/5"
-          onClick={(event) => { anchor.current = event.currentTarget; managePath.current = undefined; setMenu({ create: false }); }}
+          onClick={(event) => { anchor.current = event.currentTarget; setMenu({ create: false }); }}
         >
           {allChildren.length - children.length} hidden · Manage worktrees
         </button>
@@ -1494,7 +2047,9 @@ function ProjectCard({
   worktreeControls?: {
     expanded: boolean;
     toggle: () => void;
-    create: (event: MouseEvent<HTMLButtonElement>) => void;
+    /** Worktree creation lives on repository rows for multi-repo projects —
+     * a project-level + would silently target only the anchor repo. */
+    create?: (event: MouseEvent<HTMLButtonElement>) => void;
   };
   selected: boolean;
   busy: boolean;
@@ -1511,7 +2066,8 @@ function ProjectCard({
   groupLogos: ReturnType<typeof useTabGroupLogos>;
   groupMascots: Record<string, string>;
 }) {
-  const fallbackName = basename(item.path);
+  const groupRow = isProjectRailKey(item.path);
+  const fallbackName = groupRow ? "Project" : basename(item.path);
   const key = projectKey(item.path);
   const seed = projectName(item.path);
   const name =
@@ -1530,13 +2086,19 @@ function ProjectCard({
     sortable.toIndex === index &&
     sortable.fromIndex !== null &&
     sortable.toIndex > sortable.fromIndex;
-  const diffEnabled = Boolean(item.path) && item.path !== "~";
+  const diffEnabled =
+    Boolean(item.path) && item.path !== "~" && !groupRow;
   const stats = useProjectDiffStats(item.path, diffEnabled);
   const files = stats?.files ?? 0;
   const additions = stats?.additions ?? 0;
   const deletions = stats?.deletions ?? 0;
   const hasChanges = files > 0 || additions > 0 || deletions > 0;
-  const cardTitle = projectCardTitle(item.path, name, stats, busy);
+  const cardTitle = projectCardTitle(
+    groupRow ? "" : item.path,
+    name,
+    stats,
+    busy,
+  );
   const cardAriaLabel = projectCardAriaLabel(name, stats, busy);
 
   return (
@@ -1588,7 +2150,7 @@ function ProjectCard({
         title={cardTitle}
         aria-label={cardAriaLabel}
         aria-current={selected ? "true" : undefined}
-        className={`flex min-w-0 flex-1 cursor-default items-center gap-2 text-left ${worktreeControls ? "group-hover:pr-9" : "group-hover:pr-6"}`}
+        className={`flex min-w-0 flex-1 cursor-default items-center gap-2 text-left ${worktreeControls?.create ? "group-hover:pr-9" : "group-hover:pr-6"}`}
       >
         <div className="grid size-4 shrink-0 place-items-center transition-opacity group-hover:opacity-0">
           {logoPath && !busy ? (
@@ -1624,7 +2186,7 @@ function ProjectCard({
         <WslBadge cwd={item.path} compact />
       </span>
       <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
-        {worktreeControls && (
+        {worktreeControls?.create && (
           <button
             type="button"
             data-no-drag
@@ -1718,7 +2280,7 @@ function projectCardTitle(
   stats: GitDiffStats | null,
   busy: boolean,
 ): string {
-  const parts = [name, path];
+  const parts = [name, path].filter(Boolean);
   if (busy) parts.push("Working");
   const files = stats?.files ?? 0;
   const additions = stats?.additions ?? 0;

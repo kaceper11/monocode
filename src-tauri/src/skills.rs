@@ -153,6 +153,8 @@ pub(crate) fn list_skills_from(
         (".omp/skills", "omp"),
         (".fx/skills", "fx"),
         (".grok/skills", "grok"),
+        (".devin/skills", "devin"),
+        (".windsurf/skills", "devin"),
     ] {
         add_root(project.join(dir), "project", source);
         if let Some(home) = home {
@@ -162,6 +164,8 @@ pub(crate) fn list_skills_from(
     if let Some(home) = home {
         add_root(home.join(".pi/agent/skills"), "user", "pi");
         add_root(home.join(".omp/agent/skills"), "user", "omp");
+        // Devin's documented user skills live under XDG config, not ~/.devin.
+        add_root(home.join(".config/devin/skills"), "user", "devin");
         if crate::wsl::path_location(project).ok().flatten().is_none() {
             for (root, scope, namespace) in claude_plugin_skill_roots(home, project) {
                 add_namespaced_root(
@@ -769,6 +773,37 @@ mod tests {
         assert_eq!(project_skill.scope, "project");
         let user_skill = skills.iter().find(|s| s.name == "grok-global").unwrap();
         assert_eq!(user_skill.source, "grok");
+        assert_eq!(user_skill.scope, "user");
+    }
+
+    #[test]
+    fn discovers_devin_project_and_user_skills() {
+        let project = tmp("proj-devin");
+        let home = tmp("home-devin");
+        write_skill(
+            &project.0.join(".devin/skills"),
+            "devin-review",
+            "---\nname: devin-review\ndescription: devin project skill\n---\n",
+        );
+        write_skill(
+            &project.0.join(".windsurf/skills"),
+            "devin-windsurf",
+            "---\nname: devin-windsurf\ndescription: windsurf-alias project skill\n---\n",
+        );
+        write_skill(
+            &home.0.join(".config/devin/skills"),
+            "devin-global",
+            "---\nname: devin-global\ndescription: devin user skill\n---\n",
+        );
+
+        let skills = list_skills_from(&project.0, Some(&home.0), None);
+        let project_skill = skills.iter().find(|s| s.name == "devin-review").unwrap();
+        assert_eq!(project_skill.source, "devin");
+        assert_eq!(project_skill.scope, "project");
+        let windsurf_skill = skills.iter().find(|s| s.name == "devin-windsurf").unwrap();
+        assert_eq!(windsurf_skill.source, "devin");
+        let user_skill = skills.iter().find(|s| s.name == "devin-global").unwrap();
+        assert_eq!(user_skill.source, "devin");
         assert_eq!(user_skill.scope, "user");
     }
 

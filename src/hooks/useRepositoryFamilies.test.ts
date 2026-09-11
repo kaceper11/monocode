@@ -91,6 +91,43 @@ it("does not publish cancelled discovery or overwrite concurrent updates to anot
   expect(getVerifiedFamilies().has("/later")).toBe(false);
 });
 
+it("keeps the newest probe result when responses arrive out of order", async () => {
+  const worktree = {
+    path: "/repo-wt",
+    head: "abc",
+    branch: "task",
+    main: false,
+    missing: false,
+    locked: null,
+    prunable: null,
+  };
+  const stale = family("/repo");
+  const fresh = { ...family("/repo"), worktrees: [worktree] };
+  let finishOld!: (value: RepositoryFamily) => void;
+  const first = discoverRepositoryFamilies(
+    ["/repo"],
+    () =>
+      new Promise<RepositoryFamily>((resolve) => {
+        finishOld = resolve;
+      }),
+    () => false,
+    "/repo",
+  );
+  // A newer probe for the same family resolves while the first is in flight.
+  const second = discoverRepositoryFamilies(
+    ["/repo"],
+    () => Promise.resolve(fresh),
+    () => false,
+    "/repo",
+  );
+  await second;
+  expect(getVerifiedFamilies().get("/repo")?.worktrees).toHaveLength(1);
+  finishOld(stale);
+  await first;
+  // The late, stale response must not clobber the newer publish.
+  expect(getVerifiedFamilies().get("/repo")?.worktrees).toHaveLength(1);
+});
+
 it("never drops a recent subfolder alias while refreshing a sibling checkout", async () => {
   const initial = {
     ...family("/main"),

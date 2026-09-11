@@ -11,6 +11,34 @@ import {
   type RepositoryFamily,
 } from "../lib/repositoryFamilies";
 
+/** Probe ordering: every probe gets a sequence; a response may only publish
+ * for a commonDir when nothing newer has already landed. Two overlapping
+ * probes of the same family resolve in arbitrary order — this keeps the
+ * freshest result, not the last-arriving one. */
+let probeSeq = 0;
+const familySeq = new Map<string, number>();
+
+function publishFamilyEntries(
+  verified: Map<string, RepositoryFamily>,
+  path: string,
+  family: RepositoryFamily,
+  seq: number,
+): boolean {
+  // Nothing cached means there is no fresher data to be stale against —
+  // drop remembered seqs too so a reset cache can't suppress this publish.
+  if (!verified.size) familySeq.clear();
+  const key = pathKey(family.commonDir);
+  if ((familySeq.get(key) ?? 0) > seq) return false;
+  familySeq.set(key, seq);
+  for (const [entry, value] of verified)
+    if (pathKey(value.commonDir) === key) verified.delete(entry);
+  verified.set(pathKey(path), family);
+  for (const child of family.worktrees)
+    if (!child.missing && !child.prunable)
+      verified.set(pathKey(child.path), family);
+  return true;
+}
+
 /** Reuse unchanged families and publish each newly verified repository promptly.
  * Retain only families reachable from the bounded recent-project list. */
 export async function discoverRepositoryFamilies(
@@ -45,6 +73,7 @@ export async function discoverRepositoryFamilies(
       pathKey(path) !== pathKey(refreshPath ?? "")
     )
       continue;
+    const seq = ++probeSeq;
     try {
       const family = await probe(path);
       if (cancelled()) return;
@@ -72,28 +101,25 @@ export async function discoverRepositoryFamilies(
       // Merge with the latest state: Git refresh may have updated another family.
       const verified = new Map(getVerifiedFamilies());
       const old = verified.get(pathKey(path));
-      for (const [key, value] of verified) {
-        if (
-          pathKey(value.commonDir) === pathKey(family.commonDir) ||
-          (old && pathKey(value.commonDir) === pathKey(old.commonDir))
-        )
-          verified.delete(key);
+      if (old && pathKey(old.commonDir) !== pathKey(family.commonDir)) {
+        for (const [key, value] of verified)
+          if (pathKey(value.commonDir) === pathKey(old.commonDir))
+            verified.delete(key);
       }
-      verified.set(pathKey(path), family);
-      for (const child of family.worktrees) {
-        if (!child.missing && !child.prunable)
-          verified.set(pathKey(child.path), family);
-      }
+      // Drop the write entirely when a newer probe for this family already
+      // published — the last response to arrive is not the freshest.
+      if (!publishFamilyEntries(verified, path, family, seq)) continue;
       for (const alias of refreshedAliases) {
         if (alias) verified.set(...alias);
       }
       publishRepositoryFamilies(verified);
     } catch {
-      // A failed active refresh must not leave stale ownership evidence.
+      // A failed active refresh must not leave stale ownership evidence —
+      // nor wipe a family a newer probe already republished.
       if (cancelled()) return;
       const verified = new Map(getVerifiedFamilies());
       const old = verified.get(pathKey(path));
-      if (old) {
+      if (old && (familySeq.get(pathKey(old.commonDir)) ?? 0) <= seq) {
         for (const [key, value] of verified)
           if (pathKey(value.commonDir) === pathKey(old.commonDir))
             verified.delete(key);
@@ -109,18 +135,14 @@ export async function discoverRepositoryFamilies(
 export async function probeRepositoryFamily(
   path: string,
 ): Promise<RepositoryFamily | null> {
+  const seq = ++probeSeq;
   try {
     const family = await invoke<RepositoryFamily>("git_repository_family", {
       cwd: path,
     });
     const verified = new Map(getVerifiedFamilies());
-    const key = pathKey(family.commonDir);
-    for (const [entry, value] of verified)
-      if (pathKey(value.commonDir) === key) verified.delete(entry);
-    verified.set(pathKey(path), family);
-    for (const child of family.worktrees)
-      if (!child.missing && !child.prunable)
-        verified.set(pathKey(child.path), family);
+    if (!publishFamilyEntries(verified, path, family, seq))
+      return getVerifiedFamilies().get(pathKey(path)) ?? family;
     publishRepositoryFamilies(verified);
     return family;
   } catch {
@@ -132,13 +154,22 @@ export function useRepositoryFamilies(recents: RecentProject[], cwd: string) {
   const [families, setFamilies] = useState<Map<string, RepositoryFamily>>(
     () => new Map(getVerifiedFamilies()),
   );
-  useEffect(
-    () =>
-      subscribeRepositoryFamilies(() =>
-        setFamilies(new Map(getVerifiedFamilies())),
-      ),
-    [],
-  );
+  // Discovery publishes once per probed path; coalesce the burst into one
+  // rail regroup instead of rows merging a step at a time.
+  useEffect(() => {
+    let timer = 0;
+    const unsubscribe = subscribeRepositoryFamilies(() => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(
+        () => setFamilies(new Map(getVerifiedFamilies())),
+        40,
+      );
+    });
+    return () => {
+      window.clearTimeout(timer);
+      unsubscribe();
+    };
+  }, []);
   const familyPaths = JSON.stringify(
     [...collectRailProjects(recents, cwd).values()]
       .map((item) => item.path)

@@ -132,6 +132,34 @@ export function rankMentionFiles(
   const usable = withMentionDirectories(files).filter((file) =>
     isMentionableRelative(file.relative),
   );
+  return rankUsableFiles(usable, query, recents, limit);
+}
+
+/**
+ * Files the attach picker offers. Unlike mentions there is no `@token` to
+ * write, so token-safety does not apply and synthesized directories would
+ * only consume picker slots — rank the indexed files directly.
+ */
+export function rankAttachFiles(
+  files: ProjectFile[],
+  query: string,
+  recents: string[],
+  limit = MAX_PICKER,
+): RankedFile[] {
+  return rankUsableFiles(
+    files.filter((file) => !file.isDir),
+    query,
+    recents,
+    limit,
+  );
+}
+
+function rankUsableFiles(
+  usable: ProjectFile[],
+  query: string,
+  recents: string[],
+  limit: number,
+): RankedFile[] {
   const needle = query.replace(/\/+$/, "").trim();
   if (needle) return rankProjectFiles(usable, needle, recents, limit);
 

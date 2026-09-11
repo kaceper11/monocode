@@ -342,6 +342,18 @@ pub fn harness_resolve_grok() -> Result<CursorBinary, String> {
         })
 }
 
+/// Resolve the Devin CLI (`devin`).
+#[tauri::command(async)]
+pub fn harness_resolve_devin() -> Result<CursorBinary, String> {
+    resolve_devin()
+        .map(|path| CursorBinary {
+            path: path.to_string_lossy().into_owned(),
+        })
+        .ok_or_else(|| {
+            "Devin CLI not found. Install it from https://devin.ai and run `devin auth login`, then retry.".into()
+        })
+}
+
 /// Bind an ephemeral loopback port for `opencode serve`.
 #[tauri::command]
 pub fn harness_free_port() -> Result<u16, String> {
@@ -766,6 +778,7 @@ fn assert_loopback(url: &str) -> Result<(), String> {
 const EXEC_ALLOWED_ARGS: &[&[&str]] = &[
     &["--version"],
     &["--list-models"],
+    &["models", "list", "--format", "json"],
     &["models", "--verbose"],
     &["models", "--json"],
     &["models"],
@@ -792,6 +805,7 @@ fn is_resolved_harness_binary(command: &str) -> bool {
         resolve_omp(),
         resolve_fx(),
         resolve_grok(),
+        resolve_devin(),
     ]
     .into_iter()
     .flatten()
@@ -1146,6 +1160,7 @@ fn is_harness_argv_token(part: &str) -> bool {
             | "grok"
             | "omp"
             | "fx"
+            | "devin"
             | "pi"
             | "worker-server"
             | "app-server"
@@ -1562,6 +1577,31 @@ fn resolve_grok() -> Option<PathBuf> {
     first_binary_matching(candidates, is_grok_agent)
 }
 
+fn resolve_devin() -> Option<PathBuf> {
+    let home = dirs_home().map(PathBuf::from);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Installer layout first: ~/.local/bin/devin links into the versioned
+    // share dir, and either side may be the only entry on a minimal PATH.
+    if let Some(home) = &home {
+        candidates.push(home.join(".local/bin/devin"));
+        candidates.push(home.join(".local/share/devin/cli/_versions/current/bin/devin"));
+        candidates.push(home.join(".npm-global/bin/devin"));
+        candidates.push(home.join(".cargo/bin/devin"));
+        candidates.push(home.join("n/bin/devin"));
+    }
+    #[cfg(target_os = "macos")]
+    candidates.push(PathBuf::from("/opt/homebrew/bin/devin"));
+    candidates.push(PathBuf::from("/usr/local/bin/devin"));
+    candidates.push(PathBuf::from("/usr/bin/devin"));
+    candidates.push(PathBuf::from("/snap/bin/devin"));
+    if let Some(from_shell) = which_via_login_shell("devin") {
+        candidates.push(from_shell);
+    }
+
+    first_binary_matching(candidates, is_devin_agent)
+}
+
 fn is_pi_coding_agent(path: &Path) -> bool {
     if !path.is_file() {
         return false;
@@ -1653,8 +1693,7 @@ fn is_grok_agent(path: &Path) -> bool {
 /// never matched and every resolve fell through to spawning `fx --help`. Scan
 /// the whole file in chunks instead, overlapping enough to catch a marker that
 /// straddles a boundary.
-fn file_mentions_fx_agent(path: &Path) -> bool {
-    const MARKERS: [&str; 4] = ["vercel-labs/fx", "FX_MODEL", "createFxAgent", "fx acp"];
+fn file_contains_markers(path: &Path, markers: &[&str]) -> bool {
     const CHUNK: usize = 1024 * 1024;
     const OVERLAP: usize = 64;
 
@@ -1673,12 +1712,19 @@ fn file_mentions_fx_agent(path: &Path) -> bool {
         }
         let filled = carry + n;
         let text = String::from_utf8_lossy(&buf[..filled]);
-        if MARKERS.iter().any(|marker| text.contains(marker)) {
+        if markers.iter().any(|marker| text.contains(marker)) {
             return true;
         }
         carry = filled.min(OVERLAP);
         buf.copy_within(filled - carry..filled, 0);
     }
+}
+
+fn file_mentions_fx_agent(path: &Path) -> bool {
+    file_contains_markers(
+        path,
+        &["vercel-labs/fx", "FX_MODEL", "createFxAgent", "fx acp"],
+    )
 }
 
 fn fx_help_mentions_acp(path: &Path) -> bool {
@@ -1717,30 +1763,69 @@ fn fx_help_mentions_acp(path: &Path) -> bool {
 }
 
 fn file_mentions_grok_agent(path: &Path) -> bool {
-    const MARKERS: [&str; 4] = ["xai-grok", "Grok Build", "docs.x.ai/build", "grok agent"];
-    const CHUNK: usize = 1024 * 1024;
-    const OVERLAP: usize = 64;
+    file_contains_markers(
+        path,
+        &["xai-grok", "Grok Build", "docs.x.ai/build", "grok agent"],
+    )
+}
 
-    let Ok(file) = std::fs::File::open(path) else {
+fn is_devin_agent(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if !binary_name_eq(path, "devin") {
+        return false;
+    }
+    // Official installer layout: ~/.local/share/devin/cli/_versions/...
+    if path_has_component(path, "devin") && path_has_component(path, "cli") {
+        return true;
+    }
+    file_mentions_devin_agent(path) || devin_help_mentions_acp(path)
+}
+
+fn file_mentions_devin_agent(path: &Path) -> bool {
+    file_contains_markers(
+        path,
+        &[
+            "cognition.ai",
+            "Devin Agent",
+            "devin acp",
+            "agent client protocol",
+        ],
+    )
+}
+
+fn devin_help_mentions_acp(path: &Path) -> bool {
+    let mut cmd = Command::new(path);
+    cmd.arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_gui_env(&mut cmd);
+    isolate_child(&mut cmd);
+    let Ok(child) = spawn_managed(&mut cmd) else {
         return false;
     };
-    let mut reader = BufReader::new(file);
-    let mut buf = vec![0u8; CHUNK + OVERLAP];
-    let mut carry = 0usize;
-    loop {
-        let Ok(n) = reader.read(&mut buf[carry..]) else {
-            return false;
-        };
-        if n == 0 {
-            return false;
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(output)) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .to_ascii_lowercase();
+            text.contains("acp")
+                && (text.contains("devin") || text.contains("agent client protocol"))
         }
-        let filled = carry + n;
-        let text = String::from_utf8_lossy(&buf[..filled]);
-        if MARKERS.iter().any(|marker| text.contains(marker)) {
-            return true;
+        _ => {
+            terminate(pid);
+            false
         }
-        carry = filled.min(OVERLAP);
-        buf.copy_within(filled - carry..filled, 0);
     }
 }
 
@@ -2009,6 +2094,9 @@ fn prepare_child(cmd: &mut Command, command: &str) {
     if command_basename(command) == "grok" {
         apply_grok_env(cmd);
     }
+    if command_basename(command) == "devin" {
+        apply_devin_env(cmd);
+    }
     isolate_child(cmd);
 }
 
@@ -2043,17 +2131,33 @@ fn apply_grok_env(cmd: &mut Command) {
     }
 }
 
+/// Devin reads ~/.local/share/devin/credentials.toml; WINDSURF_API_KEY (or
+/// DEVIN_API_KEY) exported in the login shell is the supported alternative a
+/// bundled app never sees.
+fn apply_devin_env(cmd: &mut Command) {
+    for key in ["DEVIN_API_KEY", "WINDSURF_API_KEY"] {
+        if std::env::var_os(key).is_some() {
+            continue;
+        }
+        if let Some(value) = login_shell_env(key) {
+            cmd.env(key, value);
+        }
+    }
+}
+
 static LOGIN_SHELL_ENV: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 /// Keys worth keeping out of `printenv`. PATH is the important one: a
 /// Finder-launched app inherits only launchd's bare PATH.
-const LOGIN_SHELL_KEYS: [&str; 6] = [
+const LOGIN_SHELL_KEYS: [&str; 8] = [
     "PATH",
     "AI_GATEWAY_API_KEY",
     "FX_AI_GATEWAY_API_KEY",
     "VERCEL_OIDC_TOKEN",
     "XAI_API_KEY",
     "GROK_CODE_XAI_API_KEY",
+    "DEVIN_API_KEY",
+    "WINDSURF_API_KEY",
 ];
 
 fn login_shell_path() -> Option<String> {

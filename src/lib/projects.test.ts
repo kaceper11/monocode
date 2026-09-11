@@ -4,11 +4,13 @@ import { pathKey } from "./paths";
 import type { RepositoryFamily } from "./repositoryFamilies";
 import {
   addRepositoryToProject,
+  createProjectGroup,
   deleteRepositorySet,
   ensureProjectForPath,
   familyForRepository,
   findProjectByCommonDir,
   groupRailProjectsByMembership,
+  isProjectRailKey,
   loadProjects,
   locateRepository,
   moveRepositorySet,
@@ -394,5 +396,63 @@ describe("path resolution", () => {
         families,
       ),
     ).toBeUndefined();
+  });
+});
+
+describe("group projects", () => {
+  it("creates an anchorless project that persists", () => {
+    const group = createProjectGroup("My work");
+    expect(group.anchor).toBeUndefined();
+    expect(group.repositories).toEqual([]);
+    const stored = loadProjects();
+    expect(stored).toHaveLength(1);
+    expect(stored[0].name).toBe("My work");
+    expect(stored[0].anchor).toBeUndefined();
+  });
+
+  it("renders a sentinel rail row and still absorbs member recents", () => {
+    const group = createProjectGroup();
+    const lib = family("/tmp/lib/.git", "/tmp/lib");
+    addRepositoryToProject(group.id, {
+      commonDir: lib.commonDir,
+      anchor: lib.checkout,
+    });
+    const stored = loadProjects();
+    const families = new Map([[pathKey("/tmp/lib"), lib]]);
+    const sections = groupRailProjectsByMembership(
+      { pinned: [], projects: [{ path: "/tmp/lib", openedAt: 1 }] },
+      families,
+      stored,
+    );
+    expect(sections.projects).toHaveLength(1);
+    expect(sections.projects[0].path).toBe(`project:${group.id}`);
+    expect(isProjectRailKey(sections.projects[0].path)).toBe(true);
+    expect(sections.projects[0].project?.id).toBe(group.id);
+  });
+
+  it("keeps a sentinel row without member recents", () => {
+    const group = createProjectGroup();
+    const sections = groupRailProjectsByMembership(
+      { pinned: [], projects: [{ path: "/tmp/other", openedAt: 1 }] },
+      new Map(),
+      loadProjects(),
+    );
+    const paths = sections.projects.map((item) => item.path);
+    expect(paths).toContain(`project:${group.id}`);
+    expect(paths).toContain("/tmp/other");
+  });
+
+  it("tracks lastPath through member working copies without an anchor", () => {
+    const group = createProjectGroup();
+    const lib = family("/tmp/lib/.git", "/tmp/lib");
+    addRepositoryToProject(group.id, {
+      commonDir: lib.commonDir,
+      anchor: lib.checkout,
+    });
+    recordProjectLastPath(
+      "/tmp/lib",
+      new Map([[pathKey("/tmp/lib"), lib]]),
+    );
+    expect(loadProjects()[0].lastPath).toBe("/tmp/lib");
   });
 });

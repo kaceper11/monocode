@@ -4,6 +4,14 @@ import { loadAzurePrAssociations, AZURE_PR_ASSOCIATIONS_CHANGED } from "../lib/a
 import { loadCiSources, ciState, ciContext, AZURE_CI_SOURCES_CHANGED } from "../lib/azurePipelines";
 import type { DeliveryTabSource } from "../lib/layout";
 import { contextFromChanges, requestAgentContext } from "../lib/agentContext";
+import {
+  loadTaskWorkspaces,
+  projectForTask,
+  subscribeTaskWorkspaces,
+  taskWorkspacesSnapshot,
+} from "../lib/taskWorkspaces";
+import { projectName } from "../lib/paths";
+import { Popover } from "./Popover";
 import { ContextCheckbox } from "./InboxContextPicker";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -12,6 +20,8 @@ import {
   CircleDashed,
   SquarePlus,
   ChevronDown,
+  Task,
+  X,
   ChevronRight,
   CloudUpload,
   ExternalLink,
@@ -28,12 +38,14 @@ import {
   WandSparkles,
 } from "./icons";
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
 import { FileTypeIcon } from "./FileTypeIcon";
@@ -97,6 +109,7 @@ let changesView: ChangesView = loadChangesView();
 const collapsedDirs = new Set<string>();
 const indexByCwd = new Map<string, GitDiffIndex>();
 const prByCwd = new Map<string, GitPr | null>();
+const EMPTY_FILES: GitChangedFile[] = [];
 
 type Props = {
   sourceSessionId?: string;
@@ -125,8 +138,8 @@ export function GitChangesPanel({
   onOpenDelivery,
   onOpenCommit,
 }: Props) {
-  const { index, reload } = useDiffIndex(cwd, enabled);
-  const files = index?.files ?? [];
+  const { index, patch } = useDiffIndex(cwd, enabled);
+  const files = index?.files ?? EMPTY_FILES;
   const [, refreshDelivery] = useState(0);
   useEffect(() => {
     const refresh = () => refreshDelivery(value => value + 1);
@@ -291,11 +304,15 @@ export function GitChangesPanel({
         fill
         onOpenFile={onOpenFile}
         onOpenAllChanges={onOpenAllChanges}
-        onMutated={(paths) => {
-          reload();
+        onMutated={(paths, apply, touchWorktree) => {
+          if (apply) patch(apply);
           notifyGitChanged(cwd);
-          invalidateWatchedFiles(paths);
-          window.setTimeout(() => invalidateWatchedFiles(paths), 150);
+          // Only discard and sync rewrite worktree bytes; staging and
+          // committing must not reload open editors.
+          if (touchWorktree) {
+            invalidateWatchedFiles(paths);
+            window.setTimeout(() => invalidateWatchedFiles(paths), 150);
+          }
         }}
       />
       {graphExpanded ? (
@@ -360,7 +377,11 @@ function ChangedFiles({
   fill: boolean;
   onOpenFile: (path: string, kind: GitFileDiffKind) => void;
   onOpenAllChanges: () => void;
-  onMutated: (paths?: string[]) => void;
+  onMutated: (
+    paths?: string[],
+    apply?: (index: GitDiffIndex) => GitDiffIndex,
+    touchWorktree?: boolean,
+  ) => void;
 }) {
   const [selectingContext, setSelectingContext] = useState(false);
   const [contextSelected, setContextSelected] = useState<Set<string>>(
@@ -369,27 +390,34 @@ function ChangedFiles({
   const [contextBusy, setContextBusy] = useState(false);
   const [contextError, setContextError] = useState("");
   const contextGeneration = useRef(0);
+  const contextBusyRef = useRef(contextBusy);
+  contextBusyRef.current = contextBusy;
   useEffect(() => {
     setContextSelected(new Set());
     return () => {
       contextGeneration.current++;
     };
   }, [cwd]);
-  const contextSelection = selectingContext
-    ? {
-        selected: contextSelected,
-        toggle: (relative: string, kind: GitFileDiffKind) => {
-          if (contextBusy) return;
-          const key = JSON.stringify([relative, kind]);
-          setContextSelected((previous) => {
-            const next = new Set(previous);
-            if (next.has(key)) next.delete(key);
-            else if (next.size < 20) next.add(key);
-            return next;
-          });
-        },
-      }
-    : undefined;
+  const toggleContext = useCallback(
+    (relative: string, kind: GitFileDiffKind) => {
+      if (contextBusyRef.current) return;
+      const key = JSON.stringify([relative, kind]);
+      setContextSelected((previous) => {
+        const next = new Set(previous);
+        if (next.has(key)) next.delete(key);
+        else if (next.size < 20) next.add(key);
+        return next;
+      });
+    },
+    [],
+  );
+  const contextSelection = useMemo(
+    () =>
+      selectingContext
+        ? { selected: contextSelected, toggle: toggleContext }
+        : undefined,
+    [selectingContext, contextSelected, toggleContext],
+  );
   const toggleContextSelection = () => {
     contextGeneration.current++;
     setContextSelected(new Set());
@@ -407,7 +435,31 @@ function ChangedFiles({
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const menuRef = useRef<HTMLDivElement>(null);
   const messageRef = useRef<HTMLTextAreaElement>(null);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [busy, setBusyState] = useState<string | null>(null);
+  // Ref mirror keeps action callbacks stable so memoized rows do not
+  // re-render when an unrelated row starts or finishes a git operation.
+  const busyRef = useRef<string | null>(null);
+  const setBusy = (value: string | null) => {
+    busyRef.current = value;
+    setBusyState(value);
+  };
+  const onMutatedRef = useRef(onMutated);
+  onMutatedRef.current = onMutated;
+  const mutated = useCallback(
+    (
+      paths?: string[],
+      apply?: (index: GitDiffIndex) => GitDiffIndex,
+      touchWorktree?: boolean,
+    ) => onMutatedRef.current(paths, apply, touchWorktree),
+    [],
+  );
+  const onOpenFileRef = useRef(onOpenFile);
+  onOpenFileRef.current = onOpenFile;
+  const openFile = useCallback(
+    (path: string, kind: GitFileDiffKind) =>
+      onOpenFileRef.current(path, kind),
+    [],
+  );
   const [message, setMessage] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [stagedExpanded, setStagedExpanded] = useState(stagedOpen);
@@ -483,59 +535,68 @@ function ChangedFiles({
     );
   };
 
-  const run = async (
-    file: GitChangedFile,
-    action: "stage" | "unstage" | "discard",
-  ) => {
-    if (busy) return;
-    if (action === "discard") {
-      const name = basename(file.relative);
-      const untracked = file.status === "untracked";
-      const ok = await confirmNative(
-        untracked
-          ? `Delete untracked file ${name}?`
-          : `Discard changes in ${name}? This cannot be undone.`,
-        untracked ? "Delete" : "Discard",
-      );
-      if (!ok) return;
-    }
-    setBusy(file.relative);
-    try {
-      if (action === "stage") await gitStageFile(cwd, file.relative);
-      else if (action === "unstage") await gitUnstageFile(cwd, file.relative);
-      else await gitDiscardFile(cwd, file.relative);
-      onMutated([file.path]);
-    } catch (error) {
-      fail(error);
-    } finally {
-      setBusy(null);
-    }
-  };
+  const run = useCallback(
+    async (
+      file: GitChangedFile,
+      action: "stage" | "unstage" | "discard",
+    ) => {
+      if (busyRef.current) return;
+      setBusy(file.relative);
+      try {
+        if (action === "discard") {
+          const name = basename(file.relative);
+          const untracked = file.status === "untracked";
+          const ok = await confirmNative(
+            untracked
+              ? `Delete untracked file ${name}?`
+              : `Discard changes in ${name}? This cannot be undone.`,
+            untracked ? "Delete" : "Discard",
+          );
+          if (!ok) return;
+        }
+        if (action === "stage") await gitStageFile(cwd, file.relative);
+        else if (action === "unstage") await gitUnstageFile(cwd, file.relative);
+        else await gitDiscardFile(cwd, file.relative);
+        mutated(
+          [file.path],
+          (index) => indexAfterFileAction(index, file.relative, action),
+          action === "discard",
+        );
+      } catch (error) {
+        fail(error);
+      } finally {
+        setBusy(null);
+      }
+    },
+    [cwd, mutated],
+  );
 
   const runAll = async (action: "stage" | "unstage" | "discard") => {
-    if (busy) return;
-    if (action === "discard") {
-      const n = unstaged.length;
-      if (n === 0) return;
-      const only = unstaged[0];
-      const untrackedOnly = n === 1 && only?.status === "untracked";
-      const ok = await confirmNative(
-        untrackedOnly
-          ? `Delete untracked file ${basename(only.relative)}?`
-          : n === 1 && only
-            ? `Discard changes in ${basename(only.relative)}? This cannot be undone.`
-            : `Discard all unstaged changes in ${n} files? This cannot be undone.`,
-        untrackedOnly ? "Delete" : "Discard",
-      );
-      if (!ok) return;
-    }
+    if (busyRef.current) return;
     setBusy(action);
     try {
+      if (action === "discard") {
+        const n = unstaged.length;
+        if (n === 0) return;
+        const only = unstaged[0];
+        const untrackedOnly = n === 1 && only?.status === "untracked";
+        const ok = await confirmNative(
+          untrackedOnly
+            ? `Delete untracked file ${basename(only.relative)}?`
+            : n === 1 && only
+              ? `Discard changes in ${basename(only.relative)}? This cannot be undone.`
+              : `Discard all unstaged changes in ${n} files? This cannot be undone.`,
+          untrackedOnly ? "Delete" : "Discard",
+        );
+        if (!ok) return;
+      }
       if (action === "stage") await gitStageAll(cwd);
       else if (action === "unstage") await gitUnstageAll(cwd);
       else await gitDiscardAll(cwd);
-      onMutated(
+      mutated(
         action === "discard" ? unstaged.map((file) => file.path) : undefined,
+        (index) => indexAfterAllAction(index, action),
+        action === "discard",
       );
     } catch (error) {
       fail(error);
@@ -558,26 +619,26 @@ function ChangedFiles({
 
   const commit = async (push: boolean, createPr = false) => {
     if (!canCommit) return;
-    if (
-      (push || createPr) &&
-      !(await confirmDefault(createPr ? "pr" : "push"))
-    ) {
-      return;
-    }
     setBusy(createPr ? "pr" : "commit");
     setMenuOpen(false);
     try {
+      if (
+        (push || createPr) &&
+        !(await confirmDefault(createPr ? "pr" : "push"))
+      ) {
+        return;
+      }
       await gitCommit(cwd, message);
       if (push || createPr) await gitPush(cwd);
       setMessage("");
-      onMutated();
+      mutated();
       if (createPr) {
         await openCreatedPr();
         reloadPr();
       }
     } catch (error) {
       fail(error);
-      onMutated();
+      mutated();
     } finally {
       setBusy(null);
     }
@@ -588,11 +649,11 @@ function ChangedFiles({
     setBusy("sync");
     try {
       await gitSync(cwd);
-      onMutated();
+      mutated(undefined, undefined, true);
       reloadPr();
     } catch (error) {
       fail(error);
-      onMutated();
+      mutated(undefined, undefined, true);
     } finally {
       setBusy(null);
     }
@@ -613,23 +674,36 @@ function ChangedFiles({
 
   const createPr = async () => {
     if (!canCreatePr) return;
-    if (!(await confirmDefault("pr"))) return;
     setBusy("pr");
     try {
+      if (!(await confirmDefault("pr"))) return;
       if ((index?.ahead ?? 0) > 0) await gitPush(cwd);
       await openCreatedPr();
-      onMutated();
+      mutated();
       reloadPr();
     } catch (error) {
       fail(error);
-      onMutated();
+      mutated();
     } finally {
       setBusy(null);
     }
   };
 
   const contextLoading = useRef(false);
-  const prepareSelected = async (prepareInSource: boolean) => {
+  const taskMenuButton = useRef<HTMLButtonElement | null>(null);
+  const [taskMenuOpen, setTaskMenuOpen] = useState(false);
+  const tasksRaw = useSyncExternalStore(
+    subscribeTaskWorkspaces,
+    taskWorkspacesSnapshot,
+  );
+  const contextTasks = useMemo(
+    () => loadTaskWorkspaces().filter((task) => !task.archived),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [tasksRaw],
+  );
+  const prepareSelected = async (
+    route: { prepareInSource: true } | { taskId: string } | { newTask: true },
+  ) => {
     if (contextLoading.current) return;
     contextLoading.current = true;
     const generation = contextGeneration.current;
@@ -655,11 +729,12 @@ function ChangedFiles({
         );
       const context = await contextFromChanges(cwd, selections);
       if (generation === contextGeneration.current) {
+        setTaskMenuOpen(false);
         requestAgentContext({
           context,
           cwd,
           sourceSessionId,
-          prepareInSource,
+          ...route,
           onPrepared: () => {
             if (generation !== contextGeneration.current) return;
             setContextSelected(new Set());
@@ -677,7 +752,7 @@ function ChangedFiles({
   };
   return (
     <aside
-      className={`flex min-h-0 min-w-0 flex-col ${fill ? "flex-1" : "shrink-0"}`}
+      className={`relative flex min-h-0 min-w-0 flex-col ${fill ? "flex-1" : "shrink-0"}`}
     >
       <div className="shrink-0 border-b border-content/10 p-2">
         <div className="relative">
@@ -777,53 +852,9 @@ function ChangedFiles({
           />
         ) : null}
       </div>
-      {selectingContext ? (
-        <div className="flex flex-wrap items-center gap-1 border-b border-content/10 px-2 py-1 text-[12px]">
-          {selectingContext ? (
-            <span className="min-w-0 flex-1 px-1 text-content/50">
-              {contextSelected.size
-                ? `${contextSelected.size} selected`
-                : "Select files"}
-            </span>
-          ) : null}
-          {selectingContext && contextSelected.size > 0 ? (
-            <>
-              <button
-                type="button"
-                disabled={contextBusy}
-                className="h-7 rounded-md px-2 text-content/80 hover:bg-content/5 disabled:opacity-40"
-                onClick={() => void prepareSelected(true)}
-              >
-                {contextBusy ? "Loading…" : "Add to chat"}
-              </button>
-              <button
-                type="button"
-                disabled={contextBusy}
-                className="h-7 rounded-md px-2 text-content/65 hover:bg-content/5 disabled:opacity-40"
-                onClick={() => void prepareSelected(false)}
-              >
-                Send to agent…
-              </button>
-            </>
-          ) : null}
-          <button
-            type="button"
-            aria-pressed={selectingContext}
-            className="h-7 rounded-md px-2 text-content/65 hover:bg-content/5"
-            onClick={toggleContextSelection}
-          >
-            {selectingContext ? "Cancel" : "Select files for agent"}
-          </button>
-          {contextError ? (
-            <p role="alert" className="w-full px-1 text-red-400">
-              {contextError}
-            </p>
-          ) : null}
-        </div>
-      ) : null}
       <div
         ref={lockOverscroll}
-        className="min-h-0 flex-1 overflow-y-auto overscroll-none py-1"
+        className={`relative min-h-0 flex-1 overflow-y-auto overscroll-none py-1 ${selectingContext ? "pb-20" : ""}`}
       >
         {files.length === 0 ? (
           <p className="px-3 py-2 text-[12px] text-content/45">
@@ -868,7 +899,7 @@ function ChangedFiles({
                   selected={selected}
                   selectedKind={selectedKind}
                   busy={busy}
-                  onOpenFile={onOpenFile}
+                  onOpenFile={openFile}
                   onAction={run}
                 />
               </FileSection>
@@ -911,7 +942,7 @@ function ChangedFiles({
                   selected={selected}
                   selectedKind={selectedKind}
                   busy={busy}
-                  onOpenFile={onOpenFile}
+                  onOpenFile={openFile}
                   onAction={run}
                 />
               </FileSection>
@@ -919,6 +950,65 @@ function ChangedFiles({
           </>
         )}
       </div>
+      {selectingContext ? (
+        <div className="pointer-events-none absolute inset-x-2 bottom-2 z-10">
+          <div className="pointer-events-auto overflow-hidden rounded-xl border border-content/15 bg-background-base/85 shadow-xl backdrop-blur-xl">
+            <div className="flex items-center gap-2 border-b border-content/10 px-3 py-1.5">
+              <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-content/70">
+                {contextSelected.size
+                  ? `${contextSelected.size} file${contextSelected.size === 1 ? "" : "s"} selected`
+                  : "Select files to send"}
+              </span>
+              <button
+                type="button"
+                aria-label="Cancel selection"
+                title="Cancel selection"
+                className="grid size-5.5 shrink-0 place-items-center rounded-md text-content/50 hover:bg-content/8 hover:text-content"
+                onClick={toggleContextSelection}
+              >
+                <X className="size-3.5" strokeWidth={1.75} />
+              </button>
+            </div>
+            <div className="flex items-center gap-1.5 px-2 py-1.5">
+              <button
+                type="button"
+                disabled={!contextSelected.size || contextBusy}
+                className="h-7 flex-1 rounded-md text-[12px] text-content/80 hover:bg-content/5 disabled:opacity-40"
+                onClick={() => void prepareSelected({ prepareInSource: true })}
+              >
+                {contextBusy ? "Loading…" : "Add to chat"}
+              </button>
+              <button
+                ref={taskMenuButton}
+                type="button"
+                disabled={!contextSelected.size || contextBusy}
+                aria-haspopup="menu"
+                aria-expanded={taskMenuOpen}
+                title="Send the selected changes to a task"
+                className="flex h-7 flex-1 items-center justify-center gap-1 rounded-md bg-accent/15 text-[12px] font-medium text-accent hover:bg-accent/25 disabled:opacity-40"
+                onClick={() => setTaskMenuOpen((open) => !open)}
+              >
+                Send to task
+                <ChevronDown className="size-3" strokeWidth={1.75} />
+              </button>
+            </div>
+            {contextError ? (
+              <p role="alert" className="px-3 pb-2 text-[11px] text-red-400">
+                {contextError}
+              </p>
+            ) : null}
+          </div>
+          {taskMenuOpen ? (
+            <ContextTaskMenu
+              anchor={taskMenuButton}
+              tasks={contextTasks}
+              onPick={(taskId) => void prepareSelected({ taskId })}
+              onNewTask={() => void prepareSelected({ newTask: true })}
+              onClose={() => setTaskMenuOpen(false)}
+            />
+          ) : null}
+        </div>
+      ) : null}
     </aside>
   );
 }
@@ -1225,7 +1315,11 @@ type ChangeRowProps = {
   ) => void;
 };
 
-function ChangeList({ files, view, ...rest }: ChangeRowProps) {
+const ChangeList = memo(function ChangeList({
+  files,
+  view,
+  ...rest
+}: ChangeRowProps) {
   const tree = useMemo(() => buildChangeTree(files), [files]);
   if (view === "tree") {
     return <ChangeDirChildren dir={tree} depth={0} {...rest} />;
@@ -1241,12 +1335,19 @@ function ChangeList({ files, view, ...rest }: ChangeRowProps) {
           kind={rest.kind}
           onOpenFile={rest.onOpenFile}
           onAction={rest.onAction}
-          contextSelection={rest.contextSelection}
+          contextChecked={
+            rest.contextSelection
+              ? rest.contextSelection.selected.has(
+                  JSON.stringify([file.relative, rest.kind]),
+                )
+              : undefined
+          }
+          onToggleContext={rest.contextSelection?.toggle}
         />
       ))}
     </>
   );
-}
+});
 
 function ChangeDirChildren({
   dir,
@@ -1288,14 +1389,21 @@ function ChangeDirChildren({
           depth={depth}
           onOpenFile={onOpenFile}
           onAction={onAction}
-          contextSelection={contextSelection}
+          contextChecked={
+            contextSelection
+              ? contextSelection.selected.has(
+                  JSON.stringify([file.relative, kind]),
+                )
+              : undefined
+          }
+          onToggleContext={contextSelection?.toggle}
         />
       ))}
     </>
   );
 }
 
-function ChangeDirRow({
+const ChangeDirRow = memo(function ChangeDirRow({
   dir,
   depth,
   kind,
@@ -1353,7 +1461,7 @@ function ChangeDirRow({
       ) : null}
     </li>
   );
-}
+});
 
 function isActive(
   file: GitChangedFile,
@@ -1373,15 +1481,17 @@ function buildChangeTree(files: GitChangedFile[]): ChangeDir {
     files: [],
     status: null,
   };
+  const dirByPath = new Map<string, ChangeDir>([["", root]]);
   for (const file of files) {
     const segments = file.relative.split("/");
     let node = root;
     for (const segment of segments.slice(0, -1)) {
       const path = node.path ? `${node.path}/${segment}` : segment;
-      let next = node.dirs.find((dir) => dir.path === path);
+      let next = dirByPath.get(path);
       if (!next) {
         next = { name: segment, path, dirs: [], files: [], status: null };
         node.dirs.push(next);
+        dirByPath.set(path, next);
       }
       node = next;
     }
@@ -1410,59 +1520,80 @@ function sortChangeDir(dir: ChangeDir): string | null {
   return dir.status;
 }
 
-function ChangeRow({
-  file,
-  active,
-  busy,
-  kind,
-  depth,
-  onOpenFile,
-  onAction,
-  contextSelection,
-}: {
-  contextSelection?: ContextSelection;
-  file: GitChangedFile;
-  active: boolean;
-  busy: boolean;
-  kind: GitFileDiffKind;
-  /** Set in tree view: nesting level, and the folder path moves to the tree. */
-  depth?: number;
-  onOpenFile: (path: string, kind: GitFileDiffKind) => void;
-  onAction: (
-    file: GitChangedFile,
-    action: "stage" | "unstage" | "discard",
-  ) => void;
-}) {
-  const name = basename(file.relative);
-  const tree = depth !== undefined;
-  const dir = tree ? "" : dirname(file.relative);
-  const canOpen = file.status !== "deleted";
+function sameChangedFile(a: GitChangedFile, b: GitChangedFile): boolean {
   return (
-    <li>
-      <div
-        style={tree ? { paddingLeft: 8 + depth * 12 } : undefined}
-        className={`group flex h-7 w-full items-center gap-1 pr-2 leading-none ${
-          tree ? "" : "pl-2"
-        } ${
-          active
-            ? "bg-content/10 text-content"
-            : "text-content hover:bg-content/5"
-        }`}
-      >
-        {contextSelection ? (
-          <ContextCheckbox
-            label={`Select ${kind} ${file.relative}`}
-            checked={contextSelection.selected.has(
-              JSON.stringify([file.relative, kind]),
-            )}
-            onChange={() => contextSelection.toggle(file.relative, kind)}
-          />
-        ) : null}
+    a === b ||
+    (a.path === b.path &&
+      a.relative === b.relative &&
+      a.status === b.status &&
+      a.staged === b.staged &&
+      a.unstaged === b.unstaged &&
+      a.additions === b.additions &&
+      a.deletions === b.deletions)
+  );
+}
+
+const ChangeRow = memo(
+  function ChangeRow({
+    file,
+    active,
+    busy,
+    kind,
+    depth,
+    onOpenFile,
+    onAction,
+    contextChecked,
+    onToggleContext,
+  }: {
+    /** Selection-mode state for this file; undefined hides the checkbox. */
+    contextChecked?: boolean;
+    onToggleContext?: (relative: string, kind: GitFileDiffKind) => void;
+    file: GitChangedFile;
+    active: boolean;
+    busy: boolean;
+    kind: GitFileDiffKind;
+    /** Set in tree view: nesting level, and the folder path moves to the tree. */
+    depth?: number;
+    onOpenFile: (path: string, kind: GitFileDiffKind) => void;
+    onAction: (
+      file: GitChangedFile,
+      action: "stage" | "unstage" | "discard",
+    ) => void;
+  }) {
+    const name = basename(file.relative);
+    const tree = depth !== undefined;
+    const dir = tree ? "" : dirname(file.relative);
+    const canOpen = file.status !== "deleted";
+    const selecting = onToggleContext !== undefined;
+    return (
+      <li>
+        <div
+          style={tree ? { paddingLeft: 8 + depth * 12 } : undefined}
+          className={`group flex h-7 w-full items-center gap-1 pr-2 leading-none ${
+            tree ? "" : "pl-2"
+          } ${
+            contextChecked
+              ? "bg-accent/10 text-content"
+              : active
+                ? "bg-content/10 text-content"
+                : "text-content hover:bg-content/5"
+          }`}
+        >
+          {selecting ? (
+            <ContextCheckbox
+              className=""
+              label={`Select ${kind} ${file.relative}`}
+              checked={contextChecked ?? false}
+              onChange={() => onToggleContext(file.relative, kind)}
+            />
+          ) : null}
         <button
           type="button"
           title={file.relative}
+          aria-pressed={selecting ? contextChecked : undefined}
           onClick={() => {
-            if (canOpen) onOpenFile(file.path, kind);
+            if (selecting) onToggleContext(file.relative, kind);
+            else if (canOpen) onOpenFile(file.path, kind);
           }}
           className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
         >
@@ -1475,6 +1606,7 @@ function ChangeRow({
             ) : null}
           </span>
         </button>
+        {selecting ? null : (
         <div
           className={` shrink-0 items-center ${
             active ? "flex" : "hidden group-focus-within:flex group-hover:flex"
@@ -1507,6 +1639,7 @@ function ChangeRow({
             </IconAction>
           )}
         </div>
+        )}
         <span
           className={`w-3.5 shrink-0 text-right font-mono text-[11px] font-semibold ${statusColor(file.status)}`}
         >
@@ -1515,7 +1648,18 @@ function ChangeRow({
       </div>
     </li>
   );
-}
+  },
+  (prev, next) =>
+    prev.active === next.active &&
+    prev.busy === next.busy &&
+    prev.kind === next.kind &&
+    prev.depth === next.depth &&
+    prev.contextChecked === next.contextChecked &&
+    prev.onOpenFile === next.onOpenFile &&
+    prev.onAction === next.onAction &&
+    prev.onToggleContext === next.onToggleContext &&
+    sameChangedFile(prev.file, next.file),
+);
 
 function IconAction({
   title,
@@ -1566,57 +1710,94 @@ function useDiffIndex(
   enabled: boolean,
 ): {
   index: GitDiffIndex | null;
-  reload: () => void;
+  patch: (update: (index: GitDiffIndex) => GitDiffIndex) => void;
 } {
   const [index, setIndex] = useState<GitDiffIndex | null>(() =>
     cachedIndex(cwd),
   );
-  const [nonce, setNonce] = useState(0);
-  const reload = useCallback(() => setNonce((value) => value + 1), []);
   const indexRef = useRef(index);
   indexRef.current = index;
+  // The cwd that produced indexRef.current. Between a cwd-change render and
+  // this hook's effect, indexRef still holds the previous repo's index —
+  // patch must not apply to or store under the new cwd.
+  const indexCwd = useRef(cwd);
+  // Bumped by every local patch so an in-flight load started before the
+  // mutation cannot clobber optimistic state with a pre-mutation snapshot.
+  const patchEpoch = useRef(0);
+
+  // Apply a local mutation result instantly; the next load still reconciles.
+  const patch = useCallback(
+    (update: (index: GitDiffIndex) => GitDiffIndex) => {
+      patchEpoch.current += 1;
+      if (indexCwd.current !== cwd) return;
+      const prev = indexRef.current;
+      if (!prev) return;
+      const next = update(prev);
+      if (next === prev) return;
+      indexByCwd.set(cwd, next);
+      indexRef.current = next;
+      setIndex(next);
+    },
+    [cwd],
+  );
 
   useEffect(() => {
     if (!enabled || !cwd || cwd === "~") {
       return;
     }
+    indexCwd.current = cwd;
     const cached = cachedIndex(cwd);
-    if (cached && !sameIndex(indexRef.current, cached)) {
+    if (
+      cached ? !sameIndex(indexRef.current, cached) : indexRef.current !== null
+    ) {
       indexRef.current = cached;
       setIndex(cached);
     }
     let cancelled = false;
     let inFlight = false;
     let pending = false;
+    let selfNotify = false;
 
     const load = async () => {
       if (inFlight) {
         pending = true;
         return;
       }
-      if (document.hidden && nonce === 0) return;
+      if (document.hidden) return;
       inFlight = true;
+      const epoch = patchEpoch.current;
       try {
         const next = await gitDiffIndex(cwd);
         if (cancelled) return;
-        const prev = indexRef.current;
-        if (sameIndex(prev, next)) return;
-        indexByCwd.set(cwd, next);
-        indexRef.current = next;
-        setIndex(next);
         applyProjectDiffStats(cwd, {
           files: next.files.length,
           additions: next.additions,
           deletions: next.deletions,
         });
+        // A patch landed while this fetch was in flight; the mutation's
+        // git-changed notification already queued a follow-up load.
+        if (patchEpoch.current !== epoch) return;
+        const prev = indexRef.current;
+        if (sameIndex(prev, next)) return;
+        indexByCwd.set(cwd, next);
+        indexRef.current = next;
+        setIndex(next);
         if (prev) {
           const paths = changedFilePaths(prev, next);
           invalidateWatchedFiles(paths);
-          notifyGitChanged(cwd);
+          // Fan the detected change out to other consumers without
+          // re-triggering this hook's own subscription into a second fetch.
+          selfNotify = true;
+          try {
+            notifyGitChanged(cwd);
+          } finally {
+            selfNotify = false;
+          }
         }
       } catch {
         if (!cancelled) {
           indexByCwd.delete(cwd);
+          indexRef.current = null;
           setIndex(null);
         }
       } finally {
@@ -1630,7 +1811,8 @@ function useDiffIndex(
 
     void load();
     const onResume = () => {
-      if (!document.hidden) void load();
+      if (selfNotify || document.hidden) return;
+      void load();
     };
     const timer = window.setInterval(onResume, GIT_POLL_MS);
     window.addEventListener("focus", onResume);
@@ -1643,9 +1825,9 @@ function useDiffIndex(
       document.removeEventListener("visibilitychange", onResume);
       unsubGit();
     };
-  }, [cwd, enabled, nonce]);
+  }, [cwd, enabled]);
 
-  return { index, reload };
+  return { index, patch };
 }
 
 function cachedIndex(cwd: string | undefined): GitDiffIndex | null {
@@ -1680,6 +1862,90 @@ function changedFilePaths(prev: GitDiffIndex, next: GitDiffIndex): string[] {
   return paths;
 }
 
+/**
+ * Local result of a row mutation applied before the refreshed index lands.
+ * Only section membership (staged/unstaged flags) is predicted; status,
+ * stats, and anything unexpected get corrected by the next `load()`.
+ */
+function indexAfterFileAction(
+  index: GitDiffIndex,
+  relative: string,
+  action: "stage" | "unstage" | "discard",
+): GitDiffIndex {
+  const files: GitChangedFile[] = [];
+  for (const file of index.files) {
+    if (file.relative !== relative) {
+      files.push(file);
+      continue;
+    }
+    if (action === "stage") {
+      if (file.staged && !file.unstaged) return index;
+      files.push({
+        ...file,
+        staged: true,
+        unstaged: false,
+        status: file.status === "untracked" ? "added" : file.status,
+      });
+    } else if (action === "unstage") {
+      if (!file.staged && file.unstaged) return index;
+      files.push({
+        ...file,
+        staged: false,
+        unstaged: true,
+        status: file.status === "added" ? "untracked" : file.status,
+      });
+    } else if (file.staged) {
+      files.push({ ...file, unstaged: false });
+    }
+  }
+  return { ...index, files };
+}
+
+function indexAfterAllAction(
+  index: GitDiffIndex,
+  action: "stage" | "unstage" | "discard",
+): GitDiffIndex {
+  let changed = false;
+  const files: GitChangedFile[] = [];
+  for (const file of index.files) {
+    if (action === "stage") {
+      if (file.staged && !file.unstaged) {
+        files.push(file);
+      } else {
+        changed = true;
+        files.push({
+          ...file,
+          staged: true,
+          unstaged: false,
+          status: file.status === "untracked" ? "added" : file.status,
+        });
+      }
+    } else if (action === "unstage") {
+      if (!file.staged && file.unstaged) {
+        files.push(file);
+      } else {
+        changed = true;
+        files.push({
+          ...file,
+          staged: false,
+          unstaged: true,
+          status: file.status === "added" ? "untracked" : file.status,
+        });
+      }
+    } else if (file.staged) {
+      if (file.unstaged) {
+        changed = true;
+        files.push({ ...file, unstaged: false });
+      } else {
+        files.push(file);
+      }
+    } else {
+      changed = true;
+    }
+  }
+  return changed ? { ...index, files } : index;
+}
+
 function sameIndex(prev: GitDiffIndex | null, next: GitDiffIndex): boolean {
   if (!prev) return false;
   if (
@@ -1708,4 +1974,76 @@ function sameIndex(prev: GitDiffIndex | null, next: GitDiffIndex): boolean {
       file.unstaged === other.unstaged
     );
   });
+}
+
+/** Task target menu for prepared change context — existing tasks, or a new
+ * task whose sheet opens with the selection summarized into its brief. */
+function ContextTaskMenu({
+  anchor,
+  tasks,
+  onPick,
+  onNewTask,
+  onClose,
+}: {
+  anchor: React.RefObject<HTMLButtonElement | null>;
+  tasks: readonly import("../lib/taskWorkspaces").TaskWorkspace[];
+  onPick: (taskId: string) => void;
+  onNewTask: () => void;
+  onClose: () => void;
+}) {
+  const itemClass =
+    "flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5";
+  return (
+    <Popover
+      anchor={anchor}
+      align="end"
+      onDismiss={onClose}
+      role="menu"
+      aria-label="Send changes to a task"
+      className="w-64 overflow-hidden"
+    >
+      <div className="px-1.5 py-1.5">
+        <button
+          type="button"
+          role="menuitem"
+          className={itemClass}
+          onClick={onNewTask}
+        >
+          <Plus className="size-3.5 shrink-0 text-content/50" strokeWidth={1.75} />
+          <span className="min-w-0 flex-1 truncate">New task…</span>
+        </button>
+        {tasks.length ? (
+          <div
+            role="separator"
+            className="mx-1 my-1 border-t border-content/10"
+          />
+        ) : null}
+        {tasks.map((task) => {
+          const project = projectForTask(task);
+          const projectLabel = project
+            ? project.name?.trim() ||
+              (project.anchor ? projectName(project.anchor) : "Project")
+            : "";
+          return (
+            <button
+              type="button"
+              role="menuitem"
+              key={task.id}
+              className={itemClass}
+              onClick={() => onPick(task.id)}
+            >
+              <Task
+                className="size-3.5 shrink-0 text-content/50"
+                strokeWidth={1.75}
+              />
+              <span className="min-w-0 flex-1 truncate">{task.name}</span>
+              <span className="shrink-0 truncate text-[10px] text-content/40">
+                {projectLabel}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </Popover>
+  );
 }

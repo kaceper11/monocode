@@ -17,6 +17,7 @@ import {
   loadModelPickerTab,
   modelsFor,
   modelCatalogStatus,
+  modelCatalogError,
   resolveModel,
   saveFavoriteModels,
   saveModelPickerTab,
@@ -28,6 +29,7 @@ import {
   type ModelPickerTab,
 } from "../lib/models";
 import {
+  harnessAuthHint,
   harnessUnavailableHint,
   hasProbedHarnessAvailability,
   isHarnessAvailable,
@@ -160,7 +162,7 @@ export function ModelPicker({
       if (target.closest(".monocode-terminal")) return true;
       return Boolean(
         target.closest(
-          "[data-file-picker], [data-branch-picker], [data-skill-picker], [data-mention-picker], [data-access-picker], [data-model-settings]",
+          "[data-file-picker], [data-branch-picker], [data-skill-picker], [data-mention-picker], [data-attach-picker], [data-access-picker], [data-model-settings]",
         ),
       );
     };
@@ -219,6 +221,11 @@ export function ModelPicker({
   useEffect(() => {
     if (open) search.current?.focus();
   }, [open]);
+
+  const catalogError =
+    visibleTab !== "favorites" ? modelCatalogError(visibleTab, cwd) : undefined;
+  const authHint =
+    visibleTab !== "favorites" ? harnessAuthHint(visibleTab, cwd) : undefined;
 
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -404,9 +411,13 @@ export function ModelPicker({
                   : visibleTab !== "favorites" &&
                       !isHarnessAvailable(visibleTab, cwd)
                     ? harnessUnavailableHint(visibleTab, cwd)
-                    : visibleTab === "codex" && !query.trim()
-                      ? "Loading Codex models…"
-                      : "No matching models"
+                    : !query.trim() && catalogError
+                      ? catalogError
+                      : !query.trim() && authHint
+                        ? authHint
+                        : visibleTab === "codex" && !query.trim()
+                          ? "Loading Codex models…"
+                          : "No matching models"
               }
               onActive={setActive}
               onPick={pick}

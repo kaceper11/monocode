@@ -87,6 +87,9 @@ type Shared = {
   onSteerQueuedMessage: (sessionId: string, messageId: string) => void;
   onResumeQueue: (sessionId: string) => void;
   onAddIssues?: (sessionId: string) => void;
+  onOpenTaskChild?: (taskId: string, childId: string) => void;
+  onRetryTaskChild?: (taskId: string, childId: string) => void;
+  needsInputSessionIds?: ReadonlySet<string>;
   onInboxCardDismiss?: (sessionId: string, fileId?: string) => void;
   onNoteCardDismiss?: (sessionId: string) => void;
   onHandoffCardDismiss?: (sessionId: string) => void;
@@ -177,6 +180,9 @@ function PaneTreeComponent({
   onSteerQueuedMessage,
   onResumeQueue,
   onAddIssues,
+  onOpenTaskChild,
+  onRetryTaskChild,
+  needsInputSessionIds,
   onInboxCardDismiss,
   onNoteCardDismiss,
   onHandoffCardDismiss,
@@ -394,6 +400,9 @@ function PaneTreeComponent({
                 onSteerQueuedMessage={onSteerQueuedMessage}
                 onResumeQueue={onResumeQueue}
                 onAddIssues={onAddIssues}
+                onOpenTaskChild={onOpenTaskChild}
+                onRetryTaskChild={onRetryTaskChild}
+                needsInputSessionIds={needsInputSessionIds}
                 onInboxCardDismiss={onInboxCardDismiss}
                 onNoteCardDismiss={onNoteCardDismiss}
                 onHandoffCardDismiss={onHandoffCardDismiss}

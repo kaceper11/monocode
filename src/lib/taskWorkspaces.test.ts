@@ -7,18 +7,26 @@ import {
 } from "./projects";
 import type { RepositoryFamily } from "./repositoryFamilies";
 import {
+  addTaskChildren,
   archiveTask,
   composeTaskPrompt,
+  composeTaskSessionPrompt,
   createTask,
+  isTaskChildLaunching,
   loadTaskWorkspaces,
+  markTaskChildLaunching,
+  pruneTaskSession,
   recordTaskActiveChild,
   removeTask,
   removeTaskChild,
+  reviseTask,
   suggestTaskBranch,
   taskChildrenForWorkingCopy,
   taskForSession,
   taskHostConflict,
   tasksForProject,
+  unmarkTaskChildLaunching,
+  updateTask,
   updateTaskChild,
 } from "./taskWorkspaces";
 
@@ -102,6 +110,36 @@ describe("loadTaskWorkspaces", () => {
     const [task] = loadTaskWorkspaces();
     expect(task.children[0].launch.state).toBe("pending");
     expect(task.children[1].launch.state).toBe("ready");
+  });
+
+  it("keeps a working launch while a live in-flight marker owns it", () => {
+    localStorage.setItem(
+      "monocode.taskWorkspaces.v1",
+      JSON.stringify([
+        {
+          id: "t1",
+          projectId: "p1",
+          name: "Task",
+          children: [
+            {
+              id: "c1",
+              repositoryId: "r1",
+              sessionIds: [],
+              launch: { state: "working" },
+            },
+          ],
+        },
+      ]),
+    );
+    markTaskChildLaunching("t1", "c1");
+    try {
+      const [task] = loadTaskWorkspaces();
+      expect(task.children[0].launch.state).toBe("working");
+    } finally {
+      unmarkTaskChildLaunching("t1", "c1");
+    }
+    // The marker gone — the next read normalizes back to actionable.
+    expect(loadTaskWorkspaces()[0].children[0].launch.state).toBe("pending");
   });
 
   it("drops children and tasks that fail validation", () => {
@@ -194,6 +232,35 @@ describe("createTask", () => {
         children: [{ repositoryId: repo.id, mode: "existing" }],
       }),
     ).toThrow("Choose a working copy");
+  });
+
+  it("rejects a new task past the storage cap instead of dropping it", () => {
+    const seeded = Array.from({ length: 100 }, (_, i) => ({
+      id: `t${i}`,
+      projectId: "p1",
+      name: `Task ${i}`,
+      children: [
+        {
+          id: `c${i}`,
+          repositoryId: "r1",
+          sessionIds: [],
+          launch: { state: "pending" },
+        },
+      ],
+      sessionIds: [],
+      createdAt: i,
+    }));
+    localStorage.setItem("monocode.taskWorkspaces.v1", JSON.stringify(seeded));
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    expect(() =>
+      createTask({
+        projectId: project.id,
+        name: "X",
+        children: [later(repo.id)],
+      }),
+    ).toThrow("up to 100 tasks");
+    expect(loadTaskWorkspaces()).toHaveLength(100);
   });
 
   it("rejects mixed execution hosts", () => {
@@ -298,6 +365,46 @@ describe("task child updates", () => {
   });
 });
 
+describe("addTaskChildren", () => {
+  it("appends new children and returns them for launch", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [later(repo.id)],
+    });
+    const added = addTaskChildren(task.id, [later(lib.id)]);
+    expect(added).toHaveLength(1);
+    expect(added[0].repositoryId).toBe(lib.id);
+    expect(added[0].launch.state).toBe("pending");
+    expect(
+      loadTaskWorkspaces().find((entry) => entry.id === task.id)?.children,
+    ).toHaveLength(2);
+  });
+
+  it("rejects repositories already in the task or not in the project", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [later(repo.id)],
+    });
+    expect(() => addTaskChildren(task.id, [later(repo.id)])).toThrow(
+      "already in this task",
+    );
+    expect(() => addTaskChildren(task.id, [later("gone")])).toThrow(
+      "no longer in this project",
+    );
+    // Nothing was appended on failure.
+    expect(
+      loadTaskWorkspaces().find((entry) => entry.id === task.id)?.children,
+    ).toHaveLength(1);
+    expect(addTaskChildren(task.id, [])).toEqual([]);
+  });
+});
+
 describe("taskForSession", () => {
   it("finds the owning child by session id", () => {
     const project = projectWith("/tmp/app");
@@ -310,6 +417,165 @@ describe("taskForSession", () => {
     updateTaskChild(task.id, task.children[0].id, { sessionIds: ["s1"] });
     expect(taskForSession("s1")?.task.id).toBe(task.id);
     expect(taskForSession("unknown")).toBeNull();
+  });
+
+  it("resolves a task-level session to its host child", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [later(repo.id), later(lib.id)],
+    });
+    updateTask(task.id, (current) => ({
+      ...current,
+      sessionIds: ["task-session"],
+      lastActiveChildId: lib.id ? current.children[1].id : undefined,
+    }));
+    const found = taskForSession("task-session");
+    expect(found?.task.id).toBe(task.id);
+    expect(found?.child.repositoryId).toBe(lib.id);
+  });
+
+  it("pins the host child to the session's actual working copy", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [later(repo.id), later(lib.id)],
+    });
+    const [first, second] = task.children;
+    updateTaskChild(task.id, first.id, { workingCopy: "/tmp/app-wt" });
+    updateTaskChild(task.id, second.id, { workingCopy: "/tmp/lib-wt" });
+    // lastActiveChildId points at lib — but the session runs in app's copy.
+    updateTask(task.id, (current) => ({
+      ...current,
+      sessionIds: ["task-session"],
+      lastActiveChildId: second.id,
+    }));
+    expect(
+      taskForSession("task-session", "/tmp/app-wt")?.child.id,
+    ).toBe(first.id);
+    // A cwd no child owns falls back to lastActiveChildId.
+    expect(
+      taskForSession("task-session", "/tmp/elsewhere")?.child.id,
+    ).toBe(second.id);
+  });
+});
+
+describe("reviseTask", () => {
+  it("commits rename, removals, responsibilities and additions together", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib", "/tmp/ext");
+    const [repo, lib, ext] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "Old",
+      children: [later(repo.id), later(lib.id)],
+    });
+    const [first] = task.children;
+    const next = reviseTask(task.id, {
+      name: "New name",
+      keepRepositoryIds: [repo.id],
+      responsibilities: new Map([[first.id, "Owns UI"]]),
+      additions: [
+        {
+          repositoryId: ext.id,
+          mode: "existing",
+          workingCopy: "/tmp/ext-copy",
+        },
+      ],
+    });
+    expect(next.name).toBe("New name");
+    expect(next.children.map((child) => child.repositoryId)).toEqual([
+      repo.id,
+      ext.id,
+    ]);
+    expect(next.children[0].id).toBe(first.id);
+    expect(next.children[0].responsibility).toBe("Owns UI");
+    expect(next.children[1].workingCopy).toBe("/tmp/ext-copy");
+  });
+
+  it("persists nothing when an addition fails validation", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "Old",
+      children: [later(repo.id), later(lib.id)],
+    });
+    // Adding a repository that's still selected must fail — and must not
+    // leave the rename or the (zero) removals half-saved.
+    expect(() =>
+      reviseTask(task.id, {
+        name: "Renamed",
+        keepRepositoryIds: [repo.id],
+        responsibilities: new Map(),
+        additions: [later(repo.id)],
+      }),
+    ).toThrow("already in this task");
+    const [stored] = loadTaskWorkspaces();
+    expect(stored.name).toBe("Old");
+    expect(stored.children).toHaveLength(2);
+  });
+
+  it("drops lastActiveChildId when that child is removed", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [later(repo.id), later(lib.id)],
+    });
+    recordTaskActiveChild(task.id, task.children[1].id);
+    const next = reviseTask(task.id, {
+      name: "X",
+      keepRepositoryIds: [repo.id],
+      responsibilities: new Map(),
+      additions: [],
+    });
+    expect(next.lastActiveChildId).toBeUndefined();
+    expect(next.children).toHaveLength(1);
+  });
+});
+
+describe("pruneTaskSession", () => {
+  it("detaches a deleted session from task and child references", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [later(repo.id), later(lib.id)],
+    });
+    updateTaskChild(task.id, task.children[0].id, {
+      sessionIds: ["child-session"],
+    });
+    updateTask(task.id, (current) => ({
+      ...current,
+      sessionIds: ["task-session"],
+    }));
+    pruneTaskSession("task-session");
+    let [stored] = loadTaskWorkspaces();
+    expect(stored.sessionIds).toEqual([]);
+    expect(stored.children[0].sessionIds).toEqual(["child-session"]);
+    pruneTaskSession("child-session");
+    [stored] = loadTaskWorkspaces();
+    expect(stored.children[0].sessionIds).toEqual([]);
+  });
+});
+
+describe("launch markers", () => {
+  it("rejects a second in-flight launch of the same child", () => {
+    expect(markTaskChildLaunching("t", "c")).toBe(true);
+    expect(markTaskChildLaunching("t", "c")).toBe(false);
+    expect(isTaskChildLaunching("t", "c")).toBe(true);
+    expect(markTaskChildLaunching("t", "other")).toBe(true);
+    unmarkTaskChildLaunching("t", "c");
+    expect(isTaskChildLaunching("t", "c")).toBe(false);
+    expect(markTaskChildLaunching("t", "c")).toBe(true);
+    unmarkTaskChildLaunching("t", "c");
+    unmarkTaskChildLaunching("t", "other");
   });
 });
 
@@ -388,6 +654,35 @@ describe("composeTaskPrompt", () => {
     const second_prompt = composeTaskPrompt(task, second, lib);
     expect(second_prompt).not.toContain("UI only");
     expect(second_prompt).toContain("out of scope");
+  });
+
+  it("task session prompt names every repository's copy and job", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "Checkout",
+      brief: "Rebuild the checkout flow.",
+      children: [
+        {
+          repositoryId: repo.id,
+          mode: "worktree",
+          baseRef: "refs/heads/main",
+          baseCommit: "abc1234567",
+          branch: "checkout",
+          path: "/tmp/app-checkout",
+          responsibility: "UI only",
+        },
+        later(lib.id),
+      ],
+    });
+    const prompt = composeTaskSessionPrompt(task, project);
+    expect(prompt).toContain("working copy: /tmp/app-checkout");
+    expect(prompt).toContain("branch: checkout (from main @ abc1234567)");
+    expect(prompt).toContain("Responsibility: UI only");
+    // The sibling child is listed too — one session covers all repos.
+    expect(prompt).toContain("no working copy prepared yet");
+    expect(prompt).toContain("separate checkouts");
   });
 });
 

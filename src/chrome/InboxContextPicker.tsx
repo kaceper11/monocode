@@ -19,14 +19,19 @@ export function ContextCheckbox({
   checked,
   disabled,
   onChange,
+  className,
 }: {
   label: string;
   checked: boolean;
   disabled?: boolean;
   onChange: () => void;
+  /** Overrides the default `mt-0.5` used to align with multi-line rows. */
+  className?: string;
 }) {
   return (
-    <span className="relative mt-0.5 inline-flex size-4 shrink-0">
+    <span
+      className={`relative inline-flex size-4 shrink-0 ${className ?? "mt-0.5"}`}
+    >
       <input
         type="checkbox"
         aria-label={label}

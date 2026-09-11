@@ -86,26 +86,40 @@ def run(argv, cwd, input_bytes=None, timeout=25):
 ENVIRONMENT_READY = False
 
 
+def capture_environment(shell):
+    marker = "MONOCODE_ENV_" + uuid.uuid4().hex
+    script = "import json,os; print(" + repr(marker) + "+json.dumps(dict(os.environ)))"
+    command = "/usr/bin/python3 -c " + shlex.quote(script)
+    code, out, _ = run([shell, "-ilc", command], str(Path.home()), timeout=10)
+    lines = [line[len(marker):] for line in out.decode("utf-8").splitlines() if line.startswith(marker)]
+    if code or len(lines) != 1 or len(lines[0]) > 256 * 1024:
+        return None
+    environment = json.loads(lines[0])
+    if not isinstance(environment, dict) or any(not isinstance(k, str) or not isinstance(v, str) or "\0" in k + v or "=" in k for k, v in environment.items()):
+        return None
+    return environment
+
+
 def prepare_environment():
     global ENVIRONMENT_READY
     if ENVIRONMENT_READY:
         return
     # Use the selected Linux user's shell, never repository startup files or
     # an arbitrary installed Node version. Capture noisy shell output privately.
-    marker = "MONOCODE_ENV_" + uuid.uuid4().hex
-    script = "import json,os; print(" + repr(marker) + "+json.dumps(dict(os.environ)))"
-    command = "/usr/bin/python3 -c " + shlex.quote(script)
-    shell = pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
-    try:
-        code, out, _ = run([shell, "-ilc", command], str(Path.home()), timeout=10)
-        lines = [line[len(marker):] for line in out.decode("utf-8").splitlines() if line.startswith(marker)]
-        if code or len(lines) != 1 or len(lines[0]) > 256 * 1024:
-            raise ValueError("Invalid shell environment")
-        environment = json.loads(lines[0])
-        if not isinstance(environment, dict) or any(not isinstance(k, str) or not isinstance(v, str) or "\0" in k + v or "=" in k for k, v in environment.items()):
-            raise ValueError("Invalid shell environment")
-    except Exception:
-        raise ValueError("Cannot read the Linux login-shell environment. Check shell startup and reconnect.") from None
+    # A configured shell that cannot answer (missing, non-POSIX, broken rc) must
+    # not hide every installed agent: fall back to common POSIX shells so login
+    # profiles still load user-managed tool paths.
+    preferred = pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
+    environment = None
+    for shell in dict.fromkeys([preferred, "/bin/bash", "/bin/sh"]):
+        try:
+            environment = capture_environment(shell)
+        except Exception:
+            environment = None
+        if environment is not None:
+            break
+    if environment is None:
+        raise ValueError("Cannot read the Linux login-shell environment. Check shell startup and reconnect.")
     # Exclude Windows interop PATH entries; keep user-managed Linux tool paths.
     environment["PATH"] = ":".join(dict.fromkeys(folder for folder in environment.get("PATH", "").split(":") if folder.startswith("/") and not folder.startswith("/mnt/")))
     environment["WSLENV"] = ""
@@ -166,6 +180,157 @@ def bounded_tree(path):
                     pending.append(Path(entry.path))
 
 
+AGENT_PROVIDERS = ["claude", "codex", "cursor", "opencode", "pi", "omp", "fx", "grok", "devin"]
+AGENT_NAMES = {
+    "claude": ["claude"],
+    "codex": ["codex"],
+    "cursor": ["cursor-agent", "agent"],
+    "opencode": ["opencode"],
+    "pi": ["pi", "pi-coding-agent"],
+    "omp": ["omp"],
+    "fx": ["fx"],
+    "grok": ["grok"],
+    "devin": ["devin"],
+}
+# Linux tool folders that are not always exported to the login PATH.
+AGENT_FOLDERS = [
+    ".local/bin", ".npm-global/bin", ".cargo/bin", ".bun/bin", "n/bin",
+    ".volta/bin", ".asdf/shims", ".local/share/mise/shims",
+    ".grok/bin", ".fx/bin", ".claude/local", ".local/share/claude",
+    ".local/share/devin/cli/_versions/current/bin",
+]
+# Credential evidence checked without spawning the provider or reading secrets:
+# only env names and file existence are inspected. strict providers report a
+# definitive "signed out" when nothing is found; others stay unknown.
+AGENT_AUTH = {
+    "claude": {
+        "env": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"),
+        "files": (".claude/.credentials.json",),
+        "settings": (".claude/settings.json", ".claude/settings.local.json"),
+        "strict": True,
+    },
+    "codex": {
+        "env": ("OPENAI_API_KEY", "CODEX_API_KEY"),
+        "files": (".codex/auth.json",),
+        "strict": True,
+    },
+    "cursor": {"env": ("CURSOR_API_KEY",)},
+    "pi": {
+        "env": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"),
+        "files": (".pi/agent/auth.json",),
+        "strict": True,
+    },
+    "omp": {
+        "env": ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY"),
+        "files": (".omp/agent/auth.json", ".pi/agent/auth.json"),
+    },
+    "fx": {"env": ("AI_GATEWAY_API_KEY", "FX_AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN")},
+    "grok": {"env": ("XAI_API_KEY", "GROK_CODE_XAI_API_KEY")},
+    "devin": {
+        "env": ("WINDSURF_API_KEY", "DEVIN_API_KEY"),
+        "files": (".local/share/devin/credentials.toml",),
+        "strict": True,
+    },
+}
+
+
+def file_mentions(candidate, needles):
+    try:
+        with open(candidate, "rb") as stream:
+            head = stream.read(512 * 1024).lower()
+    except OSError:
+        return False
+    return any(needle in head for needle in needles)
+
+
+def agent_help(candidate, home):
+    try:
+        code, out, err = run([str(candidate), "--help"], str(home), timeout=2)
+        return code, (out + err).decode("utf-8", errors="replace").lower()
+    except (OSError, ValueError, TimeoutError):
+        return 1, ""
+
+
+def verify_agent(provider, name, candidate, resolved, home):
+    if provider == "cursor":
+        return name != "agent" or "cursor" in resolved.lower()
+    if provider == "pi":
+        if name == "pi-coding-agent":
+            return True
+        if file_mentions(candidate, (b"pi-coding-agent", b"@earendil-works/pi", b"@mariozechner/pi-coding-agent", b"pi_coding_agent")):
+            return True
+        code, text = agent_help(candidate, home)
+        return code == 0 and "--mode" in text and "rpc" in text
+    if provider == "omp":
+        if file_mentions(candidate, (b"oh-my-pi", b"oh_my_pi", b"@sinkboy-chen/omp", b"@oh-my-pi", b"pi-coding-agent", b"pi_coding_agent")):
+            return True
+        code, text = agent_help(candidate, home)
+        return code == 0 and "--mode" in text and "rpc" in text
+    if provider == "fx":
+        if file_mentions(candidate, (b"vercel-labs/fx", b"fx_model", b"createfxagent", b"fx acp")):
+            return True
+        code, text = agent_help(candidate, home)
+        return code == 0 and "acp" in text and ("ask" in text or "gateway" in text)
+    if provider == "grok":
+        if ".grok" in Path(resolved).parts:
+            return True
+        if file_mentions(candidate, (b"xai-grok", b"grok build", b"docs.x.ai/build", b"grok agent")):
+            return True
+        code, text = agent_help(candidate, home)
+        return code == 0 and ("grok build" in text or ("agent" in text and "stdio" in text))
+    if provider == "devin":
+        if "/devin/cli/" in resolved:
+            return True
+        if file_mentions(candidate, (b"cognition.ai", b"devin agent", b"devin acp", b"agent client protocol")):
+            return True
+        code, text = agent_help(candidate, home)
+        return code == 0 and "acp" in text and ("devin" in text or "agent client protocol" in text)
+    return True
+
+
+def find_agent(provider):
+    if provider == "opencode":
+        raise ValueError("OpenCode's HTTP transport is not supported in WSL yet. Choose a stdio agent such as Claude or Codex.")
+    names = AGENT_NAMES.get(provider)
+    if names is None:
+        raise ValueError("Unknown agent provider")
+    home = Path.home()
+    folders = [home / suffix for suffix in AGENT_FOLDERS]
+    folders = [Path(folder) for folder in os.environ.get("PATH", "").split(":") if folder.startswith("/") and not folder.startswith("/mnt/")] + folders
+    for name in names:
+        for folder in dict.fromkeys(folders):
+            candidate = folder / name
+            if not candidate.is_file() or not os.access(candidate, os.X_OK):
+                continue
+            resolved = str(candidate.resolve())
+            if resolved.startswith("/mnt/") or resolved.lower().endswith((".exe", ".cmd", ".bat")):
+                continue
+            if not verify_agent(provider, name, candidate, resolved, home):
+                continue
+            AGENT_BINARIES[provider] = str(candidate)
+            return str(candidate)
+    raise ValueError("%s is not installed in this WSL distribution; install its Linux CLI and retry" % provider)
+
+
+def agent_authenticated(provider):
+    checks = AGENT_AUTH.get(provider)
+    if checks is None:
+        return None
+    if any(os.environ.get(name) for name in checks.get("env", ())):
+        return True
+    home = Path.home()
+    if any((home / relative).is_file() for relative in checks.get("files", ())):
+        return True
+    for relative in checks.get("settings", ()):
+        try:
+            settings = json.loads((home / relative).read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(settings, dict) and settings.get("apiKeyHelper"):
+            return True
+    return False if checks.get("strict") else None
+
+
 def handle(request):
     op = request["op"]
     path = absolute(request["path"])
@@ -220,37 +385,16 @@ def handle(request):
     if op == "resolve_agent":
         prepare_environment()
         provider = request["provider"]
-        if provider == "opencode":
-            raise ValueError("OpenCode's HTTP transport is not supported in WSL yet. Choose a stdio agent such as Claude or Codex.")
-        names = {"claude": ["claude"], "codex": ["codex"], "cursor": ["cursor-agent", "agent"],
-                 "opencode": ["opencode"], "pi": ["pi", "pi-coding-agent"], "omp": ["omp"],
-                 "fx": ["fx"], "grok": ["grok"]}.get(provider)
-        if names is None:
-            raise ValueError("Unknown agent provider")
-        home = Path.home()
-        folders = [home / suffix for suffix in [".local/bin", ".npm-global/bin", ".cargo/bin", ".bun/bin", "n/bin", ".grok/bin", ".fx/bin"]]
-        folders = [Path(folder) for folder in os.environ.get("PATH", "").split(":") if folder.startswith("/") and not folder.startswith("/mnt/")] + folders
-        for name in names:
-            for folder in dict.fromkeys(folders):
-                candidate = folder / name
-                if not candidate.is_file() or not os.access(candidate, os.X_OK):
-                    continue
-                resolved = str(candidate.resolve())
-                if resolved.startswith("/mnt/") or resolved.lower().endswith((".exe", ".cmd", ".bat")):
-                    continue
-                if provider == "cursor" and name == "agent" and "cursor" not in resolved.lower():
-                    continue
-                if provider in {"pi", "omp", "fx"}:
-                    try:
-                        code, out, err = run([str(candidate), "--help"], str(home), timeout=2)
-                        help_text = (out + err).decode("utf-8", errors="replace").lower()
-                        if code or "rpc" not in help_text or "--mode" not in help_text:
-                            continue
-                    except (OSError, ValueError, TimeoutError):
-                        continue
-                AGENT_BINARIES[provider] = str(candidate)
-                return {"path": str(candidate)}
-        raise ValueError("%s is not installed in this WSL distribution; install its Linux CLI and retry" % provider)
+        return {"path": find_agent(provider), "authenticated": agent_authenticated(provider)}
+    if op == "resolve_agents":
+        prepare_environment()
+        resolved = {}
+        for provider in AGENT_PROVIDERS:
+            try:
+                resolved[provider] = {"path": find_agent(provider), "authenticated": agent_authenticated(provider)}
+            except ValueError as error:
+                resolved[provider] = {"error": str(error)}
+        return resolved
     if op == "agent_exec":
         command = request["command"]
         if command not in AGENT_BINARIES.values():
