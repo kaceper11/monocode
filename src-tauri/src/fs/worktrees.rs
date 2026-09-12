@@ -11,7 +11,7 @@ use tauri::{Manager, State};
 // Serializes removal against process startup, not against running agents.
 pub(crate) static LIFECYCLE: RwLock<()> = RwLock::new(());
 
-fn path_to_js(path: &Path) -> String {
+pub(crate) fn path_to_js(path: &Path) -> String {
     let text = super::path_to_js(path);
     // Rust canonicalization uses extended Windows paths; Git's inventory does not.
     if cfg!(windows) {
@@ -23,7 +23,7 @@ fn path_to_js(path: &Path) -> String {
     text
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Worktree {
     path: String,
@@ -520,17 +520,17 @@ pub fn git_worktree_removal_preview(
     removal_preview(&expand_home(&cwd), &path, include_files)
 }
 
-fn remove(root: &Path, path: &str, head: &str) -> Result<(), String> {
-    remove_reviewed(root, path, head, None)
-}
-
-fn remove_reviewed(
+/// Every check that must pass before the destructive call. Returns the
+/// family's common Git dir — it outlives removal of any member, so execution
+/// and the post-remove confirmation run through a context that survives even
+/// when the caller was sitting inside the removed checkout.
+fn removal_checks(
     root: &Path,
     path: &str,
     head: &str,
     reviewed: Option<&str>,
-) -> Result<(), String> {
-    let (_, entry) = removal_entry(root, path)?;
+) -> Result<String, String> {
+    let (common_dir, entry) = removal_entry(root, path)?;
     if entry.head != head {
         return Err("Worktree HEAD changed; refresh and review again".into());
     }
@@ -557,17 +557,38 @@ fn remove_reviewed(
             "Worktree has modified, untracked or ignored files; all files are preserved.".into(),
         );
     }
-    let target = git_path(root, path)?;
-    let result = if reviewed.is_some() {
-        git(root, &["worktree", "remove", "--force", "--", &target])
+    Ok(common_dir)
+}
+
+fn execute_removal(common_dir: &str, path: &str, force: bool) -> Result<(), String> {
+    let context = Path::new(common_dir);
+    let target = git_path(context, path)?;
+    let result = if force {
+        git(context, &["worktree", "remove", "--force", "--", &target])
     } else {
-        git(root, &["worktree", "remove", "--", &target])
+        git(context, &["worktree", "remove", "--", &target])
     };
-    if !inventory(root)?.iter().any(|e| e.path == path) {
+    if !inventory(context)?.iter().any(|e| e.path == path) {
         return Ok(());
     }
     result?;
     Err("Removal could not be confirmed; refresh before retrying".into())
+}
+
+#[cfg(test)]
+fn remove(root: &Path, path: &str, head: &str) -> Result<(), String> {
+    remove_reviewed(root, path, head, None)
+}
+
+#[cfg(test)]
+fn remove_reviewed(
+    root: &Path,
+    path: &str,
+    head: &str,
+    reviewed: Option<&str>,
+) -> Result<(), String> {
+    let common_dir = removal_checks(root, path, head, reviewed)?;
+    execute_removal(&common_dir, path, reviewed.is_some())
 }
 
 #[tauri::command(async)]
@@ -577,29 +598,48 @@ pub fn git_worktree_remove(
     path: String,
     head: String,
     reviewed: Option<String>,
+    stop_processes: Option<bool>,
 ) -> Result<(), String> {
     let _guard = LIFECYCLE
         .try_write()
         .map_err(|_| "Another worktree operation or process startup is in progress")?;
-    // ponytail: conservatively block all live processes; add scoped leases if cross-repo cleanup is needed.
-    if app
-        .state::<crate::harness::HarnessHost>()
-        .has_live_processes()
-        || app.state::<crate::pty::PtyHost>().has_live_processes()
-    {
-        return Err("Close running agents and terminals before removing a worktree. No processes were stopped.".into());
+    let root = expand_home(&cwd);
+    // Everything that can still fail is checked before any process is stopped.
+    let mut common_dir = removal_checks(&root, &path, &head, reviewed.as_deref())?;
+    let bound = super::occupancy::bound_processes(&app, &path);
+    if !bound.is_empty() {
+        if !stop_processes.unwrap_or(false) {
+            return Err(format!(
+                "Work is still running in this worktree: {}. Open it or choose Stop and remove; nothing was removed.",
+                bound
+                    .iter()
+                    .map(|process| process.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        super::occupancy::stop_bound(&app, &bound)?;
+        // Stopped work may have written during shutdown; the earlier snapshot
+        // cannot be trusted for the destructive call.
+        common_dir = removal_checks(&root, &path, &head, reviewed.as_deref())?;
     }
-    match reviewed {
-        Some(token) => remove_reviewed(&expand_home(&cwd), &path, &head, Some(&token)),
-        None => remove(&expand_home(&cwd), &path, &head),
-    }
+    execute_removal(&common_dir, &path, reviewed.is_some())
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeSafety {
+    /// Execution host of this repository family: `macos`/`windows`/`linux` or
+    /// `wsl:<distribution>`.
+    host: String,
+    /// Fresh inventory entry for the reviewed target, with recorded use.
+    entry: Worktree,
     dirty: bool,
-    running: bool,
+    /// Agents and terminals bound to the target checkout at preflight time.
+    processes: Vec<super::occupancy::BoundProcess>,
+    /// Usable alternative checkouts for the switch-away fallback, in
+    /// inventory order; the frontend ranks them by recorded use.
+    siblings: Vec<Worktree>,
 }
 
 /// On-demand detail only; deletion always performs its own fresh safety checks.
@@ -609,10 +649,19 @@ pub fn git_worktree_safety(
     cwd: String,
     path: String,
 ) -> Result<WorktreeSafety, String> {
-    let entries = inventory(&expand_home(&cwd))?;
+    let root = expand_home(&cwd);
+    let host = crate::wsl::path_location(&root)?
+        .map(|location| format!("wsl:{}", location.distribution))
+        .unwrap_or_else(|| std::env::consts::OS.into());
+    let mut entries = inventory(&root)?;
+    add_session_activity(
+        &mut entries,
+        &app.state::<crate::session_store::SessionStore>(),
+    )?;
     let entry = entries
         .iter()
         .find(|entry| entry.path == path)
+        .cloned()
         .ok_or("Worktree is no longer registered. Refresh.")?;
     if entry.missing || entry.prunable.is_some() {
         return Err("This working copy is unavailable. Restore its original location or repair its Git registration, then retry.".into());
@@ -629,11 +678,14 @@ pub fn git_worktree_safety(
     .trim()
     .is_empty();
     Ok(WorktreeSafety {
+        host,
         dirty,
-        running: app
-            .state::<crate::harness::HarnessHost>()
-            .has_live_processes()
-            || app.state::<crate::pty::PtyHost>().has_live_processes(),
+        processes: super::occupancy::bound_processes(&app, &path),
+        siblings: entries
+            .into_iter()
+            .filter(|entry| entry.path != path && !entry.missing && entry.prunable.is_none())
+            .collect(),
+        entry,
     })
 }
 
@@ -987,6 +1039,76 @@ pub(crate) mod tests {
         assert!(!Path::new(&path).exists());
         assert!(git(&repo.0, &["show-ref", "--verify", "refs/heads/keep-branch"]).is_ok());
         assert_eq!(inventory(&repo.0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn removal_runs_through_a_surviving_context() {
+        let repo = Repo::new();
+        let head = repo.head();
+        let path = repo.target("self-context");
+        create(&repo.0, "refs/heads/main", &head, "self", &path).unwrap();
+        // The caller may be sitting inside the removed checkout; the common
+        // Git dir carries the removal and the post-remove confirmation.
+        remove(Path::new(&path), &path, &head).unwrap();
+        assert!(!Path::new(&path).exists());
+        assert!(git(&repo.0, &["show-ref", "--verify", "refs/heads/self"]).is_ok());
+        assert_eq!(inventory(&repo.0).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn switch_away_removal_stops_only_bound_work_on_a_real_repo() {
+        // The `git_worktree_remove` command sequence, exercised at the owning
+        // boundary: fresh checks, scoped occupancy evidence, explicit stop,
+        // re-check, then removal through the surviving common Git dir.
+        let repo = Repo::new();
+        let head = repo.head();
+        let path = repo.target("busy target");
+        let sibling = repo.target("healthy sibling");
+        create(&repo.0, "refs/heads/main", &head, "busy", &path).unwrap();
+        create(&repo.0, "refs/heads/main", &head, "sibling", &sibling).unwrap();
+
+        let harness = crate::harness::HarnessHost::new();
+        let pty = crate::pty::PtyHost::new();
+        let mut inside = harness.add_test_child("agent-in-target", &path);
+        let mut outside = harness.add_test_child("agent-in-sibling", &sibling);
+
+        let common_dir = removal_checks(&repo.0, &path, &head, None).unwrap();
+        let bound = crate::fs::occupancy::collect(&harness, &pty, None, &path);
+        assert_eq!(
+            bound.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            vec!["agent-in-target"]
+        );
+
+        crate::fs::occupancy::stop_processes(&harness, &pty, &bound).unwrap();
+        assert!(harness
+            .live_cwds()
+            .iter()
+            .all(|(id, _)| id != "agent-in-target"));
+
+        // Stopped work may have changed files, so checks run again before
+        // the destructive call — the same order the command enforces.
+        let common_dir = removal_checks(&repo.0, &path, &head, None).unwrap_or_else(|_| {
+            panic!("clean tree still passes after stop; first context {common_dir}")
+        });
+        execute_removal(&common_dir, &path, false).unwrap();
+
+        assert!(!Path::new(&path).exists());
+        assert!(Path::new(&sibling).exists());
+        assert_eq!(inventory(&repo.0).unwrap().len(), 2);
+        assert!(git(&repo.0, &["show-ref", "--verify", "refs/heads/busy"]).is_ok());
+        assert_eq!(
+            harness
+                .live_cwds()
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-in-sibling"]
+        );
+
+        let _ = inside.wait();
+        let _ = outside.kill();
+        let _ = outside.wait();
     }
 
     #[test]

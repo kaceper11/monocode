@@ -12,6 +12,7 @@ use serde_json::json;
 
 use crate::dirs_home;
 
+pub mod occupancy;
 pub mod worktrees;
 
 pub(crate) const MAX_TEXT_FILE_BYTES: u64 = 8 * 1024 * 1024;

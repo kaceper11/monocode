@@ -121,6 +121,10 @@ import {
   type ProjectTerminalDock as ProjectTerminal,
 } from "./lib/projectTerminal";
 import {
+  OPEN_BOUND_PROCESS,
+  type BoundProcess,
+} from "./lib/worktreeRemoval";
+import {
   applyGroupedReorder,
   insertTabBesideActive,
   removeTabFromGroup,
@@ -658,6 +662,11 @@ export default function App({
       setRecents(loadRecents());
       setProjectCwd((current) =>
         sameProjectPath(current, path) ? replacement : current,
+      );
+      // The removed checkout's dock is detached, not moved: its terminals
+      // were bound processes and were stopped or blocked the removal.
+      setProjectTerminals((current) =>
+        current.filter((dock) => !sameProjectPath(dock.projectPath, path)),
       );
     }),
     [],
@@ -4634,6 +4643,55 @@ export default function App({
     window.addEventListener(OPEN_REPAIR, open);
     return () => window.removeEventListener(OPEN_REPAIR, open);
   }, [onSelectHistorySession]);
+
+  // "Open" on a removal blocker row: focus the bound session or terminal.
+  useEffect(() => {
+    const open = (event: Event) => {
+      const process = (event as CustomEvent<BoundProcess>).detail;
+      if (!process?.id) return;
+      if (process.kind === "terminal") {
+        for (const tab of tabsRef.current) {
+          for (const pane of tab.terminalPanes ?? []) {
+            if (!pane.files.some((file) => file.id === process.id)) continue;
+            setTabs((current) =>
+              current.map((entry) =>
+                entry.id === tab.id
+                  ? {
+                      ...entry,
+                      terminalPanes: (entry.terminalPanes ?? []).map(
+                        (item) =>
+                          item.id === pane.id
+                            ? { ...item, activeFileId: process.id }
+                            : item,
+                      ),
+                    }
+                  : entry,
+              ),
+            );
+            activateTab(tab.id, pane.id);
+            return;
+          }
+        }
+        const dock = projectTerminalsRef.current.find((entry) =>
+          entry.pane.files.some((file) => file.id === process.id),
+        );
+        if (dock) {
+          setProjectCwd(dock.projectPath);
+          setProjectTerminals((prev) =>
+            mapProjectTerminal(prev, dock.projectPath, (entry) =>
+              withDockOpen(selectDockTerminal(entry, process.id), true),
+            ),
+          );
+          focusProjectTerminal();
+        }
+        return;
+      }
+      setInboxViewOpen(false);
+      void onSelectHistorySession(process.id);
+    };
+    window.addEventListener(OPEN_BOUND_PROCESS, open);
+    return () => window.removeEventListener(OPEN_BOUND_PROCESS, open);
+  }, [activateTab, focusProjectTerminal, onSelectHistorySession]);
 
   // The task just created — the rail's "current" task until a task session
   // takes over. Never launches work on its own.

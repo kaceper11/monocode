@@ -15,6 +15,13 @@ import {
 } from "../lib/repositoryFamilies";
 import { notifyGitChanged } from "../lib/fs";
 import {
+  openBoundProcess,
+  removalFallbackLabel,
+  removalFallbacks,
+  type BoundProcess,
+  type WorktreeSafety,
+} from "../lib/worktreeRemoval";
+import {
   ArrowLeft,
   Check,
   ChevronRight,
@@ -74,10 +81,7 @@ export function WorktreePanel({
   const recents = loadRecents();
   const [oldestFirst, setOldestFirst] = useState(false);
   const [detail, setDetail] = useState<Worktree | null>(null);
-  const [safety, setSafety] = useState<{
-    dirty: boolean;
-    running: boolean;
-  } | null>(null);
+  const [safety, setSafety] = useState<WorktreeSafety | null>(null);
   const [safetyError, setSafetyError] = useState("");
   const openedInitial = useRef(false);
   useEffect(() => {
@@ -85,7 +89,8 @@ export function WorktreePanel({
     let cancelled = false;
     setSafety(null);
     setSafetyError("");
-    void invoke<{ dirty: boolean; running: boolean }>("git_worktree_safety", {
+    setRemovalFailure(null);
+    void invoke<WorktreeSafety>("git_worktree_safety", {
       cwd,
       path: detail.path,
     })
@@ -117,7 +122,13 @@ export function WorktreePanel({
   const [confirmation, setConfirmation] = useState<{
     entry: Worktree;
     action: "open" | "remove";
+    processes?: BoundProcess[];
+    fallbacks?: Worktree[];
+    host?: string;
   } | null>(null);
+  const [fallbackPath, setFallbackPath] = useState<string | null>(null);
+  const [stopConfirm, setStopConfirm] = useState(false);
+  const [removalFailure, setRemovalFailure] = useState<string | null>(null);
   const [forceReview, setForceReview] = useState<{
     token: string;
     fileCount: number;
@@ -264,6 +275,67 @@ export function WorktreePanel({
       }
     });
   };
+  const family = getVerifiedFamilies().get(pathKey(cwd));
+  const startRemove = (entry: Worktree) =>
+    void run(async () => {
+      setForceReview(null);
+      setForceFiles(null);
+      setStopConfirm(false);
+      setRemovalFailure(null);
+      // Fresh preflight: identity, file state and target-bound processes.
+      const current = await invoke<WorktreeSafety>("git_worktree_safety", {
+        cwd,
+        path: entry.path,
+      });
+      const fallbacks = removalFallbacks(entry.path, current.siblings, recents);
+      if (current.dirty) {
+        const review = await invoke<NonNullable<typeof forceReview>>(
+          "git_worktree_removal_preview",
+          { cwd, path: entry.path, includeFiles: false },
+        );
+        setForceReview(review);
+      }
+      setFallbackPath(fallbacks[0]?.path ?? null);
+      setConfirmation({
+        entry: current.entry,
+        action: "remove",
+        processes: current.processes,
+        fallbacks,
+        host: current.host,
+      });
+    });
+  const confirmRemove = confirmation?.action === "remove";
+  const confirmProcesses = confirmation?.processes ?? [];
+  const confirmFallbacks = confirmation?.fallbacks ?? [];
+  // Removing the selected worktree switches the visible project first.
+  const confirmSwitch =
+    confirmRemove &&
+    !!confirmation &&
+    pathKey(confirmation.entry.path) === pathKey(activeCwd);
+  const confirmFallback =
+    confirmFallbacks.find(
+      (candidate) => pathKey(candidate.path) === pathKey(fallbackPath ?? ""),
+    ) ?? confirmFallbacks[0];
+  const processRow = (process: BoundProcess) => (
+    <div
+      key={`${process.kind}:${process.id}`}
+      className="flex items-center gap-2 text-[11px] text-content/70"
+    >
+      <span
+        className="min-w-0 flex-1 truncate"
+        title={prettyCwd(process.cwd)}
+      >
+        {process.label}
+      </span>
+      <button
+        type="button"
+        className="shrink-0 rounded border border-content/10 px-1.5 py-0.5 hover:bg-content/5"
+        onClick={() => openBoundProcess(process)}
+      >
+        Open
+      </button>
+    </div>
+  );
   return (
     <div
       className="min-h-0 flex-1 overflow-y-auto overscroll-none text-[12px]"
@@ -272,18 +344,23 @@ export function WorktreePanel({
       {confirmation ? (
         <div className="space-y-2 px-3 py-2.5">
           <p className="flex items-center gap-2 font-medium">
-            {confirmation.action === "remove" && (
+            {confirmRemove && (
               <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-red-500/10 text-red-600">
                 <Trash2 className="size-3.5" aria-hidden="true" />
               </span>
             )}
-            {confirmation.action === "remove"
+            {confirmRemove
               ? forceReview
                 ? "Permanently remove worktree?"
-                : "Remove worktree?"
+                : confirmSwitch && confirmFallback
+                  ? `Switch to ${removalFallbackLabel(confirmFallback, family)} and remove ${confirmation.entry.branch?.replace("refs/heads/", "")}?`
+                  : "Remove worktree?"
               : "Share this worktree?"}
           </p>
-          <p className="truncate text-content/70">Repository: {prettyCwd(cwd)}</p>
+          <p className="truncate text-content/70">
+            Repository: {prettyCwd(cwd)}
+            {confirmation.host ? ` · ${confirmation.host}` : ""}
+          </p>
           <p className="truncate font-mono">
             {confirmation.entry.branch?.replace("refs/heads/", "")} ·{" "}
             {confirmation.entry.head.slice(0, 10)}
@@ -291,11 +368,68 @@ export function WorktreePanel({
           <p className="break-all text-[11px] text-content/50">
             {prettyCwd(confirmation.entry.path)}
           </p>
+          {confirmRemove && confirmSwitch && (
+            <div className="space-y-1">
+              {confirmFallback ? (
+                <p className="truncate text-content/70">
+                  Switches to {removalFallbackLabel(confirmFallback, family)} ·{" "}
+                  <span className="text-content/50">
+                    {prettyCwd(confirmFallback.path)}
+                  </span>
+                </p>
+              ) : (
+                <p className="text-[11px] text-red-400 [.theme-light_&]:text-red-700">
+                  No other checkout can receive this project — the selected
+                  worktree is the only usable one.
+                </p>
+              )}
+              {confirmFallbacks.length > 1 && (
+                <details className="text-[11px] text-content/70">
+                  <summary className="cursor-pointer">
+                    Choose another checkout
+                  </summary>
+                  {confirmFallbacks.map((candidate) => (
+                    <button
+                      key={candidate.path}
+                      type="button"
+                      className="flex w-full items-center gap-1.5 py-0.5 text-left hover:bg-content/5"
+                      onClick={() => setFallbackPath(candidate.path)}
+                    >
+                      <Check
+                        className={`size-3 shrink-0 ${confirmFallback && pathKey(candidate.path) === pathKey(confirmFallback.path) ? "" : "opacity-0"}`}
+                        aria-hidden="true"
+                      />
+                      <span className="min-w-0 flex-1 truncate">
+                        {removalFallbackLabel(candidate, family)}
+                      </span>
+                      <span className="max-w-1/2 truncate text-content/40">
+                        {prettyCwd(candidate.path)}
+                      </span>
+                    </button>
+                  ))}
+                </details>
+              )}
+            </div>
+          )}
+          {confirmRemove && confirmProcesses.length > 0 && (
+            <div className="space-y-1">
+              <p className="text-[11px] font-medium text-content/80">
+                Running in this checkout
+              </p>
+              {confirmProcesses.map(processRow)}
+              <p className="text-[11px] text-content/50">
+                Editors and agents outside MonoCode are not listed and keep
+                running.
+              </p>
+            </div>
+          )}
           <p className="text-[11px] leading-4 text-content/60">
-            {confirmation.action === "remove"
+            {confirmRemove
               ? forceReview
                 ? `All files in this working copy, including uncommitted, untracked and ignored files, will be permanently deleted. Reviewed ${forceReview.fileCount} entries. The branch and conversations stay.`
-                : "The branch and conversations stay. Files and running work are checked again before removal."
+                : stopConfirm
+                  ? `The ${confirmProcesses.length} listed ${confirmProcesses.length === 1 ? "process" : "processes"} will be stopped, then the working copy is removed. This cannot be undone for running work.`
+                  : "The branch and conversations stay. Files and running work are checked again before removal."
               : "Other conversations use this folder. Their agents can change the same files."}
           </p>
           {confirmation.action === "remove" && forceReview && (
@@ -346,8 +480,10 @@ export function WorktreePanel({
             </button>
             <button
               type="button"
-              disabled={busy}
-              className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 font-medium outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-background-base disabled:opacity-40 ${confirmation.action === "remove" ? "bg-content/5 text-red-400 hover:bg-content/10 [.theme-light_&]:text-red-700 focus-visible:ring-red-500" : "bg-content/10 hover:bg-content/15 focus-visible:ring-content/30"}`}
+              disabled={
+                busy || (confirmRemove && confirmSwitch && !confirmFallback)
+              }
+              className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 font-medium outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-background-base disabled:opacity-40 ${confirmRemove ? "bg-content/5 text-red-400 hover:bg-content/10 [.theme-light_&]:text-red-700 focus-visible:ring-red-500" : "bg-content/10 hover:bg-content/15 focus-visible:ring-content/30"}`}
               onClick={() => {
                 const { entry, action } = confirmation;
                 if (action === "open") {
@@ -355,37 +491,71 @@ export function WorktreePanel({
                   onClose();
                   return;
                 }
+                // Stopping bound processes needs its own explicit click.
+                if (confirmProcesses.length > 0 && !stopConfirm) {
+                  setStopConfirm(true);
+                  return;
+                }
+                const fallback = confirmFallback;
                 void run(async () => {
+                  if (confirmSwitch) {
+                    if (!fallback) {
+                      throw new Error(
+                        "No surviving checkout can receive this project.",
+                      );
+                    }
+                    // Move only the visible context; removal still validates
+                    // identity, files and processes itself.
+                    onOpen(fallback.path);
+                  }
                   try {
                     await invoke("git_worktree_remove", {
-                      cwd,
+                      cwd: confirmSwitch && fallback ? fallback.path : cwd,
                       path: entry.path,
                       head: entry.head,
                       reviewed: forceReview?.token ?? null,
+                      stopProcesses:
+                        confirmProcesses.length > 0 ? true : null,
                     });
                   } catch (error) {
+                    // The checkout may or may not have been removed — the
+                    // refresh below reports the true state; the detail view
+                    // offers reopen or review-and-retry.
                     setConfirmation(null);
                     setForceReview(null);
-                    throw error;
+                    setStopConfirm(false);
+                    setRemovalFailure(String(error));
+                    return;
                   }
                   forgetRemovedWorktree(
                     entry.path,
-                    entries.find((tree) => tree.main)?.path ?? cwd,
+                    confirmSwitch && fallback
+                      ? fallback.path
+                      : (entries.find((tree) => tree.main)?.path ?? cwd),
                   );
                   setWorkingCopyHidden(entry.path, false);
                   notifyGitChanged(cwd);
                   setConfirmation(null);
+                  setStopConfirm(false);
                   setDetail(null);
                 });
               }}
             >
-              {confirmation.action === "remove" && (
+              {confirmRemove && (
                 <Trash2 className="size-3.5" aria-hidden="true" />
               )}
-              {confirmation.action === "remove"
-                ? forceReview
-                  ? "Permanently remove"
-                  : "Remove"
+              {confirmRemove
+                ? confirmProcesses.length > 0
+                  ? stopConfirm
+                    ? forceReview
+                      ? "Stop and permanently remove"
+                      : "Stop and remove"
+                    : "Stop and remove…"
+                  : forceReview
+                    ? "Permanently remove"
+                    : confirmSwitch
+                      ? "Switch and remove"
+                      : "Remove"
                 : "Open conversation"}
             </button>
           </div>
@@ -423,10 +593,45 @@ export function WorktreePanel({
                 : safetyError || "Checking worktree…"}
             </p>
           )}
-          {safety?.running && (
-            <p className="text-content/70">
-              Close running agents or terminals before removal.
-            </p>
+          {safety && safety.processes.length > 0 && (
+            <div className="space-y-1">
+              <p className="text-content/70">
+                {safety.processes.length === 1
+                  ? "1 process runs"
+                  : `${safety.processes.length} processes run`}{" "}
+                in this checkout. Removal offers to stop them, or open and
+                close them first.
+              </p>
+              {safety.processes.map(processRow)}
+            </div>
+          )}
+          {removalFailure && (
+            <div className="space-y-1.5 rounded-md border border-red-500/30 bg-red-500/5 p-2">
+              <p className="break-words text-[11px] text-red-400 [.theme-light_&]:text-red-700">
+                {removalFailure}
+              </p>
+              <div className="flex gap-2">
+                {!detail.missing && !detail.prunable && (
+                  <button
+                    type="button"
+                    className="rounded-md border border-content/10 px-2 py-1 text-[11px] text-content/70 hover:bg-content/5"
+                    onClick={() => {
+                      onOpen(detail.path);
+                      onClose();
+                    }}
+                  >
+                    Reopen target
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="rounded-md border border-content/10 px-2 py-1 text-[11px] text-content/70 hover:bg-content/5"
+                  onClick={() => startRemove(detail)}
+                >
+                  Review and retry
+                </button>
+              </div>
+            </div>
           )}
           <details className="text-[11px] text-content/70">
             <summary className="cursor-pointer">
@@ -498,45 +703,17 @@ export function WorktreePanel({
               busy ||
               detail.main ||
               !detail.branch ||
-              pathKey(detail.path) === pathKey(activeCwd) ||
               detail.missing ||
               !!detail.locked ||
               !!detail.prunable ||
-              !safety ||
-              safety.running
+              !safety
             }
             className={`${rowClass} text-red-400! [.theme-light_&]:text-red-700! focus-visible:ring-2 focus-visible:ring-red-500`}
-            onClick={() =>
-              void run(async () => {
-                setForceReview(null);
-                setForceFiles(null);
-                const current = await invoke<{
-                  dirty: boolean;
-                  running: boolean;
-                }>("git_worktree_safety", { cwd, path: detail.path });
-                if (current.running)
-                  throw new Error(
-                    "Close running agents or terminals before removal. No processes were stopped.",
-                  );
-                if (current.dirty) {
-                  const review = await invoke<NonNullable<typeof forceReview>>(
-                    "git_worktree_removal_preview",
-                    { cwd, path: detail.path, includeFiles: false },
-                  );
-                  setForceReview(review);
-                }
-                setConfirmation({ entry: detail, action: "remove" });
-              })
-            }
+            onClick={() => startRemove(detail)}
           >
             <Trash2 className="size-3.5" />
             Remove Git worktree…
           </button>
-          {pathKey(detail.path) === pathKey(activeCwd) && !detail.main && (
-            <p className="text-[11px] text-content/70">
-              Switch to another working copy before removing this checkout.
-            </p>
-          )}
           {detail.main && (
             <p className="text-[11px] text-content/70">
               The main checkout is protected. Use the project menu to archive

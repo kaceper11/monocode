@@ -44,6 +44,8 @@ struct LivePty {
     #[cfg(windows)]
     master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     pid: u32,
+    /// Spawn-time working directory — worktree-removal binding evidence.
+    cwd: String,
 }
 
 pub struct PtyHost {
@@ -51,13 +53,6 @@ pub struct PtyHost {
 }
 
 impl PtyHost {
-    pub(crate) fn has_live_processes(&self) -> bool {
-        !self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-    }
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
@@ -94,6 +89,27 @@ impl PtyHost {
         sessions.remove(id)
     }
 
+    /// (pty id, spawn cwd) of every live terminal — removal binding evidence.
+    pub(crate) fn live_cwds(&self) -> Vec<(String, String)> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, live)| (id.clone(), live.cwd.clone()))
+            .collect()
+    }
+
+    /// `pty_kill` by id — also stops only the terminals proven to belong to a
+    /// reviewed worktree.
+    pub(crate) fn kill_id(&self, id: &str) -> Result<(), String> {
+        if let Some(live) = self.remove(id) {
+            terminate(live.pid);
+            #[cfg(unix)]
+            close_fd(live.master_fd);
+        }
+        Ok(())
+    }
+
     pub(crate) fn kill_all(&self) {
         let kids: Vec<Arc<LivePty>> = {
             let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -113,6 +129,29 @@ impl PtyHost {
         // before this returns. `terminate`'s detached escalate thread never gets
         // to run, and every shell is its own `setsid` session that outlives us.
         crate::harness::terminate_all(&pids);
+    }
+
+    /// A real child behind a fake PTY, for tests that exercise scoped
+    /// ownership and stopping without a frontend.
+    #[cfg(all(test, unix))]
+    pub(crate) fn add_test_pty(&self, id: &str, cwd: &str) -> std::process::Child {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn test process");
+        self.insert(
+            id.into(),
+            Arc::new(LivePty {
+                writer: Mutex::new(Box::new(std::io::sink())),
+                master_fd: -1,
+                pid: child.id(),
+                cwd: cwd.into(),
+            }),
+        );
+        child
     }
 }
 
@@ -227,12 +266,7 @@ pub fn pty_status(host: State<'_, PtyHost>, id: String) -> Result<PtyStatus, Str
 
 #[tauri::command]
 pub fn pty_kill(host: State<PtyHost>, id: String) -> Result<(), String> {
-    if let Some(live) = host.remove(&id) {
-        terminate(live.pid);
-        #[cfg(unix)]
-        close_fd(live.master_fd);
-    }
-    Ok(())
+    host.kill_id(&id)
 }
 
 /// Off the main thread: `kill_all` waits for the shells to die before it
@@ -309,6 +343,7 @@ fn spawn_unix(
         writer: Mutex::new(Box::new(writer)),
         master_fd: master,
         pid,
+        cwd,
     });
     host.insert(id.clone(), live);
 
@@ -438,6 +473,7 @@ fn spawn_windows(
         writer: Mutex::new(Box::new(writer)),
         master: Mutex::new(pair.master),
         pid,
+        cwd,
     });
     host.insert(id.clone(), live);
 
@@ -838,6 +874,7 @@ mod tests {
                 writer: Mutex::new(Box::new(std::io::sink())),
                 master_fd: -1,
                 pid: 42,
+                cwd: String::new(),
             }),
         );
         assert!(host.remove_if_pid("term", 7).is_none());
