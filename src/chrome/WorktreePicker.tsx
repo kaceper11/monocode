@@ -103,10 +103,18 @@ export function WorktreePanel({
   const hidden = hiddenWorkingCopies(hiddenRaw);
   const recents = loadRecents();
   const [oldestFirst, setOldestFirst] = useState(false);
-  const [detail, setDetail] = useState<Worktree | null>(null);
+  // The manage affordance opens straight on the entry it was clicked for;
+  // seeding from the published family avoids a list flash before refresh.
+  const [detail, setDetail] = useState<Worktree | null>(() => {
+    if (!initialPath) return null;
+    const seeded = getVerifiedFamilies()
+      .get(pathKey(cwd))
+      ?.worktrees.find((entry) => pathKey(entry.path) === pathKey(initialPath));
+    return seeded ? { ...seeded, users: seeded.users ?? [] } : null;
+  });
   const [safety, setSafety] = useState<WorktreeSafety | null>(null);
   const [safetyError, setSafetyError] = useState("");
-  const openedInitial = useRef(false);
+  const openedInitial = useRef(detail != null);
   useEffect(() => {
     if (!detail) return;
     let cancelled = false;
@@ -150,6 +158,10 @@ export function WorktreePanel({
   } | null>(null);
   const [fallbackPath, setFallbackPath] = useState<string | null>(null);
   const [stopConfirm, setStopConfirm] = useState(false);
+  // The confirmation mounts while run()'s trailing refresh still holds busy;
+  // its buttons track the destructive call itself instead of that generic
+  // flag, so they never flash disabled-then-enabled on open.
+  const [removing, setRemoving] = useState(false);
   const [removalFailure, setRemovalFailure] = useState<string | null>(null);
   // A failed removal must stay visible across refresh()'s new detail object;
   // it clears only when a different checkout (or repository) is viewed.
@@ -314,6 +326,7 @@ export function WorktreePanel({
       setForceReview(null);
       setForceFiles(null);
       setStopConfirm(false);
+      setRemoving(false);
       setRemovalFailure(null);
       // Fresh preflight: identity, file state and target-bound processes.
       const current = await invoke<WorktreeSafety>("git_worktree_safety", {
@@ -510,7 +523,7 @@ export function WorktreePanel({
           <div className="flex justify-end gap-2 border-t border-content/10 pt-2.5">
             <button
               type="button"
-              disabled={busy}
+              disabled={removing}
               className="rounded-md border border-content/10 px-2.5 py-1.5 text-content/70 outline-none hover:bg-content/5 focus-visible:ring-2 focus-visible:ring-content/30 disabled:opacity-40"
               onClick={() => setConfirmation(null)}
             >
@@ -519,7 +532,7 @@ export function WorktreePanel({
             <button
               type="button"
               disabled={
-                busy || (confirmRemove && confirmSwitch && !confirmFallback)
+                removing || (confirmRemove && confirmSwitch && !confirmFallback)
               }
               className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 font-medium outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-background-base disabled:opacity-40 ${confirmRemove ? "bg-content/5 text-red-400 hover:bg-content/10 [.theme-light_&]:text-red-700 focus-visible:ring-red-500" : "bg-content/10 hover:bg-content/15 focus-visible:ring-content/30"}`}
               onClick={() => {
@@ -536,6 +549,7 @@ export function WorktreePanel({
                 }
                 const fallback = confirmFallback;
                 void run(async () => {
+                  setRemoving(true);
                   if (confirmSwitch) {
                     if (!fallback) {
                       throw new Error(
@@ -562,6 +576,7 @@ export function WorktreePanel({
                     setConfirmation(null);
                     setForceReview(null);
                     setStopConfirm(false);
+                    setRemoving(false);
                     setRemovalFailure(String(error));
                     return;
                   }
