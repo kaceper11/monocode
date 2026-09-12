@@ -16,6 +16,8 @@ export type RepositoryFamily = {
   commonDir: string;
   checkout: string;
   worktrees: WorkingCopy[];
+  /** Root commit — stable across clones of the same lineage. */
+  identity?: string | null;
 };
 
 let verifiedFamilies: ReadonlyMap<string, RepositoryFamily> = new Map();

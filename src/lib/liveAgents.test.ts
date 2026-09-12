@@ -44,6 +44,7 @@ describe("liveAgentsFromSessions", () => {
       {
         id: session.id,
         cwd: "/tmp/agent-terminal",
+        workCwd: "/tmp/agent-terminal",
         title: "Fix the sidebar",
         harness: "claude",
         activity: "Edited src/App.tsx",
@@ -53,6 +54,20 @@ describe("liveAgentsFromSessions", () => {
         done: false,
       },
     ]);
+  });
+
+  it("reports the bound worktree as workCwd", () => {
+    const session = chat("/tmp/main", {
+      busy: true,
+      worktreeCwd: "/tmp/main-wt",
+      blocks: [
+        { id: "u1", role: "user", text: "go", startedAt: 1_000 },
+        edit("t1"),
+      ],
+    });
+    const [agent] = liveAgentsFromSessions([session]);
+    expect(agent.cwd).toBe("/tmp/main");
+    expect(agent.workCwd).toBe("/tmp/main-wt");
   });
 
   it("puts sessions waiting on approval first", () => {
@@ -142,6 +157,7 @@ describe("liveAgentsFromSessions", () => {
       {
         id: finished.id,
         cwd: "/tmp/done",
+        workCwd: "/tmp/done",
         title: "Fix the sidebar",
         harness: "claude",
         activity: "Done",

@@ -199,9 +199,14 @@ pub struct RepositoryFamily {
     common_dir: String,
     checkout: String,
     worktrees: Vec<Worktree>,
+    /// Root commit — stable across clones of the same lineage, so separate
+    /// checkouts that share no .git still land in one collision domain.
+    /// Absent on unborn heads and divergent shallow clones.
+    identity: Option<String>,
 }
 
-/// Shared Git metadata identifies linked checkouts; remotes do not identify clones.
+/// Shared Git metadata identifies linked checkouts; the root commit ties
+/// together clones that share no common dir (remotes do not identify clones).
 #[tauri::command(async)]
 pub fn git_repository_family(cwd: String) -> Result<RepositoryFamily, String> {
     let root = expand_home(&cwd);
@@ -210,10 +215,14 @@ pub fn git_repository_family(cwd: String) -> Result<RepositoryFamily, String> {
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
     let checkout = git(&root, &["rev-parse", "--show-toplevel"])?;
+    let identity = git(&root, &["rev-list", "--max-parents=0", "HEAD"])
+        .ok()
+        .and_then(|text| text.lines().next().map(str::to_string));
     Ok(RepositoryFamily {
         common_dir: canonical(&qualify(&root, common.trim_end_matches(['\r', '\n']))?)?,
         checkout: canonical(&qualify(&root, checkout.trim_end_matches(['\r', '\n']))?)?,
         worktrees: inventory(&root)?,
+        identity,
     })
 }
 
@@ -227,7 +236,35 @@ pub fn git_worktrees(
     Ok(entries)
 }
 
-const ACTIVITY_QUERY: &str = "SELECT id, title, updated_at FROM sessions WHERE COALESCE(NULLIF(worktree_cwd, ''), cwd) = ?1 AND has_user_message = 1 ORDER BY updated_at DESC LIMIT 100";
+/// Files committed on HEAD since the merge-base with the default branch —
+/// the landed half of "did a sibling already touch this path". Working-tree
+/// changes are covered by `git_diff_files`; absent a default branch there is
+/// nothing to compare, so the answer is honestly empty.
+#[tauri::command]
+pub async fn git_branch_changed_files(cwd: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        let remote = super::git_remote_name(&root);
+        let Some(base_name) = super::git_default_branch(&root, remote.as_deref()) else {
+            return Ok(Vec::new());
+        };
+        let Some(base_ref) = super::git_target_ref(&root, &base_name, remote.as_deref()) else {
+            return Ok(Vec::new());
+        };
+        let spec = format!("{base_ref}...HEAD");
+        let text = git(&root, &["diff", "--name-only", "--no-ext-diff", &spec])?;
+        Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+const ACTIVITY_QUERY: &str = "SELECT id, title, updated_at FROM sessions WHERE COALESCE(NULLIF(worktree_cwd, ''), cwd) = ?1 AND has_user_message = 1 AND archived = 0 ORDER BY updated_at DESC LIMIT 100";
 
 fn add_session_activity(
     entries: &mut [Worktree],
@@ -727,6 +764,8 @@ pub(crate) mod tests {
             for index in 1..=110 {
                 conn.execute("INSERT INTO sessions (id,cwd,worktree_cwd,harness,model,runtime_mode,title,created_at,updated_at,has_user_message) VALUES (?1,'/main','/child','codex','test','supervised','fixture',1,?2,1)", rusqlite::params![format!("s{index}"), index]).unwrap();
             }
+            // Archived sessions are neither live evidence nor peer labels.
+            conn.execute("INSERT INTO sessions (id,cwd,worktree_cwd,harness,model,runtime_mode,title,created_at,updated_at,has_user_message,archived) VALUES ('archived-1','/main','/child','codex','test','supervised','archived',1,999,1,1)", []).unwrap();
         }
         let mut entries = vec![
             Worktree {
@@ -741,6 +780,10 @@ pub(crate) mod tests {
         add_session_activity(&mut entries, &store).unwrap();
         assert_eq!(entries[0].last_used, None);
         assert_eq!(entries[1].last_used, Some(110));
+        assert!(entries[1]
+            .users
+            .iter()
+            .all(|user| !user.contains("archived-1")));
 
         assert_eq!(entries[1].users.len(), 100);
         assert!(entries[1].users[0].ends_with("(s110)"));

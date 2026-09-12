@@ -132,6 +132,7 @@ import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import { useProjectDiffStats } from "../hooks/useProjectDiffStats";
 import { useSortable } from "../hooks/useSortable";
 import { useTabGroupLogos } from "../hooks/useTabGroupLogos";
+import { useWorktreeCollision } from "../hooks/useWorktreeCollisions";
 import { normalizeHex } from "../lib/colorUtils";
 import {
   looksLikeProject,
@@ -146,6 +147,7 @@ import { HarnessIcon } from "./HarnessIcon";
 import { ProjectRail } from "./ProjectRail";
 import { RailAction } from "./RailAction";
 import { TerminalSpinner } from "./TerminalSpinner";
+import { WorktreeCollisionBadge } from "./WorktreeCollisionBadge";
 import { DevModeSlot, IconButton, TabVisitNav } from "./TitleBar";
 import { ProjectSearch } from "./ProjectSearch";
 import { ProjectLogoIcon } from "./ProjectLogoIcon";
@@ -2452,6 +2454,7 @@ function SessionCard({
   const title = sessionDisplayTitle(session.title, session.harness);
   const gitLabel = formatGitLabel(session.repo, session.branch);
   const taskScope = useTaskScope(session.id, sessionWorkCwd(session));
+  const collision = useWorktreeCollision(sessionWorkCwd(session));
 
   const time = formatRelative(session.updatedAt, now);
   const model = compact
@@ -2714,6 +2717,7 @@ function SessionCard({
           <span className="min-w-0 flex-1 line-clamp-1 text-[13px] font-semibold leading-snug text-content">
             {title}
           </span>
+          {collision ? <WorktreeCollisionBadge files={collision} /> : null}
           {compact ? (
             <span className="flex shrink-0 items-center gap-1.5">
               {status}

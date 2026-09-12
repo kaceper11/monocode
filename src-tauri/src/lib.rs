@@ -309,6 +309,7 @@ pub fn run() {
             linear::linear_issue_comment,
             fs::git_branches,
             fs::worktrees::git_worktrees,
+            fs::worktrees::git_branch_changed_files,
             fs::worktrees::git_repository_family,
             fs::worktrees::git_worktree_refs,
             fs::worktrees::git_worktree_create,

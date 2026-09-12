@@ -72,6 +72,12 @@ import {
   cachedBranchPr,
   subscribeBranchPrVersion,
 } from "../hooks/useBranchPr";
+import {
+  peekWorktreeCollision,
+  subscribeWorktreeCollisionVersion,
+  useWorktreeCollision,
+  worktreeCollisionVersion,
+} from "../hooks/useWorktreeCollisions";
 import { useSortable } from "../hooks/useSortable";
 import { useTabGroupLogos } from "../hooks/useTabGroupLogos";
 import {
@@ -128,6 +134,7 @@ import { SettingsNav } from "./SettingsRail";
 import { Shimmer } from "../surfaces/Shimmer";
 import { TabGroupMenu, type TabGroupMenuExtraItem } from "./TabGroupMenu";
 import { TerminalSpinner } from "./TerminalSpinner";
+import { WorktreeCollisionBadge } from "./WorktreeCollisionBadge";
 import { Popover } from "./Popover";
 import { WorktreePanel } from "./WorktreePicker";
 import {
@@ -1238,83 +1245,94 @@ function LiveAgentCard({
       ? "Done"
       : agent.activity;
   const live = !agent.needsApproval && !agent.done;
+  const collision = useWorktreeCollision(agent.workCwd);
   const title = [agent.title, project, activity, elapsed]
     .filter(Boolean)
     .join("\n");
 
   return (
-    <button
-      type="button"
-      title={title}
-      aria-label={[agent.title, project, activity, elapsed]
-        .filter(Boolean)
-        .join(", ")}
-      aria-current={selected ? "true" : undefined}
-      onClick={() => onSelect?.(agent.id)}
-      className={`relative flex w-full flex-col rounded-md px-2 py-1.5 text-left ${
-        selected ? "bg-content/10" : "hover:bg-content/8"
-      }`}
-    >
-      <span className="flex min-w-0 items-center gap-2">
-        {taskScope ? (
-          <Task
-            className={`size-3 shrink-0 ${live ? "text-accent" : "text-content/40"}`}
-            strokeWidth={1.75}
-          />
-        ) : (
-          <ProjectMascot
-            project={seed}
-            color={color}
-            name={resolveTabGroupMascot(key, groupMascots)}
-            className="size-2 shrink-0"
-            active={live}
-          />
-        )}
-        {live ? (
-          <p className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-snug">
-            {agent.title}
-          </p>
-        ) : (
-          <span className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-snug">
-            {agent.title}
-          </span>
-        )}
-      </span>
-      <span
-        className={`mt-1 flex min-w-0 items-center gap-1.5 pl-4 text-[11px] leading-tight ${
-          agent.needsApproval
-            ? "text-amber-400"
-            : agent.done
-              ? "text-emerald-400"
-              : "text-content/50"
+    <div className="relative">
+      <button
+        type="button"
+        title={title}
+        aria-label={[agent.title, project, activity, elapsed]
+          .filter(Boolean)
+          .join(", ")}
+        aria-current={selected ? "true" : undefined}
+        onClick={() => onSelect?.(agent.id)}
+        className={`relative flex w-full flex-col rounded-md px-2 py-1.5 text-left ${
+          selected ? "bg-content/10" : "hover:bg-content/8"
         }`}
       >
-        {agent.needsApproval ? (
-          <CircleAlert className="size-3 shrink-0" strokeWidth={1.75} />
-        ) : agent.done ? (
-          <Check className="size-3 shrink-0" strokeWidth={2.25} />
-        ) : (
-          <TerminalSpinner className="inline-block w-3 select-none text-center text-[11px] leading-none" />
-        )}
-        <span className="min-w-0 truncate">{activity}</span>
-      </span>
-      <span className="mt-1 flex min-w-0 items-center gap-1.5 pl-4 text-[11px] leading-tight text-content/45">
-        <HarnessIcon harness={agent.harness} className="size-3 shrink-0" />
-        <span className="min-w-0 flex-1 truncate">
-          {taskScope
-            ? [
-                taskScope.task.name,
-                ...taskScope.task.children.map((child) =>
-                  taskChildRepoLabel(taskScope.task, child),
-                ),
-              ].join(" · ")
-            : project}
+        <span
+          className={`flex min-w-0 items-center gap-2 ${collision ? "pr-7" : ""}`}
+        >
+          {taskScope ? (
+            <Task
+              className={`size-3 shrink-0 ${live ? "text-accent" : "text-content/40"}`}
+              strokeWidth={1.75}
+            />
+          ) : (
+            <ProjectMascot
+              project={seed}
+              color={color}
+              name={resolveTabGroupMascot(key, groupMascots)}
+              className="size-2 shrink-0"
+              active={live}
+            />
+          )}
+          {live ? (
+            <p className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-snug">
+              {agent.title}
+            </p>
+          ) : (
+            <span className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-snug">
+              {agent.title}
+            </span>
+          )}
         </span>
-        {elapsed ? (
-          <span className="shrink-0 tabular-nums">{elapsed}</span>
-        ) : null}
-      </span>
-    </button>
+        <span
+          className={`mt-1 flex min-w-0 items-center gap-1.5 pl-4 text-[11px] leading-tight ${
+            agent.needsApproval
+              ? "text-amber-400"
+              : agent.done
+                ? "text-emerald-400"
+                : "text-content/50"
+          }`}
+        >
+          {agent.needsApproval ? (
+            <CircleAlert className="size-3 shrink-0" strokeWidth={1.75} />
+          ) : agent.done ? (
+            <Check className="size-3 shrink-0" strokeWidth={2.25} />
+          ) : (
+            <TerminalSpinner className="inline-block w-3 select-none text-center text-[11px] leading-none" />
+          )}
+          <span className="min-w-0 truncate">{activity}</span>
+        </span>
+        <span className="mt-1 flex min-w-0 items-center gap-1.5 pl-4 text-[11px] leading-tight text-content/45">
+          <HarnessIcon harness={agent.harness} className="size-3 shrink-0" />
+          <span className="min-w-0 flex-1 truncate">
+            {taskScope
+              ? [
+                  taskScope.task.name,
+                  ...taskScope.task.children.map((child) =>
+                    taskChildRepoLabel(taskScope.task, child),
+                  ),
+                ].join(" · ")
+              : project}
+          </span>
+          {elapsed ? (
+            <span className="shrink-0 tabular-nums">{elapsed}</span>
+          ) : null}
+        </span>
+      </button>
+      {collision ? (
+        <WorktreeCollisionBadge
+          files={collision}
+          className="absolute right-1.5 top-1.5"
+        />
+      ) : null}
+    </div>
   );
 }
 
@@ -1478,6 +1496,11 @@ function WorkingCopyRows({
   onSelect: (path: string) => void;
   onManage: (event: MouseEvent<HTMLButtonElement>, path?: string) => void;
 }) {
+  // One version subscription per rows block; per-copy results are peeked.
+  useSyncExternalStore(
+    subscribeWorktreeCollisionVersion,
+    worktreeCollisionVersion,
+  );
   const children = family.worktrees.filter(
     (child) =>
       sameProjectPath(child.path, cwd) ||
@@ -1489,6 +1512,7 @@ function WorkingCopyRows({
         const name = workingCopyName(child, family);
         const active = sameProjectPath(child.path, cwd);
         const working = isBusyPath(child.path, busyPaths);
+        const collision = peekWorktreeCollision(child.path);
         return (
           <div
             key={child.path}
@@ -1499,7 +1523,7 @@ function WorkingCopyRows({
               disabled={child.missing || !!child.prunable}
               title={`${prettyCwd(child.path)}\n${child.head}\n${workingCopyAge(lastWorkingCopyUse(child, recents))} in MonoCode${child.locked ? ` · ${child.locked}` : ""}${working ? " · Working" : ""}`}
               aria-current={active ? "true" : undefined}
-              className={`flex h-7 w-full min-w-0 items-center gap-1.5 rounded-md pl-2 pr-7 text-left text-xs outline-none focus-visible:ring-1 focus-visible:ring-content/30 disabled:opacity-40 ${active ? "bg-content/10 text-content" : "text-content/55 hover:bg-content/5 hover:text-content/85"}`}
+              className={`flex h-7 w-full min-w-0 items-center gap-1.5 rounded-md pl-2 ${collision ? "pr-16" : "pr-7"} text-left text-xs outline-none focus-visible:ring-1 focus-visible:ring-content/30 disabled:opacity-40 ${active ? "bg-content/10 text-content" : "text-content/55 hover:bg-content/5 hover:text-content/85"}`}
               onClick={() => onSelect(child.path)}
             >
               <GitBranch
@@ -1520,11 +1544,17 @@ function WorkingCopyRows({
                 />
               ) : null}
             </button>
+            {collision ? (
+              <WorktreeCollisionBadge
+                files={collision}
+                className="absolute right-1 top-1/2 -translate-y-1/2"
+              />
+            ) : null}
             <button
               type="button"
               title="Worktree details and cleanup"
               aria-label={`Manage worktree ${name}`}
-              className="invisible absolute right-1 top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded-md text-content/40 hover:bg-content/10 hover:text-content group-hover/working-copy:visible group-focus-within/working-copy:visible focus-visible:ring-1 focus-visible:ring-content/30"
+              className={`invisible absolute ${collision ? "right-11" : "right-1"} top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded-md text-content/40 hover:bg-content/10 hover:text-content group-hover/working-copy:visible group-focus-within/working-copy:visible focus-visible:ring-1 focus-visible:ring-content/30`}
               onClick={(event) => onManage(event, child.path)}
             >
               <MoreHorizontal className="size-3" />
