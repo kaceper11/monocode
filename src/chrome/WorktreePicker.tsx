@@ -89,7 +89,6 @@ export function WorktreePanel({
     let cancelled = false;
     setSafety(null);
     setSafetyError("");
-    setRemovalFailure(null);
     void invoke<WorktreeSafety>("git_worktree_safety", {
       cwd,
       path: detail.path,
@@ -104,6 +103,11 @@ export function WorktreePanel({
       cancelled = true;
     };
   }, [cwd, detail]);
+  // A failed removal must stay visible across refresh()'s new detail object;
+  // it clears only when a different checkout (or repository) is viewed.
+  useEffect(() => {
+    setRemovalFailure(null);
+  }, [cwd, detail?.path]);
   const [refs, setRefs] = useState<Ref[]>([]);
   const [base, setBase] = useState(initialBase);
   const [creating, setCreating] = useState(
@@ -137,21 +141,26 @@ export function WorktreePanel({
   const [forceFiles, setForceFiles] = useState<string[] | null>(null);
   const pending = useRef(false);
   const selected = refs.find((ref) => ref.name === base);
+  // A pending removal may switch the project under this panel; refresh must
+  // query the path the panel is showing now, not the one it captured.
+  const cwdRef = useRef(cwd);
+  cwdRef.current = cwd;
   const refresh = async () => {
+    const current = cwdRef.current;
     const [trees, branches] = await Promise.all([
-      invoke<Worktree[]>("git_worktrees", { cwd }),
-      invoke<Ref[]>("git_worktree_refs", { cwd }),
+      invoke<Worktree[]>("git_worktrees", { cwd: current }),
+      invoke<Ref[]>("git_worktree_refs", { cwd: current }),
     ]);
     setEntries(trees);
-    setDetail((current) =>
-      current
+    setDetail((shown) =>
+      shown
         ? (trees.find(
-            (entry) => pathKey(entry.path) === pathKey(current.path),
+            (entry) => pathKey(entry.path) === pathKey(shown.path),
           ) ?? null)
         : null,
     );
     const previous = getVerifiedFamilies();
-    const family = previous.get(pathKey(cwd));
+    const family = previous.get(pathKey(current));
     if (family) {
       const next = new Map(previous);
       for (const [key, value] of next) {
@@ -428,7 +437,7 @@ export function WorktreePanel({
               ? forceReview
                 ? `All files in this working copy, including uncommitted, untracked and ignored files, will be permanently deleted. Reviewed ${forceReview.fileCount} entries. The branch and conversations stay.`
                 : stopConfirm
-                  ? `The ${confirmProcesses.length} listed ${confirmProcesses.length === 1 ? "process" : "processes"} will be stopped, then the working copy is removed. This cannot be undone for running work.`
+                  ? `Work running in this checkout will be stopped (${confirmProcesses.length} ${confirmProcesses.length === 1 ? "process" : "processes"} now, re-checked before removal), then the working copy is removed. This cannot be undone for running work.`
                   : "The branch and conversations stay. Files and running work are checked again before removal."
               : "Other conversations use this folder. Their agents can change the same files."}
           </p>

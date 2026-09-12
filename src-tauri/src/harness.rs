@@ -743,6 +743,11 @@ pub fn harness_sse_open(
     headers: Option<HashMap<String, String>>,
 ) -> Result<(), String> {
     assert_loopback(&url)?;
+    // A stream-only session is removal-binding evidence; registration must
+    // not slip between a removal's occupancy check and its stop.
+    let _worktree_guard = crate::fs::worktrees::LIFECYCLE
+        .try_read()
+        .map_err(|_| "Worktree operation in progress; retry startup after it completes")?;
     host.stop_sse(&session_id);
     let stop = Arc::new(AtomicBool::new(false));
     host.insert_sse(

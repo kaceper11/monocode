@@ -619,6 +619,19 @@ pub fn git_worktree_remove(
             ));
         }
         super::occupancy::stop_bound(&app, &bound)?;
+        // Fail closed: anything still bound after the stop — a process that
+        // refused to die or one a future host reports — blocks removal.
+        let remaining = super::occupancy::bound_processes(&app, &path);
+        if !remaining.is_empty() {
+            return Err(format!(
+                "Work is still running in this worktree: {}. Review it, then retry; nothing was removed.",
+                remaining
+                    .iter()
+                    .map(|process| process.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         // Stopped work may have written during shutdown; the earlier snapshot
         // cannot be trusted for the destructive call.
         common_dir = removal_checks(&root, &path, &head, reviewed.as_deref())?;

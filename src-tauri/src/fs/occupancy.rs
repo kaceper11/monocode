@@ -49,16 +49,49 @@ fn host_key(path: &str) -> String {
     }
 }
 
+/// The target's comparison key, computed once per collection so each
+/// candidate only canonicalizes itself.
+enum TargetKey {
+    Wsl { distribution: String, path: String },
+    Host(String),
+}
+
+fn target_key(target: &str) -> Option<TargetKey> {
+    match crate::wsl::location(target) {
+        Ok(Some(location)) => Some(TargetKey::Wsl {
+            distribution: location.distribution,
+            path: location.path,
+        }),
+        Ok(None) => Some(TargetKey::Host(host_key(target))),
+        Err(_) => None,
+    }
+}
+
+fn owns_key(target: &TargetKey, path: &str) -> bool {
+    match (target, crate::wsl::location(path)) {
+        (
+            TargetKey::Wsl {
+                distribution,
+                path: root,
+            },
+            Ok(Some(location)),
+        ) => {
+            distribution.eq_ignore_ascii_case(&location.distribution)
+                && inside(root, &location.path)
+        }
+        (TargetKey::Host(root), Ok(None)) => inside(root, &host_key(path)),
+        _ => false,
+    }
+}
+
 /// True when `path` is the target checkout or a directory inside it, on the
 /// same execution host. Cross-host and unparsable paths are not evidence.
+/// `collect` inlines this via `owns_key` so the target key is computed once.
+#[cfg(test)]
 pub fn owns_path(target: &str, path: &str) -> bool {
-    match (crate::wsl::location(target), crate::wsl::location(path)) {
-        (Ok(Some(target)), Ok(Some(path))) => {
-            target.distribution.eq_ignore_ascii_case(&path.distribution)
-                && inside(&target.path, &path.path)
-        }
-        (Ok(None), Ok(None)) => inside(&host_key(target), &host_key(path)),
-        _ => false,
+    match target_key(target) {
+        Some(key) => owns_key(&key, path),
+        None => false,
     }
 }
 
@@ -99,9 +132,12 @@ pub(crate) fn collect(
     store: Option<&SessionStore>,
     target: &str,
 ) -> Vec<BoundProcess> {
+    let Some(target) = target_key(target) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for (id, cwd) in harness.live_cwds() {
-        if owns_path(target, &cwd) {
+        if owns_key(&target, &cwd) {
             out.push(BoundProcess {
                 kind: "agent",
                 label: agent_label(store, &id),
@@ -119,7 +155,7 @@ pub(crate) fn collect(
         let Some((title, cwd)) = store.and_then(|store| session_row(store, &id)) else {
             continue;
         };
-        if owns_path(target, &cwd) {
+        if owns_key(&target, &cwd) {
             out.push(BoundProcess {
                 kind: "agent",
                 label: if title.trim().is_empty() {
@@ -133,7 +169,7 @@ pub(crate) fn collect(
         }
     }
     for (id, cwd) in pty.live_cwds() {
-        if owns_path(target, &cwd) {
+        if owns_key(&target, &cwd) {
             out.push(BoundProcess {
                 kind: "terminal",
                 label: format!(
@@ -172,7 +208,8 @@ pub(crate) fn stop_processes(
         let result = match process.kind {
             "agent" => harness.kill_id(&process.id),
             "terminal" => pty.kill_id(&process.id),
-            _ => continue,
+            // A bound process we cannot stop must block, not be skipped.
+            kind => Err(format!("no stopper for process kind '{kind}'")),
         };
         if let Err(error) = result {
             failed.push(format!("{} ({error})", process.label));
