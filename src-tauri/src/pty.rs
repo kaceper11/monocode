@@ -100,14 +100,16 @@ impl PtyHost {
     }
 
     /// `pty_kill` by id — also stops only the terminals proven to belong to a
-    /// reviewed worktree.
-    pub(crate) fn kill_id(&self, id: &str) -> Result<(), String> {
+    /// reviewed worktree. Returns the stopped shell's pid so callers can wait
+    /// out the TERM→KILL escalation and report survivors.
+    pub(crate) fn kill_id(&self, id: &str) -> Result<Option<u32>, String> {
         if let Some(live) = self.remove(id) {
             terminate(live.pid);
             #[cfg(unix)]
             close_fd(live.master_fd);
+            return Ok(Some(live.pid));
         }
-        Ok(())
+        Ok(None)
     }
 
     pub(crate) fn kill_all(&self) {
@@ -266,7 +268,7 @@ pub fn pty_status(host: State<'_, PtyHost>, id: String) -> Result<PtyStatus, Str
 
 #[tauri::command]
 pub fn pty_kill(host: State<PtyHost>, id: String) -> Result<(), String> {
-    host.kill_id(&id)
+    host.kill_id(&id).map(|_| ())
 }
 
 /// Off the main thread: `kill_all` waits for the shells to die before it

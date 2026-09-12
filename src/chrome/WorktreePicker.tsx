@@ -1,7 +1,13 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { forgetRemovedWorktree, loadRecents } from "../lib/recents";
-import { pathKey, prettyCwd, wslLocation, wslPath } from "../lib/paths";
+import {
+  isEqualOrInside,
+  pathKey,
+  prettyCwd,
+  wslLocation,
+  wslPath,
+} from "../lib/paths";
 import {
   getVerifiedFamilies,
   publishRepositoryFamilies,
@@ -103,11 +109,6 @@ export function WorktreePanel({
       cancelled = true;
     };
   }, [cwd, detail]);
-  // A failed removal must stay visible across refresh()'s new detail object;
-  // it clears only when a different checkout (or repository) is viewed.
-  useEffect(() => {
-    setRemovalFailure(null);
-  }, [cwd, detail?.path]);
   const [refs, setRefs] = useState<Ref[]>([]);
   const [base, setBase] = useState(initialBase);
   const [creating, setCreating] = useState(
@@ -133,6 +134,11 @@ export function WorktreePanel({
   const [fallbackPath, setFallbackPath] = useState<string | null>(null);
   const [stopConfirm, setStopConfirm] = useState(false);
   const [removalFailure, setRemovalFailure] = useState<string | null>(null);
+  // A failed removal must stay visible across refresh()'s new detail object;
+  // it clears only when a different checkout (or repository) is viewed.
+  useEffect(() => {
+    setRemovalFailure(null);
+  }, [cwd, detail?.path]);
   const [forceReview, setForceReview] = useState<{
     token: string;
     fileCount: number;
@@ -168,7 +174,7 @@ export function WorktreePanel({
           next.delete(key);
       }
       const updated = { ...family, worktrees: trees };
-      next.set(pathKey(cwd), updated);
+      next.set(pathKey(current), updated);
       for (const tree of trees)
         if (!tree.missing && !tree.prunable)
           next.set(pathKey(tree.path), updated);
@@ -296,6 +302,10 @@ export function WorktreePanel({
         cwd,
         path: entry.path,
       });
+      if (current.entry.locked)
+        throw new Error(
+          `This working copy is locked (${current.entry.locked}). Unlock it with Git, then retry.`,
+        );
       const fallbacks = removalFallbacks(entry.path, current.siblings, recents);
       if (current.dirty) {
         const review = await invoke<NonNullable<typeof forceReview>>(
@@ -316,11 +326,12 @@ export function WorktreePanel({
   const confirmRemove = confirmation?.action === "remove";
   const confirmProcesses = confirmation?.processes ?? [];
   const confirmFallbacks = confirmation?.fallbacks ?? [];
-  // Removing the selected worktree switches the visible project first.
+  // Removing the selected worktree — or a worktree containing the selected
+  // project — switches the visible context first.
   const confirmSwitch =
     confirmRemove &&
     !!confirmation &&
-    pathKey(confirmation.entry.path) === pathKey(activeCwd);
+    isEqualOrInside(activeCwd, confirmation.entry.path);
   const confirmFallback =
     confirmFallbacks.find(
       (candidate) => pathKey(candidate.path) === pathKey(fallbackPath ?? ""),

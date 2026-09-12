@@ -182,14 +182,16 @@ impl HarnessHost {
     }
 
     /// `harness_kill` by id — also stops only the agent proven to belong to a
-    /// reviewed worktree.
-    pub(crate) fn kill_id(&self, session_id: &str) -> Result<(), String> {
+    /// reviewed worktree. Returns the stopped child's pid so callers can wait
+    /// out the TERM→KILL escalation and report survivors.
+    pub(crate) fn kill_id(&self, session_id: &str) -> Result<Option<u32>, String> {
         self.stop_sse(session_id);
         if let Some(live) = self.kill_session(session_id) {
             live.terminate()?;
             self.remove_if_pid(session_id, live.pid);
+            return Ok(Some(live.pid));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn kill_session(&self, session_id: &str) -> Option<Arc<LiveChild>> {
@@ -627,7 +629,7 @@ pub fn harness_write(
 
 #[tauri::command(async)]
 pub fn harness_kill(host: State<HarnessHost>, session_id: String) -> Result<(), String> {
-    host.kill_id(&session_id)
+    host.kill_id(&session_id).map(|_| ())
 }
 
 const MAX_HARNESS_LINE_BYTES: u64 = 32 * 1024 * 1024;
@@ -934,6 +936,9 @@ pub async fn harness_exec(
     .map_err(|e| e.to_string())?
 }
 
+// Deliberately not registered and not serialized against worktree removal:
+// allowlisted ≤15s read-only probes only. A long-lived process host must
+// take LIFECYCLE.try_read() and record its cwd like harness_spawn does.
 fn exec_capture(command: &str, args: &[String], cwd: Option<&str>) -> Result<String, String> {
     let mut cmd = Command::new(command);
     cmd.args(args)
@@ -1093,6 +1098,27 @@ fn wait_until_dead(pids: &[u32], until: Instant) {
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Bounded wait for just-signaled trees — outlasts the TERM→KILL escalation,
+/// then reports the pids still answering so callers can fail closed instead
+/// of removing a directory under a live process.
+#[cfg(not(windows))]
+pub(crate) fn await_stopped(pids: &[u32]) -> Vec<u32> {
+    wait_until_dead(
+        pids,
+        Instant::now() + KILL_ESCALATE + Duration::from_millis(500),
+    );
+    pids.iter()
+        .copied()
+        .filter(|pid| tree_alive(*pid))
+        .collect()
+}
+
+/// `taskkill /F` is synchronous — nothing to wait on.
+#[cfg(windows)]
+pub(crate) fn await_stopped(_pids: &[u32]) -> Vec<u32> {
+    Vec::new()
 }
 
 enum TreeSignal {

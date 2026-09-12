@@ -1085,6 +1085,11 @@ pub(crate) mod tests {
         let pty = crate::pty::PtyHost::new();
         let mut inside = harness.add_test_child("agent-in-target", &path);
         let mut outside = harness.add_test_child("agent-in-sibling", &sibling);
+        // Real children are reaped by their owner threads; an unwaited test
+        // child would stay a zombie and answer kill(pid, 0) during the wait.
+        std::thread::spawn(move || {
+            let _ = inside.wait();
+        });
 
         let common_dir = removal_checks(&repo.0, &path, &head, None).unwrap();
         let bound = crate::fs::occupancy::collect(&harness, &pty, None, &path);
@@ -1119,7 +1124,6 @@ pub(crate) mod tests {
             vec!["agent-in-sibling"]
         );
 
-        let _ = inside.wait();
         let _ = outside.kill();
         let _ = outside.wait();
     }

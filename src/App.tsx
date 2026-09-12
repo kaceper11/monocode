@@ -661,13 +661,43 @@ export default function App({
     () => subscribeRemovedWorktree(({ path, replacement }) => {
       setRecents(loadRecents());
       setProjectCwd((current) =>
-        sameProjectPath(current, path) ? replacement : current,
+        isEqualOrInside(current, path) ? replacement : current,
       );
-      // The removed checkout's dock is detached, not moved: its terminals
-      // were bound processes and were stopped or blocked the removal.
-      setProjectTerminals((current) =>
-        current.filter((dock) => !sameProjectPath(dock.projectPath, path)),
-      );
+      // The removed checkout's dock detaches: terminals spawned inside it
+      // were bound processes — stopped, or they blocked the removal. A
+      // terminal running elsewhere keeps running and moves to the
+      // replacement dock instead of losing its only UI.
+      setProjectTerminals((current) => {
+        let touched = false;
+        let survivors: FilePaneTab[] = [];
+        const docks = current.filter((dock) => {
+          if (!isEqualOrInside(dock.projectPath, path)) return true;
+          touched = true;
+          survivors = dock.pane.files.filter(
+            (file) =>
+              file.terminal &&
+              !!file.cwd &&
+              !isEqualOrInside(file.cwd, path),
+          );
+          return false;
+        });
+        if (!touched) return current;
+        if (survivors.length === 0) return docks;
+        const index = docks.findIndex((dock) =>
+          sameProjectPath(dock.projectPath, replacement),
+        );
+        if (index < 0) {
+          const [first, ...rest] = survivors;
+          let dock = createProjectTerminal(replacement, first);
+          for (const file of rest) dock = addTerminalToDock(dock, file);
+          return [...docks, dock];
+        }
+        docks[index] = survivors.reduce(
+          (dock, file) => addTerminalToDock(dock, file),
+          docks[index],
+        );
+        return docks;
+      });
     }),
     [],
   );

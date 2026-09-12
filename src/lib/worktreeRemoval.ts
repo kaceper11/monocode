@@ -39,9 +39,9 @@ export type WorktreeSafety = {
 /**
  * Ordered switch targets for removing `target` while it is selected:
  * healthy sibling checkouts by most recent recorded use, then the
- * accessible main checkout. The target itself, missing checkouts, prunable
- * registrations, locked copies and detached HEADs can never receive the
- * active context.
+ * accessible main checkout. The target itself, missing checkouts and
+ * prunable registrations can never receive the active context; locked and
+ * detached-HEAD checkouts stay eligible — locks block removal, not use.
  */
 export function removalFallbacks(
   target: string,
@@ -52,9 +52,7 @@ export function removalFallbacks(
     (entry) =>
       pathKey(entry.path) !== pathKey(target) &&
       !entry.missing &&
-      !entry.prunable &&
-      !entry.locked &&
-      !!entry.branch,
+      !entry.prunable,
   );
   const siblings = usable
     .filter((entry) => !entry.main)

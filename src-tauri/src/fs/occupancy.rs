@@ -189,7 +189,7 @@ pub(crate) fn collect(
 
 /// Stop exactly the processes evidence proved belong to the reviewed target.
 /// The caller holds the worktree lifecycle write lock, so no spawn can join
-/// mid-stop. Unknown kinds are skipped rather than guessed at.
+/// mid-stop. Unknown kinds block rather than being guessed at.
 pub fn stop_bound(app: &AppHandle, processes: &[BoundProcess]) -> Result<(), String> {
     stop_processes(
         &app.state::<HarnessHost>(),
@@ -204,6 +204,7 @@ pub(crate) fn stop_processes(
     processes: &[BoundProcess],
 ) -> Result<(), String> {
     let mut failed = Vec::new();
+    let mut stopped: Vec<(String, u32)> = Vec::new();
     for process in processes {
         let result = match process.kind {
             "agent" => harness.kill_id(&process.id),
@@ -211,8 +212,20 @@ pub(crate) fn stop_processes(
             // A bound process we cannot stop must block, not be skipped.
             kind => Err(format!("no stopper for process kind '{kind}'")),
         };
-        if let Err(error) = result {
-            failed.push(format!("{} ({error})", process.label));
+        match result {
+            Ok(Some(pid)) => stopped.push((process.label.clone(), pid)),
+            Ok(None) => {}
+            Err(error) => failed.push(format!("{} ({error})", process.label)),
+        }
+    }
+    // Signaling is asynchronous: a process ignoring SIGTERM stays inside the
+    // reviewed tree until the escalation lands. Wait out that window and
+    // report survivors rather than removing files under live work.
+    let pids: Vec<u32> = stopped.iter().map(|(_, pid)| *pid).collect();
+    let survivors = crate::harness::await_stopped(&pids);
+    for (label, pid) in stopped {
+        if survivors.contains(&pid) {
+            failed.push(format!("{label} (pid {pid} still running)"));
         }
     }
     if failed.is_empty() {
@@ -284,12 +297,20 @@ mod tests {
 
         let harness = HarnessHost::new();
         let pty = PtyHost::new();
-        let inside = harness.add_test_child("s-inside", &target);
+        let mut inside = harness.add_test_child("s-inside", &target);
         let mut outside = harness.add_test_child("s-outside", &sibling);
         harness.add_test_sse("streamed");
         harness.add_test_sse("unknown-stream"); // no session row — not evidence
         let mut term_inside = pty.add_test_pty("t-inside", &format!("{target}/sub"));
         let mut term_other = pty.add_test_pty("t-other", &sibling);
+        // Real children are reaped by their owner threads; an unwaited test
+        // child would stay a zombie and answer kill(pid, 0) during the wait.
+        std::thread::spawn(move || {
+            let _ = inside.wait();
+        });
+        std::thread::spawn(move || {
+            let _ = term_inside.wait();
+        });
 
         let bound = collect(&harness, &pty, Some(&store), &target);
         let ids: Vec<&str> = bound.iter().map(|p| p.id.as_str()).collect();
@@ -308,6 +329,19 @@ mod tests {
             other.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
             vec!["s-outside", "t-other"]
         );
+
+        // A kind no host can stop fails closed instead of being skipped.
+        assert!(stop_processes(
+            &harness,
+            &pty,
+            &[BoundProcess {
+                kind: "command",
+                id: "cmd-1".into(),
+                cwd: target.clone(),
+                label: "Saved command".into(),
+            }],
+        )
+        .is_err());
 
         stop_processes(&harness, &pty, &bound).unwrap();
         assert!(harness.live_cwds().iter().all(|(id, _)| id != "s-inside"));
@@ -335,10 +369,7 @@ mod tests {
             vec!["t-other"]
         );
 
-        // Reap the stopped children and release the survivors.
-        let mut inside = inside;
-        let _ = inside.wait();
-        let _ = term_inside.wait();
+        // Release the surviving children.
         let _ = outside.kill();
         let _ = outside.wait();
         let _ = term_other.kill();

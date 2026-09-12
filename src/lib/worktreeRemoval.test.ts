@@ -58,15 +58,30 @@ describe("removalFallbacks", () => {
     const target = entry("/repo/wt-target");
     const missing = entry("/repo/wt-missing", { missing: true });
     const prunable = entry("/repo/wt-prunable", { prunable: "gone" });
+    const main = entry("/repo", { main: true, branch: "refs/heads/main" });
+    const result = removalFallbacks(
+      target.path,
+      [target, missing, prunable, main],
+      [],
+    );
+    expect(result.map((e) => e.path)).toEqual(["/repo"]);
+  });
+
+  it("accepts locked and detached checkouts as switch destinations", () => {
     const locked = entry("/repo/wt-locked", { locked: "reason" });
     const detached = entry("/repo/wt-detached", { branch: null });
     const main = entry("/repo", { main: true, branch: "refs/heads/main" });
     const result = removalFallbacks(
-      target.path,
-      [target, missing, prunable, locked, detached, main],
+      "/repo/wt-target",
+      [locked, detached, main],
       [],
     );
-    expect(result.map((e) => e.path)).toEqual(["/repo"]);
+    // Siblings still rank ahead of main even without a branch.
+    expect(result.map((e) => e.path)).toEqual([
+      "/repo/wt-detached",
+      "/repo/wt-locked",
+      "/repo",
+    ]);
   });
 
   it("never treats a WSL path as a host-path match", () => {
