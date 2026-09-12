@@ -50,6 +50,23 @@ type Worktree = {
   users: string[];
   lastUsed?: number | null;
 };
+
+/** Same displayed entry — lets refresh() keep detail object identity so the
+ * safety fetch effect does not refire and flash "Checking worktree…". */
+function sameWorktree(a: Worktree, b: Worktree): boolean {
+  return (
+    a.path === b.path &&
+    a.head === b.head &&
+    a.branch === b.branch &&
+    a.main === b.main &&
+    a.locked === b.locked &&
+    a.prunable === b.prunable &&
+    a.missing === b.missing &&
+    a.lastUsed === b.lastUsed &&
+    a.users.length === b.users.length &&
+    a.users.every((user, index) => user === b.users[index])
+  );
+}
 type Ref = { name: string; commit: string };
 
 export function WorktreePanel({
@@ -158,13 +175,14 @@ export function WorktreePanel({
       invoke<Ref[]>("git_worktree_refs", { cwd: current }),
     ]);
     setEntries(trees);
-    setDetail((shown) =>
-      shown
-        ? (trees.find(
-            (entry) => pathKey(entry.path) === pathKey(shown.path),
-          ) ?? null)
-        : null,
-    );
+    setDetail((shown) => {
+      if (!shown) return null;
+      const found = trees.find(
+        (entry) => pathKey(entry.path) === pathKey(shown.path),
+      );
+      if (!found) return null;
+      return sameWorktree(found, shown) ? shown : found;
+    });
     const previous = getVerifiedFamilies();
     const family = previous.get(pathKey(current));
     if (family) {
@@ -554,10 +572,9 @@ export function WorktreePanel({
                       : (entries.find((tree) => tree.main)?.path ?? cwd),
                   );
                   setWorkingCopyHidden(entry.path, false);
-                  notifyGitChanged(cwd);
-                  setConfirmation(null);
-                  setStopConfirm(false);
-                  setDetail(null);
+                  notifyGitChanged(cwdRef.current);
+                  // Done — the action completed; don't drop back to the list.
+                  onClose();
                 });
               }}
             >

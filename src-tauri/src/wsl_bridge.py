@@ -373,16 +373,19 @@ def handle(request):
     if op == "worktree_review":
         # The Rust owner verifies Git family/HEAD/index and all removal policy.
         # This OS boundary fingerprints Linux files without following symlinks.
+        # Metadata only — name, mode, size, mtime — so trees of any byte size
+        # review in stat time; a write between review and removal still moves
+        # mtime or size and invalidates the token.
         digest = hashlib.sha256()
-        pending, count, total, files = [path], 0, 0, []
+        pending, count, files = [path], 0, []
         deadline = time.monotonic() + 25
         while pending:
             current = pending.pop()
             count += 1
-            if count > 10_000 or time.monotonic() > deadline:
-                raise ValueError("Force review exceeds 10,000 entries or 25 seconds; clean up with Git")
+            if count > 250_000 or time.monotonic() > deadline:
+                raise ValueError("Force review exceeds 250,000 entries or 25 seconds; clean up with Git")
             meta = current.lstat()
-            digest.update(json.dumps([str(current.relative_to(path)), meta.st_mode, meta.st_mtime_ns], ensure_ascii=True).encode())
+            digest.update(json.dumps([str(current.relative_to(path)), meta.st_mode, meta.st_size, meta.st_mtime_ns], ensure_ascii=True).encode())
             if stat.S_ISLNK(meta.st_mode):
                 digest.update(os.fsencode(os.readlink(current)))
             elif stat.S_ISDIR(meta.st_mode):
@@ -391,20 +394,11 @@ def handle(request):
                     for child in entries:
                         if current == path and child.name == ".git":
                             continue
-                        if count + len(pending) + len(children) >= 10_000:
-                            raise ValueError("Force review exceeds 10,000 entries; clean up with Git")
+                        if count + len(pending) + len(children) >= 250_000:
+                            raise ValueError("Force review exceeds 250,000 entries; clean up with Git")
                         children.append(Path(child.path))
                 pending.extend(sorted(children))
-            elif stat.S_ISREG(meta.st_mode):
-                total += meta.st_size
-                if total > 64 * 1024 * 1024:
-                    raise ValueError("Force review exceeds 64 MiB; clean up with Git")
-                with current.open("rb") as source:
-                    data = source.read(64 * 1024 * 1024 + 1)
-                if len(data) != meta.st_size:
-                    raise ValueError("Files changed during review; refresh")
-                digest.update(data)
-            else:
+            elif not stat.S_ISREG(meta.st_mode):
                 raise ValueError("Special files cannot be reviewed safely; clean up with Git")
             if request.get("includeFiles") and not stat.S_ISDIR(meta.st_mode) and len(files) < 100:
                 files.append(str(current.relative_to(path)))

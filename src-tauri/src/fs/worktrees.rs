@@ -399,8 +399,11 @@ fn removal_entry(root: &Path, path: &str) -> Result<(String, Worktree), String> 
     Ok((family.common_dir, entry))
 }
 
-// Force review is deliberately bounded and on demand. Large trees must be cleaned
-// explicitly with Git; never trade incomplete evidence for a destructive action.
+// Force review fingerprints metadata — name, type, mode, size and mtime per
+// entry — so trees of any byte size review in stat time. A write between
+// review and removal changes mtime or size, so the token still binds the
+// reviewed tree to the destructive call; only the entry count and walk time
+// are bounded.
 fn removal_preview(root: &Path, path: &str, include_files: bool) -> Result<RemovalPreview, String> {
     use std::hash::{Hash, Hasher};
     let (common_dir, entry) = removal_entry(root, path)?;
@@ -428,12 +431,11 @@ fn removal_preview(root: &Path, path: &str, include_files: bool) -> Result<Remov
     let start = Instant::now();
     let mut pending = vec![std::path::PathBuf::from(path)];
     let mut count = 0;
-    let mut bytes = 0u64;
     let mut files = Vec::new();
     while let Some(current) = pending.pop() {
-        if start.elapsed() > Duration::from_secs(30) || count >= 10_000 {
+        if start.elapsed() > Duration::from_secs(30) || count >= 250_000 {
             return Err(
-                "Force review exceeds 10,000 entries or 30 seconds. Clean up with Git instead."
+                "Force review exceeds 250,000 entries or 30 seconds. Clean up with Git instead."
                     .into(),
             );
         }
@@ -463,9 +465,9 @@ fn removal_preview(root: &Path, path: &str, include_files: bool) -> Result<Remov
                 if current == Path::new(path) && child.file_name() == ".git" {
                     continue;
                 }
-                if children.len() + pending.len() + count >= 10_000 {
+                if children.len() + pending.len() + count >= 250_000 {
                     return Err(
-                        "Force review exceeds 10,000 entries. Clean up with Git instead.".into(),
+                        "Force review exceeds 250,000 entries. Clean up with Git instead.".into(),
                     );
                 }
                 children.push(child.path());
@@ -473,22 +475,7 @@ fn removal_preview(root: &Path, path: &str, include_files: bool) -> Result<Remov
             children.sort();
             pending.extend(children);
         } else if meta.is_file() {
-            bytes = bytes
-                .checked_add(meta.len())
-                .ok_or("Force review is too large")?;
-            if bytes > 64 * 1024 * 1024 {
-                return Err("Force review exceeds 64 MiB. Clean up with Git instead.".into());
-            }
-            let mut data = Vec::new();
-            std::fs::File::open(&current)
-                .map_err(|e| e.to_string())?
-                .take(64 * 1024 * 1024 + 1)
-                .read_to_end(&mut data)
-                .map_err(|e| e.to_string())?;
-            if data.len() as u64 != meta.len() {
-                return Err("Files changed during review; refresh".into());
-            }
-            data.hash(&mut digest);
+            meta.len().hash(&mut digest);
         } else {
             return Err(
                 "Special files cannot be reviewed safely. Clean up with Git instead.".into(),
@@ -1003,20 +990,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn force_review_bounds_large_files_and_never_follows_symlinks() {
+    fn force_review_handles_large_files_and_never_follows_symlinks() {
         let repo = Repo::new();
         let path = repo.target("bounded");
         create(&repo.0, "refs/heads/main", &repo.head(), "bounded", &path).unwrap();
+        // Byte size is not bounded: the fingerprint is metadata, so a sparse
+        // file larger than the old 64 MiB cap still reviews.
         let file = Path::new(&path).join("large");
         std::fs::File::create(&file)
             .unwrap()
             .set_len(64 * 1024 * 1024 + 1)
             .unwrap();
-        assert!(removal_preview(&repo.0, &path, false)
-            .err()
-            .unwrap()
-            .contains("64 MiB"));
-        std::fs::remove_file(file).unwrap();
+        let reviewed = removal_preview(&repo.0, &path, false).unwrap();
+        // A post-review write moves size/mtime — the reviewed token no longer
+        // matches and removal refuses.
+        std::fs::write(&file, "changed same-slot write").unwrap();
+        assert!(remove_reviewed(&repo.0, &path, &repo.head(), Some(&reviewed.token)).is_err());
+        std::fs::remove_file(&file).unwrap();
         #[cfg(unix)]
         {
             let outside = repo.0.join("outside");
