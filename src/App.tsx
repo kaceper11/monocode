@@ -81,6 +81,7 @@ import { WhatsNewDialog } from "./chrome/WhatsNewDialog";
 import { TitleBar, type Tab as TitleTab } from "./chrome/TitleBar";
 import { MenuBar } from "./chrome/MenuBar";
 import { FilePicker } from "./chrome/FilePicker";
+import { LinkChoiceMenu } from "./chrome/LinkChoiceMenu";
 import { UsageFooter } from "./chrome/UsageFooter";
 import { useProjectBranches } from "./hooks/useProjectBranches";
 import {
@@ -135,6 +136,7 @@ import {
   leafIds,
   movePane,
   neighborLeafId,
+  newBrowserTab,
   newFileTab,
   newPlanTab,
   newTab,
@@ -152,8 +154,10 @@ import {
   siblingLeafId,
   splitPane,
   surfacePanes,
+  updateBrowserTab,
   updateTerminalTab,
   withSurfacePanes,
+  type BrowserMetaPatch,
   type EditorPane,
   type FilePaneTab,
   type FocusDir,
@@ -161,6 +165,10 @@ import {
   type SplitDir,
   type WorkspaceTab,
 } from "./lib/layout";
+import {
+  isBrowserOpenRequest,
+  OPEN_BROWSER_EVENT,
+} from "./lib/browser";
 import { releaseNotesForVersion, releaseNotesTitle } from "./lib/releaseNotes";
 import { mergeOrderedSubset, orderByIds } from "./lib/reorder";
 import {
@@ -2425,6 +2433,15 @@ export default function App({
     [],
   );
 
+  const onBrowserMetaChange = useCallback(
+    (fileId: string, patch: BrowserMetaPatch) => {
+      setTabs((prev) =>
+        prev.map((tab) => updateBrowserTab(tab, fileId, patch)),
+      );
+    },
+    [],
+  );
+
   const onToggleRunningTerminal = useCallback(
     (fileId: string) => {
       const dock = projectTerminalsRef.current.find((entry) =>
@@ -4304,6 +4321,44 @@ export default function App({
     },
     [activeTabId, dismissOverlays],
   );
+
+  /** Open (or focus) a browser tab for `url` in the current workspace tab.
+   * An empty url yields the URL-entry state — opening is always the user's
+   * explicit choice. `cwd` is the worktree the link came from. */
+  const onOpenBrowser = useCallback(
+    (url: string, cwd?: string) => {
+      dismissOverlays();
+      const tab = tabsRef.current.find(
+        (entry) => entry.id === activeTabIdRef.current,
+      );
+      if (!tab) return;
+      const source = sessionsRef.current.find(
+        (session) => session.id === tab.focusedId,
+      );
+      const workdir =
+        cwd ||
+        (source ? sessionWorkCwd(source) : activeRef.current?.cwd) ||
+        projectCwdRef.current;
+      const file = newBrowserTab(workdir, url);
+      setTabs((prev) =>
+        prev.map((entry) =>
+          entry.id === tab.id ? openEditorTab(entry, file) : entry,
+        ),
+      );
+      setComposerFocused(false);
+    },
+    [dismissOverlays],
+  );
+
+  useEffect(() => {
+    const listener = (event: Event) => {
+      if (!isBrowserOpenRequest(event)) return;
+      onOpenBrowser(event.detail.url, event.detail.cwd);
+    };
+    window.addEventListener(OPEN_BROWSER_EVENT, listener);
+    return () =>
+      window.removeEventListener(OPEN_BROWSER_EVENT, listener);
+  }, [onOpenBrowser]);
 
   const onOpenPlan = useCallback(
     (sessionId: string, blockId: string) => {
@@ -7476,6 +7531,7 @@ export default function App({
     onOpenSearch,
     onOpenInbox,
     onOpenNotes,
+    onOpenBrowser,
     pickProject,
     onNewTerminal,
     onNewTerminalTab,
@@ -7503,6 +7559,7 @@ export default function App({
     onOpenSearch,
     onOpenInbox,
     onOpenNotes,
+    onOpenBrowser,
     pickProject,
     onNewTerminal,
     onNewTerminalTab,
@@ -7737,6 +7794,7 @@ export default function App({
       listen("open_search", () => actions.current.onOpenSearch()),
       listen("open_inbox", () => actions.current.onOpenInbox()),
       listen("open_notes", () => actions.current.onOpenNotes()),
+      listen("open_browser", () => actions.current.onOpenBrowser("")),
       listen<{ section?: string }>("open_settings", ({ payload }) => actions.current.openSettings(isSettingsSectionId(payload?.section) ? payload.section : undefined)),
       listen("check_for_updates", () => {
         void runUpdateFlow(true);
@@ -8212,7 +8270,13 @@ export default function App({
                       <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
                         <PaneTree
                           {...sessionPaneProps}
-                          visible={tab.id === activeTabId && !inboxViewOpen}
+                          visible={
+                            tab.id === activeTabId &&
+                            !inboxViewOpen &&
+                            !searchViewOpen &&
+                            !notesViewOpen &&
+                            !settingsOpen
+                          }
                           sessionPortal={inboxViewOpen && tab.id === activeTabId ? inboxAskPortal ?? undefined : undefined}
                           layout={tab.layout}
                           sessions={sessions}
@@ -8249,6 +8313,7 @@ export default function App({
                           onUpdatePlan={onUpdatePlan}
                           onMovePane={onMovePane}
                           onTerminalMetaChange={onTerminalMetaChange}
+                          onBrowserMetaChange={onBrowserMetaChange}
                         />
                       </div>
                     </div>
@@ -8373,6 +8438,8 @@ export default function App({
           onClose={() => setFilePickerOpen(false)}
         />
       ) : null}
+
+      <LinkChoiceMenu onOpenBrowser={onOpenBrowser} />
 
       <ApprovalToasts
         notices={hiddenApprovalToasts}

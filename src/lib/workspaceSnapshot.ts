@@ -473,6 +473,7 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
         "terminal",
         "review",
         "changes",
+        "browser",
       ].some((key) => value[key] != null && value[key] !== false)
     )
       return null;
@@ -505,7 +506,8 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       releaseNotes != null ||
       commit != null ||
       value.changes === true ||
-      value.terminal === true)
+      value.terminal === true ||
+      value.browser != null)
   ) {
     return null;
   }
@@ -516,6 +518,7 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       value.changes === true ||
       sessionChanges != null ||
       value.terminal === true ||
+      value.browser != null ||
       commit != null)
   ) {
     return null;
@@ -526,9 +529,42 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       value.review === true ||
       value.changes === true ||
       sessionChanges != null ||
-      value.terminal === true)
+      value.terminal === true ||
+      value.browser != null)
   ) {
     return null;
+  }
+  if ("browser" in value) {
+    const source = value.browser;
+    if (!source || typeof source !== "object") return null;
+    const browser = source as Record<string, unknown>;
+    if (
+      typeof browser.url !== "string" ||
+      !/^https?:\/\//i.test(browser.url) ||
+      browser.url.length > 8192 ||
+      [
+        "plan",
+        "releaseNotes",
+        "commit",
+        "sessionChanges",
+        "terminal",
+        "review",
+        "changes",
+        "delivery",
+      ].some((key) => value[key] != null && value[key] !== false)
+    )
+      return null;
+    return {
+      id: value.id,
+      path: value.path,
+      cwd: value.cwd,
+      browser: {
+        url: browser.url,
+        ...(typeof browser.title === "string" && browser.title.trim()
+          ? { title: browser.title.trim().slice(0, 200) }
+          : {}),
+      },
+    };
   }
   const command =
     value.terminal === true ? sanitizeTerminalCommand(value.command) : undefined;

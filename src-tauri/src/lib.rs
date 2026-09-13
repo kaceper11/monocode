@@ -6,6 +6,7 @@ mod azure;
 mod azure_inbox;
 mod azure_pipelines;
 mod azure_repos;
+mod browser;
 mod chat_background;
 mod checkpoint;
 mod confluence;
@@ -185,6 +186,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(harness::HarnessHost::new())
         .manage(power::PowerHost::new())
+        .manage(browser::BrowserState::default())
         .manage(pty::PtyHost::new())
         .manage(window_transfer::WindowTransferState::new())
         .manage(dictation::DictationHost::new())
@@ -232,6 +234,15 @@ pub fn run() {
             reminders::reminder_take_open,
             reminders::reminder_register_window,
             reminders::reminder_open,
+            browser::browser_open,
+            browser::browser_close,
+            browser::browser_navigate,
+            browser::browser_reload,
+            browser::browser_go_back,
+            browser::browser_go_forward,
+            browser::browser_set_bounds,
+            browser::browser_set_visible,
+            browser::browser_probe,
             fs::list_dir,
             fs::list_project_files,
             fs::git_diff_stats,

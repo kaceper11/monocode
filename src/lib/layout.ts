@@ -72,6 +72,13 @@ export type TerminalCommand = {
   step?: { runId: number; done: number };
 };
 
+export type BrowserTabSource = {
+  /** Page currently shown; updated as the webview navigates. */
+  url: string;
+  /** Last document title reported by the page. */
+  title?: string;
+};
+
 export type FilePaneTab = {
   id: string;
   path: string;
@@ -79,6 +86,7 @@ export type FilePaneTab = {
   plan?: PlanTabSource;
   releaseNotes?: ReleaseNotesTabSource;
   delivery?: DeliveryTabSource;
+  browser?: BrowserTabSource;
   review?: boolean;
   /** Single working-tree review of every changed file (unified diff). */
   changes?: boolean;
@@ -232,6 +240,51 @@ export function newTerminalFile(cwd: string, title?: string): FilePaneTab {
   };
 }
 
+export function newBrowserTab(cwd: string, url: string): FilePaneTab {
+  return {
+    id: crypto.randomUUID(),
+    path: url,
+    cwd,
+    browser: { url },
+  };
+}
+
+export type BrowserMetaPatch = {
+  url?: string;
+  title?: string;
+};
+
+/** Page-side state the webview reports back; keeps tab + snapshot current. */
+export function updateBrowserTab(
+  tab: WorkspaceTab,
+  fileId: string,
+  patch: BrowserMetaPatch,
+): WorkspaceTab {
+  let changed = false;
+  const editorPanes = tab.editorPanes.map((pane) => {
+    let paneChanged = false;
+    const files = pane.files.map((file) => {
+      if (!file.browser || file.id !== fileId) return file;
+      const url = patch.url?.trim();
+      const title =
+        patch.title !== undefined ? patch.title.trim() : file.browser.title;
+      if ((!url || url === file.browser.url) && title === file.browser.title)
+        return file;
+      paneChanged = true;
+      const browser: BrowserTabSource = {
+        url: url ?? file.browser.url,
+        ...(title ? { title } : {}),
+      };
+      return { ...file, ...(url ? { path: url } : {}), browser };
+    });
+    if (!paneChanged) return pane;
+    changed = true;
+    return { ...pane, files };
+  });
+  if (!changed) return tab;
+  return { ...tab, editorPanes };
+}
+
 export function newTerminalWorkspaceTab(file: FilePaneTab): WorkspaceTab {
   const pane = newEditorPane(file);
   return {
@@ -340,11 +393,18 @@ export function isTerminalTab(file: FilePaneTab): boolean {
   return !!file.terminal;
 }
 
+export function isBrowserTab(
+  file: FilePaneTab,
+): file is FilePaneTab & { browser: BrowserTabSource } {
+  return !!file.browser;
+}
+
 export function isVirtualDocumentTab(file: FilePaneTab): boolean {
   return (
     isPlanTab(file) ||
     isReleaseNotesTab(file) ||
     isCommitTab(file) ||
+    isBrowserTab(file) ||
     !!file.delivery
   );
 }
@@ -425,6 +485,7 @@ export function editorTabKey(file: FilePaneTab): string {
   if (file.delivery)
     return `delivery:${JSON.stringify([file.cwd, file.delivery.kind, file.delivery.branch, file.delivery.sourceSessionId])}`;
   if (file.terminal) return `terminal:${file.id}`;
+  if (file.browser) return `browser:${file.cwd}:${file.browser.url}`;
   if (file.plan) return `plan:${file.plan.blockId}`;
   if (file.releaseNotes) return `release-notes:${file.releaseNotes.version}`;
   if (file.commit) return `commit:${file.cwd}:${file.commit.sha}`;

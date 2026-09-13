@@ -21,7 +21,7 @@ pub fn dispatch(app: &AppHandle, id: &str) {
         | "forward_tab" | "split_right" | "split_down" | "focus_left" | "focus_right"
         | "focus_up" | "focus_down" | "toggle_sidebar" | "sidebar_opacity" | "open_project"
         | "go_to_file" | "open_search" | "open_inbox" | "open_notes" | "find_in_project"
-        | "find" | "new_terminal" | "new_terminal_tab" | "toggle_terminal"
+        | "find" | "new_terminal" | "new_terminal_tab" | "toggle_terminal" | "open_browser"
         | "open_model_picker" | "open_settings" | "check_for_updates" => {
             let _ = app.emit(id, ());
         }
@@ -145,6 +145,9 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .accelerator("CmdOrCtrl+Shift+F")
         .build(app)?;
 
+    let open_browser =
+        MenuItemBuilder::with_id("open_browser", "Open URL in Browser…").build(app)?;
+
     let file = SubmenuBuilder::new(app, "File")
         .item(&new_window)
         .item(&open_project)
@@ -155,6 +158,7 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&new_tab)
         .item(&new_terminal)
         .item(&new_terminal_tab)
+        .item(&open_browser)
         .item(&split_right)
         .item(&split_down)
         .item(&close_tab)

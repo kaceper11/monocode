@@ -15,6 +15,7 @@ import {
   layoutLeaves,
   layoutSashes,
   setSplitRatio,
+  type BrowserMetaPatch,
   type EditorPane,
   type LayoutNode,
   type LayoutSash,
@@ -133,6 +134,7 @@ type Shared = {
   onMovePane: (fromId: string, toId: string, edge: PaneEdge) => void;
   onNewTerminal: (sessionId: string) => void;
   onTerminalMetaChange?: (fileId: string, patch: TerminalMetaPatch) => void;
+  onBrowserMetaChange?: (fileId: string, patch: BrowserMetaPatch) => void;
   onRunAgentAction?: (args: {
     sourceSessionId: string;
     cwd: string;
@@ -210,6 +212,7 @@ function PaneTreeComponent({
   onMovePane,
   onNewTerminal,
   onTerminalMetaChange,
+  onBrowserMetaChange,
   onRunAgentAction,
 }: Props) {
   const treeRef = useRef<HTMLDivElement>(null);
@@ -374,6 +377,7 @@ function PaneTreeComponent({
                 editorNavigation={editorNavigation}
                 onPaneDragStart={onPaneDragStart}
                 onTerminalMetaChange={onTerminalMetaChange}
+                onBrowserMetaChange={onBrowserMetaChange}
               />
             ) : session ? (
               <SessionSurface host={sessionPortal?.sessionId === session.id ? sessionPortal.host : undefined}>
