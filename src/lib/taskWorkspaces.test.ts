@@ -16,6 +16,7 @@ import {
   composeTaskSessionPrompt,
   createTask,
   isTaskChildLaunching,
+  linkTicketToTask,
   loadTaskWorkspaces,
   markTaskChildLaunching,
   PRIMARY_ATTEMPT_ID,
@@ -32,6 +33,7 @@ import {
   taskChildrenForWorkingCopy,
   taskForSession,
   taskHostConflict,
+  taskMatchesQuery,
   taskOwnsCheckout,
   tasksForProject,
   unmarkTaskChildLaunching,
@@ -1051,6 +1053,83 @@ describe("composeTaskPrompt", () => {
     // The sibling child is listed too — one session covers all repos.
     expect(prompt).toContain("no working copy prepared yet");
     expect(prompt).toContain("separate checkouts");
+  });
+});
+
+describe("taskMatchesQuery", () => {
+  const build = () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "Checkout",
+      brief: "Rebuild the checkout flow.",
+      ticket: {
+        kind: "issue",
+        repo: "acme/shop",
+        number: 217,
+        url: "https://github.com/acme/shop/issues/217",
+        identifier: "BOOK-217",
+        title: "Checkout",
+      },
+      children: [
+        {
+          repositoryId: repo.id,
+          mode: "worktree",
+          baseRef: "refs/heads/main",
+          baseCommit: "abc1234567",
+          branch: "checkout",
+          path: "/tmp/app-checkout",
+          responsibility: "UI only",
+        },
+        later(lib.id),
+      ],
+    });
+    return { task, project };
+  };
+
+  it("matches name, brief, ticket and repository fields", () => {
+    const { task, project } = build();
+    for (const query of [
+      "checkout", // name, ticket title, branch
+      "BOOK-217", // ticket identifier
+      "issues/217", // ticket url
+      "rebuild the checkout", // brief
+      "lib", // repository display name
+      "app-checkout", // working copy path
+      "ui only", // responsibility
+    ]) {
+      expect(taskMatchesQuery(task, query, project), query).toBe(true);
+    }
+  });
+
+  it("matches additional ticket items and attempt labels", () => {
+    const { task, project } = build();
+    linkTicketToTask(task.id, {
+      kind: "issue",
+      repo: "acme/shop",
+      number: 88,
+      url: "https://github.com/acme/shop/issues/88",
+      identifier: "OPS-88",
+      title: "Ops follow-up",
+    });
+    const linked = loadTaskWorkspaces().find((row) => row.id === task.id)!;
+    expect(taskMatchesQuery(linked, "OPS-88", project)).toBe(true);
+    expect(taskMatchesQuery(linked, "ops follow", project)).toBe(true);
+  });
+
+  it("matches tokens across different fields", () => {
+    const { task, project } = build();
+    // "book-217" is the ticket identifier, "ui" only appears in the
+    // responsibility — the pair must still match.
+    expect(taskMatchesQuery(task, "book-217 ui", project)).toBe(true);
+    expect(taskMatchesQuery(task, "checkout nope", project)).toBe(false);
+  });
+
+  it("returns true for empty queries and false for misses", () => {
+    const { task, project } = build();
+    expect(taskMatchesQuery(task, "  ", project)).toBe(true);
+    expect(taskMatchesQuery(task, "unrelated", project)).toBe(false);
   });
 });
 

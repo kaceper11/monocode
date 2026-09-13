@@ -7,6 +7,7 @@ import {
   subscribeProjects,
 } from "../lib/projects";
 import {
+  OPEN_TASK_DETAILS,
   repositoryForChild,
   subscribeTaskWorkspaces,
   taskForSession,
@@ -57,7 +58,7 @@ function childRepoName(task: TaskWorkspace, child: TaskChild): string {
 
 /** Delivery badges for a child row: linked PRs and CI pipelines, colored
  * only when they need attention. Compact icons, never provider payloads. */
-function DeliveryBadges({
+export function DeliveryBadges({
   delivery,
 }: {
   delivery: { prs: number; prNeedsAttention: boolean; ci: number; ciRunning: boolean; ciFailing: boolean };
@@ -397,6 +398,23 @@ export function TaskScopeChip({
             })}
           </div>
           <div className="border-t border-content/10 px-1.5 py-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                setOpen(false);
+                window.dispatchEvent(
+                  new CustomEvent(OPEN_TASK_DETAILS, { detail: task.id }),
+                );
+              }}
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+            >
+              <Task
+                aria-hidden="true"
+                className="size-3.5 shrink-0 text-content/50"
+                strokeWidth={1.75}
+              />
+              Task details…
+            </button>
             <button
               type="button"
               onClick={() => {

@@ -27,6 +27,8 @@ import {
 
 const KEY = "monocode.taskWorkspaces.v1";
 const EVENT = "monocode:task-workspaces-changed";
+/** Opens the task details sheet — the App-level listener owns the modal. */
+export const OPEN_TASK_DETAILS = "monocode:open-task-details";
 const MAX_TASKS = 100;
 const MAX_ATTEMPTS = 20;
 const MAX_CHILDREN = 50;
@@ -378,6 +380,50 @@ export function tasksForProject(
     .sort((a, b) => b.createdAt - a.createdAt);
 }
 
+/**
+ * Rail/search filter: does this task match `query`? Checks the name, ticket
+ * fields, brief, repository names, working copies and branch/attempt labels
+ * — already-loaded records only, never Git or provider IO.
+ */
+export function taskMatchesQuery(
+  task: TaskWorkspace,
+  query: string,
+  project: ProjectRecord | undefined = projectForTask(task),
+): boolean {
+  const tokens = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!tokens.length) return true;
+  const fields: (string | undefined)[] = [
+    task.name,
+    task.brief,
+    task.ticket?.identifier,
+    task.ticket?.title,
+    task.ticket?.url,
+    ...(task.ticket?.additionalItems ?? []).flatMap((item) => [
+      item.identifier,
+      item.title,
+      item.url,
+    ]),
+  ];
+  for (const attempt of task.attempts) fields.push(attempt.label);
+  for (const child of task.children) {
+    const repo = repositoryForChild(task, child, project);
+    fields.push(
+      repo ? repositoryDisplay(repo) : undefined,
+      child.workingCopy,
+      child.branch,
+      child.mergeTarget,
+      child.responsibility,
+    );
+  }
+  // Every token must appear somewhere — "book-217 checkout" spans the ticket
+  // identifier and the branch name.
+  return tokens.every((token) =>
+    fields.some(
+      (field) => field !== undefined && field.toLowerCase().includes(token),
+    ),
+  );
+}
+
 /** Distinct execution hosts are never mixed: native vs WSL distribution. */
 export function taskHostKey(path: string): string {
   const location = wslLocation(path);
@@ -427,7 +473,7 @@ function assertUniqueChildBindings(children: readonly TaskChild[]) {
     if (child.branch) {
       // `refs/heads/x` and `x` are the same branch to Git.
       const normalized = child.branch.replace(/^refs\/heads\//, "");
-      const branchKey = `${child.repositoryId} ${normalized}`;
+      const branchKey = `${child.repositoryId}\0${normalized}`;
       if (seenBranches.has(branchKey))
         throw new Error(
           `Branch ${child.branch} is already used for this repository in another attempt`,
