@@ -18,6 +18,7 @@ import {
   type BrowserMetaPatch,
   type EditorPane,
   type LayoutNode,
+  type LayoutRect,
   type LayoutSash,
   type PaneEdge,
 } from "../lib/layout";
@@ -154,8 +155,60 @@ type PaneDrag = {
 };
 
 const DRAG_THRESHOLD = 5;
-/** Width of the docked session column while a browser pane is expanded. */
-const CHAT_DOCK_WIDTH = "min(26rem, 42%)";
+/** A leaf docked while a browser is expanded is snapped to the full band
+ * on the edge it already hugs — the agent keeps its own position and
+ * size along that edge instead of jumping to a fixed right column. */
+type DockBand = {
+  side: "left" | "right" | "top" | "bottom";
+  agent: LayoutRect;
+  rest: LayoutRect;
+};
+
+function dockBand(rect: LayoutRect): DockBand {
+  const E = 1e-3;
+  let side: DockBand["side"];
+  if (rect.h > 1 - E && rect.y < E) {
+    side = rect.x + rect.w / 2 < 0.5 ? "left" : "right";
+  } else if (rect.w > 1 - E && rect.x < E) {
+    side = rect.y + rect.h / 2 < 0.5 ? "top" : "bottom";
+  } else {
+    const d = {
+      left: rect.x,
+      right: 1 - rect.x - rect.w,
+      top: rect.y,
+      bottom: 1 - rect.y - rect.h,
+    };
+    side = (Object.keys(d) as DockBand["side"][]).reduce((a, b) =>
+      d[a] <= d[b] ? a : b,
+    );
+  }
+  switch (side) {
+    case "left":
+      return {
+        side,
+        agent: { x: 0, y: 0, w: rect.w, h: 1 },
+        rest: { x: rect.w, y: 0, w: 1 - rect.w, h: 1 },
+      };
+    case "right":
+      return {
+        side,
+        agent: { x: 1 - rect.w, y: 0, w: rect.w, h: 1 },
+        rest: { x: 0, y: 0, w: 1 - rect.w, h: 1 },
+      };
+    case "top":
+      return {
+        side,
+        agent: { x: 0, y: 0, w: 1, h: rect.h },
+        rest: { x: 0, y: rect.h, w: 1, h: 1 - rect.h },
+      };
+    default:
+      return {
+        side,
+        agent: { x: 0, y: 1 - rect.h, w: 1, h: rect.h },
+        rest: { x: 0, y: 0, w: 1, h: 1 - rect.h },
+      };
+  }
+}
 
 function PaneTreeComponent({
   sessionPortal,
@@ -253,11 +306,11 @@ function PaneTreeComponent({
   const sashes = layoutSashes(tree);
   const inSplit = leaves.length > 1;
   // A browser tab flagged `expanded` zooms its leaf over the tree —
-  // tmux-style pane zoom — while the focused session stays docked as a
-  // column on the right so the agent keeps working alongside. Other
-  // leaves stay mounted underneath (sessions keep running, composers keep
-  // drafts); only their native webviews must be told to hide via
-  // `occluded`.
+  // tmux-style pane zoom — while the focused session keeps its own edge:
+  // docked as the full band it already occupies, everything else covered.
+  // Other leaves stay mounted underneath (sessions keep running,
+  // composers keep drafts); only their native webviews must be told to
+  // hide via `occluded`.
   const expandedLeafId = leaves.find((leaf) => {
     const pane = editorPanes.find((entry) => entry.id === leaf.id);
     const file = pane?.files.find((entry) => entry.id === pane.activeFileId);
@@ -271,6 +324,19 @@ function PaneTreeComponent({
             (leaf) => leaf.id !== expandedLeafId && isSessionLeaf(leaf.id),
           )?.id)
     : undefined;
+  const chatRect = leaves.find((leaf) => leaf.id === chatLeafId)?.rect;
+  const band = expandedLeafId && chatRect ? dockBand(chatRect) : null;
+  // A session spanning nearly the whole area leaves a useless sliver —
+  // expand fully and let it stay covered instead.
+  const dock = band && band.rest.w > 0.05 && band.rest.h > 0.05 ? band : null;
+  const dockBorder = dock
+    ? {
+        left: "border-r",
+        right: "border-l",
+        top: "border-b",
+        bottom: "border-t",
+      }[dock.side]
+    : "";
 
   const startPaneDrag = useCallback(
     (fromId: string, event: ReactPointerEvent<HTMLElement>) => {
@@ -355,44 +421,30 @@ function PaneTreeComponent({
         const session = sessions.find((entry) => entry.id === leaf.id);
         const dragging = drop?.fromId === leaf.id;
         const onPaneDragStart = inSplit ? paneDragStartFor(leaf.id) : undefined;
-        const backgroundStyle = {
-          "--chat-background-left": `${(-leaf.rect.x / leaf.rect.w) * 100}%`,
-          "--chat-background-top": `${(-leaf.rect.y / leaf.rect.h) * 100}%`,
-          "--chat-background-width": `${100 / leaf.rect.w}%`,
-          "--chat-background-height": `${100 / leaf.rect.h}%`,
-        } as CSSProperties;
         const expanded = leaf.id === expandedLeafId;
         const docked = leaf.id === chatLeafId;
+        const rendered: LayoutRect = expanded
+          ? (dock?.rest ?? { x: 0, y: 0, w: 1, h: 1 })
+          : docked && dock
+            ? dock.agent
+            : leaf.rect;
+        const backgroundStyle = {
+          "--chat-background-left": `${(-rendered.x / rendered.w) * 100}%`,
+          "--chat-background-top": `${(-rendered.y / rendered.h) * 100}%`,
+          "--chat-background-width": `${100 / rendered.w}%`,
+          "--chat-background-height": `${100 / rendered.h}%`,
+        } as CSSProperties;
         return (
           <div
             key={leaf.id}
             data-pane-id={leaf.id}
-            className={`absolute flex min-h-0 min-w-0 flex-col overflow-hidden ${dragging ? "opacity-40" : ""} ${expanded || docked ? "bg-background-base" : ""} ${docked ? "border-l border-content/10" : ""}`}
+            className={`absolute flex min-h-0 min-w-0 flex-col overflow-hidden ${dragging ? "opacity-40" : ""} ${expanded || docked ? "bg-background-base" : ""} ${docked ? `${dockBorder} border-content/10` : ""}`}
             style={{
-              ...(expanded
-                ? {
-                    left: 0,
-                    top: 0,
-                    width: chatLeafId
-                      ? `calc(100% - ${CHAT_DOCK_WIDTH})`
-                      : "100%",
-                    height: "100%",
-                    zIndex: 30,
-                  }
-                : docked
-                  ? {
-                      left: `calc(100% - ${CHAT_DOCK_WIDTH})`,
-                      top: 0,
-                      width: CHAT_DOCK_WIDTH,
-                      height: "100%",
-                      zIndex: 40,
-                    }
-                  : {
-                      left: `${leaf.rect.x * 100}%`,
-                      top: `${leaf.rect.y * 100}%`,
-                      width: `${leaf.rect.w * 100}%`,
-                      height: `${leaf.rect.h * 100}%`,
-                    }),
+              left: `${rendered.x * 100}%`,
+              top: `${rendered.y * 100}%`,
+              width: `${rendered.w * 100}%`,
+              height: `${rendered.h * 100}%`,
+              ...(expanded ? { zIndex: 30 } : docked ? { zIndex: 40 } : {}),
               ...backgroundStyle,
             }}
           >
