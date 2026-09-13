@@ -250,7 +250,9 @@ fn run_check_sync(
                     command
                 }
                 #[cfg(windows)]
-                Host::Wsl(location) => crate::wsl::exec_command_verified(location, &step.exec)?,
+                Host::Wsl(location) => {
+                    crate::wsl::exec_command_verified(location, &step.exec, None)?
+                }
             }
         };
         // Construction can burn real time (the WSL bridge, PATH lookup) —

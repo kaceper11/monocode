@@ -225,10 +225,10 @@ import {
   confirmCloseTerminals,
 } from "./lib/terminalClose";
 import {
-  listRunningTerminals,
   terminalTabLabel,
   type TerminalMetaPatch,
 } from "./lib/terminalTab";
+import { footerTerminals } from "./lib/terminalResources";
 import {
   applyHarnessEvent,
   appendUser,
@@ -1424,28 +1424,10 @@ export default function App({
     if (!active) return undefined;
     return { harness: active.harness };
   }, [active?.harness]);
-  const runningTerminals = useMemo(() => {
-    const files: FilePaneTab[] = [];
-    const dock = findProjectTerminal(projectTerminals, projectCwd);
-    if (dock) files.push(...dock.pane.files);
-    for (const tab of tabs) {
-      for (const pane of tab.terminalPanes ?? []) {
-        files.push(...pane.files);
-      }
-    }
-    return listRunningTerminals(files);
-  }, [projectCwd, projectTerminals, tabs]);
-  const runningTerminalOpen = useMemo(() => {
-    const ids = new Set(runningTerminals.map((terminal) => terminal.id));
-    if (
-      currentProjectDock?.open &&
-      currentProjectDock.pane.files.some((file) => ids.has(file.id))
-    ) {
-      return true;
-    }
-    const focused = activeTab ? focusedFileTab(activeTab) : undefined;
-    return !!focused && ids.has(focused.id);
-  }, [activeTab, currentProjectDock, runningTerminals]);
+  const footerTerminalList = useMemo(
+    () => footerTerminals(projectTerminals, tabs, projectCwd),
+    [projectCwd, projectTerminals, tabs],
+  );
 
   const nextApprovalSessionIds = useMemo(() => {
     const ids = new Set<string>();
@@ -2530,26 +2512,21 @@ export default function App({
     [],
   );
 
-  const onToggleRunningTerminal = useCallback(
+  /** Footer manager "go to terminal" — always selects and focuses the
+   * terminal; a no-op when it is already the visible one. */
+  const onShowTerminal = useCallback(
     (fileId: string) => {
       const dock = projectTerminalsRef.current.find((entry) =>
         entry.pane.files.some((file) => file.id === fileId),
       );
       if (dock) {
-        if (dock.open) {
+        if (!(dock.open && dock.pane.activeFileId === fileId)) {
           setProjectTerminals((prev) =>
             mapProjectTerminal(prev, dock.projectPath, (entry) =>
-              withDockOpen(entry, false),
+              withDockOpen(selectDockTerminal(entry, fileId), true),
             ),
           );
-          setProjectTerminalFocused(false);
-          return;
         }
-        setProjectTerminals((prev) =>
-          mapProjectTerminal(prev, dock.projectPath, (entry) =>
-            withDockOpen(selectDockTerminal(entry, fileId), true),
-          ),
-        );
         focusProjectTerminal();
         return;
       }
@@ -2561,16 +2538,27 @@ export default function App({
             tab.focusedId === pane.id &&
             pane.activeFileId === fileId;
           if (showing) {
-            setComposerFocused(true);
+            // Already selected — just reclaim focus from the dock or an
+            // open diff, both of which mask the terminal's focus.
+            if (tab.diffFocused) {
+              setTabs((prev) =>
+                prev.map((entry) =>
+                  entry.id === tab.id ? { ...entry, diffFocused: false } : entry,
+                ),
+              );
+            }
             setProjectTerminalFocused(false);
+            setComposerFocused(false);
             return;
           }
-          setActiveTabId(tab.id);
+          // activateTab (not bare setActiveTabId) so a terminal pane in
+          // another project's tab also switches the sidebar/dock project.
+          activateTab(tab.id, pane.id);
           setTabs((prev) =>
             prev.map((entry) => {
               if (entry.id !== tab.id) return entry;
               return withSurfacePanes(
-                { ...entry, focusedId: pane.id },
+                entry,
                 "terminal",
                 (entry.terminalPanes ?? []).map((item) =>
                   item.id === pane.id
@@ -2581,12 +2569,11 @@ export default function App({
             }),
           );
           setProjectTerminalFocused(false);
-          setComposerFocused(false);
           return;
         }
       }
     },
-    [focusProjectTerminal],
+    [activateTab, focusProjectTerminal],
   );
 
   const onNewTerminalTab = useCallback(() => {
@@ -2848,6 +2835,29 @@ export default function App({
       })();
     },
     [activeTabId, onCloseTab, projectCwd, tabCloseScope],
+  );
+
+  /** Close button in the footer terminal manager — routes to the same
+   * confirm-and-remove path the dock/pane close buttons use. */
+  const onCloseFooterTerminal = useCallback(
+    (fileId: string) => {
+      const dock = projectTerminalsRef.current.find((entry) =>
+        entry.pane.files.some((file) => file.id === fileId),
+      );
+      if (dock) {
+        onCloseProjectTerminal(fileId);
+        return;
+      }
+      for (const tab of tabsRef.current) {
+        for (const pane of tab.terminalPanes ?? []) {
+          if (pane.files.some((file) => file.id === fileId)) {
+            onCloseFile(pane.id, fileId);
+            return;
+          }
+        }
+      }
+    },
+    [onCloseFile, onCloseProjectTerminal],
   );
 
   const onCloseOtherFiles = useCallback((paneId: string, fileId: string) => {
@@ -8886,9 +8896,9 @@ export default function App({
           <UsageFooter
             providers={usageProviders}
             session={usageSession}
-            terminals={runningTerminals}
-            terminalOpen={runningTerminalOpen}
-            onToggleTerminal={onToggleRunningTerminal}
+            terminals={footerTerminalList}
+            onOpenTerminal={onShowTerminal}
+            onCloseTerminal={onCloseFooterTerminal}
           />
         )}
       </div>

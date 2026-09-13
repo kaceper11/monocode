@@ -1,5 +1,11 @@
-import { RefreshCw } from "./icons";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { RefreshCw, Stop, X } from "./icons";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 import { HarnessIcon } from "./HarnessIcon";
 import { Popover } from "./Popover";
 import {
@@ -20,10 +26,18 @@ import {
   type RateLimitWindow,
 } from "../lib/rateLimits";
 import { HARNESS_LABEL, HARNESS_TITLE, type HarnessId } from "../lib/session";
+import { runningTerminalChipLabel } from "../lib/terminalTab";
 import {
-  runningTerminalChipLabel,
-  type RunningTerminal,
-} from "../lib/terminalTab";
+  getPtyResources,
+  killPtyWorkload,
+  type PtyResource,
+} from "../lib/pty";
+import {
+  formatCpu,
+  formatMem,
+  mergeTerminalRows,
+  type FooterTerminal,
+} from "../lib/terminalResources";
 
 const CLOCK_MS = 30_000;
 
@@ -35,14 +49,14 @@ export function UsageFooter({
   providers,
   session,
   terminals = [],
-  terminalOpen = false,
-  onToggleTerminal,
+  onOpenTerminal,
+  onCloseTerminal,
 }: {
   providers: RateLimitProvider[];
   session?: UsageFooterSession;
-  terminals?: RunningTerminal[];
-  terminalOpen?: boolean;
-  onToggleTerminal?: (fileId: string) => void;
+  terminals?: FooterTerminal[];
+  onOpenTerminal?: (fileId: string) => void;
+  onCloseTerminal?: (fileId: string) => void;
 }) {
   const wantClaude = providers.includes("claude");
   const wantCodex = providers.includes("codex");
@@ -143,10 +157,10 @@ export function UsageFooter({
       {showRight ? (
         <div className="ml-auto flex shrink-0 items-center gap-2">
           {showTerminals ? (
-            <RunningTerminalChip
+            <TerminalChip
               terminals={terminals}
-              open={terminalOpen}
-              onToggle={onToggleTerminal}
+              onOpen={onOpenTerminal}
+              onClose={onCloseTerminal}
             />
           ) : null}
           {showUsage ? (
@@ -193,34 +207,34 @@ function SessionChip({ session }: { session: UsageFooterSession }) {
   );
 }
 
-function RunningTerminalChip({
+const RESOURCE_POLL_MS = 1500;
+
+function TerminalChip({
   terminals,
-  open: panelOpen,
-  onToggle,
+  onOpen,
+  onClose,
 }: {
-  terminals: RunningTerminal[];
-  open: boolean;
-  onToggle?: (fileId: string) => void;
+  terminals: FooterTerminal[];
+  onOpen?: (fileId: string) => void;
+  onClose?: (fileId: string) => void;
 }) {
   const root = useRef<HTMLButtonElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
-  const label = runningTerminalChipLabel(terminals);
-  const many = terminals.length > 1;
-  const title = terminals
-    .map((terminal) => `"${terminal.process}" in ${terminal.label}`)
-    .join("\n");
-  const ariaLabel =
-    terminals.length === 1
-      ? panelOpen
-        ? `Hide ${terminals[0]?.process}`
-        : `Show ${terminals[0]?.process}`
-      : panelOpen
-        ? "Hide running terminals"
-        : `${terminals.length} terminals are running processes`;
+  const processes = terminals.flatMap((terminal) =>
+    terminal.foreground ? [terminal.foreground] : [],
+  );
+  const label = processes.length
+    ? runningTerminalChipLabel(processes)
+    : terminals.length === 1
+      ? "1 terminal"
+      : `${terminals.length} terminals`;
+  const ariaLabel = menuOpen
+    ? "Hide terminal manager"
+    : `${terminals.length} terminal${terminals.length === 1 ? "" : "s"}`;
 
-  const toggle = (fileId: string) => {
+  const open = (fileId: string) => {
     setMenuOpen(false);
-    onToggle?.(fileId);
+    onOpen?.(fileId);
   };
 
   return (
@@ -230,53 +244,194 @@ function RunningTerminalChip({
         type="button"
         className="inline-flex min-w-0 max-w-[16rem] items-center gap-1.5 whitespace-nowrap rounded px-1 -mx-1 hover:bg-content/10 hover:text-content"
         aria-label={ariaLabel}
-        aria-pressed={panelOpen}
-        aria-expanded={many && !panelOpen ? menuOpen : undefined}
-        aria-haspopup={many && !panelOpen ? "menu" : undefined}
-        title={title}
-        onClick={() => {
-          if (panelOpen || !many) {
-            const target = terminals[0];
-            if (target) toggle(target.id);
-            return;
-          }
-          setMenuOpen((value) => !value);
-        }}
+        aria-expanded={menuOpen}
+        aria-haspopup="dialog"
+        title="Terminals"
+        onClick={() => setMenuOpen((value) => !value)}
       >
-        <TerminalLiveMark />
+        {processes.length ? <TerminalLiveMark /> : null}
         <span className="truncate font-mono text-[10px] tabular-nums">
           {label}
         </span>
       </button>
-      {menuOpen && many && !panelOpen ? (
-        <Popover
+      {menuOpen ? (
+        <TerminalManager
           anchor={root}
-          side="top"
-          align="end"
-          autoFocus
+          terminals={terminals}
+          onOpen={open}
+          onClose={onClose}
           onDismiss={() => setMenuOpen(false)}
-          role="menu"
-          aria-label="Running terminals"
-          className="min-w-[12rem] p-1"
-        >
-          {terminals.map((terminal) => (
-            <button
-              key={terminal.id}
-              type="button"
-              role="menuitem"
-              className="flex h-7 w-full items-center gap-2 rounded-lg px-2 text-left text-[12px] leading-none text-content hover:bg-content/10"
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={() => toggle(terminal.id)}
-            >
-              <span className="min-w-0 flex-1 truncate">{terminal.process}</span>
-              <span className="max-w-[7rem] shrink-0 truncate text-[11px] text-content/40">
-                {terminal.label}
-              </span>
-            </button>
-          ))}
-        </Popover>
+        />
       ) : null}
     </>
+  );
+}
+
+/** Compact activity monitor for the window's terminals. Polls one shared
+ * process sample while open — closing the panel stops all sampling. */
+function TerminalManager({
+  anchor,
+  terminals,
+  onOpen,
+  onClose,
+  onDismiss,
+}: {
+  anchor: RefObject<HTMLButtonElement | null>;
+  terminals: FooterTerminal[];
+  onOpen: (fileId: string) => void;
+  onClose?: (fileId: string) => void;
+  onDismiss: () => void;
+}) {
+  const [resources, setResources] = useState<PtyResource[] | null>(null);
+  const [killing, setKilling] = useState<ReadonlySet<string>>(new Set());
+  const inFlight = useRef(false);
+  /** Bumped by every request — a slower earlier response never overwrites
+   * a newer one (e.g. a pre-kill poll landing after the kill refresh),
+   * and only the newest request may clear the in-flight guard. */
+  const seq = useRef(0);
+
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = () => {
+      if (stopped) return;
+      // Hidden: stop the chain — visibilitychange re-arms it. In-flight:
+      // the active request's finally already schedules the next tick.
+      if (document.visibilityState !== "visible") return;
+      if (inFlight.current) {
+        timer = setTimeout(poll, RESOURCE_POLL_MS);
+        return;
+      }
+      inFlight.current = true;
+      const my = ++seq.current;
+      void getPtyResources()
+        .then((found) => {
+          if (seq.current === my) setResources(found);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (seq.current === my) inFlight.current = false;
+          if (!stopped) timer = setTimeout(poll, RESOURCE_POLL_MS);
+        });
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") poll();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    poll();
+    return () => {
+      stopped = true;
+      document.removeEventListener("visibilitychange", onVisible);
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
+
+  const rows = mergeTerminalRows(terminals, resources);
+
+  const kill = (fileId: string) => {
+    inFlight.current = true;
+    const my = ++seq.current;
+    setKilling((prev) => new Set(prev).add(fileId));
+    void killPtyWorkload(fileId)
+      .then(() => getPtyResources())
+      .then((found) => {
+        if (seq.current === my) setResources(found);
+      })
+      .catch((error) => console.warn("Kill workload failed:", error))
+      .finally(() => {
+        if (seq.current === my) inFlight.current = false;
+        setKilling((prev) => {
+          const next = new Set(prev);
+          next.delete(fileId);
+          return next;
+        });
+      });
+  };
+
+  return (
+    <Popover
+      anchor={anchor}
+      side="top"
+      align="end"
+      autoFocus
+      tabIndex={-1}
+      onDismiss={onDismiss}
+      role="dialog"
+      aria-label="Terminals"
+      className="w-[22rem] overflow-y-auto overscroll-none p-1"
+    >
+      <div className="flex h-6 items-center px-2 text-[10px] font-medium uppercase tracking-wide text-content/40">
+        Terminals
+      </div>
+      {rows.map((row) => {
+        const process = row.top ?? row.foreground;
+        return (
+          <div
+            key={row.id}
+            className="flex h-8 items-center gap-2 rounded-lg px-2 text-[12px] leading-none text-content hover:bg-content/10"
+          >
+            <button
+              type="button"
+              className="flex min-w-0 flex-1 items-center gap-2 text-left"
+              title={
+                row.alive
+                  ? `${row.title} — ${row.cwd}` +
+                    (row.host === "wsl"
+                      ? ` · WSL ${row.distro ?? ""}`
+                      : "") +
+                    (row.processes ? ` · ${row.processes} processes` : "")
+                  : `${row.title} — exited`
+              }
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => onOpen(row.id)}
+            >
+              <span
+                className={`size-1.5 shrink-0 rounded-full ${
+                  row.alive
+                    ? row.workload
+                      ? "bg-emerald-400"
+                      : "bg-content/30"
+                    : "bg-content/15"
+                }`}
+                aria-hidden
+              />
+              <span className="min-w-0 flex-1 truncate">{row.title}</span>
+              {process ? (
+                <span className="max-w-[7rem] shrink-0 truncate font-mono text-[10px] text-content/50">
+                  {process}
+                </span>
+              ) : null}
+              <span className="min-w-24 shrink-0 text-right font-mono text-[10px] tabular-nums text-content/50">
+                {row.alive
+                  ? `${formatCpu(row.cpuPct)} · ${formatMem(row.rssBytes)}`
+                  : "exited"}
+              </span>
+            </button>
+            <span className="flex shrink-0 items-center gap-0.5 text-content/40">
+              <button
+                type="button"
+                className="grid size-5 place-items-center rounded hover:bg-content/15 hover:text-content disabled:opacity-30"
+                aria-label={`Stop processes in ${row.title}`}
+                title="Kill processes"
+                disabled={!row.workload || killing.has(row.id)}
+                onClick={() => kill(row.id)}
+              >
+                <Stop className="size-2.5" aria-hidden />
+              </button>
+              <button
+                type="button"
+                className="grid size-5 place-items-center rounded hover:bg-content/15 hover:text-content"
+                aria-label={`Close ${row.title}`}
+                title="Close terminal"
+                onClick={() => onClose?.(row.id)}
+              >
+                <X className="size-3" strokeWidth={1.75} aria-hidden />
+              </button>
+            </span>
+          </div>
+        );
+      })}
+    </Popover>
   );
 }
 

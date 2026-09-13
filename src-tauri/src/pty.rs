@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::collections::HashSet;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -87,6 +89,17 @@ impl PtyHost {
             return None;
         }
         sessions.remove(id)
+    }
+
+    /// Live terminals with their spawn records — resource sampling and
+    /// workload kills read the same inventory.
+    fn inventory(&self) -> Vec<(String, Arc<LivePty>)> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, live)| (id.clone(), live.clone()))
+            .collect()
     }
 
     /// (pty id, spawn cwd) of every live terminal — removal binding evidence.
@@ -274,6 +287,179 @@ pub fn pty_kill(host: State<PtyHost>, id: String) -> Result<(), String> {
     host.kill_id(&id).map(|_| ())
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PtyResource {
+    id: String,
+    /// `native` runs on the OS host; `wsl` is a Linux tree behind wsl.exe.
+    host: &'static str,
+    distro: Option<String>,
+    cpu_pct: f32,
+    rss_bytes: u64,
+    processes: u32,
+    /// Non-shell work exists — the kill-workload action is meaningful.
+    workload: bool,
+    /// Busiest non-shell process name, for the row's process label.
+    top: Option<String>,
+}
+
+/// One shared process sample for every terminal — much cheaper than the
+/// per-terminal `ps` forks the title poll already performs each second.
+/// Off the main thread: unix forks `ps`, WSL fans out to the bridges.
+#[tauri::command(async)]
+pub fn pty_resources(host: State<'_, PtyHost>) -> Vec<PtyResource> {
+    let live = host.inventory();
+    if live.is_empty() {
+        return Vec::new();
+    }
+    let roots: Vec<u32> = live
+        .iter()
+        .map(|(_, live)| live.pid)
+        .filter(|&pid| pid > 1)
+        .collect();
+    let native = crate::proc_stats::sample_trees(&roots);
+    let linux = linux_stats(&live);
+    live.into_iter()
+        .map(|(id, live)| {
+            let location = crate::wsl::location(&live.cwd).ok().flatten();
+            let stat = linux
+                .get(&id)
+                .map(|stat| {
+                    (
+                        stat.cpu_pct,
+                        stat.rss_bytes,
+                        stat.processes,
+                        stat.workload,
+                        stat.top.clone(),
+                    )
+                })
+                .or_else(|| {
+                    native.get(&live.pid).map(|stat| {
+                        (
+                            stat.cpu_pct,
+                            stat.rss_bytes,
+                            stat.processes,
+                            stat.workload,
+                            stat.top.clone(),
+                        )
+                    })
+                });
+            let (cpu_pct, rss_bytes, processes, workload, top) =
+                stat.unwrap_or((0.0, 0, 0, false, None));
+            PtyResource {
+                id,
+                host: if location.is_some() { "wsl" } else { "native" },
+                distro: location.map(|location| location.distribution),
+                cpu_pct,
+                rss_bytes,
+                processes,
+                workload,
+                top,
+            }
+        })
+        .collect()
+}
+
+/// Linux-side stats keyed by pty id, one bridge request per distro.
+/// Missing bridges degrade to the Windows-side wsl.exe numbers instead
+/// of failing the whole poll.
+#[cfg(windows)]
+fn linux_stats(live: &[(String, Arc<LivePty>)]) -> HashMap<String, crate::wsl::WslPtyStat> {
+    let mut locations: HashMap<String, crate::wsl::Location> = HashMap::new();
+    for (_, live) in live {
+        if let Ok(Some(location)) = crate::wsl::location(&live.cwd) {
+            locations
+                .entry(location.distribution.to_lowercase())
+                .or_insert(location);
+        }
+    }
+    let mut stats = HashMap::new();
+    for location in locations.values() {
+        if let Ok(found) = crate::wsl::pty_stats(location) {
+            stats.extend(found);
+        }
+    }
+    stats
+}
+
+#[cfg(not(windows))]
+fn linux_stats(_live: &[(String, Arc<LivePty>)]) -> HashMap<String, crate::wsl::WslPtyStat> {
+    HashMap::new()
+}
+
+/// Stop the terminal's workload but keep its shell: every non-root member
+/// of the shell's process tree gets TERM, then KILL after the escalation
+/// window. WSL trees are signaled inside the distribution. Marker-based
+/// WSL attribution also reaches detached procs (tmux/nohup keep the env);
+/// native walks the live ppid tree, so reparented daemons escape there.
+#[tauri::command(async)]
+pub fn pty_kill_workload(host: State<'_, PtyHost>, id: String) -> Result<(), String> {
+    let live = host
+        .get(&id)
+        .ok_or_else(|| "Terminal is not running".to_string())?;
+    if live.pid <= 1 {
+        return Err("Terminal has no live process".into());
+    }
+    if let Some(location) = crate::wsl::location(&live.cwd)? {
+        #[cfg(windows)]
+        return crate::wsl::signal_workload(&location, &id);
+        #[cfg(not(windows))]
+        {
+            let _ = location;
+            return Err("WSL terminals require the native Windows app".into());
+        }
+    }
+    kill_tree(live.pid);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn kill_tree(root: u32) {
+    let members = crate::proc_stats::descendants(root);
+    for &pid in members.iter().filter(|&&pid| pid > 1) {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+    if members.is_empty() {
+        return;
+    }
+    thread::spawn(move || {
+        thread::sleep(KILL_ESCALATE);
+        // Re-resolve the tree — a member that exited during the window may
+        // have had its pid recycled by an unrelated process.
+        let survivors: HashSet<u32> = crate::proc_stats::descendants(root).into_iter().collect();
+        for pid in members {
+            if pid > 1 && survivors.contains(&pid) {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+    });
+}
+
+/// Hard-stops each descendant — Windows has no TERM-equivalent here, so
+/// unlike unix there is no grace window before the kill.
+#[cfg(windows)]
+fn kill_tree(root: u32) {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    for pid in crate::proc_stats::descendants(root) {
+        unsafe {
+            let raw = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if raw.is_null() {
+                continue;
+            }
+            let handle = OwnedHandle::from_raw_handle(raw);
+            let _ = TerminateProcess(handle.as_raw_handle(), 1);
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn kill_tree(_root: u32) {}
+
 /// Off the main thread: `kill_all` waits for the shells to die before it
 /// returns, and a window close calls this while the app keeps running.
 #[tauri::command(async)]
@@ -451,8 +637,8 @@ fn spawn_windows(
         // Dropping the master closes that terminal, rather than running a
         // Windows shell or walking UNC metadata here.
         let command = match &exec {
-            Some(exec) => crate::wsl::exec_command(location, exec)?,
-            None => crate::wsl::terminal_command(location)?,
+            Some(exec) => crate::wsl::exec_command(location, exec, Some(&id))?,
+            None => crate::wsl::terminal_command(location, Some(&id))?,
         };
         let mut cmd = CommandBuilder::new(command.get_program());
         cmd.args(command.get_args());
