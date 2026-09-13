@@ -6,6 +6,7 @@ import type { DeliveryTabSource } from "../lib/layout";
 import { contextFromChanges, requestAgentContext } from "../lib/agentContext";
 import {
   abortMerge,
+  opLabel,
   sendMergeConflictsToAgent,
   syncWithDefaultBranch,
 } from "../lib/syncDefault";
@@ -1000,6 +1001,7 @@ function ChangedFiles({
     hasRemote &&
     Boolean(index?.defaultBranch) &&
     index?.branch !== index?.defaultBranch &&
+    !index?.detached &&
     !index?.opInProgress;
   const canCommitPush = canCommit && hasRemote && !diverged;
   const canCommitPushPr = canCommitPush && !hasOpenPr && !onDefault;
@@ -1621,9 +1623,10 @@ function GitSyncActions({
   onCreatePr: () => void;
   onViewPr: () => void;
 }) {
-  // While a merge/rebase is in progress the banner owns this space — the
-  // checkout must be resolved or aborted before any further fetch+merge.
-  if (!hasRemote || index.opInProgress) return null;
+  if (!hasRemote) return null;
+  // While a merge/rebase is in progress the banner owns this space —
+  // fetch/push buttons hide, but "View PR" stays available.
+  const op = index.opInProgress;
   const ahead = index.ahead;
   const behind = index.behind;
   const dest =
@@ -1651,12 +1654,16 @@ function GitSyncActions({
   const secondary = `${btn} bg-content/10 text-content hover:bg-content/15`;
   const showCreatePr = !hasOpenPr && !onDefault;
   const showViewPr = hasOpenPr;
-  if (!canPublish && !canSync && !canSyncDefault && !showCreatePr && !showViewPr)
-    return null;
+  const mutating =
+    canPublish ||
+    canSync ||
+    (canSyncDefault && Boolean(index.defaultBranch)) ||
+    showCreatePr;
+  if (op ? !showViewPr : !mutating && !showViewPr) return null;
 
   return (
     <div className="mt-1.5 flex flex-col gap-1.5">
-      {canPublish ? (
+      {!op && canPublish ? (
         <button
           type="button"
           title={syncTitle}
@@ -1674,7 +1681,7 @@ function GitSyncActions({
           )}
           <span className="min-w-0 truncate">Publish Branch</span>
         </button>
-      ) : canSync ? (
+      ) : !op && canSync ? (
         <button
           type="button"
           title={syncTitle}
@@ -1699,7 +1706,7 @@ function GitSyncActions({
           ) : null}
         </button>
       ) : null}
-      {canSyncDefault && index.defaultBranch ? (
+      {!op && canSyncDefault && index.defaultBranch ? (
         <button
           type="button"
           title={`Fetch ${index.remote ?? "origin"}, then merge ${index.remote ?? "origin"}/${index.defaultBranch} into ${index.branch ?? "the current branch"} in this working copy`}
@@ -1720,7 +1727,7 @@ function GitSyncActions({
           </span>
         </button>
       ) : null}
-      {showCreatePr ? (
+      {!op && showCreatePr ? (
         <button
           type="button"
           title={createTitle}
@@ -1775,18 +1782,19 @@ function MergeBanner({
   onAbort: () => void;
 }) {
   const conflicts = index.conflicts ?? [];
+  const op = opLabel(index.op);
   const btn =
     "flex h-7 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-[12px] font-medium disabled:opacity-40";
   return (
     <div
       className="shrink-0 border-b border-amber-400/25 bg-amber-400/10 px-2 py-1.5"
       role="status"
-      aria-label="Merge in progress"
+      aria-label={`${op} in progress`}
     >
       <p className="flex items-center gap-1.5 px-1 text-[11px] font-medium text-amber-200">
         <GitMerge className="size-3 shrink-0" strokeWidth={1.75} />
         <span className="min-w-0 truncate">
-          Merge in progress
+          {op} in progress
           {conflicts.length
             ? ` — ${conflicts.length} conflicted file${conflicts.length === 1 ? "" : "s"}`
             : ""}
@@ -1827,7 +1835,7 @@ function MergeBanner({
         </button>
         <button
           type="button"
-          title="Abort the merge and restore the pre-merge state"
+          title={`Abort the ${op.toLowerCase()} and restore the previous state`}
           disabled={!!busy}
           onClick={onAbort}
           className={`${btn} bg-content/10 text-content hover:bg-content/15`}
@@ -1840,7 +1848,7 @@ function MergeBanner({
           ) : (
             <Undo2 className="size-3.5 shrink-0" strokeWidth={1.75} />
           )}
-          <span className="min-w-0 truncate">Abort merge</span>
+          <span className="min-w-0 truncate">Abort {op.toLowerCase()}</span>
         </button>
       </div>
     </div>
@@ -2596,6 +2604,8 @@ function sameIndex(prev: GitDiffIndex | null, next: GitDiffIndex): boolean {
     prev.behind !== next.behind ||
     prev.aheadOfDefault !== next.aheadOfDefault ||
     !!prev.opInProgress !== !!next.opInProgress ||
+    (prev.op ?? "") !== (next.op ?? "") ||
+    !!prev.detached !== !!next.detached ||
     (prev.mergeHead ?? null) !== (next.mergeHead ?? null) ||
     (prev.conflicts ?? []).length !== (next.conflicts ?? []).length ||
     (prev.conflicts ?? []).some((path, i) => (next.conflicts ?? [])[i] !== path)

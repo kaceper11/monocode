@@ -936,9 +936,8 @@ function SidebarComponent({
       return;
     }
     if (id === "sync-default") {
-      const summary =
-        menuSessions.find((session) => session.id === sessionId) ??
-        menuSessions[0];
+      // Only ever the clicked session — never fall back to another row.
+      const summary = menuSessions.find((session) => session.id === sessionId);
       if (summary) onSyncSession?.(summary);
       return;
     }

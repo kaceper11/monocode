@@ -22,8 +22,22 @@ export type SyncTarget = {
   title?: string;
 };
 
+/** Display label for the operation in progress — index.op / merge.op. */
+export function opLabel(op: string | undefined): string {
+  switch (op) {
+    case "rebase":
+      return "Rebase";
+    case "cherry-pick":
+      return "Cherry-pick";
+    case "revert":
+      return "Revert";
+    default:
+      return "Merge";
+  }
+}
+
 /** Execution host for confirmations and agent context — never guessed. */
-export function syncHostLabel(cwd: string): string {
+function syncHostLabel(cwd: string): string {
   const wsl = wslLocation(cwd);
   if (wsl) return `WSL · ${wsl.distribution}`;
   return IS_WIN ? "Windows" : IS_MAC ? "macOS" : "Linux";
@@ -46,34 +60,65 @@ export function syncConfirmText(cwd: string, index: GitDiffIndex): string {
   ].join("\n");
 }
 
+/** Pre-flight: the confirmation must describe an operation that can run.
+ * These mirror the backend refusals so the user is told plainly instead of
+ * confirming an impossible fetch+merge. Returns the refusal text, or null
+ * when a sync is at least plausible. */
+function syncPreflightRefusal(index: GitDiffIndex): string | null {
+  if (index.opInProgress)
+    return `A ${index.op || "merge"} is already in progress in this working copy — resolve or abort it first.`;
+  if (!index.branch || index.detached)
+    return "Check out a branch before syncing with the default branch.";
+  if (!index.remote) return "No remote configured for this checkout.";
+  if (!index.defaultBranch)
+    return "Cannot resolve the remote default branch for this checkout.";
+  if (index.files.length > 0)
+    return `${index.files.length} uncommitted change${index.files.length === 1 ? "" : "s"} — commit or stash before syncing; nothing is stashed automatically.`;
+  return null;
+}
+
 /**
  * Confirm → fetch → merge `remote/<default>` → report. Returns the raw
- * result (undefined when the user cancels or the pre-read fails). Conflicts
- * stay in the tree and route to `offerMergeResolution`; abort is offered
- * again there. Callers own busy state — a second run is refused by the
- * backend, never queued.
+ * result (undefined when the user cancels). A failed pre-read throws —
+ * callers surface it. Conflicts stay in the tree and route to
+ * `offerMergeResolution`; abort is offered again there. Callers own busy
+ * state — a second run is refused by the backend, never queued.
  */
 export async function syncWithDefaultBranch(
   target: SyncTarget,
 ): Promise<GitSyncResult | undefined> {
+  const title = target.title || "Sync with remote default";
+  if (!target.cwd || target.cwd === "~") {
+    await message("This conversation has no working copy to sync.", {
+      title,
+      kind: "warning",
+    });
+    return undefined;
+  }
   const index = await gitDiffIndex(target.cwd);
+  const refusal = syncPreflightRefusal(index);
+  if (refusal) {
+    await message(refusal, { title, kind: "warning" });
+    return undefined;
+  }
   if (
     !(await ask(syncConfirmText(target.cwd, index), {
-      title: "Sync with remote default",
+      title,
       kind: "info",
       okLabel: "Sync",
       cancelLabel: "Cancel",
     }))
   )
     return undefined;
-  const result = await gitSyncBranch(target.cwd);
+  // The branch named in the confirmation is pinned: a checkout that moved
+  // while the dialog was open is refused, not merged into.
+  const result = await gitSyncBranch(target.cwd, index.branch ?? undefined);
   notifyGitChanged(target.cwd);
-  const title = target.title || "Sync with remote default";
   switch (result.outcome) {
     case "merged": {
       const list = result.commits.slice(0, 10).join("\n");
       await message(
-        `Merged ${result.syncedWith} into ${result.branch} — ${result.commits.length} incoming commit${result.commits.length === 1 ? "" : "s"}${list ? `:\n${list}` : "."}\n\nNothing was pushed.`,
+        `Merged ${result.syncedWith} into ${result.branch} — ${result.commitCount} incoming commit${result.commitCount === 1 ? "" : "s"}${list ? `:\n${list}` : "."}\n\nNothing was pushed.`,
         { title },
       );
       break;
@@ -97,19 +142,24 @@ export async function syncWithDefaultBranch(
 }
 
 /**
- * Conflict resolution choice after a sync (or later, from the merge
- * banner): send the merge context to an agent, or leave the real state in
- * the tree — with one more explicit chance to abort instead.
+ * Conflict resolution choice after a sync or update (or later, from the
+ * merge banner): send the merge context to an agent, or leave the real
+ * state in the tree — with one more explicit chance to abort instead.
+ * `op` names what produced the state ("merge" by default, "rebase" from
+ * the update-branch flow).
  */
-async function offerMergeResolution(
+export async function offerMergeResolution(
   target: SyncTarget,
   syncedWith: string,
   conflicts: string[],
+  op: "merge" | "rebase" = "merge",
 ): Promise<void> {
   const title = target.title || "Merge conflicts";
   const list = conflicts.slice(0, 10).join("\n");
+  const action =
+    op === "rebase" ? `Rebasing onto ${syncedWith}` : `Merging ${syncedWith}`;
   const send = await ask(
-    `Merging ${syncedWith} left ${conflicts.length} conflicted file${conflicts.length === 1 ? "" : "s"}${list ? `:\n${list}` : ""}\n\nThe conflicted state is preserved in the working copy. Send the merge context to ${target.sessionId ? "the owning conversation" : "an agent"}?`,
+    `${action} left ${conflicts.length} conflicted file${conflicts.length === 1 ? "" : "s"}${list ? `:\n${list}` : ""}\n\nThe conflicted state is preserved in the working copy. Send the merge context to ${target.sessionId ? "the owning conversation" : "an agent"}?`,
     {
       title,
       kind: "warning",
@@ -121,18 +171,18 @@ async function offerMergeResolution(
     const sent = await sendMergeConflictsToAgent(target);
     if (!sent)
       await message(
-        "The merge is no longer in progress — nothing was sent.",
+        `The ${op} is no longer in progress — nothing was sent.`,
         { title, kind: "info" },
       );
     return;
   }
   if (
     await ask(
-      "Keep the conflicts in the tree, or abort the merge and restore the pre-merge state?",
+      `Keep the conflicts in the tree, or abort the ${op} and restore the previous state?`,
       {
         title,
         kind: "warning",
-        okLabel: "Abort merge",
+        okLabel: `Abort ${op}`,
         cancelLabel: "Keep conflicts",
       },
     )
@@ -154,26 +204,27 @@ export async function sendMergeConflictsToAgent(
   const merge = await gitMergeContext(target.cwd);
   if (!merge.merging) return false;
   const index = await gitDiffIndex(target.cwd).catch(() => null);
-  const remote = index?.remote ?? "origin";
-  const incoming = index?.defaultBranch
-    ? `${remote}/${index.defaultBranch}`
-    : `the ${remote} default branch`;
   const branch = index?.branch ?? "the current branch";
   const host = syncHostLabel(target.cwd);
+  const op = opLabel(merge.op);
+  // Only a ref verified against the operation's head is named — a merge
+  // the user started on another ref is never described as the default.
+  const incoming = merge.incomingRef ?? merge.mergeHead;
   const paths = merge.conflicts.length
     ? merge.conflicts.join("\n")
     : "(no unmerged paths — the operation is still in progress)";
   const text = [
-    `Merging ${incoming} into ${branch} stopped with conflicts in this working copy. Resolve the merge in place — preserve both sides' intent, then run the checks this repository offers.`,
+    `A ${op.toLowerCase()} in ${branch} stopped with conflicts in this working copy. Resolve it in place — preserve both sides' intent, then run the checks this repository offers.`,
     "",
     `Host: ${host}`,
     `Working copy: ${target.cwd}`,
     `Branch: ${branch}`,
-    `Incoming ref: ${incoming}${merge.mergeHead ? ` (${merge.mergeHead})` : ""}`,
+    `Operation: ${op.toLowerCase()}`,
+    `Incoming head: ${incoming ?? "unknown"}`,
     `Conflicted paths (${merge.conflicts.length}):`,
     paths,
     "",
-    "Work only in this working copy and host. Do not abort the merge, do not commit until every conflict is resolved, and do not push. Leave the tree ready for review in the diff view.",
+    `Work only in this working copy and host. Do not abort the ${op.toLowerCase()}, do not commit or push — stage resolved files and leave the tree ready for review in the diff view.`,
   ].join("\n");
   requestAgentContext({
     context: boundAgentContext({
@@ -182,8 +233,8 @@ export async function sendMergeConflictsToAgent(
       entries: [
         {
           id: crypto.randomUUID(),
-          title: `Merge conflicts in ${branch}`,
-          origin: `${target.cwd} · ${host} · merge in progress`,
+          title: `${op} conflicts in ${branch}`,
+          origin: `${target.cwd} · ${host} · ${op.toLowerCase()} in progress`,
           text,
         },
         ...(merge.diff
@@ -206,15 +257,17 @@ export async function sendMergeConflictsToAgent(
   return true;
 }
 
-/** Explicit `merge --abort` — available at every state, always confirmed. */
+/** Explicit abort of the operation in progress — always confirmed. */
 export async function abortMerge(target: SyncTarget): Promise<boolean> {
+  const index = await gitDiffIndex(target.cwd).catch(() => null);
+  const op = opLabel(index?.op).toLowerCase();
   if (
     !(await ask(
-      `Abort the merge in ${target.cwd} and restore the pre-merge state?`,
+      `Abort the ${op} in ${target.cwd} and restore the previous state?`,
       {
-        title: "Abort merge",
+        title: `Abort ${op}`,
         kind: "warning",
-        okLabel: "Abort merge",
+        okLabel: `Abort ${op}`,
         cancelLabel: "Cancel",
       },
     ))

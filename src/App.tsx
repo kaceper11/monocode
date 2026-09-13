@@ -106,7 +106,6 @@ import { runUpdateFlow } from "./lib/updater";
 import { displayAttachments, prepareAttachments } from "./lib/attachments";
 import {
   basename,
-  gitMergeAbort,
   gitUpdateFromDefault,
   listDir,
   notifyGitChanged,
@@ -115,7 +114,7 @@ import {
   type GitFileDiffKind,
   type GitHistoryCommit,
 } from "./lib/fs";
-import { syncWithDefaultBranch } from "./lib/syncDefault";
+import { offerMergeResolution, syncWithDefaultBranch } from "./lib/syncDefault";
 import {
   invalidateProjectFiles,
   prefetchProjectFiles,
@@ -6896,35 +6895,18 @@ export default function App({
       const result = await gitUpdateFromDefault(action.cwd, mode, action.base);
       notifyGitChanged(action.cwd);
       if (result.outcome === "conflicts") {
-        const session = action.sessionId
-          ? sessionsRef.current.find((row) => row.id === action.sessionId)
-          : undefined;
-        const list = result.conflicts.slice(0, 10).join("\n");
-        const send = session
-          ? await ask(
-              `${result.conflicts.length} conflicted file${result.conflicts.length === 1 ? "" : "s"}:\n${list}\n\nSend the conflict list to the owning conversation?`,
-              { title: "Merge conflicts", kind: "warning", okLabel: "Send to agent", cancelLabel: "Resolve manually" },
-            )
-          : false;
-        if (send && session) {
-          requestAgentContext({
-            context: contextFromText(
-              `Merge conflicts in ${result.branch}`,
-              `Merging ${result.updatedFrom} into ${result.branch} left ${result.conflicts.length} conflicted file${result.conflicts.length === 1 ? "" : "s"}:\n\n${result.conflicts.join("\n")}\n\nResolve the conflicts in this checkout — keep both sides' intent. Do not push or merge.`,
-              action.cwd,
-            ),
+        // Same resolution flow as a panel/menu sync — live merge state is
+        // re-read on send, and a sessionless row gets the picker.
+        await offerMergeResolution(
+          {
             cwd: action.cwd,
-            sourceSessionId: session.id,
-          });
-        } else if (
-          await ask(
-            `Leave the ${result.conflicts.length} conflicted file${result.conflicts.length === 1 ? "" : "s"} in the tree, or abort the ${mode}?`,
-            { title: "Merge conflicts", kind: "warning", okLabel: `Abort ${mode}`, cancelLabel: "Keep conflicts" },
-          )
-        ) {
-          await gitMergeAbort(action.cwd);
-          notifyGitChanged(action.cwd);
-        }
+            sessionId: action.sessionId,
+            title: item.title,
+          },
+          result.updatedFrom,
+          result.conflicts,
+          mode,
+        );
         return;
       }
       // The condition the row described is handled locally — mute it by

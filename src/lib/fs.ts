@@ -89,10 +89,14 @@ export type GitDiffIndex = {
   aheadOfDefault: number;
   /** A merge, rebase, cherry-pick or revert is in progress. */
   opInProgress: boolean;
+  /** "merge" | "rebase" | "cherry-pick" | "revert" — "" when none. */
+  op: string;
   /** Unmerged paths while an operation is in progress (bounded). */
   conflicts: string[];
   /** Short SHA of MERGE_HEAD (or the rebased head) when known. */
   mergeHead: string | null;
+  /** HEAD is detached — `branch` then holds a short SHA, not a branch. */
+  detached: boolean;
 };
 
 export function gitDiffIndex(cwd: string): Promise<GitDiffIndex> {
@@ -273,6 +277,8 @@ export type GitSyncResult = {
   syncedWith: string;
   /** Subjects of the incoming commits the merge brought in (bounded). */
   commits: string[];
+  /** Total incoming commits — `commits` may be truncated. */
+  commitCount: number;
   /** Conflicted paths when the merge stopped; left in progress. */
   conflicts: string[];
   /** Why a refused sync did not run. */
@@ -282,20 +288,28 @@ export type GitSyncResult = {
 /**
  * Fetch the remote default branch and merge `remote/<default>` into this
  * exact working copy on its own host. Merge only; never pushes. A dirty
- * tree, an operation already in progress, or a second concurrent sync is
- * refused as data — nothing is stashed or queued.
+ * tree, an operation already in progress, a branch that moved since
+ * `expectedBranch` was confirmed, or a second concurrent sync is refused
+ * as data — nothing is stashed or queued.
  */
-export function gitSyncBranch(cwd: string): Promise<GitSyncResult> {
-  return invoke<GitSyncResult>("git_sync_branch", { cwd });
+export function gitSyncBranch(
+  cwd: string,
+  expectedBranch?: string,
+): Promise<GitSyncResult> {
+  return invoke<GitSyncResult>("git_sync_branch", { cwd, expectedBranch });
 }
 
 export type GitMergeContext = {
   /** A merge, rebase, cherry-pick or revert is in progress. */
   merging: boolean;
+  /** "merge" | "rebase" | "cherry-pick" | "revert" — "" when none. */
+  op: string;
   /** Unmerged paths (bounded). */
   conflicts: string[];
-  /** Short SHA of MERGE_HEAD (or the rebased head) when known. */
+  /** Short SHA of the head being applied (MERGE_HEAD…) when known. */
   mergeHead: string | null;
+  /** Remote-tracking ref verified to name MERGE_HEAD, e.g. "origin/main". */
+  incomingRef: string | null;
   /** Bounded combined diff of the conflicted paths — both sides. */
   diff: string;
 };

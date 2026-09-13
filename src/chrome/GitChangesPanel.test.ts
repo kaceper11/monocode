@@ -762,8 +762,10 @@ it("offers 'Sync with main' and runs fetch+merge through the shared flow", async
         defaultBranch: "main",
         files: [],
         opInProgress: false,
+        op: "",
         conflicts: [],
         mergeHead: null,
+        detached: false,
       };
     if (command === "git_sync_branch") {
       synced.push((args as { cwd: string }).cwd);
@@ -772,6 +774,7 @@ it("offers 'Sync with main' and runs fetch+merge through the shared flow", async
         branch: "feature",
         syncedWith: "origin/main",
         commits: ["remote work"],
+        commitCount: 1,
         conflicts: [],
         reason: "",
       };
@@ -822,8 +825,10 @@ it("shows merge state with send-to-owning-agent and abort controls", async () =>
     upstream: null,
     defaultBranch: "main",
     opInProgress: true,
+    op: "merge",
     conflicts: ["a.ts"],
     mergeHead: "abc1234",
+    detached: false,
     files: [
       {
         path: "/repo/a.ts",
@@ -842,13 +847,16 @@ it("shows merge state with send-to-owning-agent and abort controls", async () =>
     if (command === "git_merge_context")
       return {
         merging: true,
+        op: "merge",
         conflicts: ["a.ts"],
         mergeHead: "abc1234",
+        incomingRef: "origin/main",
         diff: "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> FETCH_HEAD",
       };
     if (command === "git_merge_abort") {
       aborted.push((args as { cwd: string }).cwd);
       mergeIndex.opInProgress = false;
+      mergeIndex.op = "";
       mergeIndex.conflicts = [];
       mergeIndex.mergeHead = null;
       return null;
