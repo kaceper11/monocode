@@ -10,6 +10,7 @@ import {
   loadCiSources,
   parsePipelineUrl,
   saveCiSources,
+  unbindCiSourceSession,
   type CiRun,
   type CiSource,
 } from "./azurePipelines";
@@ -236,4 +237,40 @@ it("lifts the watcher of a row the cap evicts", () => {
     expect.objectContaining({ cwd: evicted.cwd }),
   );
   expect(sources).toContainEqual(expect.objectContaining({ cwd: kept.cwd }));
+});
+
+it("shows session-less sources to session-scoped loads and lets them unlink", () => {
+  saveCiSources(
+    [{ ...source, session: undefined }],
+    source.cwd,
+    source.branch,
+  );
+  expect(loadCiSources(source.cwd, source.branch, "s1")).toHaveLength(1);
+  // A session-scoped save that drops the source unlinks it — and lifts its
+  // watcher even though the stored row was session-less.
+  saveCiSources([], source.cwd, source.branch, "s1");
+  expect(loadCiSources(source.cwd, source.branch)).toHaveLength(0);
+  expect(loadWatchers()).toHaveLength(0);
+});
+
+it("unbinds a deleted session from stored sources without unlinking", () => {
+  saveCiSources(
+    [{ ...source, session: "s1" }],
+    source.cwd,
+    source.branch,
+    "s1",
+  );
+  saveCiSources(
+    [{ ...source, session: "s2" }],
+    source.cwd,
+    source.branch,
+    "s2",
+  );
+  unbindCiSourceSession("s1");
+  let rows = loadCiSources(source.cwd, source.branch, "s2");
+  expect(rows).toHaveLength(2);
+  unbindCiSourceSession("s2");
+  rows = loadCiSources(source.cwd, source.branch);
+  expect(rows).toHaveLength(1);
+  expect(rows[0].session).toBeUndefined();
 });

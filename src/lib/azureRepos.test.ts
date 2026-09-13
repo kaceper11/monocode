@@ -11,6 +11,7 @@ import {
   parseAzurePrLocation,
   readAzurePrSection,
   saveAzurePrAssociation,
+  unbindAzurePrSession,
   type AzurePrAssociation,
 } from "./azureRepos";
 import {
@@ -498,4 +499,75 @@ it("lifts the watcher of an association the cap evicts", () => {
     expect.objectContaining({ cwd: evicted.cwd }),
   );
   expect(sources).toContainEqual(expect.objectContaining({ cwd: kept.cwd }));
+});
+
+it("shows session-less rows to session-scoped loads", () => {
+  const sessionless: AzurePrAssociation = {
+    ...association,
+    sourceSessionId: undefined,
+  };
+  saveAzurePrAssociation(sessionless, association.cwd, "feature");
+  expect(
+    loadAzurePrAssociations(association.cwd, "feature", "s1"),
+  ).toHaveLength(1);
+  expect(loadAzurePrAssociations(association.cwd, "feature")).toHaveLength(1);
+  // A different checkout stays isolated.
+  expect(loadAzurePrAssociations("/other", "feature", "s1")).toHaveLength(0);
+});
+
+it("adopts and unlinks a session-less row from a session scope", () => {
+  const sessionless: AzurePrAssociation = {
+    ...association,
+    sourceSessionId: undefined,
+  };
+  saveAzurePrAssociation(sessionless, association.cwd, "feature");
+  expect(loadWatchers()).toHaveLength(1);
+  // A session-bound save of the same PR adopts the row — no duplicate.
+  saveAzurePrAssociation(
+    { ...association, sourceSessionId: "s1" },
+    association.cwd,
+    "feature",
+    "s1",
+  );
+  const rows = loadAzurePrAssociations(association.cwd, "feature", "s1");
+  expect(rows).toHaveLength(1);
+  expect(rows[0].sourceSessionId).toBe("s1");
+  expect(loadWatchers()).toHaveLength(1);
+  // Unlinking from the session scope removes the adopted row + watcher.
+  saveAzurePrAssociation(
+    null,
+    association.cwd,
+    "feature",
+    "s1",
+    association.target,
+  );
+  expect(loadAzurePrAssociations(association.cwd, "feature", "s1")).toHaveLength(0);
+  expect(loadWatchers()).toHaveLength(0);
+});
+
+it("unbinds a deleted session from stored rows without unlinking", () => {
+  saveAzurePrAssociation(
+    { ...association, sourceSessionId: "s1" },
+    association.cwd,
+    "feature",
+    "s1",
+  );
+  saveAzurePrAssociation(
+    { ...association, sourceSessionId: "s2" },
+    association.cwd,
+    "feature",
+    "s2",
+  );
+  unbindAzurePrSession("s1");
+  let rows = loadAzurePrAssociations(association.cwd, "feature", "s2");
+  expect(rows).toHaveLength(2);
+  expect(rows.map((row) => row.sourceSessionId)).toEqual([
+    "s2",
+    undefined,
+  ]);
+  // Unbinding the second owner collapses the session-less twins.
+  unbindAzurePrSession("s2");
+  rows = loadAzurePrAssociations(association.cwd, "feature");
+  expect(rows).toHaveLength(1);
+  expect(rows[0].sourceSessionId).toBeUndefined();
 });

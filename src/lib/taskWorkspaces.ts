@@ -5,8 +5,16 @@ import {
   type ProjectRepository,
 } from "./projects";
 import type { LinkedWorkItem } from "./session";
-import { allAzurePrAssociations, azurePrKey } from "./azureRepos";
-import { allCiSources, ciKey } from "./azurePipelines";
+import {
+  allAzurePrAssociations,
+  azurePrKey,
+  unbindAzurePrSession,
+} from "./azureRepos";
+import {
+  allCiSources,
+  ciKey,
+  unbindCiSourceSession,
+} from "./azurePipelines";
 import { listTaskPrDrafts, taskPrRowKey } from "./taskPrs";
 import { parseGithubWorkItemUrl } from "./sessionWorkItem";
 import {
@@ -865,52 +873,69 @@ type DeliveryScope = {
 
 /** A stored link still covering the delivery from OUTSIDE the torn-down
  * scope keeps its watcher. Rows bound to the scope itself don't count —
- * they stay on disk but their owner is gone. Coverage can't span
- * checkouts, so a shared working copy still loses the watcher. */
+ * they stay on disk but their owner is gone. A live session owner keeps
+ * its link meaningful even at a torn-down checkout (the working copy stays
+ * on disk); session-less or dead-owner rows count only at surviving
+ * checkouts, and archived-task owners never count. */
 function deliveryLinkedOutsideScope(scope: DeliveryScope) {
-  const sessionIds = new Set(scope.sessionIds ?? []);
-  const cwds = new Set((scope.cwds ?? []).map(pathKey));
-  const bound = (cwd: string, sessions: readonly (string | undefined)[]) =>
-    cwds.has(pathKey(cwd)) ||
-    sessions.some((id) => id !== undefined && sessionIds.has(id));
+  const tornSessions = new Set(scope.sessionIds ?? []);
+  const tornCwds = new Set((scope.cwds ?? []).map(pathKey));
+  const tasks = loadTaskWorkspaces();
+  const associations = allAzurePrAssociations();
+  const ciSources = allCiSources();
+  const drafts = listTaskPrDrafts();
+  const archivedSessions = new Set(
+    tasks
+      .filter((task) => task.archived)
+      .flatMap((task) => [
+        ...(task.sessionIds ?? []),
+        ...task.children.flatMap((child) => child.sessionIds),
+      ]),
+  );
+  const live = (session?: string) =>
+    session !== undefined &&
+    !tornSessions.has(session) &&
+    !archivedSessions.has(session);
+  const inScope = (cwd: string, session?: string) =>
+    (session !== undefined && tornSessions.has(session)) ||
+    (tornCwds.has(pathKey(cwd)) && !live(session));
+  const covers = (cwd: string, session?: string) =>
+    !inScope(cwd, session) && (session === undefined || live(session));
   return (source: DeliveryWatcherSource): DeliverySurvival => {
     if (source.kind === "azure-pr") {
       const key = azurePrKey(source.target);
-      const row = allAzurePrAssociations().find(
+      const row = associations.find(
         (row) =>
-          row?.target &&
           azurePrKey(row.target) === key &&
           pathKey(row.cwd) === pathKey(source.cwd) &&
           row.branch === source.branch &&
-          !bound(row.cwd, [row.sourceSessionId]),
+          covers(row.cwd, row.sourceSessionId),
       );
       return row ? { sessionId: row.sourceSessionId } : false;
     }
     if (source.kind === "azure-ci") {
       const key = ciKey(source.target);
-      const row = allCiSources().find(
+      const row = ciSources.find(
         (row) =>
-          row?.target &&
           ciKey(row.target) === key &&
           pathKey(row.cwd) === pathKey(source.cwd) &&
           row.branch === source.branch &&
-          !bound(row.cwd, [row.session]),
+          covers(row.cwd, row.session),
       );
       return row ? { sessionId: row.session } : false;
     }
-    // github-pr — coverage comes from another task child's saved PR result.
-    const drafts = listTaskPrDrafts();
-    for (const task of loadTaskWorkspaces()) {
+    // github-pr — coverage comes from a live task child's saved PR result.
+    for (const task of tasks) {
+      if (task.archived) continue;
       for (const child of task.children) {
         if (
           !child.workingCopy ||
-          pathKey(child.workingCopy) !== pathKey(source.cwd) ||
-          bound(child.workingCopy, [
-            ...(task.sessionIds ?? []),
-            ...child.sessionIds,
-          ])
+          pathKey(child.workingCopy) !== pathKey(source.cwd)
         )
           continue;
+        const owner =
+          child.sessionIds.find(live) ?? task.sessionIds?.find(live);
+        if (tornCwds.has(pathKey(child.workingCopy)) && !owner) continue;
         const result = drafts[taskPrRowKey(task.id, child.id)]?.result;
         if (result?.provider !== "github") continue;
         const parsed = parseGithubWorkItemUrl(result.url);
@@ -920,7 +945,7 @@ function deliveryLinkedOutsideScope(scope: DeliveryScope) {
           parsed.number !== source.number
         )
           continue;
-        return { sessionId: child.sessionIds[0] ?? task.sessionIds?.[0] };
+        return { sessionId: owner };
       }
     }
     return false;
@@ -1053,6 +1078,11 @@ export function pruneTaskSession(sessionId: string) {
     return { ...task, sessionIds, children };
   });
   if (changed) saveTaskWorkspaces(next);
+  // Stored links keep their delivery but drop the dead owner — otherwise a
+  // stale row could cover a watcher and rebind it to a session that no
+  // longer exists.
+  unbindAzurePrSession(sessionId);
+  unbindCiSourceSession(sessionId);
   teardownDeliveryScope({ sessionIds: [sessionId] });
 }
 

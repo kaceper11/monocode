@@ -513,7 +513,9 @@ export function openWatchSheet(request: WatchSheetRequest) {
  * so review comments and CI failures surface without a manual Watch click.
  * `auto` marks these rows: teardown paths (unlink, terminal status re-save,
  * task close, session prune) lift only auto watchers — a watcher the user
- * created or edited by hand is never removed by them.
+ * created by hand is never removed by them. The sheet can't re-point a
+ * delivery source, so editing one keeps its managed status — delete and
+ * recreate to own it.
  */
 
 export type DeliveryWatcherSource = Extract<
@@ -586,6 +588,16 @@ export function ensureDeliveryWatcher(source: DeliveryWatcherSource): void {
     intervalSec: WATCHER_INTERVAL_DEFAULT,
     cooldownSec: WATCHER_COOLDOWN_DEFAULT,
   });
+}
+
+/** Two sources poll the same delivery — same PR/pipeline at one
+ * checkout+branch, regardless of which session owns the link. */
+export function sameDeliverySource(
+  a: WatcherSource,
+  b: WatcherSource,
+): boolean {
+  const key = deliveryWatchKey(a);
+  return key !== null && key === deliveryWatchKey(b);
 }
 
 /** The watcher already covering this delivery — auto or manual, any

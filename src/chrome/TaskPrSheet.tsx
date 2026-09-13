@@ -577,7 +577,7 @@ export function TaskPrSheet({
           watchGithubPrUrl(
             cwd,
             url,
-            task?.sessionIds?.[0] ?? row.child.sessionIds[0],
+            row.child.sessionIds[0] ?? task?.sessionIds?.[0],
           );
           saveTaskPrDraft(taskId, id, {
             target,

@@ -46,6 +46,7 @@ import {
   watchGithubPrUrl,
 } from "./watchers";
 import {
+  allAzurePrAssociations,
   saveAzurePrAssociation,
   type AzurePrAssociation,
 } from "./azureRepos";
@@ -1264,12 +1265,98 @@ describe("delivery watcher teardown", () => {
     expect(watchers[0].seen).toEqual(["k1"]);
   });
 
-  it("lifts a pruned session's watcher when only its own row linked the delivery", () => {
+  it("keeps a pruned session's watcher session-less while its link stays", () => {
     const assoc = association("/tmp/app-copy", "s1");
     saveAzurePrAssociation(assoc, "/tmp/app-copy", "feat", "s1");
     expect(loadWatchers()).toHaveLength(1);
     pruneTaskSession("s1");
+    // The stored link survives with the dead owner stripped, so the watcher
+    // follows it — rebound to nobody rather than to a deleted session.
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).not.toHaveProperty("sessionId");
+    expect(allAzurePrAssociations()[0].sourceSessionId).toBeUndefined();
+  });
+
+  it("never rebinds a watcher to a deleted session", () => {
+    const assoc = association("/tmp/app-copy", "s1");
+    saveAzurePrAssociation(assoc, "/tmp/app-copy", "feat", "s1");
+    saveAzurePrAssociation(
+      { ...assoc, sourceSessionId: "s2" },
+      "/tmp/app-copy",
+      "feat",
+      "s2",
+    );
+    expect(loadWatchers()[0].source).toEqual(
+      expect.objectContaining({ sessionId: "s1" }),
+    );
+    pruneTaskSession("s1");
+    expect(loadWatchers()[0].source).toEqual(
+      expect.objectContaining({ sessionId: "s2" }),
+    );
+    pruneTaskSession("s2");
+    // s1's row was unbound when s1 was pruned — nothing points back at a
+    // dead session; the session-less twins collapse to one covering row.
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).not.toHaveProperty("sessionId");
+    expect(allAzurePrAssociations()).toHaveLength(1);
+  });
+
+  it("does not count an archived task's draft as coverage", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    const childId = task.children[0].id;
+    updateTaskChild(task.id, childId, { sessionIds: ["s9"] });
+    saveTaskPrDraft(task.id, childId, {
+      target: "main",
+      title: "T",
+      body: "",
+      result: {
+        provider: "github",
+        url: "https://github.com/acme/app/pull/9",
+        title: "T",
+        number: 9,
+      },
+    });
+    archiveTask(task.id);
+    // The parked task's draft must not keep another session's watcher alive.
+    watchGithubPrUrl("/tmp/app-copy", "https://github.com/acme/app/pull/9", "s1");
+    pruneTaskSession("s1");
     expect(loadWatchers()).toHaveLength(0);
+  });
+
+  it("keeps a watcher covered by a live session at a torn checkout", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    updateTaskChild(task.id, task.children[0].id, { sessionIds: ["s1"] });
+    // s9 is a live session elsewhere — its stored link shares the checkout.
+    saveAzurePrAssociation(
+      association("/tmp/app-copy", "s9"),
+      "/tmp/app-copy",
+      "feat",
+      "s9",
+    );
+    removeTask(task.id);
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).toEqual(
+      expect.objectContaining({ sessionId: "s9" }),
+    );
   });
 
   it("keeps a github-pr watcher covered by a task's saved PR result", () => {
@@ -1308,7 +1395,7 @@ describe("delivery watcher teardown", () => {
     expect(loadWatchers()).toHaveLength(0);
   });
 
-  it("restores watchers session-less when the linked session isn't the task's", () => {
+  it("keeps a foreign live session's watcher through archive/unarchive", () => {
     const project = projectWith("/tmp/app");
     const [repo] = project.repositories;
     const task = createTask({
@@ -1324,13 +1411,19 @@ describe("delivery watcher teardown", () => {
       "feat",
       "foreign",
     );
+    // The foreign session is live — its stored link still covers the
+    // delivery, so archiving this task doesn't lift the watcher.
     archiveTask(task.id);
-    expect(loadWatchers()).toHaveLength(0);
+    let watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).toEqual(
+      expect.objectContaining({ sessionId: "foreign" }),
+    );
+    // Un-archiving must not stack a second watcher over the kept one.
     archiveTask(task.id, false);
-    const watchers = loadWatchers();
+    watchers = loadWatchers();
     expect(watchers).toHaveLength(1);
     expect(watchers[0].source.kind).toBe("azure-pr");
-    expect(watchers[0].source).not.toHaveProperty("sessionId");
   });
 
   it("lifts watchers for children dropped by reviseTask", () => {

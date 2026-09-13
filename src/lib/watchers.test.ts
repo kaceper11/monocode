@@ -7,6 +7,7 @@ import {
   loadWatchers,
   openWatchSheet,
   removeWatcher,
+  sameDeliverySource,
   saveWatcher,
   setWatcherEnabled,
   unwatchAzurePrDelivery,
@@ -391,4 +392,40 @@ describe("produced-delivery auto watchers", () => {
     expect(deliveryWatcherFor(AZURE_PR)?.name).toBe("Jira · ENG");
     expect(deliveryWatcherFor(JIRA_SOURCE)).toBeUndefined();
   });
+});
+
+it("sameDeliverySource matches across owners and rejects other deliveries", () => {
+  const a: WatcherSource = {
+    kind: "azure-pr",
+    target: {
+      site: "https://dev.azure.com/team",
+      accountId: "a",
+      project: "p",
+      repository: "r",
+      number: 7,
+    },
+    projectName: "P",
+    repositoryName: "R",
+    cwd: "/repo",
+    branch: "feat",
+    sessionId: "s1",
+  };
+  const b: WatcherSource = { ...a, sessionId: undefined } as WatcherSource;
+  expect(sameDeliverySource(a, b)).toBe(true);
+  expect(
+    sameDeliverySource(a, {
+      kind: "github-items",
+      cwd: "/repo",
+      repo: "acme/app",
+      itemKind: "pr",
+      state: "open",
+    }),
+  ).toBe(false);
+  // A different PR number at the same checkout is a different delivery.
+  expect(
+    sameDeliverySource(a, {
+      ...a,
+      target: { ...a.target, number: 8 },
+    }),
+  ).toBe(false);
 });
