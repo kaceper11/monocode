@@ -65,10 +65,12 @@ type Props = {
   path: string;
   /** Explicit stored project when the rail row already carries one. */
   projectId?: string;
-  /** Import flow: open on the folder scan and create the project group only
-   * when the user submits — nothing is persisted if the sheet is closed
-   * first. */
+  /** Import flow: create the project group only when the user submits the
+   * queue — nothing is persisted, and nothing appears in the rail, if the
+   * sheet is closed first. */
   groupImport?: boolean;
+  /** With `groupImport`, launch the folder picker as soon as the sheet opens. */
+  autoPick?: boolean;
   families: ReadonlyMap<string, RepositoryFamily>;
   onOpenPath: (path: string) => void;
   onClose: () => void;
@@ -98,6 +100,7 @@ export function ProjectRepositories({
   path,
   projectId,
   groupImport,
+  autoPick,
   families,
   onOpenPath,
   onClose,
@@ -209,16 +212,17 @@ export function ProjectRepositories({
     };
   }, [project, families]);
 
-  // Import flow: open straight into the folder pick so choosing a parent and
-  // reviewing its repositories is the whole interaction.
+  // Import flow: open the add panel at once — and the folder picker too when
+  // the rail asked for it — so choosing a parent and reviewing its
+  // repositories is the whole interaction.
   const autoScan = useRef(false);
   useEffect(() => {
     if (!groupImport || autoScan.current) return;
     autoScan.current = true;
     setAdding(true);
-    pickAdd();
+    if (autoPick) pickAdd();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [groupImport]);
+  }, [groupImport, autoPick]);
 
   const names = members.map(repositoryDisplayName);
   const ambiguous = new Set(
@@ -295,12 +299,15 @@ export function ProjectRepositories({
     return failed;
   };
 
-  /** A single explicit pick commits immediately — the queue is only for
-   * reviewing scan results before they join. */
+  /** A single explicit pick commits immediately — unless the group is still
+   * being imported, where everything waits in the queue so the project only
+   * exists once the user submits. */
   const addFamily = (family: RepositoryFamily, nameHint?: string) => {
     const result = stageable([family]);
-    if (result.items.length) commitFamilies([family], nameHint);
-    else if (result.covered)
+    if (result.items.length) {
+      if (groupImport && !project) stage(result);
+      else commitFamilies([family], nameHint);
+    } else if (result.covered)
       setError("That repository is already in this project or queued.");
   };
 

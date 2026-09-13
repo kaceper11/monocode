@@ -46,7 +46,6 @@ import {
   familyForRepository,
   projectRailKey,
   isProjectRailKey,
-  createProjectGroup,
   renameProject,
   type ProjectRecord,
 } from "../lib/projects";
@@ -345,9 +344,11 @@ export function ProjectRail({
   const [repositoriesProject, setRepositoriesProject] = useState<{
     path: string;
     projectId?: string;
-    /** Import flow — the sheet scans a picked parent folder and creates the
-     * group only on submit. */
+    /** Import flow — the sheet queues repositories and creates the group only
+     * on submit; nothing lands in the rail before that. */
     groupImport?: boolean;
+    /** Launch the folder picker as soon as the sheet opens. */
+    autoPick?: boolean;
   } | null>(null);
   const [taskMenu, setTaskMenu] = useState<{
     x: number;
@@ -550,15 +551,11 @@ export function ProjectRail({
 
   const closeAddMenu = () => setAddMenu(null);
 
-  /** A pathless project — a pure group; opens its repositories sheet so the
-   * user can add members right away. The group is unnamed until renamed via
-   * its project menu. */
+  /** A pathless project — a pure group. The sheet queues repositories and
+   * materializes the group on the first submit, so an abandoned setup never
+   * leaves an empty project row behind. */
   const submitGroup = () => {
-    const project = createProjectGroup();
-    setRepositoriesProject({
-      path: projectRailKey(project.id),
-      projectId: project.id,
-    });
+    setRepositoriesProject({ path: "", groupImport: true });
   };
 
   const onProjectRename = (groupId: string, label: string) => {
@@ -972,6 +969,7 @@ export function ProjectRail({
           path={repositoriesProject.path}
           projectId={repositoriesProject.projectId}
           groupImport={repositoriesProject.groupImport}
+          autoPick={repositoriesProject.autoPick}
           families={families}
           onOpenPath={(path) => {
             setRepositoriesProject(null);
@@ -1006,7 +1004,11 @@ export function ProjectRail({
               className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
               onClick={() => {
                 closeAddMenu();
-                setRepositoriesProject({ path: "", groupImport: true });
+                setRepositoriesProject({
+                  path: "",
+                  groupImport: true,
+                  autoPick: true,
+                });
               }}
             >
               Folder of repositories…
