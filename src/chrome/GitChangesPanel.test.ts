@@ -22,6 +22,10 @@ vi.mock("./GitHistoryGraph", () => ({
   saveGraphPanelHeight: () => {},
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  ask: vi.fn(async () => true),
+  message: vi.fn(async () => undefined),
+}));
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (command: string) =>
     command === "git_diff_index"
@@ -740,4 +744,170 @@ it("routes GitHub rows externally and keeps an Azure CI override independent", a
     await act(async () => row("CI").click());
     expect(open).toHaveBeenCalledWith("/github", {kind:"ci",branch:"feature",sourceSessionId:"gh-owner"});
   } finally { await act(async () => root.unmount()); host.remove(); vi.mocked(invoke).mockImplementation(original); vi.unstubAllGlobals(); }
+});
+
+it("offers 'Sync with main' and runs fetch+merge through the shared flow", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const { invoke } = await import("@tauri-apps/api/core");
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  const synced: string[] = [];
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "git_diff_index")
+      return {
+        branch: "feature",
+        ahead: 0,
+        behind: 0,
+        remote: "origin",
+        upstream: null,
+        defaultBranch: "main",
+        files: [],
+        opInProgress: false,
+        op: "",
+        conflicts: [],
+        mergeHead: null,
+        detached: false,
+      };
+    if (command === "git_sync_branch") {
+      synced.push((args as { cwd: string }).cwd);
+      return {
+        outcome: "merged",
+        branch: "feature",
+        syncedWith: "origin/main",
+        commits: ["remote work"],
+        commitCount: 1,
+        conflicts: [],
+        reason: "",
+      };
+    }
+    return original(command, args);
+  });
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const button = (text: string) =>
+    [...host.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes(text),
+    ) as HTMLButtonElement | undefined;
+  try {
+    await act(async () =>
+      root.render(
+        createElement(GitChangesPanel, {
+          cwd: "/repo",
+          sourceSessionId: "owner",
+          enabled: true,
+          onOpenFile: vi.fn(),
+          onOpenAllChanges: vi.fn(),
+          onOpenCommit: vi.fn(),
+        }),
+      ),
+    );
+    expect(button("Sync with main")).toBeTruthy();
+    await act(async () => button("Sync with main")!.click());
+    // The shared flow confirmed, then invoked the merge on this exact copy.
+    expect(synced).toEqual(["/repo"]);
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    vi.mocked(invoke).mockImplementation(original);
+    vi.unstubAllGlobals();
+  }
+});
+
+it("shows merge state with send-to-owning-agent and abort controls", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const { invoke } = await import("@tauri-apps/api/core");
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  const mergeIndex = {
+    branch: "feature",
+    ahead: 0,
+    behind: 0,
+    remote: "origin",
+    upstream: null,
+    defaultBranch: "main",
+    opInProgress: true,
+    op: "merge",
+    conflicts: ["a.ts"],
+    mergeHead: "abc1234",
+    detached: false,
+    files: [
+      {
+        path: "/repo/a.ts",
+        relative: "a.ts",
+        status: "conflicted",
+        staged: false,
+        unstaged: true,
+        additions: 1,
+        deletions: 0,
+      },
+    ],
+  };
+  const aborted: string[] = [];
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    // Fresh object per read — mutating in place would make the cached
+    // index compare equal and the banner would never re-render.
+    if (command === "git_diff_index") return { ...mergeIndex };
+    if (command === "git_merge_context")
+      return {
+        merging: true,
+        op: "merge",
+        conflicts: ["a.ts"],
+        mergeHead: "abc1234",
+        incomingRef: "origin/main",
+        diff: "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> FETCH_HEAD",
+      };
+    if (command === "git_merge_abort") {
+      aborted.push((args as { cwd: string }).cwd);
+      mergeIndex.opInProgress = false;
+      mergeIndex.op = "";
+      mergeIndex.conflicts = [];
+      mergeIndex.mergeHead = null;
+      return null;
+    }
+    return original(command, args);
+  });
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const button = (text: string) =>
+    [...host.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes(text),
+    ) as HTMLButtonElement | undefined;
+  try {
+    await act(async () =>
+      root.render(
+        createElement(GitChangesPanel, {
+          cwd: "/repo",
+          sourceSessionId: "owner",
+          enabled: true,
+          onOpenFile: vi.fn(),
+          onOpenAllChanges: vi.fn(),
+          onOpenCommit: vi.fn(),
+        }),
+      ),
+    );
+    // The merge state is a distinct banner, not an ordinary dirty list.
+    expect(host.textContent).toContain("Merge in progress");
+    expect(host.textContent).toContain("1 conflicted file");
+    expect(button("Sync with main")).toBeUndefined();
+    vi.mocked(requestAgentContext).mockClear();
+    await act(async () => button("Send to owning agent")!.click());
+    const request = vi.mocked(requestAgentContext).mock.calls.at(-1)?.[0];
+    expect(request?.sourceSessionId).toBe("owner");
+    expect(request?.cwd).toBe("/repo");
+    expect(request?.context.entries[0].text).toContain("a.ts");
+    expect(request?.context.entries[1].text).toContain("<<<<<<< HEAD");
+    // Abort goes through an explicit confirm, then clears the banner.
+    await act(async () => button("Abort merge")!.click());
+    expect(aborted).toEqual(["/repo"]);
+    // The abort notifies GIT_CHANGED; the next index read reports no op
+    // and the banner clears instead of sticking on a stale snapshot.
+    await vi.waitFor(() => {
+      expect(host.textContent).not.toContain("Merge in progress");
+    });
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    vi.mocked(invoke).mockImplementation(original);
+    vi.unstubAllGlobals();
+  }
 });

@@ -6,6 +6,12 @@ import { loadCiSources, ciState, ciContext, AZURE_CI_SOURCES_CHANGED } from "../
 import type { DeliveryTabSource } from "../lib/layout";
 import { contextFromChanges, requestAgentContext } from "../lib/agentContext";
 import {
+  abortMerge,
+  opLabel,
+  sendMergeConflictsToAgent,
+  syncWithDefaultBranch,
+} from "../lib/syncDefault";
+import {
   loadTaskWorkspaces,
   projectForTask,
   repositoryForChild,
@@ -29,6 +35,7 @@ import { ContextCheckbox } from "./InboxContextPicker";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  Bot,
   Check,
   CircleDashed,
   SquarePlus,
@@ -41,6 +48,7 @@ import {
   FileDiff,
   FolderTree,
   GitBranch,
+  GitMerge,
   GitPullRequest,
   ListBullet,
   Loader,
@@ -99,6 +107,7 @@ import {
   type ChangesView,
 } from "../lib/appearance";
 import { generateCommitMessage, generatePrContent } from "../lib/harness";
+import { watchGithubPrUrl } from "../lib/watchers";
 import { invalidateWatchedFiles } from "../lib/fileWatch";
 import { MOD } from "../lib/platform";
 import {
@@ -1007,6 +1016,12 @@ function ChangedFiles({
     hasRemote &&
     Boolean(index?.upstream) &&
     ((index?.ahead ?? 0) > 0 || (index?.behind ?? 0) > 0);
+  const canSyncDefault =
+    hasRemote &&
+    Boolean(index?.defaultBranch) &&
+    index?.branch !== index?.defaultBranch &&
+    !index?.detached &&
+    !index?.opInProgress;
   const canCommitPush = canCommit && hasRemote && !diverged;
   const canCommitPushPr = canCommitPush && !hasOpenPr && !onDefault;
   const canEditMessage = staged.length > 0 && !busy;
@@ -1172,6 +1187,57 @@ function ChangedFiles({
     }
   };
 
+  const syncDefault = async () => {
+    if (!index || !canSyncDefault || busyRef.current) return;
+    setBusy("sync-default");
+    try {
+      const result = await syncWithDefaultBranch({ cwd, sessionId: sourceSessionId });
+      // A merge or a conflicted state changed the tree — invalidate
+      // watchers and the PR row. A cancel/refusal/up-to-date changed
+      // nothing locally (runSync already refreshed the index).
+      if (result?.outcome === "merged" || result?.outcome === "conflicted") {
+        mutated(undefined, undefined, true);
+        reloadPr();
+      }
+    } catch (error) {
+      fail(error);
+      mutated(undefined, undefined, true);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const sendMergeToAgent = async () => {
+    if (!index?.opInProgress || busyRef.current) return;
+    setBusy("merge-agent");
+    try {
+      // Nothing was sent when the operation already ended — refresh shows it.
+      if (!(await sendMergeConflictsToAgent({ cwd, sessionId: sourceSessionId })))
+        mutated();
+    } catch (error) {
+      fail(error);
+      mutated();
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const abortMergeOperation = async () => {
+    if (!index?.opInProgress || busyRef.current) return;
+    setBusy("merge-abort");
+    try {
+      // Nothing in progress (a stale banner) or a confirmed abort both end
+      // with a refresh — a declined confirm is the only no-op.
+      if (await abortMerge({ cwd })) mutated(undefined, undefined, true);
+      else mutated();
+    } catch (error) {
+      fail(error);
+      mutated();
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const openCreatedPr = async () => {
     const content = await generatePrContent(cwd, textHarness);
     if (!content) throw new Error("Could not prepare pull request content");
@@ -1182,6 +1248,7 @@ function ChangedFiles({
       content.base,
       content.head,
     );
+    watchGithubPrUrl(cwd, url.trim(), sourceSessionId);
     await openUrl(url.trim());
   };
 
@@ -1354,10 +1421,12 @@ function ChangedFiles({
             hasOpenPr={hasOpenPr}
             onDefault={onDefault}
             canSync={canSync}
+            canSyncDefault={canSyncDefault}
             canPublish={canPublish}
             canCreatePr={canCreatePr}
             canViewPr={canViewPr}
             onSync={() => void sync()}
+            onSyncDefault={() => void syncDefault()}
             onCreatePr={() => void createPr()}
             onViewPr={() => {
               if (pr?.url) void openUrl(pr.url);
@@ -1365,6 +1434,15 @@ function ChangedFiles({
           />
         ) : null}
       </div>
+      {index?.opInProgress ? (
+        <MergeBanner
+          index={index}
+          busy={busy}
+          hasOwner={!!sourceSessionId}
+          onSend={() => void sendMergeToAgent()}
+          onAbort={() => void abortMergeOperation()}
+        />
+      ) : null}
       <div
         ref={lockOverscroll}
         className={`relative min-h-0 flex-1 overflow-y-auto overscroll-none py-1 ${selectingContext ? "pb-20" : ""}`}
@@ -1549,10 +1627,12 @@ function GitSyncActions({
   hasOpenPr,
   onDefault,
   canSync,
+  canSyncDefault,
   canPublish,
   canCreatePr,
   canViewPr,
   onSync,
+  onSyncDefault,
   onCreatePr,
   onViewPr,
 }: {
@@ -1563,14 +1643,19 @@ function GitSyncActions({
   hasOpenPr: boolean;
   onDefault: boolean;
   canSync: boolean;
+  canSyncDefault: boolean;
   canPublish: boolean;
   canCreatePr: boolean;
   canViewPr: boolean;
   onSync: () => void;
+  onSyncDefault: () => void;
   onCreatePr: () => void;
   onViewPr: () => void;
 }) {
   if (!hasRemote) return null;
+  // While a merge/rebase is in progress the banner owns this space —
+  // fetch/push buttons hide, but "View PR" stays available.
+  const op = index.opInProgress;
   const ahead = index.ahead;
   const behind = index.behind;
   const dest =
@@ -1598,11 +1683,16 @@ function GitSyncActions({
   const secondary = `${btn} bg-content/10 text-content hover:bg-content/15`;
   const showCreatePr = !hasOpenPr && !onDefault;
   const showViewPr = hasOpenPr;
-  if (!canPublish && !canSync && !showCreatePr && !showViewPr) return null;
+  const mutating =
+    canPublish ||
+    canSync ||
+    (canSyncDefault && Boolean(index.defaultBranch)) ||
+    showCreatePr;
+  if (op ? !showViewPr : !mutating && !showViewPr) return null;
 
   return (
     <div className="mt-1.5 flex flex-col gap-1.5">
-      {canPublish ? (
+      {!op && canPublish ? (
         <button
           type="button"
           title={syncTitle}
@@ -1620,7 +1710,7 @@ function GitSyncActions({
           )}
           <span className="min-w-0 truncate">Publish Branch</span>
         </button>
-      ) : canSync ? (
+      ) : !op && canSync ? (
         <button
           type="button"
           title={syncTitle}
@@ -1645,7 +1735,28 @@ function GitSyncActions({
           ) : null}
         </button>
       ) : null}
-      {showCreatePr ? (
+      {!op && canSyncDefault && index.defaultBranch ? (
+        <button
+          type="button"
+          title={`Fetch ${index.remote ?? "origin"}, then merge ${index.remote ?? "origin"}/${index.defaultBranch} into ${index.branch ?? "the current branch"} in this working copy`}
+          disabled={!!busy}
+          onClick={onSyncDefault}
+          className={secondary}
+        >
+          {busy === "sync-default" ? (
+            <Loader
+              className="size-3.5 shrink-0 animate-spin"
+              strokeWidth={1.75}
+            />
+          ) : (
+            <GitMerge className="size-3.5 shrink-0" strokeWidth={1.75} />
+          )}
+          <span className="min-w-0 truncate">
+            Sync with {index.defaultBranch}
+          </span>
+        </button>
+      ) : null}
+      {!op && showCreatePr ? (
         <button
           type="button"
           title={createTitle}
@@ -1678,6 +1789,97 @@ function GitSyncActions({
           </span>
         </button>
       ) : null}
+    </div>
+  );
+}
+
+/** Persistent merge/rebase state — visible across restarts through
+ * `GitDiffIndex.opInProgress`, not only right after a sync ran. The
+ * conflicted state stays in the tree until the user resolves it, hands it
+ * to an agent, or aborts explicitly. */
+function MergeBanner({
+  index,
+  busy,
+  hasOwner,
+  onSend,
+  onAbort,
+}: {
+  index: GitDiffIndex;
+  busy: string | null;
+  hasOwner: boolean;
+  onSend: () => void;
+  onAbort: () => void;
+}) {
+  const conflicts = index.conflicts ?? [];
+  const op = opLabel(index.op);
+  const btn =
+    "flex h-7 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-[12px] font-medium disabled:opacity-40";
+  return (
+    <div
+      className="shrink-0 border-b border-amber-400/25 bg-amber-400/10 px-2 py-1.5"
+      role="status"
+      aria-label={`${op} in progress`}
+    >
+      <p className="flex items-center gap-1.5 px-1 text-[11px] font-medium text-amber-200">
+        <GitMerge className="size-3 shrink-0" strokeWidth={1.75} />
+        <span className="min-w-0 truncate">
+          {op} in progress
+          {conflicts.length
+            ? ` — ${conflicts.length === 100 ? "100+" : conflicts.length} conflicted file${conflicts.length === 1 ? "" : "s"}`
+            : ""}
+        </span>
+      </p>
+      {conflicts.length ? (
+        <p
+          className="truncate px-1 text-[11px] text-content/50"
+          title={conflicts.join("\n")}
+        >
+          {conflicts.slice(0, 3).join(", ")}
+          {conflicts.length > 3 ? ` +${conflicts.length - 3} more` : ""}
+        </p>
+      ) : null}
+      <div className="mt-1.5 flex gap-1.5">
+        <button
+          type="button"
+          title={
+            hasOwner
+              ? "Send the merge context to the owning conversation"
+              : "Send the merge context to an agent you choose"
+          }
+          disabled={!!busy}
+          onClick={onSend}
+          className={`${btn} bg-amber-400/15 text-amber-100 hover:bg-amber-400/25`}
+        >
+          {busy === "merge-agent" ? (
+            <Loader
+              className="size-3.5 shrink-0 animate-spin"
+              strokeWidth={1.75}
+            />
+          ) : (
+            <Bot className="size-3.5 shrink-0" strokeWidth={1.75} />
+          )}
+          <span className="min-w-0 truncate">
+            {hasOwner ? "Send to owning agent" : "Send to agent"}
+          </span>
+        </button>
+        <button
+          type="button"
+          title={`Abort the ${op.toLowerCase()} and restore the previous state`}
+          disabled={!!busy}
+          onClick={onAbort}
+          className={`${btn} bg-content/10 text-content hover:bg-content/15`}
+        >
+          {busy === "merge-abort" ? (
+            <Loader
+              className="size-3.5 shrink-0 animate-spin"
+              strokeWidth={1.75}
+            />
+          ) : (
+            <Undo2 className="size-3.5 shrink-0" strokeWidth={1.75} />
+          )}
+          <span className="min-w-0 truncate">Abort {op.toLowerCase()}</span>
+        </button>
+      </div>
     </div>
   );
 }
@@ -2429,7 +2631,13 @@ function sameIndex(prev: GitDiffIndex | null, next: GitDiffIndex): boolean {
     prev.defaultBranch !== next.defaultBranch ||
     prev.ahead !== next.ahead ||
     prev.behind !== next.behind ||
-    prev.aheadOfDefault !== next.aheadOfDefault
+    prev.aheadOfDefault !== next.aheadOfDefault ||
+    !!prev.opInProgress !== !!next.opInProgress ||
+    (prev.op ?? "") !== (next.op ?? "") ||
+    !!prev.detached !== !!next.detached ||
+    (prev.mergeHead ?? null) !== (next.mergeHead ?? null) ||
+    (prev.conflicts ?? []).length !== (next.conflicts ?? []).length ||
+    (prev.conflicts ?? []).some((path, i) => (next.conflicts ?? [])[i] !== path)
   ) {
     return false;
   }
