@@ -83,7 +83,6 @@ const inputClass =
  * user submits the queue. */
 type PendingRepo = {
   family: RepositoryFamily;
-  checked: boolean;
   /** Name of another project this repository would move from. */
   owner?: string;
 };
@@ -114,7 +113,6 @@ export function ProjectRepositories({
   const [importName, setImportName] = useState("");
   const [error, setError] = useState("");
   const [missing, setMissing] = useState<Set<string>>(new Set());
-  const [adding, setAdding] = useState(false);
   const [pickOpen, setPickOpen] = useState(false);
   /** Repository id being relocated through the shared folder picker. */
   const locating = useRef<string | null>(null);
@@ -155,8 +153,9 @@ export function ProjectRepositories({
 
   const title = useMemo(() => {
     if (project?.name) return project.name;
-    if (groupImport && !project)
-      return importParent ? basename(importParent) : "New project";
+    // Keep the import sheet's title stable — the picked folder's name is only
+    // a preview inside the name field, not a moving header.
+    if (groupImport && !project) return "New project";
     if (isProjectRailKey(path)) return "Project";
     const key = projectKey(project?.anchor ?? path);
     return resolveTabGroupLabel(
@@ -166,7 +165,7 @@ export function ProjectRepositories({
     );
     // Re-resolve after project edits (raw snapshot changed).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project, path, raw, groupImport, importParent]);
+  }, [project, path, raw, groupImport]);
 
   /** The record edits write to. In import mode the group is created lazily on
    * the first write so a cancelled import leaves nothing behind. `nameHint`
@@ -212,15 +211,14 @@ export function ProjectRepositories({
     };
   }, [project, families]);
 
-  // Import flow: open the add panel at once — and the folder picker too when
-  // the rail asked for it — so choosing a parent and reviewing its
-  // repositories is the whole interaction.
+  // Import flow: launch the folder picker as soon as the sheet opens when the
+  // rail asked for it — choosing a parent and reviewing its repositories is
+  // the whole interaction.
   const autoScan = useRef(false);
   useEffect(() => {
-    if (!groupImport || autoScan.current) return;
+    if (!groupImport || !autoPick || autoScan.current) return;
     autoScan.current = true;
-    setAdding(true);
-    if (autoPick) pickAdd();
+    pickAdd();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groupImport, autoPick]);
 
@@ -249,7 +247,6 @@ export function ProjectRepositories({
       const owner = findProjectByCommonDir(family.commonDir, projects)?.project;
       items.push({
         family,
-        checked: true,
         owner:
           owner && owner.id !== project?.id
             ? (owner.name ??
@@ -317,7 +314,9 @@ export function ProjectRepositories({
   const addPicked = async (picked: string | null) => {
     if (!picked) return;
     setError("");
-    if (groupImport) setImportParent(picked);
+    // The first picked folder proposes the group name; later picks just add
+    // more repositories, so the name preview never moves again.
+    if (groupImport) setImportParent((prev) => prev ?? picked);
     setScanning(true);
     try {
       const own = await probeRepositoryFamily(picked);
@@ -350,15 +349,17 @@ export function ProjectRepositories({
     }
   };
 
-  /** Commits the checked scan queue entries — the only batched write. */
+  /** Commits the queued entries — the only batched write. In import mode a
+   * clean submit creates the project and closes the sheet; failures keep the
+   * sheet open with just the failed rows left. */
   const submitPending = () => {
-    const chosen = pending.filter((item) => item.checked);
-    if (!chosen.length) return;
+    if (!pending.length) return;
     setError("");
-    const failed = commitFamilies(chosen.map((item) => item.family));
+    const failed = commitFamilies(pending.map((item) => item.family));
     setPending((prev) =>
       prev.filter((item) => failed.has(pathKey(item.family.commonDir))),
     );
+    if (groupImport && !project && !failed.size) onClose();
   };
 
   const pickAdd = () => {
@@ -505,16 +506,24 @@ export function ProjectRepositories({
         <div>
           <p className="mb-1 text-[11px] text-content/50">Project name</p>
           <input
-            key={project?.id ?? "new"}
-            defaultValue={title}
+            key={project?.id ?? (groupImport ? (importParent ?? "new") : "row")}
+            defaultValue={
+              groupImport && !project
+                ? importName || (importParent ? basename(importParent) : "")
+                : title
+            }
+            placeholder={groupImport && !project ? "Project name" : undefined}
             aria-label="Project name"
             className={inputClass}
             onBlur={(event) => {
               const name = event.target.value.trim();
-              if (!name || name === title) return;
-              if (project) renameProject(project.id, name);
-              else if (groupImport) setImportName(name);
-              else {
+              if (!name) return;
+              if (project) {
+                if (name !== title) renameProject(project.id, name);
+              } else if (groupImport) {
+                if (name !== importName) setImportName(name);
+              } else {
+                if (name === title) return;
                 saveTabGroupLabel(projectKey(path), name);
                 if (family) ensureProjectForPath(path, family);
               }
@@ -526,19 +535,7 @@ export function ProjectRepositories({
         </div>
 
         <div>
-          <div className="mb-1 flex items-center gap-1">
-            <p className="min-w-0 flex-1 text-[11px] text-content/50">
-              Repositories
-            </p>
-            <button
-              type="button"
-              onClick={() => setAdding((open) => !open)}
-              className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-content/55 hover:bg-content/8 hover:text-content"
-            >
-              <Plus className="size-3" strokeWidth={1.75} />
-              Add repository
-            </button>
-          </div>
+          <p className="mb-1 text-[11px] text-content/50">Repositories</p>
 
           {members.length === 0 ? (
             <p className="rounded-lg border border-content/10 px-2.5 py-2 text-[12px] text-content/45">
@@ -640,150 +637,137 @@ export function ProjectRepositories({
             </ul>
           )}
 
-          {adding ? (
-            <div className="mt-1.5 rounded-lg border border-content/10 p-2">
-              <button
-                type="button"
-                disabled={scanning}
-                title="Pick a repository folder to add it, or a parent folder to review its repositories"
-                onClick={pickAdd}
-                className="flex items-center gap-1.5 rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-[12px] text-content hover:bg-content/10 disabled:opacity-50"
-              >
-                <FolderPlus className="size-3.5" strokeWidth={1.75} />
-                {scanning ? "Scanning…" : "Add folder…"}
-              </button>
-              <p className="mt-1.5 text-[11px] leading-tight text-content/45">
-                {pending.length
-                  ? "Checked repositories join the project when you submit."
+          <div className="mt-1.5 rounded-lg border border-content/10 p-2">
+            <button
+              type="button"
+              disabled={scanning}
+              title="Pick a repository folder to add it, or a parent folder to review its repositories"
+              onClick={pickAdd}
+              className="flex items-center gap-1.5 rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-[12px] text-content hover:bg-content/10 disabled:opacity-50"
+            >
+              <FolderPlus className="size-3.5" strokeWidth={1.75} />
+              {scanning ? "Scanning…" : "Add folder…"}
+            </button>
+            <p className="mt-1.5 text-[11px] leading-tight text-content/45">
+              {groupImport && !project
+                ? "Picked repositories are queued — the project is created when you submit."
+                : pending.length
+                  ? "Queued repositories join the project when you submit."
                   : "Pick a repository to add it now, or a parent folder to review its repositories first."}
-              </p>
-              {pending.length ? (
-                <div className="mt-1.5 space-y-1">
-                  <ul className="flex flex-col gap-px">
-                    {pending.map((item) => {
-                      const key = pathKey(item.family.commonDir);
-                      const label =
-                        basename(item.family.checkout) || item.family.checkout;
-                      return (
-                        <li
-                          key={key}
-                          className="flex items-center gap-2 rounded-lg px-1.5 py-1 hover:bg-content/5"
+            </p>
+            {pending.length ? (
+              <div className="mt-1.5 space-y-1">
+                <ul className="flex max-h-40 flex-col gap-px overflow-y-auto">
+                  {pending.map((item) => {
+                    const key = pathKey(item.family.commonDir);
+                    const label =
+                      basename(item.family.checkout) || item.family.checkout;
+                    return (
+                      <li
+                        key={key}
+                        className="flex items-center gap-2 rounded-lg px-1.5 py-1 hover:bg-content/5"
+                      >
+                        <GitBranch
+                          className="size-3.5 shrink-0 text-content/40"
+                          strokeWidth={1.5}
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[12px] leading-tight text-content">
+                            {label}
+                          </span>
+                          <span className="block truncate text-[10px] leading-tight text-content/45">
+                            {prettyCwd(item.family.checkout)}
+                          </span>
+                        </span>
+                        {item.owner ? (
+                          <span className="shrink-0 text-[10px] text-amber-400">
+                            Moves from {item.owner}
+                          </span>
+                        ) : null}
+                        <button
+                          type="button"
+                          aria-label={`Remove ${label} from queue`}
+                          onClick={() =>
+                            setPending((prev) =>
+                              prev.filter((entry) => entry !== item),
+                            )
+                          }
+                          className="grid size-5 shrink-0 place-items-center rounded text-content/40 hover:bg-content/8 hover:text-content"
                         >
-                          <ContextCheckbox
-                            label={`Select ${label}`}
-                            checked={item.checked}
-                            onChange={() =>
-                              setPending((prev) =>
-                                prev.map((entry) =>
-                                  entry === item
-                                    ? { ...entry, checked: !entry.checked }
-                                    : entry,
-                                ),
-                              )
-                            }
-                          />
+                          <X className="size-3" strokeWidth={1.75} />
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+                <div className="flex items-center justify-end gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setPending([])}
+                    className="rounded-md px-2 py-1 text-[11px] text-content/60 hover:bg-content/8 hover:text-content"
+                  >
+                    Clear
+                  </button>
+                  <button
+                    type="button"
+                    onClick={submitPending}
+                    className="rounded-md bg-content px-2.5 py-1 text-[11px] font-medium text-background-base"
+                  >
+                    {groupImport && !project
+                      ? "Add project"
+                      : `Add ${pending.length} ${
+                          pending.length === 1 ? "repository" : "repositories"
+                        }`}
+                  </button>
+                </div>
+              </div>
+            ) : null}
+            {candidates.length ? (
+              <>
+                <p className="mt-2 text-[11px] text-content/45">
+                  Already verified:
+                </p>
+                <ul className="mt-0.5 flex max-h-40 flex-col gap-px overflow-y-auto">
+                  {candidates.map((entry) => {
+                    const owner = findProjectByCommonDir(
+                      entry.commonDir,
+                      projects,
+                    )?.project;
+                    return (
+                      <li key={pathKey(entry.commonDir)}>
+                        <button
+                          type="button"
+                          title={prettyCwd(entry.checkout)}
+                          onClick={() => {
+                            setError("");
+                            addFamily(entry);
+                          }}
+                          className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+                        >
                           <GitBranch
                             className="size-3.5 shrink-0 text-content/40"
                             strokeWidth={1.5}
                           />
-                          <span className="min-w-0 flex-1">
-                            <span className="block truncate text-[12px] leading-tight text-content">
-                              {label}
-                            </span>
-                            <span className="block truncate text-[10px] leading-tight text-content/45">
-                              {prettyCwd(item.family.checkout)}
-                            </span>
+                          <span className="min-w-0 flex-1 truncate">
+                            {basename(entry.checkout) || entry.checkout}
                           </span>
-                          {item.owner ? (
-                            <span className="shrink-0 text-[10px] text-amber-400">
-                              Moves from {item.owner}
+                          {owner ? (
+                            <span className="shrink-0 text-[10px] text-content/45">
+                              Moves from{" "}
+                              {owner.name ??
+                                (owner.anchor
+                                  ? basename(owner.anchor)
+                                  : "another project")}
                             </span>
                           ) : null}
-                          <button
-                            type="button"
-                            aria-label={`Remove ${label} from queue`}
-                            onClick={() =>
-                              setPending((prev) =>
-                                prev.filter((entry) => entry !== item),
-                              )
-                            }
-                            className="grid size-5 shrink-0 place-items-center rounded text-content/40 hover:bg-content/8 hover:text-content"
-                          >
-                            <X className="size-3" strokeWidth={1.75} />
-                          </button>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                  <div className="flex items-center justify-end gap-2 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => setPending([])}
-                      className="rounded-md px-2 py-1 text-[11px] text-content/60 hover:bg-content/8 hover:text-content"
-                    >
-                      Clear
-                    </button>
-                    <button
-                      type="button"
-                      disabled={!pending.some((item) => item.checked)}
-                      onClick={submitPending}
-                      className="rounded-md bg-content px-2.5 py-1 text-[11px] font-medium text-background-base disabled:opacity-40"
-                    >
-                      Add{" "}
-                      {pending.filter((item) => item.checked).length}{" "}
-                      {pending.filter((item) => item.checked).length === 1
-                        ? "repository"
-                        : "repositories"}
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-              {candidates.length ? (
-                <>
-                  <p className="mt-2 text-[11px] text-content/45">
-                    Already verified:
-                  </p>
-                  <ul className="mt-0.5 flex flex-col gap-px">
-                    {candidates.map((entry) => {
-                      const owner = findProjectByCommonDir(
-                        entry.commonDir,
-                        projects,
-                      )?.project;
-                      return (
-                        <li key={pathKey(entry.commonDir)}>
-                          <button
-                            type="button"
-                            title={prettyCwd(entry.checkout)}
-                            onClick={() => {
-                              setError("");
-                              addFamily(entry);
-                            }}
-                            className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
-                          >
-                            <GitBranch
-                              className="size-3.5 shrink-0 text-content/40"
-                              strokeWidth={1.5}
-                            />
-                            <span className="min-w-0 flex-1 truncate">
-                              {basename(entry.checkout) || entry.checkout}
-                            </span>
-                            {owner ? (
-                              <span className="shrink-0 text-[10px] text-content/45">
-                                Moves from {owner.name ??
-                                  (owner.anchor
-                                    ? basename(owner.anchor)
-                                    : "another project")}
-                              </span>
-                            ) : null}
-                          </button>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </>
-              ) : null}
-            </div>
-          ) : null}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </>
+            ) : null}
+          </div>
         </div>
 
         {members.length ? (
