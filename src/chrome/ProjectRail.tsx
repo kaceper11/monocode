@@ -345,6 +345,9 @@ export function ProjectRail({
   const [repositoriesProject, setRepositoriesProject] = useState<{
     path: string;
     projectId?: string;
+    /** Import flow — the sheet scans a picked parent folder and creates the
+     * group only on submit. */
+    groupImport?: boolean;
   } | null>(null);
   const [taskMenu, setTaskMenu] = useState<{
     x: number;
@@ -968,6 +971,7 @@ export function ProjectRail({
         <ProjectRepositories
           path={repositoriesProject.path}
           projectId={repositoriesProject.projectId}
+          groupImport={repositoriesProject.groupImport}
           families={families}
           onOpenPath={(path) => {
             setRepositoriesProject(null);
@@ -995,6 +999,17 @@ export function ProjectRail({
               }}
             >
               Open folder…
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+              onClick={() => {
+                closeAddMenu();
+                setRepositoriesProject({ path: "", groupImport: true });
+              }}
+            >
+              Folder of repositories…
             </button>
             <button
               type="button"

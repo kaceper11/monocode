@@ -9,6 +9,7 @@ import { basename, listDir, pickFolder } from "../lib/fs";
 import { probeRepositoryFamily } from "../hooks/useRepositoryFamilies";
 import {
   addRepositoryToProject,
+  createProjectGroup,
   deleteRepositorySet,
   ensureProjectForPath,
   familyForRepository,
@@ -49,7 +50,6 @@ import {
   ChevronDown,
   ChevronUp,
   CircleAlert,
-  FolderOpen,
   FolderPlus,
   FolderTree,
   GitBranch,
@@ -61,10 +61,14 @@ import {
 
 type Props = {
   /** Rail row path — the project anchor, or the recent for an implicit
-   * one-repository project. */
+   * one-repository project. Empty when `groupImport` drives the sheet. */
   path: string;
   /** Explicit stored project when the rail row already carries one. */
   projectId?: string;
+  /** Import flow: open on the folder scan and create the project group only
+   * when the user submits — nothing is persisted if the sheet is closed
+   * first. */
+  groupImport?: boolean;
   families: ReadonlyMap<string, RepositoryFamily>;
   onOpenPath: (path: string) => void;
   onClose: () => void;
@@ -93,20 +97,24 @@ const SCAN_LIMIT = 200;
 export function ProjectRepositories({
   path,
   projectId,
+  groupImport,
   families,
   onOpenPath,
   onClose,
 }: Props) {
   const raw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
   const projects = useMemo(() => loadProjects(), [raw]);
+  /** Group created by the import flow — the sheet rebinds to it once the
+   * first submit materializes it. */
+  const [createdId, setCreatedId] = useState<string | undefined>();
+  const [importParent, setImportParent] = useState<string | null>(null);
+  const [importName, setImportName] = useState("");
   const [error, setError] = useState("");
   const [missing, setMissing] = useState<Set<string>>(new Set());
   const [adding, setAdding] = useState(false);
   const [pickOpen, setPickOpen] = useState(false);
+  /** Repository id being relocated through the shared folder picker. */
   const locating = useRef<string | null>(null);
-  /** What the shared folder picker feeds: a single repository, a folder scan,
-   * or a locate. Reset to "add" after every pick. */
-  const pickPurpose = useRef<"add" | "scan">("add");
   const [pending, setPending] = useState<PendingRepo[]>([]);
   const [scanning, setScanning] = useState(false);
   const [selection, setSelection] = useState<Set<string>>(new Set());
@@ -115,18 +123,23 @@ export function ProjectRepositories({
   const [editingSet, setEditingSet] = useState<string | null>(null);
   const [renamingSet, setRenamingSet] = useState<string | null>(null);
 
-  const direct = projectId
-    ? projects.find((project) => project.id === projectId)
-    : undefined;
-  const family = families.get(pathKey(path));
+  const direct = projects.find(
+    (project) => project.id === (projectId ?? createdId),
+  );
+  // The import flow creates its own group — never resolve the picked folder's
+  // family or an existing project, or a repo-folder pick would hijack the
+  // sheet into editing that project instead.
+  const family = groupImport ? undefined : families.get(pathKey(path));
   const project =
     direct ??
     (family
       ? findProjectByCommonDir(family.commonDir, projects)?.project
       : undefined) ??
-    projects.find(
-      (entry) => entry.anchor && pathKey(entry.anchor) === pathKey(path),
-    );
+    (!groupImport
+      ? projects.find(
+          (entry) => entry.anchor && pathKey(entry.anchor) === pathKey(path),
+        )
+      : undefined);
 
   // An implicit one-repository project still lists its verified repository so
   // it can join saved sets and the sheet can materialize on first edit.
@@ -139,6 +152,8 @@ export function ProjectRepositories({
 
   const title = useMemo(() => {
     if (project?.name) return project.name;
+    if (groupImport && !project)
+      return importParent ? basename(importParent) : "New project";
     if (isProjectRailKey(path)) return "Project";
     const key = projectKey(project?.anchor ?? path);
     return resolveTabGroupLabel(
@@ -148,10 +163,24 @@ export function ProjectRepositories({
     );
     // Re-resolve after project edits (raw snapshot changed).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project, path, raw]);
+  }, [project, path, raw, groupImport, importParent]);
 
-  const ensureProject = (): ProjectRecord =>
-    project ?? ensureProjectForPath(path, family);
+  /** The record edits write to. In import mode the group is created lazily on
+   * the first write so a cancelled import leaves nothing behind. `nameHint`
+   * carries the just-picked folder — its state update is not visible in the
+   * same async continuation. */
+  const ensureProject = (nameHint?: string): ProjectRecord => {
+    if (project) return project;
+    if (groupImport) {
+      const folder = nameHint ?? importParent ?? "";
+      const group = createProjectGroup(
+        importName || (folder ? basename(folder) : undefined),
+      );
+      setCreatedId(group.id);
+      return group;
+    }
+    return ensureProjectForPath(path, family);
+  };
 
   // Probe member anchors once so missing repositories are visible; published
   // families flow back through the shared verified map.
@@ -179,6 +208,17 @@ export function ProjectRepositories({
       cancelled = true;
     };
   }, [project, families]);
+
+  // Import flow: open straight into the folder pick so choosing a parent and
+  // reviewing its repositories is the whole interaction.
+  const autoScan = useRef(false);
+  useEffect(() => {
+    if (!groupImport || autoScan.current) return;
+    autoScan.current = true;
+    setAdding(true);
+    pickAdd();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupImport]);
 
   const names = members.map(repositoryDisplayName);
   const ambiguous = new Set(
@@ -222,27 +262,60 @@ export function ProjectRepositories({
       setError("That repository is already in this project or queued.");
   };
 
-  const addPath = async (picked: string | null) => {
-    if (!picked) return;
-    setError("");
-    const found = await probeRepositoryFamily(picked);
-    if (!found) {
-      setError("That folder is not a Git repository.");
-      return;
+  /** Writes memberships for the given families — materializing the project on
+   * first use. Returns the commonDir keys that failed so a queue can keep
+   * them. */
+  const commitFamilies = (found: RepositoryFamily[], nameHint?: string) => {
+    const target = ensureProject(nameHint);
+    const errors: string[] = [];
+    const failed = new Set<string>();
+    for (const family of found) {
+      const anchor =
+        family.checkout ||
+        target.anchor ||
+        family.worktrees.find((entry) => !entry.missing)?.path;
+      const key = pathKey(family.commonDir);
+      if (!anchor) {
+        errors.push(
+          `${basename(family.checkout) || family.commonDir}: no working-copy folder found.`,
+        );
+        failed.add(key);
+        continue;
+      }
+      const result = addRepositoryToProject(target.id, {
+        commonDir: family.commonDir,
+        anchor,
+      });
+      if (result.error) {
+        errors.push(result.error);
+        failed.add(key);
+      }
     }
-    stage(stageable([found]));
+    if (errors.length) setError(errors.join("\n"));
+    return failed;
   };
 
-  /** Pick a parent folder and probe each immediate child directory. A picked
-   * repository stages itself instead of scanning inside its working tree. */
-  const scanPicked = async (picked: string | null) => {
+  /** A single explicit pick commits immediately — the queue is only for
+   * reviewing scan results before they join. */
+  const addFamily = (family: RepositoryFamily, nameHint?: string) => {
+    const result = stageable([family]);
+    if (result.items.length) commitFamilies([family], nameHint);
+    else if (result.covered)
+      setError("That repository is already in this project or queued.");
+  };
+
+  /** One pick for both intents: a repository folder adds right away; any
+   * other folder is scanned — each immediate child repository is queued for
+   * review before it joins. */
+  const addPicked = async (picked: string | null) => {
     if (!picked) return;
     setError("");
+    if (groupImport) setImportParent(picked);
     setScanning(true);
     try {
       const own = await probeRepositoryFamily(picked);
       if (own) {
-        stage(stageable([own]));
+        addFamily(own, picked);
         return;
       }
       const dirs = (await listDir(picked))
@@ -270,60 +343,26 @@ export function ProjectRepositories({
     }
   };
 
-  /** Commits the checked queue entries — the only write in the add flow. */
+  /** Commits the checked scan queue entries — the only batched write. */
   const submitPending = () => {
     const chosen = pending.filter((item) => item.checked);
     if (!chosen.length) return;
     setError("");
-    const target = ensureProject();
-    const errors: string[] = [];
-    const failed = new Set<string>();
-    for (const item of chosen) {
-      const anchor =
-        item.family.checkout ||
-        target.anchor ||
-        item.family.worktrees.find((entry) => !entry.missing)?.path;
-      const key = pathKey(item.family.commonDir);
-      if (!anchor) {
-        errors.push(
-          `${basename(item.family.checkout) || item.family.commonDir}: no working-copy folder found.`,
-        );
-        failed.add(key);
-        continue;
-      }
-      const result = addRepositoryToProject(target.id, {
-        commonDir: item.family.commonDir,
-        anchor,
-      });
-      if (result.error) {
-        errors.push(result.error);
-        failed.add(key);
-      }
-    }
+    const failed = commitFamilies(chosen.map((item) => item.family));
     setPending((prev) =>
       prev.filter((item) => failed.has(pathKey(item.family.commonDir))),
     );
-    if (errors.length) setError(errors.join("\n"));
   };
 
-  const pickRepository = () => {
+  const pickAdd = () => {
     setError("");
-    pickPurpose.current = "add";
     if (IS_WIN) {
       setPickOpen(true);
       return;
     }
-    void pickFolder("Choose repository").then(addPath);
-  };
-
-  const pickScanFolder = () => {
-    setError("");
-    pickPurpose.current = "scan";
-    if (IS_WIN) {
-      setPickOpen(true);
-      return;
-    }
-    void pickFolder("Choose a folder of repositories").then(scanPicked);
+    void pickFolder("Choose a repository or a folder of repositories").then(
+      addPicked,
+    );
   };
 
   const reconnect = (repo: ProjectRepository) => {
@@ -447,9 +486,11 @@ export function ProjectRepositories({
       onClose={onClose}
       title={title}
       description={
-        isProjectRailKey(path)
-          ? "A group of repositories — no folder of its own"
-          : prettyCwd(project?.anchor ?? path)
+        groupImport && !project
+          ? "A new group — saved when you add repositories"
+          : (project && !project.anchor) || isProjectRailKey(path)
+            ? "A group of repositories — no folder of its own"
+            : prettyCwd(project?.anchor ?? path)
       }
       size="md"
     >
@@ -457,6 +498,7 @@ export function ProjectRepositories({
         <div>
           <p className="mb-1 text-[11px] text-content/50">Project name</p>
           <input
+            key={project?.id ?? "new"}
             defaultValue={title}
             aria-label="Project name"
             className={inputClass}
@@ -464,6 +506,7 @@ export function ProjectRepositories({
               const name = event.target.value.trim();
               if (!name || name === title) return;
               if (project) renameProject(project.id, name);
+              else if (groupImport) setImportName(name);
               else {
                 saveTabGroupLabel(projectKey(path), name);
                 if (family) ensureProjectForPath(path, family);
@@ -492,8 +535,8 @@ export function ProjectRepositories({
 
           {members.length === 0 ? (
             <p className="rounded-lg border border-content/10 px-2.5 py-2 text-[12px] text-content/45">
-              No repositories yet. Add one explicitly — folders are never
-              auto-imported.
+              No repositories yet. Add a repository folder, or scan a parent
+              folder to add several at once.
             </p>
           ) : (
             <ul className="flex flex-col gap-px">
@@ -592,31 +635,20 @@ export function ProjectRepositories({
 
           {adding ? (
             <div className="mt-1.5 rounded-lg border border-content/10 p-2">
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  disabled={scanning}
-                  onClick={pickRepository}
-                  className="flex items-center gap-1.5 rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-[12px] text-content hover:bg-content/10 disabled:opacity-50"
-                >
-                  <FolderPlus className="size-3.5" strokeWidth={1.75} />
-                  Choose folder…
-                </button>
-                <button
-                  type="button"
-                  disabled={scanning}
-                  title="Pick a parent folder — every Git repository directly inside is queued"
-                  onClick={pickScanFolder}
-                  className="flex items-center gap-1.5 rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-[12px] text-content hover:bg-content/10 disabled:opacity-50"
-                >
-                  <FolderOpen className="size-3.5" strokeWidth={1.75} />
-                  {scanning ? "Scanning…" : "Scan a folder…"}
-                </button>
-              </div>
+              <button
+                type="button"
+                disabled={scanning}
+                title="Pick a repository folder to add it, or a parent folder to review its repositories"
+                onClick={pickAdd}
+                className="flex items-center gap-1.5 rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-[12px] text-content hover:bg-content/10 disabled:opacity-50"
+              >
+                <FolderPlus className="size-3.5" strokeWidth={1.75} />
+                {scanning ? "Scanning…" : "Add folder…"}
+              </button>
               <p className="mt-1.5 text-[11px] leading-tight text-content/45">
                 {pending.length
-                  ? "Queued repositories join the project when you submit."
-                  : "Picked repositories are queued — nothing changes until you submit."}
+                  ? "Checked repositories join the project when you submit."
+                  : "Pick a repository to add it now, or a parent folder to review its repositories first."}
               </p>
               {pending.length ? (
                 <div className="mt-1.5 space-y-1">
@@ -715,7 +747,10 @@ export function ProjectRepositories({
                           <button
                             type="button"
                             title={prettyCwd(entry.checkout)}
-                            onClick={() => stage(stageable([entry]))}
+                            onClick={() => {
+                              setError("");
+                              addFamily(entry);
+                            }}
                             className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
                           >
                             <GitBranch
@@ -901,25 +936,21 @@ export function ProjectRepositories({
       </div>
       {pickOpen ? (
         <WslProjectDialog
-          cwd={path}
+          cwd={importParent || path}
           onOpen={(picked) => {
             setPickOpen(false);
             const target = locating.current;
             locating.current = null;
-            const purpose = pickPurpose.current;
-            pickPurpose.current = "add";
             if (target && project) {
               const repo = project.repositories.find(
                 (entry) => entry.id === target,
               );
               if (repo) void locateInto(repo, picked);
-            } else if (purpose === "scan") void scanPicked(picked);
-            else void addPath(picked);
+            } else void addPicked(picked);
           }}
           onClose={() => {
             setPickOpen(false);
             locating.current = null;
-            pickPurpose.current = "add";
           }}
         />
       ) : null}
