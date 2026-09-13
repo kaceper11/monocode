@@ -5,7 +5,14 @@ import {
   type ProjectRepository,
 } from "./projects";
 import type { LinkedWorkItem } from "./session";
-import { unwatchDeliveryScope } from "./watchers";
+import { allAzurePrAssociations } from "./azureRepos";
+import { allCiSources } from "./azurePipelines";
+import { listTaskPrDrafts, taskPrRowKey } from "./taskPrs";
+import {
+  ensureDeliveryWatcher,
+  unwatchDeliveryScope,
+  watchGithubPrUrl,
+} from "./watchers";
 
 const KEY = "monocode.taskWorkspaces.v1";
 const EVENT = "monocode:task-workspaces-changed";
@@ -848,6 +855,57 @@ const childDeliveryScope = (child: TaskChild) => ({
   cwds: child.workingCopy ? [child.workingCopy] : [],
 });
 
+/** Un-archiving restores the task's produced-delivery watchers from the
+ * links that stayed saved — symmetric with the teardown above. Links whose
+ * watcher the user removed by hand stay uncovered: `ensureDeliveryWatcher`
+ * sees no watcher and re-adds one, which is the intent here. */
+function rewatchDeliveryScope(task: TaskWorkspace) {
+  const sessionIds = new Set(taskDeliveryScope(task).sessionIds);
+  const cwds = new Set(
+    task.children.flatMap((child) =>
+      child.workingCopy ? [pathKey(child.workingCopy)] : [],
+    ),
+  );
+  const bound = (cwd: string, session?: string) =>
+    (session !== undefined && sessionIds.has(session)) ||
+    cwds.has(pathKey(cwd));
+  for (const row of allAzurePrAssociations()) {
+    if (row.pr.status !== "active" || !bound(row.cwd, row.sourceSessionId))
+      continue;
+    ensureDeliveryWatcher({
+      kind: "azure-pr",
+      target: row.target,
+      projectName: row.projectName,
+      repositoryName: row.repositoryName,
+      cwd: row.cwd,
+      branch: row.branch,
+      ...(row.sourceSessionId ? { sessionId: row.sourceSessionId } : {}),
+    });
+  }
+  for (const row of allCiSources()) {
+    if (!bound(row.cwd, row.session)) continue;
+    ensureDeliveryWatcher({
+      kind: "azure-ci",
+      target: row.target,
+      definitionName: row.definitionName,
+      remote: row.remote,
+      cwd: row.cwd,
+      branch: row.branch,
+      ...(row.session ? { sessionId: row.session } : {}),
+    });
+  }
+  const drafts = listTaskPrDrafts();
+  for (const child of task.children) {
+    const result = drafts[taskPrRowKey(task.id, child.id)]?.result;
+    if (result?.provider === "github" && child.workingCopy)
+      watchGithubPrUrl(
+        child.workingCopy,
+        result.url,
+        child.sessionIds[0] ?? task.sessionIds?.[0],
+      );
+  }
+}
+
 /** Removes the task record only — sessions, worktrees and branches stay. */
 export function removeTask(taskId: string) {
   const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
@@ -858,9 +916,10 @@ export function removeTask(taskId: string) {
 }
 
 export function archiveTask(taskId: string, archived = true) {
-  if (archived) {
-    const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-    if (task) unwatchDeliveryScope(taskDeliveryScope(task));
+  const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+  if (task) {
+    if (archived) unwatchDeliveryScope(taskDeliveryScope(task));
+    else rewatchDeliveryScope(task);
   }
   updateTask(taskId, (task) => ({ ...task, archived }));
 }

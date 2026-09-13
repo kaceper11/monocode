@@ -3,7 +3,7 @@ import { removeAttention, resolveAttentionWhere } from "./attention";
 import { pathKey } from "./paths";
 import { parseGithubWorkItemUrl } from "./sessionWorkItem";
 import type { AzurePrTarget } from "./azureRepos";
-import type { CiSource, CiTarget } from "./azurePipelines";
+import type { CiTarget } from "./azurePipelines";
 import type { JiraFilter } from "./jira";
 import type { AzureFilter } from "./azure";
 import type { GithubTaskKind } from "./githubTasks";
@@ -523,19 +523,37 @@ const isDeliverySource = (
   source.kind === "azure-pr" ||
   source.kind === "azure-ci";
 
-/** Canonical identity of the delivery a source polls — the same field tuples
- * `azurePrKey`/`ciKey` use, inlined so this module stays provider-free.
- * Owner fields (`sessionId`) are excluded: a watcher covering the same PR or
- * pipeline under another session already serves the link, so a re-save must
- * not stack a second row on it. */
+/** The same field tuples `azurePrKey`/`ciKey` build — inlined so this module
+ * keeps provider imports type-only. */
+const azurePrTuple = (target: AzurePrTarget) =>
+  JSON.stringify([
+    target.site,
+    target.accountId,
+    target.project,
+    target.repository,
+    target.number,
+  ]);
+const ciTuple = (target: CiTarget) =>
+  JSON.stringify([
+    target.site,
+    target.accountId,
+    target.project,
+    target.definition,
+    target.repositoryId,
+  ]);
+
+/** Canonical identity of the delivery a source polls. Owner fields
+ * (`sessionId`) are excluded: a watcher covering the same PR or pipeline
+ * under another session already serves the link, so a re-save must not stack
+ * a second row on it. */
 function deliveryWatchKey(source: WatcherSource): string | null {
   switch (source.kind) {
     case "github-pr":
       return `gh-pr:${source.repo.toLowerCase()}:${source.number}:${pathKey(source.cwd)}`;
     case "azure-pr":
-      return `azure-pr:${JSON.stringify([source.target.site, source.target.accountId, source.target.project, source.target.repository, source.target.number])}:${pathKey(source.cwd)}:${source.branch}`;
+      return `azure-pr:${azurePrTuple(source.target)}:${pathKey(source.cwd)}:${source.branch}`;
     case "azure-ci":
-      return `azure-ci:${JSON.stringify([source.target.site, source.target.accountId, source.target.project, source.target.definition, source.target.repositoryId])}:${pathKey(source.cwd)}:${source.branch}`;
+      return `azure-ci:${ciTuple(source.target)}:${pathKey(source.cwd)}:${source.branch}`;
     default:
       return null;
   }
@@ -590,119 +608,57 @@ function removeAutoDeliveryWatchers(
   }
 }
 
-/** The association for `target` in this scope was unlinked or re-saved with a
- * terminal status — its watcher has nothing left to report. */
+/** Lift auto watchers for one delivery at one checkout+branch — any session.
+ * Callers invoke this only when no stored link still covers the delivery, so
+ * the watcher is orphaned regardless of which session it was bound to. */
+function unwatchDelivery(
+  kind: "azure-pr" | "azure-ci",
+  targetKey: string,
+  cwd: string,
+  branch: string,
+) {
+  const cwdKey = pathKey(cwd);
+  removeAutoDeliveryWatchers((source) => {
+    if (source.kind !== kind) return false;
+    const key =
+      kind === "azure-pr"
+        ? azurePrTuple(
+            (source as Extract<WatcherSource, { kind: "azure-pr" }>).target,
+          )
+        : ciTuple(
+            (source as Extract<WatcherSource, { kind: "azure-ci" }>).target,
+          );
+    return (
+      key === targetKey &&
+      pathKey(source.cwd) === cwdKey &&
+      source.branch === branch
+    );
+  });
+}
+
+/** No association row still links this PR at this checkout — nothing left to
+ * watch, whichever session scope the link lived in. */
 export function unwatchAzurePrDelivery(
   target: AzurePrTarget,
   cwd: string,
   branch: string,
-  session?: string,
 ) {
-  const key = JSON.stringify([
-    target.site,
-    target.accountId,
-    target.project,
-    target.repository,
-    target.number,
-  ]);
-  const cwdKey = pathKey(cwd);
-  removeAutoDeliveryWatchers(
-    (source) =>
-      source.kind === "azure-pr" &&
-      JSON.stringify([
-        source.target.site,
-        source.target.accountId,
-        source.target.project,
-        source.target.repository,
-        source.target.number,
-      ]) === key &&
-      pathKey(source.cwd) === cwdKey &&
-      source.branch === branch &&
-      (source.sessionId ?? undefined) === session,
-  );
+  unwatchDelivery("azure-pr", azurePrTuple(target), cwd, branch);
 }
 
-/** Reconcile auto watchers with a just-saved CI source scope: sources linked
- * for the first time get watchers; watchers whose pipeline left the scope are
- * lifted. Re-saving an unchanged set is a no-op, so a hand-removed watcher is
- * not resurrected by a refresh. */
-export function syncCiWatchers(
-  previous: readonly CiSource[],
-  next: readonly CiSource[],
+/** No CI source row still links this pipeline at this checkout. */
+export function unwatchCiDelivery(
+  target: CiTarget,
   cwd: string,
   branch: string,
-  session?: string,
 ) {
-  const before = new Set(
-    previous.map((source) =>
-      JSON.stringify([
-        source.target.site,
-        source.target.accountId,
-        source.target.project,
-        source.target.definition,
-        source.target.repositoryId,
-      ]),
-    ),
-  );
-  const after = new Set(
-    next.map((source) =>
-      JSON.stringify([
-        source.target.site,
-        source.target.accountId,
-        source.target.project,
-        source.target.definition,
-        source.target.repositoryId,
-      ]),
-    ),
-  );
-  for (const source of next) {
-    if (
-      before.has(
-        JSON.stringify([
-          source.target.site,
-          source.target.accountId,
-          source.target.project,
-          source.target.definition,
-          source.target.repositoryId,
-        ]),
-      )
-    )
-      continue;
-    ensureDeliveryWatcher({
-      kind: "azure-ci",
-      target: source.target,
-      definitionName: source.definitionName,
-      remote: source.remote,
-      cwd,
-      branch,
-      ...(source.session ?? session
-        ? { sessionId: source.session ?? session }
-        : {}),
-    });
-  }
-  const cwdKey = pathKey(cwd);
-  removeAutoDeliveryWatchers(
-    (source) =>
-      source.kind === "azure-ci" &&
-      pathKey(source.cwd) === cwdKey &&
-      source.branch === branch &&
-      (source.sessionId ?? undefined) === session &&
-      !after.has(
-        JSON.stringify([
-          source.target.site,
-          source.target.accountId,
-          source.target.project,
-          source.target.definition,
-          source.target.repositoryId,
-        ]),
-      ),
-  );
+  unwatchDelivery("azure-ci", ciTuple(target), cwd, branch);
 }
 
 /** Drop auto watchers bound to a gone scope — an archived or removed task's
  * sessions and working copies, or a deleted session. A checkout shared with
- * another live task still loses the watcher; its link re-registers on the
- * next save of that task's association or CI source. */
+ * another live task still loses the watcher; restoring it needs a fresh
+ * unlink/re-link or un-archiving the other task. */
 export function unwatchDeliveryScope(scope: {
   sessionIds?: readonly string[];
   cwds?: readonly string[];

@@ -338,7 +338,7 @@ it("auto-watches a newly linked PR and lifts the watcher on unlink", () => {
   expect(loadWatchers()).toHaveLength(0);
 });
 
-it("does not resurrect a removed watcher on refresh; terminal status lifts it", () => {
+it("does not resurrect a removed watcher on refresh; terminal status keeps it for the poll", () => {
   saveAzurePrAssociation(
     association,
     association.cwd,
@@ -356,7 +356,9 @@ it("does not resurrect a removed watcher on refresh; terminal status lifts it", 
     association.target,
   );
   expect(loadWatchers()).toHaveLength(0);
-  // Unlinked and re-linked later, then re-read as abandoned — it leaves.
+  // Unlinked and re-linked later — the watcher returns; a re-read reporting
+  // "abandoned" keeps the stored row, so the watcher stays for the poll-side
+  // retirement that emits the goodbye row.
   saveAzurePrAssociation(
     null,
     association.cwd,
@@ -371,6 +373,69 @@ it("does not resurrect a removed watcher on refresh; terminal status lifts it", 
     association.cwd,
     "feature",
     "session-a",
+    association.target,
+  );
+  expect(loadWatchers()).toHaveLength(1);
+});
+
+it("keeps the previous link's watcher when the displayed PR switches", () => {
+  const second = {
+    ...association,
+    target: { ...association.target, number: 14 },
+    pr: { ...association.pr, pullRequestId: 14 },
+  };
+  saveAzurePrAssociation(association, association.cwd, "feature", "session-a");
+  // The panel always passes the current target as removeTarget — but the old
+  // row stays stored (the Saved-PR switcher lists it), so its watcher stays.
+  saveAzurePrAssociation(
+    second,
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  expect(
+    loadAzurePrAssociations(association.cwd, "feature", "session-a"),
+  ).toHaveLength(2);
+  expect(loadWatchers()).toHaveLength(2);
+  // Truly unlinking the old PR lifts only its watcher.
+  saveAzurePrAssociation(
+    null,
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  const watchers = loadWatchers();
+  expect(watchers).toHaveLength(1);
+  expect(watchers[0].source).toMatchObject({ target: { number: 14 } });
+});
+
+it("keeps the watcher while another session scope still links the PR", () => {
+  saveAzurePrAssociation(association, association.cwd, "feature", "session-a");
+  // The task sheet links every session sharing the copy — the second save
+  // dedupes the watcher but stores its own row.
+  saveAzurePrAssociation(
+    { ...association, sourceSessionId: "session-b" },
+    association.cwd,
+    "feature",
+    "session-b",
+  );
+  expect(loadWatchers()).toHaveLength(1);
+  // Unlinking under session-a leaves session-b's link — coverage survives.
+  saveAzurePrAssociation(
+    null,
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  expect(loadWatchers()).toHaveLength(1);
+  saveAzurePrAssociation(
+    null,
+    association.cwd,
+    "feature",
+    "session-b",
     association.target,
   );
   expect(loadWatchers()).toHaveLength(0);

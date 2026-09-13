@@ -1,7 +1,8 @@
 export const AZURE_CI_SOURCES_CHANGED = "monocode:azure-ci-sources";
 import { invoke } from "@tauri-apps/api/core";
 import { contextFromText } from "./agentContext";
-import { syncCiWatchers } from "./watchers";
+import { pathKey } from "./paths";
+import { ensureDeliveryWatcher, unwatchCiDelivery } from "./watchers";
 
 export type CiTarget = {
   site: string;
@@ -287,8 +288,8 @@ export function saveCiSources(
     /* Recover this feature's malformed cache. */
   }
   const scope = ciScope(cwd, branch, session);
-  // Scope members before this write — `syncCiWatchers` diffs them against the
-  // new set so only first-time links register and departed ones are lifted.
+  // Scope members before this write — diffed against the new set below so
+  // only first-time links register a watcher and departed ones are lifted.
   const previous = rows.filter(
     (row) =>
       row &&
@@ -298,10 +299,34 @@ export function saveCiSources(
   const others = rows.filter(
     (row) => row && ciScope(row.cwd, row.branch, row.session) !== scope,
   );
-  localStorage.setItem(
-    KEY,
-    JSON.stringify([...sources.slice(0, 20), ...others].slice(0, 100)),
-  );
+  const stored = [...sources.slice(0, 20), ...others].slice(0, 100);
+  localStorage.setItem(KEY, JSON.stringify(stored));
   if (typeof window !== "undefined") window.dispatchEvent(new Event(AZURE_CI_SOURCES_CHANGED));
-  syncCiWatchers(previous, sources.slice(0, 20), cwd, branch, session);
+  const before = new Set(previous.map((row) => ciKey(row.target)));
+  const covered = (target: CiTarget) =>
+    stored.some(
+      (row) =>
+        row?.target &&
+        ciKey(row.target) === ciKey(target) &&
+        pathKey(row.cwd) === pathKey(cwd) &&
+        row.branch === branch,
+    );
+  for (const source of sources.slice(0, 20)) {
+    if (before.has(ciKey(source.target))) continue;
+    ensureDeliveryWatcher({
+      kind: "azure-ci",
+      target: source.target,
+      definitionName: source.definitionName,
+      remote: source.remote,
+      cwd,
+      branch,
+      ...(source.session ?? session
+        ? { sessionId: source.session ?? session }
+        : {}),
+    });
+  }
+  // A source leaves the scope → lift its watcher unless another scope's row
+  // still covers the same pipeline at this checkout+branch.
+  for (const row of previous)
+    if (!covered(row.target)) unwatchCiDelivery(row.target, cwd, branch);
 }

@@ -179,3 +179,20 @@ it("a hand-removed watcher is not resurrected by a source re-save", () => {
   saveCiSources([source], source.cwd, source.branch, source.session);
   expect(loadWatchers()).toHaveLength(0);
 });
+
+it("keeps the watcher while another session scope still links the pipeline", () => {
+  saveCiSources([source], source.cwd, source.branch, "owner");
+  // A second session sharing the checkout links the same pipeline — its row
+  // dedupes the watcher but keeps the delivery covered.
+  saveCiSources(
+    [{ ...source, session: "peer" }],
+    source.cwd,
+    source.branch,
+    "peer",
+  );
+  expect(loadWatchers()).toHaveLength(1);
+  saveCiSources([], source.cwd, source.branch, "owner");
+  expect(loadWatchers()).toHaveLength(1);
+  saveCiSources([], source.cwd, source.branch, "peer");
+  expect(loadWatchers()).toHaveLength(0);
+});

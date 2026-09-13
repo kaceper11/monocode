@@ -7,7 +7,6 @@ import {
   removeWatcher,
   saveWatcher,
   setWatcherEnabled,
-  syncCiWatchers,
   unwatchAzurePrDelivery,
   unwatchDeliveryScope,
   updateWatcher,
@@ -243,16 +242,6 @@ describe("produced-delivery auto watchers", () => {
     branch: "feat",
     sessionId: "s1",
   };
-  const ciSource = {
-    target: CI_TARGET,
-    definitionName: "Tests",
-    projectName: "P",
-    remote: CI_TARGET.repositoryUrl,
-    cwd: "/repo",
-    branch: "feat",
-    session: "s1",
-  };
-
   it("registers a notify watcher marked auto for each delivery kind", () => {
     for (const source of [GH_PR, AZURE_PR, CI]) ensureDeliveryWatcher(source);
     const watchers = loadWatchers();
@@ -315,41 +304,17 @@ describe("produced-delivery auto watchers", () => {
     expect(watchers[0].name).toBe("Manual");
   });
 
-  it("unwatchAzurePrDelivery lifts only the matching scope+target", () => {
+  it("unwatchAzurePrDelivery lifts the delivery at that checkout+branch, any session", () => {
     ensureDeliveryWatcher(AZURE_PR);
     ensureDeliveryWatcher({ ...AZURE_PR, sessionId: undefined, branch: "main" });
     expect(loadWatchers()).toHaveLength(2);
-    unwatchAzurePrDelivery(AZURE_TARGET, "/repo", "feat", "s1");
+    unwatchAzurePrDelivery(AZURE_TARGET, "/repo", "feat");
     const watchers = loadWatchers();
     expect(watchers).toHaveLength(1);
     expect(watchers[0].source).toMatchObject({ branch: "main" });
-  });
-
-  it("syncCiWatchers registers new sources, lifts departed ones, never resurrects", () => {
-    syncCiWatchers([], [ciSource], "/repo", "feat", "s1");
-    expect(loadWatchers()).toHaveLength(1);
-    const id = loadWatchers()[0].id;
-    // Re-saving the same set changes nothing.
-    syncCiWatchers([ciSource], [ciSource], "/repo", "feat", "s1");
-    expect(loadWatchers()).toHaveLength(1);
-    // A hand-removed watcher is not resurrected by a refresh.
-    removeWatcher(id);
-    syncCiWatchers([ciSource], [ciSource], "/repo", "feat", "s1");
+    // Callers gate on stored-link coverage — a leftover watcher under another
+    // branch or checkout is untouched.
+    unwatchAzurePrDelivery(AZURE_TARGET, "/repo", "main");
     expect(loadWatchers()).toHaveLength(0);
-    // Removing the source lifts its watcher; a second source survives.
-    ensureDeliveryWatcher(CI);
-    const other = {
-      ...ciSource,
-      target: { ...CI_TARGET, definition: 6 },
-    };
-    syncCiWatchers([ciSource], [ciSource, other], "/repo", "feat", "s1");
-    expect(loadWatchers()).toHaveLength(2);
-    syncCiWatchers([ciSource, other], [other], "/repo", "feat", "s1");
-    const watchers = loadWatchers();
-    expect(watchers).toHaveLength(1);
-    expect(watchers[0].source).toMatchObject({
-      kind: "azure-ci",
-      target: { definition: 6 },
-    });
   });
 });
