@@ -465,6 +465,15 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       (delivery.sourceSessionId !== undefined &&
         (typeof delivery.sourceSessionId !== "string" ||
           !delivery.sourceSessionId)) ||
+      (delivery.provider !== undefined &&
+        !["azure", "github", "gitlab"].includes(
+          delivery.provider as string,
+        )) ||
+      (delivery.repo !== undefined && typeof delivery.repo !== "string") ||
+      (delivery.number !== undefined &&
+        (typeof delivery.number !== "number" ||
+          !Number.isInteger(delivery.number) ||
+          delivery.number <= 0)) ||
       [
         "plan",
         "releaseNotes",
@@ -485,6 +494,15 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
         branch: delivery.branch,
         ...(typeof delivery.sourceSessionId === "string"
           ? { sourceSessionId: delivery.sourceSessionId }
+          : {}),
+        ...(typeof delivery.provider === "string"
+          ? { provider: delivery.provider as "azure" | "github" | "gitlab" }
+          : {}),
+        ...(typeof delivery.repo === "string" && delivery.repo
+          ? { repo: delivery.repo }
+          : {}),
+        ...(typeof delivery.number === "number"
+          ? { number: delivery.number }
           : {}),
       },
     };

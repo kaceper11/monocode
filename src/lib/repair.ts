@@ -36,6 +36,13 @@ import {
   type GithubPrState,
   type GithubWorkItemComment,
 } from "./githubTasks";
+import {
+  gitlabMrDiscussions,
+  gitlabMrState,
+  gitlabRepo,
+  type GitlabMrState,
+  type GitlabWorkItemComment,
+} from "./gitlab";
 import { sessionWorkCwd, type Session } from "./session";
 import { isLiveHarness } from "./harness/registry";
 import { isPreparingHandoff } from "./handoff";
@@ -87,6 +94,33 @@ export type RepairEvidence = {
         conclusion: string;
         url: string;
       }[];
+    }
+  | {
+      kind: "gitlab-comments";
+      /** GitLab project path (acme/web) — the checkout must resolve to it. */
+      repo: string;
+      number: number;
+      comments: {
+        id: string;
+        digest: string;
+        entry: string;
+        author: string;
+        text: string;
+        file?: string;
+        line?: number;
+      }[];
+    }
+  | {
+      kind: "gitlab-ci";
+      repo: string;
+      number: number;
+      pipeline: {
+        id: number;
+        digest: string;
+        entry: string;
+        status: string;
+        url: string;
+      };
     }
 );
 export type RepairDelivery = {
@@ -551,6 +585,182 @@ export async function githubCiRepair(input: {
   };
 }
 
+/** True when a git remote URL points at the GitLab project path — covers
+ * https/ssh transports, a `.git` suffix and a relative-URL-root prefix. */
+const gitlabRemoteMatches = (url: string, repo: string) => {
+  const repoPath = repo.trim().toLowerCase();
+  if (!repoPath) return false;
+  const trimmed = url
+    .trim()
+    .toLowerCase()
+    .replace(/[?#].*$/, "")
+    .replace(/\.git\/?$/, "")
+    .replace(/\/+$/, "");
+  const path = trimmed.includes("://")
+    ? (trimmed.split("://")[1]?.split("/").slice(1).join("/") ?? "")
+    : trimmed.includes(":")
+      ? trimmed.slice(trimmed.indexOf(":") + 1)
+      : "";
+  return path === repoPath || path.endsWith(`/${repoPath}`);
+};
+
+/** GitLab MR-head binding for a repair: the checkout must resolve to the
+ * MR's project and sit at its head commit on its source branch. A mismatch
+ * is a visible error, never a silent fixup. */
+async function gitlabRepairHead(input: {
+  cwd: string;
+  repo: string;
+  number: number;
+}): Promise<{ head: CiHead; state: GitlabMrState }> {
+  const state = await gitlabMrState(input.cwd, input.number);
+  if (state.state !== "open")
+    throw new Error("The merge request is no longer open. Refresh and retry.");
+  if (!state.headSha || !state.headRefName)
+    throw new Error("GitLab did not report the MR head. Refresh and retry.");
+  const resolved = await gitlabRepo(input.cwd).catch(() => "");
+  if (resolved.toLowerCase() !== input.repo.toLowerCase())
+    throw new Error(
+      `This checkout resolves to ${resolved || "no GitLab project"}; the MR belongs to ${input.repo}. Open that project's checkout.`,
+    );
+  const checkout = await ciContext(input.cwd);
+  const remote = checkout.remotes.find((row) =>
+    gitlabRemoteMatches(row.url, input.repo),
+  );
+  if (!remote)
+    throw new Error(
+      `This checkout has no remote for ${input.repo}. Open the MR's checkout.`,
+    );
+  if (
+    checkout.commit !== state.headSha ||
+    checkout.branch !== state.headRefName
+  )
+    throw new Error(
+      `Checkout is not at the MR head (${state.headRefName} · ${state.headSha.slice(0, 8)}). Update the checkout first.`,
+    );
+  return {
+    head: {
+      cwd: checkout.cwd,
+      branch: checkout.branch,
+      commit: checkout.commit,
+      remote: remote.url,
+    },
+    state,
+  };
+}
+
+/** "Address comments" for a GitLab MR — discussion evidence digested so a
+ * changed discussion blocks dispatch instead of replaying stale comments. */
+export async function gitlabCommentsRepair(input: {
+  cwd: string;
+  repo: string;
+  number: number;
+  comments: GitlabWorkItemComment[];
+}) {
+  const comments = input.comments.slice(0, 20);
+  if (!comments.length) throw new Error("Select review comments first.");
+  const { head, state } = await gitlabRepairHead(input);
+  const origin = `${state.url} · project ${input.repo} · head ${state.headSha} · checkout ${head.cwd}`;
+  const built = comments.map((comment) => {
+    const where = comment.path
+      ? `File: ${comment.path}${comment.line != null ? `, line ${comment.line}` : ""}`
+      : "General discussion";
+    const replies = (comment.replies ?? [])
+      .slice(0, 20)
+      .map((reply) => `${reply.author}:\n${reply.body}`)
+      .join("\n\n");
+    const context = contextFromText(
+      `GitLab MR !${input.number}: ${state.title} · ${comment.author}`,
+      [
+        `Review comment, resolved: ${comment.resolved ? "yes" : "no"}.`,
+        where,
+        `${comment.author}:\n${comment.body}`,
+        replies ? `Replies:\n${replies}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+      origin,
+    );
+    return { comment, entry: context.entries[0] };
+  });
+  const evidence: RepairEvidence = {
+    kind: "gitlab-comments",
+    scope: `gitlab-mr:${input.repo}#${input.number}`,
+    head,
+    repo: input.repo,
+    number: input.number,
+    comments: await Promise.all(
+      built.map(async ({ comment, entry }) => ({
+        id: comment.id,
+        digest: await digest(comment),
+        entry: entry.id,
+        author: comment.author,
+        text: (comment.body ?? "").slice(0, 2000),
+        ...(comment.path ? { file: comment.path } : {}),
+        ...(comment.line != null ? { line: comment.line } : {}),
+      })),
+    ),
+  };
+  return {
+    evidence,
+    context: boundAgentContext({
+      id: crypto.randomUUID(),
+      entries: built.map(({ entry }) => entry),
+      attachments: [],
+      instruction:
+        "Address the selected review comments in this checkout. Run relevant checks and summarize changes. Do not reply, resolve discussions, push or merge.",
+    }),
+  };
+}
+
+const FAILING_PIPELINE_STATUSES = ["failed", "canceled"];
+
+/** "Fix pipeline" for a GitLab MR — the head pipeline, digested so a
+ * replaced or re-run pipeline blocks dispatch of stale evidence. */
+export async function gitlabPipelineRepair(input: {
+  cwd: string;
+  repo: string;
+  number: number;
+}) {
+  const { head, state } = await gitlabRepairHead(input);
+  const pipeline = state.pipeline;
+  if (!pipeline || !FAILING_PIPELINE_STATUSES.includes(pipeline.status))
+    throw new Error("No failing pipeline on this MR head. Refresh and retry.");
+  const origin = `${state.url} · project ${input.repo} · head ${state.headSha} · checkout ${head.cwd}`;
+  const context = contextFromText(
+    `GitLab pipeline #${pipeline.id}`,
+    `Pipeline #${pipeline.id} on ${state.headRefName} (${state.headSha.slice(0, 8)}): ${pipeline.status}. Review the failing jobs in GitLab before sending.`,
+    pipeline.url ? `${origin} · pipeline ${pipeline.url}` : origin,
+  );
+  const evidence: RepairEvidence = {
+    kind: "gitlab-ci",
+    scope: `gitlab-ci:${input.repo}#${input.number}`,
+    head,
+    repo: input.repo,
+    number: input.number,
+    pipeline: {
+      id: pipeline.id,
+      digest: await digest({
+        id: pipeline.id,
+        sha: pipeline.sha,
+        status: pipeline.status,
+      }),
+      entry: context.entries[0].id,
+      status: pipeline.status,
+      url: pipeline.url,
+    },
+  };
+  return {
+    evidence,
+    context: boundAgentContext({
+      id: crypto.randomUUID(),
+      entries: [context.entries[0]],
+      attachments: [],
+      instruction:
+        "Fix the failing pipeline for this MR in this checkout. Run relevant checks and summarize changes. Do not rerun pipelines, push or merge.",
+    }),
+  };
+}
+
 export async function validateRepair(
   evidence: RepairEvidence,
   context: AgentContext,
@@ -643,6 +853,56 @@ export async function validateRepair(
           "Check output changed. Close this draft and Refresh evidence.",
         );
     }
+  } else if (evidence.kind === "gitlab-comments") {
+    const state = await gitlabMrState(evidence.head.cwd, evidence.number);
+    if (state.state !== "open")
+      throw new Error("MR is no longer open. Refresh evidence.");
+    if (
+      state.headSha !== evidence.head.commit ||
+      state.headRefName !== evidence.head.branch
+    )
+      throw new Error(
+        "The MR head moved. Close this draft and Refresh evidence.",
+      );
+    const thread = await gitlabMrDiscussions(
+      evidence.head.cwd,
+      evidence.number,
+      { force: true },
+    );
+    const flat = thread.comments.flatMap((row) => [row, ...row.replies]);
+    for (const selected of evidence.comments.filter((row) =>
+      context.entries.some((entry) => entry.id === row.entry),
+    )) {
+      const comment = flat.find((row) => row.id === selected.id);
+      if (!comment || (await digest(comment)) !== selected.digest)
+        throw new Error(
+          "Selected discussions changed. Close this draft and Refresh evidence.",
+        );
+    }
+  } else if (evidence.kind === "gitlab-ci") {
+    const state = await gitlabMrState(evidence.head.cwd, evidence.number);
+    if (state.state !== "open")
+      throw new Error("MR is no longer open. Refresh evidence.");
+    if (
+      state.headSha !== evidence.head.commit ||
+      state.headRefName !== evidence.head.branch
+    )
+      throw new Error(
+        "The MR head moved. Close this draft and Refresh evidence.",
+      );
+    const pipeline = state.pipeline;
+    if (
+      context.entries.some((entry) => entry.id === evidence.pipeline.entry) &&
+      (!pipeline ||
+        (await digest({
+          id: pipeline.id,
+          sha: pipeline.sha,
+          status: pipeline.status,
+        })) !== evidence.pipeline.digest)
+    )
+      throw new Error(
+        "Pipeline evidence changed. Close this draft and Refresh evidence.",
+      );
   } else {
     const pr = await readAzurePr(
       evidence.association.target,

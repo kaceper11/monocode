@@ -1,4 +1,4 @@
-import { openGitHubDelivery, saveDeliveryProvider } from "./lib/deliveryProviders";
+import { openGitHubDelivery, gitlabDeliveryTarget, saveDeliveryProvider } from "./lib/deliveryProviders";
 import {
   ciContext,
   ciLookup,
@@ -6721,7 +6721,7 @@ export default function App({
     setInboxTarget(null);
   }, []);
 
-  const onOpenInboxDelivery = useCallback(async (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure", prUrl?: string) => {
+  const onOpenInboxDelivery = useCallback(async (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string) => {
     const session = await ensureOpenSession(sessionId);
     if (!current()) return;
     if (!session || session.inboxAsk) throw new Error("Open a workspace conversation for this item before reviewing PRs or CI.");
@@ -6735,9 +6735,14 @@ export default function App({
       await openGitHubDelivery(cwd, kind, () => current() && sessionWorkCwd(sessionsRef.current.find(value => value.id === sessionId) ?? session) === cwd, prUrl);
       return;
     }
+    // GitLab delivery tabs bind to the checkout's configured-host project and
+    // the open MR for its branch — identity is resolved here, never inferred.
+    const target = provider === "gitlab" ? await gitlabDeliveryTarget(cwd, checkout.branch) : undefined;
+    if (!current() || sessionWorkCwd(sessionsRef.current.find(value => value.id === sessionId) ?? session) !== cwd)
+      throw new Error("The conversation checkout changed. Open its review again.");
     const existing = tabsRef.current.find(tab => leafIds(tab.layout).includes(sessionId));
     const base = existing ?? newTab(sessionId);
-    const file = { id: crypto.randomUUID(), path: kind === "pr" ? "Pull requests" : "CI", cwd, delivery: { kind, branch: checkout.branch, sourceSessionId: sessionId } };
+    const file = { id: crypto.randomUUID(), path: kind === "pr" ? "Pull requests" : "CI", cwd, delivery: { kind, branch: checkout.branch, sourceSessionId: sessionId, ...(provider === "gitlab" ? { provider: "gitlab" as const, repo: target!.repo, number: target!.number } : {}) } };
     if (existing) {
       setTabs(previous => previous.map(tab => tab.id === existing.id ? openEditorTab(tab, file) : tab));
       activateTab(existing.id);

@@ -245,6 +245,84 @@ it("does not reserve a second scope while its destination is being checked", () 
   expect(repairRecords().some((row) => row.id === draft.id)).toBe(false);
 });
 
+it("rejects GitLab evidence when the MR head or discussions moved", async () => {
+  const { gitlabCommentsRepair } = await import("./repair");
+  const { clearGitlabCache } = await import("./gitlab");
+  clearGitlabCache();
+  const mr = {
+    number: 7,
+    title: "Improve login",
+    url: "https://gitlab.example.com/acme/web/-/merge_requests/7",
+    state: "open",
+    headSha: "head",
+    headRefName: "feature",
+    baseRefName: "main",
+    mergeStatus: "discussions_not_resolved",
+    blockingDiscussionsResolved: false,
+    approvalsRequired: 0,
+    approvalsLeft: 0,
+    approved: false,
+    draft: false,
+    pipeline: null,
+  };
+  const discussion = {
+    id: "10",
+    kind: "review",
+    author: "reviewer",
+    body: "Fix this",
+    createdAt: "2024-01-01T00:00:00Z",
+    url: "",
+    state: "",
+    path: "src/file.ts",
+    line: 12,
+    resolved: false,
+    resolvable: true,
+    threadId: "deadbeef01",
+    replies: [],
+  };
+  let moved = false;
+  let changed = false;
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "azure_ci_context")
+      return {
+        cwd: "/work/web",
+        branch: "feature",
+        commit: "head",
+        remotes: [{ name: "origin", url: "https://gitlab.example.com/acme/web" }],
+      };
+    if (command === "gitlab_repo") return "acme/web";
+    if (command === "gitlab_mr_state")
+      return { ...mr, headSha: moved ? "new-head" : "head" };
+    if (command === "gitlab_mr_discussions")
+      return {
+        comments: [
+          changed
+            ? { ...discussion, body: "Edited comment" }
+            : discussion,
+        ],
+        truncated: false,
+      };
+    throw new Error(`Unexpected ${command}`);
+  });
+  const draft = await gitlabCommentsRepair({
+    cwd: "/work/web",
+    repo: "acme/web",
+    number: 7,
+    comments: [discussion],
+  });
+  expect(draft.evidence.scope).toBe("gitlab-mr:acme/web#7");
+  await validateRepair(draft.evidence, draft.context);
+  moved = true;
+  await expect(validateRepair(draft.evidence, draft.context)).rejects.toThrow(
+    "MR head moved",
+  );
+  moved = false;
+  changed = true;
+  await expect(validateRepair(draft.evidence, draft.context)).rejects.toThrow(
+    "Selected discussions changed",
+  );
+});
+
 it("prepares comments in a verified PR checkout without retargeting the source conversation", async () => {
   const association: AzurePrAssociation = { cwd: "/work/story", branch: "main", sourceSessionId: "owner", target: { site: "https://dev.azure.com/org", accountId: "account", project: "p", repository: "r", number: 9 }, account: "Ada", projectName: "Project", repositoryName: "Repo", revision: "rev", pr: { pullRequestId: 9, title: "Work", status: "active", sourceRefName: "refs/heads/feature", targetRefName: "refs/heads/main", lastMergeSourceCommit: {commitId:"head"}, reviewers: [] } };
   const threads: AzurePrThread[] = [{id:1,status:"active",comments:[{id:2,content:"Fix this"}]}];

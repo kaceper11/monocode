@@ -81,6 +81,9 @@ pub struct GitlabWorkItemComment {
     pub path: String,
     pub line: Option<i64>,
     pub resolved: bool,
+    /// GitLab reports which notes may be resolved; a resolved flag without
+    /// it is never shown as actionable.
+    pub resolvable: bool,
     pub thread_id: String,
     pub replies: Vec<GitlabWorkItemComment>,
 }
@@ -111,6 +114,40 @@ pub struct GitlabMrDiff {
     pub files: Vec<GitlabMrFile>,
     pub patch: String,
     pub truncated: bool,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitlabMrPipeline {
+    pub id: i64,
+    pub sha: String,
+    pub status: String,
+    pub url: String,
+}
+
+/// One read of a merge request's review/merge/pipeline state for the review
+/// surface and repair evidence. `head_sha` binds evidence to an exact
+/// revision so a stale head is rejected before an agent is dispatched.
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitlabMrState {
+    pub number: i64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub draft: bool,
+    pub head_sha: String,
+    pub head_ref_name: String,
+    pub base_ref_name: String,
+    /// `detailed_merge_status` when the instance provides it, else
+    /// `merge_status`: can_be_merged, cannot_be_merged, checking…
+    pub merge_status: String,
+    /// False while unresolved resolvable discussions block the merge.
+    pub blocking_discussions_resolved: bool,
+    pub approvals_required: i64,
+    pub approvals_left: i64,
+    pub approved: bool,
+    pub pipeline: Option<GitlabMrPipeline>,
 }
 
 #[tauri::command(async)]
@@ -271,6 +308,123 @@ pub async fn gitlab_mr_diff(
         let config = require_config(&app)?;
         let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
         gitlab_mr_diff_for(&config, &repo, number)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// The open merge request for a source branch — delivery rows bind to an
+/// explicit `repo` + `number`, never a guessed listing.
+#[tauri::command]
+pub async fn gitlab_mr_for_branch(
+    app: AppHandle,
+    cwd: String,
+    branch: String,
+) -> Result<GitlabWorkItem, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let branch = branch.trim().to_string();
+        if branch.is_empty() || branch.len() > 255 || branch.chars().any(char::is_whitespace) {
+            return Err("Invalid GitLab branch".into());
+        }
+        let config = require_config(&app)?;
+        let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
+        let path = format!(
+            "/projects/{}/merge_requests?source_branch={}&state=opened&order_by=updated_at&sort=desc&per_page=1",
+            encode_path_component(&repo),
+            encode_path_component(&branch)
+        );
+        let response = gitlab_get(&config, &path)?;
+        parse_work_items(&response.value, "pr", &repo)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "No open merge request for this branch".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn gitlab_mr_state(
+    app: AppHandle,
+    cwd: String,
+    number: i64,
+) -> Result<GitlabMrState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = require_config(&app)?;
+        let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
+        gitlab_mr_state_for(&config, &repo, number)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn gitlab_mr_discussions(
+    app: AppHandle,
+    cwd: String,
+    number: i64,
+) -> Result<GitlabWorkItemThread, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = require_config(&app)?;
+        let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
+        gitlab_mr_discussions_for(&config, &repo, number)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn gitlab_mr_discussion_reply(
+    app: AppHandle,
+    cwd: String,
+    number: i64,
+    discussion_id: String,
+    body: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = require_config(&app)?;
+        let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
+        validate_item("pr", number)?;
+        let discussion = validate_discussion_id(&discussion_id)?;
+        let body = body.trim();
+        if body.is_empty() {
+            return Err("Reply cannot be empty".into());
+        }
+        let path = format!(
+            "{}/discussions/{discussion}/notes",
+            item_path(&repo, "pr", number)
+        );
+        let response = gitlab_post_form(&config, &path, &[("body", body)])?;
+        let id = response
+            .value
+            .get("id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "GitLab did not return a reply".to_string())?;
+        Ok(note_url(&config.url, &repo, "pr", number, id))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn gitlab_mr_discussion_resolve(
+    app: AppHandle,
+    cwd: String,
+    number: i64,
+    discussion_id: String,
+    resolved: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = require_config(&app)?;
+        let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
+        validate_item("pr", number)?;
+        let discussion = validate_discussion_id(&discussion_id)?;
+        let path = format!(
+            "{}/discussions/{discussion}?resolved={resolved}",
+            item_path(&repo, "pr", number)
+        );
+        gitlab_put_form(&config, &path, &[])?;
+        Ok(())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -457,6 +611,226 @@ fn gitlab_mr_diff_for(
     parse_mr_diff(&response.value, response.has_next_page)
 }
 
+fn gitlab_mr_state_for(
+    config: &GitlabConfig,
+    repo: &str,
+    number: i64,
+) -> Result<GitlabMrState, String> {
+    validate_item("pr", number)?;
+    let response = gitlab_get(config, &item_path(repo, "pr", number))?;
+    let value = &response.value;
+    if value.get("iid").and_then(Value::as_i64) != Some(number) {
+        return Err("GitLab returned a different merge request".into());
+    }
+    // Approvals need a second read; a denied endpoint must not hide the MR.
+    let approvals = gitlab_get(
+        config,
+        &format!("{}/approvals", item_path(repo, "pr", number)),
+    )
+    .map(|response| response.value)
+    .unwrap_or_default();
+    // `head_pipeline` rides on the MR response on modern instances; older
+    // ones need the pipelines list.
+    let pipeline = parse_mr_pipeline(value.get("head_pipeline")).or_else(|| {
+        gitlab_get(
+            config,
+            &format!("{}/pipelines?per_page=1", item_path(repo, "pr", number)),
+        )
+        .ok()
+        .and_then(|response| {
+            response
+                .value
+                .as_array()
+                .and_then(|rows| rows.first())
+                .and_then(|row| parse_mr_pipeline(Some(row)))
+        })
+    });
+    parse_mr_state(value, number, &approvals, pipeline)
+}
+
+fn parse_mr_state(
+    value: &Value,
+    number: i64,
+    approvals: &Value,
+    pipeline: Option<GitlabMrPipeline>,
+) -> Result<GitlabMrState, String> {
+    let title = string_field(value, "title").unwrap_or_default();
+    let title_lower = title.to_ascii_lowercase();
+    let draft = value.get("draft").and_then(Value::as_bool).unwrap_or(false)
+        || value
+            .get("work_in_progress")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || title_lower.starts_with("draft:")
+        || title_lower.starts_with("wip:");
+    Ok(GitlabMrState {
+        number,
+        title,
+        url: string_field(value, "web_url").unwrap_or_default(),
+        state: normalize_state(&string_field(value, "state").unwrap_or_default()),
+        draft,
+        head_sha: string_field(value, "sha").unwrap_or_default(),
+        head_ref_name: string_field(value, "source_branch").unwrap_or_default(),
+        base_ref_name: string_field(value, "target_branch").unwrap_or_default(),
+        merge_status: string_field(value, "detailed_merge_status")
+            .or_else(|| string_field(value, "merge_status"))
+            .unwrap_or_default(),
+        blocking_discussions_resolved: value
+            .get("blocking_discussions_resolved")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        approvals_required: approvals
+            .get("approvals_required")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        approvals_left: approvals
+            .get("approvals_left")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        approved: approvals
+            .get("approved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        pipeline,
+    })
+}
+
+fn parse_mr_pipeline(row: Option<&Value>) -> Option<GitlabMrPipeline> {
+    let row = row.filter(|row| row.is_object())?;
+    let id = row.get("id").and_then(Value::as_i64)?;
+    if id <= 0 {
+        return None;
+    }
+    Some(GitlabMrPipeline {
+        id,
+        sha: string_field(row, "sha").unwrap_or_default(),
+        status: string_field(row, "status").unwrap_or_default(),
+        url: string_field(row, "web_url").unwrap_or_default(),
+    })
+}
+
+fn gitlab_mr_discussions_for(
+    config: &GitlabConfig,
+    repo: &str,
+    number: i64,
+) -> Result<GitlabWorkItemThread, String> {
+    validate_item("pr", number)?;
+    let path = format!(
+        "{}/discussions?order_by=created_at&sort=asc&per_page=100",
+        item_path(repo, "pr", number)
+    );
+    let response = gitlab_get(config, &path)?;
+    parse_mr_discussions(
+        &response.value,
+        &config.url,
+        repo,
+        number,
+        response.has_next_page,
+    )
+}
+
+fn parse_mr_discussions(
+    value: &Value,
+    base_url: &str,
+    repo: &str,
+    number: i64,
+    has_next_page: bool,
+) -> Result<GitlabWorkItemThread, String> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| "GitLab did not return discussions".to_string())?;
+    let mut comments = Vec::new();
+    for discussion in rows {
+        let discussion_id = string_field(discussion, "id").unwrap_or_default();
+        let notes = match discussion.get("notes").and_then(Value::as_array) {
+            Some(notes) => notes,
+            None => continue,
+        };
+        let mut thread_comments = Vec::new();
+        for note in notes {
+            if note.get("system").and_then(Value::as_bool).unwrap_or(false) {
+                continue;
+            }
+            let Some(id) = note.get("id").and_then(Value::as_i64) else {
+                continue;
+            };
+            let position = note.get("position").filter(|p| p.is_object());
+            let (path, line) = position
+                .map(|position| {
+                    (
+                        string_field(position, "new_path")
+                            .or_else(|| string_field(position, "old_path"))
+                            .unwrap_or_default(),
+                        position
+                            .get("new_line")
+                            .and_then(Value::as_i64)
+                            .or_else(|| position.get("old_line").and_then(Value::as_i64)),
+                    )
+                })
+                .unwrap_or_default();
+            let author = note.get("author");
+            thread_comments.push(GitlabWorkItemComment {
+                id: id.to_string(),
+                kind: if path.is_empty() {
+                    "comment".into()
+                } else {
+                    "review".into()
+                },
+                author: author
+                    .and_then(|author| string_field(author, "username"))
+                    .or_else(|| author.and_then(|author| string_field(author, "name")))
+                    .unwrap_or_default(),
+                author_avatar_url: author
+                    .and_then(|author| string_field(author, "avatar_url"))
+                    .unwrap_or_default(),
+                body: string_field(note, "body").unwrap_or_default(),
+                created_at: string_field(note, "created_at").unwrap_or_default(),
+                url: note_url(base_url, repo, "pr", number, id),
+                state: String::new(),
+                path,
+                line,
+                resolved: note
+                    .get("resolved")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                resolvable: note
+                    .get("resolvable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                thread_id: discussion_id.clone(),
+                replies: Vec::new(),
+            });
+        }
+        if !thread_comments.is_empty() {
+            let mut first = thread_comments.remove(0);
+            first.replies = thread_comments;
+            comments.push(first);
+        }
+    }
+    Ok(GitlabWorkItemThread {
+        comments,
+        truncated: has_next_page,
+        review_decision: String::new(),
+        base_ref_name: String::new(),
+        head_ref_name: String::new(),
+    })
+}
+
+/// Discussion ids become a URL path segment — accept only the hex/opaque
+/// form GitLab returns, never slashes or whitespace.
+fn validate_discussion_id(raw: &str) -> Result<String, String> {
+    let id = raw.trim();
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("Invalid GitLab discussion".into());
+    }
+    Ok(id.to_string())
+}
+
 fn validate_kind(kind: &str) -> Result<(), String> {
     if kind == "issue" || kind == "pr" {
         Ok(())
@@ -592,6 +966,10 @@ fn parse_work_item_thread(
                 line: None,
                 resolved: row
                     .get("resolved")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                resolvable: row
+                    .get("resolvable")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 thread_id: String::new(),
@@ -854,6 +1232,23 @@ fn gitlab_post_form(
     read_gitlab_response(
         agent
             .post(&url)
+            .set("PRIVATE-TOKEN", &config.token)
+            .set("Accept", "application/json")
+            .set("User-Agent", USER_AGENT)
+            .send_form(fields),
+    )
+}
+
+fn gitlab_put_form(
+    config: &GitlabConfig,
+    path: &str,
+    fields: &[(&str, &str)],
+) -> Result<GitlabResponse, String> {
+    let url = format!("{}/api/v4{}", config.url.trim_end_matches('/'), path);
+    let agent = gitlab_agent();
+    read_gitlab_response(
+        agent
+            .put(&url)
             .set("PRIVATE-TOKEN", &config.token)
             .set("Accept", "application/json")
             .set("User-Agent", USER_AGENT)
@@ -1323,5 +1718,119 @@ mod tests {
         assert_eq!(diff.files[0].path, "src/new.ts");
         assert!(diff.patch.contains("rename from src/old.ts"));
         assert!(diff.patch.contains("@@ -1 +1 @@"));
+    }
+
+    #[test]
+    fn parses_merge_request_state() {
+        let state = parse_mr_state(
+            &json!({
+                "iid": 9,
+                "title": "Draft: Improve login",
+                "web_url": "https://gitlab.example.com/acme/web/-/merge_requests/9",
+                "state": "opened",
+                "sha": "abc123def456",
+                "source_branch": "feature",
+                "target_branch": "main",
+                "detailed_merge_status": "need_rebase",
+                "blocking_discussions_resolved": false,
+            }),
+            9,
+            &json!({ "approvals_required": 2, "approvals_left": 1, "approved": false }),
+            Some(GitlabMrPipeline {
+                id: 77,
+                sha: "abc123def456".into(),
+                status: "failed".into(),
+                url: "https://gitlab.example.com/acme/web/-/pipelines/77".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(state.state, "open");
+        assert!(state.draft);
+        assert_eq!(state.head_sha, "abc123def456");
+        assert_eq!(state.merge_status, "need_rebase");
+        assert!(!state.blocking_discussions_resolved);
+        assert_eq!(state.approvals_left, 1);
+        assert_eq!(state.pipeline.unwrap().status, "failed");
+    }
+
+    #[test]
+    fn merge_state_defaults_when_approvals_denied() {
+        let state = parse_mr_state(
+            &json!({ "iid": 3, "state": "merged", "sha": "f00", "merge_status": "can_be_merged" }),
+            3,
+            &Value::Null,
+            None,
+        )
+        .unwrap();
+        assert_eq!(state.merge_status, "can_be_merged");
+        assert!(state.blocking_discussions_resolved);
+        assert_eq!(state.approvals_required, 0);
+        assert!(!state.approved);
+        assert!(state.pipeline.is_none());
+    }
+
+    #[test]
+    fn parses_discussions_with_positions_and_replies() {
+        let thread = parse_mr_discussions(
+            &json!([
+                {
+                    "id": "deadbeef01",
+                    "notes": [
+                        {
+                            "id": 10, "body": "Naming?", "system": false,
+                            "created_at": "2026-09-09T10:00:00Z",
+                            "author": { "username": "ada" },
+                            "resolved": false, "resolvable": true,
+                            "position": { "new_path": "src/app.ts", "new_line": 12 }
+                        },
+                        {
+                            "id": 11, "body": "Renamed", "system": false,
+                            "created_at": "2026-09-09T10:05:00Z",
+                            "author": { "username": "maya" },
+                            "resolved": true,
+                            "position": { "new_path": "src/app.ts", "new_line": 12 }
+                        },
+                        { "id": 12, "body": "ada resolved this", "system": true }
+                    ]
+                },
+                {
+                    "id": "cafe0002",
+                    "notes": [{
+                        "id": 20, "body": "Overall looks fine", "system": false,
+                        "created_at": "2026-09-09T11:00:00Z",
+                        "author": { "username": "sam" }
+                    }]
+                }
+            ]),
+            "https://gitlab.example.com",
+            "acme/web",
+            9,
+            true,
+        )
+        .unwrap();
+        assert!(thread.truncated);
+        assert_eq!(thread.comments.len(), 2);
+        let anchored = &thread.comments[0];
+        assert_eq!(anchored.kind, "review");
+        assert_eq!(anchored.path, "src/app.ts");
+        assert_eq!(anchored.line, Some(12));
+        assert_eq!(anchored.thread_id, "deadbeef01");
+        assert!(!anchored.resolved);
+        assert_eq!(anchored.replies.len(), 1);
+        assert_eq!(anchored.replies[0].author, "maya");
+        let plain = &thread.comments[1];
+        assert_eq!(plain.kind, "comment");
+        assert!(plain.path.is_empty());
+    }
+
+    #[test]
+    fn discussion_ids_reject_path_segments() {
+        assert_eq!(validate_discussion_id("deadbeef01").unwrap(), "deadbeef01");
+        assert_eq!(validate_discussion_id("a-b_c").unwrap(), "a-b_c");
+        assert!(validate_discussion_id("").is_err());
+        assert!(validate_discussion_id("../admin").is_err());
+        assert!(validate_discussion_id("a/b").is_err());
+        assert!(validate_discussion_id("a b").is_err());
+        assert!(validate_discussion_id(&"x".repeat(65)).is_err());
     }
 }

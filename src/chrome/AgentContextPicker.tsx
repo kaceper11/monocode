@@ -145,7 +145,7 @@ export function AgentContextPicker({
     .slice(0, 30);
   return (
     <Modal
-      title={request.repair ? (request.repair.kind === "ci" || request.repair.kind === "github-ci") ? "Fix CI" : "Address comments" : tickets ? "Open conversation" : "Send to agent"}
+      title={request.repair ? (request.repair.kind === "ci" || request.repair.kind === "github-ci" || request.repair.kind === "gitlab-ci") ? "Fix CI" : "Address comments" : tickets ? "Open conversation" : "Send to agent"}
       description={
         request.repair
           ? request.repair.kind === "comments"
@@ -154,7 +154,11 @@ export function AgentContextPicker({
               ? `PR #${request.repair.number} · ${request.repair.repo}`
               : request.repair.kind === "github-ci"
                 ? `PR #${request.repair.number} · ${request.repair.repo} · ${request.repair.checks.length} check${request.repair.checks.length === 1 ? "" : "s"}`
-                : `Run ${request.repair.run.id} · ${request.repair.job.name}`
+                : request.repair.kind === "gitlab-comments"
+                  ? `MR !${request.repair.number} · ${request.repair.repo}`
+                  : request.repair.kind === "gitlab-ci"
+                    ? `MR !${request.repair.number} · ${request.repair.repo} · pipeline ${request.repair.pipeline.id}`
+                    : `Run ${request.repair.run.id} · ${request.repair.job.name}`
           : tickets
             ? `${request.context.entries.length} selected · titles and descriptions · send when ready`
             : "Selected context · does not auto-send"

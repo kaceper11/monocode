@@ -1,8 +1,9 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { gitPrStatus } from "./fs";
 import { parseAzurePrLocation } from "./azureRepos";
+import { gitlabMrForBranch, gitlabRepo } from "./gitlab";
 
-export type DeliveryProvider = "github" | "azure";
+export type DeliveryProvider = "github" | "azure" | "gitlab";
 export const DELIVERY_PROVIDERS_CHANGED = "monocode:delivery-providers";
 const key = "monocode.deliveryProviders.v1";
 const scope = (cwd: string, branch: string, session: string | undefined, kind: string) => JSON.stringify([cwd, branch, session ?? "", kind]);
@@ -10,7 +11,7 @@ function saved(): Record<string, DeliveryProvider> {
   try {
     const value = JSON.parse(localStorage.getItem(key) || "{}");
     return value && typeof value === "object" && !Array.isArray(value)
-      ? Object.fromEntries(Object.entries(value).filter(([, provider]) => provider === "github" || provider === "azure").slice(-100)) as Record<string, DeliveryProvider> : {};
+      ? Object.fromEntries(Object.entries(value).filter(([, provider]) => provider === "github" || provider === "azure" || provider === "gitlab").slice(-100)) as Record<string, DeliveryProvider> : {};
   } catch { return {}; }
 }
 export function deliveryProvider(cwd: string, branch: string, session: string | undefined, kind: "pr" | "ci") {
@@ -67,4 +68,21 @@ export async function openGitHubDelivery(cwd: string, kind: "pr" | "ci", current
   target.hash = "";
   target.pathname = target.pathname.replace(/\/$/, "") + (kind === "ci" ? "/checks" : "");
   await openUrl(target.href);
+}
+/**
+ * The exact GitLab MR a delivery tab is bound to — the checkout's
+ * configured-host project plus the open MR for its source branch. GitLab
+ * identity resolves only from GitLab bindings, never inferred from
+ * GitHub/Azure configuration.
+ */
+export async function gitlabDeliveryTarget(
+  cwd: string,
+  branch: string,
+): Promise<{ repo: string; number: number }> {
+  if (!branch.trim())
+    throw new Error("No branch for this checkout. Open the MR branch or choose another provider.");
+  const repo = (await gitlabRepo(cwd)).trim();
+  if (!repo) throw new Error("This checkout does not resolve to a GitLab project.");
+  const mr = await gitlabMrForBranch(cwd, branch);
+  return { repo, number: mr.number };
 }
