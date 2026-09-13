@@ -483,8 +483,12 @@ def handle(request):
         if not isinstance(args, list) or len(args) > 512 or any(not isinstance(arg, str) or "\0" in arg for arg in args):
             raise ValueError("Invalid Git arguments")
         source = request.get("input")
+        # Callers may raise the 25s default for fetch/merge-scale work;
+        # the value is clamped so a guest can never wait forever.
+        timeout = request.get("timeout")
+        timeout = max(5, min(int(timeout), 600)) if isinstance(timeout, (int, float)) else 25
         code, out, err = run(["git", "--no-pager", "-c", "core.quotepath=false", "-C", str(path), *args], str(path),
-                             base64.b64decode(source, validate=True) if source else None)
+                             base64.b64decode(source, validate=True) if source else None, timeout)
         return {"code": code, "stdout": base64.b64encode(out).decode(),
                 "stderr": base64.b64encode(err).decode()}
     if op == "attachment":

@@ -13,6 +13,7 @@ import {
   type Session,
 } from "../lib/session";
 import {
+  sameDeliverySource,
   saveWatcher,
   watcherSourceLabel,
   WATCHER_COOLDOWN_DEFAULT,
@@ -124,12 +125,18 @@ export function WatchSheet({
   }, [request.source, request.repos, repoPick, itemKind]);
 
   const save = () => {
+    // The sheet can't re-point a delivery source — when this edits the
+    // watcher already covering the delivery, keep ITS source (owner and
+    // watermark intact) and its managed `auto` status; only policy changes.
+    const keepDelivery =
+      existing && sameDeliverySource(source, existing.source);
     const result = saveWatcher(
       {
         name,
-        source,
+        source: keepDelivery ? existing.source : source,
         enabled,
         mode,
+        ...(keepDelivery && existing.auto ? { auto: true } : {}),
         ...(actionId ? { actionId } : {}),
         ...(mode === "run"
           ? {
