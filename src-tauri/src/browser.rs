@@ -107,13 +107,15 @@ const SUMMARY_SCRIPT: &str = r#"(() => {
       ? window.__monocodeConsole.slice(-40)
       : [];
   } catch (e) {}
-  return JSON.stringify({
+  // wry serializes the completion value itself — return the object, not a
+  // JSON string, or the result arrives double-encoded.
+  return {
     url: location.href,
     title: document.title || "",
     text: text.slice(0, 6000),
     controls,
     console: log,
-  });
+  };
 })()"#;
 
 #[derive(Default)]
@@ -554,7 +556,7 @@ pub async fn browser_probe(window: Window, label: String) -> Result<String, Stri
     let view = find_webview(&window, &label)?;
     let (tx, rx) = std::sync::mpsc::channel();
     view.eval_with_callback(
-        "JSON.stringify({href:location.href,title:document.title,readyState:document.readyState})",
+        "({href:location.href,title:document.title,readyState:document.readyState})",
         move |result| {
             let _ = tx.send(result);
         },

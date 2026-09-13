@@ -264,19 +264,26 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
     [label, clearWatchdog],
   );
 
-  // Native content sits above DOM chrome — hide it while a menu or dialog
-  // from our side is open so the overlay is reachable.
+  // Native content sits above DOM chrome — hide it while a menu, dialog or
+  // popover from our side is open so the overlay is reachable. Overlays are
+  // portaled to body inside plain wrapper divs, so the match has to descend
+  // into each body child, not just test the child itself.
   useEffect(() => {
+    const OVERLAY = '[role="dialog"], [role="menu"], [data-explorer-menu], [data-popover-side]';
     const check = () => {
-      const has = Array.from(document.body.children).some(
+      const host = hostRef.current;
+      const has = Array.from(
+        document.body.querySelectorAll<HTMLElement>(OVERLAY),
+      ).some(
         (el) =>
-          el instanceof HTMLElement &&
-          el.matches('[role="dialog"], [role="menu"], [data-explorer-menu]'),
+          !(host && (host.contains(el) || el.contains(host))) &&
+          !el.closest("[aria-hidden='true'], [inert], .hidden") &&
+          !!el.getClientRects().length,
       );
       setOverlayOpen(has);
     };
     const observer = new MutationObserver(check);
-    observer.observe(document.body, { childList: true });
+    observer.observe(document.body, { childList: true, subtree: true });
     check();
     return () => observer.disconnect();
   }, []);
