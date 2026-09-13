@@ -105,8 +105,9 @@ export type AttentionAction =
     }
   | { kind: "open-automations"; watcherId?: string }
   | { kind: "reconnect"; source: ConnectableInboxSource }
-  /** Opens the worktree manager for the family containing `cwd`. */
-  | { kind: "open-worktrees"; cwd: string }
+  /** Opens the worktree manager for the family containing `cwd`; `paths`
+   * pre-checks those copies in select mode. */
+  | { kind: "open-worktrees"; cwd: string; paths?: string[] }
   | { kind: "open-url"; url: string };
 
 export type AttentionItem = {

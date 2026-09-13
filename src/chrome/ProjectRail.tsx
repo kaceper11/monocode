@@ -57,9 +57,13 @@ import {
   lastWorkingCopyUse,
   hiddenWorkingCopies,
   hiddenWorkingCopiesSnapshot,
+  setWorkingCopyHidden,
   subscribeWorkingCopyPreferences,
   type RepositoryFamily,
+  type WorkingCopy,
 } from "../lib/repositoryFamilies";
+import { copyText } from "../lib/clipboard";
+import { openWorktreeManager } from "../lib/worktreeRemoval";
 import { useDragResize } from "../hooks/useDragResize";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import {
@@ -137,14 +141,16 @@ import { TabGroupMenu, type TabGroupMenuExtraItem } from "./TabGroupMenu";
 import { TerminalSpinner } from "./TerminalSpinner";
 import { WorktreeCollisionBadge } from "./WorktreeCollisionBadge";
 import { Popover } from "./Popover";
+import { ExplorerMenu, type ExplorerMenuItem } from "./ExplorerMenu";
+import { TaskWorktreesSheet } from "./TaskWorktreesSheet";
 import { WorktreePanel } from "./WorktreePicker";
 import {
   archiveTask,
   OPEN_TASK_DETAILS,
-  removeTask,
   repositoryForChild,
   subscribeTaskWorkspaces,
   taskChildRepoLabel,
+  taskChildrenForWorkingCopy,
   taskForSession,
   taskMatchesQuery,
   taskWorkspacesSnapshot,
@@ -352,6 +358,9 @@ export function ProjectRail({
     /** Right-clicked row — anchors follow-up popovers to the task itself. */
     rowRect?: DOMRect;
   } | null>(null);
+  // Delete goes through the worktree sheet — it can offer cleanup of the
+  // task's own working copies in the same flow.
+  const [deleteTaskId, setDeleteTaskId] = useState<string | null>(null);
   const tasksRaw = useSyncExternalStore(
     subscribeTaskWorkspaces,
     taskWorkspacesSnapshot,
@@ -1102,20 +1111,22 @@ export function ProjectRail({
               role="menuitem"
               className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-red-400 hover:bg-content/5"
               onClick={() => {
-                // Sessions and working copies survive — only the record goes.
-                if (
-                  window.confirm(
-                    `Delete task “${taskMenu.task.name}”? Its sessions and working copies stay.`,
-                  )
-                )
-                  removeTask(taskMenu.task.id);
+                setDeleteTaskId(taskMenu.task.id);
                 setTaskMenu(null);
               }}
             >
-              Delete task
+              Delete task…
             </button>
           </div>
         </Popover>
+      ) : null}
+      {deleteTaskId ? (
+        <TaskWorktreesSheet
+          taskId={deleteTaskId}
+          cwd={cwd}
+          families={families}
+          onClose={() => setDeleteTaskId(null)}
+        />
       ) : null}
       <div
         role="separator"
@@ -1516,7 +1527,7 @@ function WorkingCopyRows({
   busyPaths,
   recents,
   onSelect,
-  onManage,
+  onOpenList,
 }: {
   family: RepositoryFamily;
   hidden: string[];
@@ -1524,18 +1535,146 @@ function WorkingCopyRows({
   busyPaths: Set<string>;
   recents: RecentProject[];
   onSelect: (path: string) => void;
-  onManage: (event: MouseEvent<HTMLButtonElement>, path?: string) => void;
+  /** Opens the full worktree panel anchored to the clicked button — the
+   * menu's "All worktrees…" escape hatch. */
+  onOpenList: (anchor: HTMLButtonElement) => void;
 }) {
   // One version subscription per rows block; per-copy results are peeked.
   useSyncExternalStore(
     subscribeWorktreeCollisionVersion,
     worktreeCollisionVersion,
   );
+  // Claim labels re-derive on every task store write.
+  const tasksRaw = useSyncExternalStore(
+    subscribeTaskWorkspaces,
+    taskWorkspacesSnapshot,
+  );
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    child: WorkingCopy;
+    anchor: HTMLButtonElement;
+  } | null>(null);
+  const menuClaim = useMemo(
+    () =>
+      menu ? taskChildrenForWorkingCopy(menu.child.path)[0] : undefined,
+    // tasksRaw changes on every store write.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [menu, tasksRaw],
+  );
   const children = family.worktrees.filter(
     (child) =>
       sameProjectPath(child.path, cwd) ||
       !hidden.some((path) => sameProjectPath(path, child.path)),
   );
+  /** A surviving member that can host the manager's Git calls — a removed,
+   * missing or targeted path can never be the context. */
+  const managerContext = (exclude?: string) => {
+    const usable = family.worktrees.filter(
+      (entry) =>
+        !entry.missing &&
+        !entry.prunable &&
+        (!exclude || pathKey(entry.path) !== pathKey(exclude)),
+    );
+    return (
+      usable.find((entry) => entry.main)?.path ??
+      usable[0]?.path ??
+      family.checkout
+    );
+  };
+  const menuItems = (child: WorkingCopy): ExplorerMenuItem[] => {
+    const isHidden = hidden.some((path) => sameProjectPath(path, child.path));
+    const unavailable = child.missing || !!child.prunable;
+    return [
+      {
+        kind: "item",
+        id: "open",
+        label: "Open",
+        disabled: unavailable,
+      },
+      { kind: "item", id: "copy", label: "Copy path" },
+      {
+        kind: "item",
+        id: "reveal",
+        label: REVEAL_LABEL,
+        // WSL paths can't be revealed from a host-shell call on macOS/Linux.
+        disabled: unavailable || (!!wslLocation(child.path) && !IS_WIN),
+      },
+      { kind: "sep" },
+      ...(!child.main
+        ? [
+            {
+              kind: "item" as const,
+              id: "hide",
+              label: isHidden ? "Show in project" : "Hide from project",
+            },
+          ]
+        : []),
+      { kind: "item", id: "details", label: "Details & cleanup…" },
+      { kind: "item", id: "all", label: "All worktrees…" },
+      { kind: "sep" },
+      {
+        kind: "item",
+        id: "remove",
+        label: "Remove Git worktree…",
+        danger: true,
+        disabled:
+          child.main ||
+          unavailable ||
+          !!child.locked ||
+          !child.branch,
+      },
+    ];
+  };
+  const pickMenuItem = (id: string) => {
+    const state = menu;
+    setMenu(null);
+    if (!state) return;
+    // `onPick` bypasses `onClose` — restore focus the same way. The …
+    // anchor is visibility:hidden off-hover, so focus the row button.
+    (
+      state.anchor.parentElement?.querySelector("button") ?? state.anchor
+    ).focus();
+    const child = state.child;
+    switch (id) {
+      case "open":
+        onSelect(child.path);
+        break;
+      case "copy":
+        void copyText(child.path).catch(() => {});
+        break;
+      case "reveal":
+        void revealPath(child.path).catch(() => {});
+        break;
+      case "hide":
+        try {
+          setWorkingCopyHidden(
+            child.path,
+            !hidden.some((path) => sameProjectPath(path, child.path)),
+          );
+        } catch {
+          /* storage quota — presentation only */
+        }
+        break;
+      case "details":
+        openWorktreeManager({
+          cwd: managerContext(child.path),
+          path: child.path,
+        });
+        break;
+      case "all":
+        onOpenList(state.anchor);
+        break;
+      case "remove":
+        // Delegates to the modal's reviewed confirmation — no check bypassed.
+        openWorktreeManager({
+          cwd: managerContext(child.path),
+          path: child.path,
+          action: "remove",
+        });
+        break;
+    }
+  };
   return (
     <>
       {children.map((child) => {
@@ -1582,16 +1721,51 @@ function WorkingCopyRows({
             ) : null}
             <button
               type="button"
-              title="Worktree details and cleanup"
-              aria-label={`Manage worktree ${name}`}
+              title="Worktree actions"
+              aria-label={`Actions for worktree ${name}`}
+              aria-haspopup="menu"
               className={`invisible absolute ${collision ? "right-11" : "right-1"} top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded-md text-content/40 hover:bg-content/10 hover:text-content group-hover/working-copy:visible group-focus-within/working-copy:visible focus-visible:ring-1 focus-visible:ring-content/30`}
-              onClick={(event) => onManage(event, child.path)}
+              onClick={(event) =>
+                setMenu({
+                  x: event.clientX,
+                  y: event.clientY,
+                  child,
+                  anchor: event.currentTarget,
+                })
+              }
             >
               <MoreHorizontal className="size-3" />
             </button>
           </div>
         );
       })}
+      {menu ? (
+        <ExplorerMenu
+          x={menu.x}
+          y={menu.y}
+          ariaLabel={`Worktree ${workingCopyName(menu.child, family)} actions`}
+          header={
+            <div className="px-2 py-1.5">
+              <p className="truncate text-[12px] font-medium text-content">
+                {workingCopyName(menu.child, family)}
+                {menuClaim ? ` · Task ${menuClaim.task.name}` : ""}
+              </p>
+              <p className="truncate text-[10px] text-content/45">
+                {prettyCwd(menu.child.path)}
+              </p>
+            </div>
+          }
+          items={menuItems(menu.child)}
+          onPick={pickMenuItem}
+          onClose={() => {
+            setMenu(null);
+            (
+              menu.anchor.parentElement?.querySelector("button") ??
+              menu.anchor
+            ).focus();
+          }}
+        />
+      ) : null}
     </>
   );
 }
@@ -1617,9 +1791,7 @@ function ProjectRepositoryRow({
   onSelect: (path: string) => void;
 }) {
   const anchor = useRef<HTMLButtonElement>(null);
-  const [menu, setMenu] = useState<{ create: boolean; path?: string } | null>(
-    null,
-  );
+  const [menu, setMenu] = useState<{ create: boolean } | null>(null);
   const [working, setWorking] = useState(false);
   const family = familyForRepository(repo, families);
   const [expanded, setExpanded] = useExpandedRow(
@@ -1717,9 +1889,9 @@ function ProjectRepositoryRow({
             busyPaths={busyPaths}
             recents={recents}
             onSelect={onSelect}
-            onManage={(event, path) => {
-              anchor.current = event.currentTarget;
-              setMenu({ create: false, path });
+            onOpenList={(el) => {
+              anchor.current = el;
+              setMenu({ create: false });
             }}
           />
         </div>
@@ -1741,9 +1913,8 @@ function ProjectRepositoryRow({
           className="flex flex-col overflow-hidden"
         >
           <WorktreePanel
-            key={`${menu.create}:${menu.path ?? ""}`}
+            key={String(menu.create)}
             initialCreate={menu.create}
-            initialPath={menu.path}
             activeCwd={cwd}
             cwd={
               family?.worktrees.find(
@@ -2147,9 +2318,7 @@ function ProjectFamilyCard(
   /** Anchorless group — no own folder; the row exists to hold members. */
   const isGroup = !!project && !project.anchor;
   const anchor = useRef<HTMLButtonElement>(null);
-  const [menu, setMenu] = useState<{ create: boolean; path?: string } | null>(
-    null,
-  );
+  const [menu, setMenu] = useState<{ create: boolean } | null>(null);
   const hiddenRaw = useSyncExternalStore(
     subscribeWorkingCopyPreferences,
     hiddenWorkingCopiesSnapshot,
@@ -2267,9 +2436,9 @@ function ProjectFamilyCard(
             busyPaths={busyPaths}
             recents={recents}
             onSelect={onSelect}
-            onManage={(event, path) => {
-              anchor.current = event.currentTarget;
-              setMenu({ create: false, path });
+            onOpenList={(el) => {
+              anchor.current = el;
+              setMenu({ create: false });
             }}
           />
         </div>
@@ -2297,9 +2466,8 @@ function ProjectFamilyCard(
           className="flex flex-col overflow-hidden"
         >
           <WorktreePanel
-            key={`${menu.create}:${menu.path ?? ""}`}
+            key={String(menu.create)}
             initialCreate={menu.create}
-            initialPath={menu.path}
             activeCwd={cwd}
             cwd={
               family?.worktrees.find(

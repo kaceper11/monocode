@@ -44,7 +44,11 @@ describe("worktreeCleanupAttention", () => {
     expect(rows[0].kind).toBe("worktree");
     expect(rows[0].key).toBe("worktree-stale:/repo/.git");
     expect(rows[0].title).toBe("repo · 1 stale working copy");
-    expect(rows[0].action).toEqual({ kind: "open-worktrees", cwd: "/repo" });
+    expect(rows[0].action).toEqual({
+      kind: "open-worktrees",
+      cwd: "/repo",
+      paths: ["/repo/wt-a"],
+    });
     expect(rows[0].cwd).toBe("/repo");
   });
 
@@ -66,6 +70,11 @@ describe("worktreeCleanupAttention", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].title).toContain("2 stale");
     expect(rows[0].detail).toContain("2 missing or stale on disk");
+    // Missing/prunable paths ride the action too — they land in the
+    // manager's review list, never in a batch.
+    expect(rows[0].action).toMatchObject({
+      paths: ["/repo/wt-missing", "/repo/wt-prunable"],
+    });
   });
 
   it("never treats unknown activity as stale", () => {

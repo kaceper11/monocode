@@ -1,7 +1,9 @@
+import { invoke } from "@tauri-apps/api/core";
 import { pathKey } from "./paths";
-import type { RecentProject } from "./recents";
+import { forgetRemovedWorktree, type RecentProject } from "./recents";
 import {
   lastWorkingCopyUse,
+  setWorkingCopyHidden,
   workingCopyName,
   type RepositoryFamily,
   type WorkingCopy,
@@ -136,4 +138,98 @@ export function openBoundProcess(process: BoundProcess) {
   window.dispatchEvent(
     new CustomEvent(OPEN_BOUND_PROCESS, { detail: process }),
   );
+}
+
+/** Opens the worktree manager for the family containing `cwd`, optionally
+ * focused on one checkout's detail (`path`), pre-checked into select mode
+ * (`select`), or straight into the reviewed removal confirmation
+ * (`action: "remove"`, requires `path`). */
+export const OPEN_WORKTREE_MANAGER = "monocode:open-worktree-manager";
+
+export type WorktreeManagerRequest = {
+  cwd: string;
+  path?: string;
+  select?: string[];
+  action?: "remove";
+};
+
+export function openWorktreeManager(request: WorktreeManagerRequest) {
+  window.dispatchEvent(
+    new CustomEvent(OPEN_WORKTREE_MANAGER, { detail: request }),
+  );
+}
+
+/**
+ * Fresh `git_worktree_safety` per target — the batch version of the
+ * single-removal preflight. A target that changed state or left the
+ * inventory fails into the review list instead of aborting the batch.
+ * `contextFor` resolves each target to a path inside its repository family.
+ */
+export async function preflightWorktrees(
+  targets: readonly RemovalEntry[],
+  contextFor: (path: string) => string,
+): Promise<{
+  results: { target: RemovalEntry; safety: WorktreeSafety }[];
+  failed: BulkSkip[];
+}> {
+  const results: { target: RemovalEntry; safety: WorktreeSafety }[] = [];
+  const failed: BulkSkip[] = [];
+  for (const target of targets) {
+    try {
+      results.push({
+        target,
+        safety: await invoke<WorktreeSafety>("git_worktree_safety", {
+          cwd: contextFor(target.path),
+          path: target.path,
+        }),
+      });
+    } catch (error) {
+      failed.push({ entry: target, reason: String(error) });
+    }
+  }
+  return { results, failed };
+}
+
+/**
+ * Sequential `git_worktree_remove` over an already-reviewed plan — never
+ * force, never stopping processes. `contextFor` must return a surviving
+ * family member (a removed target can never host the next call);
+ * `fallbackFor` resolves the rail/bookkeeping replacement per removed path
+ * and receives the full removed set to compute survivors from.
+ * Callers notify Git changes for each context they passed.
+ */
+export async function executeWorktreeRemovals(input: {
+  removable: readonly WorktreeSafety[];
+  contextFor: (path: string) => string;
+  fallbackFor: (path: string, removed: readonly string[]) => string;
+}): Promise<{
+  removed: string[];
+  failures: { entry: RemovalEntry; message: string }[];
+}> {
+  const removed: string[] = [];
+  const failures: { entry: RemovalEntry; message: string }[] = [];
+  for (const safety of input.removable) {
+    try {
+      await invoke("git_worktree_remove", {
+        cwd: input.contextFor(safety.entry.path),
+        path: safety.entry.path,
+        head: safety.entry.head,
+        reviewed: null,
+        stopProcesses: null,
+      });
+      removed.push(safety.entry.path);
+    } catch (error) {
+      failures.push({ entry: safety.entry, message: String(error) });
+    }
+  }
+  for (const path of removed) {
+    try {
+      forgetRemovedWorktree(path, input.fallbackFor(path, removed));
+      setWorkingCopyHidden(path, false);
+    } catch {
+      // Bookkeeping is best-effort (localStorage quota) — a throw here
+      // must not strand a finished batch in its "removing" phase.
+    }
+  }
+  return { removed, failures };
 }

@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { forgetRemovedWorktree, loadRecents } from "../lib/recents";
 import {
@@ -16,26 +22,34 @@ import {
   subscribeWorkingCopyPreferences,
   setWorkingCopyHidden,
   lastWorkingCopyUse,
+  staleWorkingCopy,
   workingCopyAge,
   oldestWorkingCopies,
 } from "../lib/repositoryFamilies";
 import { notifyGitChanged } from "../lib/fs";
 import {
+  subscribeTaskWorkspaces,
+  taskChildrenForWorkingCopy,
+  taskWorkspacesSnapshot,
+} from "../lib/taskWorkspaces";
+import {
   bulkRemovalPlan,
+  executeWorktreeRemovals,
   openBoundProcess,
+  preflightWorktrees,
   removalFallbackLabel,
   removalFallbacks,
   type BulkSkip,
   type BoundProcess,
   type WorktreeSafety,
 } from "../lib/worktreeRemoval";
+import { WorktreeRemovalBatch } from "./WorktreeRemovalBatch";
 import {
   ArrowLeft,
   Check,
   ChevronRight,
   Folder,
   GitBranch,
-  Loader,
   Plus,
   RefreshCw,
   Search,
@@ -80,6 +94,8 @@ export function WorktreePanel({
   initialBase = "",
   initialCreate = false,
   initialPath,
+  initialSelect,
+  initialAction,
   activeCwd = cwd,
 }: {
   cwd: string;
@@ -89,6 +105,12 @@ export function WorktreePanel({
   initialBase?: string;
   initialCreate?: boolean;
   initialPath?: string;
+  /** Mount straight into select mode with these paths checked — the stale
+   * set an attention row derived, or a caller-reviewed batch. */
+  initialSelect?: string[];
+  /** With `initialPath`: skip the detail view and land on the reviewed
+   * removal confirmation. */
+  initialAction?: "remove";
   activeCwd?: string;
 }) {
   const location = wslLocation(cwd);
@@ -104,6 +126,10 @@ export function WorktreePanel({
     hiddenWorkingCopiesSnapshot,
   );
   const hidden = hiddenWorkingCopies(hiddenRaw);
+  const tasksRaw = useSyncExternalStore(
+    subscribeTaskWorkspaces,
+    taskWorkspacesSnapshot,
+  );
   const recents = loadRecents();
   const [oldestFirst, setOldestFirst] = useState(false);
   // The manage affordance opens straight on the entry it was clicked for;
@@ -179,8 +205,10 @@ export function WorktreePanel({
   const [forceFiles, setForceFiles] = useState<string[] | null>(null);
   // Bulk select mode: checkboxes on each removable row, a staged plan that
   // re-preflights every target, and a summary instead of silent removal.
-  const [selecting, setSelecting] = useState(false);
-  const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
+  const [selecting, setSelecting] = useState(() => !!initialSelect?.length);
+  const [checked, setChecked] = useState<ReadonlySet<string>>(
+    () => new Set((initialSelect ?? []).map(pathKey)),
+  );
   const [bulk, setBulk] = useState<{
     phase: "confirm" | "removing" | "done";
     removable: WorktreeSafety[];
@@ -291,6 +319,17 @@ export function WorktreePanel({
   );
   const canCreate =
     name.length > 0 && !refs.some((ref) => ref.name === `refs/heads/${name}`);
+  /** First non-archived task claiming each listed copy — the "· Task X" marker. */
+  const taskClaims = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const entry of entries) {
+      const claim = taskChildrenForWorkingCopy(entry.path)[0];
+      if (claim) map.set(pathKey(entry.path), claim.task.name);
+    }
+    return map;
+    // tasksRaw changes on every store write.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entries, tasksRaw]);
   const prepareCreate = () => {
     setBranch(name);
     setPath(`${rootPath}-${name.replace(/\//g, "-")}`);
@@ -370,6 +409,25 @@ export function WorktreePanel({
         host: current.host,
       });
     });
+  // A mounted `initialAction` jumps straight to the reviewed confirmation
+  // once the seeded detail exists — `startRemove` re-preflights first. It
+  // waits out the mount refresh: `run` early-returns while another run holds
+  // `pending`. The guard must read the ref — `busy` is still false during
+  // the mount effect pass, so checking state would latch the flag while
+  // `startRemove` no-ops.
+  const initialActionFired = useRef(false);
+  useEffect(() => {
+    if (
+      initialAction !== "remove" ||
+      !detail ||
+      pending.current ||
+      initialActionFired.current
+    )
+      return;
+    initialActionFired.current = true;
+    startRemove(detail);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fire once on the seeded detail
+  }, [detail, busy]);
   const confirmRemove = confirmation?.action === "remove";
   const confirmProcesses = confirmation?.processes ?? [];
   const confirmFallbacks = confirmation?.fallbacks ?? [];
@@ -394,40 +452,58 @@ export function WorktreePanel({
       return next;
     });
   };
+  /** Batch-check the selectable rows matching a predicate — quick-select
+   * can never arm a protected or in-use row. */
+  const selectMatching = (match: (entry: Worktree) => boolean) =>
+    setChecked(
+      new Set(
+        entries
+          .filter((entry) => bulkSelectable(entry) && match(entry))
+          .map((entry) => pathKey(entry.path)),
+      ),
+    );
   const checkedCount = entries.filter((entry) =>
     checked.has(pathKey(entry.path)),
   ).length;
   // Stable family context for the batch: a just-removed path can never
-  // serve as cwd for the next preflight. Prefer the surviving main
-  // checkout — never a missing or prunable registration.
-  const removalContext = () =>
+  // serve as cwd for the next call. Prefer the surviving main checkout —
+  // never a missing or prunable registration and never a removal target
+  // (a seeded check can bypass `bulkSelectable`'s cwd guard).
+  const removalContext = (excluded?: ReadonlySet<string>) =>
     entries.find(
-      (entry) => entry.main && !entry.missing && !entry.prunable,
-    )?.path ?? cwdRef.current;
+      (entry) =>
+        entry.main &&
+        !entry.missing &&
+        !entry.prunable &&
+        !excluded?.has(pathKey(entry.path)),
+    )?.path ??
+    entries.find(
+      (entry) =>
+        !entry.missing &&
+        !entry.prunable &&
+        !excluded?.has(pathKey(entry.path)),
+    )?.path ??
+    cwdRef.current;
   const beginBulkRemove = () =>
     void run(async () => {
-      const targets = entries.filter((entry) =>
-        checked.has(pathKey(entry.path)),
+      // Seeded checks bypass `bulkSelectable` — re-apply the two guards
+      // preflight cannot verify: the panel context and the active context
+      // can never join a batch (a removal needs a switch-away).
+      const targets = entries.filter(
+        (entry) =>
+          checked.has(pathKey(entry.path)) &&
+          pathKey(entry.path) !== pathKey(cwd) &&
+          !isEqualOrInside(activeCwd, entry.path),
       );
-      const context = removalContext();
-      const safeties: WorktreeSafety[] = [];
+      const context = removalContext(checked);
       // A worktree that changed state since the last refresh (or is already
       // unregistered) fails preflight — skip it into the review list rather
       // than aborting the whole batch.
-      const failed: BulkSkip[] = [];
-      for (const target of targets) {
-        try {
-          safeties.push(
-            await invoke<WorktreeSafety>("git_worktree_safety", {
-              cwd: context,
-              path: target.path,
-            }),
-          );
-        } catch (error) {
-          failed.push({ entry: target, reason: String(error) });
-        }
-      }
-      const plan = bulkRemovalPlan(safeties);
+      const { results, failed } = await preflightWorktrees(
+        targets,
+        () => context,
+      );
+      const plan = bulkRemovalPlan(results.map((row) => row.safety));
       plan.skipped.push(...failed);
       if (!plan.removable.length && !plan.skipped.length) return;
       setBulk({ phase: "confirm", ...plan, removed: [], failures: [] });
@@ -444,34 +520,24 @@ export function WorktreePanel({
       if (!bulk) return;
       const plan = bulk;
       setBulk({ ...plan, phase: "removing" });
-      const context = removalContext();
-      const removed: string[] = [];
-      const failures: { entry: Worktree; message: string }[] = [];
-      for (const safety of plan.removable) {
-        try {
-          await invoke("git_worktree_remove", {
-            cwd: context,
-            path: safety.entry.path,
-            head: safety.entry.head,
-            reviewed: null,
-            stopProcesses: null,
-          });
-          removed.push(safety.entry.path);
-        } catch (error) {
-          failures.push({ entry: safety.entry, message: String(error) });
-        }
-      }
-      const survivors = entries.filter(
-        (entry) =>
-          !removed.some((path) => pathKey(path) === pathKey(entry.path)),
+      const context = removalContext(
+        new Set(plan.removable.map((safety) => pathKey(safety.entry.path))),
       );
-      const fallback =
-        removalFallbacks(removed[0] ?? "", survivors, recents)[0]?.path ??
-        context;
-      for (const path of removed) {
-        forgetRemovedWorktree(path, fallback);
-        setWorkingCopyHidden(path, false);
-      }
+      const { removed, failures } = await executeWorktreeRemovals({
+        removable: plan.removable,
+        contextFor: () => context,
+        fallbackFor: (path, removedPaths) =>
+          removalFallbacks(
+            path,
+            entries.filter(
+              (entry) =>
+                !removedPaths.some(
+                  (removed) => pathKey(removed) === pathKey(entry.path),
+                ),
+            ),
+            recents,
+          )[0]?.path ?? context,
+      });
       if (removed.length) notifyGitChanged(cwdRef.current);
       setChecked(new Set());
       setSelecting(false);
@@ -517,155 +583,18 @@ export function WorktreePanel({
     <div className="flex min-h-0 flex-1 flex-col text-[12px]" aria-busy={busy}>
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-none">
         {bulk ? (
-          <div className="space-y-2 px-3 py-2.5">
-            <p className="flex items-center gap-2 font-medium">
-              {bulk.phase === "removing" ? (
-                <Loader
-                  className="size-4 shrink-0 animate-spin text-content/50"
-                  aria-hidden="true"
-                />
-              ) : (
-                <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-red-500/10 text-red-600">
-                  <Trash2 className="size-3.5" aria-hidden="true" />
-                </span>
-              )}
-              {bulk.phase === "removing"
-                ? `Removing ${bulk.removable.length} ${
-                    bulk.removable.length === 1 ? "worktree" : "worktrees"
-                  }…`
-                : bulk.phase === "done"
-                  ? `Removed ${bulk.removed.length} ${
-                      bulk.removed.length === 1 ? "worktree" : "worktrees"
-                    }`
-                  : `Remove ${bulk.removable.length} ${
-                      bulk.removable.length === 1 ? "worktree" : "worktrees"
-                    }?`}
-            </p>
-            {bulk.phase === "confirm" && bulk.removable.length > 0 && (
-              <div className="space-y-0.5">
-                {bulk.removable.map((safety) => (
-                  <p
-                    key={safety.entry.path}
-                    className="truncate font-mono text-[11px] text-content/70"
-                  >
-                    {safety.entry.branch?.replace("refs/heads/", "")} ·{" "}
-                    {prettyCwd(safety.entry.path)}
-                    {safety.entry.users.length
-                      ? ` · keeps ${safety.entry.users.length} ${
-                          safety.entry.users.length === 1
-                            ? "conversation"
-                            : "conversations"
-                        }`
-                      : ""}
-                  </p>
-                ))}
-                <p className="pt-1 text-[11px] leading-4 text-content/60">
-                  Branches and conversations stay. Each worktree is checked
-                  again before removal.
-                </p>
-              </div>
-            )}
-            {bulk.phase === "confirm" && bulk.removable.length === 0 && (
-              <p className="text-[11px] text-content/60">
-                None of the selected worktrees can be removed without
-                individual review.
-              </p>
-            )}
-            {bulk.phase !== "removing" && bulk.skipped.length > 0 && (
-              <div className="space-y-1">
-                <p className="text-[11px] font-medium text-content/80">
-                  Needs individual review
-                </p>
-                {bulk.skipped.map((skip) => (
-                  <div
-                    key={skip.entry.path}
-                    className="flex items-center gap-2"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate font-mono text-[11px] text-content/70">
-                        {skip.entry.branch?.replace(
-                          "refs/heads/",
-                          "",
-                        ) ?? `Detached ${skip.entry.head.slice(0, 8)}`}
-                      </p>
-                      <p className="truncate text-[10px] text-content/45">
-                        {skip.reason}
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      className="shrink-0 rounded border border-content/10 px-1.5 py-0.5 text-[11px] hover:bg-content/5"
-                      onClick={() => reviewEntry(skip.entry)}
-                    >
-                      Review
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-            {bulk.phase === "done" && bulk.failures.length > 0 && (
-              <div className="space-y-1">
-                <p className="text-[11px] font-medium text-red-400">
-                  {bulk.failures.length}{" "}
-                  {bulk.failures.length === 1 ? "removal" : "removals"} failed
-                </p>
-                {bulk.failures.map((failure) => (
-                  <div
-                    key={failure.entry.path}
-                    className="flex items-center gap-2"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate font-mono text-[11px] text-content/70">
-                        {failure.entry.branch?.replace("refs/heads/", "") ??
-                          failure.entry.path}
-                      </p>
-                      <p className="truncate text-[10px] text-red-400/80">
-                        {failure.message}
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      className="shrink-0 rounded border border-content/10 px-1.5 py-0.5 text-[11px] hover:bg-content/5"
-                      onClick={() => reviewEntry(failure.entry)}
-                    >
-                      Review
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="flex justify-end gap-2 border-t border-content/10 pt-2.5">
-              {bulk.phase === "confirm" ? (
-                <>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    className="rounded-md border border-content/10 px-2.5 py-1.5 text-content/70 outline-none hover:bg-content/5 focus-visible:ring-2 focus-visible:ring-content/30 disabled:opacity-40"
-                    onClick={() => setBulk(null)}
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy || !bulk.removable.length}
-                    className="inline-flex items-center gap-1.5 rounded-md bg-content/5 px-2.5 py-1.5 font-medium text-red-400 outline-none hover:bg-content/10 focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-2 focus-visible:ring-offset-background-base disabled:opacity-40 [.theme-light_&]:text-red-700"
-                    onClick={confirmBulkRemove}
-                  >
-                    <Trash2 className="size-3.5" aria-hidden="true" />
-                    Remove {bulk.removable.length || ""}
-                  </button>
-                </>
-              ) : bulk.phase === "done" ? (
-                <button
-                  type="button"
-                  className="rounded-md border border-content/10 px-2.5 py-1.5 text-content/70 outline-none hover:bg-content/5 focus-visible:ring-2 focus-visible:ring-content/30"
-                  onClick={onClose}
-                >
-                  Done
-                </button>
-              ) : null}
-            </div>
-          </div>
+          <WorktreeRemovalBatch
+            phase={bulk.phase}
+            removable={bulk.removable}
+            skipped={bulk.skipped}
+            removed={bulk.removed}
+            failures={bulk.failures}
+            busy={busy}
+            onCancel={() => setBulk(null)}
+            onConfirm={confirmBulkRemove}
+            onReview={reviewEntry}
+            onDone={onClose}
+          />
         ) : confirmation ? (
         <div className="space-y-2 px-3 py-2.5">
           <p className="flex items-center gap-2 font-medium">
@@ -858,7 +787,10 @@ export function WorktreePanel({
                     entry.path,
                     confirmSwitch && fallback
                       ? fallback.path
-                      : (entries.find((tree) => tree.main)?.path ?? cwd),
+                      : (entries.find(
+                          (tree) =>
+                            tree.main && !tree.missing && !tree.prunable,
+                        )?.path ?? removalContext()),
                   );
                   setWorkingCopyHidden(entry.path, false);
                   notifyGitChanged(cwdRef.current);
@@ -1318,6 +1250,9 @@ export function WorktreePanel({
                       `Detached ${entry.head.slice(0, 8)}`}
                     <span className="block truncate font-sans text-[10px] text-content/70">
                       {workingCopyAge(lastWorkingCopyUse(entry, recents))}
+                      {taskClaims.get(pathKey(entry.path))
+                        ? ` · Task ${taskClaims.get(pathKey(entry.path))}`
+                        : ""}
                       {hidden.some(
                         (path) => pathKey(path) === pathKey(entry.path),
                       )
@@ -1334,7 +1269,11 @@ export function WorktreePanel({
                           ? "main"
                           : pathKey(entry.path) === pathKey(cwd)
                             ? "current"
-                            : ""}
+                            : isEqualOrInside(activeCwd, entry.path)
+                              ? "in use"
+                              : !entry.branch
+                                ? "detached"
+                                : ""}
                   </span>
                 </button>
                 <button
@@ -1397,6 +1336,34 @@ export function WorktreePanel({
           <span className="min-w-0 flex-1 text-[11px] text-content/50">
             {checkedCount} selected
           </span>
+          <button
+            type="button"
+            disabled={busy}
+            className="rounded px-1.5 py-1 text-[11px] text-content/60 hover:bg-content/10 disabled:opacity-40"
+            onClick={() =>
+              selectMatching((entry) =>
+                staleWorkingCopy(entry, lastWorkingCopyUse(entry, recents)),
+              )
+            }
+          >
+            Stale
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            className="rounded px-1.5 py-1 text-[11px] text-content/60 hover:bg-content/10 disabled:opacity-40"
+            onClick={() => selectMatching(() => true)}
+          >
+            All
+          </button>
+          <button
+            type="button"
+            disabled={busy || !checkedCount}
+            className="rounded px-1.5 py-1 text-[11px] text-content/60 hover:bg-content/10 disabled:opacity-40"
+            onClick={() => setChecked(new Set())}
+          >
+            None
+          </button>
           <button
             type="button"
             disabled={busy}

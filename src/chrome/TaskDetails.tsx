@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { basename } from "../lib/fs";
-import { prettyCwd } from "../lib/paths";
+import { pathKey, prettyCwd } from "../lib/paths";
 import {
   projectsSnapshot,
   repositoryDisplayName,
   subscribeProjects,
 } from "../lib/projects";
+import { getVerifiedFamilies } from "../lib/repositoryFamilies";
+import { openWorktreeManager } from "../lib/worktreeRemoval";
 import {
   loadTaskWorkspaces,
   projectForTask,
@@ -62,6 +64,7 @@ import { InboxProviderMark } from "./InboxProviderMark";
 import { DeliveryBadges } from "./TaskScopeChip";
 import {
   Check,
+  ChevronRight,
   CircleAlert,
   CircleDashed,
   CircleDot,
@@ -326,6 +329,38 @@ export function TaskDetails({
                     className="shrink-0 rounded-md px-1.5 py-0.5 text-[10px] text-content/60 hover:bg-content/8 hover:text-content"
                   >
                     {ready ? "Open" : "Start"}
+                  </button>
+                ) : null}
+                {child.workingCopy ? (
+                  <button
+                    type="button"
+                    title="Worktree details and cleanup"
+                    aria-label={`Manage worktree ${name}`}
+                    className="shrink-0 rounded-md p-0.5 text-content/40 hover:bg-content/8 hover:text-content"
+                    onClick={() => {
+                      const path = child.workingCopy!;
+                      // Any healthy family member hosts the manager's Git
+                      // calls — never the target; the repository anchor is
+                      // the fallback.
+                      const usable = (
+                        getVerifiedFamilies().get(pathKey(path))
+                          ?.worktrees ?? []
+                      ).filter(
+                        (entry) =>
+                          !entry.missing &&
+                          !entry.prunable &&
+                          pathKey(entry.path) !== pathKey(path),
+                      );
+                      const context =
+                        usable.find((entry) => entry.main)?.path ??
+                        usable[0]?.path ??
+                        repo?.anchor ??
+                        path;
+                      onClose();
+                      openWorktreeManager({ cwd: context, path });
+                    }}
+                  >
+                    <ChevronRight className="size-3.5" strokeWidth={1.75} />
                   </button>
                 ) : null}
               </div>
