@@ -106,6 +106,7 @@ import { runUpdateFlow } from "./lib/updater";
 import { displayAttachments, prepareAttachments } from "./lib/attachments";
 import {
   basename,
+  gitDiffIndex,
   gitUpdateFromDefault,
   listDir,
   notifyGitChanged,
@@ -118,6 +119,7 @@ import {
   acquireSyncSlot,
   offerMergeResolution,
   syncHostLabel,
+  syncPreflightRefusal,
   syncWithDefaultBranch,
 } from "./lib/syncDefault";
 import {
@@ -6866,6 +6868,14 @@ export default function App({
       item: AttentionItem,
       action: Extract<AttentionAction, { kind: "update-branch" }>,
     ) => {
+      // Same guard as the menu/panel flow — a bare "~" would probe $HOME.
+      if (!action.cwd || action.cwd === "~") {
+        await message("This row has no working copy to update.", {
+          title: item.title,
+          kind: "warning",
+        });
+        return;
+      }
       // Share the menu/panel sync slot — confirmations must not stack on
       // the same working copy even when the entry points differ.
       const release = acquireSyncSlot(action.cwd);
@@ -6877,46 +6887,61 @@ export default function App({
         return;
       }
       try {
-        // The binding names the branch this row was emitted for — merging
-        // into a checkout that has since moved would corrupt the wrong one.
-        if (action.branch) {
-          const checkout = await ciContext(action.cwd);
-          if (checkout.branch !== action.branch) {
-            await message(
-              `Checkout is on ${checkout.branch || "detached HEAD"}, not ${action.branch}. Switch back or dismiss the row.`,
-              { title: item.title, kind: "warning" },
-            );
-            return;
-          }
+        // The confirm must not describe an impossible operation — run the
+        // same preflight the menu/panel flow does before asking.
+        const index = await gitDiffIndex(action.cwd);
+        const refusal = syncPreflightRefusal(index);
+        if (refusal) {
+          await message(refusal, { title: item.title, kind: "warning" });
+          return;
         }
+        // The binding names the branch this row was emitted for — merging
+        // into a checkout that has since moved would corrupt the wrong
+        // one. Rows without a binding pin the live branch instead.
+        if (action.branch && index.branch !== action.branch) {
+          await message(
+            `Checkout is on ${index.branch || "detached HEAD"}, not ${action.branch}. Switch back or dismiss the row.`,
+            { title: item.title, kind: "warning" },
+          );
+          return;
+        }
+        const branch = action.branch ?? index.branch;
+        if (!branch) {
+          await message(
+            `${action.cwd} has no branch checked out — nothing to update.`,
+            { title: item.title, kind: "warning" },
+          );
+          return;
+        }
+        // A bare base name is fetched from the checkout's remote — name it
+        // so the confirm can't hide a multi-remote surprise.
         const baseLabel = action.base
-          ? `the ${action.base} branch`
-          : "the remote default branch";
-        const branchLabel = action.branch ?? "the current branch";
+          ? `the ${action.base.includes("/") ? action.base : `${index.remote ?? "remote"}/${action.base}`} branch`
+          : `the ${index.remote ?? "remote"} default branch`;
         const where = `\n\nWorking copy: ${action.cwd}\nHost: ${syncHostLabel(action.cwd)}`;
         let mode: "merge" | "rebase" = "merge";
         if (
           !(await ask(
-            `Fetch ${baseLabel} and merge it into ${branchLabel}? The tree must be clean; conflicts stay in place for you to resolve.${where}`,
+            `Fetch ${baseLabel} and merge it into ${branch}? The tree must be clean; conflicts stay in place for you to resolve. Nothing is pushed.${where}`,
             { title: item.title, kind: "info", okLabel: "Merge", cancelLabel: "Rebase instead…" },
           ))
         ) {
           if (
             !(await ask(
-              `Rebase ${branchLabel} onto ${baseLabel}?${where}`,
-              { title: "Update branch", kind: "info", okLabel: "Rebase", cancelLabel: "Cancel" },
+              `Rebase ${branch} onto ${baseLabel}? Nothing is pushed.${where}`,
+              { title: item.title, kind: "info", okLabel: "Rebase", cancelLabel: "Cancel" },
             ))
           )
             return;
           mode = "rebase";
         }
-        // Pin the branch the row was emitted for — it can move during the
-        // confirm dialogs or the fetch itself.
+        // Pin the branch the confirm named — it can move during the
+        // dialogs or the fetch itself.
         const result = await gitUpdateFromDefault(
           action.cwd,
           mode,
           action.base,
-          action.branch,
+          branch,
         );
         if (result.outcome === "conflicts") {
           // Same resolution flow as a panel/menu sync — live merge state is

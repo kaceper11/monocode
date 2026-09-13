@@ -68,9 +68,9 @@ export function syncConfirmText(cwd: string, index: GitDiffIndex): string {
  * outside a subdirectory-scoped index, an op or dirty file appearing after
  * the read) still refuse honestly at the backend. Returns the refusal
  * text, or null when a sync is at least plausible. */
-function syncPreflightRefusal(index: GitDiffIndex): string | null {
+export function syncPreflightRefusal(index: GitDiffIndex): string | null {
   if (index.opInProgress)
-    return `A ${index.op || "merge"} is already in progress in this working copy — resolve or abort it first.`;
+    return `A ${opLabel(index.op).toLowerCase()} is already in progress in this working copy — resolve or abort it first.`;
   if (!index.branch || index.detached)
     return "Check out a branch before syncing with the default branch.";
   if (!index.remote) return "No remote configured for this checkout.";
@@ -93,6 +93,8 @@ const syncInFlight = new Set<string>();
  * not all normalized the same way; a subdirectory spelling can still
  * slip through (the backend guard catches that case as a refusal). */
 export function acquireSyncSlot(cwd: string): (() => void) | undefined {
+  // "" would key to "/" — never let a pathological cwd claim it.
+  if (!cwd || cwd === "~") return undefined;
   const key = pathKey(cwd);
   if (syncInFlight.has(key)) return undefined;
   syncInFlight.add(key);
@@ -236,14 +238,16 @@ export async function offerMergeResolution(
     });
     return;
   }
-  const liveOp = live ? opLabel(live.op) : opLabel(op);
+  // A failed read still offers the abort — but names no operation rather
+  // than guessing this flow's op for whatever is actually in progress.
+  const liveOp = live ? `the ${opLabel(live.op).toLowerCase()}` : "the operation";
   if (
     await ask(
-      `Keep the conflicts in the tree, or abort the ${liveOp.toLowerCase()} and restore the previous state?`,
+      `Keep the conflicts in the tree, or abort ${liveOp} and restore the previous state?`,
       {
         title,
         kind: "warning",
-        okLabel: `Abort ${liveOp}`,
+        okLabel: live ? `Abort ${opLabel(live.op)}` : "Abort",
         cancelLabel: "Keep conflicts",
       },
     )

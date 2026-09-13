@@ -583,13 +583,16 @@ impl Bridge {
         let mut encoded = Vec::with_capacity(size);
         serde_json::to_writer(&mut encoded, &request).map_err(|e| e.to_string())?;
         encoded.push(b'\n');
-        let deadline = Instant::now() + timeout;
+        // The queue wait is bounded separately — `timeout` budgets the
+        // request's execution; time spent queued behind another command
+        // must not eat it, or a long git op would expire before it starts.
+        let queue_deadline = Instant::now() + REQUEST_TIMEOUT;
         let mut slot = self.io.lock().map_err(|_| "WSL IO lock poisoned")?;
         loop {
             if !self.alive.load(Ordering::SeqCst) {
                 return Err("WSL connection was interrupted. Reconnect the selected distribution; no action was replayed.".into());
             }
-            if Instant::now() >= deadline {
+            if Instant::now() >= queue_deadline {
                 return Err("WSL is busy. This queued action did not start.".into());
             }
             if slot.is_some() {
@@ -597,7 +600,10 @@ impl Bridge {
             }
             slot = self
                 .available
-                .wait_timeout(slot, deadline.saturating_duration_since(Instant::now()))
+                .wait_timeout(
+                    slot,
+                    queue_deadline.saturating_duration_since(Instant::now()),
+                )
                 .map_err(|_| "WSL IO lock poisoned")?
                 .0;
         }
@@ -605,7 +611,8 @@ impl Bridge {
         drop(slot);
         let (done, waiting) = mpsc::channel();
         let process = self.process.clone();
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        // The execution budget starts now that the channel is ours.
+        let remaining = timeout;
         let watchdog = std::thread::spawn(move || {
             if waiting.recv_timeout(remaining).is_err() {
                 let _ = process

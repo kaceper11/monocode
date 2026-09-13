@@ -1197,6 +1197,7 @@ function ChangedFiles({
         mutated();
     } catch (error) {
       fail(error);
+      mutated();
     } finally {
       setBusy(null);
     }

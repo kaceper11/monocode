@@ -87,9 +87,9 @@ export type GitDiffIndex = {
   ahead: number;
   behind: number;
   aheadOfDefault: number;
-  /** A merge, rebase, cherry-pick or revert is in progress. */
+  /** A merge, rebase, patch apply (`git am`), cherry-pick or revert is in progress. */
   opInProgress: boolean;
-  /** "merge" | "rebase" | "cherry-pick" | "revert" — "" when none. */
+  /** "merge" | "rebase" | "am" | "cherry-pick" | "revert" — "" when none. */
   op: string;
   /** Unmerged paths while an operation is in progress (bounded). */
   conflicts: string[];
@@ -270,7 +270,7 @@ export function gitUpdateFromDefault(
   });
 }
 
-/** Abort an in-progress merge or rebase, leaving the checkout clean. */
+/** Abort an in-progress merge, rebase, `git am`, cherry-pick or revert, leaving the checkout clean. */
 export function gitMergeAbort(cwd: string): Promise<void> {
   return invoke<void>("git_merge_abort", { cwd });
 }
@@ -306,9 +306,9 @@ export function gitSyncBranch(
 }
 
 export type GitMergeContext = {
-  /** A merge, rebase, cherry-pick or revert is in progress. */
+  /** A merge, rebase, patch apply (`git am`), cherry-pick or revert is in progress. */
   merging: boolean;
-  /** "merge" | "rebase" | "cherry-pick" | "revert" — "" when none. */
+  /** "merge" | "rebase" | "am" | "cherry-pick" | "revert" — "" when none. */
   op: string;
   /** Unmerged paths (bounded). */
   conflicts: string[];

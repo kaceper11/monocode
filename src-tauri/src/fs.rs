@@ -241,10 +241,11 @@ pub struct GitDiffIndex {
     pub ahead: i64,
     pub behind: i64,
     pub ahead_of_default: i64,
-    /// A merge, rebase, cherry-pick or revert is in progress — conflicts or
-    /// not, the checkout is mid-operation and must not be synced.
+    /// A merge, rebase, patch apply (`git am`), cherry-pick or revert is
+    /// in progress — conflicts or not, the checkout is mid-operation and
+    /// must not be synced.
     pub op_in_progress: bool,
-    /// "merge" | "rebase" | "cherry-pick" | "revert" — "" when none.
+    /// "merge" | "rebase" | "am" | "cherry-pick" | "revert" — "" when none.
     pub op: String,
     /// Unmerged paths while an operation is in progress (bounded).
     pub conflicts: Vec<String>,
@@ -595,9 +596,10 @@ pub async fn git_sync_branch(
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitMergeContext {
-    /// A merge, rebase, cherry-pick or revert is in progress.
+    /// A merge, rebase, patch apply (`git am`), cherry-pick or revert is in
+    /// progress.
     pub merging: bool,
-    /// "merge" | "rebase" | "cherry-pick" | "revert" — "" when none.
+    /// "merge" | "rebase" | "am" | "cherry-pick" | "revert" — "" when none.
     pub op: String,
     /// Unmerged paths (bounded).
     pub conflicts: Vec<String>,
@@ -722,10 +724,7 @@ fn git_op_state_uncached(root: &Path) -> GitOpState {
     // mid-run `git am` carry neither REBASE_HEAD nor a current patch.
     let rebase_head = head("REBASE_HEAD");
     let dir = GitDir::resolve(root);
-    let (merge_dir, apply_dir) = dir
-        .as_ref()
-        .map(git_rebase_dirs)
-        .unwrap_or_default();
+    let (merge_dir, apply_dir) = dir.as_ref().map(git_rebase_dirs).unwrap_or_default();
     if rebase_head.is_some() || merge_dir || apply_dir {
         // `git am` shares rebase-apply but is a different operation — the
         // `applying` marker distinguishes it, and it aborts differently.
@@ -797,6 +796,17 @@ fn git_op_cache_forget(root: &Path) {
     }
 }
 
+/// A killed fetch/merge can orphan `*.lock` files — ref locks,
+/// packed-refs.lock, index.lock, shallow.lock. The next git command then
+/// fails on the lock, not the operation; say what to remove.
+fn git_lock_hint(error: String) -> String {
+    if error.contains(".lock") || error.contains("Unable to create") {
+        format!("{error} — a previous git process may have been killed; remove the stale lock in the repository's .git directory and retry.")
+    } else {
+        error
+    }
+}
+
 /// Abort whichever git operation is in progress; error when nothing is.
 fn git_abort_in_progress(root: &Path) -> Result<(), String> {
     let result = git_abort_in_progress_inner(root);
@@ -805,34 +815,32 @@ fn git_abort_in_progress(root: &Path) -> Result<(), String> {
 }
 
 fn git_abort_in_progress_inner(root: &Path) -> Result<(), String> {
-    if git_stdout(root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_some() {
-        return git_checked(root, &["merge", "--abort"]);
-    }
-    // Rebase before the sequencer heads: a rebase stopped on a pick can
-    // also carry CHERRY_PICK_HEAD, and `cherry-pick --abort` would error
-    // while the rebase stays wedged — it must be aborted as a rebase.
-    // `git am` shares the rebase-apply dir but needs `am --abort`.
-    let dir = GitDir::resolve(root);
-    let (merge_dir, apply_dir) = dir
-        .as_ref()
-        .map(git_rebase_dirs)
-        .unwrap_or_default();
-    if git_stdout(root, &["rev-parse", "-q", "--verify", "REBASE_HEAD"]).is_some()
-        || merge_dir
-        || apply_dir
-    {
-        if apply_dir && !merge_dir && dir.as_ref().is_some_and(git_rebase_apply_is_am) {
-            return git_checked(root, &["am", "--abort"]);
+    // Detection lives in one place — `git_op_state_uncached` orders the
+    // probes (rebase before the sequencer heads, `am` via the `applying`
+    // marker) and the same ordering picks the abort command.
+    let args: &[&str] = match git_op_state_uncached(root).op {
+        "merge" => &["merge", "--abort"],
+        "am" => &["am", "--abort"],
+        "rebase" => &["rebase", "--abort"],
+        "cherry-pick" => &["cherry-pick", "--abort"],
+        "revert" => &["revert", "--abort"],
+        _ => {
+            return Err("No merge, rebase, patch apply, cherry-pick or revert in progress.".into())
         }
-        return git_checked(root, &["rebase", "--abort"]);
-    }
-    if git_stdout(root, &["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"]).is_some() {
-        return git_checked(root, &["cherry-pick", "--abort"]);
-    }
-    if git_stdout(root, &["rev-parse", "-q", "--verify", "REVERT_HEAD"]).is_some() {
-        return git_checked(root, &["revert", "--abort"]);
-    }
-    Err("No merge, rebase, cherry-pick or revert in progress.".into())
+    };
+    git_checked(root, args).map_err(|error| {
+        // A crashed operation can leave rebase-merge/rebase-apply state
+        // behind — detection keeps reporting it while git says nothing is
+        // running; say how to clear it rather than looping on the banner.
+        if error.contains("no rebase in progress")
+            || error.contains("No rebase in progress")
+            || error.contains("not in progress")
+        {
+            format!("{error} — the operation state looks stale; remove the rebase-merge/rebase-apply state in the repository's .git directory.")
+        } else {
+            error
+        }
+    })
 }
 
 /// One merge-into-checkout run per working copy across `git_sync_branch`,
@@ -1044,31 +1052,35 @@ fn git_dir_entry_mtime(dir: &GitDir, name: &str) -> Option<SystemTime> {
 }
 
 /// True only when the operation in progress is provably the one this run
-/// just started — a merge of ours records the FETCH_HEAD we fetched as
+/// just started — a merge of ours records the pinned `fetched` SHA as
 /// MERGE_HEAD, a rebase of ours records it as the onto commit, and the
-/// marker file must be no older than `started` (a same-commit op begun by
-/// the user in the fetch window is foreign — left alone). Anything else
-/// belongs to the user and must be left untouched.
-fn git_own_op_in_progress(root: &Path, mode: &str, started: SystemTime) -> bool {
+/// marker file must be no older than FETCH_HEAD itself (a same-commit op
+/// begun by the user before our fetch wrote its marker earlier — foreign,
+/// left alone). Comparing against FETCH_HEAD's mtime keeps the whole check
+/// on one clock and one filesystem — a WSL guest's drifted clock or a
+/// coarse host filesystem can't flip the answer. Residual: a foreign op on
+/// the same commit started *after* our fetch is indistinguishable and is
+/// treated as ours. Anything else belongs to the user and is untouched.
+fn git_own_op_in_progress(root: &Path, mode: &str, fetched: &str) -> bool {
     let verify = |name: &str| git_stdout(root, &["rev-parse", "-q", "--verify", name]);
-    let Some(fetched) = verify("FETCH_HEAD") else {
-        return false;
-    };
     let Some(dir) = GitDir::resolve(root) else {
         return false;
     };
+    let Some(fetch_mtime) = git_dir_entry_mtime(&dir, "FETCH_HEAD") else {
+        return false;
+    };
     if mode == "merge" {
-        verify("MERGE_HEAD").as_deref() == Some(fetched.as_str())
+        verify("MERGE_HEAD").as_deref() == Some(fetched)
             && git_dir_entry_mtime(&dir, "MERGE_HEAD")
-                .map(|mtime| mtime >= started)
+                .map(|mtime| mtime >= fetch_mtime)
                 .unwrap_or(false)
     } else {
-        git_rebase_onto(&dir).as_deref() == Some(fetched.as_str())
+        git_rebase_onto(&dir).as_deref() == Some(fetched)
             && ["rebase-merge/onto", "rebase-apply/onto"]
                 .iter()
                 .any(|name| {
                     git_dir_entry_mtime(&dir, name)
-                        .map(|mtime| mtime >= started)
+                        .map(|mtime| mtime >= fetch_mtime)
                         .unwrap_or(false)
                 })
     }
@@ -1093,7 +1105,7 @@ fn git_merge_incoming(
     }
     if git_op_in_progress(root) {
         return Ok(GitMergeOutcome::refused(
-            "A merge, rebase, or cherry-pick is already in progress. Resolve or abort it first.",
+            "A merge, rebase, patch apply, cherry-pick or revert is already in progress. Resolve or abort it first.",
         ));
     }
     let Some(branch) = git_head_branch(root) else {
@@ -1182,6 +1194,11 @@ fn git_merge_incoming(
             }
         },
     };
+    // A remote picked by prefix matching also becomes `git fetch` argv —
+    // apply the same leading-dash/plus refusal as the default remote.
+    if fetch_remote.starts_with('-') || fetch_remote.starts_with('+') {
+        return Ok(GitMergeOutcome::refused("The remote name is not usable."));
+    }
     // No pathspec — a checkout rooted below the repository root must still
     // refuse when files elsewhere in the worktree are dirty. The flag keeps
     // a `status.showUntrackedFiles=no` user config from hiding changes.
@@ -1206,11 +1223,70 @@ fn git_merge_incoming(
         root,
         &["fetch", &fetch_remote, &base_name],
         GIT_FETCH_TIMEOUT,
-    )?;
-    // The fetch window is long — re-verify before merging: an operation
-    // started in a terminal meanwhile must not be absorbed or unwound, the
-    // confirmed branch may have moved, and the owning agent may have
-    // dirtied the tree — the contract refuses to merge into any of those.
+    )
+    .map_err(git_lock_hint)?;
+    // Custom fetch refspecs can leave `remote/base` stale or missing —
+    // FETCH_HEAD always names the commit this fetch wrote. Pin it to a SHA
+    // immediately: FETCH_HEAD is rewritten by every fetch/pull, and a
+    // foreign one landing between our fetch and merge must never change
+    // what we merge.
+    let synced_with = format!("{fetch_remote}/{base_name}");
+    let Some(fetched) = git_stdout(
+        root,
+        &["rev-parse", "-q", "--verify", "FETCH_HEAD^{commit}"],
+    ) else {
+        return Err(format!(
+            "git fetch {fetch_remote} {base_name} produced no FETCH_HEAD — cannot verify what was fetched; nothing was merged."
+        ));
+    };
+    // On an unborn branch HEAD does not resolve and the rev-list range
+    // fails; the merge still fast-forwards, exactly like `git pull` into an
+    // empty clone.
+    let head_exists = git_stdout(root, &["rev-parse", "-q", "--verify", "HEAD"]).is_some();
+    let incoming = if head_exists {
+        format!("HEAD..{fetched}")
+    } else {
+        fetched.clone()
+    };
+    if head_exists {
+        // Count incoming commits directly so a rev-list failure is an
+        // error, never a false "0 behind".
+        let behind = git_stdout(root, &["rev-list", "--count", &incoming])
+            .and_then(|text| text.parse::<i64>().ok());
+        let Some(behind) = behind else {
+            return Err(format!(
+                "Cannot compare {branch} with the fetched {synced_with} — nothing was merged."
+            ));
+        };
+        if behind <= 0 {
+            return Ok(GitMergeOutcome {
+                outcome: "up-to-date",
+                branch,
+                synced_with,
+                commits: Vec::new(),
+                commit_count: 0,
+                conflicts: Vec::new(),
+                reason: String::new(),
+            });
+        }
+    }
+    let commits = git_run(root, &["log", "--format=%s", "-n", "50", &incoming])
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| line.chars().take(200).collect::<String>())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let commit_count = git_stdout(root, &["rev-list", "--count", &incoming])
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(commits.len() as i64);
+    // The fetch window is long — re-verify right before merging: an
+    // operation started in a terminal meanwhile must not be absorbed or
+    // unwound, the confirmed branch may have moved, and the owning agent
+    // may have dirtied the tree — the contract refuses to merge into any
+    // of those.
     if git_op_in_progress(root) {
         return Ok(GitMergeOutcome::refused(
             "An operation started in this working copy while fetching — nothing was merged. Resolve or abort it, then sync again.",
@@ -1228,62 +1304,19 @@ fn git_merge_incoming(
             if dirty == 1 { "" } else { "s" }
         )));
     }
-    // Custom fetch refspecs can leave `remote/base` stale or missing —
-    // FETCH_HEAD always names the commit this fetch wrote.
-    let synced_with = format!("{fetch_remote}/{base_name}");
-    // On an unborn branch HEAD does not resolve and the rev-list range
-    // fails; the merge still fast-forwards, exactly like `git pull` into an
-    // empty clone.
-    let head_exists = git_stdout(root, &["rev-parse", "-q", "--verify", "HEAD"]).is_some();
-    // A missing/corrupt FETCH_HEAD makes the rev-list below fail and would
-    // otherwise read as "0 behind" — a false up-to-date. Require it to
-    // resolve before trusting any comparison or running the merge.
-    if git_stdout(root, &["rev-parse", "-q", "--verify", "FETCH_HEAD"]).is_none() {
-        return Err(format!(
-            "git fetch {fetch_remote} {base_name} produced no FETCH_HEAD — cannot verify what was fetched; nothing was merged."
-        ));
-    }
-    let incoming = if head_exists {
-        "HEAD..FETCH_HEAD"
-    } else {
-        "FETCH_HEAD"
-    };
-    if head_exists && git_ahead_behind(root, "FETCH_HEAD").1 <= 0 {
-        return Ok(GitMergeOutcome {
-            outcome: "up-to-date",
-            branch,
-            synced_with,
-            commits: Vec::new(),
-            commit_count: 0,
-            conflicts: Vec::new(),
-            reason: String::new(),
-        });
-    }
-    let commits = git_run(root, &["log", "--format=%s", "-n", "50", incoming])
-        .map(|text| {
-            text.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(|line| line.chars().take(200).collect::<String>())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let commit_count = git_stdout(root, &["rev-list", "--count", incoming])
-        .and_then(|text| text.parse().ok())
-        .unwrap_or(commits.len() as i64);
     // `--no-autostash` overrides a user's merge.autoStash/rebase.autoStash
-    // — the contract is to refuse a dirty tree, never to stash one.
-    let merge_started = SystemTime::now();
+    // — the contract is to refuse a dirty tree, never to stash one. The
+    // pinned SHA is merged, not the FETCH_HEAD name.
     let result = if mode == "merge" {
         git_command_output_bounded(
             root,
-            &["merge", "--no-edit", "--no-autostash", "FETCH_HEAD"],
+            &["merge", "--no-edit", "--no-autostash", &fetched],
             GIT_MERGE_TIMEOUT,
         )
     } else {
         git_command_output_bounded(
             root,
-            &["rebase", "--no-autostash", "FETCH_HEAD"],
+            &["rebase", "--no-autostash", &fetched],
             GIT_MERGE_TIMEOUT,
         )
     };
@@ -1328,7 +1361,7 @@ fn git_merge_incoming(
         // started is unwound to a clean tree. An operation someone else
         // started is reported and left alone — never auto-aborted.
         let detail = String::from_utf8_lossy(&result.stderr).trim().to_string();
-        if git_own_op_in_progress(root, mode, merge_started) {
+        if git_own_op_in_progress(root, mode, &fetched) {
             let _ = git_abort_in_progress(root);
             return Err(if detail.is_empty() {
                 format!("git {mode} {synced_with} failed — aborted to a clean tree")
@@ -1339,7 +1372,7 @@ fn git_merge_incoming(
         return Err(if detail.is_empty() {
             format!("git {mode} {synced_with} failed")
         } else {
-            detail
+            git_lock_hint(detail)
         });
     }
     Ok(GitMergeOutcome {
@@ -1353,8 +1386,8 @@ fn git_merge_incoming(
     })
 }
 
-/// Abort an in-progress merge, rebase, cherry-pick or revert, leaving the
-/// checkout clean.
+/// Abort an in-progress merge, rebase, `git am`, cherry-pick or revert,
+/// leaving the checkout clean.
 #[tauri::command]
 pub async fn git_merge_abort(cwd: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || git_merge_abort_for(&expand_home(&cwd)))
@@ -1374,15 +1407,7 @@ fn git_merge_abort_for(root: &Path) -> Result<(), String> {
     if !git_is_work_tree(root) {
         return Err("Not a git repository".into());
     }
-    git_abort_in_progress(root).map_err(|error| {
-        // A killed fetch/merge can orphan index.lock — the abort then
-        // fails on the lock, not the operation; say what to remove.
-        if error.contains("index.lock") {
-            format!("{error} — a previous git process may have been killed; remove the stale lock in the repository's .git directory and retry.")
-        } else {
-            error
-        }
-    })
+    git_abort_in_progress(root).map_err(git_lock_hint)
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -2865,7 +2890,11 @@ fn git_commit_for(root: &Path, message: &str) -> Result<(), String> {
     if message.is_empty() {
         return Err("Commit message cannot be empty".into());
     }
-    git_checked(root, &["commit", "--cleanup=strip", "-m", message])
+    let result = git_checked(root, &["commit", "--cleanup=strip", "-m", message]);
+    // Committing during a merge concludes it — the poll cache would
+    // otherwise report an in-progress operation for up to its TTL.
+    git_op_cache_forget(root);
+    result
 }
 
 fn git_push_for(root: &Path) -> Result<(), String> {
@@ -7838,10 +7867,13 @@ mod tests {
             || !commit_file(&work.0, "f.txt", "a\nB-feat\nc\n", "feat change")
             || !commit_file(&remote.0, "f.txt", "a\nB-main\nc\n", "main change")
             || !git(&work.0, &["fetch", "origin", "main"])
-            || git(&work.0, &["merge", "--no-edit", "FETCH_HEAD"])
         {
             return;
         }
+        assert!(
+            !git(&work.0, &["merge", "--no-edit", "FETCH_HEAD"]),
+            "the fixture merge must conflict to leave an in-progress state"
+        );
         assert!(git_op_in_progress(&work.0));
         let blocked = git_merge_incoming(&work.0, "merge", None, None).unwrap();
         assert_eq!(blocked.outcome, "refused");
@@ -8045,32 +8077,42 @@ mod tests {
         };
         assert_ne!(head, other);
         let git_dir = work.0.join(".git");
-        // `started` precedes the fixture writes, like a real run's
-        // timestamp precedes its own merge — a marker older than the run
-        // (a same-commit op the user started first) is never ours.
-        let started = SystemTime::now() - Duration::from_secs(5);
-        let future = SystemTime::now() + Duration::from_secs(60);
-        // A foreign merge records a MERGE_HEAD that is not the FETCH_HEAD
-        // this run fetched — it must never be aborted by us.
-        std::fs::write(git_dir.join("MERGE_HEAD"), format!("{head}\n")).unwrap();
-        assert!(!git_own_op_in_progress(&work.0, "merge", started));
-        // The merge this run started: MERGE_HEAD is exactly FETCH_HEAD and
-        // was written inside the run's window.
+        // The marker must match the pinned fetched SHA and be no older
+        // than FETCH_HEAD itself — a marker written before this run's
+        // fetch is a same-commit op someone else started (foreign).
+        let older = SystemTime::now() - Duration::from_secs(60);
+        let set_older = |path: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(older)
+                .unwrap();
+        };
+        // A foreign merge records a MERGE_HEAD that is not the commit this
+        // run fetched — it must never be aborted by us.
         std::fs::write(git_dir.join("FETCH_HEAD"), format!("{other}\n")).unwrap();
+        std::fs::write(git_dir.join("MERGE_HEAD"), format!("{head}\n")).unwrap();
+        assert!(!git_own_op_in_progress(&work.0, "merge", &other));
+        // The merge this run started: MERGE_HEAD is the pinned SHA and was
+        // written after this run's FETCH_HEAD.
         std::fs::write(git_dir.join("MERGE_HEAD"), format!("{other}\n")).unwrap();
-        assert!(git_own_op_in_progress(&work.0, "merge", started));
-        assert!(!git_own_op_in_progress(&work.0, "merge", future));
+        assert!(git_own_op_in_progress(&work.0, "merge", &other));
+        // A same-commit marker older than FETCH_HEAD is foreign.
+        set_older(&git_dir.join("MERGE_HEAD"));
+        assert!(!git_own_op_in_progress(&work.0, "merge", &other));
         // A foreign rebase (onto a different base) is never ours to abort —
-        // `git rebase FETCH_HEAD` records the fetched commit as its onto.
+        // `git rebase <sha>` records the fetched commit as its onto.
         std::fs::remove_file(git_dir.join("MERGE_HEAD")).unwrap();
-        assert!(!git_own_op_in_progress(&work.0, "merge", started));
+        assert!(!git_own_op_in_progress(&work.0, "merge", &other));
         let rebase_merge = git_dir.join("rebase-merge");
         std::fs::create_dir_all(&rebase_merge).unwrap();
         std::fs::write(rebase_merge.join("onto"), format!("{head}\n")).unwrap();
-        assert!(!git_own_op_in_progress(&work.0, "rebase", started));
+        assert!(!git_own_op_in_progress(&work.0, "rebase", &other));
         std::fs::write(rebase_merge.join("onto"), format!("{other}\n")).unwrap();
-        assert!(git_own_op_in_progress(&work.0, "rebase", started));
-        assert!(!git_own_op_in_progress(&work.0, "rebase", future));
+        assert!(git_own_op_in_progress(&work.0, "rebase", &other));
+        set_older(&rebase_merge.join("onto"));
+        assert!(!git_own_op_in_progress(&work.0, "rebase", &other));
         let _ = git_abort_in_progress(&work.0);
     }
 
@@ -8125,9 +8167,10 @@ mod tests {
         }
 
         // Cherry-pick conflict: detected, labeled, and abortable.
-        if git(&tmp.0, &["cherry-pick", &theirs]) {
-            return; // needs a real conflict
-        }
+        assert!(
+            !git(&tmp.0, &["cherry-pick", &theirs]),
+            "the pick must conflict — the fixture changes the same line"
+        );
         let state = git_op_state_uncached(&tmp.0);
         assert_eq!(state.op, "cherry-pick");
         let expected = git_stdout(&tmp.0, &["rev-parse", "--short", &theirs]);
@@ -8139,9 +8182,10 @@ mod tests {
         assert_eq!(git_op_state_uncached(&tmp.0).op, "");
 
         // Revert conflict: same coverage.
-        if git(&tmp.0, &["revert", "--no-edit", &theirs2]) {
-            return;
-        }
+        assert!(
+            !git(&tmp.0, &["revert", "--no-edit", &theirs2]),
+            "the revert must conflict — the fixture changes the same line"
+        );
         let state = git_op_state_uncached(&tmp.0);
         assert_eq!(state.op, "revert");
         let expected = git_stdout(&tmp.0, &["rev-parse", "--short", &theirs2]);

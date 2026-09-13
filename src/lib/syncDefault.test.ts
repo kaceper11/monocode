@@ -311,6 +311,7 @@ it("aborts only after a second explicit confirm when send is declined", async ()
     if (command === "git_diff_index") return cleanIndex;
     if (command === "git_sync_branch")
       return syncResult({ outcome: "conflicted", conflicts: ["a.ts"] });
+    if (command === "git_merge_context") return mergeContext({});
     if (command === "git_merge_abort") return "aborted";
     return null;
   });
@@ -548,6 +549,78 @@ it("keeps the slot held while the conflict resolution dialog is open", async () 
   // Declining send opens the keep/abort ask — answer "keep".
   vi.mocked(ask).mockResolvedValueOnce(false);
   await first;
+});
+
+it("releases the slot once the flow finishes", async () => {
+  mockInvoke((command) => {
+    if (command === "git_diff_index") return cleanIndex;
+    if (command === "git_sync_branch")
+      return syncResult({ outcome: "up-to-date" });
+    return null;
+  });
+  await syncWithDefaultBranch({ cwd: "/repo" });
+  // The same working copy must sync again — a leaked slot would refuse.
+  expect(await syncWithDefaultBranch({ cwd: "/repo" })).toEqual(
+    expect.objectContaining({ outcome: "up-to-date" }),
+  );
+});
+
+it("releases the slot even when the sync throws", async () => {
+  mockInvoke((command) => {
+    if (command === "git_diff_index") return cleanIndex;
+    if (command === "git_sync_branch") throw new Error("bridge down");
+    return null;
+  });
+  await expect(syncWithDefaultBranch({ cwd: "/repo" })).rejects.toThrow(
+    "bridge down",
+  );
+  // A second attempt must not report "already running".
+  mockInvoke((command) => {
+    if (command === "git_diff_index") return cleanIndex;
+    if (command === "git_sync_branch")
+      return syncResult({ outcome: "up-to-date" });
+    return null;
+  });
+  expect(await syncWithDefaultBranch({ cwd: "/repo" })).toEqual(
+    expect.objectContaining({ outcome: "up-to-date" }),
+  );
+});
+
+it("does not block syncs on other working copies", async () => {
+  let resolveFirst: ((value: boolean) => void) | undefined;
+  vi.mocked(ask)
+    .mockImplementationOnce(
+      () => new Promise((resolve) => (resolveFirst = resolve)),
+    )
+    .mockResolvedValueOnce(true);
+  mockInvoke((command) => {
+    if (command === "git_diff_index") return cleanIndex;
+    if (command === "git_sync_branch")
+      return syncResult({ outcome: "up-to-date" });
+    return null;
+  });
+  const first = syncWithDefaultBranch({ cwd: "/repo-a" });
+  await vi.waitFor(() => expect(vi.mocked(ask)).toHaveBeenCalledTimes(1));
+  // A different working copy proceeds while /repo-a waits on its confirm.
+  expect(await syncWithDefaultBranch({ cwd: "/repo-b" })).toEqual(
+    expect.objectContaining({ outcome: "up-to-date" }),
+  );
+  resolveFirst?.(false);
+  await first;
+});
+
+it("propagates a failed context read out of the resolution flow", async () => {
+  vi.mocked(ask).mockResolvedValueOnce(true).mockResolvedValueOnce(true);
+  mockInvoke((command) => {
+    if (command === "git_diff_index") return cleanIndex;
+    if (command === "git_sync_branch")
+      return syncResult({ outcome: "conflicted", conflicts: ["a.ts"] });
+    if (command === "git_merge_context") throw new Error("bridge down");
+    return null;
+  });
+  await expect(syncWithDefaultBranch({ cwd: "/repo" })).rejects.toThrow(
+    "bridge down",
+  );
 });
 
 it("labels the abort confirm generically when the state read fails", async () => {
