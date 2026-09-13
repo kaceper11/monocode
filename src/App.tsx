@@ -8214,6 +8214,7 @@ export default function App({
             onNew={onNew}
             onNewTerminal={onNewTerminal}
             onShowTerminal={onShowProjectTerminal}
+            onOpenBrowser={() => onOpenBrowser("")}
             projectTerminalActive={
               !!currentProjectDock && currentProjectDock.pane.files.length > 0
             }
