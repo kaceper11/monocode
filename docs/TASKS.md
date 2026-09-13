@@ -106,6 +106,25 @@ that touch disjoint repositories, keep today's output.
   the session is rooted at a host checkout and the prompt lists every child;
   per-attempt session UX is a later slice, not hidden in this model.
 
+## Discovery and details surfaces
+
+- `taskMatchesQuery` is the one rail/search filter — name, ticket fields
+  (identifier/title/url, including `additionalItems`), brief, repository
+  display names, working copies, branches, merge targets, responsibilities
+  and attempt labels, all from already-loaded records. The Tasks rail shows
+  every live and archived match while filtering (the rail cap is suspended);
+  the global ⌘K search exposes the same records as `task` hits under a Tasks
+  scope. Selecting a task row never retints unrelated repository rows.
+- **Task details** (`src/chrome/TaskDetails.tsx`, `OPEN_TASK_DETAILS` event)
+  is a read-only rollup opened from the task row's menu, the scope chip and
+  ⌘K results: deduped tickets (task ticket, `additionalItems` and
+  session-linked work items), per-repository working copies with launch
+  state and delivery badges, saved PR links (Azure associations, the cached
+  GitHub branch PR, `taskPrs` drafts/results) and CI sources, and the task's
+  conversations resolved against sidebar history. It renders saved/cached
+  state only — no Git or provider fetch — and external links are opened
+  after an http(s) check.
+
 ## Verification
 
 `npx vitest run src/lib/taskWorkspaces.test.ts` covers attempt

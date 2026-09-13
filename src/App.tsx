@@ -24,7 +24,10 @@ import {
   type AttentionAction,
   type AttentionItem,
 } from "./lib/attention";
-import { deriveLocalAttention } from "./lib/attentionSources";
+import {
+  deriveLocalAttention,
+  worktreeCleanupAttention,
+} from "./lib/attentionSources";
 import {
   ciRepair,
   commentsRepair,
@@ -81,6 +84,7 @@ import { WhatsNewDialog } from "./chrome/WhatsNewDialog";
 import { TitleBar, type Tab as TitleTab } from "./chrome/TitleBar";
 import { MenuBar } from "./chrome/MenuBar";
 import { FilePicker } from "./chrome/FilePicker";
+import { LinkChoiceMenu } from "./chrome/LinkChoiceMenu";
 import { UsageFooter } from "./chrome/UsageFooter";
 import { useProjectBranches } from "./hooks/useProjectBranches";
 import {
@@ -142,6 +146,7 @@ import {
   leafIds,
   movePane,
   neighborLeafId,
+  newBrowserTab,
   newFileTab,
   newPlanTab,
   newTab,
@@ -159,8 +164,10 @@ import {
   siblingLeafId,
   splitPane,
   surfacePanes,
+  updateBrowserTab,
   updateTerminalTab,
   withSurfacePanes,
+  type BrowserMetaPatch,
   type EditorPane,
   type FilePaneTab,
   type FocusDir,
@@ -168,6 +175,13 @@ import {
   type SplitDir,
   type WorkspaceTab,
 } from "./lib/layout";
+import {
+  browserTabLabel,
+  isBrowserOpenRequest,
+  normalizeBrowserUrl,
+  OPEN_BROWSER_EVENT,
+  rememberedBrowserUrl,
+} from "./lib/browser";
 import { releaseNotesForVersion, releaseNotesTitle } from "./lib/releaseNotes";
 import { mergeOrderedSubset, orderByIds } from "./lib/reorder";
 import {
@@ -302,13 +316,17 @@ import {
 } from "./lib/paths";
 import { removeProjectData } from "./lib/projectData";
 import { TaskCreateSheet } from "./chrome/TaskCreateSheet";
+import { TaskDetails } from "./chrome/TaskDetails";
 import { TaskPrSheet } from "./chrome/TaskPrSheet";
+import { Modal } from "./chrome/Modal";
+import { WorktreePanel } from "./chrome/WorktreePicker";
 import {
   addTaskChildren,
   composeTaskPrompt,
   composeTaskSessionPrompt,
   linkTicketToTask,
   loadTaskWorkspaces,
+  OPEN_TASK_DETAILS,
   markTaskChildLaunching,
   preferredTaskChild,
   projectForTask,
@@ -336,7 +354,13 @@ import {
   subscribeProjects,
   type ProjectRecord,
 } from "./lib/projects";
-import { getVerifiedFamilies } from "./lib/repositoryFamilies";
+import {
+  getVerifiedFamilies,
+  hiddenWorkingCopies,
+  hiddenWorkingCopiesSnapshot,
+  subscribeRepositoryFamilies,
+  subscribeWorkingCopyPreferences,
+} from "./lib/repositoryFamilies";
 import { probeRepositoryFamily } from "./hooks/useRepositoryFamilies";
 import {
   archiveProject,
@@ -369,6 +393,7 @@ import {
   newSession,
   sessionDisplayTitle,
   sessionWorkCwd,
+  harnessSupportsAttachments,
   titleFromPrompt,
   type Attachment,
   type Block,
@@ -1275,6 +1300,9 @@ export default function App({
     );
   activeRef.current = active;
   const sessionDefaults = active ?? sessions[0];
+  const browserOpen = !!activeTab?.editorPanes.some((pane) =>
+    pane.files.some((file) => file.browser),
+  );
   // Saved commands resolve their owning project at open: explicit id → rail
   // path → the active task's project → the current folder's project.
   const commandsProject = !commandsMenu
@@ -2076,7 +2104,13 @@ export default function App({
       return target.id;
     }
     const tickets = request.context.entries.every(entry => !!entry.ticket);
-    let next = tickets ? linkTicketContext(target, context) : prepareSessionContext(target, context, true);
+    const prepared =
+      request.attachmentsOptional &&
+      context.attachments.length &&
+      !harnessSupportsAttachments(target.harness)
+        ? { ...context, attachments: [] }
+        : context;
+    let next = tickets ? linkTicketContext(target, prepared) : prepareSessionContext(target, prepared, true);
     if (existing) {
       const updated = sessionsRef.current.map((session) =>
         session.id === next.id ? next : session,
@@ -2304,22 +2338,6 @@ export default function App({
     onOpenTerminal(active?.cwd ?? projectCwd);
   }, [active?.cwd, onOpenTerminal, projectCwd]);
 
-  const onShowProjectTerminal = useCallback(() => {
-    const dock = findProjectTerminal(projectTerminalsRef.current, projectCwd);
-    if (dock && dock.pane.files.length > 0) {
-      if (!dock.open) {
-        setProjectTerminals((prev) =>
-          mapProjectTerminal(prev, projectCwd, (entry) =>
-            withDockOpen(entry, true),
-          ),
-        );
-      }
-      focusProjectTerminal();
-      return;
-    }
-    onOpenTerminal(active?.cwd ?? projectCwd);
-  }, [active?.cwd, focusProjectTerminal, onOpenTerminal, projectCwd]);
-
   const onNewTerminalInSession = useCallback(
     (sessionId: string) => {
       const session = sessionsRef.current.find(
@@ -2452,6 +2470,15 @@ export default function App({
       setProjectTerminals((prev) => patchProjectTerminals(prev, fileId, patch));
       setTabs((prev) =>
         prev.map((tab) => updateTerminalTab(tab, fileId, patch)),
+      );
+    },
+    [],
+  );
+
+  const onBrowserMetaChange = useCallback(
+    (fileId: string, patch: BrowserMetaPatch) => {
+      setTabs((prev) =>
+        prev.map((tab) => updateBrowserTab(tab, fileId, patch)),
       );
     },
     [],
@@ -4339,6 +4366,112 @@ export default function App({
     [activeTabId, dismissOverlays],
   );
 
+  /** Open (or focus) a browser tab for `url` in the current workspace tab.
+   * `undefined` opens the worktree's remembered page; "" is a deliberate
+   * blank tab (URL-entry state). `cwd` is the worktree the link came from. */
+  const onOpenBrowser = useCallback(
+    (url?: string, cwd?: string, paneId?: string) => {
+      dismissOverlays();
+      const tab = tabsRef.current.find(
+        (entry) => entry.id === activeTabIdRef.current,
+      );
+      if (!tab) return;
+      const source = sessionsRef.current.find(
+        (session) => session.id === tab.focusedId,
+      );
+      const workdir =
+        cwd ||
+        (source ? sessionWorkCwd(source) : activeRef.current?.cwd) ||
+        projectCwdRef.current;
+      // No URL = open the worktree's remembered page directly; only a
+      // deliberately blank request (the toolbar's +) lands on the form.
+      let target = url ?? rememberedBrowserUrl(workdir) ?? "";
+      // Normalize so the dedupe key is canonical (http://x vs http://x/).
+      if (target) {
+        try {
+          target = normalizeBrowserUrl(target);
+        } catch {
+          // Keep the raw value — BrowserView surfaces the parse error.
+        }
+      }
+      const file = newBrowserTab(workdir, target);
+      setTabs((prev) =>
+        prev.map((entry) =>
+          entry.id === tab.id ? openEditorTab(entry, file, paneId) : entry,
+        ),
+      );
+      setComposerFocused(false);
+    },
+    [dismissOverlays],
+  );
+
+  /** Title-bar globe toggle: with no browser open in the active workspace
+   * it opens one (the remembered page); with browsers open it closes them
+   * all. The remembered per-worktree URL restores the last page on the
+   * next open, so toggling off and on brings the browser back. */
+  const onToggleBrowser = useCallback(() => {
+    const tab = tabsRef.current.find(
+      (entry) => entry.id === activeTabIdRef.current,
+    );
+    if (!tab) return;
+    if (
+      !tab.editorPanes.some((pane) => pane.files.some((file) => file.browser))
+    ) {
+      onOpenBrowser();
+      return;
+    }
+    // A tab that is only a lone browser pane — closing the browser is
+    // closing the workspace tab itself.
+    if (
+      leafIds(tab.layout).length === 1 &&
+      tab.editorPanes.length === 1 &&
+      tab.editorPanes[0].files.every((file) => file.browser)
+    ) {
+      onCloseTab(tab.id);
+      return;
+    }
+    let layout = tab.layout;
+    let focusedId = tab.focusedId;
+    const editorPanes = tab.editorPanes.flatMap((pane) => {
+      const files = pane.files.filter((file) => !file.browser);
+      if (files.length > 0) {
+        return [
+          {
+            ...pane,
+            files,
+            activeFileId: files.some((file) => file.id === pane.activeFileId)
+              ? pane.activeFileId
+              : files[0].id,
+          },
+        ];
+      }
+      const sibling = siblingLeafId(layout, pane.id);
+      const without = removePane(layout, pane.id);
+      if (!without) return [pane];
+      layout = without;
+      if (focusedId === pane.id) focusedId = sibling ?? firstLeafId(without);
+      return [];
+    });
+    setTabs((prev) =>
+      prev.map((entry) =>
+        entry.id === tab.id ? { ...entry, layout, focusedId, editorPanes } : entry,
+      ),
+    );
+    setComposerFocused(
+      sessionsRef.current.some((session) => session.id === focusedId),
+    );
+  }, [onCloseTab, onOpenBrowser]);
+
+  useEffect(() => {
+    const listener = (event: Event) => {
+      if (!isBrowserOpenRequest(event)) return;
+      onOpenBrowser(event.detail.url, event.detail.cwd, event.detail.paneId);
+    };
+    window.addEventListener(OPEN_BROWSER_EVENT, listener);
+    return () =>
+      window.removeEventListener(OPEN_BROWSER_EVENT, listener);
+  }, [onOpenBrowser]);
+
   const onOpenPlan = useCallback(
     (sessionId: string, blockId: string) => {
       const tab = tabsRef.current.find((entry) => entry.id === activeTabId);
@@ -5227,6 +5360,16 @@ export default function App({
     window.addEventListener("monocode:open-task-prs", listener);
     return () =>
       window.removeEventListener("monocode:open-task-prs", listener);
+  }, []);
+
+  const [taskDetailsId, setTaskDetailsId] = useState<string | null>(null);
+  useEffect(() => {
+    const listener = (event: Event) => {
+      const taskId = (event as CustomEvent<string>).detail;
+      if (typeof taskId === "string" && taskId) setTaskDetailsId(taskId);
+    };
+    window.addEventListener(OPEN_TASK_DETAILS, listener);
+    return () => window.removeEventListener(OPEN_TASK_DETAILS, listener);
   }, []);
 
   /** True when a task-linked session can still be opened — open now, or
@@ -6859,15 +7002,89 @@ export default function App({
     },
     repairRecordsSafe,
   );
-  const derivedAttention = useMemo(
+  // Family discovery publishes once per probed path — coalesce the startup
+  // burst into one render the same way the rail does.
+  const [verifiedFamilies, setVerifiedFamilies] =
+    useState(getVerifiedFamilies);
+  useEffect(() => {
+    let timer = 0;
+    const unsubscribe = subscribeRepositoryFamilies(() => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(
+        () => setVerifiedFamilies(getVerifiedFamilies()),
+        40,
+      );
+    });
+    return () => {
+      window.clearTimeout(timer);
+      unsubscribe();
+    };
+  }, []);
+  const hiddenWorktreeRaw = useSyncExternalStore(
+    subscribeWorkingCopyPreferences,
+    hiddenWorkingCopiesSnapshot,
+  );
+  const [worktreeManager, setWorktreeManager] = useState<string | null>(null);
+  const [worktreeManagerBusy, setWorktreeManagerBusy] = useState(false);
+  // Live + persisted sessions across every checkout. `sidebarHistory` is
+  // cwd-filtered; task details and worktree staleness must see sessions in
+  // sibling working copies too.
+  const allSessions = useMemo(() => {
+    const byId = new Map<string, SessionSummary>();
+    for (const entry of history) byId.set(entry.id, entry);
+    for (const session of sessions) {
+      if (session.inboxAsk) continue;
+      byId.set(session.id, summaryFromSession(session));
+    }
+    return [...byId.values()];
+  }, [history, sessions]);
+  const worktreeSessionActivity = useMemo(() => {
+    const activity = new Map<string, number>();
+    const touch = (cwd: string | undefined, at: number) => {
+      if (!cwd) return;
+      const key = pathKey(cwd);
+      if ((activity.get(key) ?? 0) < at) activity.set(key, at);
+    };
+    for (const entry of history)
+      touch(entry.worktreeCwd ?? entry.cwd, entry.updatedAt);
+    // An open session counts as activity now — Session carries no updatedAt.
+    for (const session of sessions) touch(sessionWorkCwd(session), Date.now());
+    return activity;
+  }, [history, sessions]);
+  const worktreeAttention = useMemo(
     () =>
-      deriveLocalAttention({
+      worktreeCleanupAttention({
+        families: verifiedFamilies,
+        recents,
+        sessionActivity: worktreeSessionActivity,
+        currentCwd: projectCwd,
+        hidden: hiddenWorkingCopies(hiddenWorktreeRaw),
+      }),
+    [
+      verifiedFamilies,
+      recents,
+      worktreeSessionActivity,
+      projectCwd,
+      hiddenWorktreeRaw,
+    ],
+  );
+  const derivedAttention = useMemo(
+    () => [
+      ...deriveLocalAttention({
         sessions,
         unseenFinishedIds,
         reminders: sessionReminders.due,
         repairs: repairRows,
       }),
-    [sessions, unseenFinishedIds, sessionReminders, repairRows],
+      ...worktreeAttention,
+    ],
+    [
+      sessions,
+      unseenFinishedIds,
+      sessionReminders,
+      repairRows,
+      worktreeAttention,
+    ],
   );
   const attentionItems = useMemo(
     () => visibleAttention(derivedAttention, attentionStore),
@@ -7210,6 +7427,10 @@ export default function App({
           }
           case "reconnect":
             openSettings("inbox", action.source);
+            return;
+          case "open-worktrees":
+            setWorktreeManagerBusy(false);
+            setWorktreeManager(action.cwd);
             return;
           case "open-url":
             await openUrl(action.url);
@@ -7595,6 +7816,7 @@ export default function App({
     onOpenSearch,
     onOpenInbox,
     onOpenNotes,
+    onOpenBrowser,
     pickProject,
     onNewTerminal,
     onNewTerminalTab,
@@ -7622,6 +7844,7 @@ export default function App({
     onOpenSearch,
     onOpenInbox,
     onOpenNotes,
+    onOpenBrowser,
     pickProject,
     onNewTerminal,
     onNewTerminalTab,
@@ -7753,6 +7976,8 @@ export default function App({
           run("prev-project", () => a.onNavigateProjectList(-1));
         else if (cmd === "next-project")
           run("next-project", () => a.onNavigateProjectList(1));
+        else if (cmd === "open-browser")
+          run("open-browser", () => a.onOpenBrowser());
         else if ("focus" in cmd)
           run(`focus-${cmd.focus}`, () => a.onFocusDir(cmd.focus));
         else run(`activate-${cmd.activate}`, () => a.onActivate(cmd.activate));
@@ -7856,6 +8081,7 @@ export default function App({
       listen("open_search", () => actions.current.onOpenSearch()),
       listen("open_inbox", () => actions.current.onOpenInbox()),
       listen("open_notes", () => actions.current.onOpenNotes()),
+      listen("open_browser", () => actions.current.onOpenBrowser()),
       listen<{ section?: string }>("open_settings", ({ payload }) => actions.current.openSettings(isSettingsSectionId(payload?.section) ? payload.section : undefined)),
       listen("check_for_updates", () => {
         void runUpdateFlow(true);
@@ -8102,6 +8328,29 @@ export default function App({
           onClose={() => setScheduleSheet(null)}
         />
       ) : null}
+      {worktreeManager ? (
+        <Modal
+          title="Worktrees"
+          size="sm"
+          className="max-h-[80vh]"
+          // A removal batch must not be dismissed mid-run — the results
+          // screen is where failures surface.
+          onClose={() => {
+            if (!worktreeManagerBusy) setWorktreeManager(null);
+          }}
+        >
+          <WorktreePanel
+            cwd={worktreeManager}
+            activeCwd={projectCwd}
+            onClose={() => setWorktreeManager(null)}
+            onOpen={(path) => {
+              setWorktreeManager(null);
+              onSelectProject(path);
+            }}
+            onBusyChange={setWorktreeManagerBusy}
+          />
+        </Modal>
+      ) : null}
       {wslPickerOpen && <WslProjectDialog cwd={projectCwd} onOpen={selectProject} onClose={() => setWslPickerOpen(false)} />}
       {taskSheet && (
         <TaskCreateSheet
@@ -8186,6 +8435,16 @@ export default function App({
           onClose={() => setTaskPrSheetTaskId(null)}
         />
       )}
+      {taskDetailsId ? (
+        <TaskDetails
+          taskId={taskDetailsId}
+          sessions={allSessions}
+          onClose={() => setTaskDetailsId(null)}
+          onOpenSession={(sessionId) => void onSelectHistorySession(sessionId)}
+          onOpenChild={(taskId, childId) => void onOpenTaskChild(taskId, childId)}
+          onEdit={onEditTask}
+        />
+      ) : null}
       <div className="body-glass flex min-h-0 min-w-0 flex-1 flex-col">
         {wslOpening && (
           <div role={wslOpening.error ? "alert" : "status"} className="flex shrink-0 items-center gap-3 border-b border-content/10 px-4 py-2 text-[12px]">
@@ -8255,9 +8514,13 @@ export default function App({
             onSelect={activateTab}
             onNew={onNew}
             onNewTerminal={onNewTerminal}
-            onShowTerminal={onShowProjectTerminal}
-            projectTerminalActive={
-              !!currentProjectDock && currentProjectDock.pane.files.length > 0
+            onShowTerminal={onToggleProjectTerminal}
+            onOpenBrowser={onToggleBrowser}
+            browserActive={browserOpen}
+            projectTerminalActive={dockVisible}
+            projectTerminalExists={
+              !!currentProjectDock &&
+              currentProjectDock.pane.files.length > 0
             }
             onOpenSettings={onOpenSettings}
             onOpenInbox={onOpenInbox}
@@ -8332,7 +8595,13 @@ export default function App({
                       <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
                         <PaneTree
                           {...sessionPaneProps}
-                          visible={tab.id === activeTabId && !inboxViewOpen}
+                          visible={
+                            tab.id === activeTabId &&
+                            !inboxViewOpen &&
+                            !searchViewOpen &&
+                            !notesViewOpen &&
+                            !settingsOpen
+                          }
                           sessionPortal={inboxViewOpen && tab.id === activeTabId ? inboxAskPortal ?? undefined : undefined}
                           layout={tab.layout}
                           sessions={sessions}
@@ -8369,6 +8638,7 @@ export default function App({
                           onUpdatePlan={onUpdatePlan}
                           onMovePane={onMovePane}
                           onTerminalMetaChange={onTerminalMetaChange}
+                          onBrowserMetaChange={onBrowserMetaChange}
                         />
                       </div>
                     </div>
@@ -8392,6 +8662,7 @@ export default function App({
             onOpenFile={onOpenFile}
             onOpenSession={onSelectHistorySession}
             onOpenProject={onSelectProject}
+            onOpenTask={setTaskDetailsId}
           />
         ) : null}
         <div className="hidden" aria-hidden>
@@ -8497,6 +8768,8 @@ export default function App({
           onClose={() => setFilePickerOpen(false)}
         />
       ) : null}
+
+      <LinkChoiceMenu onOpenBrowser={onOpenBrowser} />
 
       <ApprovalToasts
         notices={hiddenApprovalToasts}
@@ -8618,7 +8891,9 @@ function toTitleTab(
         ? `plan:${file.plan.blockId}`
         : file.releaseNotes
           ? `release-notes:${file.releaseNotes.version}`
-          : file.path;
+          : file.browser
+            ? `browser:${file.browser.url}`
+            : file.path;
     if (seenKeys.has(key)) return;
     seenKeys.add(key);
     files.push(
@@ -8627,7 +8902,9 @@ function toTitleTab(
           ? releaseNotesTitle(file.releaseNotes.version)
           : file.terminal
             ? terminalTabLabel(file)
-            : basename(file.path)),
+            : file.browser
+              ? browserTabLabel(file.browser.url, file.browser.title)
+              : basename(file.path)),
     );
   };
   const focusedPane =

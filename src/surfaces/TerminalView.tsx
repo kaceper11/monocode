@@ -1,4 +1,6 @@
 import { Terminal } from "@xterm/xterm";
+import type { ILink } from "@xterm/xterm";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useEffect, useRef } from "react";
 import {
   getPtyStatus,
@@ -15,6 +17,7 @@ import {
   type TerminalMetaPatch,
 } from "../lib/terminalTab";
 import { isLightScheme, SCHEME_CHANGE_EVENT } from "../lib/appearance";
+import { isLocalhostUrl, requestLinkChoice } from "../lib/browser";
 import { homeDir } from "../lib/fs";
 import {
   applyTerminalChrome,
@@ -44,6 +47,11 @@ function cssColor(expr: string, fallback: string): string {
   probe.remove();
   return color || fallback;
 }
+
+/** Printed URLs — brackets/quotes can't be part of a link, and trailing
+ * punctuation is almost always prose, not the target. */
+const LINK_PATTERN = /https?:\/\/[^\s<>"'()[\]{}]+/g;
+const LINK_TRAILING = /[.,;:!?'")\]}>]+$/;
 
 const ANSI_DARK = {
   black: "#1d2428",
@@ -136,6 +144,8 @@ export function TerminalView({ id, cwd, active, onMetaChange, command }: Props) 
   const applySizeRef = useRef<() => void>(() => {});
   const onMetaChangeRef = useRef(onMetaChange);
   onMetaChangeRef.current = onMetaChange;
+  const cwdRef = useRef(cwd);
+  cwdRef.current = cwd;
   const runningProcessRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -186,6 +196,46 @@ export function TerminalView({ id, cwd, active, onMetaChange, command }: Props) 
       }
       if (key === "v") return false;
       return true;
+    });
+
+    // Explicit click on a printed http(s) link: loopback targets ask where
+    // to open (preview vs system browser); anything else opens externally.
+    // Never automatic — activation is always a user gesture.
+    term.registerLinkProvider({
+      provideLinks(y, callback) {
+        const line = term.buffer.active.getLine(y - 1);
+        if (!line) {
+          callback(undefined);
+          return;
+        }
+        const text = line.translateToString(true);
+        const links: ILink[] = [];
+        for (const match of text.matchAll(LINK_PATTERN)) {
+          const url = match[0].replace(LINK_TRAILING, "");
+          if (!url) continue;
+          const startX = match.index + 1;
+          links.push({
+            range: {
+              start: { x: startX, y },
+              end: { x: startX + url.length - 1, y },
+            },
+            text: url,
+            activate(event, target) {
+              if (isLocalhostUrl(target)) {
+                requestLinkChoice({
+                  url: target,
+                  x: event.clientX,
+                  y: event.clientY,
+                  cwd: cwdRef.current,
+                });
+              } else {
+                void openUrl(target).catch(() => undefined);
+              }
+            },
+          });
+        }
+        callback(links.length ? links : undefined);
+      },
     });
 
     let oscBuffer = "";

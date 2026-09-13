@@ -1,6 +1,7 @@
 import {
   ChevronLeft,
   ChevronRight,
+  Globe,
   Inbox,
   PanelLeft,
   Plus,
@@ -32,7 +33,7 @@ import { HarnessIcon } from "./HarnessIcon";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TerminalSpinner } from "./TerminalSpinner";
 import { WindowControls } from "./WindowControls";
-import { IS_MAC, IS_WIN, MOD } from "../lib/platform";
+import { IS_MAC, IS_WIN, MOD, SHIFT } from "../lib/platform";
 import type { RecentProject } from "../lib/recents";
 import { ExplorerMenu, type ExplorerMenuItem } from "./ExplorerMenu";
 
@@ -72,7 +73,13 @@ type Props = {
   onNew: () => void;
   onNewTerminal?: () => void;
   onShowTerminal?: () => void;
+  onOpenBrowser?: () => void;
+  /** A browser tab is open in the active workspace tab. */
+  browserActive?: boolean;
+  /** The project terminal dock is open. */
   projectTerminalActive?: boolean;
+  /** The project terminal dock exists (open or hidden). */
+  projectTerminalExists?: boolean;
   onOpenSettings?: () => void;
   onOpenInbox?: () => void;
   onOpenNotes?: () => void;
@@ -548,7 +555,10 @@ function TitleBarComponent({
   onNew,
   onNewTerminal,
   onShowTerminal,
+  onOpenBrowser,
+  browserActive = false,
   projectTerminalActive = false,
+  projectTerminalExists = false,
   onOpenSettings,
   onOpenInbox,
   onOpenNotes,
@@ -734,16 +744,33 @@ function TitleBarComponent({
         {!projectless && (onShowTerminal || onNewTerminal) ? (
           <IconButton
             label={
-              projectTerminalActive ? "Terminal" : `New Terminal (${MOD}\`)`
+              projectTerminalActive
+                ? "Hide Terminal"
+                : projectTerminalExists
+                  ? "Show Terminal"
+                  : `New Terminal (${MOD}\`)`
             }
             accent={projectTerminalActive}
             onClick={
-              projectTerminalActive
+              projectTerminalExists
                 ? (onShowTerminal ?? onNewTerminal)
                 : onNewTerminal
             }
           >
             <Terminal className="size-3.5" strokeWidth={1.75} />
+          </IconButton>
+        ) : null}
+        {!projectless && onOpenBrowser ? (
+          <IconButton
+            label={
+              browserActive
+                ? "Browser"
+                : `Open URL in Browser (${MOD}${SHIFT}B)`
+            }
+            accent={browserActive}
+            onClick={onOpenBrowser}
+          >
+            <Globe className="size-3.5" strokeWidth={1.75} />
           </IconButton>
         ) : null}
         {!projectRailOpen && !showCurrentProject && onOpenSettings ? (

@@ -34,6 +34,7 @@ export type AttentionKind =
   | "pr-done" // PR reached a terminal state (merged/closed)
   | "schedule" // scheduled-run outcome (ran/skipped/missed/failed)
   | "check" // post-turn check outcome (passed/failed/couldn't run)
+  | "worktree" // stale/missing working copies worth cleaning up
   | "watcher"; // watcher lifecycle row: source errors with a reconnect affordance
 
 /** Lower sorts first. */
@@ -106,6 +107,8 @@ export type AttentionAction =
   | { kind: "open-automations"; watcherId?: string }
   | { kind: "check-fix"; runId: string }
   | { kind: "reconnect"; source: ConnectableInboxSource }
+  /** Opens the worktree manager for the family containing `cwd`. */
+  | { kind: "open-worktrees"; cwd: string }
   | { kind: "open-url"; url: string };
 
 export type AttentionItem = {
@@ -180,6 +183,7 @@ const KINDS: AttentionKind[] = [
   "pr-done",
   "schedule",
   "check",
+  "worktree",
   "watcher",
 ];
 
@@ -207,6 +211,7 @@ const ACTION_KINDS = new Set([
   "open-automations",
   "check-fix",
   "reconnect",
+  "open-worktrees",
   "open-url",
 ]);
 

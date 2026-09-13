@@ -46,6 +46,7 @@ const KIND_ICON = {
   "pr-done": GitPullRequestClosed,
   schedule: Clock,
   check: Play,
+  worktree: GitBranch,
   watcher: Zap,
 } as const;
 
@@ -79,6 +80,8 @@ export function attentionActionLabel(item: AttentionItem): string {
       return "Send to agent";
     case "reconnect":
       return "Reconnect";
+    case "open-worktrees":
+      return "Clean up";
     case "open-url":
       return "Open";
     default:

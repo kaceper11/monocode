@@ -141,11 +141,13 @@ import { Popover } from "./Popover";
 import { WorktreePanel } from "./WorktreePicker";
 import {
   archiveTask,
+  OPEN_TASK_DETAILS,
   removeTask,
   repositoryForChild,
   subscribeTaskWorkspaces,
   taskChildRepoLabel,
   taskForSession,
+  taskMatchesQuery,
   taskWorkspacesSnapshot,
   loadTaskWorkspaces,
   projectForTask,
@@ -357,8 +359,7 @@ export function ProjectRail({
   );
 
 
-  /** Task owning the focused session — drives the scope highlight across all
-   * of its repository rows, not just the host cwd. */
+  /** Task owning the focused session. */
   const activeTask = useMemo(
     () => (activeSessionId ? taskForSession(activeSessionId)?.task : undefined),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -368,11 +369,6 @@ export function ProjectRail({
   // still looking at another task's session; otherwise the focused
   // session's task is current.
   const currentTaskId = focusTaskId ?? activeTask?.id;
-  const scopeRepoIds = useMemo(
-    () =>
-      new Set(activeTask?.children.map((entry) => entry.repositoryId) ?? []),
-    [activeTask],
-  );
   const busySessionIds = useMemo(
     () =>
       new Set(
@@ -842,7 +838,6 @@ export function ProjectRail({
                 onTogglePin={onTogglePin}
                 onContextMenu={onProjectContextMenu}
                 onOpenMenu={openProjectMenu}
-                scopeRepoIds={scopeRepoIds}
                 groupLabels={groupLabels}
                 groupColors={groupColors}
                 groupCustomColors={groupCustomColors}
@@ -868,7 +863,6 @@ export function ProjectRail({
               onTogglePin={onTogglePin}
               onContextMenu={onProjectContextMenu}
               onOpenMenu={openProjectMenu}
-              scopeRepoIds={scopeRepoIds}
               groupLabels={groupLabels}
               groupColors={groupColors}
               groupCustomColors={groupCustomColors}
@@ -1036,6 +1030,21 @@ export function ProjectRail({
               }}
             >
               Open task
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+              onClick={() => {
+                window.dispatchEvent(
+                  new CustomEvent(OPEN_TASK_DETAILS, {
+                    detail: taskMenu.task.id,
+                  }),
+                );
+                setTaskMenu(null);
+              }}
+            >
+              Task details…
             </button>
             <button
               type="button"
@@ -1377,7 +1386,6 @@ function ProjectSection({
   onTogglePin,
   onContextMenu,
   onOpenMenu,
-  scopeRepoIds,
   groupLabels,
   groupColors,
   groupCustomColors,
@@ -1403,7 +1411,6 @@ function ProjectSection({
     y: number,
     rowRect?: DOMRect,
   ) => void;
-  scopeRepoIds?: ReadonlySet<string>;
   groupLabels: Record<string, string>;
   groupColors: Record<string, number>;
   groupCustomColors: Record<string, string>;
@@ -1451,7 +1458,6 @@ function ProjectSection({
             onTogglePin={onTogglePin}
             onContextMenu={onContextMenu}
             onOpenMenu={onOpenMenu}
-            scopeRepoIds={scopeRepoIds}
             groupLabels={groupLabels}
             groupColors={groupColors}
             groupCustomColors={groupCustomColors}
@@ -1602,13 +1608,9 @@ function ProjectRepositoryRow({
   cwd,
   busyPaths,
   recents,
-  scoped = false,
   onSelect,
 }: {
   repo: ProjectRecord["repositories"][number];
-  /** The focused session's task spans this repository — secondary scope
-   * highlight alongside the host's `active` state. */
-  scoped?: boolean;
   families: ReadonlyMap<string, RepositoryFamily>;
   hidden: string[];
   cwd: string;
@@ -1659,11 +1661,11 @@ function ProjectRepositoryRow({
           type="button"
           title={prettyCwd(repo.anchor)}
           aria-current={active ? "true" : undefined}
-          className={`flex h-7 w-full min-w-0 items-center gap-1.5 rounded-md pl-2 pr-7 text-left text-xs outline-none focus-visible:ring-1 focus-visible:ring-content/30 group-hover/repository:pr-12 ${active ? "bg-content/10 text-content" : scoped ? "bg-accent/10 text-content/80 hover:bg-accent/15" : "text-content/55 hover:bg-content/5 hover:text-content/85"}`}
+          className={`flex h-7 w-full min-w-0 items-center gap-1.5 rounded-md pl-2 pr-7 text-left text-xs outline-none focus-visible:ring-1 focus-visible:ring-content/30 group-hover/repository:pr-12 ${active ? "bg-content/10 text-content" : "text-content/55 hover:bg-content/5 hover:text-content/85"}`}
           onClick={openRepository}
         >
           <Folder
-            className={`size-3 shrink-0 ${scoped ? "text-accent/70" : "text-content/40"}`}
+            className="size-3 shrink-0 text-content/40"
             strokeWidth={1.5}
           />
           <span className="min-w-0 flex-1 truncate">{name}</span>
@@ -1796,6 +1798,9 @@ function TasksSection({
 }) {
   const [showArchived, setShowArchived] = useState(false);
   const [showAll, setShowAll] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [query, setQuery] = useState("");
+  const searchRef = useRef<HTMLInputElement>(null);
   // Re-read saved provider links when they change — one parse shared by all
   // rows; the rail never fetches live provider data itself.
   const [deliveryTick, setDeliveryTick] = useState(0);
@@ -1815,9 +1820,17 @@ function TasksSection({
   );
   if (!tasks.length && !archivedTasks.length) return null;
   // The rail stays compact — current and working tasks sort first, the
-  // long tail hides behind a toggle like the archived list.
-  const visibleTasks =
-    showAll || tasks.length <= TASK_RAIL_CAP ? tasks : tasks.slice(0, TASK_RAIL_CAP);
+  // long tail hides behind a toggle like the archived list. Filtering shows
+  // every match (live and archived) without the cap.
+  const filtering = Boolean(query.trim());
+  const visibleTasks = filtering
+    ? tasks.filter((task) => taskMatchesQuery(task, query))
+    : showAll || tasks.length <= TASK_RAIL_CAP
+      ? tasks
+      : tasks.slice(0, TASK_RAIL_CAP);
+  const visibleArchived = filtering
+    ? archivedTasks.filter((task) => taskMatchesQuery(task, query))
+    : archivedTasks;
   const row = (task: TaskWorkspace, archived = false) => {
     const project = projectForTask(task);
     return (
@@ -1858,6 +1871,19 @@ function TasksSection({
         <span className="min-w-0 flex-1 truncate px-1 text-xs text-content/50">
           Tasks
         </span>
+        <button
+          type="button"
+          title="Search tasks"
+          aria-label="Search tasks"
+          aria-expanded={searching}
+          onClick={() => {
+            setSearching(true);
+            searchRef.current?.focus();
+          }}
+          className={`grid size-5 shrink-0 place-items-center rounded-md hover:bg-content/8 hover:text-content ${searching ? "text-content" : "text-content/50"}`}
+        >
+          <Search className="size-3.5" strokeWidth={1.75} />
+        </button>
         {onNewTask ? (
           <button
             type="button"
@@ -1870,9 +1896,41 @@ function TasksSection({
           </button>
         ) : null}
       </div>
+      {searching ? (
+        <div className="px-3 pb-1.5">
+          <input
+            ref={searchRef}
+            autoFocus
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key !== "Escape") return;
+              event.preventDefault();
+              event.stopPropagation();
+              setQuery("");
+              setSearching(false);
+            }}
+            onBlur={() => {
+              if (!query) setSearching(false);
+            }}
+            placeholder="Filter tasks..."
+            aria-label="Filter tasks"
+            spellCheck={false}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            className="h-6 w-full rounded-md bg-content/6 px-2 text-[11px] text-content outline-none placeholder:text-content/35 focus:ring-1 focus:ring-content/25"
+          />
+        </div>
+      ) : null}
       <div className="flex flex-col gap-px px-2">
         {visibleTasks.map((task) => row(task))}
-        {tasks.length > visibleTasks.length ? (
+        {filtering && !visibleTasks.length && !visibleArchived.length ? (
+          <p className="px-4 pb-1 text-[11px] leading-tight text-content/40">
+            No matching tasks
+          </p>
+        ) : null}
+        {!filtering && tasks.length > visibleTasks.length ? (
           <button
             type="button"
             onClick={() => setShowAll(true)}
@@ -1882,23 +1940,23 @@ function TasksSection({
           </button>
         ) : null}
       </div>
-      {archivedTasks.length ? (
+      {visibleArchived.length ? (
         <div className="px-2 pt-1">
           <button
             type="button"
-            aria-expanded={showArchived}
+            aria-expanded={showArchived || filtering}
             onClick={() => setShowArchived((value) => !value)}
             className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-[11px] text-content/40 hover:bg-content/5 hover:text-content/60"
           >
             <ChevronDown
-              className={`size-3 shrink-0 transition-transform ${showArchived ? "" : "-rotate-90"}`}
+              className={`size-3 shrink-0 transition-transform ${showArchived || filtering ? "" : "-rotate-90"}`}
               strokeWidth={1.75}
             />
-            Archived · {archivedTasks.length}
+            Archived · {visibleArchived.length}
           </button>
-          {showArchived ? (
+          {showArchived || filtering ? (
             <div className="flex flex-col gap-px">
-              {archivedTasks.map((task) => row(task, true))}
+              {visibleArchived.map((task) => row(task, true))}
             </div>
           ) : null}
         </div>
@@ -2083,17 +2141,9 @@ function ProjectFamilyCard(
     families: ReadonlyMap<string, RepositoryFamily>;
     cwd: string;
     busyPaths: Set<string>;
-    scopeRepoIds?: ReadonlySet<string>;
   },
 ) {
-  const {
-    family,
-    families,
-    cwd,
-    busyPaths,
-    onSelect,
-    scopeRepoIds,
-  } = props;
+  const { family, families, cwd, busyPaths, onSelect } = props;
   const project = props.item.project;
   const multiRepo = (project?.repositories.length ?? 0) > 1;
   /** Anchorless group — no own folder; the row exists to hold members. */
@@ -2205,7 +2255,6 @@ function ProjectFamilyCard(
               cwd={cwd}
               busyPaths={busyPaths}
               recents={recents}
-              scoped={scopeRepoIds?.has(repo.id) ?? false}
               onSelect={onSelect}
             />
           ))}
