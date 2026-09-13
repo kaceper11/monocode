@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, ExternalLink, Globe, Maximize2, Minimize2, Pencil, Plus, RefreshCw, Star, Trash2, X } from "../chrome/icons";
-import { Popover } from "../chrome/Popover";
+
 import {
   browserAgentContext,
   browserCapture,
@@ -101,7 +101,7 @@ export function BrowserView({
   const [failure, setFailure] = useState("");
   const [overlayOpen, setOverlayOpen] = useState(false);
   const [capturing, setCapturing] = useState(false);
-  const [favoritesAnchor, setFavoritesAnchor] = useState<HTMLElement | null>(null);
+  const [bookmarksOpen, setBookmarksOpen] = useState(false);
   const favorites = useSyncExternalStore(
     subscribeBrowserFavorites,
     browserFavorites,
@@ -332,16 +332,27 @@ export function BrowserView({
       if (queued) return;
       queued = requestAnimationFrame(() => {
         queued = 0;
-        if (!openedRef.current) return;
         const host = hostRef.current;
+        if (!openedRef.current || !host) return;
+        const hostRect = host.getBoundingClientRect();
         const has = Array.from(
           document.body.querySelectorAll<HTMLElement>(OVERLAY),
-        ).some(
-          (el) =>
-            !(host && (host.contains(el) || el.contains(host))) &&
-            !el.closest("[aria-hidden='true'], [inert], .hidden") &&
-            !!el.getClientRects().length,
-        );
+        ).some((el) => {
+          if (host.contains(el) || el.contains(host)) return false;
+          if (el.closest("[aria-hidden='true'], [inert], .hidden"))
+            return false;
+          const rect = el.getBoundingClientRect();
+          // Only an overlay that actually overlaps the page area needs the
+          // webview parked — a menu or toast elsewhere must not blank it.
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.left < hostRect.right &&
+            rect.right > hostRect.left &&
+            rect.top < hostRect.bottom &&
+            rect.bottom > hostRect.top
+          );
+        });
         setOverlayOpen(has);
       });
     };
@@ -545,7 +556,8 @@ export function BrowserView({
           </ToolbarButton>
           <ToolbarButton
             title="Bookmarks"
-            onClick={(event) => setFavoritesAnchor(event.currentTarget)}
+            pressed={bookmarksOpen}
+            onClick={() => setBookmarksOpen((open) => !open)}
           >
             <ChevronDown className="size-3.5" strokeWidth={1.75} />
           </ToolbarButton>
@@ -568,15 +580,10 @@ export function BrowserView({
           </ToolbarButton>
         </div>
       ) : null}
-      {favoritesAnchor ? (
-        <BrowserFavoritesMenu
-          anchor={favoritesAnchor}
+      {showChrome && bookmarksOpen ? (
+        <BrowserBookmarksBar
           current={current}
-          onPick={(target) => {
-            setFavoritesAnchor(null);
-            navigate(target);
-          }}
-          onClose={() => setFavoritesAnchor(null)}
+          onPick={navigate}
         />
       ) : null}
       {notice || popup || draftError ? (
@@ -697,16 +704,18 @@ function ToolbarButton({
   );
 }
 
-function BrowserFavoritesMenu({
-  anchor,
+/**
+ * Chrome-style bookmarks bar under the toolbar — a DOM popover would
+ * paint under the native webview, so the list lives in flow and the page
+ * keeps rendering (just a little shorter). Editing is inline for the
+ * same reason.
+ */
+function BrowserBookmarksBar({
   current,
   onPick,
-  onClose,
 }: {
-  anchor: HTMLElement;
   current: string;
   onPick: (url: string) => void;
-  onClose: () => void;
 }) {
   const favorites = useSyncExternalStore(
     subscribeBrowserFavorites,
@@ -720,36 +729,26 @@ function BrowserFavoritesMenu({
   const [editError, setEditError] = useState("");
 
   return (
-    <Popover
-      anchor={anchor}
-      side="bottom"
-      align="end"
-      gap={4}
-      width={300}
-      onDismiss={onClose}
-      role="menu"
+    <div
+      role="toolbar"
       aria-label="Bookmarks"
-      className="overflow-y-auto overscroll-none p-1"
+      className="flex min-h-7 shrink-0 flex-wrap items-center gap-1 border-b border-content/10 bg-content/2 px-2 py-1"
     >
       {current && !isBrowserFavorite(current) ? (
-        <>
-          <button
-            type="button"
-            role="menuitem"
-            className="flex h-7 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] leading-none text-content hover:bg-content/5"
-            onClick={() => toggleBrowserFavorite(current)}
-          >
-            <Star className="size-3.5 shrink-0 text-content/50" strokeWidth={1.75} />
-            <span className="min-w-0 flex-1 truncate">Bookmark this page</span>
-          </button>
-          <div role="separator" className="my-1 h-px bg-content/10" />
-        </>
+        <button
+          type="button"
+          className="flex h-5.5 shrink-0 items-center gap-1.5 rounded-md px-2 text-[11.5px] leading-none text-content/60 hover:bg-content/8 hover:text-content"
+          onClick={() => toggleBrowserFavorite(current)}
+        >
+          <Star className="size-3 shrink-0" strokeWidth={1.75} />
+          Bookmark this page
+        </button>
       ) : null}
       {favorites.map((fav) =>
         editing?.id === fav.id ? (
           <form
             key={fav.id}
-            className="flex flex-col gap-1.5 px-2 py-1.5"
+            className="flex min-w-0 flex-1 items-center gap-1"
             onSubmit={(event) => {
               event.preventDefault();
               try {
@@ -775,7 +774,7 @@ function BrowserFavoritesMenu({
               placeholder="Name"
               aria-label="Bookmark name"
               autoFocus
-              className="h-6 w-full rounded-md border border-content/10 bg-content/5 px-2 text-[12px] text-content outline-none focus:border-content/25"
+              className="h-5.5 w-28 shrink-0 rounded-md border border-content/10 bg-content/5 px-1.5 text-[11.5px] text-content outline-none focus:border-content/25"
             />
             <input
               value={editing.url}
@@ -787,74 +786,73 @@ function BrowserFavoritesMenu({
               aria-label="Bookmark URL"
               spellCheck={false}
               autoCapitalize="off"
-              className="h-6 w-full rounded-md border border-content/10 bg-content/5 px-2 font-mono text-[11.5px] text-content outline-none focus:border-content/25"
+              className="h-5.5 min-w-24 flex-1 rounded-md border border-content/10 bg-content/5 px-1.5 font-mono text-[11px] text-content outline-none focus:border-content/25"
             />
             {editError ? (
-              <p className="text-[11px] text-red-400">{editError}</p>
+              <span className="shrink-0 text-[11px] text-red-400">
+                {editError}
+              </span>
             ) : null}
-            <div className="flex items-center gap-1">
-              <button
-                type="submit"
-                aria-label="Save bookmark"
-                className="grid size-5 place-items-center rounded text-content/60 hover:bg-content/10 hover:text-content"
-              >
-                <Check className="size-3" strokeWidth={2} />
-              </button>
-              <button
-                type="button"
-                aria-label="Cancel"
-                className="grid size-5 place-items-center rounded text-content/50 hover:bg-content/10 hover:text-content"
-                onClick={() => {
-                  setEditing(null);
-                  setEditError("");
-                }}
-              >
-                <X className="size-3" strokeWidth={1.75} />
-              </button>
-            </div>
-          </form>
-        ) : (
-          <div key={fav.id} className="group flex items-center gap-1">
+            <button
+              type="submit"
+              aria-label="Save bookmark"
+              className="grid size-5 shrink-0 place-items-center rounded text-content/60 hover:bg-content/10 hover:text-content"
+            >
+              <Check className="size-3" strokeWidth={2} />
+            </button>
             <button
               type="button"
-              role="menuitem"
-              className="flex h-7 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-left text-[13px] leading-none text-content hover:bg-content/5"
+              aria-label="Cancel"
+              className="grid size-5 shrink-0 place-items-center rounded text-content/50 hover:bg-content/10 hover:text-content"
+              onClick={() => {
+                setEditing(null);
+                setEditError("");
+              }}
+            >
+              <X className="size-3" strokeWidth={1.75} />
+            </button>
+          </form>
+        ) : (
+          <div key={fav.id} className="group flex min-w-0 items-center">
+            <button
+              type="button"
+              className="flex h-5.5 min-w-0 items-center gap-1.5 rounded-md px-2 text-[11.5px] leading-none text-content/75 hover:bg-content/8 hover:text-content"
               onClick={() => onPick(fav.url)}
               title={fav.url}
             >
-              <Globe className="size-3.5 shrink-0 text-content/50" strokeWidth={1.75} />
-              <span className="min-w-0 flex-1 truncate">
+              <Globe className="size-3 shrink-0 text-content/40" strokeWidth={1.75} />
+              <span className="max-w-40 truncate">
                 {fav.title || browserTabLabel(fav.url)}
               </span>
             </button>
             <button
               type="button"
               aria-label="Edit bookmark"
-              className="grid size-5 shrink-0 place-items-center rounded text-content/40 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100"
+              className="grid size-4.5 shrink-0 place-items-center rounded text-content/40 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100"
               onClick={() => {
                 setEditing({ id: fav.id, title: fav.title, url: fav.url });
                 setEditError("");
               }}
             >
-              <Pencil className="size-3" strokeWidth={1.75} />
+              <Pencil className="size-2.5" strokeWidth={1.75} />
             </button>
             <button
               type="button"
               aria-label="Delete bookmark"
-              className="grid size-5 shrink-0 place-items-center rounded text-content/40 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100"
+              className="grid size-4.5 shrink-0 place-items-center rounded text-content/40 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100"
               onClick={() => removeBrowserFavorite(fav.id)}
             >
-              <Trash2 className="size-3" strokeWidth={1.75} />
+              <Trash2 className="size-2.5" strokeWidth={1.75} />
             </button>
           </div>
         ),
       )}
       {!favorites.length ? (
-        <p className="px-2 py-1.5 text-[12px] text-content/45">
+        <span className="px-1 text-[11.5px] text-content/40">
           No bookmarks yet — open a page and star it.
-        </p>
+        </span>
       ) : null}
-    </Popover>
+    </div>
   );
 }
 
