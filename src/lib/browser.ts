@@ -44,12 +44,14 @@ export type BrowserOpenRequest = {
   /** Omitted = open the worktree's remembered URL; "" = blank new tab. */
   url?: string;
   cwd?: string;
+  /** Pane the new tab should land in (a `+` in that pane's tab row). */
+  paneId?: string;
 };
 
-export function requestBrowserOpen(url?: string, cwd?: string) {
+export function requestBrowserOpen(url?: string, cwd?: string, paneId?: string) {
   window.dispatchEvent(
     new CustomEvent<BrowserOpenRequest>(OPEN_BROWSER_EVENT, {
-      detail: { url, cwd },
+      detail: { url, cwd, paneId },
     }),
   );
 }
@@ -347,8 +349,9 @@ export function browserOpen(
   label: string,
   url: string,
   bounds: BrowserBounds,
+  background?: [number, number, number, number],
 ): Promise<void> {
-  return invoke("browser_open", { label, url, bounds });
+  return invoke("browser_open", { label, url, bounds, background });
 }
 
 export function browserClose(label: string): Promise<void> {
@@ -383,6 +386,15 @@ export function browserSetVisible(
   visible: boolean,
 ): Promise<void> {
   return invoke("browser_set_visible", { label, visible });
+}
+
+/** Swap-flash color — the pane's painted background, so navigation
+ * doesn't strobe white on a dark theme. */
+export function browserSetBackground(
+  label: string,
+  color: [number, number, number, number],
+): Promise<void> {
+  return invoke("browser_set_background", { label, color });
 }
 
 export type BrowserProbe = {

@@ -9,7 +9,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, ExternalLink, Globe, Maximize2, Minimize2, Pencil, Plus, RefreshCw, Star, Trash2, X } from "../chrome/icons";
+import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, ExternalLink, Globe, Maximize2, Minimize2, Pencil, RefreshCw, Star, Trash2, X } from "../chrome/icons";
 
 import {
   browserAgentContext,
@@ -23,6 +23,7 @@ import {
   browserOpen,
   browserProbe,
   browserReload,
+  browserSetBackground,
   browserSetBounds,
   browserSetVisible,
   browserTabLabel,
@@ -31,7 +32,6 @@ import {
   rememberedBrowserUrl,
   rememberBrowserUrl,
   removeBrowserFavorite,
-  requestBrowserOpen,
   subscribeBrowser,
   subscribeBrowserFavorites,
   toggleBrowserFavorite,
@@ -63,6 +63,52 @@ const WATCHDOG_RETRY_MS = 6_000;
 const WATCHDOG_MAX_ATTEMPTS = 3;
 /** Re-checks the host rect — pane position can shift without a resize. */
 const BOUNDS_POLL_MS = 800;
+
+type Rgba = [number, number, number, number];
+
+function parseCssColor(value: string): Rgba | undefined {
+  const rgb = /^rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+([\d.]+%?))?\s*\)$/.exec(
+    value,
+  );
+  if (rgb) {
+    const a =
+      rgb[4] === undefined
+        ? 1
+        : rgb[4].endsWith("%")
+          ? parseFloat(rgb[4]) / 100
+          : parseFloat(rgb[4]);
+    return [+rgb[1], +rgb[2], +rgb[3], Math.round(a * 255)];
+  }
+  const srgb =
+    /^color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+%?))?\s*\)$/.exec(
+      value,
+    );
+  if (srgb) {
+    const a =
+      srgb[4] === undefined
+        ? 1
+        : srgb[4].endsWith("%")
+          ? parseFloat(srgb[4]) / 100
+          : parseFloat(srgb[4]);
+    return [
+      Math.round(+srgb[1] * 255),
+      Math.round(+srgb[2] * 255),
+      Math.round(+srgb[3] * 255),
+      Math.round(a * 255),
+    ];
+  }
+}
+
+/** First painted background above the host — the color the native
+ * webview should flash while a navigation swaps renderer processes. */
+function paneBackground(host: HTMLElement | null): Rgba | undefined {
+  let el = host;
+  while (el) {
+    const color = parseCssColor(getComputedStyle(el).backgroundColor);
+    if (color && color[3] > 0) return color;
+    el = el.parentElement;
+  }
+}
 
 /**
  * Chrome around a native child webview. React draws the toolbar, notices,
@@ -210,6 +256,7 @@ export function BrowserView({
   }, [label, armWatchdog, clearWatchdog]);
 
   const wantShowRef = useRef(false);
+  const bgRef = useRef<Rgba | undefined>(undefined);
   const syncBounds = useCallback(() => {
     const el = hostRef.current;
     if (!el || !openedRef.current) return;
@@ -277,7 +324,9 @@ export function BrowserView({
           const bounds = rect
             ? { x: rect.x, y: rect.y, width: Math.max(1, rect.width), height: Math.max(1, rect.height) }
             : { x: 0, y: 0, width: 1, height: 1 };
-          await browserOpen(label, url, bounds);
+          const background = paneBackground(hostRef.current);
+          bgRef.current = background;
+          await browserOpen(label, url, bounds, background);
           if (!alive) {
             void browserClose(label).catch(() => undefined);
             return;
@@ -370,6 +419,25 @@ export function BrowserView({
       if (queued) cancelAnimationFrame(queued);
     };
   }, []);
+
+  // Theme flips rewrite the document's class and inline custom props —
+  // keep the webview's swap-flash color in step with the pane behind it.
+  useEffect(() => {
+    const update = () => {
+      if (!openedRef.current) return;
+      const next = paneBackground(hostRef.current);
+      const prev = bgRef.current;
+      if (!next || (prev && next.every((v, i) => v === prev[i]))) return;
+      bgRef.current = next;
+      void browserSetBackground(label, next).catch(() => undefined);
+    };
+    const observer = new MutationObserver(update);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class", "style"],
+    });
+    return () => observer.disconnect();
+  }, [label]);
 
   // Track the host rect: ResizeObserver covers resizes, window resize covers
   // window bounds, and a slow poll covers shifts that resize neither (e.g.
@@ -560,12 +628,6 @@ export function BrowserView({
             onClick={() => setBookmarksOpen((open) => !open)}
           >
             <ChevronDown className="size-3.5" strokeWidth={1.75} />
-          </ToolbarButton>
-          <ToolbarButton
-            title="New browser tab"
-            onClick={() => requestBrowserOpen("", file.cwd)}
-          >
-            <Plus className="size-3.5" strokeWidth={1.75} />
           </ToolbarButton>
           <ToolbarButton
             title={expanded ? "Back to split view" : "Fill the workspace"}

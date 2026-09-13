@@ -4323,7 +4323,7 @@ export default function App({
    * `undefined` opens the worktree's remembered page; "" is a deliberate
    * blank tab (URL-entry state). `cwd` is the worktree the link came from. */
   const onOpenBrowser = useCallback(
-    (url?: string, cwd?: string) => {
+    (url?: string, cwd?: string, paneId?: string) => {
       dismissOverlays();
       const tab = tabsRef.current.find(
         (entry) => entry.id === activeTabIdRef.current,
@@ -4350,7 +4350,7 @@ export default function App({
       const file = newBrowserTab(workdir, target);
       setTabs((prev) =>
         prev.map((entry) =>
-          entry.id === tab.id ? openEditorTab(entry, file) : entry,
+          entry.id === tab.id ? openEditorTab(entry, file, paneId) : entry,
         ),
       );
       setComposerFocused(false);
@@ -4418,7 +4418,7 @@ export default function App({
   useEffect(() => {
     const listener = (event: Event) => {
       if (!isBrowserOpenRequest(event)) return;
-      onOpenBrowser(event.detail.url, event.detail.cwd);
+      onOpenBrowser(event.detail.url, event.detail.cwd, event.detail.paneId);
     };
     window.addEventListener(OPEN_BROWSER_EVENT, listener);
     return () =>

@@ -26,7 +26,8 @@ import type { TerminalMetaPatch } from "../lib/terminalTab";
 import type { EditorNavigationTarget } from "../lib/search";
 import { editorPathsEqual } from "../lib/search";
 import type { PlanBuildTarget, Session } from "../lib/session";
-import { Play } from "../chrome/icons";
+import { Play, Plus } from "../chrome/icons";
+import { requestBrowserOpen } from "../lib/browser";
 import { BuildTargetButton } from "../chrome/SecondOpinionButton";
 import { loadDiffViewer, subscribeDiffViewer } from "../lib/settings";
 import { MarkdownPreview } from "./AgentMarkdown";
@@ -121,6 +122,20 @@ function FilePaneComponent({
         onCloseOtherFiles={(fileId) => onCloseOtherFiles(pane.id, fileId)}
         onReorder={(ids) => onReorderFiles(pane.id, ids)}
         onPaneDragStart={onPaneDragStart}
+        trailing={
+          <button
+            type="button"
+            title="New browser tab"
+            aria-label="New browser tab"
+            className="mr-1 grid size-5.5 shrink-0 place-items-center self-center rounded text-content/55 outline-none hover:bg-content/10 hover:text-content focus-visible:ring-1 focus-visible:ring-content/30"
+            onClick={(event) => {
+              event.stopPropagation();
+              requestBrowserOpen("", activeFile?.cwd, pane.id);
+            }}
+          >
+            <Plus className="size-3" strokeWidth={1.75} />
+          </button>
+        }
       />
       <div className="relative min-h-0 flex-1">
         {sessionReview ? (

@@ -521,6 +521,7 @@ export function newEditorPane(file: FilePaneTab): EditorPane {
 export function openEditorTab(
   tab: WorkspaceTab,
   file: FilePaneTab,
+  targetPaneId?: string,
 ): WorkspaceTab {
   if (file.terminal) return openTerminalTab(tab, file);
   tab = isolateTerminalPanes(tab);
@@ -545,7 +546,9 @@ export function openEditorTab(
     };
   }
 
-  const focusedPane = tab.editorPanes.find((pane) => pane.id === tab.focusedId);
+  const focusedPane = tab.editorPanes.find(
+    (pane) => pane.id === (targetPaneId ?? tab.focusedId),
+  );
   const targetPane = focusedPane ?? tab.editorPanes[0];
   if (targetPane) {
     return {

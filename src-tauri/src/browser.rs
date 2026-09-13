@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{
+    utils::config::Color,
     webview::{DownloadEvent, NewWindowResponse, PageLoadEvent, WebviewBuilder},
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Rect, Runtime, Url, WebviewUrl,
     Window,
@@ -336,6 +337,7 @@ pub async fn browser_open(
     label: String,
     url: String,
     bounds: BrowserBounds,
+    background: Option<Color>,
 ) -> Result<(), String> {
     if !valid_label(&label) {
         return Err("Invalid browser label".into());
@@ -379,6 +381,10 @@ pub async fn browser_open(
         .incognito(true)
         .devtools(false)
         .focused(false)
+        // The pane's own background — WKWebView paints it during the
+        // process swap on every cross-site navigation, so matching the
+        // theme turns a white strobe into an invisible handoff.
+        .background_color(background.unwrap_or(Color(255, 255, 255, 255)))
         .initialization_script(CONSOLE_TAP_SCRIPT)
         .on_navigation(move |url| {
             // Policy gate only. WKWebView reports subframe navigations here
@@ -574,6 +580,15 @@ pub fn browser_set_bounds(
             position: LogicalPosition::new(bounds.x.max(0.0), bounds.y.max(0.0)).into(),
             size: LogicalSize::new(bounds.width.max(1.0), bounds.height.max(1.0)).into(),
         })
+        .map_err(|error| error.to_string())
+}
+
+/// The shell follows theme flips; an open webview's swap-flash color is
+/// only as fresh as its last update — cheap to keep in step.
+#[tauri::command]
+pub fn browser_set_background(window: Window, label: String, color: Color) -> Result<(), String> {
+    find_webview(&window, &label)?
+        .set_background_color(Some(color))
         .map_err(|error| error.to_string())
 }
 

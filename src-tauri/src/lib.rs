@@ -242,6 +242,7 @@ pub fn run() {
             browser::browser_go_forward,
             browser::browser_set_bounds,
             browser::browser_set_visible,
+            browser::browser_set_background,
             browser::browser_probe,
             browser::browser_capture,
             fs::list_dir,
