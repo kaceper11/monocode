@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -61,6 +62,10 @@ pub struct RemoveRef {
     /// TOML array-of-tables it disambiguates the block by name/command.
     #[serde(default)]
     pub array_item: Option<String>,
+    /// Content the element at `path` must still contain — protects index-based
+    /// refs from cutting a different entry after the file changed.
+    #[serde(default)]
+    pub expect: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -676,7 +681,12 @@ fn json_value_idx(text: &str, spans: &[JSpan], path: &[String]) -> Option<usize>
         .iter()
         .position(|s| matches!(s.tok, JTok::Open | JTok::ArrOpen))?;
     for segment in path {
-        match spans[idx].tok {
+        let Some(&span) = spans.get(idx) else {
+            // Truncated input like `{"a":` — the member exists but has no
+            // value token, so there is nothing to descend into.
+            return None;
+        };
+        match span.tok {
             JTok::Open => {
                 let mut depth = 0usize;
                 let mut j = idx + 1;
@@ -745,6 +755,11 @@ fn json_value_idx(text: &str, spans: &[JSpan], path: &[String]) -> Option<usize>
             }
             _ => return None,
         }
+    }
+    // A truncated `"key":` yields idx == spans.len() — never hand that back
+    // to callers that index spans directly.
+    if idx >= spans.len() {
+        return None;
     }
     Some(idx)
 }
@@ -845,25 +860,56 @@ fn json_element_tokens(text: &str, spans: &[JSpan], path: &[String]) -> Option<(
 /// Cut the byte range covering the element, plus one comma and the newline a
 /// full-line element leaves behind.
 fn json_cut(text: &str, spans: &[JSpan], lo: usize, hi: usize) -> String {
-    let mut start = spans[lo].start;
+    let start = spans[lo].start;
     let mut end = spans[hi - 1].end;
     if spans.get(hi).map(|s| s.tok) == Some(JTok::Comma) {
         end = spans[hi].end;
-        if text.as_bytes().get(end) == Some(&b'\n') {
+        // Swallow the line ending a full-line element leaves behind.
+        if text.as_bytes().get(end) == Some(&b'\r') && text.as_bytes().get(end + 1) == Some(&b'\n')
+        {
+            end += 2;
+        } else if text.as_bytes().get(end) == Some(&b'\n') {
             end += 1;
         }
     } else if lo > 0 && spans[lo - 1].tok == JTok::Comma {
-        start = spans[lo - 1].start;
+        // Cut the preceding comma as a separate range so a `//` comment
+        // between it and this element survives.
+        let comma = spans[lo - 1];
+        return format!(
+            "{}{}{}",
+            &text[..comma.start],
+            &text[comma.end..start],
+            &text[end..]
+        );
     }
     format!("{}{}", &text[..start], &text[end..])
 }
 
 /// Remove the member or array element at `path` (numeric segments index into
-/// arrays), preserving JSONC comments and formatting.
-fn remove_json_at(text: &str, path: &[String]) -> Result<String, String> {
+/// arrays), preserving JSONC comments and formatting. When `expect` is set the
+/// element must still match it — a `command`/`prompt` member for objects, or
+/// the scalar itself — so a ref captured by an older scan cannot cut the wrong
+/// entry after the file changed underneath.
+fn remove_json_at(text: &str, path: &[String], expect: Option<&str>) -> Result<String, String> {
     let spans = json_spans(text).map_err(|e| format!("Cannot parse {e}"))?;
     let (lo, hi) =
         json_element_tokens(text, &spans, path).ok_or("Entry not found in config file")?;
+    if let Some(expect) = expect {
+        let mut matches = false;
+        for s in &spans[lo..hi] {
+            if s.tok != JTok::Str {
+                continue;
+            }
+            let value = unquote_json(text, s).unwrap_or_default();
+            if value == expect {
+                matches = true;
+                break;
+            }
+        }
+        if !matches {
+            return Err("Config changed since the last scan — refresh and retry".into());
+        }
+    }
     Ok(json_cut(text, &spans, lo, hi))
 }
 
@@ -875,57 +921,49 @@ fn remove_json_array_item(text: &str, path: &[String], item: &str) -> Result<Str
     if spans[arr].tok != JTok::ArrOpen {
         return Err("Config section is not a list".into());
     }
-    let mut depth = 0usize;
     let mut j = arr + 1;
     while j < spans.len() {
         let s = spans[j];
         match s.tok {
+            // Composite elements are matched wholesale then skipped.
             JTok::Open | JTok::ArrOpen => {
-                if depth == 0 {
-                    let end = json_value_end(&spans, j).ok_or("Unbalanced array")?;
-                    if s.tok == JTok::Open {
-                        // Object element: match its package/name member.
-                        let mut d = 0usize;
-                        let mut k = j + 1;
-                        while k < end {
-                            match spans[k].tok {
-                                JTok::Open | JTok::ArrOpen => d += 1,
-                                JTok::Close | JTok::ArrClose => {
-                                    if d == 0 {
-                                        break;
-                                    }
-                                    d -= 1;
+                let end = json_value_end(&spans, j).ok_or("Unbalanced array")?;
+                if s.tok == JTok::Open {
+                    // Object element: match its package/name member.
+                    let mut d = 0usize;
+                    let mut k = j + 1;
+                    while k < end {
+                        match spans[k].tok {
+                            JTok::Open | JTok::ArrOpen => d += 1,
+                            JTok::Close | JTok::ArrClose => {
+                                if d == 0 {
+                                    break;
                                 }
-                                JTok::Str
-                                    if d == 0
-                                        && spans.get(k + 1).map(|t| t.tok) == Some(JTok::Colon)
-                                        && matches!(
-                                            unquote_json(text, &spans[k]).as_deref(),
-                                            Some("package") | Some("name")
-                                        )
-                                        && unquote_json(text, &spans[k + 2]).as_deref()
-                                            == Some(item) =>
-                                {
-                                    return Ok(json_cut(text, &spans, j, end));
-                                }
-                                _ => {}
+                                d -= 1;
                             }
-                            k += 1;
+                            JTok::Str
+                                if d == 0
+                                    && spans.get(k + 1).map(|t| t.tok) == Some(JTok::Colon)
+                                    && matches!(
+                                        unquote_json(text, &spans[k]).as_deref(),
+                                        Some("package") | Some("name")
+                                    )
+                                    && unquote_json(text, &spans[k + 2]).as_deref()
+                                        == Some(item) =>
+                            {
+                                return Ok(json_cut(text, &spans, j, end));
+                            }
+                            _ => {}
                         }
+                        k += 1;
                     }
-                    j = end;
-                    continue;
                 }
-                depth += 1;
+                j = end;
+                continue;
             }
-            JTok::Close | JTok::ArrClose => {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
-            }
-            JTok::Comma if depth == 0 => {}
-            _ if depth == 0 => {
+            JTok::Close | JTok::ArrClose => break,
+            JTok::Comma => {}
+            _ => {
                 let matches_item = if s.tok == JTok::Str {
                     unquote_json(text, &s)
                         .map(|v| v.trim_start_matches('-') == item)
@@ -937,7 +975,6 @@ fn remove_json_array_item(text: &str, path: &[String], item: &str) -> Result<Str
                     return Ok(json_cut(text, &spans, j, j + 1));
                 }
             }
-            _ => {}
         }
         j += 1;
     }
@@ -1073,15 +1110,54 @@ fn toml_multiline_next(line: &str, mut open: Option<u8>) -> Option<u8> {
     open
 }
 
+/// Net `[`/`]` balance of a line, skipping quoted strings and `#` comments.
+/// Used to keep table-header detection out of multiline array values.
+fn toml_bracket_delta(line: &str) -> i32 {
+    let mut depth = 0i32;
+    let mut quote = 0u8;
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if quote != 0 {
+            if quote == b'"' && b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'#' => break,
+            b'"' | b'\'' => quote = b,
+            b'[' => depth += 1,
+            b']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
 fn toml_tables(text: &str) -> Vec<TomlTable> {
     let mut tables = Vec::new();
     let mut offset = 0usize;
     let mut in_multiline: Option<u8> = None;
+    // >0 while a member value is an unterminated multiline array — a line
+    // like `["y"]` inside one must never parse as a table header.
+    let mut array_depth = 0i32;
     for line in text.split_inclusive('\n') {
         let line_start = offset;
         offset += line.len();
-        let inside = in_multiline.is_some();
+        let inside = in_multiline.is_some() || array_depth > 0;
+        let string_before = in_multiline;
         in_multiline = toml_multiline_next(line, in_multiline);
+        if string_before.is_none() && in_multiline.is_none() {
+            array_depth = (array_depth + toml_bracket_delta(line)).max(0);
+        }
         if inside {
             continue;
         }
@@ -1377,8 +1453,13 @@ fn toml_member_span(body: &str, key: &str) -> Option<(usize, usize, usize, usize
 }
 
 /// Drop one element from a TOML array's text, keeping brackets and commas
-/// balanced. `value` is the raw value (may span lines).
+/// balanced. `value` is the raw value (may span lines); anything that is not
+/// an array is refused — cutting a string out of `key = "x"` would leave an
+/// invalid bare `key =`.
 fn toml_list_remove(value: &str, item: &str) -> Option<String> {
+    if !value.trim_start().starts_with('[') {
+        return None;
+    }
     let bytes = value.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -1437,24 +1518,45 @@ fn remove_toml(text: &str, path: &[String], array_item: Option<&str>) -> Result<
     let tables = toml_tables(text);
     let matching: Vec<&TomlTable> = tables.iter().filter(|t| t.path == path).collect();
     if !matching.is_empty() {
+        // A single match is still verified against `array_item` when given —
+        // a ref captured by an older scan must not cut a different block.
+        let matches_needle = |t: &TomlTable, needle: &str| {
+            let body = &text[t.body_start..t.end];
+            ["name", "command", "prompt"].iter().any(|k| {
+                toml_get(body, k)
+                    .map(|v| unquote_toml_string(&v) == needle)
+                    .unwrap_or(false)
+            })
+        };
         let target = if matching.len() == 1 {
-            matching[0]
+            let only = matching[0];
+            if let Some(needle) = array_item {
+                if !matches_needle(only, needle) {
+                    return Err("Config changed since the last scan — refresh and retry".into());
+                }
+            }
+            only
         } else {
             let needle = array_item.ok_or("Entry is ambiguous")?;
             matching
                 .iter()
                 .copied()
-                .find(|t| {
-                    let body = &text[t.body_start..t.end];
-                    ["name", "command"].iter().any(|k| {
-                        toml_get(body, k)
-                            .map(|v| unquote_toml_string(&v) == needle)
-                            .unwrap_or(false)
-                    })
-                })
+                .find(|t| matches_needle(t, needle))
                 .ok_or("Entry not found in config file")?
         };
-        return Ok(format!("{}{}", &text[..target.start], &text[target.end..]));
+        // Extend the cut over contiguous sub-tables — removing
+        // `[mcp_servers.x]` must also drop `[mcp_servers.x.env]`, otherwise
+        // the env block silently keeps the server (and its secrets) alive.
+        // Same-path `[[siblings]]` are untouched: descendants are strictly
+        // longer paths.
+        let mut end = target.end;
+        while let Some(next) = tables
+            .iter()
+            .find(|t| t.start == end && t.path.len() > path.len() && t.path.starts_with(path))
+        {
+            end = next.end;
+        }
+        return Ok(format!("{}{}", &text[..target.start], &text[end..]));
     }
     let key = path.last().ok_or("Invalid config path")?;
     let parent = &path[..path.len() - 1];
@@ -2176,6 +2278,7 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                     format: "toml".into(),
                     path: table.path.clone(),
                     array_item: None,
+                    expect: None,
                 }),
             });
         } else if table.path.len() == 1 && table.path[0] == "plugins" {
@@ -2207,6 +2310,7 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                         format: "toml".into(),
                         path: jp(&["plugins", "enabled"]),
                         array_item: Some(name.clone()),
+                        expect: None,
                     }),
                 });
             }
@@ -2229,6 +2333,7 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                         format: "toml".into(),
                         path: jp(&["plugins", "disabled"]),
                         array_item: Some(name.clone()),
+                        expect: None,
                     }),
                 });
             }
@@ -2248,6 +2353,7 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                         format: "toml".into(),
                         path: jp(&["plugins", "paths"]),
                         array_item: Some(p.clone()),
+                        expect: None,
                     }),
                 });
             }
@@ -2275,6 +2381,7 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                     format: "toml".into(),
                     path: table.path.clone(),
                     array_item: None,
+                    expect: None,
                 }),
             });
         } else if table.path.len() == 2 && table.path[0] == "marketplaces" {
@@ -2294,6 +2401,7 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                     format: "toml".into(),
                     path: table.path.clone(),
                     array_item: None,
+                    expect: None,
                 }),
             });
         }
@@ -2319,6 +2427,7 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                         format: "toml".into(),
                         path: table.path.clone(),
                         array_item: Some(command),
+                        expect: None,
                     }),
                 });
             }
@@ -2350,6 +2459,7 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                     format: "toml".into(),
                     path: jp(&["notify"]),
                     array_item: None,
+                    expect: None,
                 }),
             });
         }
@@ -2513,6 +2623,7 @@ fn opencode_extensions(ctx: &Ctx) -> ProviderExtensions {
                             format: "json".into(),
                             path: jp(&[key]),
                             array_item: Some(id.to_string()),
+                            expect: None,
                         }),
                     });
                 }
@@ -2548,6 +2659,7 @@ fn opencode_extensions(ctx: &Ctx) -> ProviderExtensions {
                     format: "file".into(),
                     path: Vec::new(),
                     array_item: None,
+                    expect: None,
                 }),
             });
         }
@@ -2682,6 +2794,7 @@ fn pi_family_extensions(ctx: &Ctx, provider: &str, dir: &str) -> ProviderExtensi
                                         .chain([section.to_string()])
                                         .collect(),
                                     array_item: Some(name.to_string()),
+                                    expect: None,
                                 }),
                             );
                         }
@@ -2703,6 +2816,7 @@ fn pi_family_extensions(ctx: &Ctx, provider: &str, dir: &str) -> ProviderExtensi
                                     .chain([section.to_string(), name.clone()])
                                     .collect(),
                                 array_item: None,
+                                expect: None,
                             }),
                         );
                     }
@@ -2743,6 +2857,7 @@ fn pi_family_extensions(ctx: &Ctx, provider: &str, dir: &str) -> ProviderExtensi
                     format: "file".into(),
                     path: Vec::new(),
                     array_item: None,
+                    expect: None,
                 }),
             );
         }
@@ -3348,6 +3463,7 @@ fn mcp_map_entries(
                     .chain(std::iter::once(name.clone()))
                     .collect(),
                 array_item: None,
+                expect: None,
             }),
         });
     }
@@ -3366,7 +3482,9 @@ fn collect_hooks_map(
     let Some(map) = hooks.as_object() else {
         return;
     };
-    let hook_remove = |segments: &[String]| RemoveRef {
+    // Index paths carry the scanned command as `expect` so removal
+    // verifies the element still matches before cutting.
+    let hook_remove = |segments: &[String], command: Option<&str>| RemoveRef {
         file: file.into(),
         format: "json".into(),
         path: root
@@ -3375,6 +3493,7 @@ fn collect_hooks_map(
             .chain(segments.iter().cloned())
             .collect(),
         array_item: None,
+        expect: command.map(String::from),
     };
     for (event, groups) in map {
         let Some(groups) = groups.as_array() else {
@@ -3385,24 +3504,24 @@ fn collect_hooks_map(
             if let Some(list) = group["hooks"].as_array() {
                 for (hi, hook) in list.iter().enumerate() {
                     let kind = hook["type"].as_str().unwrap_or("command");
-                    let command = hook["command"]
-                        .as_str()
-                        .or_else(|| hook["prompt"].as_str())
-                        .map(String::from);
+                    let command = hook["command"].as_str().or_else(|| hook["prompt"].as_str());
                     out.push(HookEntry {
                         event: event.clone(),
                         matcher: matcher.clone(),
                         kind: kind.into(),
-                        command,
+                        command: command.map(String::from),
                         file: file.into(),
                         scope: scope.into(),
                         refs: Vec::new(),
-                        remove: Some(hook_remove(&[
-                            event.clone(),
-                            gi.to_string(),
-                            "hooks".into(),
-                            hi.to_string(),
-                        ])),
+                        remove: Some(hook_remove(
+                            &[
+                                event.clone(),
+                                gi.to_string(),
+                                "hooks".into(),
+                                hi.to_string(),
+                            ],
+                            command,
+                        )),
                     });
                 }
             } else {
@@ -3419,7 +3538,7 @@ fn collect_hooks_map(
                         file: file.into(),
                         scope: scope.into(),
                         refs: Vec::new(),
-                        remove: Some(hook_remove(&[event.clone(), gi.to_string()])),
+                        remove: Some(hook_remove(&[event.clone(), gi.to_string()], Some(command))),
                     });
                 }
             }
@@ -3464,6 +3583,7 @@ fn collect_flat_hooks(
                             .chain([event.clone(), i.to_string()])
                             .collect(),
                         array_item: None,
+                        expect: Some(command.to_string()),
                     }),
                 });
             }
@@ -3956,6 +4076,117 @@ fn push_instruction(
 
 // ---- set_enabled ---------------------------------------------------------------
 
+/// Serializes config mutations: every change is an unlocked
+/// read-modify-write, so overlapping invokes on the same file would
+/// resurrect entries or drop flags.
+static CONFIG_MUTATION: Mutex<()> = Mutex::new(());
+
+/// `cwd` is the trust root for the project bound — the frontend passes the
+/// open project's path, but invoke args are not trusted input. Refuse a root
+/// filesystem identity, which would make every path "within the project".
+fn checked_project(cwd: &str) -> Result<PathBuf, String> {
+    let project = expand_home(cwd);
+    match wsl::path_location(&project) {
+        Ok(Some(location)) => {
+            if location.path == "/" || location.path.is_empty() {
+                return Err("Refusing a filesystem root as the project path".into());
+            }
+        }
+        Ok(None) => {
+            let canonical = project
+                .canonicalize()
+                .map_err(|_| "Project path does not exist".to_string())?;
+            if !canonical.is_dir() || canonical.parent().is_none() {
+                return Err("Refusing a filesystem root as the project path".into());
+            }
+            return Ok(canonical);
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(project)
+}
+
+/// Basenames of files the inventory itself may offer for removal, and
+/// directory names whose immediate children are removable (extension/plugin
+/// files, rules, agent files, hook files, provider config files). Keeps
+/// `format: "file"` removal from renaming arbitrary files or directories —
+/// `~`, `~/.ssh`, `.git` all fail this check.
+fn known_removable_file(path: &Path) -> bool {
+    const KNOWN_FILES: &[&str] = &[
+        ".claude.json",
+        ".cursorrules",
+        ".fx.json",
+        ".mcp.json",
+        ".windsurfrules",
+        "agent.md",
+        "agents.md",
+        "claude.md",
+        "config.json",
+        "config.toml",
+        "config.yml",
+        "config.yaml",
+        "copilot-instructions.md",
+        "gemini.md",
+        "hooks.json",
+        "hooks.v1.json",
+        "installed_plugins.json",
+        "mcp-config.json",
+        "mcp.json",
+        "mcp.jsonc",
+        "mcp_config.json",
+        "opencode.json",
+        "opencode.jsonc",
+        "package.json",
+        "settings.json",
+        "settings.local.json",
+        "managed-settings.json",
+    ];
+    const KNOWN_PARENTS: &[&str] = &[
+        ".devin",
+        ".github",
+        ".opencode",
+        ".vscode",
+        "agent",
+        "agents",
+        "command",
+        "commands",
+        "extensions",
+        "hooks",
+        "instructions",
+        "plugins",
+        "rules",
+        "skills",
+        "copilot",
+        "muse",
+        "opencode",
+    ];
+    const KNOWN_EXTS: &[&str] = &[
+        "json", "jsonc", "toml", "yml", "yaml", "md", "mdc", "ts", "js",
+    ];
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if KNOWN_FILES.contains(&name.as_str()) || name.ends_with(".mdc") {
+        return true;
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    // Directories (plugin/extension dirs have no extension) are fine under a
+    // known parent; files need a config/text extension too.
+    if !ext.is_empty() && !KNOWN_EXTS.contains(&ext.as_str()) {
+        return false;
+    }
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .is_some_and(|p| KNOWN_PARENTS.contains(&p.to_lowercase().as_str()))
+}
+
 /// Whether `file` sits beneath `root`, comparing canonical paths on the host
 /// and (distribution, linux path) pairs for WSL identities.
 fn path_within(file: &Path, root: &Path) -> bool {
@@ -4027,7 +4258,10 @@ pub fn agent_config_set_enabled(
     toggle: ToggleRequest,
     enabled: bool,
 ) -> Result<(), String> {
-    let project = expand_home(&cwd);
+    let _guard = CONFIG_MUTATION
+        .lock()
+        .map_err(|_| "Config mutation lock poisoned".to_string())?;
+    let project = checked_project(&cwd)?;
     let home = home_for(&project);
     let path = expand_home(&toggle.file);
     toggle_allowed(&toggle, &path, &project, home.as_deref())?;
@@ -4041,14 +4275,19 @@ pub fn agent_config_set_enabled(
     if next == text {
         return Ok(());
     }
-    // Keep a pre-edit copy next to the file so a bad edit is recoverable.
+    // Never leave a syntactically broken file behind.
+    if toggle.format == "json" && parse_json_file(&next).is_none() {
+        return Err("Toggle would produce invalid JSON — aborted".into());
+    }
+    // Keep a pre-edit copy next to the file so a bad edit is recoverable —
+    // and refuse to write without it.
     let backup = path.with_file_name(format!(
         "{}.monocode-bak",
         path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("config")
     ));
-    let _ = write_config_text(&backup, &text);
+    write_config_text(&backup, &text)?;
     write_config_text(&path, &next)
 }
 
@@ -4079,8 +4318,16 @@ fn remove_allowed(
         return Err("Refusing to write outside the project and home directory".into());
     }
     if remove.format == "file" {
-        // File removal renames to <name>.monocode-bak — recoverable — so the
-        // project/home bounds above suffice.
+        // File removal renames to <name>.monocode-bak — recoverable — but the
+        // target must still be a file the inventory could have produced: a
+        // known config name or a child of a known extension dir. The project
+        // and home roots themselves are never removable.
+        if path == project || home.is_some_and(|h| path == h) {
+            return Err("Refusing to remove the project or home directory".into());
+        }
+        if !known_removable_file(path) {
+            return Err("This file cannot be removed from here".into());
+        }
         return Ok(());
     }
     let section = remove.path.first().map(String::as_str).unwrap_or("");
@@ -4109,6 +4356,18 @@ fn remove_allowed(
         other => return Err(format!("Unsupported config format: {other}")),
     };
     if section_ok {
+        // Whitelisted sections are maps/arrays — a removal must address an
+        // entry inside them (`["mcpServers", "x"]`, `["plugin"]` + array_item),
+        // never the section itself. `projects` in particular would wipe every
+        // per-project approval in ~/.claude.json at depth 1.
+        let minimum = if remove.array_item.is_some() || section == "notify" {
+            1
+        } else {
+            2
+        };
+        if remove.path.len() < minimum {
+            return Err("Only entries inside a config section can be removed".into());
+        }
         return Ok(());
     }
     let dedicated = remove.format == "json"
@@ -4156,7 +4415,10 @@ fn remove_config_file(path: &Path) -> Result<(), String> {
 
 #[tauri::command(async)]
 pub fn agent_config_remove(cwd: String, remove: RemoveRef) -> Result<(), String> {
-    let project = expand_home(&cwd);
+    let _guard = CONFIG_MUTATION
+        .lock()
+        .map_err(|_| "Config mutation lock poisoned".to_string())?;
+    let project = checked_project(&cwd)?;
     let home = home_for(&project);
     let path = expand_home(&remove.file);
     remove_allowed(&remove, &path, &project, home.as_deref())?;
@@ -4167,7 +4429,7 @@ pub fn agent_config_remove(cwd: String, remove: RemoveRef) -> Result<(), String>
     let next = match remove.format.as_str() {
         "json" => match &remove.array_item {
             Some(item) => remove_json_array_item(&text, &remove.path, item)?,
-            None => remove_json_at(&text, &remove.path)?,
+            None => remove_json_at(&text, &remove.path, remove.expect.as_deref())?,
         },
         "toml" => remove_toml(&text, &remove.path, remove.array_item.as_deref())?,
         other => return Err(format!("Unsupported config format: {other}")),
@@ -4185,7 +4447,7 @@ pub fn agent_config_remove(cwd: String, remove: RemoveRef) -> Result<(), String>
             .and_then(|n| n.to_str())
             .unwrap_or("config")
     ));
-    let _ = write_config_text(&backup, &text);
+    write_config_text(&backup, &text)?;
     write_config_text(&path, &next)
 }
 
@@ -4506,17 +4768,20 @@ mod tests {
         // First, middle and last members all cut cleanly with one comma.
         let text = "{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": 3\n}";
         for key in ["a", "b", "c"] {
-            let next = remove_json_at(text, &[key.into()]).unwrap();
+            let next = remove_json_at(text, &[key.into()], None).unwrap();
             let reparsed: Value = serde_json::from_str(&next).unwrap();
             assert!(reparsed.get(key).is_none(), "{key} still present");
             assert_eq!(reparsed.as_object().unwrap().len(), 2);
         }
-        let next = remove_json_at(text, &["b".into()]).unwrap();
+        let next = remove_json_at(text, &["b".into()], None).unwrap();
         let reparsed: Value = serde_json::from_str(&next).unwrap();
         assert_eq!(reparsed, serde_json::json!({"a": 1, "c": 3}));
         // Single-line object keeps it single-line.
         let flat = "{\"a\": 1, \"b\": 2}";
-        assert_eq!(remove_json_at(flat, &["a".into()]).unwrap(), "{ \"b\": 2}");
+        assert_eq!(
+            remove_json_at(flat, &["a".into()], None).unwrap(),
+            "{ \"b\": 2}"
+        );
     }
 
     #[test]
@@ -4524,13 +4789,13 @@ mod tests {
         // Nested member and array-index descent (hook-style paths).
         let text = r#"{"mcpServers": {"a": {"command": "x"}, "b": {"url": "u"}},
             "hooks": {"Pre": [{"matcher": "m", "hooks": [{"type": "command", "command": "one"}, {"type": "command", "command": "two"}]}]}}"#;
-        let next = remove_json_at(text, &jp(&["mcpServers", "a"])).unwrap();
+        let next = remove_json_at(text, &jp(&["mcpServers", "a"]), None).unwrap();
         let reparsed: Value = serde_json::from_str(&next).unwrap();
         assert!(reparsed["mcpServers"].get("a").is_none());
         assert!(reparsed["mcpServers"].get("b").is_some());
 
         let path = jp(&["hooks", "Pre", "0", "hooks", "0"]);
-        let next = remove_json_at(text, &path).unwrap();
+        let next = remove_json_at(text, &path, None).unwrap();
         let reparsed: Value = serde_json::from_str(&next).unwrap();
         let hooks = reparsed["hooks"]["Pre"][0]["hooks"].as_array().unwrap();
         assert_eq!(hooks.len(), 1);
@@ -4555,7 +4820,7 @@ mod tests {
     #[test]
     fn json_remove_keeps_utf8_and_comments() {
         let text = "{\n  // keep me\n  \"n\": \"héllo—✓\",\n  \"m\": 1\n}";
-        let next = remove_json_at(text, &["n".into()]).unwrap();
+        let next = remove_json_at(text, &["n".into()], None).unwrap();
         assert!(next.contains("// keep me"));
         let reparsed = parse_json_file(&next).unwrap();
         assert_eq!(reparsed, serde_json::json!({"m": 1}));
@@ -4601,6 +4866,7 @@ mod tests {
             format: "toml".into(),
             path: jp(&["mcp_servers", "x"]),
             array_item: None,
+            expect: None,
         };
         assert!(remove_allowed(
             &entry,
@@ -4621,6 +4887,7 @@ mod tests {
             format: "json".into(),
             path: jp(&["theme"]),
             array_item: None,
+            expect: None,
         };
         assert!(remove_allowed(
             &other,
@@ -4635,9 +4902,166 @@ mod tests {
             format: "json".into(),
             path: jp(&["myserver"]),
             array_item: None,
+            expect: None,
         };
         assert!(
             remove_allowed(&map, Path::new("/home/u/.fx/mcp.json"), project, Some(home)).is_ok()
         );
+    }
+
+    #[test]
+    fn json_remove_index_verifies_expected_content() {
+        let text = r#"{"hooks": {"PostToolUse": [{"hooks": [{"command": "a.sh"}, {"command": "b.sh"}]}]}}"#;
+        // Index path + expect match: removes the right element.
+        let next = remove_json_at(
+            text,
+            &jp(&["hooks", "PostToolUse", "0", "hooks", "1"]),
+            Some("b.sh"),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_json_file(&next).unwrap(),
+            serde_json::json!({"hooks": {"PostToolUse": [{"hooks": [{"command": "a.sh"}]}]}})
+        );
+        // Stale ref (file changed: the element at index 1 is now "c.sh") is
+        // refused instead of cutting the wrong entry.
+        let shifted = r#"{"hooks": {"PostToolUse": [{"hooks": [{"command": "c.sh"}]}]}}"#;
+        assert!(remove_json_at(
+            shifted,
+            &jp(&["hooks", "PostToolUse", "0", "hooks", "1"]),
+            Some("b.sh"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn toml_tables_skip_multiline_arrays() {
+        // A `["y"]` line inside an unterminated array value is not a header.
+        let text = "[mcp_servers.a]\nargs = [\n  \"x\",\n  [\"y\"]\n]\n\n[mcp_servers.b]\ncommand = \"z\"\n";
+        let tables = toml_tables(text);
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].path, vec!["mcp_servers", "a"]);
+        assert_eq!(tables[1].path, vec!["mcp_servers", "b"]);
+        // Removing table a leaves balanced brackets.
+        let next = remove_toml(text, &jp(&["mcp_servers", "a"]), None).unwrap();
+        assert!(!next.contains("mcp_servers.a"));
+        assert!(next.contains("[mcp_servers.b]"));
+        assert!(!next.contains("[\"y\"]"));
+    }
+
+    #[test]
+    fn remove_requires_known_file_and_entry_depth() {
+        let project = Path::new("/repo");
+        let home = Path::new("/home/u");
+        let file_remove = |file: &str| RemoveRef {
+            file: file.into(),
+            format: "file".into(),
+            path: Vec::new(),
+            array_item: None,
+            expect: None,
+        };
+        // Arbitrary files and dirs are refused even inside the bounds.
+        for bad in [
+            "/home/u/.ssh/config",
+            "/home/u/.zshrc",
+            "/repo/.git",
+            "/repo/src/main.rs",
+            "/home/u",
+            "/repo",
+        ] {
+            let r = file_remove(bad);
+            assert!(
+                remove_allowed(&r, Path::new(bad), project, Some(home)).is_err(),
+                "{bad} must not be removable"
+            );
+        }
+        // Inventory-emitted file targets pass.
+        for good in [
+            "/repo/CLAUDE.md",
+            "/repo/.mcp.json",
+            "/home/u/.claude/settings.json",
+            "/home/u/.codex/hooks/notify.json",
+            "/repo/.cursor/rules/style.mdc",
+            "/home/u/.pi/agent/extensions/foo.ts",
+            "/repo/.devin/config.json",
+        ] {
+            let r = file_remove(good);
+            assert!(
+                remove_allowed(&r, Path::new(good), project, Some(home)).is_ok(),
+                "{good} should be removable"
+            );
+        }
+        // Whole-section removal is refused; entries inside are allowed.
+        let whole = RemoveRef {
+            file: "/home/u/.claude.json".into(),
+            format: "json".into(),
+            path: jp(&["projects"]),
+            array_item: None,
+            expect: None,
+        };
+        assert!(remove_allowed(
+            &whole,
+            Path::new("/home/u/.claude.json"),
+            project,
+            Some(home)
+        )
+        .is_err());
+        let entry = RemoveRef {
+            file: "/home/u/.claude.json".into(),
+            format: "json".into(),
+            path: jp(&["projects", "/repo"]),
+            array_item: None,
+            expect: None,
+        };
+        assert!(remove_allowed(
+            &entry,
+            Path::new("/home/u/.claude.json"),
+            project,
+            Some(home)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn project_root_is_rejected() {
+        assert!(checked_project("/").is_err());
+        assert!(checked_project("/definitely/not/here").is_err());
+        // A real directory passes.
+        assert!(checked_project(env!("CARGO_MANIFEST_DIR")).is_ok());
+    }
+
+    #[test]
+    fn json_remove_truncated_file_does_not_panic() {
+        // `{"mcpServers":` — member present, value token missing.
+        assert!(remove_json_at("{\"mcpServers\":", &jp(&["mcpServers", "x"]), None).is_err());
+    }
+
+    #[test]
+    fn json_remove_last_keeps_trailing_comment() {
+        let text = "{\n  \"a\": 1, // keep\n  \"b\": 2\n}";
+        let next = remove_json_at(text, &["b".into()], None).unwrap();
+        assert!(next.contains("// keep"));
+        assert_eq!(parse_json_file(&next).unwrap(), serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn toml_remove_refuses_scalar_list_item() {
+        // `enabled = "one"` is not an array — a string cut would leave
+        // `enabled = ` behind, which is invalid TOML.
+        let text = "[plugins]\nenabled = \"one\"\n";
+        assert!(remove_toml(text, &jp(&["plugins", "enabled"]), Some("one")).is_err());
+    }
+
+    #[test]
+    fn toml_remove_table_takes_subtables() {
+        let text = "[mcp_servers.a]\ncommand = \"x\"\n\n[mcp_servers.a.env]\nKEY = \"secret\"\n\n[mcp_servers.b]\ncommand = \"y\"\n";
+        let next = remove_toml(text, &jp(&["mcp_servers", "a"]), None).unwrap();
+        assert!(!next.contains("mcp_servers.a"));
+        assert!(!next.contains("secret"));
+        assert!(next.contains("[mcp_servers.b]"));
+        // A verified single array-table match still checks the needle.
+        let text = "[[hooks.a]]\ncommand = \"one\"\n";
+        assert!(remove_toml(text, &jp(&["hooks", "a"]), Some("other")).is_err());
+        assert!(remove_toml(text, &jp(&["hooks", "a"]), Some("one")).is_ok());
     }
 }

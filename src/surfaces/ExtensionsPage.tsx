@@ -78,6 +78,9 @@ export function ExtensionsPage({
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pending, setPending] = useState<Set<string>>(new Set());
+  // Files with an in-flight mutation — every row bound to one is disabled so
+  // two read-modify-writes on the same file cannot interleave.
+  const [busyFiles, setBusyFiles] = useState<Set<string>>(new Set());
   const [reload, setReload] = useState(0);
   // Scan once per (cwd, reload) — tab switches alone must not rescan.
   const fetchedFor = useRef("");
@@ -86,7 +89,11 @@ export function ExtensionsPage({
     if (tab === "skills") return;
     const key = `${cwd}${reload}`;
     if (fetchedFor.current === key) return;
+    const prev = fetchedFor.current;
+    const projectChanged =
+      prev === "" || prev.slice(0, prev.lastIndexOf(" ")) !== cwd;
     fetchedFor.current = key;
+    if (projectChanged) setInventory(null);
     let cancelled = false;
     let settled = false;
     agentConfigInventory(cwd)
@@ -101,6 +108,13 @@ export function ExtensionsPage({
         if (!cancelled) {
           setError(err instanceof Error ? err.message : String(err));
         }
+      })
+      .finally(() => {
+        if (cancelled) return;
+        // Mutations stay pending until their refetch lands — removed rows keep
+        // spinning instead of briefly re-enabling against a stale list.
+        setPending(new Set());
+        setBusyFiles(new Set());
       });
     return () => {
       cancelled = true;
@@ -110,50 +124,59 @@ export function ExtensionsPage({
     };
   }, [cwd, reload, tab]);
 
+  useEffect(() => {
+    setActionError(null);
+  }, [tab]);
+
+  const mutationFailed = (key: string, file: string, message: string): void => {
+    setActionError(message);
+    setPending((keys) => {
+      const next = new Set(keys);
+      next.delete(key);
+      return next;
+    });
+    setBusyFiles((files) => {
+      const next = new Set(files);
+      next.delete(file);
+      return next;
+    });
+  };
+
   const onToggle = (toggle: ToggleRef, enabled: boolean): void => {
     const key = toggleKey(toggle);
     setPending((keys) => new Set(keys).add(key));
+    setBusyFiles((files) => new Set(files).add(toggle.file));
     setActionError(null);
     void agentConfigSetEnabled(cwd, toggle, enabled)
       .then(() => setReload((value) => value + 1))
       .catch((err: unknown) => {
-        setActionError(
+        mutationFailed(
+          key,
+          toggle.file,
           `Could not update the config: ${err instanceof Error ? err.message : String(err)}`,
         );
-      })
-      .finally(() =>
-        setPending((keys) => {
-          const next = new Set(keys);
-          next.delete(key);
-          return next;
-        }),
-      );
+      });
   };
 
   const onRemove = (remove: RemoveRef, label: string): void => {
-    const fileLabel = remove.file.split("/").pop() ?? remove.file;
     const message =
       remove.format === "file"
-        ? `Remove ${label}? It is renamed to ${fileLabel}.monocode-bak so you can restore it.`
-        : `Remove ${label} from ${fileLabel}? A ${fileLabel}.monocode-bak backup is kept.`;
+        ? `Remove ${remove.file}? It is renamed to ${remove.file}.monocode-bak so you can restore it.`
+        : `Remove ${label} from ${remove.file}? A backup is kept as ${remove.file}.monocode-bak.`;
     if (!window.confirm(message)) return;
     const key = removeKey(remove);
     setPending((keys) => new Set(keys).add(key));
+    setBusyFiles((files) => new Set(files).add(remove.file));
     setActionError(null);
     void agentConfigRemove(cwd, remove)
       .then(() => setReload((value) => value + 1))
       .catch((err: unknown) => {
-        setActionError(
+        mutationFailed(
+          key,
+          remove.file,
           `Could not remove it: ${err instanceof Error ? err.message : String(err)}`,
         );
-      })
-      .finally(() =>
-        setPending((keys) => {
-          const next = new Set(keys);
-          next.delete(key);
-          return next;
-        }),
-      );
+      });
   };
 
   const onReveal = (path: string): void => {
@@ -171,7 +194,11 @@ export function ExtensionsPage({
 
   const onCopyPath = (path: string): void => {
     setActionError(null);
-    void copyText(path).catch(() => {
+    // Copy the UNC form so it pastes straight into Windows tools.
+    const copyPath = path.startsWith("//wsl.localhost/")
+      ? `\\\\${path.slice(2).replace(/\//g, "\\")}`
+      : path;
+    void copyText(copyPath).catch(() => {
       setActionError("Could not copy the path to the clipboard.");
     });
   };
@@ -234,6 +261,7 @@ export function ExtensionsPage({
       error={error}
       actionError={actionError}
       pending={pending}
+      busyFiles={busyFiles}
       onRefresh={() => setReload((value) => value + 1)}
       onToggle={onToggle}
       onRemove={onRemove}
@@ -265,6 +293,7 @@ function InventoryTab({
   error,
   actionError,
   pending,
+  busyFiles,
   onRefresh,
   onToggle,
   onRemove,
@@ -279,6 +308,7 @@ function InventoryTab({
   error: string | null;
   actionError: string | null;
   pending: Set<string>;
+  busyFiles: Set<string>;
   onRefresh: () => void;
   onToggle: (toggle: ToggleRef, enabled: boolean) => void;
   onRemove: (remove: RemoveRef, label: string) => void;
@@ -382,6 +412,7 @@ function InventoryTab({
             entries={inventory.instructions}
             needle={needle}
             pending={pending}
+            busyFiles={busyFiles}
             onRemove={onRemove}
             onCopyPath={onCopyPath}
             onReveal={onReveal}
@@ -393,6 +424,7 @@ function InventoryTab({
             tab={tab}
             needle={needle}
             pending={pending}
+            busyFiles={busyFiles}
             collapsed={collapsed}
             onCollapseChange={setCollapsed}
             onToggle={onToggle}
@@ -480,6 +512,7 @@ function ProviderGroups({
   tab,
   needle,
   pending,
+  busyFiles,
   collapsed,
   onCollapseChange,
   onToggle,
@@ -492,6 +525,7 @@ function ProviderGroups({
   tab: Exclude<ExtensionTab, "skills" | "instructions">;
   needle: string;
   pending: Set<string>;
+  busyFiles: Set<string>;
   collapsed: Set<string>;
   onCollapseChange: (next: Set<string>) => void;
   onToggle: (toggle: ToggleRef, enabled: boolean) => void;
@@ -504,13 +538,25 @@ function ProviderGroups({
     .map((provider) => {
       const entries = filteredEntries(provider, tab, needle);
       const entryFiles = new Set(entries.map((entry) => entry.file));
+      // A file carrying entries in ANY category must not be offered for
+      // removal — on another tab it would silently take those with it.
+      const allEntryFiles = new Set(
+        [...provider.mcpServers, ...provider.plugins, ...provider.hooks].map(
+          (entry) => entry.file,
+        ),
+      );
       const files = (
         needle
           ? provider.files.filter((f) =>
               f.path.toLowerCase().includes(needle),
             )
           : provider.files
-      ).filter((f) => entries.length === 0 || !entryFiles.has(f.path));
+      )
+        .filter((f) => entries.length === 0 || !entryFiles.has(f.path))
+        .map((f) => ({
+          file: f,
+          removable: !allEntryFiles.has(f.path),
+        }));
       return { provider, entries, files };
     })
     .filter((group) => group.entries.length > 0 || group.files.length > 0);
@@ -571,6 +617,7 @@ function ProviderGroups({
                     entry={entry as McpServerEntry}
                     provider={provider.provider}
                     pending={pending}
+                    busyFiles={busyFiles}
                     onToggle={onToggle}
                     onRemove={onRemove}
                     onCopyPath={onCopyPath}
@@ -581,6 +628,7 @@ function ProviderGroups({
                   <PluginRow
                     entry={entry as PluginEntry}
                     pending={pending}
+                    busyFiles={busyFiles}
                     onToggle={onToggle}
                     onRemove={onRemove}
                     onCopyPath={onCopyPath}
@@ -591,6 +639,7 @@ function ProviderGroups({
                   <HookRow
                     entry={entry as HookEntry}
                     pending={pending}
+                    busyFiles={busyFiles}
                     onRemove={onRemove}
                     onCopyPath={onCopyPath}
                     onReveal={onReveal}
@@ -603,7 +652,7 @@ function ProviderGroups({
               <div
                 className={`px-3 py-2 ${entries.length > 0 ? "border-t border-content/10 bg-content/[0.02]" : ""}`}
               >
-                {files.map((file) => (
+                {files.map(({ file, removable }) => (
                   <div
                     key={file.path}
                     className="flex items-center gap-1 py-0.5"
@@ -616,9 +665,10 @@ function ProviderGroups({
                       {` · ${file.kind} · ${formatSize(file.size)}`}
                     </p>
                     <RemoveButton
-                      remove={fileRemove(file.path)}
+                      remove={removable ? fileRemove(file.path) : null}
                       label={file.path.split("/").pop() ?? file.path}
                       pending={pending}
+                      busyFiles={busyFiles}
                       onRemove={onRemove}
                     />
                     <RowActions
@@ -643,21 +693,28 @@ function RemoveButton({
   remove,
   label,
   pending,
+  busyFiles,
   onRemove,
 }: {
   remove: RemoveRef | null;
   /** Entry name, used for the confirm dialog and accessible label. */
   label: string;
   pending: Set<string>;
+  busyFiles: Set<string>;
   onRemove: (remove: RemoveRef, label: string) => void;
 }) {
   if (!remove) return null;
+  // A pending action on this file locks every other row bound to it — the
+  // backend does unlocked read-modify-write, so concurrent edits on the same
+  // file could resurrect a removed entry.
+  const disabled =
+    busyFiles.has(remove.file) || pending.has(removeKey(remove));
   return (
     <button
       type="button"
       aria-label={`Remove ${label}`}
       title={remove.format === "file" ? "Remove file" : "Remove from config"}
-      disabled={pending.has(removeKey(remove))}
+      disabled={disabled}
       onClick={() => onRemove(remove, label)}
       className="grid size-5 shrink-0 place-items-center rounded text-content/40 hover:bg-red-400/15 hover:text-red-300 disabled:opacity-40"
     >
@@ -725,6 +782,7 @@ function GateControl({
   enabled,
   readonly,
   pending,
+  busyFiles,
   name,
   onToggle,
 }: {
@@ -733,6 +791,7 @@ function GateControl({
   /** Text shown when there is no writable flag. */
   readonly: string;
   pending: Set<string>;
+  busyFiles: Set<string>;
   /** Entry name, used for the switch's accessible label. */
   name: string;
   onToggle: (toggle: ToggleRef, enabled: boolean) => void;
@@ -746,7 +805,9 @@ function GateControl({
     <Toggle
       label={`Enable ${name}`}
       on={enabled ?? false}
-      disabled={pending.has(toggleKey(toggle))}
+      disabled={
+        busyFiles.has(toggle.file) || pending.has(toggleKey(toggle))
+      }
       onChange={(next) => onToggle(toggle, next)}
     />
   );
@@ -756,6 +817,7 @@ function McpRow({
   entry,
   provider,
   pending,
+  busyFiles,
   onToggle,
   onRemove,
   onCopyPath,
@@ -765,6 +827,7 @@ function McpRow({
   entry: McpServerEntry;
   provider: string;
   pending: Set<string>;
+  busyFiles: Set<string>;
   onToggle: (toggle: ToggleRef, enabled: boolean) => void;
   onRemove: (remove: RemoveRef, label: string) => void;
   onCopyPath: (path: string) => void;
@@ -797,6 +860,7 @@ function McpRow({
           enabled={entry.enabled}
           readonly={readonly}
           pending={pending}
+          busyFiles={busyFiles}
           name={entry.name}
           onToggle={onToggle}
         />
@@ -821,6 +885,7 @@ function McpRow({
           remove={entry.remove}
           label={entry.name}
           pending={pending}
+          busyFiles={busyFiles}
           onRemove={onRemove}
         />
         <RowActions
@@ -837,6 +902,7 @@ function McpRow({
 function PluginRow({
   entry,
   pending,
+  busyFiles,
   onToggle,
   onRemove,
   onCopyPath,
@@ -845,6 +911,7 @@ function PluginRow({
 }: {
   entry: PluginEntry;
   pending: Set<string>;
+  busyFiles: Set<string>;
   onToggle: (toggle: ToggleRef, enabled: boolean) => void;
   onRemove: (remove: RemoveRef, label: string) => void;
   onCopyPath: (path: string) => void;
@@ -878,6 +945,7 @@ function PluginRow({
           enabled={entry.enabled}
           readonly={readonly}
           pending={pending}
+          busyFiles={busyFiles}
           name={entry.id}
           onToggle={onToggle}
         />
@@ -893,6 +961,7 @@ function PluginRow({
           remove={entry.remove}
           label={entry.id}
           pending={pending}
+          busyFiles={busyFiles}
           onRemove={onRemove}
         />
         <RowActions
@@ -909,6 +978,7 @@ function PluginRow({
 function HookRow({
   entry,
   pending,
+  busyFiles,
   onRemove,
   onCopyPath,
   onReveal,
@@ -916,6 +986,7 @@ function HookRow({
 }: {
   entry: HookEntry;
   pending: Set<string>;
+  busyFiles: Set<string>;
   onRemove: (remove: RemoveRef, label: string) => void;
   onCopyPath: (path: string) => void;
   onReveal: (path: string) => void;
@@ -947,9 +1018,9 @@ function HookRow({
       ) : null}
       {entry.refs.length > 0 ? (
         <div className="mt-1 flex flex-wrap items-center gap-1">
-          {entry.refs.map((ref) => (
+          {entry.refs.map((ref, index) => (
             <span
-              key={ref.path}
+              key={`${ref.path}#${index}`}
               title={
                 ref.exists === null
                   ? `${ref.path} — depends on the environment`
@@ -981,6 +1052,7 @@ function HookRow({
           remove={entry.remove}
           label={entry.command ?? entry.event}
           pending={pending}
+          busyFiles={busyFiles}
           onRemove={onRemove}
         />
         <RowActions
@@ -1004,6 +1076,7 @@ function InstructionsList({
   entries,
   needle,
   pending,
+  busyFiles,
   onRemove,
   onCopyPath,
   onReveal,
@@ -1012,6 +1085,7 @@ function InstructionsList({
   entries: InstructionEntry[];
   needle: string;
   pending: Set<string>;
+  busyFiles: Set<string>;
   onRemove: (remove: RemoveRef, label: string) => void;
   onCopyPath: (path: string) => void;
   onReveal: (path: string) => void;
@@ -1076,6 +1150,7 @@ function InstructionsList({
               remove={fileRemove(entry.path)}
               label={entry.name}
               pending={pending}
+              busyFiles={busyFiles}
               onRemove={onRemove}
             />
             <RowActions

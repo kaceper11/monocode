@@ -25,6 +25,7 @@ export type RemoveRef = {
   format: "json" | "toml" | "file";
   path: string[];
   arrayItem?: string | null;
+  expect?: string | null;
 };
 
 export type McpServerEntry = {
