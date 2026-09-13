@@ -1,7 +1,7 @@
 import { copilotEffortSetting } from "./harness/copilotEffort";
 import { pathKey, wslLocation } from "./paths";
-import type { HarnessId } from "./session";
-import { HARNESSES } from "./session";
+import type { HarnessId, RuntimeMode } from "./session";
+import { DEFAULT_RUNTIME_MODE, HARNESSES, RUNTIME_MODES } from "./session";
 
 export type ModelSettingChoice = {
   value: string;
@@ -250,6 +250,7 @@ const HIDDEN_PICKER_PROVIDERS_KEY = "monocode.hiddenPickerProviders";
 const LAST_MODEL_KEY = "monocode.lastModel";
 const LAST_MODEL_SETTINGS_KEY = "monocode.lastModelSettings";
 const DEFAULT_MODELS_KEY = "monocode.defaultModels";
+const DEFAULT_RUNTIME_MODE_KEY = "monocode.defaultRuntimeMode";
 const RECENT_MODELS_KEY = "monocode.recentModels";
 const RECENT_MODEL_LIMIT = 6;
 
@@ -801,6 +802,27 @@ export function defaultSessionChoice(cwd?: string): LastModelChoice {
   const last = loadLastModelChoice(cwd);
   const harness = last?.harness ?? "cursor";
   return { harness, model: preferredModelId(harness, cwd) };
+}
+
+/** Access mode new conversations start in; `supervised` until configured. */
+export function loadDefaultRuntimeMode(): RuntimeMode {
+  try {
+    const raw = localStorage.getItem(DEFAULT_RUNTIME_MODE_KEY);
+    if ((RUNTIME_MODES as string[]).includes(raw ?? "")) {
+      return raw as RuntimeMode;
+    }
+    return DEFAULT_RUNTIME_MODE;
+  } catch {
+    return DEFAULT_RUNTIME_MODE;
+  }
+}
+
+export function saveDefaultRuntimeMode(mode: RuntimeMode) {
+  try {
+    localStorage.setItem(DEFAULT_RUNTIME_MODE_KEY, mode);
+  } catch {
+    // private mode / quota
+  }
 }
 
 export function loadLastModelChoice(cwd?: string): LastModelChoice | null {

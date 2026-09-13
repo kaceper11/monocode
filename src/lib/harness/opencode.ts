@@ -10,7 +10,11 @@ import {
   unwatchChild,
   watchChild,
 } from "./child";
-import { OpenCodeClient, OpenCodeHttpError } from "./opencodeClient";
+import {
+  OpenCodeClient,
+  OpenCodeHttpError,
+  type OpenCodeSession,
+} from "./opencodeClient";
 import {
   appendOpenCodeAssistantTextDelta,
   asRecord,
@@ -60,6 +64,8 @@ import {
 
 type PendingApproval = {
   id: string;
+  /** Server permission name — decides whether a new mode covers this ask. */
+  permission: string;
   resolve: (decision: ApprovalDecision) => void;
 };
 
@@ -73,7 +79,10 @@ type Live = {
   client: OpenCodeClient;
   openCodeSessionId: string;
   cwd: string;
+  runtimeMode: RuntimeMode;
   planning: boolean;
+  /** Effective rule set last confirmed on the server — retries dedupe on it. */
+  appliedRuntimeMode?: RuntimeMode;
   onEvent: (event: HarnessEvent) => void;
   approvals: Map<number, PendingApproval>;
   questions: Map<number, PendingQuestion>;
@@ -129,6 +138,7 @@ export async function sendOpenCodeTurn(input: SendTurnInput): Promise<void> {
       // Posture applies when the queued turn actually runs — applying it at
       // enqueue time would flip the running turn's permission handling.
       live.planning = input.intent === "plan";
+      applyOpenCodeRuntimeMode(live, input.runtimeMode);
       live.cancelled = false;
       live.muteUpdates = false;
       try {
@@ -201,6 +211,61 @@ export async function steerOpenCodeTurn(input: SteerTurnInput): Promise<void> {
     variant: input.modelSettings?.variant,
     parts,
   });
+}
+
+/**
+ * Apply a UI access-mode change to the running server session: push fresh
+ * permission rules over `updateSession` and settle parked asks the new rules
+ * already allow.
+ */
+export function setOpenCodeRuntimeMode(
+  sessionId: string,
+  runtimeMode: RuntimeMode,
+): void {
+  const live = liveByThread.get(sessionId);
+  if (!live) return;
+  applyOpenCodeRuntimeMode(live, runtimeMode);
+}
+
+function applyOpenCodeRuntimeMode(
+  live: Live,
+  runtimeMode: RuntimeMode,
+): void {
+  const changed = live.runtimeMode !== runtimeMode;
+  live.runtimeMode = runtimeMode;
+  // Plan turns keep ask-everything rules so the local deny gate decides;
+  // allow-all rules would let bash/external_directory through unasked.
+  const effective = live.planning ? "supervised" : runtimeMode;
+  if (live.appliedRuntimeMode !== effective) {
+    void live.client
+      .updateSession(live.openCodeSessionId, {
+        permission: buildOpenCodePermissionRules(effective),
+      })
+      .then(() => {
+        live.appliedRuntimeMode = effective;
+      })
+      .catch((error: unknown) => {
+        console.debug("[monocode] opencode updateSession failed", error);
+      });
+  }
+  if (!changed) return;
+  for (const [uiId, pending] of live.approvals) {
+    if (!openCodeAutoAllow(runtimeMode, pending.permission)) continue;
+    live.approvals.delete(uiId);
+    pending.resolve("allow");
+  }
+}
+
+/** Would the new mode's generated rules let this permission through unasked? */
+function openCodeAutoAllow(
+  runtimeMode: RuntimeMode,
+  permission: string,
+): boolean {
+  return buildOpenCodePermissionRules(runtimeMode).some(
+    (rule) =>
+      rule.action === "allow" &&
+      (rule.permission === "*" || rule.permission === permission),
+  );
 }
 
 export function respondOpenCodeApproval(
@@ -348,17 +413,21 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       SERVER_TIMEOUT_MS,
     );
     const client = new OpenCodeClient(url, input.cwd);
-    const openCodeSession = await resolveSession(client, {
+    const planning = input.intent === "plan";
+    const resolved = await resolveSession(client, {
       resume: canResume ? resume : undefined,
       runtimeMode: input.runtimeMode,
+      planning,
       cwd: input.cwd,
     });
 
     const live: Live = {
       client,
-      openCodeSessionId: openCodeSession.id,
+      openCodeSessionId: resolved.session.id,
       cwd: input.cwd,
-      planning: input.intent === "plan",
+      runtimeMode: input.runtimeMode,
+      planning,
+      appliedRuntimeMode: resolved.appliedMode,
       onEvent: input.onEvent,
       approvals: new Map(),
       questions: new Map(),
@@ -379,7 +448,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     liveRef.current = live;
     liveByThread.set(input.sessionId, live);
     resumeByThread.set(input.sessionId, {
-      sessionId: openCodeSession.id,
+      sessionId: resolved.session.id,
       cwd: input.cwd,
     });
 
@@ -431,7 +500,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
 
     live.onEvent({
       type: "session.providerBound",
-      providerSessionId: openCodeSession.id,
+      providerSessionId: resolved.session.id,
     });
     live.onEvent({ type: "session.started" });
     return live;
@@ -446,29 +515,36 @@ async function resolveSession(
   input: {
     resume?: Resume;
     runtimeMode: RuntimeMode;
+    planning: boolean;
     cwd: string;
   },
-) {
-  const permission = buildOpenCodePermissionRules(input.runtimeMode);
+): Promise<{ session: OpenCodeSession; appliedMode?: RuntimeMode }> {
+  const applied = input.planning ? "supervised" : input.runtimeMode;
+  const permission = buildOpenCodePermissionRules(applied);
   if (input.resume) {
     try {
       const adopted = await client.getSession(input.resume.sessionId);
       if (!adopted.directory || sameDirectory(adopted.directory, input.cwd)) {
-        await client
+        const ok = await client
           .updateSession(adopted.id, { permission })
-          .catch(() => undefined);
-        return adopted;
+          .then(() => true)
+          .catch(() => false);
+        return { session: adopted, appliedMode: ok ? applied : undefined };
       }
       const forked = await client.forkSession(adopted.id, input.cwd);
-      await client
+      const ok = await client
         .updateSession(forked.id, { permission })
-        .catch(() => undefined);
-      return forked;
+        .then(() => true)
+        .catch(() => false);
+      return { session: forked, appliedMode: ok ? applied : undefined };
     } catch (error) {
       if (!isOpenCodeNotFound(error) && !isHttpNotFound(error)) throw error;
     }
   }
-  return client.createSession({ permission });
+  return {
+    session: await client.createSession({ permission }),
+    appliedMode: applied,
+  };
 }
 
 async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
@@ -663,7 +739,7 @@ async function handleEvent(
         );
         break;
       }
-      const pending = waitApproval(live, uiId, id);
+      const pending = waitApproval(live, uiId, id, permission);
       if (callId) {
         live.onEvent({
           type: "tool.updated",
@@ -841,9 +917,10 @@ async function waitApproval(
   live: Live,
   uiId: number,
   id: string,
+  permission: string,
 ): Promise<void> {
   const decision = await new Promise<ApprovalDecision>((resolve) => {
-    live.approvals.set(uiId, { id, resolve });
+    live.approvals.set(uiId, { id, permission, resolve });
   });
   live.approvals.delete(uiId);
   live.onEvent({ type: "approval.resolved", requestId: uiId, decision });

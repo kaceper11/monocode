@@ -8,6 +8,7 @@ import {
   respondDevinApproval,
   respondDevinQuestion,
   sendDevinTurn,
+  setDevinRuntimeMode,
   steerDevinTurn,
   stopDevinSession,
 } from "./devin";
@@ -25,6 +26,7 @@ export const devinAdapter: HarnessAdapter = {
   steerTurn: steerDevinTurn,
   cancelTurn: cancelDevinTurn,
   respondApproval: respondDevinApproval,
+  setRuntimeMode: setDevinRuntimeMode,
   respondQuestion: respondDevinQuestion,
   stopSession: stopDevinSession,
   forgetSession: forgetDevinSession,

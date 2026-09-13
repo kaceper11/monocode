@@ -39,6 +39,14 @@ import type {
 } from "./types";
 import { questionPromptTitle, type UserQuestionReply } from "../userQuestion";
 
+/** A parked permission request, kept with enough context to re-decide it when
+ * the access mode changes mid-conversation. */
+type PendingApproval = {
+  kind?: string;
+  optionIds: string[];
+  resolve: (decision: ApprovalDecision) => void;
+};
+
 type Live = {
   acp: AcpClient;
   acpSessionId: string;
@@ -48,10 +56,12 @@ type Live = {
   muteUpdates: boolean;
   cancelled: boolean;
   fullAccess: boolean;
+  /** Server `autoMode` was requested at `session/new` and can't be revoked live. */
+  autoMode: boolean;
   planning: boolean;
   runtimeMode: RuntimeMode;
   onEvent: (event: HarnessEvent) => void;
-  approvals: Map<string, (decision: ApprovalDecision) => void>;
+  approvals: Map<string, PendingApproval>;
   questions: Map<string, (reply: UserQuestionReply) => void>;
   /** Synthetic requestId source for ACP requests with non-numeric ids. */
   nextRequestId: number;
@@ -93,10 +103,12 @@ export async function sendGrokTurn(input: SendTurnInput): Promise<void> {
   if (cancelledThreads.delete(input.sessionId)) return;
 
   live.onEvent = input.onEvent;
-  live.runtimeMode = input.runtimeMode;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      // Posture applies when the queued turn actually runs — applying it at
+      // enqueue time would flip the running turn's permission handling.
+      live.runtimeMode = input.runtimeMode;
       live.cancelled = false;
       live.muteUpdates = false;
       try {
@@ -156,7 +168,40 @@ export function respondGrokApproval(
   requestId: number,
   decision: ApprovalDecision,
 ) {
-  liveByThread.get(sessionId)?.approvals.get(String(requestId))?.(decision);
+  liveByThread
+    .get(sessionId)
+    ?.approvals.get(String(requestId))
+    ?.resolve(decision);
+}
+
+/**
+ * Apply a UI access-mode change. Grok's `yoloMode`/`autoMode` flags are fixed
+ * at `session/new`, so a live switch loosens through our own auto-answers —
+ * the server still sends its asks and we grant them. Tightening away from
+ * full-access cannot claw back a yolo session, so `fullAccess` stays stale and
+ * `ensureLive` respawns on the next turn.
+ */
+export function setGrokRuntimeMode(
+  sessionId: string,
+  runtimeMode: RuntimeMode,
+): void {
+  const live = liveByThread.get(sessionId);
+  if (!live || live.runtimeMode === runtimeMode) return;
+  live.runtimeMode = runtimeMode;
+  if (!live.planning) {
+    // Looser modes are emulated by our own auto-answers, so record them as
+    // established and skip a pointless respawn. Tightening keeps the stale
+    // spawn flags, which makes ensureLive respawn to revoke them.
+    if (runtimeMode === "full-access") live.fullAccess = true;
+    if (runtimeMode === "auto") live.autoMode = true;
+  }
+  for (const [key, pending] of live.approvals) {
+    if (!pickAutoOption(runtimeMode, pending.kind, pending.optionIds)) {
+      continue;
+    }
+    live.approvals.delete(key);
+    pending.resolve("allow");
+  }
 }
 
 export function respondGrokQuestion(
@@ -175,7 +220,7 @@ export async function cancelGrokTurn(sessionId: string): Promise<void> {
   }
   live.cancelled = true;
   live.muteUpdates = true;
-  for (const [, resolve] of live.approvals) resolve("deny");
+  for (const [, pending] of live.approvals) pending.resolve("deny");
   live.approvals.clear();
   for (const [, resolve] of live.questions) resolve({ kind: "skipped" });
   live.questions.clear();
@@ -191,7 +236,7 @@ export async function stopGrokSession(sessionId: string): Promise<void> {
   liveByThread.delete(sessionId);
   if (live) {
     live.muteUpdates = true;
-    for (const [, resolve] of live.approvals) resolve("deny");
+    for (const [, pending] of live.approvals) pending.resolve("deny");
     live.approvals.clear();
     for (const [, resolve] of live.questions) resolve({ kind: "skipped" });
     live.questions.clear();
@@ -219,15 +264,16 @@ export function bindGrokSession(
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   const wantPlanning = input.intent === "plan";
   const wantFullAccess = input.runtimeMode === "full-access" && !wantPlanning;
+  const wantAutoMode = input.runtimeMode === "auto" && !wantPlanning;
   const existing = liveByThread.get(input.sessionId);
   if (
     existing &&
     existing.cwd === input.cwd &&
     existing.fullAccess === wantFullAccess &&
+    existing.autoMode === wantAutoMode &&
     existing.planning === wantPlanning
   ) {
     existing.onEvent = input.onEvent;
-    existing.runtimeMode = input.runtimeMode;
     return existing;
   }
   if (existing) {
@@ -392,6 +438,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       muteUpdates: didLoad,
       cancelled: false,
       fullAccess: wantFullAccess,
+      autoMode: wantAutoMode,
       planning: wantPlanning,
       runtimeMode: input.runtimeMode,
       onEvent: input.onEvent,
@@ -600,7 +647,11 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
   });
 
   const decision = await new Promise<ApprovalDecision>((resolve) => {
-    live.approvals.set(String(requestId), resolve);
+    live.approvals.set(String(requestId), {
+      kind: request.kind,
+      optionIds: request.optionIds,
+      resolve,
+    });
   });
   live.approvals.delete(String(requestId));
   live.onEvent({ type: "approval.resolved", requestId, decision });

@@ -7,6 +7,7 @@ import {
   respondCopilotApproval,
   respondCopilotQuestion,
   sendCopilotTurn,
+  setCopilotRuntimeMode,
   steerCopilotTurn,
   stopCopilotSession,
 } from "./copilot";
@@ -23,6 +24,7 @@ export const copilotAdapter: HarnessAdapter = {
   steerTurn: steerCopilotTurn,
   cancelTurn: cancelCopilotTurn,
   respondApproval: respondCopilotApproval,
+  setRuntimeMode: setCopilotRuntimeMode,
   respondQuestion: respondCopilotQuestion,
   stopSession: stopCopilotSession,
   forgetSession: forgetCopilotSession,

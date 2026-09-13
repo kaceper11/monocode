@@ -108,15 +108,13 @@ describe("fx live turn sequence", () => {
     // ---- turn 2 ----
     sent.length = 0;
     const turn2 = sendFxTurn({ ...input, text: "check the repo" } as never);
-    await waitFor(
-      () => parse().some((m) => m.method === "session/set_mode"),
-      "set_mode t2",
-    );
-    reply(parse().find((m) => m.method === "session/set_mode")!.id, {});
+    // The mode is unchanged, so the provider-confirmed modeId is reused and
+    // no second session/set_mode goes out — the turn goes straight to prompt.
     await waitFor(
       () => parse().some((m) => m.method === "session/prompt"),
       "prompt t2",
     );
+    expect(parse().some((m) => m.method === "session/set_mode")).toBe(false);
     const promptId = parse().find((m) => m.method === "session/prompt")!.id;
     console.log(
       "turn2 outbound ids:",
@@ -238,11 +236,7 @@ describe("fx live turn sequence", () => {
       text: "again",
       onEvent: (e: HarnessEvent) => turn2Events.push(e),
     } as never);
-    await waitFor(
-      () => parse().some((m) => m.method === "session/set_mode"),
-      "set_mode t2",
-    );
-    reply(parse().find((m) => m.method === "session/set_mode")!.id, {});
+    // Mode unchanged from turn 1 -> no session/set_mode, straight to prompt.
     await waitFor(
       () => parse().some((m) => m.method === "session/prompt"),
       "prompt t2",

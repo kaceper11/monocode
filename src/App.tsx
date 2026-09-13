@@ -234,6 +234,7 @@ import {
   promoteLastAssistantToPlan,
   respondHarnessApproval,
   respondHarnessQuestion,
+  setHarnessRuntimeMode,
   keepHarnessQuestionOpen,
   sendHarnessTurn,
   prewarmHarness,
@@ -372,6 +373,7 @@ import {
 } from "./lib/workspaceTabGroups";
 import { runSessionRemoval } from "./lib/sessionRemoval";
 import {
+  DEFAULT_RUNTIME_MODE,
   HARNESS_LABEL,
   HARNESS_TITLE,
   canReplaceSessionTitle,
@@ -1963,7 +1965,7 @@ export default function App({
     setInboxViewOpen(false);
     setNotesViewOpen(false);
     const cwd = active?.cwd ?? sessionDefaults?.cwd ?? projectCwd;
-    const session = newDefaultSession(cwd, sessionDefaults?.runtimeMode);
+    const session = newDefaultSession(cwd);
     const tab = newTab(session.id);
     setSessions((prev) => [...prev, session]);
     appendTab(tab, cwd);
@@ -1974,7 +1976,6 @@ export default function App({
     active?.cwd,
     appendTab,
     sessionDefaults?.cwd,
-    sessionDefaults?.runtimeMode,
     projectCwd,
   ]);
 
@@ -2130,7 +2131,7 @@ export default function App({
         projectCwd;
       const title = card.title.trim();
       const session = {
-        ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
+        ...newDefaultSession(cwd),
         ...(title ? { title } : {}),
         noteCard: card,
       };
@@ -2144,7 +2145,6 @@ export default function App({
       active?.cwd,
       appendTab,
       sessionDefaults?.cwd,
-      sessionDefaults?.runtimeMode,
       projectCwd,
     ],
   );
@@ -2197,7 +2197,6 @@ export default function App({
       if (!activeTab) return;
       const session = newDefaultSession(
         sessionDefaults?.cwd ?? projectCwd,
-        sessionDefaults?.runtimeMode,
       );
       setSessions((prev) => [...prev, session]);
       setTabs((prev) =>
@@ -2212,7 +2211,7 @@ export default function App({
       );
       setComposerFocused(true);
     },
-    [activeTab, projectCwd, sessionDefaults?.cwd, sessionDefaults?.runtimeMode],
+    [activeTab, projectCwd, sessionDefaults?.cwd],
   );
 
   const focusProjectTerminal = useCallback(() => {
@@ -2693,14 +2692,7 @@ export default function App({
               );
               return;
             }
-            const seed = sessionsRef.current[0];
-            const session = newSession(
-              seed?.harness ?? "claude",
-              file.cwd || projectCwd,
-              seed?.model,
-              seed?.runtimeMode,
-              seed?.modelSettings,
-            );
+            const session = newDefaultSession(file.cwd || projectCwd);
             setSessions((prev) => [...prev, session]);
             setTabs((prev) =>
               prev.map((entry) =>
@@ -3574,10 +3566,7 @@ export default function App({
         replaceTarget,
         scope: tabCloseScope,
         createReplacement: (seed) =>
-          newDefaultSession(
-            seed?.cwd ?? projectCwdRef.current,
-            seed?.runtimeMode,
-          ),
+          newDefaultSession(seed?.cwd ?? projectCwdRef.current),
       });
       if (!result) return;
 
@@ -3661,12 +3650,8 @@ export default function App({
             dirtyFiles: dirtyFilesRef.current,
           }),
           createReplacement: (latest) =>
-            newSession(
-              latest?.harness ?? seed?.harness ?? "cursor",
+            newDefaultSession(
               latest?.cwd ?? seed?.cwd ?? sidebarCwd,
-              latest?.model ?? seed?.model,
-              latest?.runtimeMode ?? seed?.runtimeMode,
-              latest?.modelSettings ?? open?.modelSettings,
             ),
           confirmClose: async (closedTabs) => {
             const files = filesInWorkspaceTabs(closedTabs);
@@ -3939,13 +3924,7 @@ export default function App({
       ) {
         setProjectCwd(normalized);
         setRecents(rememberProject(normalized));
-        const session = newSession(
-          current.harness,
-          normalized,
-          current.model,
-          current.runtimeMode,
-          current.modelSettings,
-        );
+        const session = newDefaultSession(normalized);
         const tab = newTab(session.id);
         setSessions((prev) => [...prev, session]);
         appendTab(tab, normalized);
@@ -4021,14 +4000,6 @@ export default function App({
       const normalized = normalizeProjectPath(path);
       if (!looksLikeProject(normalized)) return;
 
-      const activeWorkspace = tabsRef.current.find(
-        (entry) => entry.id === activeTabIdRef.current,
-      );
-      const current = activeWorkspace
-        ? sessionsRef.current.find(
-            (session) => session.id === activeWorkspace.focusedId,
-          )
-        : undefined;
       const decision = planProjectReturn({
         memory: readProjectReturnMemory(),
         tabs: tabsRef.current,
@@ -4057,14 +4028,7 @@ export default function App({
         }
       }
 
-      const seed = current ?? sessionsRef.current[0];
-      const session = newSession(
-        seed?.harness ?? "claude",
-        normalized,
-        seed?.model,
-        seed?.runtimeMode,
-        seed?.modelSettings,
-      );
+      const session = newDefaultSession(normalized);
       const tab = newTab(session.id);
       setProjectCwd(normalized);
       setRecents(rememberProject(normalized));
@@ -4193,8 +4157,7 @@ export default function App({
       let nextActiveTabId = activeTabIdRef.current;
 
       if (nextTabs.length === 0) {
-        const fallback = nextSessions[0];
-        const session = newDefaultSession("~", fallback?.runtimeMode);
+        const session = newDefaultSession("~");
         const tab = newTab(session.id);
         nextSessions = [...nextSessions, session];
         nextTabs = [tab];
@@ -4455,9 +4418,15 @@ export default function App({
 
   const onRuntimeModeChange = useCallback(
     (sessionId: string, runtimeMode: RuntimeMode) => {
-      setSessions((prev) =>
-        prev.map((s) => (s.id === sessionId ? { ...s, runtimeMode } : s)),
+      const session = sessionsRef.current.find((s) => s.id === sessionId);
+      sessionsRef.current = sessionsRef.current.map((s) =>
+        s.id === sessionId ? { ...s, runtimeMode } : s,
       );
+      setSessions(sessionsRef.current);
+      if (!session) return;
+      for (const harness of sessionChildHarnesses(session)) {
+        setHarnessRuntimeMode(harness, sessionId, runtimeMode);
+      }
     },
     [],
   );
@@ -5440,7 +5409,7 @@ export default function App({
         );
       if (!host?.workingCopy) return undefined;
       const session = {
-        ...newDefaultSession(host.workingCopy, sessionDefaults?.runtimeMode),
+        ...newDefaultSession(host.workingCopy),
         title: fresh.name,
         ...(fresh.ticket ? { linkedWorkItem: fresh.ticket } : {}),
       };
@@ -5482,7 +5451,6 @@ export default function App({
       appendTab,
       onSelectHistorySession,
       onSubmit,
-      sessionDefaults?.runtimeMode,
       taskSessionAlive,
     ],
   );
@@ -7411,7 +7379,15 @@ export default function App({
           : undefined;
       }
       const session = {
-        ...newSession(target.harness, target.cwd, target.model),
+        // Unattended runs stay supervised — parked approvals are what the
+        // attention row reviews, and the conversation default must not
+        // silently lift that.
+        ...newSession(
+          target.harness,
+          target.cwd,
+          target.model,
+          DEFAULT_RUNTIME_MODE,
+        ),
         title: formatSessionTitle(target.harness, watcher.name),
       };
       sessionsRef.current = [...sessionsRef.current, session];
@@ -7489,7 +7465,13 @@ export default function App({
           : undefined;
       }
       const session = {
-        ...newSession(schedule.target.harness, schedule.target.cwd, schedule.target.model),
+        // Same as watcher runs: unattended work stays supervised.
+        ...newSession(
+          schedule.target.harness,
+          schedule.target.cwd,
+          schedule.target.model,
+          DEFAULT_RUNTIME_MODE,
+        ),
         title: formatSessionTitle(schedule.target.harness, schedule.name),
       };
       sessionsRef.current = [...sessionsRef.current, session];

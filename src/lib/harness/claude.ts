@@ -56,6 +56,7 @@ import {
   turnStatusFromResult,
   type ClaudeCliSettings,
   type ClaudeControlRequest,
+  type ClaudePermissionMode,
 } from "./claudeProtocol";
 import { isAgentToolName } from "./preview";
 import { joinStreamText, snapshotRemainder } from "./streamText";
@@ -84,6 +85,7 @@ type ApprovalOutcome = ApprovalDecision | "cancelled";
 
 type PendingApproval = {
   requestId: string;
+  kind: string;
   input: Record<string, unknown>;
   resolve: (decision: ApprovalOutcome) => void;
 };
@@ -114,6 +116,8 @@ type Live = {
   claudeSessionId: string;
   runtimeMode: RuntimeMode;
   planning: boolean;
+  /** Last permission mode confirmed written to the wire — retries dedupe on it. */
+  pushedMode: ClaudePermissionMode;
   settingsKey: string;
   onEvent: (event: HarnessEvent) => void;
   approvals: Map<number, PendingApproval>;
@@ -201,10 +205,12 @@ export async function sendClaudeTurn(input: SendTurnInput): Promise<void> {
   if (cancelledThreads.delete(input.sessionId)) return;
 
   live.onEvent = input.onEvent;
-  live.runtimeMode = input.runtimeMode;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      // Posture applies when the queued turn actually runs — applying it at
+      // enqueue time would flip the running turn's permission handling.
+      applyClaudeRuntimeMode(input.sessionId, live, input.runtimeMode);
       live.cancelled = false;
       live.muteUpdates = false;
       try {
@@ -228,10 +234,10 @@ export async function compactClaudeContext(
   if (cancelledThreads.delete(input.sessionId)) return;
 
   live.onEvent = input.onEvent;
-  live.runtimeMode = input.runtimeMode;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      applyClaudeRuntimeMode(input.sessionId, live, input.runtimeMode);
       live.cancelled = false;
       live.muteUpdates = false;
       live.manualCompaction = true;
@@ -269,6 +275,63 @@ export async function steerClaudeTurn(input: SteerTurnInput): Promise<void> {
   if (content.length === 0) return;
 
   await writeJson(input.sessionId, message);
+}
+
+/**
+ * Apply a UI access-mode change to a running CLI: push the matching
+ * `set_permission_mode` control so the process stops (or resumes) gating on
+ * its own, then settle parked approvals the new mode already covers. Asks the
+ * mode still escalates stay pending for the user.
+ */
+export function setClaudeRuntimeMode(
+  sessionId: string,
+  runtimeMode: RuntimeMode,
+): void {
+  const live = liveByThread.get(sessionId);
+  if (!live) return;
+  applyClaudeRuntimeMode(sessionId, live, runtimeMode);
+}
+
+/** What the wire mode must be: plan turns always stay gated as "plan". */
+function desiredPermissionMode(
+  live: Live,
+  runtimeMode: RuntimeMode,
+): ClaudePermissionMode {
+  if (live.planning) return "plan";
+  return runtimeModeToPermission(runtimeMode) ?? "default";
+}
+
+function applyClaudeRuntimeMode(
+  sessionId: string,
+  live: Live,
+  runtimeMode: RuntimeMode,
+): void {
+  const changed = live.runtimeMode !== runtimeMode;
+  live.runtimeMode = runtimeMode;
+  const desired = desiredPermissionMode(live, runtimeMode);
+  if (live.pushedMode !== desired) {
+    void writeJson(
+      sessionId,
+      buildControlRequest(nextControlId(live), {
+        subtype: "set_permission_mode",
+        mode: desired,
+      }),
+    )
+      .then(() => {
+        live.pushedMode = desired;
+      })
+      .catch(() => undefined);
+  }
+  if (!changed) return;
+  for (const [uiId, pending] of live.approvals) {
+    if (
+      runtimeMode === "full-access" ||
+      (runtimeMode === "auto-accept-edits" && pending.kind === "edit")
+    ) {
+      live.approvals.delete(uiId);
+      pending.resolve("allow");
+    }
+  }
 }
 
 export function respondClaudeApproval(
@@ -368,7 +431,11 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     existing.planning === planning
   ) {
     existing.onEvent = input.onEvent;
-    existing.runtimeMode = input.runtimeMode;
+    // A queued send must not retarget the running turn's posture; the queued
+    // task applies its own mode when it starts.
+    if (!existing.activeTurn) {
+      applyClaudeRuntimeMode(input.sessionId, existing, input.runtimeMode);
+    }
     return existing;
   }
   if (existing) {
@@ -401,6 +468,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     claudeSessionId,
     runtimeMode: input.runtimeMode,
     planning,
+    pushedMode: launch.permissionMode ?? "default",
     settingsKey,
     onEvent: input.onEvent,
     approvals: new Map(),
@@ -889,7 +957,13 @@ async function handleControlRequest(
   }
 
   const uiId = live.nextApprovalUiId++;
-  const pending = waitApproval(live, uiId, control.requestId, input);
+  const pending = waitApproval(
+    live,
+    uiId,
+    control.requestId,
+    input,
+    toolKindFromName(toolName),
+  );
   live.onEvent({
     type: "approval.requested",
     requestId: uiId,
@@ -937,9 +1011,10 @@ function waitApproval(
   uiId: number,
   requestId: string,
   input: Record<string, unknown>,
+  kind: string,
 ): Promise<ApprovalOutcome> {
   return new Promise<ApprovalOutcome>((resolve) => {
-    live.approvals.set(uiId, { requestId, input, resolve });
+    live.approvals.set(uiId, { requestId, kind, input, resolve });
   }).finally(() => {
     live.approvals.delete(uiId);
   });
@@ -1262,7 +1337,6 @@ function settingsKeyFor(input: HarnessSessionInput): string {
     fast: input.modelSettings?.fast,
     thinking: input.modelSettings?.thinking,
     context: input.modelSettings?.context,
-    runtimeMode: input.runtimeMode,
     hooks: loadClaudeHooks(),
   });
 }

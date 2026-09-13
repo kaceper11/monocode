@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { HarnessId } from "./session";
+import { newDefaultSession, newSession, type HarnessId } from "./session";
 import {
   coerceModelPickerTab,
   defaultModelId,
@@ -7,6 +7,7 @@ import {
   hasLiveCatalog,
   isPickerProviderVisible,
   loadDefaultModels,
+  loadDefaultRuntimeMode,
   loadHiddenPickerProviders,
   loadLastModelChoice,
   loadLastModelSettings,
@@ -19,6 +20,7 @@ import {
   resetHarnessModelOverlays,
   resolveModel,
   saveDefaultModel,
+  saveDefaultRuntimeMode,
   saveLastModelChoice,
   saveLastModelSettings,
   savePickerProviderVisible,
@@ -224,6 +226,37 @@ describe("provider defaults", () => {
       harness: "cursor",
       model: defaultModelId("cursor"),
     });
+  });
+
+  it("starts new conversations supervised until an access mode is saved", () => {
+    expect(loadDefaultRuntimeMode()).toBe("supervised");
+    saveDefaultRuntimeMode("full-access");
+    expect(loadDefaultRuntimeMode()).toBe("full-access");
+    saveDefaultRuntimeMode("auto-accept-edits");
+    expect(loadDefaultRuntimeMode()).toBe("auto-accept-edits");
+  });
+
+  it("ignores a stored value that is not a runtime mode", () => {
+    localStorage.setItem("monocode.defaultRuntimeMode", "yolo");
+    expect(loadDefaultRuntimeMode()).toBe("supervised");
+  });
+
+  it("seeds new sessions with the saved access mode unless one is given", () => {
+    saveDefaultRuntimeMode("full-access");
+    expect(newDefaultSession().runtimeMode).toBe("full-access");
+    expect(newSession("claude").runtimeMode).toBe("full-access");
+    expect(newDefaultSession("~", "auto").runtimeMode).toBe("auto");
+    expect(newSession("claude", "~", undefined, "supervised").runtimeMode).toBe(
+      "supervised",
+    );
+  });
+
+  it("seeds new sessions with the saved provider and model", () => {
+    saveLastModelChoice("claude", "claude:opus-5");
+    saveDefaultModel("claude", "claude:haiku-4.5");
+    const session = newDefaultSession();
+    expect(session.harness).toBe("claude");
+    expect(session.model).toBe("claude:haiku-4.5");
   });
 
   it("keeps the six most recently used unique models", () => {

@@ -25,6 +25,7 @@ const {
   respondCodexApproval,
   respondCodexQuestion,
   sendCodexTurn,
+  setCodexRuntimeMode,
   stopCodexSession,
   __codexTestReset,
 } = await import("./codex");
@@ -306,6 +307,141 @@ describe("codex live turn sequence", () => {
       await turn;
     },
   );
+
+  it("settles pending and new approvals when the mode loosens mid-turn", async () => {
+    const { events, turn } = await startTurn("codex-live");
+    onLine!(
+      JSON.stringify({
+        id: 91,
+        method: "item/fileChange/requestApproval",
+        params: { itemId: "edit_1", reason: "Update config" },
+      }),
+    );
+    onLine!(
+      JSON.stringify({
+        id: 92,
+        method: "item/commandExecution/requestApproval",
+        params: { itemId: "cmd_1", command: "git status --short" },
+      }),
+    );
+    await waitFor(
+      () =>
+        events.filter((e) => e.type === "approval.requested").length === 2,
+      "both approvals parked",
+    );
+
+    // auto-accept-edits covers the file change but not the command.
+    setCodexRuntimeMode("codex-live", "auto-accept-edits");
+    await waitFor(() => parse().some((m) => m.id === 91), "edit decision");
+    expect(parse().find((m) => m.id === 91)?.result).toEqual({
+      decision: "accept",
+    });
+    expect(parse().some((m) => m.id === 92)).toBe(false);
+
+    // full-access settles the command too, and new asks never reach the UI.
+    setCodexRuntimeMode("codex-live", "full-access");
+    await waitFor(() => parse().some((m) => m.id === 92), "command decision");
+    expect(parse().find((m) => m.id === 92)?.result).toEqual({
+      decision: "accept",
+    });
+    expect(
+      events.filter((e) => e.type === "approval.resolved"),
+    ).toHaveLength(2);
+
+    onLine!(
+      JSON.stringify({
+        id: 93,
+        method: "item/commandExecution/requestApproval",
+        params: { itemId: "cmd_2", command: "rm -rf build" },
+      }),
+    );
+    await waitFor(() => parse().some((m) => m.id === 93), "fresh ask");
+    expect(parse().find((m) => m.id === 93)?.result).toEqual({
+      decision: "accept",
+    });
+    expect(
+      events.filter((e) => e.type === "approval.requested"),
+    ).toHaveLength(2);
+
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
+  });
+
+  it("keeps parked MCP consent for the user under full-access", async () => {
+    const { events, turn } = await startTurn("codex-live");
+    onLine!(
+      JSON.stringify({
+        id: 91,
+        method: "mcpServer/elicitation/request",
+        params: {
+          serverName: "example",
+          mode: "form",
+          message: "Read this source?",
+          requestedSchema: {
+            type: "object",
+            properties: { approved: { type: "boolean" } },
+            required: ["approved"],
+          },
+        },
+      }),
+    );
+    await waitFor(
+      () => events.some((e) => e.type === "approval.requested"),
+      "MCP approval UI",
+    );
+
+    setCodexRuntimeMode("codex-live", "full-access");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(parse().some((m) => m.id === 91)).toBe(false);
+    expect(events.some((e) => e.type === "approval.resolved")).toBe(false);
+
+    const approval = events.find((e) => e.type === "approval.requested")!;
+    respondCodexApproval("codex-live", approval.requestId, "allow");
+    await waitFor(() => parse().some((m) => m.id === 91), "MCP response");
+    expect(parse().find((m) => m.id === 91)?.result).toMatchObject({
+      action: "accept",
+    });
+
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
+  });
+
+  it("resumes parking asks when the mode tightens mid-turn", async () => {
+    const { events, turn } = await startTurn("codex-live");
+    onLine!(
+      JSON.stringify({
+        id: 91,
+        method: "item/fileChange/requestApproval",
+        params: { itemId: "edit_1", reason: "Update config" },
+      }),
+    );
+    await waitFor(
+      () => events.some((e) => e.type === "approval.requested"),
+      "approval parked",
+    );
+
+    setCodexRuntimeMode("codex-live", "auto-accept-edits");
+    await waitFor(() => parse().some((m) => m.id === 91), "edit decision");
+
+    setCodexRuntimeMode("codex-live", "supervised");
+    onLine!(
+      JSON.stringify({
+        id: 92,
+        method: "item/fileChange/requestApproval",
+        params: { itemId: "edit_2", reason: "Update other file" },
+      }),
+    );
+    await waitFor(
+      () =>
+        events.filter((e) => e.type === "approval.requested").length === 2,
+      "fresh ask parks",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(parse().some((m) => m.id === 92)).toBe(false);
+
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
+  });
 
   it("still waits for an explicit command decision in supervised mode", async () => {
     const { events, turn } = await startTurn("codex-live");

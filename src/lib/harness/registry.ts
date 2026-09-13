@@ -1,4 +1,4 @@
-import type { HarnessId } from "../session";
+import type { HarnessId, RuntimeMode } from "../session";
 import type { GeneratedSessionTitle } from "../sessionTitle";
 import type { PrContent } from "../gitText";
 import { hasLiveCatalog } from "../models";
@@ -45,6 +45,14 @@ export type HarnessAdapter = {
     requestId: number,
     decision: ApprovalDecision,
   ): void;
+  /**
+   * Apply a runtime-mode change to a live session: update local approval
+   * policy, push the provider-side mode when the protocol supports it, and
+   * resolve pending approvals the new mode already covers. Sessions without
+   * a live child keep the recorded mode for the next spawn. Adapters without
+   * a mode concept leave this unimplemented.
+   */
+  setRuntimeMode?(sessionId: string, mode: RuntimeMode): void;
   respondQuestion?(
     sessionId: string,
     requestId: number,
@@ -243,6 +251,14 @@ export function respondHarnessApproval(
   decision: ApprovalDecision,
 ): void {
   getHarness(harness)?.respondApproval(sessionId, requestId, decision);
+}
+
+export function setHarnessRuntimeMode(
+  harness: HarnessId,
+  sessionId: string,
+  mode: RuntimeMode,
+): void {
+  getHarness(harness)?.setRuntimeMode?.(sessionId, mode);
 }
 
 export function respondHarnessQuestion(
