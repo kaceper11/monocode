@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { removalFallbacks, type RemovalEntry } from "./worktreeRemoval";
+import {
+  bulkRemovalPlan,
+  removalFallbacks,
+  type RemovalEntry,
+  type WorktreeSafety,
+} from "./worktreeRemoval";
 import type { RecentProject } from "./recents";
 
 const entry = (
@@ -102,5 +107,78 @@ describe("removalFallbacks", () => {
         [],
       ).map((e) => e.path),
     ).toEqual(["/repo"]);
+  });
+});
+
+describe("bulkRemovalPlan", () => {
+  const safety = (
+    path: string,
+    over: Partial<RemovalEntry> = {},
+    rest: Partial<WorktreeSafety> = {},
+  ): WorktreeSafety => ({
+    host: "macos",
+    entry: entry(path, over),
+    dirty: false,
+    processes: [],
+    siblings: [],
+    ...rest,
+  });
+
+  it("passes clean checkouts through as removable", () => {
+    const { removable, skipped } = bulkRemovalPlan([
+      safety("/repo/wt-a"),
+      safety("/repo/wt-b"),
+    ]);
+    expect(removable.map((row) => row.entry.path)).toEqual([
+      "/repo/wt-a",
+      "/repo/wt-b",
+    ]);
+    expect(skipped).toEqual([]);
+  });
+
+  it("skips each protected state with its own reason", () => {
+    const { removable, skipped } = bulkRemovalPlan([
+      safety("/repo", { main: true }),
+      safety("/repo/wt-missing", { missing: true }),
+      safety("/repo/wt-prunable", { prunable: "gone" }),
+      safety("/repo/wt-locked", { locked: "editor" }),
+      safety("/repo/wt-detached", { branch: null }),
+      safety("/repo/wt-dirty", {}, { dirty: true }),
+      safety(
+        "/repo/wt-busy",
+        {},
+        {
+          processes: [
+            { kind: "agent", id: "1", cwd: "/repo/wt-busy", label: "agent" },
+            { kind: "terminal", id: "2", cwd: "/repo/wt-busy", label: "sh" },
+          ],
+        },
+      ),
+    ]);
+    expect(removable).toEqual([]);
+    expect(skipped.map((row) => row.reason)).toEqual([
+      "The main checkout is protected",
+      "Folder is missing — restore or repair it",
+      "Stale registration — repair from a surviving checkout",
+      "Locked: editor",
+      "Detached HEAD",
+      "Uncommitted, untracked or ignored files",
+      "2 processes running — review to stop them",
+    ]);
+  });
+
+  it("partitions a mixed batch without losing order", () => {
+    const { removable, skipped } = bulkRemovalPlan([
+      safety("/repo/wt-ok"),
+      safety("/repo/wt-dirty", {}, { dirty: true }),
+      safety("/repo/wt-also-ok"),
+    ]);
+    expect(removable.map((row) => row.entry.path)).toEqual([
+      "/repo/wt-ok",
+      "/repo/wt-also-ok",
+    ]);
+    expect(skipped.map((row) => row.entry.path)).toEqual([
+      "/repo/wt-dirty",
+    ]);
   });
 });

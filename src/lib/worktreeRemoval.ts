@@ -65,6 +65,52 @@ export function removalFallbacks(
   return [...siblings, ...usable.filter((entry) => entry.main)];
 }
 
+/** One skipped bulk-removal row: the entry and why it cannot join a batch
+ * delete. `safety` is absent when the preflight itself failed. */
+export type BulkSkip = {
+  entry: RemovalEntry;
+  reason: string;
+  safety?: WorktreeSafety;
+};
+
+/**
+ * Partitions fresh `git_worktree_safety` results into removable entries and
+ * per-entry skip reasons. Bulk removal only ever takes clean, unprotected
+ * checkouts — dirty, process-bound, locked, detached, missing or main
+ * entries stay behind for individual review (force removal and
+ * stopProcesses keep their one-at-a-time flows).
+ */
+export function bulkRemovalPlan(safeties: readonly WorktreeSafety[]): {
+  removable: WorktreeSafety[];
+  skipped: BulkSkip[];
+} {
+  const removable: WorktreeSafety[] = [];
+  const skipped: BulkSkip[] = [];
+  for (const safety of safeties) {
+    const entry = safety.entry;
+    const reason = entry.main
+      ? "The main checkout is protected"
+      : entry.missing
+        ? "Folder is missing — restore or repair it"
+        : entry.prunable
+          ? "Stale registration — repair from a surviving checkout"
+          : entry.locked
+            ? `Locked: ${entry.locked}`
+            : !entry.branch
+              ? "Detached HEAD"
+              : safety.processes.length
+                ? `${safety.processes.length} ${
+                    safety.processes.length === 1 ? "process" : "processes"
+                  } running — review to stop them`
+                : safety.dirty
+                  ? "Uncommitted, untracked or ignored files"
+                  : null;
+    if (reason) skipped.push({ entry, reason, safety });
+    else removable.push(safety);
+  }
+  return { removable, skipped };
+}
+
 /** Short name for a switch destination: branch name, `main`, or basename. */
 export function removalFallbackLabel(
   entry: WorkingCopy,

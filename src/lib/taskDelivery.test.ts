@@ -52,8 +52,9 @@ function saveAzurePr(row: {
   status?: string;
   sourceRefName?: string;
   votes?: number[];
+  number?: number;
 }) {
-  const number = 40 + Math.floor(Math.random() * 1000);
+  const number = row.number ?? 40 + Math.floor(Math.random() * 1000);
   const association = {
     target: azureTarget(number),
     revision: "rev1",
@@ -99,10 +100,11 @@ function saveCi(row: {
   result?: string | null;
   match?: string;
   runBranch?: string;
+  definition?: number;
 }) {
   const source = {
-    target: ciTarget,
-    definitionName: "build",
+    target: { ...ciTarget, definition: row.definition ?? 7 },
+    definitionName: `build-${row.definition ?? 7}`,
     projectName: "proj",
     remote: "origin",
     cwd: row.cwd ?? "/repo/a",
@@ -233,7 +235,7 @@ describe("childDelivery", () => {
 
   it("flags queued and running verified runs", () => {
     saveCi({ status: "inProgress", result: null });
-    saveCi({ status: "notStarted", result: null });
+    saveCi({ status: "notStarted", result: null, definition: 8 });
     const c = child();
     const delivery = childDelivery(task([c]), c, ["feat/x"]);
     expect(delivery.ci).toBe(2);
@@ -243,7 +245,7 @@ describe("childDelivery", () => {
 
   it("counts stale or unverified runs as linked but not failing", () => {
     saveCi({ result: "failed", match: "old-commit" });
-    saveCi({ result: "failed", match: "unverified" });
+    saveCi({ result: "failed", match: "unverified", definition: 8 });
     saveCi({
       branch: "other",
       runBranch: "refs/heads/other",
@@ -260,6 +262,20 @@ describe("childDelivery", () => {
     saveCi({ branch: "old-name", result: "failed" });
     const c = child();
     expect(childDelivery(task([c]), c, ["feat/x"]).ciFailing).toBe(true);
+  });
+
+  it("counts a link saved under several matching scopes only once", () => {
+    // The same PR/pipeline re-saved from an unassigned context and again
+    // inside a task session is one link, not two.
+    saveAzurePr({ number: 42 });
+    saveAzurePr({ number: 42, session: "s1" });
+    saveCi({ result: "failed" });
+    saveCi({ result: "succeeded", session: "s1" });
+    const c = child();
+    const delivery = childDelivery(task([c]), c, ["feat/x"]);
+    expect(delivery.prs).toBe(1);
+    expect(delivery.ci).toBe(1);
+    expect(delivery.ciFailing).toBe(true);
   });
 });
 

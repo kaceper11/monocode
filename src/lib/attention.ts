@@ -33,6 +33,7 @@ export type AttentionKind =
   | "pr-conflicts" // PR has merge conflicts
   | "pr-done" // PR reached a terminal state (merged/closed)
   | "schedule" // scheduled-run outcome (ran/skipped/missed/failed)
+  | "worktree" // stale/missing working copies worth cleaning up
   | "watcher"; // watcher lifecycle row: source errors with a reconnect affordance
 
 /** Lower sorts first. */
@@ -104,6 +105,8 @@ export type AttentionAction =
     }
   | { kind: "open-automations"; watcherId?: string }
   | { kind: "reconnect"; source: ConnectableInboxSource }
+  /** Opens the worktree manager for the family containing `cwd`. */
+  | { kind: "open-worktrees"; cwd: string }
   | { kind: "open-url"; url: string };
 
 export type AttentionItem = {
@@ -177,6 +180,7 @@ const KINDS: AttentionKind[] = [
   "pr-conflicts",
   "pr-done",
   "schedule",
+  "worktree",
   "watcher",
 ];
 
@@ -203,6 +207,7 @@ const ACTION_KINDS = new Set([
   "update-branch",
   "open-automations",
   "reconnect",
+  "open-worktrees",
   "open-url",
 ]);
 

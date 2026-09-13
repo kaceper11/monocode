@@ -45,6 +45,7 @@ const KIND_ICON = {
   "pr-conflicts": GitMerge,
   "pr-done": GitPullRequestClosed,
   schedule: Clock,
+  worktree: GitBranch,
   watcher: Zap,
 } as const;
 
@@ -76,6 +77,8 @@ export function attentionActionLabel(item: AttentionItem): string {
       return "Automations";
     case "reconnect":
       return "Reconnect";
+    case "open-worktrees":
+      return "Clean up";
     case "open-url":
       return "Open";
     default:
