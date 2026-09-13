@@ -1,9 +1,11 @@
 import {
   allAzurePrAssociations,
+  azurePrKey,
   type AzurePrAssociation,
 } from "./azureRepos";
 import {
   allCiSources,
+  ciKey,
   ciMatches,
   ciState,
   type CiSource,
@@ -61,42 +63,63 @@ export function taskSessionIds(task: TaskWorkspace): Set<string> {
 }
 
 /**
- * The saved provider links bound to one child checkout, under the same rules
- * {@link childDelivery} counts by: `branches` are the names this child may be
- * known under — the recorded `child.branch` plus the observed head from diff
- * stats/index. Links for the recorded branch keep matching even when the
- * checkout moved on: they belong to the child's task branch, not to whatever
- * someone checked out meanwhile. A saved link matches when its scope session
- * belongs to this task (or is unassigned) and its own branch — or the PR's
- * source ref — names a known branch. With no known branch the child's links
- * stay unknown rather than guessed.
+ * The saved provider links matched to one child checkout — the rows behind
+ * `childDelivery`'s counts, for callers (task details) that render the links
+ * themselves rather than a badge. Every status is kept; counting callers
+ * filter to the states they report.
  */
-export function childDeliveryRows(
+export type ChildDeliveryLinks = {
+  /** Matched Azure PR associations, any status. */
+  prs: AzurePrAssociation[];
+  /** The caller-supplied GitHub PR for this branch, if any. */
+  githubPr: GitPr | null;
+  /** Matched CI sources. */
+  ci: CiSource[];
+};
+
+/**
+ * Delivery links saved against one child checkout.
+ *
+ * `branches` are the names this child may be known under — the recorded
+ * `child.branch` plus the observed head from diff stats/index. Links for the
+ * recorded branch keep counting even when the checkout moved on: they belong
+ * to the child's task branch, not to whatever someone checked out meanwhile.
+ * A saved link counts when its scope session belongs to this task (or is
+ * unassigned) and its own branch — or the PR's source ref — names a known
+ * branch. With no known branch the child's links stay unknown rather than
+ * guessed.
+ */
+export function childDeliveryLinks(
   task: TaskWorkspace,
   child: TaskChild,
   branches: readonly (string | null | undefined)[],
+  githubPr?: GitPr | null,
   stores: DeliveryStores = deliveryStores(),
-): { prs: AzurePrAssociation[]; ci: CiSource[] } {
-  const out: { prs: AzurePrAssociation[]; ci: CiSource[] } = {
-    prs: [],
-    ci: [],
-  };
+): ChildDeliveryLinks {
+  const links: ChildDeliveryLinks = { prs: [], githubPr: githubPr ?? null, ci: [] };
   const cwd = child.workingCopy;
-  if (!cwd) return out;
+  if (!cwd) return links;
   const cwdKey = pathKey(cwd);
   const known = new Set(branches.filter((b): b is string => !!b));
-  if (!known.size) return out;
+  if (!known.size) return links;
   const sessions = taskSessionIds(task);
   const scoped = (session: string | undefined) =>
     session === undefined || sessions.has(session);
 
+  // The same link can be saved under several matching scopes (unassigned
+  // plus one or more task sessions) — dedupe on the provider identity.
+  const seenPrs = new Set<string>();
   for (const row of stores.prs) {
     if (pathKey(row.cwd) !== cwdKey || !scoped(row.sourceSessionId)) continue;
     if (!known.has(row.branch) && !known.has(shortRef(row.pr.sourceRefName)))
       continue;
-    if (row.pr.status.toLowerCase() !== "active") continue;
-    out.prs.push(row);
+    const key = azurePrKey(row.target);
+    if (seenPrs.has(key)) continue;
+    seenPrs.add(key);
+    links.prs.push(row);
   }
+
+  const seenCi = new Map<string, number>();
   for (const row of stores.ci) {
     if (pathKey(row.cwd) !== cwdKey || !scoped(row.session)) continue;
     if (
@@ -104,9 +127,40 @@ export function childDeliveryRows(
       !known.has(shortRef(row.last?.run.branch ?? ""))
     )
       continue;
-    out.ci.push(row);
+    const key = ciKey(row.target);
+    const existing = seenCi.get(key);
+    if (existing !== undefined) {
+      // Duplicate scope — keep the copy with the freshest verified run.
+      if (
+        (row.last?.checkedAt ?? 0) >
+        (links.ci[existing].last?.checkedAt ?? 0)
+      )
+        links.ci[existing] = row;
+      continue;
+    }
+    seenCi.set(key, links.ci.length);
+    links.ci.push(row);
   }
-  return out;
+  return links;
+}
+
+/**
+ * Delivery links saved against one child checkout — the active/open subset
+ * {@link childDelivery} counts by.
+ */
+export function childDeliveryRows(
+  task: TaskWorkspace,
+  child: TaskChild,
+  branches: readonly (string | null | undefined)[],
+  stores: DeliveryStores = deliveryStores(),
+): { prs: AzurePrAssociation[]; ci: CiSource[] } {
+  const links = childDeliveryLinks(task, child, branches, null, stores);
+  return {
+    prs: links.prs.filter(
+      (row) => row.pr.status.toLowerCase() === "active",
+    ),
+    ci: links.ci,
+  };
 }
 
 /**

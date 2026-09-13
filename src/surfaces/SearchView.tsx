@@ -1,9 +1,16 @@
-import { Folder, LoaderCircle, MessageSquare, Search } from "../chrome/icons";
+import {
+  Folder,
+  LoaderCircle,
+  MessageSquare,
+  Search,
+  Task,
+} from "../chrome/icons";
 import {
   useEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
@@ -26,6 +33,7 @@ import {
   searchConversationTitles,
   searchRecentProjects,
   searchSessionMessages,
+  searchTasks,
   type AppSearchHit,
   type SearchScope,
 } from "../lib/appSearch";
@@ -41,10 +49,16 @@ import { looksLikeProject, type RecentProject } from "../lib/recents";
 import { searchProject, type OpenFileFn } from "../lib/search";
 import { type Session } from "../lib/session";
 import { searchSessions, type SessionSummary } from "../lib/sessionStore";
+import {
+  loadTaskWorkspaces,
+  subscribeTaskWorkspaces,
+  taskWorkspacesSnapshot,
+} from "../lib/taskWorkspaces";
 
 const SCOPES: { id: SearchScope; label: string }[] = [
   { id: "all", label: "All" },
   { id: "conversations", label: "Conversations" },
+  { id: "tasks", label: "Tasks" },
   { id: "files", label: "Files" },
   { id: "projects", label: "Projects" },
 ];
@@ -62,6 +76,8 @@ type Props = {
   onOpenFile: OpenFileFn;
   onOpenSession: (sessionId: string) => void;
   onOpenProject: (path: string) => void;
+  /** Opens the task details sheet — read-only, never launches children. */
+  onOpenTask?: (taskId: string) => void;
 };
 
 export function SearchView({
@@ -77,6 +93,7 @@ export function SearchView({
   onOpenFile,
   onOpenSession,
   onOpenProject,
+  onOpenTask,
 }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const onCloseRef = useRef(onClose);
@@ -178,6 +195,19 @@ export function SearchView({
     () => (trimmed ? searchRecentProjects(recents, trimmed) : []),
     [recents, trimmed],
   );
+  const tasksRaw = useSyncExternalStore(
+    subscribeTaskWorkspaces,
+    taskWorkspacesSnapshot,
+  );
+  const taskHits = useMemo(
+    () =>
+      trimmed && (scope === "all" || scope === "tasks")
+        ? searchTasks(loadTaskWorkspaces(), trimmed)
+        : [],
+    // tasksRaw invalidates the cached store read after a write.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [tasksRaw, trimmed, scope],
+  );
 
   useEffect(() => {
     if (!open || !trimmed) {
@@ -249,6 +279,7 @@ export function SearchView({
           titleHits,
           liveMessageHits,
           remoteHits,
+          taskHits,
           fileHits,
           contentHits,
           projectHits,
@@ -263,6 +294,7 @@ export function SearchView({
     projectHits,
     remoteHits,
     scope,
+    taskHits,
     titleHits,
     trimmed,
   ]);
@@ -289,6 +321,8 @@ export function SearchView({
       );
     } else if (hit.kind === "conversation" || hit.kind === "message") {
       onOpenSession(hit.sessionId);
+    } else if (hit.kind === "task") {
+      onOpenTask?.(hit.taskId);
     } else onOpenProject(hit.path);
     onClose();
   };
@@ -564,6 +598,17 @@ function rowCopy(
       icon: <FileTypeIcon name={hit.name} isDir={false} size={16} />,
       title: <Highlight text={hit.preview} query={query} />,
       meta: `${hit.relative}:${hit.line}`,
+    };
+  }
+  if (hit.kind === "task") {
+    return {
+      icon: (
+        <Task className="size-3.5 text-content/55" strokeWidth={1.75} />
+      ),
+      title: <MatchText text={hit.name} positions={hit.positions} active />,
+      meta: hit.archived
+        ? [hit.detail, "archived"].filter(Boolean).join(" · ")
+        : hit.detail,
     };
   }
   return {

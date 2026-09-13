@@ -3,7 +3,6 @@ import { newSession } from "./session";
 import type { SessionSummary } from "./sessionStore";
 import {
   conversationRowsFrom,
-  filterHitsByProject,
   flattenGrouped,
   groupHits,
   hitsFromContentMatches,
@@ -12,9 +11,11 @@ import {
   searchConversationTitles,
   searchRecentProjects,
   searchSessionMessages,
+  searchTasks,
   snippetAround,
   type AppSearchHit,
 } from "./appSearch";
+import type { TaskWorkspace } from "./taskWorkspaces";
 
 function summary(
   id: string,
@@ -248,34 +249,89 @@ describe("conversationRowsFrom", () => {
   });
 });
 
-describe("filterHitsByProject", () => {
-  it("keeps current-project conversations", () => {
-    const hits: AppSearchHit[] = [
+describe("searchTasks", () => {
+  const task = (over: Partial<TaskWorkspace> = {}): TaskWorkspace => ({
+    id: "t1",
+    projectId: "p1",
+    name: "Checkout",
+    attempts: [{ id: "primary", createdAt: 1 }],
+    children: [
       {
-        id: "conversation:s1",
-        kind: "conversation",
-        sessionId: "s1",
-        cwd: "/tmp/a",
-        harness: "cursor",
-        title: "A",
-        updatedAt: 1,
-        score: 1,
-        positions: [],
+        id: "c1",
+        repositoryId: "r1",
+        attemptId: "primary",
+        workingCopy: "/tmp/app-checkout",
+        branch: "checkout",
+        sessionIds: [],
+        launch: { state: "ready" },
       },
-      {
-        id: "conversation:s2",
-        kind: "conversation",
-        sessionId: "s2",
-        cwd: "/tmp/b",
-        harness: "cursor",
-        title: "B",
-        updatedAt: 1,
-        score: 1,
-        positions: [],
-      },
-    ];
+    ],
+    sessionIds: [],
+    createdAt: 100,
+    ...over,
+  });
+  // No project lookup — repository labels degrade to ids, which is fine.
+  const noProject = () => undefined;
+
+  it("matches name and ticket fields with highlight positions", () => {
+    const hits = searchTasks(
+      [
+        task({
+          ticket: {
+            kind: "issue",
+            repo: "acme/shop",
+            number: 217,
+            url: "https://github.com/acme/shop/issues/217",
+            identifier: "BOOK-217",
+            title: "Checkout",
+          },
+        }),
+      ],
+      "book",
+      noProject,
+    );
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({
+      kind: "task",
+      taskId: "t1",
+      name: "Checkout",
+      archived: false,
+    });
+    expect(hits[0].detail).toContain("BOOK-217");
+  });
+
+  it("falls back to the wider field set and flags archived tasks", () => {
+    const hits = searchTasks(
+      [task({ archived: true })],
+      "app-checkout", // only the working copy path matches
+      noProject,
+    );
+    expect(hits).toHaveLength(1);
+    expect(hits[0].archived).toBe(true);
+    expect(hits[0].positions).toEqual([]);
+  });
+
+  it("returns nothing when no field matches", () => {
     expect(
-      filterHitsByProject(hits, "/tmp/a").map((hit) => hit.id),
-    ).toEqual(["conversation:s1"]);
+      searchTasks([task()], "unrelated", noProject),
+    ).toEqual([]);
+    expect(searchTasks([task()], "  ", noProject)).toEqual([]);
+  });
+
+  it("groups task hits under the tasks bucket with scope limits", () => {
+    const taskHit: AppSearchHit = {
+      id: "task:t1",
+      kind: "task",
+      taskId: "t1",
+      name: "Checkout",
+      detail: "BOOK-217",
+      archived: false,
+      createdAt: 1,
+      score: 10,
+      positions: [],
+    };
+    expect(groupHits([taskHit], "tasks").tasks).toHaveLength(1);
+    expect(groupHits([taskHit], "files").tasks).toHaveLength(0);
+    expect(flattenGrouped(groupHits([taskHit], "all"))).toContain(taskHit);
   });
 });

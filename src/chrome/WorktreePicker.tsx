@@ -21,9 +21,11 @@ import {
 } from "../lib/repositoryFamilies";
 import { notifyGitChanged } from "../lib/fs";
 import {
+  bulkRemovalPlan,
   openBoundProcess,
   removalFallbackLabel,
   removalFallbacks,
+  type BulkSkip,
   type BoundProcess,
   type WorktreeSafety,
 } from "../lib/worktreeRemoval";
@@ -33,6 +35,7 @@ import {
   ChevronRight,
   Folder,
   GitBranch,
+  Loader,
   Plus,
   RefreshCw,
   Search,
@@ -62,7 +65,7 @@ function sameWorktree(a: Worktree, b: Worktree): boolean {
     a.locked === b.locked &&
     a.prunable === b.prunable &&
     a.missing === b.missing &&
-    a.lastUsed === b.lastUsed &&
+    (a.lastUsed ?? null) === (b.lastUsed ?? null) &&
     a.users.length === b.users.length &&
     a.users.every((user, index) => user === b.users[index])
   );
@@ -174,6 +177,17 @@ export function WorktreePanel({
     files: string[];
   } | null>(null);
   const [forceFiles, setForceFiles] = useState<string[] | null>(null);
+  // Bulk select mode: checkboxes on each removable row, a staged plan that
+  // re-preflights every target, and a summary instead of silent removal.
+  const [selecting, setSelecting] = useState(false);
+  const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
+  const [bulk, setBulk] = useState<{
+    phase: "confirm" | "removing" | "done";
+    removable: WorktreeSafety[];
+    skipped: BulkSkip[];
+    removed: string[];
+    failures: { entry: Worktree; message: string }[];
+  } | null>(null);
   const pending = useRef(false);
   const selected = refs.find((ref) => ref.name === base);
   // A pending removal may switch the project under this panel; refresh must
@@ -264,9 +278,9 @@ export function WorktreePanel({
     void run(async () => {});
   }, []);
   useEffect(() => {
-    if (!busy && !creating && !choosingBase && !confirmation && !detail)
+    if (!busy && !creating && !choosingBase && !confirmation && !detail && !bulk)
       search.current?.focus();
-  }, [busy, creating, choosingBase, confirmation, detail]);
+  }, [busy, creating, choosingBase, confirmation, detail, bulk]);
   const name = query.trim();
   const visibleEntries = (
     oldestFirst ? oldestWorkingCopies(entries, recents) : entries
@@ -280,7 +294,9 @@ export function WorktreePanel({
   const prepareCreate = () => {
     setBranch(name);
     setPath(`${rootPath}-${name.replace(/\//g, "-")}`);
-    const current = entries.find((entry) => entry.path === cwd)?.branch;
+    const current = entries.find(
+      (entry) => pathKey(entry.path) === pathKey(cwd),
+    )?.branch;
     if (!base && current) setBase(current);
     setCreating(true);
     if (!base && !current) {
@@ -357,6 +373,116 @@ export function WorktreePanel({
   const confirmRemove = confirmation?.action === "remove";
   const confirmProcesses = confirmation?.processes ?? [];
   const confirmFallbacks = confirmation?.fallbacks ?? [];
+  /** A row can join a batch only when it isn't protected outright — the
+   * active project context never moves during bulk removal, so an entry
+   * containing it is handled by the single-removal switch flow instead. */
+  const bulkSelectable = (entry: Worktree) =>
+    !entry.main &&
+    !entry.missing &&
+    !entry.prunable &&
+    // Detached-HEAD entries can never join a batch — the plan always
+    // skips them for individual review.
+    !!entry.branch &&
+    pathKey(entry.path) !== pathKey(cwd) &&
+    !isEqualOrInside(activeCwd, entry.path);
+  const toggleChecked = (entry: Worktree) => {
+    const key = pathKey(entry.path);
+    setChecked((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+  const checkedCount = entries.filter((entry) =>
+    checked.has(pathKey(entry.path)),
+  ).length;
+  // Stable family context for the batch: a just-removed path can never
+  // serve as cwd for the next preflight. Prefer the surviving main
+  // checkout — never a missing or prunable registration.
+  const removalContext = () =>
+    entries.find(
+      (entry) => entry.main && !entry.missing && !entry.prunable,
+    )?.path ?? cwdRef.current;
+  const beginBulkRemove = () =>
+    void run(async () => {
+      const targets = entries.filter((entry) =>
+        checked.has(pathKey(entry.path)),
+      );
+      const context = removalContext();
+      const safeties: WorktreeSafety[] = [];
+      // A worktree that changed state since the last refresh (or is already
+      // unregistered) fails preflight — skip it into the review list rather
+      // than aborting the whole batch.
+      const failed: BulkSkip[] = [];
+      for (const target of targets) {
+        try {
+          safeties.push(
+            await invoke<WorktreeSafety>("git_worktree_safety", {
+              cwd: context,
+              path: target.path,
+            }),
+          );
+        } catch (error) {
+          failed.push({ entry: target, reason: String(error) });
+        }
+      }
+      const plan = bulkRemovalPlan(safeties);
+      plan.skipped.push(...failed);
+      if (!plan.removable.length && !plan.skipped.length) return;
+      setBulk({ phase: "confirm", ...plan, removed: [], failures: [] });
+    });
+  /** Hand a skipped/failed bulk entry back to the single-entry flow. */
+  const reviewEntry = (entry: Worktree) => {
+    setBulk(null);
+    setSelecting(false);
+    setChecked(new Set());
+    setDetail(entry);
+  };
+  const confirmBulkRemove = () =>
+    void run(async () => {
+      if (!bulk) return;
+      const plan = bulk;
+      setBulk({ ...plan, phase: "removing" });
+      const context = removalContext();
+      const removed: string[] = [];
+      const failures: { entry: Worktree; message: string }[] = [];
+      for (const safety of plan.removable) {
+        try {
+          await invoke("git_worktree_remove", {
+            cwd: context,
+            path: safety.entry.path,
+            head: safety.entry.head,
+            reviewed: null,
+            stopProcesses: null,
+          });
+          removed.push(safety.entry.path);
+        } catch (error) {
+          failures.push({ entry: safety.entry, message: String(error) });
+        }
+      }
+      const survivors = entries.filter(
+        (entry) =>
+          !removed.some((path) => pathKey(path) === pathKey(entry.path)),
+      );
+      const fallback =
+        removalFallbacks(removed[0] ?? "", survivors, recents)[0]?.path ??
+        context;
+      for (const path of removed) {
+        forgetRemovedWorktree(path, fallback);
+        setWorkingCopyHidden(path, false);
+      }
+      if (removed.length) notifyGitChanged(cwdRef.current);
+      setChecked(new Set());
+      setSelecting(false);
+      if (!failures.length && !plan.skipped.length) {
+        // Clean sweep — same as single removal, the panel is done.
+        setBulk(null);
+        onClose();
+        return;
+      }
+      setBulk({ ...plan, phase: "done", removed, failures });
+    });
   // Removing the selected worktree — or a worktree containing the selected
   // project — switches the visible context first.
   const confirmSwitch =
@@ -388,11 +514,159 @@ export function WorktreePanel({
     </div>
   );
   return (
-    <div
-      className="min-h-0 flex-1 overflow-y-auto overscroll-none text-[12px]"
-      aria-busy={busy}
-    >
-      {confirmation ? (
+    <div className="flex min-h-0 flex-1 flex-col text-[12px]" aria-busy={busy}>
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-none">
+        {bulk ? (
+          <div className="space-y-2 px-3 py-2.5">
+            <p className="flex items-center gap-2 font-medium">
+              {bulk.phase === "removing" ? (
+                <Loader
+                  className="size-4 shrink-0 animate-spin text-content/50"
+                  aria-hidden="true"
+                />
+              ) : (
+                <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-red-500/10 text-red-600">
+                  <Trash2 className="size-3.5" aria-hidden="true" />
+                </span>
+              )}
+              {bulk.phase === "removing"
+                ? `Removing ${bulk.removable.length} ${
+                    bulk.removable.length === 1 ? "worktree" : "worktrees"
+                  }…`
+                : bulk.phase === "done"
+                  ? `Removed ${bulk.removed.length} ${
+                      bulk.removed.length === 1 ? "worktree" : "worktrees"
+                    }`
+                  : `Remove ${bulk.removable.length} ${
+                      bulk.removable.length === 1 ? "worktree" : "worktrees"
+                    }?`}
+            </p>
+            {bulk.phase === "confirm" && bulk.removable.length > 0 && (
+              <div className="space-y-0.5">
+                {bulk.removable.map((safety) => (
+                  <p
+                    key={safety.entry.path}
+                    className="truncate font-mono text-[11px] text-content/70"
+                  >
+                    {safety.entry.branch?.replace("refs/heads/", "")} ·{" "}
+                    {prettyCwd(safety.entry.path)}
+                    {safety.entry.users.length
+                      ? ` · keeps ${safety.entry.users.length} ${
+                          safety.entry.users.length === 1
+                            ? "conversation"
+                            : "conversations"
+                        }`
+                      : ""}
+                  </p>
+                ))}
+                <p className="pt-1 text-[11px] leading-4 text-content/60">
+                  Branches and conversations stay. Each worktree is checked
+                  again before removal.
+                </p>
+              </div>
+            )}
+            {bulk.phase === "confirm" && bulk.removable.length === 0 && (
+              <p className="text-[11px] text-content/60">
+                None of the selected worktrees can be removed without
+                individual review.
+              </p>
+            )}
+            {bulk.phase !== "removing" && bulk.skipped.length > 0 && (
+              <div className="space-y-1">
+                <p className="text-[11px] font-medium text-content/80">
+                  Needs individual review
+                </p>
+                {bulk.skipped.map((skip) => (
+                  <div
+                    key={skip.entry.path}
+                    className="flex items-center gap-2"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate font-mono text-[11px] text-content/70">
+                        {skip.entry.branch?.replace(
+                          "refs/heads/",
+                          "",
+                        ) ?? `Detached ${skip.entry.head.slice(0, 8)}`}
+                      </p>
+                      <p className="truncate text-[10px] text-content/45">
+                        {skip.reason}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      className="shrink-0 rounded border border-content/10 px-1.5 py-0.5 text-[11px] hover:bg-content/5"
+                      onClick={() => reviewEntry(skip.entry)}
+                    >
+                      Review
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {bulk.phase === "done" && bulk.failures.length > 0 && (
+              <div className="space-y-1">
+                <p className="text-[11px] font-medium text-red-400">
+                  {bulk.failures.length}{" "}
+                  {bulk.failures.length === 1 ? "removal" : "removals"} failed
+                </p>
+                {bulk.failures.map((failure) => (
+                  <div
+                    key={failure.entry.path}
+                    className="flex items-center gap-2"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate font-mono text-[11px] text-content/70">
+                        {failure.entry.branch?.replace("refs/heads/", "") ??
+                          failure.entry.path}
+                      </p>
+                      <p className="truncate text-[10px] text-red-400/80">
+                        {failure.message}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      className="shrink-0 rounded border border-content/10 px-1.5 py-0.5 text-[11px] hover:bg-content/5"
+                      onClick={() => reviewEntry(failure.entry)}
+                    >
+                      Review
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="flex justify-end gap-2 border-t border-content/10 pt-2.5">
+              {bulk.phase === "confirm" ? (
+                <>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    className="rounded-md border border-content/10 px-2.5 py-1.5 text-content/70 outline-none hover:bg-content/5 focus-visible:ring-2 focus-visible:ring-content/30 disabled:opacity-40"
+                    onClick={() => setBulk(null)}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy || !bulk.removable.length}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-content/5 px-2.5 py-1.5 font-medium text-red-400 outline-none hover:bg-content/10 focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-2 focus-visible:ring-offset-background-base disabled:opacity-40 [.theme-light_&]:text-red-700"
+                    onClick={confirmBulkRemove}
+                  >
+                    <Trash2 className="size-3.5" aria-hidden="true" />
+                    Remove {bulk.removable.length || ""}
+                  </button>
+                </>
+              ) : bulk.phase === "done" ? (
+                <button
+                  type="button"
+                  className="rounded-md border border-content/10 px-2.5 py-1.5 text-content/70 outline-none hover:bg-content/5 focus-visible:ring-2 focus-visible:ring-content/30"
+                  onClick={onClose}
+                >
+                  Done
+                </button>
+              ) : null}
+            </div>
+          </div>
+        ) : confirmation ? (
         <div className="space-y-2 px-3 py-2.5">
           <p className="flex items-center gap-2 font-medium">
             {confirmRemove && (
@@ -954,7 +1228,9 @@ export function WorktreePanel({
                 } else if (e.key === "Enter") {
                   e.preventDefault();
                   const entry = visibleEntries[activeIndex];
-                  if (entry && !entry.missing && !entry.prunable)
+                  if (selecting) {
+                    if (entry && bulkSelectable(entry)) toggleChecked(entry);
+                  } else if (entry && !entry.missing && !entry.prunable)
                     openEntry(entry);
                   else if (!entry && canCreate) prepareCreate();
                 }
@@ -962,32 +1238,74 @@ export function WorktreePanel({
             />
           </label>
           <div className="flex items-center justify-between px-2.5 pt-2 text-[10px] text-content/60">
-            <span>Last used in MonoCode</span>
-            <button
-              type="button"
-              disabled={busy}
-              aria-pressed={oldestFirst}
-              className="rounded px-1.5 py-1 hover:bg-content/10"
-              onClick={() => {
-                setOldestFirst(!oldestFirst);
-                setActiveIndex(0);
-              }}
-            >
-              {oldestFirst ? "Oldest first ✓" : "Oldest first"}
-            </button>
+            <span>
+              {selecting
+                ? "Select worktrees to remove"
+                : "Last used in MonoCode"}
+            </span>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                disabled={busy}
+                aria-pressed={selecting}
+                className={`rounded px-1.5 py-1 hover:bg-content/10 ${selecting ? "text-content" : ""}`}
+                onClick={() => {
+                  setSelecting((value) => !value);
+                  setChecked(new Set());
+                }}
+              >
+                {selecting ? "Done" : "Select"}
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                aria-pressed={oldestFirst}
+                className="rounded px-1.5 py-1 hover:bg-content/10"
+                onClick={() => {
+                  setOldestFirst(!oldestFirst);
+                  setActiveIndex(0);
+                }}
+              >
+                {oldestFirst ? "Oldest first ✓" : "Oldest first"}
+              </button>
+            </div>
           </div>
           <div className="px-1.5 py-1.5">
-            {visibleEntries.map((entry, index) => (
+            {visibleEntries.map((entry, index) => {
+              const selectable = bulkSelectable(entry);
+              const isChecked = checked.has(pathKey(entry.path));
+              return (
               <div key={entry.path} className="flex items-center gap-1">
                 <button
                   type="button"
-                  disabled={busy || entry.missing || !!entry.prunable}
+                  disabled={
+                    busy ||
+                    (selecting
+                      ? !selectable
+                      : entry.missing || !!entry.prunable)
+                  }
                   title={`${prettyCwd(entry.path)}${entry.users.length ? ` · ${entry.users.length} conversations` : ""}`}
+                  aria-pressed={selecting ? isChecked : undefined}
                   className={`${rowClass} ${index === activeIndex ? "bg-content/10" : ""}`}
                   onMouseEnter={() => setActiveIndex(index)}
-                  onClick={() => openEntry(entry)}
+                  onClick={() =>
+                    selecting ? toggleChecked(entry) : openEntry(entry)
+                  }
                 >
-                  {entry.path === cwd ? (
+                  {selecting ? (
+                    <span
+                      aria-hidden="true"
+                      className={`grid size-3.5 shrink-0 place-items-center rounded-[4px] border ${
+                        isChecked
+                          ? "border-accent bg-accent text-background-base"
+                          : "border-content/30"
+                      }`}
+                    >
+                      {isChecked ? (
+                        <Check className="size-2.5" strokeWidth={2.5} />
+                      ) : null}
+                    </span>
+                  ) : pathKey(entry.path) === pathKey(cwd) ? (
                     <Check className="size-3.5 shrink-0" strokeWidth={1.75} />
                   ) : (
                     <GitBranch
@@ -1014,7 +1332,7 @@ export function WorktreePanel({
                         ? "locked"
                         : entry.main
                           ? "main"
-                          : entry.path === cwd
+                          : pathKey(entry.path) === pathKey(cwd)
                             ? "current"
                             : ""}
                   </span>
@@ -1030,7 +1348,8 @@ export function WorktreePanel({
                   <ChevronRight className="size-3.5" />
                 </button>
               </div>
-            ))}
+              );
+            })}
             <div className="mt-1 border-t border-content/10 pt-1">
               {canCreate && (
                 <button
@@ -1064,14 +1383,42 @@ export function WorktreePanel({
           </div>
         </>
       )}
-      {error && (
-        <p
-          role="alert"
-          className="max-h-24 overflow-auto whitespace-pre-wrap border-t border-content/10 px-2.5 py-2 text-[11px] leading-4 text-red-400/90"
-        >
-          {error}
-        </p>
-      )}
+        {error && (
+          <p
+            role="alert"
+            className="max-h-24 overflow-auto whitespace-pre-wrap border-t border-content/10 px-2.5 py-2 text-[11px] leading-4 text-red-400/90"
+          >
+            {error}
+          </p>
+        )}
+      </div>
+      {selecting && !bulk && !detail && !creating && !choosingBase && !confirmation ? (
+        <div className="flex shrink-0 items-center gap-2 border-t border-content/10 px-3 py-2">
+          <span className="min-w-0 flex-1 text-[11px] text-content/50">
+            {checkedCount} selected
+          </span>
+          <button
+            type="button"
+            disabled={busy}
+            className="rounded-md border border-content/10 px-2 py-1 text-[11px] text-content/70 hover:bg-content/5 disabled:opacity-40"
+            onClick={() => {
+              setSelecting(false);
+              setChecked(new Set());
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={busy || !checkedCount}
+            className="inline-flex items-center gap-1.5 rounded-md bg-content/5 px-2 py-1 text-[11px] font-medium text-red-400 hover:bg-content/10 disabled:opacity-40 [.theme-light_&]:text-red-700"
+            onClick={beginBulkRemove}
+          >
+            <Trash2 className="size-3" aria-hidden="true" />
+            Remove…
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

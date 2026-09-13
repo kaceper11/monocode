@@ -24,7 +24,10 @@ import {
   type AttentionAction,
   type AttentionItem,
 } from "./lib/attention";
-import { deriveLocalAttention } from "./lib/attentionSources";
+import {
+  deriveLocalAttention,
+  worktreeCleanupAttention,
+} from "./lib/attentionSources";
 import {
   ciRepair,
   commentsRepair,
@@ -313,13 +316,17 @@ import {
 } from "./lib/paths";
 import { removeProjectData } from "./lib/projectData";
 import { TaskCreateSheet } from "./chrome/TaskCreateSheet";
+import { TaskDetails } from "./chrome/TaskDetails";
 import { TaskPrSheet } from "./chrome/TaskPrSheet";
+import { Modal } from "./chrome/Modal";
+import { WorktreePanel } from "./chrome/WorktreePicker";
 import {
   addTaskChildren,
   composeTaskPrompt,
   composeTaskSessionPrompt,
   linkTicketToTask,
   loadTaskWorkspaces,
+  OPEN_TASK_DETAILS,
   markTaskChildLaunching,
   preferredTaskChild,
   projectForTask,
@@ -347,7 +354,13 @@ import {
   subscribeProjects,
   type ProjectRecord,
 } from "./lib/projects";
-import { getVerifiedFamilies } from "./lib/repositoryFamilies";
+import {
+  getVerifiedFamilies,
+  hiddenWorkingCopies,
+  hiddenWorkingCopiesSnapshot,
+  subscribeRepositoryFamilies,
+  subscribeWorkingCopyPreferences,
+} from "./lib/repositoryFamilies";
 import { probeRepositoryFamily } from "./hooks/useRepositoryFamilies";
 import {
   archiveProject,
@@ -5322,6 +5335,16 @@ export default function App({
       window.removeEventListener("monocode:open-task-prs", listener);
   }, []);
 
+  const [taskDetailsId, setTaskDetailsId] = useState<string | null>(null);
+  useEffect(() => {
+    const listener = (event: Event) => {
+      const taskId = (event as CustomEvent<string>).detail;
+      if (typeof taskId === "string" && taskId) setTaskDetailsId(taskId);
+    };
+    window.addEventListener(OPEN_TASK_DETAILS, listener);
+    return () => window.removeEventListener(OPEN_TASK_DETAILS, listener);
+  }, []);
+
   /** True when a task-linked session can still be opened — open now, or
    * loadable (archived sessions restore). A deleted id is pruned off the
    * task so the next open relaunches instead of silently dead-ending. */
@@ -6948,15 +6971,89 @@ export default function App({
     },
     repairRecordsSafe,
   );
-  const derivedAttention = useMemo(
+  // Family discovery publishes once per probed path — coalesce the startup
+  // burst into one render the same way the rail does.
+  const [verifiedFamilies, setVerifiedFamilies] =
+    useState(getVerifiedFamilies);
+  useEffect(() => {
+    let timer = 0;
+    const unsubscribe = subscribeRepositoryFamilies(() => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(
+        () => setVerifiedFamilies(getVerifiedFamilies()),
+        40,
+      );
+    });
+    return () => {
+      window.clearTimeout(timer);
+      unsubscribe();
+    };
+  }, []);
+  const hiddenWorktreeRaw = useSyncExternalStore(
+    subscribeWorkingCopyPreferences,
+    hiddenWorkingCopiesSnapshot,
+  );
+  const [worktreeManager, setWorktreeManager] = useState<string | null>(null);
+  const [worktreeManagerBusy, setWorktreeManagerBusy] = useState(false);
+  // Live + persisted sessions across every checkout. `sidebarHistory` is
+  // cwd-filtered; task details and worktree staleness must see sessions in
+  // sibling working copies too.
+  const allSessions = useMemo(() => {
+    const byId = new Map<string, SessionSummary>();
+    for (const entry of history) byId.set(entry.id, entry);
+    for (const session of sessions) {
+      if (session.inboxAsk) continue;
+      byId.set(session.id, summaryFromSession(session));
+    }
+    return [...byId.values()];
+  }, [history, sessions]);
+  const worktreeSessionActivity = useMemo(() => {
+    const activity = new Map<string, number>();
+    const touch = (cwd: string | undefined, at: number) => {
+      if (!cwd) return;
+      const key = pathKey(cwd);
+      if ((activity.get(key) ?? 0) < at) activity.set(key, at);
+    };
+    for (const entry of history)
+      touch(entry.worktreeCwd ?? entry.cwd, entry.updatedAt);
+    // An open session counts as activity now — Session carries no updatedAt.
+    for (const session of sessions) touch(sessionWorkCwd(session), Date.now());
+    return activity;
+  }, [history, sessions]);
+  const worktreeAttention = useMemo(
     () =>
-      deriveLocalAttention({
+      worktreeCleanupAttention({
+        families: verifiedFamilies,
+        recents,
+        sessionActivity: worktreeSessionActivity,
+        currentCwd: projectCwd,
+        hidden: hiddenWorkingCopies(hiddenWorktreeRaw),
+      }),
+    [
+      verifiedFamilies,
+      recents,
+      worktreeSessionActivity,
+      projectCwd,
+      hiddenWorktreeRaw,
+    ],
+  );
+  const derivedAttention = useMemo(
+    () => [
+      ...deriveLocalAttention({
         sessions,
         unseenFinishedIds,
         reminders: sessionReminders.due,
         repairs: repairRows,
       }),
-    [sessions, unseenFinishedIds, sessionReminders, repairRows],
+      ...worktreeAttention,
+    ],
+    [
+      sessions,
+      unseenFinishedIds,
+      sessionReminders,
+      repairRows,
+      worktreeAttention,
+    ],
   );
   const attentionItems = useMemo(
     () => visibleAttention(derivedAttention, attentionStore),
@@ -7294,6 +7391,10 @@ export default function App({
             return;
           case "reconnect":
             openSettings("inbox", action.source);
+            return;
+          case "open-worktrees":
+            setWorktreeManagerBusy(false);
+            setWorktreeManager(action.cwd);
             return;
           case "open-url":
             await openUrl(action.url);
@@ -8173,6 +8274,29 @@ export default function App({
           onClose={() => setScheduleSheet(null)}
         />
       ) : null}
+      {worktreeManager ? (
+        <Modal
+          title="Worktrees"
+          size="sm"
+          className="max-h-[80vh]"
+          // A removal batch must not be dismissed mid-run — the results
+          // screen is where failures surface.
+          onClose={() => {
+            if (!worktreeManagerBusy) setWorktreeManager(null);
+          }}
+        >
+          <WorktreePanel
+            cwd={worktreeManager}
+            activeCwd={projectCwd}
+            onClose={() => setWorktreeManager(null)}
+            onOpen={(path) => {
+              setWorktreeManager(null);
+              onSelectProject(path);
+            }}
+            onBusyChange={setWorktreeManagerBusy}
+          />
+        </Modal>
+      ) : null}
       {wslPickerOpen && <WslProjectDialog cwd={projectCwd} onOpen={selectProject} onClose={() => setWslPickerOpen(false)} />}
       {taskSheet && (
         <TaskCreateSheet
@@ -8257,6 +8381,16 @@ export default function App({
           onClose={() => setTaskPrSheetTaskId(null)}
         />
       )}
+      {taskDetailsId ? (
+        <TaskDetails
+          taskId={taskDetailsId}
+          sessions={allSessions}
+          onClose={() => setTaskDetailsId(null)}
+          onOpenSession={(sessionId) => void onSelectHistorySession(sessionId)}
+          onOpenChild={(taskId, childId) => void onOpenTaskChild(taskId, childId)}
+          onEdit={onEditTask}
+        />
+      ) : null}
       <div className="body-glass flex min-h-0 min-w-0 flex-1 flex-col">
         {wslOpening && (
           <div role={wslOpening.error ? "alert" : "status"} className="flex shrink-0 items-center gap-3 border-b border-content/10 px-4 py-2 text-[12px]">
@@ -8474,6 +8608,7 @@ export default function App({
             onOpenFile={onOpenFile}
             onOpenSession={onSelectHistorySession}
             onOpenProject={onSelectProject}
+            onOpenTask={setTaskDetailsId}
           />
         ) : null}
         <div className="hidden" aria-hidden>
