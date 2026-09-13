@@ -538,7 +538,9 @@ describe("browserAgentContext", () => {
     ];
     const withSteps = browserAgentContext(capture({ steps }), "/repo", true);
     const text = withSteps.entries[0].text;
-    expect(text).toContain("### Recent steps");
+    expect(text).toContain(
+      "### Recent steps — began 1970-01-01T00:00:01.000Z",
+    );
     expect(text).toContain("1. +0.0s Opened http://localhost:3000/");
     expect(text).toContain('2. +1.5s Clicked button "Deploy"');
     expect(text).toContain('3. +3.0s Typed "fix" in input "Search"');

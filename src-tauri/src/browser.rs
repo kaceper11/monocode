@@ -105,12 +105,18 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
     (s || "").replace(/([?&#])([^=&#]+)=([^&#]*)/g, (m, sep, k) =>
       SECRET_KEY.test(k) ? sep + k + "=…" : m,
     );
+  // A JWT is base64url'd `{"…` → always starts "eyJ". It can appear as a
+  // bare path/hash segment (#/callback/<jwt>) where param redaction can't
+  // reach, or nested inside a non-secret-looking param value.
+  const JWT = /eyJ[\w-]+\.[\w-]+\.[\w-]*/g;
   const cleanUrl = (raw) => {
     try {
       const u = new URL(raw);
       u.username = "";
       u.password = "";
-      return u.origin + u.pathname + redactParams(u.search) + redactParams(u.hash);
+      return (
+        u.origin + u.pathname + redactParams(u.search) + redactParams(u.hash)
+      ).replace(JWT, "…");
     } catch (e) {
       return String(raw).slice(0, 300);
     }
@@ -128,7 +134,9 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
         el.getAttribute("placeholder") ||
         el.getAttribute("name") ||
         el.getAttribute("title") ||
-        (tag === "input" || tag === "textarea" ? "" : el.innerText || "") ||
+        (tag === "input" || tag === "textarea" || el.isContentEditable
+          ? ""
+          : el.innerText || "") ||
         el.id ||
         "";
       text = String(text).trim().replace(/\s+/g, " ").slice(0, 80);
@@ -207,6 +215,9 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
   };
   window.__monocodeLabel = label;
   window.__monocodeTrail = trail;
+  // Clicking a <label> forwards a synthesized click to its control — the
+  // label step already says what happened, so swallow the echo.
+  let forwardedClick = null;
   window.addEventListener(
     "click",
     (e) => {
@@ -217,12 +228,24 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
           t.closest(
             "a,button,input,textarea,summary,label,[role='button'],[role='link'],[role='tab'],[role='menuitem'],[role='switch'],[contenteditable]",
           ) || t;
+        if (
+          forwardedClick &&
+          forwardedClick.el === el &&
+          Date.now() - forwardedClick.at < 500
+        ) {
+          forwardedClick = null;
+          return;
+        }
+        forwardedClick = null;
         // Checkbox/radio clicks are reported by the change event instead.
         if (el.tagName === "INPUT") {
           const ty = (el.getAttribute("type") || "").toLowerCase();
           if (ty === "checkbox" || ty === "radio") return;
         }
         step("Clicked " + label(el));
+        if (el.tagName === "LABEL" && el.control) {
+          forwardedClick = { el: el.control, at: Date.now() };
+        }
       } catch (err) {}
     },
     true,
@@ -261,15 +284,30 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
     (e) => step("Submitted " + label(e.target)),
     true,
   );
+  // Enter is a step where it submits (inputs, chat-style contenteditable);
+  // in a plain textarea it's just a newline.
   window.addEventListener(
     "keydown",
     (e) => {
       try {
         if (e.key !== "Enter") return;
         const el = e.target;
-        if (!el || !el.matches || !el.matches("input,textarea,[contenteditable]"))
+        if (!el || !el.matches || !el.matches("input,[contenteditable]"))
           return;
         step("Pressed Enter in " + label(el));
+      } catch (err) {}
+    },
+    true,
+  );
+  // contenteditable never fires `change` — the blur is the edit's end.
+  // Fact-of-edit only; the typed content itself is never recorded.
+  window.addEventListener(
+    "focusout",
+    (e) => {
+      try {
+        const el = e.target;
+        if (!el || el.nodeType !== 1 || !el.isContentEditable) return;
+        step("Edited " + label(el));
       } catch (err) {}
     },
     true,

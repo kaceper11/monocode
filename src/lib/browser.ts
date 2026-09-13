@@ -546,8 +546,12 @@ export function browserAgentContext(
   // they describe what happened, they don't prove it.
   if (includeSteps && capture.steps.length) {
     const first = capture.steps[0].at;
+    // `at` is the page's clock — stamps the session's age for a trail
+    // that may have been recorded a while before it was sent.
+    const began =
+      first > 0 ? ` — began ${new Date(first).toISOString()}` : "";
     sections.push(
-      `### Recent steps\n\n${capture.steps
+      `### Recent steps${began}\n\n${capture.steps
         .map(
           (s, i) =>
             `${i + 1}. +${Math.max(0, (s.at - first) / 1000).toFixed(1)}s ${stripUrlCredentials(s.text)}`,
