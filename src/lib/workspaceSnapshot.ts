@@ -564,6 +564,7 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
         ...(typeof browser.title === "string" && browser.title.trim()
           ? { title: browser.title.trim().slice(0, 200) }
           : {}),
+        ...(browser.collapsed === true ? { collapsed: true } : {}),
       },
     };
   }

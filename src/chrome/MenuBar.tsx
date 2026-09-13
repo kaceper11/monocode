@@ -197,7 +197,7 @@ export function MenuBar({
           { kind: "item", id: "new_terminal", label: "New Terminal", shortcut: `${MOD}\`` },
           { kind: "item", id: "new_window", label: "New Window", shortcut: `${MOD}${SHIFT}N` },
           { kind: "sep" },
-          { kind: "item", id: "open_browser", label: "Open URL in Browser…" },
+          { kind: "item", id: "open_browser", label: "Open URL in Browser…", shortcut: `${MOD}${SHIFT}B` },
           { kind: "sep" },
           { kind: "item", id: "open_project", label: "Open Project…", shortcut: `${MOD}O` },
           { kind: "item", id: "open_search", label: "Search…", shortcut: `${MOD}K` },

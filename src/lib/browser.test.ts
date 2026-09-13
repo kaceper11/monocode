@@ -2,6 +2,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   browserAgentContext,
+  browserClipboardUrl,
   browserFavorites,
   browserTabLabel,
   isBrowserFavorite,
@@ -79,6 +80,42 @@ describe("isLocalhostUrl", () => {
     "not a url",
   ])("rejects non-loopback: %s", (url) => {
     expect(isLocalhostUrl(url)).toBe(false);
+  });
+});
+
+describe("browserClipboardUrl", () => {
+  it("returns a bare http(s) URL", () => {
+    expect(browserClipboardUrl("http://localhost:3000")).toBe(
+      "http://localhost:3000/",
+    );
+    expect(browserClipboardUrl("  https://example.com/app  ")).toBe(
+      "https://example.com/app",
+    );
+  });
+
+  it("extracts a URL from a dev-server output line", () => {
+    expect(
+      browserClipboardUrl("➜  Local:   http://localhost:5173/app"),
+    ).toBe("http://localhost:5173/app");
+  });
+
+  it("strips trailing sentence punctuation", () => {
+    expect(browserClipboardUrl("see http://localhost:3000, then go")).toBe(
+      "http://localhost:3000/",
+    );
+    expect(browserClipboardUrl("(http://localhost:3000)")).toBe(
+      "http://localhost:3000/",
+    );
+  });
+
+  it.each([
+    "",
+    "no url here",
+    "file:///etc/passwd",
+    "localhost:3000",
+    "ftp://example.com",
+  ])("rejects clipboard text without an http(s) URL: %j", (text) => {
+    expect(browserClipboardUrl(text)).toBe("");
   });
 });
 
@@ -256,6 +293,32 @@ describe("browser tabs in the layout", () => {
     expect(next.editorPanes[0].files[0].browser?.title).toBe("Loaded");
     expect(next.editorPanes[0].files[0].path).toBe("http://localhost:3000/");
   });
+
+  it("updateBrowserTab toggles collapsed without touching url or title", () => {
+    const browser = {
+      ...newBrowserTab("/repo", "http://localhost:3000/"),
+      id: "b1",
+    };
+    const tab = {
+      ...newTab("s1"),
+      editorPanes: [{ id: "p1", files: [browser], activeFileId: "b1" }],
+    };
+    const collapsed = updateBrowserTab(tab, "b1", { collapsed: true });
+    const entry = collapsed.editorPanes[0].files[0];
+    expect(entry.browser?.collapsed).toBe(true);
+    expect(entry.browser?.url).toBe("http://localhost:3000/");
+
+    // A later navigation patch keeps the collapsed flag.
+    const navigated = updateBrowserTab(collapsed, "b1", {
+      url: "http://localhost:3000/next",
+    });
+    expect(navigated.editorPanes[0].files[0].browser?.collapsed).toBe(true);
+
+    const expanded = updateBrowserTab(navigated, "b1", { collapsed: false });
+    expect(
+      expanded.editorPanes[0].files[0].browser?.collapsed,
+    ).toBeUndefined();
+  });
 });
 
 describe("browser tabs in the workspace snapshot", () => {
@@ -291,6 +354,31 @@ describe("browser tabs in the workspace snapshot", () => {
     const file = parsed?.tabs[0].editorPanes[0].files[0];
     expect(file?.browser?.url).toBe("http://localhost:3000/");
     expect(file?.browser?.title).toBe("App");
+  });
+
+  it("round-trips the collapsed flag only when true", () => {
+    const parsed = parseWorkspaceSnapshot(
+      snapshotWith([
+        {
+          id: "b1",
+          path: "http://localhost:3000/",
+          cwd: "/repo",
+          browser: {
+            url: "http://localhost:3000/",
+            collapsed: true,
+          },
+        },
+        {
+          id: "b2",
+          path: "http://localhost:4000/",
+          cwd: "/repo",
+          browser: { url: "http://localhost:4000/", collapsed: "yes" },
+        },
+      ]),
+    );
+    const files = parsed?.tabs[0].editorPanes[0].files;
+    expect(files?.[0].browser?.collapsed).toBe(true);
+    expect(files?.[1].browser?.collapsed).toBeUndefined();
   });
 
   it.each([

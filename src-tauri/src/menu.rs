@@ -145,8 +145,9 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .accelerator("CmdOrCtrl+Shift+F")
         .build(app)?;
 
-    let open_browser =
-        MenuItemBuilder::with_id("open_browser", "Open URL in Browser…").build(app)?;
+    let open_browser = MenuItemBuilder::with_id("open_browser", "Open URL in Browser…")
+        .accelerator("CmdOrCtrl+Shift+B")
+        .build(app)?;
 
     let file = SubmenuBuilder::new(app, "File")
         .item(&new_window)

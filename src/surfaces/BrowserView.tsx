@@ -9,11 +9,12 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, ExternalLink, Globe, Pencil, Plus, RefreshCw, Star, Trash2, X } from "../chrome/icons";
+import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, ExternalLink, Globe, PanelTop, Pencil, Plus, RefreshCw, Star, Trash2, X } from "../chrome/icons";
 import { Popover } from "../chrome/Popover";
 import {
   browserAgentContext,
   browserCapture,
+  browserClipboardUrl,
   browserClose,
   browserFavorites,
   browserGoBack,
@@ -38,13 +39,17 @@ import {
   type BrowserFavorite,
 } from "../lib/browser";
 import { requestAgentContext } from "../lib/agentContext";
-import type { BrowserMetaPatch, FilePaneTab } from "../lib/layout";
+import type {
+  BrowserMetaPatch,
+  BrowserTabSource,
+  FilePaneTab,
+} from "../lib/layout";
 import { wslLocation } from "../lib/paths";
 
 type LoadStatus = "idle" | "opening" | "loading" | "ready" | "failed";
 
 type Props = {
-  file: FilePaneTab & { browser: { url: string; title?: string } };
+  file: FilePaneTab & { browser: BrowserTabSource };
   /** The tab is the active tab of a pane that is on screen. */
   active: boolean;
   onMetaChange?: (patch: BrowserMetaPatch) => void;
@@ -361,7 +366,9 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
     };
   }, [syncBounds]);
 
-  const wantShow = opened && active && !overlayOpen && status !== "failed";
+  const collapsed = !!file.browser.collapsed;
+  const wantShow =
+    opened && active && !overlayOpen && status !== "failed" && !collapsed;
   wantShowRef.current = wantShow;
   useEffect(() => {
     if (!opened) return;
@@ -537,6 +544,13 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
           >
             <Plus className="size-3.5" strokeWidth={1.75} />
           </ToolbarButton>
+          <ToolbarButton
+            title={collapsed ? "Expand page" : "Collapse page"}
+            pressed={collapsed}
+            onClick={() => onMetaChange?.({ collapsed: !collapsed })}
+          >
+            <PanelTop className="size-3.5" strokeWidth={1.75} />
+          </ToolbarButton>
         </div>
       ) : null}
       {favoritesAnchor ? (
@@ -597,7 +611,7 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
           </button>
         </div>
       ) : null}
-      <div className="relative min-h-0 flex-1">
+      <div className={`relative min-h-0 flex-1 ${collapsed ? "hidden" : ""}`}>
         <div ref={hostRef} className="absolute inset-0" />
         {!url ? (
           <EmptyBrowserState
@@ -643,11 +657,13 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
 function ToolbarButton({
   title,
   disabled,
+  pressed,
   onClick,
   children,
 }: {
   title: string;
   disabled?: boolean;
+  pressed?: boolean;
   onClick: (event: ReactMouseEvent<HTMLButtonElement>) => void;
   children: ReactNode;
 }) {
@@ -656,6 +672,7 @@ function ToolbarButton({
       type="button"
       title={title}
       aria-label={title}
+      aria-pressed={pressed}
       disabled={disabled}
       onClick={onClick}
       className="grid size-6 shrink-0 place-items-center rounded-md text-content/60 hover:bg-content/10 hover:text-content disabled:cursor-not-allowed disabled:opacity-35"
@@ -837,6 +854,24 @@ function EmptyBrowserState({
 }) {
   const [value, setValue] = useState(suggested ?? "");
   const [error, setError] = useState("");
+  // A URL on the clipboard is a stronger hint than the remembered URL —
+  // prefill it unless the user has already typed. Silently falls back when
+  // clipboard access is denied or the contents aren't an http(s) link.
+  const touchedRef = useRef(false);
+  useEffect(() => {
+    let cancelled = false;
+    void navigator.clipboard
+      ?.readText()
+      .then((text) => {
+        const clipped = browserClipboardUrl(text);
+        if (cancelled || touchedRef.current || !clipped) return;
+        setValue(clipped);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   return (
     <div className="absolute inset-0 grid place-items-center overflow-y-auto p-6">
       <form
@@ -861,9 +896,11 @@ function EmptyBrowserState({
         <input
           value={value}
           onChange={(event) => {
+            touchedRef.current = true;
             setValue(event.currentTarget.value);
             setError("");
           }}
+          onFocus={(event) => event.currentTarget.select()}
           autoFocus
           spellCheck={false}
           autoCapitalize="off"

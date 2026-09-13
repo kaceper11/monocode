@@ -115,6 +115,19 @@ export function isHttpUrl(value: string): boolean {
   return /^https?:\/\//i.test(value.trim());
 }
 
+/** First http(s) URL in copied text — handles whole-line copies like
+ * `➜ Local: http://localhost:5173/`. Returns "" when nothing valid. */
+export function browserClipboardUrl(text: string): string {
+  const match = /https?:\/\/[^\s"'<>`]+/i.exec(text.slice(0, 65536));
+  if (!match) return "";
+  const candidate = match[0].replace(/[.,;:'")[\]]+$/, "");
+  try {
+    return normalizeBrowserUrl(candidate);
+  } catch {
+    return "";
+  }
+}
+
 function hostnameOf(url: string): string {
   try {
     return new URL(url).hostname.toLowerCase();
