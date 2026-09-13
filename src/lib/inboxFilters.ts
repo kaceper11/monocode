@@ -380,7 +380,13 @@ export function applyInboxFilters(
   source?: InboxSource,
 ): InboxItem[] {
   const scoped = source ? filterInboxByProvider(items, source) : [...items];
-  const hiddenProjects = source === "linear" || source === "jira" || source === "azure" ? [] : filters.hiddenProjects;
+  const hiddenProjects =
+    source === "linear" ||
+    source === "jira" ||
+    source === "azure" ||
+    (source === "gitlab" && filters.assignedToMe)
+      ? []
+      : filters.hiddenProjects;
   const hiddenKinds = source === "linear" || source === "jira" ? [] : filters.hiddenKinds;
   return filterInboxItems(
     filterInboxByStatus(

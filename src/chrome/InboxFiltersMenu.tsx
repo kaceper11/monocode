@@ -193,7 +193,7 @@ export function InboxFiltersMenu({
         </>
       ) : null}
       {source === "azure" && azure ? <AzureFilters site={azure.site} filter={azure.filter} /> : <FilterItem
-        label="Assigned to me"
+        label={source === "gitlab" ? "Needs attention" : "Assigned to me"}
         checked={source === "jira" ? jiraFilter.assigned : filters.assignedToMe}
         onClick={
           source === "jira"
@@ -335,7 +335,10 @@ export function InboxFiltersMenu({
         </>
       ) : null}
 
-      {!ticket && source !== "azure" && projects.length > 0 ? (
+      {!ticket &&
+      source !== "azure" &&
+      !(source === "gitlab" && filters.assignedToMe) &&
+      projects.length > 0 ? (
         <>
           <SectionLabel>Projects</SectionLabel>
           {projects.map((project) => (

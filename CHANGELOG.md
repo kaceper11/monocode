@@ -31,6 +31,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Packaged builds and development dialogs use the MonoCode name without a downstream-distribution suffix.
 
+## [0.1.45] - 2026-09-13
+
+### Added
+
+- Subagent rows show the child's model beside its step count when the provider reports it, and retain it in saved conversations.
+- Subagent trails now include OpenCode child sessions and Pi/omp progress, including separate rows for parallel and chained tasks. Cursor recovers child messages and tools from its local stores, names foreground tasks correctly, and restores expandable rows in saved conversations. Cursor, Grok Build, and fx also route child updates carrying a parent tool ID into the same trails. OpenCode pairs concurrent runs by session ID, and repeated progress updates merge into their existing steps.
+- Subagents now get a row each in the transcript, sitting under the agent's own work with an animated mascot, a shimmering name while the run is live, and a count of the steps it has taken. Clicking a row opens the subagent's trail inline, grouped into phases the same way the main transcript groups work, so a long run reads as what it said and the calls that followed rather than one flat dump. The rows keep their place while the work above them folds and re-folds. Claude and Codex both report their subagents' work; Codex spawns are named from their brief, stay running until the agent itself reports otherwise, and one spawned agent no longer shows up as several rows.
+- GitLab's **Needs attention** Inbox view now uses pending GitLab To-Dos to include assignments, mentions, and review requests from every accessible repository. Remote-only items support details, discussions, comments, and merge-request diffs without requiring a local checkout.
+- Sessions linked to a GitHub issue or pull request now surface unseen comments, reviews, commits, and state changes in the sidebar and in an activity notice. Open the new activity directly, add it to the composer for an agent to address, or archive or delete the session after its issue closes or pull request closes or merges.
+- Settings → General can show an optional standalone effort picker beside the model picker for quicker changes, and remembers the preference. When the standalone control is hidden, the combined model picker shows the selected effort beside the model name.
+- Click a skill in Settings → Skills to inspect its `SKILL.md` in a responsive inline panel, switch between rendered Markdown and source, and expand its metadata. The preview supports keyboard focus restoration and Escape-to-close. In #172 by @ognjeeen.
+
+### Changed
+
+- While an agent is busy, entering a follow-up replaces the **Stop** action with **Send** instead of showing both controls at once.
+
+### Fixed
+
+- Clicking or dragging a session card no longer selects its text.
+- Computer Use access confirmations are accepted automatically when Codex is already running in Full Access mode; other MCP confirmations still require an explicit decision.
+- GitLab Inbox repository detection no longer flashes console windows when it invokes Git on Windows. In #200.
+- Claude Sonnet 5 appears only with Claude Code 2.1.197 or newer, preventing older CLI versions from receiving an unsupported model argument. In #199 by @nulljosh.
+- Claude model choices resolve consistently between the CLI's short live aliases and MonoCode's full startup model IDs, so relaunching no longer switches a saved session to a different model family.
+
 ## [0.1.44] - 2026-09-12
 
 ### Added
@@ -742,6 +766,7 @@ First public release. macOS (Apple Silicon) only.
 [Unreleased]: https://github.com/kaceper11/monocode/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/kaceper11/monocode/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/kaceper11/monocode/releases/tag/v0.2.0
+[0.1.45]: https://github.com/hardbeat920/monocode/compare/v0.1.44...v0.1.45
 [0.1.44]: https://github.com/hardbeat920/monocode/compare/v0.1.43...v0.1.44
 [0.1.43]: https://github.com/hardbeat920/monocode/compare/v0.1.42...v0.1.43
 [0.1.42]: https://github.com/hardbeat920/monocode/compare/v0.1.41...v0.1.42

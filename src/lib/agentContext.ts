@@ -181,12 +181,12 @@ export async function contextFromTicketDescriptions(
           const provider = await import("./gitlab");
           details =
             provider.peekGitlabWorkItemDetails(
-              item.projectPath,
+              item.repo,
               kind,
               item.number,
             ) ??
             (await provider.gitlabWorkItemDetails(
-              item.projectPath,
+              item.repo,
               kind,
               item.number,
             ));

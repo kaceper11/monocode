@@ -20,6 +20,7 @@ export type GitlabWorkItem = {
   assignees: { login: string; avatarUrl?: string }[];
   draft: boolean;
   repo: string;
+  attentionReason: string;
 };
 
 export type GitlabWorkItemDetails = {
@@ -97,11 +98,12 @@ const repoInflight = new Map<string, Promise<string>>();
 const detailsByKey = new Map<string, GitlabWorkItemDetails>();
 const threadByKey = new Map<string, GitlabWorkItemThread>();
 const threadInflight = new Map<string, Promise<GitlabWorkItemThread>>();
+const diffByKey = new Map<string, GitlabMrDiff>();
 const diffInflight = new Map<string, Promise<GitlabMrDiff>>();
 const discussionInflight = new Map<string, Promise<GitlabWorkItemThread>>();
 
-function itemKey(cwd: string, kind: GitlabKind, number: number): string {
-  return `${normalizeProjectPath(cwd)}:${kind}:${number}`;
+function itemKey(repo: string, kind: GitlabKind, number: number): string {
+  return `${repo.trim().toLowerCase()}:${kind}:${number}`;
 }
 
 export function clearGitlabCache() {
@@ -110,6 +112,7 @@ export function clearGitlabCache() {
   detailsByKey.clear();
   threadByKey.clear();
   threadInflight.clear();
+  diffByKey.clear();
   diffInflight.clear();
   discussionInflight.clear();
 }
@@ -179,42 +182,52 @@ export function listGitlabWorkItems(
   });
 }
 
+export function listGitlabTodos(query: {
+  kind: GitlabKind;
+  limit?: number;
+}): Promise<GitlabWorkItem[]> {
+  return invoke<GitlabWorkItem[]>("gitlab_list_todos", {
+    kind: query.kind,
+    limit: query.limit,
+  });
+}
+
 export function peekGitlabWorkItemDetails(
-  cwd: string,
+  repo: string,
   kind: GitlabKind,
   number: number,
 ): GitlabWorkItemDetails | null {
-  return detailsByKey.get(itemKey(cwd, kind, number)) ?? null;
+  return detailsByKey.get(itemKey(repo, kind, number)) ?? null;
 }
 
 export async function gitlabWorkItemDetails(
-  cwd: string,
+  repo: string,
   kind: GitlabKind,
   number: number,
 ): Promise<GitlabWorkItemDetails> {
   const details = await invoke<GitlabWorkItemDetails>(
     "gitlab_work_item_details",
-    { cwd, kind, number },
+    { repo, kind, number },
   );
-  detailsByKey.set(itemKey(cwd, kind, number), details);
+  detailsByKey.set(itemKey(repo, kind, number), details);
   return details;
 }
 
 export function peekGitlabWorkItemThread(
-  cwd: string,
+  repo: string,
   kind: GitlabKind,
   number: number,
 ): GitlabWorkItemThread | null {
-  return threadByKey.get(itemKey(cwd, kind, number)) ?? null;
+  return threadByKey.get(itemKey(repo, kind, number)) ?? null;
 }
 
 export async function gitlabWorkItemThread(
-  cwd: string,
+  repo: string,
   kind: GitlabKind,
   number: number,
   options?: { force?: boolean },
 ): Promise<GitlabWorkItemThread> {
-  const key = itemKey(cwd, kind, number);
+  const key = itemKey(repo, kind, number);
   if (options?.force) {
     threadByKey.delete(key);
     threadInflight.delete(key);
@@ -222,7 +235,7 @@ export async function gitlabWorkItemThread(
   const cached = threadInflight.get(key);
   if (cached) return cached;
   const pending = invoke<GitlabWorkItemThread>("gitlab_work_item_thread", {
-    cwd,
+    repo,
     kind,
     number,
   })
@@ -238,33 +251,45 @@ export async function gitlabWorkItemThread(
 }
 
 export async function gitlabWorkItemComment(
-  cwd: string,
+  repo: string,
   kind: GitlabKind,
   number: number,
   body: string,
 ): Promise<string> {
   const url = await invoke<string>("gitlab_work_item_comment", {
-    cwd,
+    repo,
     kind,
     number,
     body: body.trim(),
   });
-  const key = itemKey(cwd, kind, number);
+  const key = itemKey(repo, kind, number);
   threadByKey.delete(key);
   threadInflight.delete(key);
   // A top-level note on an MR lands as a new individual_note discussion.
-  if (kind === "pr") invalidateDiscussions(cwd, number);
+  if (kind === "pr") invalidateDiscussions(repo, number);
   return url;
 }
 
+export function peekGitlabMrDiff(
+  repo: string,
+  number: number,
+): GitlabMrDiff | null {
+  return diffByKey.get(itemKey(repo, "pr", number)) ?? null;
+}
+
+
 export async function gitlabMrDiff(
-  cwd: string,
+  repo: string,
   number: number,
 ): Promise<GitlabMrDiff> {
-  const key = itemKey(cwd, "pr", number);
+  const key = itemKey(repo, "pr", number);
   const cached = diffInflight.get(key);
   if (cached) return cached;
-  const pending = invoke<GitlabMrDiff>("gitlab_mr_diff", { cwd, number })
+  const pending = invoke<GitlabMrDiff>("gitlab_mr_diff", { repo, number })
+    .then((diff) => {
+      diffByKey.set(key, diff);
+      return diff;
+    })
     .finally(() => {
       if (diffInflight.get(key) === pending) diffInflight.delete(key);
     });
@@ -295,7 +320,8 @@ export async function gitlabMrDiscussions(
   number: number,
   options?: { force?: boolean },
 ): Promise<GitlabWorkItemThread> {
-  const key = itemKey(cwd, "pr", number);
+  const repo = await gitlabRepo(cwd);
+  const key = itemKey(repo, "pr", number);
   if (options?.force) discussionInflight.delete(key);
   const cached = discussionInflight.get(key);
   if (cached) return cached;
@@ -310,8 +336,8 @@ export async function gitlabMrDiscussions(
   return pending;
 }
 
-const invalidateDiscussions = (cwd: string, number: number) => {
-  const key = itemKey(cwd, "pr", number);
+const invalidateDiscussions = (repo: string, number: number) => {
+  const key = itemKey(repo, "pr", number);
   discussionInflight.delete(key);
   // The flat notes thread behind the inbox summary lists the same replies.
   threadByKey.delete(key);
@@ -325,13 +351,14 @@ export async function gitlabMrDiscussionReply(
   discussionId: string,
   body: string,
 ): Promise<string> {
+  const repo = await gitlabRepo(cwd);
   const url = await invoke<string>("gitlab_mr_discussion_reply", {
     cwd,
     number,
     discussionId,
     body: body.trim(),
   });
-  invalidateDiscussions(cwd, number);
+  invalidateDiscussions(repo, number);
   return url;
 }
 
@@ -341,13 +368,14 @@ export async function gitlabMrDiscussionResolve(
   discussionId: string,
   resolved: boolean,
 ): Promise<void> {
+  const repo = await gitlabRepo(cwd);
   await invoke("gitlab_mr_discussion_resolve", {
     cwd,
     number,
     discussionId,
     resolved,
   });
-  invalidateDiscussions(cwd, number);
+  invalidateDiscussions(repo, number);
 }
 
 export function notifyGitlabChange() {

@@ -3,6 +3,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   GITLAB_CHANGE_EVENT,
   gitlabMrDiff,
+  gitlabRepo,
   gitlabMrDiscussionReply,
   gitlabMrDiscussionResolve,
   gitlabMrDiscussions,
@@ -196,7 +197,9 @@ function GitlabMrPanel({
       let threadFailure = "";
       const [state, nextDiff, nextThread] = await Promise.all([
         gitlabMrState(cwd, number),
-        gitlabMrDiff(cwd, number).catch(() => null),
+        gitlabRepo(cwd)
+          .then((repo) => gitlabMrDiff(repo, number))
+          .catch(() => null),
         gitlabMrDiscussions(cwd, number, { force: true }).catch((error) => {
           threadFailure = message(error);
           return null;
