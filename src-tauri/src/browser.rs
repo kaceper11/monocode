@@ -577,14 +577,24 @@ pub fn browser_set_bounds(
         .map_err(|error| error.to_string())
 }
 
+/// Hiding a child webview suspends it — WKWebView stalls for a beat
+/// re-compositing on the next show, which read as the preview freezing
+/// whenever a tab switch hid and restored it. Instead "hidden" parks the
+/// view offscreen at its current size: nothing suspends, no relayout
+/// runs, and the next set_bounds puts it back instantly. `visible: true`
+/// is a no-op — the bounds sync that always follows restores position.
 #[tauri::command]
 pub fn browser_set_visible(window: Window, label: String, visible: bool) -> Result<(), String> {
-    let view = find_webview(&window, &label)?;
     if visible {
-        view.show().map_err(|error| error.to_string())
-    } else {
-        view.hide().map_err(|error| error.to_string())
+        return Ok(());
     }
+    let view = find_webview(&window, &label)?;
+    let bounds = view.bounds().map_err(|error| error.to_string())?;
+    view.set_bounds(Rect {
+        position: tauri::PhysicalPosition::new(-32_768, 0).into(),
+        size: bounds.size,
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// Read the live location so the tab can tell "never loaded" apart from a

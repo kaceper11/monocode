@@ -230,6 +230,9 @@ export function BrowserView({
     }
     if (!shownRef.current) {
       shownRef.current = true;
+      // The "hidden" view was parked offscreen, so the real bounds must be
+      // re-sent even when they match the last visible frame.
+      boundsRef.current = null;
       void browserSetVisible(label, true).catch(() => undefined);
     }
     const next = {

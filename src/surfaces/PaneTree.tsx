@@ -154,6 +154,8 @@ type PaneDrag = {
 };
 
 const DRAG_THRESHOLD = 5;
+/** Width of the docked session column while a browser pane is expanded. */
+const CHAT_DOCK_WIDTH = "min(26rem, 42%)";
 
 function PaneTreeComponent({
   sessionPortal,
@@ -250,15 +252,25 @@ function PaneTreeComponent({
   const leaves = layoutLeaves(tree);
   const sashes = layoutSashes(tree);
   const inSplit = leaves.length > 1;
-  // A browser tab flagged `expanded` zooms its leaf over the whole tree —
-  // tmux-style pane zoom. Other leaves stay mounted underneath (sessions
-  // keep running, composer keeps its draft); only their native webviews
-  // must be told to hide via `occluded`.
+  // A browser tab flagged `expanded` zooms its leaf over the tree —
+  // tmux-style pane zoom — while the focused session stays docked as a
+  // column on the right so the agent keeps working alongside. Other
+  // leaves stay mounted underneath (sessions keep running, composers keep
+  // drafts); only their native webviews must be told to hide via
+  // `occluded`.
   const expandedLeafId = leaves.find((leaf) => {
     const pane = editorPanes.find((entry) => entry.id === leaf.id);
     const file = pane?.files.find((entry) => entry.id === pane.activeFileId);
     return !!file?.browser?.expanded;
   })?.id;
+  const isSessionLeaf = (id: string) => sessions.some((s) => s.id === id);
+  const chatLeafId = expandedLeafId
+    ? (focusedId !== expandedLeafId && isSessionLeaf(focusedId)
+        ? focusedId
+        : leaves.find(
+            (leaf) => leaf.id !== expandedLeafId && isSessionLeaf(leaf.id),
+          )?.id)
+    : undefined;
 
   const startPaneDrag = useCallback(
     (fromId: string, event: ReactPointerEvent<HTMLElement>) => {
@@ -350,26 +362,37 @@ function PaneTreeComponent({
           "--chat-background-height": `${100 / leaf.rect.h}%`,
         } as CSSProperties;
         const expanded = leaf.id === expandedLeafId;
+        const docked = leaf.id === chatLeafId;
         return (
           <div
             key={leaf.id}
             data-pane-id={leaf.id}
-            className={`absolute flex min-h-0 min-w-0 flex-col overflow-hidden ${dragging ? "opacity-40" : ""} ${expanded ? "bg-background-base" : ""}`}
+            className={`absolute flex min-h-0 min-w-0 flex-col overflow-hidden ${dragging ? "opacity-40" : ""} ${expanded || docked ? "bg-background-base" : ""} ${docked ? "border-l border-content/10" : ""}`}
             style={{
               ...(expanded
                 ? {
                     left: 0,
                     top: 0,
-                    width: "100%",
+                    width: chatLeafId
+                      ? `calc(100% - ${CHAT_DOCK_WIDTH})`
+                      : "100%",
                     height: "100%",
                     zIndex: 30,
                   }
-                : {
-                    left: `${leaf.rect.x * 100}%`,
-                    top: `${leaf.rect.y * 100}%`,
-                    width: `${leaf.rect.w * 100}%`,
-                    height: `${leaf.rect.h * 100}%`,
-                  }),
+                : docked
+                  ? {
+                      left: `calc(100% - ${CHAT_DOCK_WIDTH})`,
+                      top: 0,
+                      width: CHAT_DOCK_WIDTH,
+                      height: "100%",
+                      zIndex: 40,
+                    }
+                  : {
+                      left: `${leaf.rect.x * 100}%`,
+                      top: `${leaf.rect.y * 100}%`,
+                      width: `${leaf.rect.w * 100}%`,
+                      height: `${leaf.rect.h * 100}%`,
+                    }),
               ...backgroundStyle,
             }}
           >
