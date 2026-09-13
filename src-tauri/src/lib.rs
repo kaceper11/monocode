@@ -243,6 +243,7 @@ pub fn run() {
             browser::browser_set_bounds,
             browser::browser_set_visible,
             browser::browser_probe,
+            browser::browser_capture,
             fs::list_dir,
             fs::list_project_files,
             fs::git_diff_stats,

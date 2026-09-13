@@ -1,11 +1,14 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  browserAgentContext,
   browserTabLabel,
   isLocalhostUrl,
   normalizeBrowserUrl,
   rememberedBrowserUrl,
   rememberBrowserUrl,
+  sanitizeCaptureUrl,
+  type BrowserCapture,
 } from "./browser";
 import {
   isBrowserTab,
@@ -228,5 +231,88 @@ describe("browser tabs in the workspace snapshot", () => {
     );
     const file = parsed?.tabs[0].editorPanes[0].files[0];
     expect(file?.browser).toBeUndefined();
+  });
+});
+
+describe("sanitizeCaptureUrl", () => {
+  it("strips embedded credentials", () => {
+    expect(sanitizeCaptureUrl("http://user:hunter2@localhost:3000/app")).toBe(
+      "http://localhost:3000/app",
+    );
+  });
+
+  it("leaves a plain URL and a non-URL untouched", () => {
+    expect(sanitizeCaptureUrl("https://example.com/a?b=1")).toBe(
+      "https://example.com/a?b=1",
+    );
+    expect(sanitizeCaptureUrl("not a url")).toBe("not a url");
+  });
+});
+
+describe("browserAgentContext", () => {
+  const capture = (over: Partial<BrowserCapture> = {}): BrowserCapture => ({
+    url: "http://localhost:3000/app",
+    title: "Dev App",
+    text: "Dashboard content",
+    controls: ["a: /settings", "button: Deploy"],
+    console: [{ level: "error", text: "boom" }],
+    ...over,
+  });
+
+  it("carries URL, worktree and host in the origin line", () => {
+    const context = browserAgentContext(capture(), "/repo/app");
+    const entry = context.entries[0];
+    expect(entry.title).toBe("Browser: Dev App");
+    expect(entry.origin).toContain("http://localhost:3000/app");
+    expect(entry.origin).toContain("/repo/app");
+    expect(entry.origin).toContain("native host");
+  });
+
+  it("marks WSL worktrees in the origin line", () => {
+    const context = browserAgentContext(
+      capture(),
+      "//wsl.localhost/Ubuntu/home/me/app",
+    );
+    expect(context.entries[0].origin).toContain("WSL Ubuntu");
+  });
+
+  it("sanitizes credentials out of the captured URL", () => {
+    const context = browserAgentContext(
+      capture({ url: "http://user:pw@localhost:3000/app" }),
+      "/repo/app",
+    );
+    expect(context.entries[0].origin).not.toContain("user:pw");
+    expect(context.entries[0].origin).toContain("http://localhost:3000/app");
+  });
+
+  it("attaches the screenshot as a vision image when present", () => {
+    const png = Buffer.from("fake-png").toString("base64");
+    const context = browserAgentContext(capture({ screenshot: png }), "/repo");
+    expect(context.attachments).toHaveLength(1);
+    expect(context.attachments[0].mimeType).toBe("image/png");
+    expect(context.attachments[0].kind).toBe("image");
+    expect(context.attachments[0].data).toBe(png);
+    expect(context.attachments[0].size).toBe(8);
+  });
+
+  it("works text-only when the platform has no screenshot", () => {
+    const context = browserAgentContext(
+      capture({ screenshot: undefined }),
+      "/repo",
+    );
+    expect(context.attachments).toHaveLength(0);
+    expect(context.entries[0].text).toContain("Dashboard content");
+    expect(context.entries[0].text).toContain("- a: /settings");
+    expect(context.entries[0].text).toContain("- [error] boom");
+  });
+
+  it("still produces an entry for a blank page", () => {
+    const context = browserAgentContext(
+      capture({ text: "", controls: [], console: [], title: "" }),
+      "/repo",
+    );
+    expect(context.entries).toHaveLength(1);
+    expect(context.entries[0].text).toContain("no visible text");
+    expect(context.entries[0].title).toBe("Browser: localhost:3000");
   });
 });

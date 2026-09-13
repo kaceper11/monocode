@@ -7,8 +7,10 @@ import {
   type FormEvent,
   type ReactNode,
 } from "react";
-import { ChevronLeft, ChevronRight, ExternalLink, Globe, RefreshCw, X } from "../chrome/icons";
+import { Camera, ChevronLeft, ChevronRight, ExternalLink, Globe, RefreshCw, X } from "../chrome/icons";
 import {
+  browserAgentContext,
+  browserCapture,
   browserClose,
   browserGoBack,
   browserGoForward,
@@ -23,6 +25,7 @@ import {
   rememberBrowserUrl,
   subscribeBrowser,
 } from "../lib/browser";
+import { requestAgentContext } from "../lib/agentContext";
 import type { BrowserMetaPatch, FilePaneTab } from "../lib/layout";
 import { wslLocation } from "../lib/paths";
 
@@ -72,6 +75,7 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
   const [popup, setPopup] = useState<string | null>(null);
   const [failure, setFailure] = useState("");
   const [overlayOpen, setOverlayOpen] = useState(false);
+  const [capturing, setCapturing] = useState(false);
 
   const clearWatchdog = useCallback(() => {
     if (watchdogRef.current != null) window.clearTimeout(watchdogRef.current);
@@ -340,6 +344,32 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
     navigate(draft);
   };
 
+  /** Explicit user action (#43): screenshot + bounded DOM/console summary →
+   * destination picker. Page content stays data — never an instruction. */
+  const captureForAgent = useCallback(() => {
+    if (capturing) return;
+    setCapturing(true);
+    void (async () => {
+      try {
+        const capture = await browserCapture(label);
+        const context = browserAgentContext(capture, cwdRef.current);
+        requestAgentContext({
+          context,
+          cwd: cwdRef.current,
+          attachmentsOptional: true,
+          requireDestinationSelection: true,
+        });
+        if (capture.detail) setNotice(capture.detail);
+      } catch (error) {
+        setNotice(
+          error instanceof Error ? error.message : String(error),
+        );
+      } finally {
+        setCapturing(false);
+      }
+    })();
+  }, [capturing, label]);
+
   const wsl = wslLocation(file.cwd);
   const showChrome = !!url;
 
@@ -399,6 +429,13 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
               WSL · {wsl.distribution}
             </span>
           ) : null}
+          <ToolbarButton
+            title="Send page to an agent"
+            disabled={!opened || capturing}
+            onClick={captureForAgent}
+          >
+            <Camera className="size-3.5" strokeWidth={1.75} />
+          </ToolbarButton>
           <ToolbarButton
             title="Open in system browser"
             disabled={!current}

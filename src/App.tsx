@@ -370,6 +370,7 @@ import {
   newSession,
   sessionDisplayTitle,
   sessionWorkCwd,
+  harnessSupportsAttachments,
   titleFromPrompt,
   type Attachment,
   type Block,
@@ -2052,7 +2053,13 @@ export default function App({
       return target.id;
     }
     const tickets = request.context.entries.every(entry => !!entry.ticket);
-    let next = tickets ? linkTicketContext(target, context) : prepareSessionContext(target, context, true);
+    const prepared =
+      request.attachmentsOptional &&
+      context.attachments.length &&
+      !harnessSupportsAttachments(target.harness)
+        ? { ...context, attachments: [] }
+        : context;
+    let next = tickets ? linkTicketContext(target, prepared) : prepareSessionContext(target, prepared, true);
     if (existing) {
       const updated = sessionsRef.current.map((session) =>
         session.id === next.id ? next : session,

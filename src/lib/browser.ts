@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { pathKey } from "./paths";
+import { pathKey, wslLocation } from "./paths";
+import { boundAgentContext, type AgentContext } from "./agentContext";
+import type { Attachment } from "./session";
 
 /**
  * Untrusted page preview. The native webview lives in the window next to
@@ -257,6 +259,107 @@ export async function browserProbe(label: string): Promise<BrowserProbe | null> 
   } catch {
     return null;
   }
+}
+
+// --- Capture for agent context (#43) ---
+
+export type BrowserConsoleLine = { level: string; text: string };
+
+export type BrowserCapture = {
+  url: string;
+  title?: string;
+  /** Bounded visible text of the page. */
+  text?: string;
+  /** Bounded list of visible interactive elements. */
+  controls: string[];
+  /** Bounded console ring buffer for the page. */
+  console: BrowserConsoleLine[];
+  /** Base64 PNG screenshot when the platform supports it. */
+  screenshot?: string;
+  detail?: string;
+};
+
+export function browserCapture(label: string): Promise<BrowserCapture> {
+  return invoke("browser_capture", { label });
+}
+
+function base64Bytes(base64: string): number {
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  return Math.floor((base64.length * 3) / 4) - padding;
+}
+
+/** Never hand an agent a URL with credentials embedded. */
+export function sanitizeCaptureUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.username = "";
+    parsed.password = "";
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Build a sendable AgentContext from a capture. Provenance — page URL,
+ * worktree, execution host — goes in `origin` so it survives the compose
+ * step; the page-derived content is data and is marked untrusted by
+ * composeAgentContext already.
+ */
+export function browserAgentContext(
+  capture: BrowserCapture,
+  cwd: string,
+): AgentContext {
+  const url = sanitizeCaptureUrl(capture.url);
+  const wsl = wslLocation(cwd);
+  const origin = [
+    url,
+    cwd,
+    wsl ? `WSL ${wsl.distribution}` : "native host",
+    `captured ${new Date().toISOString()}`,
+  ].join(" · ");
+  const sections: string[] = [];
+  if (capture.text?.trim()) {
+    sections.push(`### Visible text\n\n${capture.text.trim()}`);
+  }
+  if (capture.controls.length) {
+    sections.push(
+      `### Interactive elements\n\n${capture.controls.map((line) => `- ${line}`).join("\n")}`,
+    );
+  }
+  if (capture.console.length) {
+    sections.push(
+      `### Console\n\n${capture.console
+        .map((line) => `- [${line.level}] ${line.text}`)
+        .join("\n")}`,
+    );
+  }
+  if (!sections.length) {
+    sections.push("The page reported no visible text or console output.");
+  }
+  const attachments: Attachment[] = [];
+  if (capture.screenshot) {
+    attachments.push({
+      id: crypto.randomUUID(),
+      name: `browser-${Date.now()}.png`,
+      mimeType: "image/png",
+      kind: "image",
+      size: base64Bytes(capture.screenshot),
+      data: capture.screenshot,
+    });
+  }
+  return boundAgentContext({
+    id: crypto.randomUUID(),
+    entries: [
+      {
+        id: crypto.randomUUID(),
+        title: `Browser: ${capture.title?.trim() || browserTabLabel(url)}`,
+        origin,
+        text: sections.join("\n\n"),
+      },
+    ],
+    attachments,
+  });
 }
 
 // --- Event fan-in, one subscription for the whole window ---

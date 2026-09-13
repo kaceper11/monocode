@@ -26,6 +26,95 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Hosts where Tauri serves local content: navigating there would make the
 /// page "local" and hand it invoke authority.
 const LOCAL_HOSTS: [&str; 2] = ["tauri.localhost", "asset.localhost"];
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Rust-side bounds on untrusted page output — the page decides what the
+/// eval returns, so sizes are enforced here, not only in the script.
+const MAX_CAPTURE_TEXT: usize = 6_000;
+const MAX_CAPTURE_CONTROLS: usize = 40;
+const MAX_CAPTURE_CONTROL_LEN: usize = 120;
+const MAX_CAPTURE_CONSOLE: usize = 40;
+const MAX_CAPTURE_CONSOLE_LEN: usize = 400;
+
+/// Page-local console ring buffer. Injected before any page script runs;
+/// it writes into the page's own context only — nothing calls back into
+/// the app, so the security boundary is unchanged.
+const CONSOLE_TAP_SCRIPT: &str = r#"(() => {
+  const cap = 100;
+  const buf = [];
+  const clip = (v) => {
+    try {
+      return (typeof v === "string" ? v : JSON.stringify(v)).slice(0, 300);
+    } catch (e) {
+      return String(v).slice(0, 300);
+    }
+  };
+  const push = (level, args) => {
+    try {
+      buf.push({
+        level,
+        text: Array.from(args).map(clip).join(" ").slice(0, 400),
+      });
+      if (buf.length > cap) buf.splice(0, buf.length - cap);
+    } catch (e) {}
+  };
+  for (const level of ["log", "info", "warn", "error", "debug"]) {
+    const original = console[level];
+    if (typeof original !== "function") continue;
+    console[level] = function () {
+      push(level, arguments);
+      return original.apply(this, arguments);
+    };
+  }
+  window.addEventListener("error", (e) => push("error", [e.message || "error"]));
+  window.addEventListener("unhandledrejection", (e) =>
+    push("error", [
+      "unhandled rejection: " +
+        (e.reason && e.reason.message ? e.reason.message : e.reason),
+    ]),
+  );
+  window.__monocodeConsole = buf;
+})()"#;
+
+/// Bounded visible-DOM + console read. Completion value is a JSON string
+/// parsed and re-bounded by the Rust side — the page is untrusted.
+const SUMMARY_SCRIPT: &str = r#"(() => {
+  const controls = [];
+  try {
+    const els = document.querySelectorAll(
+      "a[href],button,input,select,textarea,[role='button'],summary",
+    );
+    for (const el of els) {
+      const r = el.getBoundingClientRect();
+      if (!r.width || !r.height || r.bottom < 0 || r.top > innerHeight) continue;
+      const tag = (el.tagName || "").toLowerCase();
+      let label =
+        (el.innerText || el.value || el.placeholder ||
+          el.getAttribute("aria-label") || el.getAttribute("title") || "")
+          .trim();
+      if (!label && tag === "a") label = el.getAttribute("href") || "";
+      if (!label) continue;
+      controls.push(`${tag}: ${label.slice(0, 120)}`);
+      if (controls.length >= 40) break;
+    }
+  } catch (e) {}
+  let text = "";
+  try {
+    text = (document.body && document.body.innerText) || "";
+  } catch (e) {}
+  let log = [];
+  try {
+    log = Array.isArray(window.__monocodeConsole)
+      ? window.__monocodeConsole.slice(-40)
+      : [];
+  } catch (e) {}
+  return JSON.stringify({
+    url: location.href,
+    title: document.title || "",
+    text: text.slice(0, 6000),
+    controls,
+    console: log,
+  });
+})()"#;
 
 #[derive(Default)]
 pub struct BrowserState {
@@ -264,6 +353,7 @@ pub fn browser_open(
         .incognito(true)
         .devtools(false)
         .focused(false)
+        .initialization_script(CONSOLE_TAP_SCRIPT)
         .on_navigation(move |url| {
             let (can_back, can_forward) = match allowed_url(url, origin.as_deref()) {
                 Ok(()) => {
@@ -476,4 +566,244 @@ pub async fn browser_probe(window: Window, label: String) -> Result<String, Stri
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserConsoleLine {
+    level: String,
+    text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserCapture {
+    url: String,
+    title: Option<String>,
+    text: Option<String>,
+    controls: Vec<String>,
+    console: Vec<BrowserConsoleLine>,
+    /// Base64 PNG of the visible page, when the platform supports it.
+    screenshot: Option<String>,
+    /// Why a piece is missing, when it is.
+    detail: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PageSummary {
+    url: Option<String>,
+    title: Option<String>,
+    text: Option<String>,
+    controls: Option<Vec<serde_json::Value>>,
+    console: Option<Vec<PageConsoleLine>>,
+}
+
+#[derive(Deserialize)]
+struct PageConsoleLine {
+    level: Option<String>,
+    text: Option<String>,
+}
+
+fn clip_chars(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
+/// Start the platform screenshot; completion arrives on `tx` as PNG bytes.
+/// Every platform variant either reports an error or guarantees a send.
+#[cfg(target_os = "macos")]
+fn start_screenshot<R: Runtime>(
+    view: &tauri::Webview<R>,
+    tx: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+) -> Result<(), String> {
+    use block2::RcBlock;
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage};
+    use objc2_foundation::{NSDictionary, NSError};
+    use objc2_web_kit::WKWebView;
+
+    view.with_webview(move |platform| {
+        let block = RcBlock::new(move |image: *mut NSImage, error: *mut NSError| {
+            let png = unsafe {
+                if image.is_null() || !error.is_null() {
+                    None
+                } else {
+                    (*image)
+                        .TIFFRepresentation()
+                        .and_then(|tiff| NSBitmapImageRep::imageRepWithData(&tiff))
+                        .and_then(|rep| {
+                            rep.representationUsingType_properties(
+                                NSBitmapImageFileType::PNG,
+                                &NSDictionary::new(),
+                            )
+                        })
+                        .map(|data| data.to_vec())
+                }
+            };
+            let _ = tx.send(png);
+        });
+        unsafe {
+            let webview: &WKWebView = &*platform.inner().cast();
+            webview.takeSnapshotWithConfiguration_completionHandler(None, &block);
+        }
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// WebView2's CapturePreview renders the viewport into a stream as PNG.
+#[cfg(windows)]
+fn start_screenshot<R: Runtime>(
+    view: &tauri::Webview<R>,
+    tx: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+) -> Result<(), String> {
+    use webview2_com::CapturePreviewCompletedHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG;
+    use windows::Win32::System::Com::{IStream, STREAM_SEEK_SET};
+    use windows::Win32::UI::Shell::SHCreateMemStream;
+
+    unsafe fn read_stream(stream: &IStream) -> Option<Vec<u8>> {
+        stream.Seek(0, STREAM_SEEK_SET, None).ok()?;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let mut read = 0u32;
+            if stream
+                .Read(buf.as_mut_ptr().cast(), buf.len() as u32, Some(&mut read))
+                .is_err()
+                || read == 0
+            {
+                break;
+            }
+            out.extend_from_slice(&buf[..read as usize]);
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    view.with_webview(move |platform| unsafe {
+        let stream = match SHCreateMemStream(None) {
+            Some(stream) => stream,
+            None => {
+                let _ = tx.send(None);
+                return;
+            }
+        };
+        let captured = stream.clone();
+        let fired = tx.clone();
+        let handler = CapturePreviewCompletedHandler::create(Box::new(move |result| {
+            let _ = fired.send(if result.is_ok() {
+                read_stream(&captured)
+            } else {
+                None
+            });
+            Ok(())
+        }));
+        let started = platform.controller().CoreWebView2().and_then(|webview| {
+            webview.CapturePreview(
+                COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
+                &stream,
+                &handler,
+            )
+        });
+        if started.is_err() {
+            // The capture never kicked off, so the handler won't run.
+            let _ = tx.send(None);
+        }
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// No snapshot API wired up for this platform — text capture still works.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn start_screenshot<R: Runtime>(
+    _view: &tauri::Webview<R>,
+    tx: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+) -> Result<(), String> {
+    let _ = tx.send(None);
+    Err("Screenshots aren't supported on this platform".into())
+}
+
+/// Snapshot the page for agent context: a screenshot plus a bounded
+/// visible-text/controls/console summary. The screenshot uses the platform
+/// capture API (`takeSnapshotWithConfiguration` / `CapturePreview`); the
+/// summary is an eval whose result is re-bounded here.
+#[tauri::command]
+pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCapture, String> {
+    let view = find_webview(&window, &label)?;
+
+    let (page_tx, page_rx) = std::sync::mpsc::channel();
+    view.eval_with_callback(SUMMARY_SCRIPT, move |result| {
+        let _ = page_tx.send(result);
+    })
+    .map_err(|error| error.to_string())?;
+
+    let (shot_tx, shot_rx) = std::sync::mpsc::channel();
+    let shot_detail = start_screenshot(&view, shot_tx).err();
+
+    let (summary, screenshot) = tauri::async_runtime::spawn_blocking(move || {
+        let summary = page_rx.recv_timeout(CAPTURE_TIMEOUT).ok();
+        let screenshot = shot_rx.recv_timeout(CAPTURE_TIMEOUT).ok().flatten();
+        (summary, screenshot)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let page: PageSummary = summary
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or(PageSummary {
+            url: None,
+            title: None,
+            text: None,
+            controls: None,
+            console: None,
+        });
+
+    let controls = page
+        .controls
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .take(MAX_CAPTURE_CONTROLS)
+        .map(|line| clip_chars(&line, MAX_CAPTURE_CONTROL_LEN))
+        .collect();
+    let console = page
+        .console
+        .unwrap_or_default()
+        .into_iter()
+        .map(|line| BrowserConsoleLine {
+            level: line
+                .level
+                .map(|level| clip_chars(&level, 16))
+                .unwrap_or_else(|| "log".to_string()),
+            text: clip_chars(&line.text.unwrap_or_default(), MAX_CAPTURE_CONSOLE_LEN),
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(MAX_CAPTURE_CONSOLE)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let screenshot_b64 = screenshot.map(|bytes| {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    });
+
+    Ok(BrowserCapture {
+        url: clip_chars(&page.url.unwrap_or_default(), MAX_URL_LEN),
+        title: page.title.map(|title| clip_chars(&title, MAX_TITLE_LEN)),
+        text: page.text.map(|text| clip_chars(&text, MAX_CAPTURE_TEXT)),
+        controls,
+        console,
+        screenshot: screenshot_b64,
+        detail: match (summary.is_none(), shot_detail) {
+            (true, Some(reason)) => Some(format!("Summary timed out; screenshot: {reason}")),
+            (true, None) => Some("Summary timed out".into()),
+            (false, reason) => reason,
+        },
+    })
 }

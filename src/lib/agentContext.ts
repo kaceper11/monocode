@@ -58,6 +58,9 @@ export type AgentContextRequest = {
    * summarized into its shared brief. */
   newTask?: boolean;
   requireDestinationSelection?: boolean;
+  /** When the chosen harness can't take attachments, deliver the text
+   * entries instead of failing — the entries carry the same context. */
+  attachmentsOptional?: boolean;
   onPrepared?: () => void;
   onRefreshEvidence?: (instruction: string) => void;
 };
