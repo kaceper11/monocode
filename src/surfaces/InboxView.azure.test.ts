@@ -185,21 +185,21 @@ it("keeps Azure identity, selected context and local project through Ask, Send a
     }));
     await act(async () => renderLinked());
     await click(container.querySelector('button[aria-label="PRs for Existing"]')!);
-    expect(onOpenDelivery).toHaveBeenLastCalledWith("existing", "pr", expect.any(Function), "azure", undefined);
+    expect(onOpenDelivery).toHaveBeenLastCalledWith("existing", "pr", expect.any(Function), "azure", undefined, undefined);
     await click(container.querySelector('button[aria-label="CI for Existing"]')!);
-    expect(onOpenDelivery).toHaveBeenLastCalledWith("existing", "ci", expect.any(Function), "azure", undefined);
+    expect(onOpenDelivery).toHaveBeenLastCalledWith("existing", "ci", expect.any(Function), "azure", undefined, undefined);
     await click(container.querySelector('button[aria-label="Delivery providers for Existing"]')!);
     await click(container.querySelector('button[aria-label^="PR provider for Existing:"]')!);
     await click([...document.querySelectorAll<HTMLElement>('[role="option"]')].find(el => el.textContent?.trim() === "GitHub")!);
     await click(container.querySelector('button[aria-label="PRs for Existing"]')!);
-    expect(onOpenDelivery).toHaveBeenLastCalledWith("existing", "pr", expect.any(Function), "github", undefined);
+    expect(onOpenDelivery).toHaveBeenLastCalledWith("existing", "pr", expect.any(Function), "github", undefined, undefined);
     await click(container.querySelector('button[aria-label="CI for Existing"]')!);
-    expect(onOpenDelivery).toHaveBeenLastCalledWith("existing", "ci", expect.any(Function), "azure", undefined);
+    expect(onOpenDelivery).toHaveBeenLastCalledWith("existing", "ci", expect.any(Function), "azure", undefined, undefined);
     expect(localStorage.getItem("monocode.inboxDeliveryProviders.v1")).toContain("github");
     await click(container.querySelector('button[aria-label^="PR provider for Existing:"]')!);
     await click([...document.querySelectorAll<HTMLElement>('[role="option"]')].find(el => el.textContent?.trim() === "Use ticket provider")!);
     await click(container.querySelector('button[aria-label="PRs for Existing"]')!);
-    expect(onOpenDelivery).toHaveBeenLastCalledWith("existing", "pr", expect.any(Function), "azure", undefined);
+    expect(onOpenDelivery).toHaveBeenLastCalledWith("existing", "pr", expect.any(Function), "azure", undefined, undefined);
     let finishReview: (() => void) | undefined;
     let isCurrent: (() => boolean) | undefined;
     onOpenDelivery.mockImplementationOnce((_id, _kind, current) => {

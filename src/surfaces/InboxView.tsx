@@ -180,11 +180,9 @@ import {
 import {
   GITLAB_CHANGE_EVENT,
   gitlabConnected,
-  gitlabMrDiff,
   gitlabWorkItemComment,
   gitlabWorkItemDetails,
   gitlabWorkItemThread,
-  peekGitlabMrDiff,
   peekGitlabWorkItemDetails,
   peekGitlabWorkItemThread,
   type GitlabWorkItemThread,
@@ -206,6 +204,7 @@ import {
   type InboxReplyTarget,
 } from "./InboxComments";
 import { InboxPrDiff } from "./InboxPrDiff";
+import { GitlabMrReview } from "../chrome/GitlabMrReview";
 import {
   InboxDiscussionPanel,
   type InboxSessionPortal,
@@ -381,7 +380,7 @@ type Props = {
   onStartTask?: (item: InboxItem, taskId: string | null) => void;
   sessions?: readonly SessionSummary[];
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure", prUrl?: string) => Promise<void>;
+  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
   /** Live session state for "my work" badges — mid-turn and input-blocked. */
   busySessionIds?: ReadonlySet<string>;
   needsInputSessionIds?: ReadonlySet<string>;
@@ -1416,7 +1415,7 @@ function InboxDetailBody({
   onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
   onStartTask?: (item: InboxItem, taskId: string | null) => void;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure", prUrl?: string) => Promise<void>;
+  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
   myWork?: InboxMyWork;
   onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
 }) {
@@ -1628,23 +1627,25 @@ export function InboxDetail({
   onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
   onStartTask?: (item: InboxItem, taskId: string | null) => void;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure", prUrl?: string) => Promise<void>;
+  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
   myWork?: InboxMyWork;
   onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
 }) {
   const detailLock = useLockOverscroll<HTMLDivElement>();
-  const [deliveryProviders, setDeliveryProviders] = useState<Record<string, "github" | "azure">>(() => {
-    try { const saved = JSON.parse(localStorage.getItem("monocode.inboxDeliveryProviders.v1") || "{}"); return saved && typeof saved === "object" && !Array.isArray(saved) ? Object.fromEntries(Object.entries(saved).filter(([, value]) => value === "github" || value === "azure").slice(-100)) as Record<string, "github" | "azure"> : {}; }
+  const [deliveryProviders, setDeliveryProviders] = useState<Record<string, "github" | "azure" | "gitlab">>(() => {
+    try { const saved = JSON.parse(localStorage.getItem("monocode.inboxDeliveryProviders.v1") || "{}"); return saved && typeof saved === "object" && !Array.isArray(saved) ? Object.fromEntries(Object.entries(saved).filter(([, value]) => value === "github" || value === "azure" || value === "gitlab").slice(-100)) as Record<string, "github" | "azure" | "gitlab"> : {}; }
     catch { return {}; }
   });
   const [choosingProviders, setChoosingProviders] = useState<string | null>(null);
   const providerKey = (sessionId: string, kind: "pr" | "ci") => JSON.stringify([contextTicketKey(item), sessionId, kind]);
   const deliveryProvider = (sessionId: string, kind: "pr" | "ci") => {
     const saved = deliveryProviders[providerKey(sessionId, kind)];
-    return saved === "github" || saved === "azure" ? saved : item.provider === "github" || item.provider === "azure" ? item.provider : undefined;
+    const provider = saved === "github" || saved === "azure" || saved === "gitlab" ? saved : item.provider === "github" || item.provider === "azure" || item.provider === "gitlab" ? item.provider : undefined;
+    // GitLab pipelines ride the MR surface — never a standalone CI delivery.
+    return provider === "gitlab" && kind === "ci" ? undefined : provider;
   };
   const saveProvider = (sessionId: string, kind: "pr" | "ci", provider: string) => {
-    if (provider !== "" && provider !== "github" && provider !== "azure") return;
+    if (provider !== "" && provider !== "github" && provider !== "azure" && provider !== "gitlab") return;
     const key = providerKey(sessionId, kind);
     const next = Object.fromEntries([...Object.entries(deliveryProviders).filter(([entry]) => entry !== key), ...(provider ? [[key, provider]] : [])].slice(-100));
     try { localStorage.setItem("monocode.inboxDeliveryProviders.v1", JSON.stringify(next)); setDeliveryProviders(next); }
@@ -1664,7 +1665,7 @@ export function InboxDetail({
     deliveryPending.current = true;
     setDeliveryBusy(true);
     setDeliveryError("");
-    try { await onOpenDelivery(sessionId, kind, () => deliveryMounted.current, provider, item.provider === "github" && item.kind === "pr" ? item.url : undefined); }
+    try { await onOpenDelivery(sessionId, kind, () => deliveryMounted.current, provider, item.provider === "github" && item.kind === "pr" ? item.url : undefined, item.provider === "gitlab" && item.kind === "pr" ? { repo: item.repo, number: item.number } : undefined); }
     catch (error) { if (deliveryMounted.current) setDeliveryError(error instanceof Error ? error.message : String(error)); }
     finally { deliveryPending.current = false; if (deliveryMounted.current) setDeliveryBusy(false); }
   };
@@ -1687,10 +1688,8 @@ export function InboxDetail({
       : githubKind
         ? peekGithubWorkItemDetails(item.projectPath, githubKind, item.number)
         : null;
-  const cachedDiff = isPr
-    ? gitlab
-      ? peekGitlabMrDiff(item.projectPath, item.number)
-      : peekGithubPrDiff(item.projectPath, item.number)
+  const cachedDiff = isPr && !gitlab
+    ? peekGithubPrDiff(item.projectPath, item.number)
     : null;
   const cachedThread = azure ? peekAzureThread(item) : jira ? peekJiraThread(item) : linear
     ? peekLinearIssueThread(item.id ?? "")
@@ -1923,11 +1922,10 @@ export function InboxDetail({
   ]);
 
   useEffect(() => {
-    if (!isPr || tab !== "code") return;
+    // GitLab MRs render the dedicated review surface, which loads its own diff.
+    if (gitlab || !isPr || tab !== "code") return;
     let cancelled = false;
-    const cachedDiff = gitlab
-      ? peekGitlabMrDiff(item.projectPath, item.number)
-      : peekGithubPrDiff(item.projectPath, item.number);
+    const cachedDiff = peekGithubPrDiff(item.projectPath, item.number);
     if (cachedDiff) {
       setPrDiff(cachedDiff);
       setDiffLoading(false);
@@ -1937,9 +1935,7 @@ export function InboxDetail({
       setDiffError(null);
       setPrDiff(null);
     }
-    const pending = gitlab
-      ? gitlabMrDiff(item.projectPath, item.number)
-      : githubPrDiff(item.projectPath, item.number);
+    const pending = githubPrDiff(item.projectPath, item.number);
     void pending
       .then((next) => {
         if (cancelled) return;
@@ -2134,11 +2130,11 @@ export function InboxDetail({
                 </button>                  {onOpenDelivery && session.cwd ? ([['pr', 'PRs'], ['ci', 'CI']] as const).map(([kind, label]) => (
                     <button key={kind} type="button" aria-label={`${label} for ${title}`} title={`${label} · ${session.cwd}`} disabled={deliveryBusy}
                       className="h-6 rounded-md px-1.5 text-[11px] text-content/50 hover:bg-content/5 hover:text-content focus-visible:outline-accent disabled:opacity-40"
-                      onClick={() => void openDelivery(session.id, kind)}>{deliveryProvider(session.id, kind) === "github" ? `GitHub ${label} ↗` : deliveryProvider(session.id, kind) === "azure" ? `Azure ${label}` : `Choose ${label}`}</button>
+                      onClick={() => void openDelivery(session.id, kind)}>{deliveryProvider(session.id, kind) === "github" ? `GitHub ${label} ↗` : deliveryProvider(session.id, kind) === "azure" ? `Azure ${label}` : deliveryProvider(session.id, kind) === "gitlab" ? `GitLab ${label}` : `Choose ${label}`}</button>
                   )) : null}
                   {onOpenDelivery && session.cwd ? <button type="button" aria-label={`Delivery providers for ${title}`} className="h-6 rounded-md px-1.5 text-[11px] text-content/40 hover:bg-content/5" onClick={() => setChoosingProviders(choosingProviders === session.id ? null : session.id)}>Providers</button> : null}
                   {choosingProviders === session.id ? <span className="flex flex-wrap items-center gap-2 rounded-md border border-content/10 p-2">
-                    {([['pr', 'PR provider'], ['ci', 'CI provider']] as const).map(([kind, label]) => <span key={kind} className="text-[11px] text-content/60">{label}<Select label={`${label} for ${title}`} value={deliveryProvider(session.id, kind) ?? ""} options={[{value:"", label:item.provider === "github" || item.provider === "azure" ? "Use ticket provider" : "Choose provider"}, {value:"github",label:kind === "pr" ? "GitHub" : "GitHub checks"}, {value:"azure",label:kind === "pr" ? "Azure Repos" : "Azure Pipelines"}]} onChange={value => saveProvider(session.id, kind, value)} /></span>)}
+                    {([['pr', 'PR provider'], ['ci', 'CI provider']] as const).map(([kind, label]) => <span key={kind} className="text-[11px] text-content/60">{label}<Select label={`${label} for ${title}`} value={deliveryProvider(session.id, kind) ?? ""} options={[{value:"", label:item.provider === "github" || item.provider === "azure" || item.provider === "gitlab" ? "Use ticket provider" : "Choose provider"}, {value:"github",label:kind === "pr" ? "GitHub" : "GitHub checks"}, {value:"azure",label:kind === "pr" ? "Azure Repos" : "Azure Pipelines"}, ...(kind === "pr" ? [{value:"gitlab",label:"GitLab"}] : [])]} onChange={value => saveProvider(session.id, kind, value)} /></span>)}
                     <button type="button" className="px-2 py-1 text-[11px]" onClick={() => setChoosingProviders(null)}>Done</button>
                   </span> : null}
                 </span>
@@ -2279,7 +2275,17 @@ export function InboxDetail({
           </div>
         ) : null}
       {isPr && tab === "code" ? (
-        diffLoading ? (
+        gitlab ? (
+          <GitlabMrReview
+            key={`${item.projectPath}:${item.repo}:${item.number}:${revision}`}
+            embedded
+            cwd={item.projectPath}
+            repo={item.repo}
+            number={item.number}
+            enabled
+            onClose={() => undefined}
+          />
+        ) : diffLoading ? (
           <div className="flex justify-center py-10 text-content/40">
             <LoaderCircle className="size-4 animate-spin" strokeWidth={1.75} />
           </div>
