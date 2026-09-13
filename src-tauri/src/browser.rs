@@ -35,13 +35,24 @@ const MAX_CAPTURE_CONTROLS: usize = 40;
 const MAX_CAPTURE_CONTROL_LEN: usize = 120;
 const MAX_CAPTURE_CONSOLE: usize = 40;
 const MAX_CAPTURE_CONSOLE_LEN: usize = 400;
+const MAX_CAPTURE_STEPS: usize = 60;
+const MAX_STEP_KIND: usize = 16;
+const MAX_STEP_TEXT: usize = 240;
+const MAX_HEADINGS: usize = 12;
+const MAX_HEADING_LEN: usize = 120;
+const MAX_FOCUSED_LEN: usize = 160;
+const MAX_SELECTION_LEN: usize = 400;
 /// A full-pane PNG base64'd over IPC and into agent context — cap it.
 const MAX_SCREENSHOT_BYTES: usize = 4 * 1024 * 1024;
 
-/// Page-local console ring buffer. Injected before any page script runs;
-/// it writes into the page's own context only — nothing calls back into
-/// the app, so the security boundary is unchanged.
-const CONSOLE_TAP_SCRIPT: &str = r#"(() => {
+/// Page-local console ring buffer plus an opt-in interaction trail.
+/// Injected before any page script runs; it writes into the page's own
+/// context only — nothing calls back into the app, so the security
+/// boundary is unchanged. The trail is gated by `__monocodeRec` (toggled
+/// via `browser_set_recording`) and both flag and trail persist in
+/// sessionStorage, so same-origin navigations keep recording while a
+/// different origin can neither read the steps nor keep the session.
+const PAGE_TAP_SCRIPT: &str = r#"(() => {
   const cap = 100;
   const buf = [];
   const clip = (v) => {
@@ -76,6 +87,198 @@ const CONSOLE_TAP_SCRIPT: &str = r#"(() => {
     ]),
   );
   window.__monocodeConsole = buf;
+
+  // --- Interaction trail ("repro steps"). Recorded only while the user
+  // pressed record (`__monocodeRec`) — a session's worth of what they did,
+  // so a send can describe it without a write-up. Sensitive fields record
+  // the fact of an edit, never the value; URL parameters that look like
+  // credentials are redacted before they are stored.
+  const TRAIL_KEY = "monocode.trail";
+  const REC_KEY = "monocode.rec";
+  const TRAIL_CAP = 80;
+  const SECRET_KEY =
+    /token|secret|password|passwd|pwd|apikey|api_key|key|auth|session|code|sig|credential/i;
+  const redactParams = (s) =>
+    (s || "").replace(/([?&#])([\w.%-]+)=([^&#]*)/g, (m, sep, k) =>
+      SECRET_KEY.test(k) ? sep + k + "=…" : m,
+    );
+  const cleanUrl = (raw) => {
+    try {
+      const u = new URL(raw);
+      u.username = "";
+      u.password = "";
+      return u.origin + u.pathname + redactParams(u.search) + redactParams(u.hash);
+    } catch (e) {
+      return String(raw).slice(0, 300);
+    }
+  };
+  const label = (el) => {
+    try {
+      if (!el || el.nodeType !== 1) return "";
+      const tag = (el.tagName || "").toLowerCase();
+      const type = ((el.getAttribute && el.getAttribute("type")) || "").toLowerCase();
+      let text =
+        el.getAttribute("aria-label") ||
+        (tag === "input" && (type === "button" || type === "submit")
+          ? el.value
+          : "") ||
+        el.getAttribute("placeholder") ||
+        el.getAttribute("name") ||
+        el.getAttribute("title") ||
+        (tag === "input" || tag === "textarea" ? "" : el.innerText || "") ||
+        el.id ||
+        "";
+      text = String(text).trim().replace(/\s+/g, " ").slice(0, 80);
+      const name =
+        tag === "input" && type && type !== "text" ? "input[" + type + "]" : tag;
+      return text ? name + ' "' + text + '"' : name;
+    } catch (e) {
+      return "element";
+    }
+  };
+  const sensitive = (el) => {
+    try {
+      if ((el.type || "").toLowerCase() === "password") return true;
+      const hint = [
+        el.name,
+        el.id,
+        el.autocomplete,
+        el.getAttribute("aria-label"),
+      ].join(" ");
+      return /pass|secret|token|cvv|card|cc-|ssn|cred/i.test(hint);
+    } catch (e) {
+      return true;
+    }
+  };
+  let trail = [];
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(TRAIL_KEY) || "[]");
+    if (Array.isArray(saved)) {
+      trail = saved.filter(
+        (e) =>
+          e &&
+          typeof e.text === "string" &&
+          typeof e.kind === "string" &&
+          typeof e.at === "number" &&
+          isFinite(e.at),
+      );
+    }
+  } catch (e) {}
+  const saveTrail = () => {
+    try {
+      sessionStorage.setItem(TRAIL_KEY, JSON.stringify(trail.slice(-TRAIL_CAP)));
+    } catch (e) {}
+  };
+  try {
+    window.__monocodeRec = sessionStorage.getItem(REC_KEY) === "1";
+  } catch (e) {
+    window.__monocodeRec = false;
+  }
+  const step = (kind, text) => {
+    try {
+      if (!window.__monocodeRec) return;
+      trail.push({ at: Date.now(), kind, text: String(text).slice(0, 240) });
+      if (trail.length > TRAIL_CAP) trail.splice(0, trail.length - TRAIL_CAP);
+      saveTrail();
+    } catch (e) {}
+  };
+  // The record toggle: a fresh session clears the previous trail and opens
+  // on the current page; stopping just drops the flag — the finished trail
+  // stays readable until the next session or the webview dies.
+  window.__monocodeSetRec = (on) => {
+    window.__monocodeRec = !!on;
+    try {
+      sessionStorage.setItem(REC_KEY, on ? "1" : "0");
+    } catch (e) {}
+    if (on) {
+      trail.length = 0;
+      step("open", "Opened " + cleanUrl(location.href));
+    }
+  };
+  window.__monocodeLabel = label;
+  window.__monocodeTrail = trail;
+  window.addEventListener(
+    "click",
+    (e) => {
+      try {
+        const t = e.target;
+        if (!t || t.nodeType !== 1 || t.closest("select,option")) return;
+        const el =
+          t.closest(
+            "a,button,input,textarea,summary,label,[role='button'],[role='link'],[role='tab'],[role='menuitem'],[role='switch'],[contenteditable]",
+          ) || t;
+        // Checkbox/radio clicks are reported by the change event instead.
+        if (el.tagName === "INPUT") {
+          const ty = (el.getAttribute("type") || "").toLowerCase();
+          if (ty === "checkbox" || ty === "radio") return;
+        }
+        step("click", "Clicked " + label(el));
+      } catch (err) {}
+    },
+    true,
+  );
+  window.addEventListener(
+    "change",
+    (e) => {
+      try {
+        const el = e.target;
+        if (!el || el.nodeType !== 1) return;
+        const tag = (el.tagName || "").toLowerCase();
+        const type = (el.type || "").toLowerCase();
+        if (tag === "select") {
+          const opt = el.options && el.options[el.selectedIndex];
+          const chosen = (((opt && opt.text) || el.value || "") + "").trim().slice(0, 60);
+          step("select", 'Selected "' + chosen + '" in ' + label(el));
+        } else if (type === "checkbox") {
+          step("check", (el.checked ? "Checked " : "Unchecked ") + label(el));
+        } else if (type === "radio") {
+          step("radio", "Selected " + label(el));
+        } else if (tag === "input" || tag === "textarea") {
+          if (sensitive(el)) {
+            step("input", "Edited " + label(el));
+          } else {
+            step(
+              "input",
+              'Typed "' + String(el.value).slice(0, 80) + '" in ' + label(el),
+            );
+          }
+        }
+      } catch (err) {}
+    },
+    true,
+  );
+  window.addEventListener(
+    "submit",
+    (e) => step("submit", "Submitted " + label(e.target)),
+    true,
+  );
+  window.addEventListener(
+    "keydown",
+    (e) => {
+      try {
+        if (e.key !== "Enter") return;
+        const el = e.target;
+        if (!el || !el.matches || !el.matches("input,textarea,[contenteditable]"))
+          return;
+        step("key", "Pressed Enter in " + label(el));
+      } catch (err) {}
+    },
+    true,
+  );
+  const navigated = () =>
+    step("navigate", "Navigated to " + cleanUrl(location.href));
+  window.addEventListener("popstate", navigated);
+  window.addEventListener("hashchange", navigated);
+  for (const fn of ["pushState", "replaceState"]) {
+    const original = history[fn];
+    history[fn] = function () {
+      const ret = original.apply(this, arguments);
+      navigated();
+      return ret;
+    };
+  }
+  // A mid-session page load belongs to the trail too.
+  step("open", "Opened " + cleanUrl(location.href));
 })()"#;
 
 /// Bounded visible-DOM + console read. wry serializes the completion
@@ -117,12 +320,78 @@ const SUMMARY_SCRIPT: &str = r#"(() => {
       text: String((entry && entry.text) || "").slice(0, 400),
     }));
   } catch (e) {}
+  let steps = [];
+  try {
+    const trail = Array.isArray(window.__monocodeTrail)
+      ? window.__monocodeTrail
+      : [];
+    steps = trail.slice(-60).map((entry) => ({
+      at:
+        entry && typeof entry.at === "number" && isFinite(entry.at)
+          ? entry.at
+          : 0,
+      kind: String((entry && entry.kind) || "").slice(0, 16),
+      text: String((entry && entry.text) || "").slice(0, 240),
+    }));
+  } catch (e) {}
+  let viewport = null;
+  try {
+    viewport = {
+      width: Math.round(window.innerWidth || 0),
+      height: Math.round(window.innerHeight || 0),
+      scrollY: Math.round(window.scrollY || 0),
+      pageHeight: Math.round(
+        (document.documentElement && document.documentElement.scrollHeight) ||
+          (document.body && document.body.scrollHeight) ||
+          0,
+      ),
+    };
+  } catch (e) {}
+  let focused = "";
+  try {
+    const active = document.activeElement;
+    if (
+      active &&
+      active !== document.body &&
+      active !== document.documentElement
+    ) {
+      const lbl = window.__monocodeLabel;
+      focused = String(
+        typeof lbl === "function"
+          ? lbl(active)
+          : (active.tagName || "").toLowerCase(),
+      ).slice(0, 160);
+    }
+  } catch (e) {}
+  let selection = "";
+  try {
+    selection = String(window.getSelection() || "").trim().slice(0, 400);
+  } catch (e) {}
+  const headings = [];
+  try {
+    const hs = document.querySelectorAll("h1,h2,h3");
+    for (const h of hs) {
+      const r = h.getBoundingClientRect();
+      if (!r.width || !r.height || r.bottom < 0 || r.top > innerHeight) continue;
+      const heading = (h.innerText || "").trim().replace(/\s+/g, " ");
+      if (!heading) continue;
+      headings.push(
+        `${(h.tagName || "").toLowerCase()} ${heading.slice(0, 100)}`,
+      );
+      if (headings.length >= 12) break;
+    }
+  } catch (e) {}
   return {
     url: String(location.href || "").slice(0, 8192),
     title: String(document.title || "").slice(0, 200),
     text: String(text).slice(0, 6000),
     controls,
     console: log,
+    steps,
+    viewport,
+    focused,
+    selection,
+    headings,
   };
 })()"#;
 
@@ -385,7 +654,7 @@ pub async fn browser_open(
         // process swap on every cross-site navigation, so matching the
         // theme turns a white strobe into an invisible handoff.
         .background_color(background.unwrap_or(Color(255, 255, 255, 255)))
-        .initialization_script(CONSOLE_TAP_SCRIPT)
+        .initialization_script(PAGE_TAP_SCRIPT)
         .on_navigation(move |url| {
             // Policy gate only. WKWebView reports subframe navigations here
             // too and wry does not pass targetFrame, so this callback can't
@@ -612,6 +881,20 @@ pub fn browser_set_visible(window: Window, label: String, visible: bool) -> Resu
     .map_err(|error| error.to_string())
 }
 
+/// Flip the page-side steps recorder on or off. The flag lives in the
+/// page's sessionStorage so a same-origin reload keeps recording; the eval
+/// reaches `__monocodeSetRec`, which simply doesn't exist on a page the
+/// init script never ran on — the toggle is a no-op there.
+#[tauri::command]
+pub fn browser_set_recording(window: Window, label: String, on: bool) -> Result<(), String> {
+    find_webview(&window, &label)?
+        .eval(format!(
+            "window.__monocodeSetRec && window.__monocodeSetRec({})",
+            if on { "true" } else { "false" }
+        ))
+        .map_err(|error| error.to_string())
+}
+
 /// Read the live location so the tab can tell "never loaded" apart from a
 /// page that is merely slow — WKWebView shows nothing for a refused
 /// connection. Async: the eval callback is delivered on the main thread,
@@ -647,12 +930,39 @@ pub struct BrowserConsoleLine {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BrowserStep {
+    /// `Date.now()` in the page — meaningful only as a relative offset.
+    at: f64,
+    kind: String,
+    text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserViewport {
+    width: f64,
+    height: f64,
+    scroll_y: f64,
+    page_height: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BrowserCapture {
     url: String,
     title: Option<String>,
     text: Option<String>,
     controls: Vec<String>,
     console: Vec<BrowserConsoleLine>,
+    /// The recorded session's interaction trail — empty unless the user
+    /// pressed record; the frontend decides whether to include it.
+    steps: Vec<BrowserStep>,
+    /// Viewport size and scroll position — what the screenshot shows.
+    viewport: Option<BrowserViewport>,
+    focused: Option<String>,
+    selection: Option<String>,
+    /// Visible h1–h3 outline, top to bottom.
+    headings: Vec<String>,
     /// Base64 PNG of the visible page, when the platform supports it.
     screenshot: Option<String>,
     /// Why a piece is missing, when it is.
@@ -660,18 +970,40 @@ pub struct BrowserCapture {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PageSummary {
     url: Option<String>,
     title: Option<String>,
     text: Option<String>,
     controls: Option<Vec<serde_json::Value>>,
     console: Option<Vec<PageConsoleLine>>,
+    steps: Option<Vec<PageStep>>,
+    viewport: Option<PageViewport>,
+    focused: Option<String>,
+    selection: Option<String>,
+    headings: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
 struct PageConsoleLine {
     level: Option<String>,
     text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PageStep {
+    at: Option<f64>,
+    kind: Option<String>,
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageViewport {
+    width: Option<f64>,
+    height: Option<f64>,
+    scroll_y: Option<f64>,
+    page_height: Option<f64>,
 }
 
 fn clip_chars(value: &str, max: usize) -> String {
@@ -835,6 +1167,11 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
         text: None,
         controls: None,
         console: None,
+        steps: None,
+        viewport: None,
+        focused: None,
+        selection: None,
+        headings: None,
     });
 
     let controls = page
@@ -863,6 +1200,48 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
+        .collect();
+    let steps = page
+        .steps
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| BrowserStep {
+            at: entry.at.unwrap_or(0.0),
+            kind: clip_chars(
+                &entry.kind.unwrap_or_else(|| "step".to_string()),
+                MAX_STEP_KIND,
+            ),
+            text: clip_chars(&entry.text.unwrap_or_default(), MAX_STEP_TEXT),
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(MAX_CAPTURE_STEPS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let viewport = page.viewport.map(|v| BrowserViewport {
+        width: v.width.unwrap_or(0.0),
+        height: v.height.unwrap_or(0.0),
+        scroll_y: v.scroll_y.unwrap_or(0.0),
+        page_height: v.page_height.unwrap_or(0.0),
+    });
+    let focused = page
+        .focused
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| clip_chars(&value, MAX_FOCUSED_LEN));
+    let selection = page
+        .selection
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| clip_chars(&value, MAX_SELECTION_LEN));
+    let headings = page
+        .headings
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .take(MAX_HEADINGS)
+        .map(|line| clip_chars(&line, MAX_HEADING_LEN))
         .collect();
 
     let (screenshot, shot_detail) = match (screenshot, shot_detail) {
@@ -900,6 +1279,11 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
         text: page.text.map(|text| clip_chars(&text, MAX_CAPTURE_TEXT)),
         controls,
         console,
+        steps,
+        viewport,
+        focused,
+        selection,
+        headings,
         screenshot: screenshot_b64,
         detail,
     })

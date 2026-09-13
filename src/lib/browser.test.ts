@@ -432,6 +432,8 @@ describe("browserAgentContext", () => {
     text: "Dashboard content",
     controls: ["a: /settings", "button: Deploy"],
     console: [{ level: "error", text: "boom" }],
+    steps: [],
+    headings: [],
     ...over,
   });
 
@@ -490,5 +492,64 @@ describe("browserAgentContext", () => {
     expect(context.entries).toHaveLength(1);
     expect(context.entries[0].text).toContain("no visible text");
     expect(context.entries[0].title).toBe("Browser: localhost:3000");
+  });
+
+  it("describes what is on screen", () => {
+    const context = browserAgentContext(
+      capture({
+        viewport: { width: 1200, height: 800, scrollY: 400, pageHeight: 1600 },
+        focused: 'input "Search"',
+        selection: "error boundary",
+        headings: ["h1 Dashboard", "h2 Deploys"],
+      }),
+      "/repo",
+    );
+    const text = context.entries[0].text;
+    expect(text).toContain("### On screen");
+    expect(text).toContain("Viewport 1200×800 — 50% down the page");
+    expect(text).toContain('Focused element: input "Search"');
+    expect(text).toContain('Selected text: "error boundary"');
+    expect(text).toContain("Visible headings: h1 Dashboard › h2 Deploys");
+  });
+
+  it("omits the on-screen section when nothing was captured", () => {
+    const context = browserAgentContext(
+      capture({ viewport: undefined, focused: "", selection: "  " }),
+      "/repo",
+    );
+    expect(context.entries[0].text).not.toContain("On screen");
+  });
+
+  it("renders recent steps only when asked", () => {
+    const steps = [
+      { at: 1000, kind: "open", text: "Opened http://localhost:3000/" },
+      { at: 2500, kind: "click", text: 'Clicked button "Deploy"' },
+      { at: 4000, kind: "input", text: 'Typed "fix" in input "Search"' },
+    ];
+    const withSteps = browserAgentContext(capture({ steps }), "/repo", true);
+    const text = withSteps.entries[0].text;
+    expect(text).toContain("### Recent steps");
+    expect(text).toContain("1. +0.0s Opened http://localhost:3000/");
+    expect(text).toContain('2. +1.5s Clicked button "Deploy"');
+    expect(text).toContain('3. +3.0s Typed "fix" in input "Search"');
+
+    const plain = browserAgentContext(capture({ steps }), "/repo");
+    expect(plain.entries[0].text).not.toContain("Recent steps");
+    expect(plain.entries[0].text).not.toContain("Clicked button");
+  });
+
+  it("strips embedded credentials inside step text", () => {
+    const steps = [
+      {
+        at: 0,
+        kind: "open",
+        text: "Opened http://user:hunter2@localhost:3000/app",
+      },
+    ];
+    const context = browserAgentContext(capture({ steps }), "/repo", true);
+    expect(context.entries[0].text).not.toContain("hunter2");
+    expect(context.entries[0].text).toContain(
+      "Opened http://localhost:3000/app",
+    );
   });
 });

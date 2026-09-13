@@ -10,7 +10,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, ExternalLink, Globe, Maximize2, Minimize2, Pencil, RefreshCw, Star, Trash2, X } from "../chrome/icons";
+import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, CircleDot, ExternalLink, Globe, ListBullet, Maximize2, Minimize2, Pencil, RefreshCw, Star, Trash2, X } from "../chrome/icons";
 
 import {
   browserAgentContext,
@@ -26,6 +26,7 @@ import {
   browserReload,
   browserSetBackground,
   browserSetBounds,
+  browserSetRecording,
   browserSetVisible,
   browserTabLabel,
   isBrowserFavorite,
@@ -64,6 +65,19 @@ const WATCHDOG_RETRY_MS = 6_000;
 const WATCHDOG_MAX_ATTEMPTS = 3;
 /** Re-checks the host rect — pane position can shift without a resize. */
 const BOUNDS_POLL_MS = 800;
+
+function urlOrigin(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
+}
+
+function elapsedLabel(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
 
 type Rgba = [number, number, number, number];
 
@@ -135,6 +149,10 @@ export function BrowserView({
   onMetaChangeRef.current = onMetaChange;
   const cwdRef = useRef(file.cwd);
   cwdRef.current = file.cwd;
+  /** Latest committed URL — the subscription callback can't see state. */
+  const currentRef = useRef(url);
+  /** Mirror of `recording` for the page-event subscription. */
+  const recordingRef = useRef(false);
 
   const [opened, setOpened] = useState(false);
   const [status, setStatus] = useState<LoadStatus>("idle");
@@ -148,6 +166,9 @@ export function BrowserView({
   const [failure, setFailure] = useState("");
   const [overlayOpen, setOverlayOpen] = useState(false);
   const [capturing, setCapturing] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [recordStart, setRecordStart] = useState<number | null>(null);
+  const [elapsed, setElapsed] = useState(0);
   const [bookmarksOpen, setBookmarksOpen] = useState(false);
   const favorites = useSyncExternalStore(
     subscribeBrowserFavorites,
@@ -213,6 +234,43 @@ export function BrowserView({
     [label],
   );
 
+  /** Stop the steps session; the page-side flag is the real gate, the
+   * eval just flips it — harmless on a page where it no longer exists.
+   * Awaits the toggle so a steps-send can stop before capturing. */
+  const stopRecording = useCallback(
+    (message?: string): Promise<void> => {
+      recordingRef.current = false;
+      setRecording(false);
+      setRecordStart(null);
+      if (message) setNotice(message);
+      return browserSetRecording(label, false).catch(() => undefined);
+    },
+    [label],
+  );
+
+  const toggleRecording = useCallback(() => {
+    const next = !recordingRef.current;
+    void browserSetRecording(label, next)
+      .then(() => {
+        recordingRef.current = next;
+        setRecording(next);
+        setRecordStart(next ? Date.now() : null);
+        setElapsed(0);
+      })
+      .catch((error) =>
+        setNotice(error instanceof Error ? error.message : String(error)),
+      );
+  }, [label]);
+
+  // The recording chip's elapsed timer — only ticks while a session runs.
+  useEffect(() => {
+    if (!recording || recordStart == null) return;
+    const tick = () => setElapsed(Date.now() - recordStart);
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [recording, recordStart]);
+
   // Page events → tab state. `navigate` fires for every committed
   // navigation (initial load, user clicks, redirects, history moves).
   useEffect(() => {
@@ -220,6 +278,11 @@ export function BrowserView({
       switch (event.kind) {
         case "navigate": {
           const next = event.url ?? "";
+          // The session flag can't cross origins — make the end visible
+          // instead of leaving a dead indicator running.
+          const movedOrigin =
+            urlOrigin(currentRef.current) !== urlOrigin(next);
+          currentRef.current = next;
           setCurrent(next);
           setDraft(next);
           setCanBack(event.canBack);
@@ -231,6 +294,11 @@ export function BrowserView({
           armWatchdog(next);
           onMetaChangeRef.current?.({ url: next });
           rememberBrowserUrl(cwdRef.current, next);
+          if (movedOrigin && recordingRef.current) {
+            void stopRecording(
+              "Recording stopped — the page moved to a different site",
+            );
+          }
           break;
         }
         case "load-started":
@@ -254,7 +322,7 @@ export function BrowserView({
           break;
       }
     });
-  }, [label, armWatchdog, clearWatchdog]);
+  }, [label, armWatchdog, clearWatchdog, stopRecording]);
 
   const wantShowRef = useRef(false);
   const bgRef = useRef<Rgba | undefined>(undefined);
@@ -509,30 +577,44 @@ export function BrowserView({
   };
 
   /** Explicit user action (#43): screenshot + bounded DOM/console summary →
-   * destination picker. Page content stays data — never an instruction. */
-  const captureForAgent = useCallback(() => {
-    if (capturing) return;
-    setCapturing(true);
-    void (async () => {
-      try {
-        const capture = await browserCapture(label);
-        const context = browserAgentContext(capture, cwdRef.current);
-        requestAgentContext({
-          context,
-          cwd: cwdRef.current,
-          attachmentsOptional: true,
-          requireDestinationSelection: true,
-        });
-        if (capture.detail) setNotice(capture.detail);
-      } catch (error) {
-        setNotice(
-          error instanceof Error ? error.message : String(error),
-        );
-      } finally {
-        setCapturing(false);
-      }
-    })();
-  }, [capturing, label]);
+   * destination picker. Page content stays data — never an instruction.
+   * `includeSteps` adds the recorded session's trail; an active recording
+   * is stopped first so the capture holds the finished session. */
+  const captureForAgent = useCallback(
+    (includeSteps = false) => {
+      if (capturing) return;
+      setCapturing(true);
+      void (async () => {
+        try {
+          if (includeSteps && recordingRef.current) await stopRecording();
+          const capture = await browserCapture(label);
+          if (includeSteps && !capture.steps.length) {
+            setNotice("No steps recorded — press the record button first");
+            return;
+          }
+          const context = browserAgentContext(
+            capture,
+            cwdRef.current,
+            includeSteps,
+          );
+          requestAgentContext({
+            context,
+            cwd: cwdRef.current,
+            attachmentsOptional: true,
+            requireDestinationSelection: true,
+          });
+          if (capture.detail) setNotice(capture.detail);
+        } catch (error) {
+          setNotice(
+            error instanceof Error ? error.message : String(error),
+          );
+        } finally {
+          setCapturing(false);
+        }
+      })();
+    },
+    [capturing, label, stopRecording],
+  );
 
   const wsl = wslLocation(file.cwd);
   const showChrome = !!url;
@@ -594,11 +676,37 @@ export function BrowserView({
             </span>
           ) : null}
           <ToolbarButton
-            title="Send page to an agent"
+            title="Send page and screenshot to an agent"
             disabled={!opened || capturing}
-            onClick={captureForAgent}
+            onClick={() => captureForAgent()}
           >
             <Camera className="size-3.5" strokeWidth={1.75} />
+          </ToolbarButton>
+          <ToolbarButton
+            title={recording ? "Stop recording steps" : "Record steps to reproduce"}
+            disabled={!opened}
+            pressed={recording}
+            onClick={toggleRecording}
+          >
+            <CircleDot
+              className={`size-3.5 ${recording ? "fill-red-400/30 text-red-400" : ""}`}
+              strokeWidth={1.75}
+            />
+          </ToolbarButton>
+          {recording && recordStart != null ? (
+            <span
+              className="shrink-0 rounded-md bg-red-500/15 px-1.5 py-0.5 font-mono text-[10px] leading-none tabular-nums text-red-400"
+              title="Recording browser steps"
+            >
+              {elapsedLabel(elapsed)}
+            </span>
+          ) : null}
+          <ToolbarButton
+            title="Send page and recorded steps to an agent"
+            disabled={!opened || capturing}
+            onClick={() => captureForAgent(true)}
+          >
+            <ListBullet className="size-3.5" strokeWidth={1.75} />
           </ToolbarButton>
           <ToolbarButton
             title="Open in system browser"

@@ -422,6 +422,18 @@ export async function browserProbe(label: string): Promise<BrowserProbe | null> 
 
 export type BrowserConsoleLine = { level: string; text: string };
 
+/** One recorded interaction; `at` is the page's Date.now() — meaningful
+ * only relative to the other steps. */
+export type BrowserStep = { at: number; kind: string; text: string };
+
+/** Viewport geometry at capture time — describes what a screenshot shows. */
+export type BrowserViewport = {
+  width: number;
+  height: number;
+  scrollY: number;
+  pageHeight: number;
+};
+
 export type BrowserCapture = {
   url: string;
   title?: string;
@@ -431,6 +443,15 @@ export type BrowserCapture = {
   controls: string[];
   /** Bounded console ring buffer for the page. */
   console: BrowserConsoleLine[];
+  /** Recorded interaction trail — empty unless the user pressed record. */
+  steps: BrowserStep[];
+  viewport?: BrowserViewport;
+  /** Focused element descriptor, when something has focus. */
+  focused?: string;
+  /** Current text selection, when non-empty. */
+  selection?: string;
+  /** Visible h1–h3 outline. */
+  headings: string[];
   /** Base64 PNG screenshot when the platform supports it. */
   screenshot?: string;
   detail?: string;
@@ -438,6 +459,14 @@ export type BrowserCapture = {
 
 export function browserCapture(label: string): Promise<BrowserCapture> {
   return invoke("browser_capture", { label });
+}
+
+/** Toggle the page-side steps recorder for a record/stop session. */
+export function browserSetRecording(
+  label: string,
+  on: boolean,
+): Promise<void> {
+  return invoke("browser_set_recording", { label, on });
 }
 
 function base64Bytes(base64: string): number {
@@ -457,15 +486,22 @@ export function sanitizeCaptureUrl(url: string): string {
   }
 }
 
+/** Step text is page-derived — strip `scheme://user:pass@` again even
+ * though the page-side recorder already redacts. */
+const stripUrlCredentials = (text: string): string =>
+  text.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/"']*:[^\s/"'@]*@/g, "$1");
+
 /**
  * Build a sendable AgentContext from a capture. Provenance — page URL,
  * worktree, execution host — goes in `origin` so it survives the compose
  * step; the page-derived content is data and is marked untrusted by
- * composeAgentContext already.
+ * composeAgentContext already. `includeSteps` opts the recorded
+ * interaction trail in — the plain page send never carries it.
  */
 export function browserAgentContext(
   capture: BrowserCapture,
   cwd: string,
+  includeSteps = false,
 ): AgentContext {
   const url = sanitizeCaptureUrl(capture.url);
   const wsl = wslLocation(cwd);
@@ -478,6 +514,40 @@ export function browserAgentContext(
     .filter(Boolean)
     .join(" · ");
   const sections: string[] = [];
+  const onScreen: string[] = [];
+  if (capture.viewport) {
+    const v = capture.viewport;
+    const scrollable = Math.max(0, v.pageHeight - v.height);
+    const pct = scrollable > 0 ? Math.round((v.scrollY / scrollable) * 100) : 0;
+    onScreen.push(
+      `Viewport ${Math.round(v.width)}×${Math.round(v.height)} — ${pct}% down the page`,
+    );
+  }
+  if (capture.focused?.trim()) {
+    onScreen.push(`Focused element: ${capture.focused.trim()}`);
+  }
+  if (capture.selection?.trim()) {
+    onScreen.push(`Selected text: "${capture.selection.trim()}"`);
+  }
+  if (capture.headings.length) {
+    onScreen.push(`Visible headings: ${capture.headings.join(" › ")}`);
+  }
+  if (onScreen.length) {
+    sections.push(
+      `### On screen\n\n${onScreen.map((line) => `- ${line}`).join("\n")}`,
+    );
+  }
+  if (includeSteps && capture.steps.length) {
+    const first = capture.steps[0].at;
+    sections.push(
+      `### Recent steps\n\n${capture.steps
+        .map(
+          (s, i) =>
+            `${i + 1}. +${Math.max(0, (s.at - first) / 1000).toFixed(1)}s ${stripUrlCredentials(s.text)}`,
+        )
+        .join("\n")}`,
+    );
+  }
   if (capture.text?.trim()) {
     sections.push(`### Visible text\n\n${capture.text.trim()}`);
   }
