@@ -34,6 +34,7 @@ export function ApprovalToasts({
   return createPortal(
     <div
       aria-live="polite"
+      data-app-overlay
       style={{ zIndex: LAYER.toast, top: topOffset }}
       className="pointer-events-none fixed right-3 flex w-[min(360px,calc(100vw-24px))] flex-col gap-2"
     >

@@ -74,6 +74,7 @@ export function ReminderNotices({
       <section
         ref={panelRef}
         aria-label="Due reminders"
+        data-app-overlay
         style={{ zIndex: LAYER.popover - 1 }}
         className="fixed top-3 right-3 w-[min(320px,calc(100vw-24px))] overflow-hidden rounded-xl border border-content/15 bg-background-base/95 text-content shadow-xl backdrop-blur-xl"
       >

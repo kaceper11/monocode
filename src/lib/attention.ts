@@ -33,6 +33,7 @@ export type AttentionKind =
   | "pr-conflicts" // PR has merge conflicts
   | "pr-done" // PR reached a terminal state (merged/closed)
   | "schedule" // scheduled-run outcome (ran/skipped/missed/failed)
+  | "check" // post-turn check outcome (passed/failed/couldn't run)
   | "worktree" // stale/missing working copies worth cleaning up
   | "watcher"; // watcher lifecycle row: source errors with a reconnect affordance
 
@@ -104,6 +105,7 @@ export type AttentionAction =
       sessionId?: string;
     }
   | { kind: "open-automations"; watcherId?: string }
+  | { kind: "check-fix"; runId: string }
   | { kind: "reconnect"; source: ConnectableInboxSource }
   /** Opens the worktree manager for the family containing `cwd`. */
   | { kind: "open-worktrees"; cwd: string }
@@ -134,9 +136,9 @@ export type AttentionItem = {
   /** External reference link — validated before opening, never fetched. */
   url?: string;
   action?: AttentionAction;
-  /** Which producer emitted this — "watcher"/"schedule" rows are persisted;
-   * derived rows are computed from live state and never stored. */
-  source?: { kind: "watcher" | "schedule"; id: string };
+  /** Which producer emitted this — "watcher"/"schedule"/"verify" rows are
+   * persisted; derived rows are computed from live state and never stored. */
+  source?: { kind: "watcher" | "schedule" | "verify"; id: string };
 };
 
 export type AttentionMuteMode = "snooze" | "dismiss";
@@ -180,6 +182,7 @@ const KINDS: AttentionKind[] = [
   "pr-conflicts",
   "pr-done",
   "schedule",
+  "check",
   "worktree",
   "watcher",
 ];
@@ -206,6 +209,7 @@ const ACTION_KINDS = new Set([
   "github-ci-fix",
   "update-branch",
   "open-automations",
+  "check-fix",
   "reconnect",
   "open-worktrees",
   "open-url",
@@ -257,7 +261,10 @@ function sanitizeItem(value: unknown): AttentionItem | null {
     ? clean(value.source.id, 128)
     : undefined;
   const source: AttentionItem["source"] =
-    (sourceKind === "watcher" || sourceKind === "schedule") && sourceId
+    (sourceKind === "watcher" ||
+      sourceKind === "schedule" ||
+      sourceKind === "verify") &&
+    sourceId
       ? { kind: sourceKind, id: sourceId }
       : undefined;
   return {

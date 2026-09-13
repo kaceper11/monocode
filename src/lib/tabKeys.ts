@@ -25,6 +25,7 @@
  *   Archive session     shift-cmd-a
  *   Previous project    shift-cmd-left
  *   Next project        shift-cmd-right
+ *   Open browser        shift-cmd-b
  *   Stop focused turn   escape
  */
 
@@ -48,6 +49,7 @@ export type TabCommand =
   | "archive-session"
   | "prev-project"
   | "next-project"
+  | "open-browser"
   | { activate: number }
   | { focus: FocusDir };
 
@@ -86,6 +88,7 @@ export function tabCommand(e: KeyboardEvent): TabCommand | null {
     if (e.key === "ArrowLeft") return "prev-project";
     if (e.key === "ArrowRight") return "next-project";
     if (key === "d") return "split-down";
+    if (key === "b") return "open-browser";
     return null;
   }
 

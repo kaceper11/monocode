@@ -155,5 +155,6 @@ pub fn confirm_quit(app: AppHandle) {
     if let Some(host) = app.try_state::<crate::pty::PtyHost>() {
         host.kill_all();
     }
+    crate::checks::reap_running();
     app.exit(0);
 }

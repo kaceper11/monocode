@@ -1,10 +1,12 @@
 import { openPath } from "@tauri-apps/plugin-opener";
-import { GitCompare, GripVertical, Terminal, X } from "./icons";
+import { GitCompare, Globe, GripVertical, Terminal, X } from "./icons";
 import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { useLayoutEffect, useRef, useState } from "react";
+import { browserTabLabel } from "../lib/browser";
 import { copyText } from "../lib/clipboard";
 import { basename, revealPath } from "../lib/fs";
 import {
+  isBrowserTab,
   isChangesTab,
   isCommitTab,
   isFilesystemTab,
@@ -125,6 +127,20 @@ export function surfaceTabPresentation(
       label: "Session Changes",
       iconName: "CHANGES",
       tooltip: "Changes captured for this session only",
+    };
+  }
+
+  if (isBrowserTab(file)) {
+    const name = file.browser.url
+      ? browserTabLabel(file.browser.url, file.browser.title)
+      : "Browser";
+    return {
+      name,
+      label: name,
+      iconName: "browser",
+      tooltip: file.browser.url
+        ? `${file.browser.url} — ${file.cwd}`
+        : `Browser — ${file.cwd}`,
     };
   }
 
@@ -267,6 +283,7 @@ export function SurfaceTabs({
         const commit = isCommitTab(file);
         const review = isReviewTab(file) && !changes;
         const terminal = isTerminalTab(file);
+        const browser = isBrowserTab(file);
         const { label, iconName, tooltip } = surfaceTabPresentation(file);
         const dragging = sortable.draggingId === file.id;
         const showStart =
@@ -344,6 +361,8 @@ export function SurfaceTabs({
             >
               {terminal ? (
                 <Terminal className="size-3.5 shrink-0" strokeWidth={1.75} />
+              ) : browser ? (
+                <Globe className="size-3.5 shrink-0" strokeWidth={1.75} />
               ) : changes || commit || file.delivery ? (
                 <GitCompare className="size-3.5 shrink-0" strokeWidth={1.75} />
               ) : (

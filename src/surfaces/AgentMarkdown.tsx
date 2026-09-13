@@ -28,6 +28,7 @@ import {
 import type { PluggableList } from "unified";
 import { ExplorerMenu, type ExplorerMenuItem } from "../chrome/ExplorerMenu";
 import { FileTypeIcon } from "../chrome/FileTypeIcon";
+import { isHttpUrl, isLocalhostUrl, requestLinkChoice } from "../lib/browser";
 import { createLazyMermaidPlugin } from "./mermaidPlugin";
 import {
   displayPath,
@@ -215,7 +216,16 @@ function MarkdownLink({
           return;
         }
         event.preventDefault();
-        if (href && /^https?:\/\//i.test(href)) {
+        if (href && isHttpUrl(href)) {
+          if (isLocalhostUrl(href)) {
+            requestLinkChoice({
+              url: href,
+              x: event.clientX,
+              y: event.clientY,
+              cwd,
+            });
+            return;
+          }
           void openUrl(href).catch((error) => {
             console.error("Failed to open web link:", error);
           });

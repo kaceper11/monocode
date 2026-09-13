@@ -47,6 +47,19 @@ export type ProjectCommandGroup = {
   commandIds: string[];
 };
 
+/** Checks-on-finish (#92): run one saved command when an agent turn ends in
+ * this project. `commandId` can outlive the command it names — a stale id is
+ * surfaced as a configuration error rather than silently cleared, so deleting
+ * a command never removes evidence of what verification used to run. */
+export type ProjectVerify = {
+  commandId: string;
+  /** "notify" ends at an attention row; "fix" also sends the bounded failure
+   * tail back to the owning session (capped consecutive sends per run). */
+  mode: "notify" | "fix";
+  /** Disabled config is kept so re-enabling restores the chosen command. */
+  enabled?: boolean;
+};
+
 /** Durable product boundary. Owns an explicit list of repositories, saved
  * sets and saved commands; never merges them into one Git repository. */
 export type ProjectRecord = {
@@ -61,6 +74,8 @@ export type ProjectRecord = {
   sets: SavedRepositorySet[];
   commands: ProjectCommand[];
   commandGroups: ProjectCommandGroup[];
+  /** Post-turn check configuration; absent when never configured. */
+  verify?: ProjectVerify;
   /** Last-active working copy inside the project — the open target. */
   lastPath?: string;
 };
@@ -204,6 +219,19 @@ function sanitizeCommandGroup(value: unknown): ProjectCommandGroup | null {
   };
 }
 
+function sanitizeVerify(value: unknown): ProjectVerify | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const commandId =
+    typeof record.commandId === "string" ? record.commandId.slice(0, 128) : "";
+  if (!commandId) return undefined;
+  return {
+    commandId,
+    mode: record.mode === "fix" ? "fix" : "notify",
+    ...(record.enabled === false ? { enabled: false } : {}),
+  };
+}
+
 function sanitizeProject(value: unknown): ProjectRecord | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
@@ -269,6 +297,9 @@ function sanitizeProject(value: unknown): ProjectRecord | null {
     sets,
     commands,
     commandGroups,
+    ...(sanitizeVerify(record.verify)
+      ? { verify: sanitizeVerify(record.verify) }
+      : {}),
     ...(typeof record.lastPath === "string" && record.lastPath
       ? { lastPath: normalizePath(record.lastPath) }
       : {}),
@@ -713,6 +744,37 @@ export function saveProjectCommand(
         : [...project.commands, entry];
     return { ...project, commands };
   });
+  return {};
+}
+
+/** Points checks-on-finish at a saved command — or clears it with `null`.
+ * The command must exist: a stale `commandId` can only arrive through a
+ * deleted command, never through this setter. */
+export function setProjectVerify(
+  projectId: string,
+  verify: Omit<ProjectVerify, "enabled"> & { enabled?: boolean } | null,
+): { error?: string } {
+  if (verify) {
+    const current = loadProjects().find((entry) => entry.id === projectId);
+    if (!current) return { error: "Project not found." };
+    // Updates to the existing (possibly deleted) command id stay allowed —
+    // pausing a stale config must work even though its command is gone.
+    if (
+      !current.commands.some((item) => item.id === verify.commandId) &&
+      current.verify?.commandId !== verify.commandId
+    )
+      return { error: "Choose a saved command for the check." };
+  }
+  updateProject(projectId, (project) => ({
+    ...project,
+    verify: verify
+      ? {
+          commandId: verify.commandId,
+          mode: verify.mode === "fix" ? "fix" : "notify",
+          ...(verify.enabled === false ? { enabled: false } : {}),
+        }
+      : undefined,
+  }));
   return {};
 }
 

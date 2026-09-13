@@ -6,8 +6,10 @@ mod azure;
 mod azure_inbox;
 mod azure_pipelines;
 mod azure_repos;
+mod browser;
 mod chat_background;
 mod checkpoint;
+mod checks;
 mod confluence;
 mod cursor_store;
 pub mod dictation;
@@ -182,9 +184,11 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(harness::HarnessHost::new())
         .manage(power::PowerHost::new())
+        .manage(browser::BrowserState::default())
         .manage(pty::PtyHost::new())
         .manage(window_transfer::WindowTransferState::new())
         .manage(dictation::DictationHost::new())
@@ -232,6 +236,18 @@ pub fn run() {
             reminders::reminder_take_open,
             reminders::reminder_register_window,
             reminders::reminder_open,
+            browser::browser_open,
+            browser::browser_close,
+            browser::browser_navigate,
+            browser::browser_reload,
+            browser::browser_go_back,
+            browser::browser_go_forward,
+            browser::browser_set_bounds,
+            browser::browser_set_visible,
+            browser::browser_set_background,
+            browser::browser_probe,
+            browser::browser_set_recording,
+            browser::browser_capture,
             fs::list_dir,
             fs::list_project_files,
             fs::git_diff_stats,
@@ -271,6 +287,7 @@ pub fn run() {
             fs::git_github_pr_diff,
             fs::git_update_from_default,
             fs::git_sync_branch,
+            checks::run_check,
             fs::git_merge_context,
             fs::git_merge_abort,
             inbox_media::fetch_inbox_media,
@@ -513,6 +530,7 @@ fn reap_harness_children(handle: &tauri::AppHandle) {
     if let Some(host) = handle.try_state::<dictation::DictationHost>() {
         host.shutdown();
     }
+    checks::reap_running();
 }
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
