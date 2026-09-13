@@ -2,6 +2,7 @@ mod bounded_process;
 mod wsl;
 use tauri::Manager;
 
+mod agent_config;
 mod azure;
 mod azure_inbox;
 mod azure_pipelines;
@@ -374,6 +375,8 @@ pub fn run() {
             fs::read_text_file,
             fs::write_text_file,
             skills::list_skills,
+            agent_config::agent_config_inventory,
+            agent_config::agent_config_set_enabled,
             search::search_project,
             cursor_store::cursor_tool_calls,
             cursor_store::cursor_subagent_runs,

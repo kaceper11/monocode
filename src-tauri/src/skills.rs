@@ -149,6 +149,7 @@ pub(crate) fn list_skills_from(
         (".cursor/skills", "cursor"),
         (".codex/skills", "codex"),
         (".opencode/skills", "opencode"),
+        (".config/opencode/skills", "opencode"),
         (".pi/skills", "pi"),
         (".omp/skills", "omp"),
         (".fx/skills", "fx"),

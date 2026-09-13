@@ -5574,7 +5574,7 @@ pub async fn write_text_file(path: String, content: String) -> Result<(), String
         .map_err(|e| e.to_string())?
 }
 
-fn write_text_file_sync(path: &str, content: &str) -> Result<(), String> {
+pub(crate) fn write_text_file_sync(path: &str, content: &str) -> Result<(), String> {
     if content.len() as u64 > MAX_TEXT_FILE_BYTES {
         return Err(format!(
             "File is too large to save (maximum {} MB).",

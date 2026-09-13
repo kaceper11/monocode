@@ -52,9 +52,9 @@ export const SETTINGS_SECTIONS: {
   },
   {
     id: "skills",
-    label: "Skills",
+    label: "Extensions",
     description:
-      "Discover and manage file skills from project, personal, and harness folders.",
+      "Skills, MCP servers, plugins, instruction files, and hooks discovered across agent providers.",
   },
   {
     id: "archive",
