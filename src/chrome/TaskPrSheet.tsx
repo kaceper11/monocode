@@ -612,12 +612,16 @@ export function TaskPrSheet({
             body,
             isDraft,
           );
-          // Link the PR to every session that shares this working copy.
+          // Link the PR to every session that shares this working copy. A
+          // task that never launched has none — save the link session-less
+          // so it is still tracked and watched like the GitHub path's.
           const sessionIds = [
             ...(task?.sessionIds ?? []),
             ...row.child.sessionIds,
           ].slice(0, 20);
-          for (const sessionId of sessionIds) {
+          for (const sessionId of sessionIds.length
+            ? sessionIds
+            : [undefined]) {
             saveAzurePrAssociation(
               {
                 target: created.target,
@@ -628,7 +632,7 @@ export function TaskPrSheet({
                 repositoryName: created.repositoryName,
                 cwd,
                 branch,
-                sourceSessionId: sessionId,
+                ...(sessionId ? { sourceSessionId: sessionId } : {}),
               },
               cwd,
               branch,

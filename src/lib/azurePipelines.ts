@@ -299,17 +299,18 @@ export function saveCiSources(
   const others = rows.filter(
     (row) => row && ciScope(row.cwd, row.branch, row.session) !== scope,
   );
-  const stored = [...sources.slice(0, 20), ...others].slice(0, 100);
+  const merged = [...sources.slice(0, 20), ...others];
+  const stored = merged.slice(0, 100);
   localStorage.setItem(KEY, JSON.stringify(stored));
   if (typeof window !== "undefined") window.dispatchEvent(new Event(AZURE_CI_SOURCES_CHANGED));
   const before = new Set(previous.map((row) => ciKey(row.target)));
-  const covered = (target: CiTarget) =>
+  const covered = (target: CiTarget, atCwd: string, atBranch: string) =>
     stored.some(
       (row) =>
         row?.target &&
         ciKey(row.target) === ciKey(target) &&
-        pathKey(row.cwd) === pathKey(cwd) &&
-        row.branch === branch,
+        pathKey(row.cwd) === pathKey(atCwd) &&
+        row.branch === atBranch,
     );
   for (const source of sources.slice(0, 20)) {
     if (before.has(ciKey(source.target))) continue;
@@ -328,5 +329,15 @@ export function saveCiSources(
   // A source leaves the scope → lift its watcher unless another scope's row
   // still covers the same pipeline at this checkout+branch.
   for (const row of previous)
-    if (!covered(row.target)) unwatchCiDelivery(row.target, cwd, branch);
+    if (!covered(row.target, cwd, branch))
+      unwatchCiDelivery(row.target, cwd, branch);
+  // Rows the cap pushed out can orphan a watcher — same coverage rule.
+  for (const row of merged.slice(100))
+    if (
+      row?.target &&
+      typeof row.cwd === "string" &&
+      typeof row.branch === "string" &&
+      !covered(row.target, row.cwd, row.branch)
+    )
+      unwatchCiDelivery(row.target, row.cwd, row.branch);
 }

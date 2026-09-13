@@ -13,7 +13,11 @@ import {
   saveAzurePrAssociation,
   type AzurePrAssociation,
 } from "./azureRepos";
-import { loadWatchers, removeWatcher } from "./watchers";
+import {
+  ensureDeliveryWatcher,
+  loadWatchers,
+  removeWatcher,
+} from "./watchers";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 beforeEach(() => {
@@ -449,4 +453,49 @@ it("never auto-watches a link that is already terminal", () => {
     "session-a",
   );
   expect(loadWatchers()).toHaveLength(0);
+});
+
+it("lifts the watcher of an association the cap evicts", () => {
+  // 100 stored rows; the next save pushes the last one out.
+  const seeded = Array.from({ length: 100 }, (_, i) => ({
+    ...association,
+    target: { ...association.target, number: 100 + i },
+    cwd: `/seeded/${i}`,
+    sourceSessionId: `s${i}`,
+  }));
+  localStorage.setItem(
+    "monocode.azurePrAssociations.v1",
+    JSON.stringify(seeded),
+  );
+  const evicted = seeded[99];
+  ensureDeliveryWatcher({
+    kind: "azure-pr",
+    target: evicted.target,
+    projectName: "P",
+    repositoryName: "R",
+    cwd: evicted.cwd,
+    branch: evicted.branch,
+  });
+  const kept = seeded[0];
+  ensureDeliveryWatcher({
+    kind: "azure-pr",
+    target: kept.target,
+    projectName: "P",
+    repositoryName: "R",
+    cwd: kept.cwd,
+    branch: kept.branch,
+  });
+  expect(loadWatchers()).toHaveLength(2);
+  saveAzurePrAssociation(
+    { ...association, sourceSessionId: "new" },
+    association.cwd,
+    "feature",
+    "new",
+  );
+  const sources = loadWatchers().map((watcher) => watcher.source);
+  expect(sources).toHaveLength(2);
+  expect(sources).not.toContainEqual(
+    expect.objectContaining({ cwd: evicted.cwd }),
+  );
+  expect(sources).toContainEqual(expect.objectContaining({ cwd: kept.cwd }));
 });

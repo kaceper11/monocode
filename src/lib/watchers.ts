@@ -497,8 +497,13 @@ export type WatchSheetRequest = {
 };
 
 export function openWatchSheet(request: WatchSheetRequest) {
+  // A delivery already watched — by hand or by a produced link — opens for
+  // edit instead of stacking a second poller that would double-report.
+  const existing = request.existing ?? deliveryWatcherFor(request.source);
   window.dispatchEvent(
-    new CustomEvent<WatchSheetRequest>(OPEN_WATCH_SHEET, { detail: request }),
+    new CustomEvent<WatchSheetRequest>(OPEN_WATCH_SHEET, {
+      detail: existing ? { ...request, existing } : request,
+    }),
   );
 }
 
@@ -562,6 +567,8 @@ function deliveryWatchKey(source: WatcherSource): string | null {
 /** Create the delivery watcher when none covers it — an existing watcher,
  * even paused or hand-made, already serves this PR/pipeline. */
 export function ensureDeliveryWatcher(source: DeliveryWatcherSource): void {
+  // Detached checkouts link rows without a branch — nothing pollable.
+  if (!isSource(source)) return;
   const key = deliveryWatchKey(source);
   if (!key) return;
   if (
@@ -579,6 +586,18 @@ export function ensureDeliveryWatcher(source: DeliveryWatcherSource): void {
     intervalSec: WATCHER_INTERVAL_DEFAULT,
     cooldownSec: WATCHER_COOLDOWN_DEFAULT,
   });
+}
+
+/** The watcher already covering this delivery — auto or manual, any
+ * session. Non-delivery sources return nothing. */
+export function deliveryWatcherFor(
+  source: WatcherSource,
+): Watcher | undefined {
+  const key = deliveryWatchKey(source);
+  if (!key) return undefined;
+  return loadWatchers().find(
+    (watcher) => deliveryWatchKey(watcher.source) === key,
+  );
 }
 
 /** Parse a just-created GitHub PR URL into its watcher — shared by the task
@@ -655,21 +674,51 @@ export function unwatchCiDelivery(
   unwatchDelivery("azure-ci", ciTuple(target), cwd, branch);
 }
 
+/** What a torn-down scope's delivery watcher becomes: `false` lifts it;
+ * `{ sessionId }` keeps it because a link outside the scope still covers
+ * the delivery, rebinding the session owner this scope took with it. */
+export type DeliverySurvival = false | { sessionId?: string };
+
 /** Drop auto watchers bound to a gone scope — an archived or removed task's
  * sessions and working copies, or a deleted session. A checkout shared with
- * another live task still loses the watcher; restoring it needs a fresh
- * unlink/re-link or un-archiving the other task. */
-export function unwatchDeliveryScope(scope: {
-  sessionIds?: readonly string[];
-  cwds?: readonly string[];
-}) {
+ * another live task still loses the watcher (coverage can't span checkouts);
+ * a delivery still linked under a session outside the scope keeps its
+ * watcher — watermark included — rebound to that link's session. */
+export function unwatchDeliveryScope(
+  scope: {
+    sessionIds?: readonly string[];
+    cwds?: readonly string[];
+  },
+  stillLinked?: (source: DeliveryWatcherSource) => DeliverySurvival,
+) {
   const sessionIds = new Set(scope.sessionIds ?? []);
   const cwds = new Set((scope.cwds ?? []).map(pathKey));
   if (!sessionIds.size && !cwds.size) return;
-  removeAutoDeliveryWatchers(
-    (source) =>
-      (source.sessionId !== undefined &&
-        sessionIds.has(source.sessionId)) ||
-      cwds.has(pathKey(source.cwd)),
-  );
+  for (const watcher of loadWatchers()) {
+    if (!watcher.auto || !isDeliverySource(watcher.source)) continue;
+    const source = watcher.source;
+    if (
+      !(
+        (source.sessionId !== undefined &&
+          sessionIds.has(source.sessionId)) ||
+        cwds.has(pathKey(source.cwd))
+      )
+    )
+      continue;
+    const survival = stillLinked?.(source) ?? false;
+    if (survival === false) {
+      removeWatcher(watcher.id);
+      continue;
+    }
+    if (source.sessionId === survival.sessionId) continue;
+    // updateWatcher — not saveWatcher — keeps the watermark: rebinding an
+    // owner is not a re-point, so seen/cursor must not reset.
+    const { sessionId: _dropped, ...unbound } = source;
+    updateWatcher(watcher.id, (row) => ({
+      ...row,
+      source: survival.sessionId
+        ? { ...unbound, sessionId: survival.sessionId }
+        : unbound,
+    }));
+  }
 }

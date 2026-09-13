@@ -42,6 +42,7 @@ import {
   ensureDeliveryWatcher,
   loadWatchers,
   saveWatcher,
+  updateWatcher,
   watchGithubPrUrl,
 } from "./watchers";
 import {
@@ -1226,6 +1227,110 @@ describe("delivery watcher teardown", () => {
     expect(loadWatchers().map((watcher) => watcher.source)).toEqual([
       expect.objectContaining({ sessionId: "s2" }),
     ]);
+  });
+
+  it("keeps a pruned session's watcher when another scope still links the delivery", () => {
+    const assoc = association("/tmp/app-copy", "s2");
+    // The watcher is bound to s1; the stored link lives under s2.
+    saveWatcher({
+      name: "Auto",
+      source: {
+        kind: "azure-pr",
+        target: assoc.target,
+        projectName: "P",
+        repositoryName: "R",
+        cwd: "/tmp/app-copy",
+        branch: "feat",
+        sessionId: "s1",
+      },
+      enabled: true,
+      mode: "notify",
+      auto: true,
+      intervalSec: 300,
+      cooldownSec: 900,
+    });
+    const watcher = loadWatchers()[0];
+    updateWatcher(watcher.id, (row) => ({ ...row, seen: ["k1"] }));
+    saveAzurePrAssociation(assoc, "/tmp/app-copy", "feat", "s2");
+    // ensureDeliveryWatcher dedupes — the s1-bound watcher already covers it.
+    expect(loadWatchers()).toHaveLength(1);
+    pruneTaskSession("s1");
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].id).toBe(watcher.id);
+    expect(watchers[0].source).toEqual(
+      expect.objectContaining({ sessionId: "s2" }),
+    );
+    expect(watchers[0].seen).toEqual(["k1"]);
+  });
+
+  it("lifts a pruned session's watcher when only its own row linked the delivery", () => {
+    const assoc = association("/tmp/app-copy", "s1");
+    saveAzurePrAssociation(assoc, "/tmp/app-copy", "feat", "s1");
+    expect(loadWatchers()).toHaveLength(1);
+    pruneTaskSession("s1");
+    expect(loadWatchers()).toHaveLength(0);
+  });
+
+  it("keeps a github-pr watcher covered by a task's saved PR result", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    const childId = task.children[0].id;
+    updateTaskChild(task.id, childId, { sessionIds: ["s2"] });
+    saveTaskPrDraft(task.id, childId, {
+      target: "main",
+      title: "T",
+      body: "",
+      result: {
+        provider: "github",
+        url: "https://github.com/acme/app/pull/9",
+        title: "T",
+        number: 9,
+      },
+    });
+    // The watcher is bound to an ad-hoc session at the same checkout.
+    watchGithubPrUrl("/tmp/app-copy", "https://github.com/acme/app/pull/9", "s1");
+    pruneTaskSession("s1");
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).toEqual(
+      expect.objectContaining({ sessionId: "s2" }),
+    );
+    // Removing the task then lifts it — its coverage is task-scoped.
+    removeTask(task.id);
+    expect(loadWatchers()).toHaveLength(0);
+  });
+
+  it("restores watchers session-less when the linked session isn't the task's", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    saveAzurePrAssociation(
+      association("/tmp/app-copy", "foreign"),
+      "/tmp/app-copy",
+      "feat",
+      "foreign",
+    );
+    archiveTask(task.id);
+    expect(loadWatchers()).toHaveLength(0);
+    archiveTask(task.id, false);
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source.kind).toBe("azure-pr");
+    expect(watchers[0].source).not.toHaveProperty("sessionId");
   });
 
   it("lifts watchers for children dropped by reviseTask", () => {

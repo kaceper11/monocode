@@ -188,4 +188,13 @@ describe("github-pr adapter", () => {
     expect(sig(first)).toBe("abc123:build=failure,lint=failure");
     expect(sig(second)).toBe(sig(first));
   });
+
+  it("fails rather than trust a PR resolved through a repointed remote", async () => {
+    prState.mockResolvedValue(
+      state({ url: "https://github.com/other/repo/pull/42" }),
+    );
+    await expect(pollWatcherSource(WATCHER)).rejects.toThrow(
+      /no longer points at acme\/app/,
+    );
+  });
 });

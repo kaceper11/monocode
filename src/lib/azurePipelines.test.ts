@@ -13,7 +13,11 @@ import {
   type CiRun,
   type CiSource,
 } from "./azurePipelines";
-import { loadWatchers, removeWatcher } from "./watchers";
+import {
+  ensureDeliveryWatcher,
+  loadWatchers,
+  removeWatcher,
+} from "./watchers";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 beforeEach(() => {
   const rows = new Map<string, string>();
@@ -195,4 +199,41 @@ it("keeps the watcher while another session scope still links the pipeline", () 
   expect(loadWatchers()).toHaveLength(1);
   saveCiSources([], source.cwd, source.branch, "peer");
   expect(loadWatchers()).toHaveLength(0);
+});
+
+it("lifts the watcher of a row the cap evicts", () => {
+  // 100 stored rows; the next save pushes the last one out.
+  const seeded = Array.from({ length: 100 }, (_, i) => ({
+    ...source,
+    target: { ...target, definition: 100 + i },
+    cwd: `/seeded/${i}`,
+    session: `s${i}`,
+  }));
+  localStorage.setItem("monocode.azureCiSources.v1", JSON.stringify(seeded));
+  const evicted = seeded[99];
+  ensureDeliveryWatcher({
+    kind: "azure-ci",
+    target: evicted.target,
+    definitionName: evicted.definitionName,
+    remote: evicted.remote,
+    cwd: evicted.cwd,
+    branch: evicted.branch,
+  });
+  const kept = seeded[0];
+  ensureDeliveryWatcher({
+    kind: "azure-ci",
+    target: kept.target,
+    definitionName: kept.definitionName,
+    remote: kept.remote,
+    cwd: kept.cwd,
+    branch: kept.branch,
+  });
+  expect(loadWatchers()).toHaveLength(2);
+  saveCiSources([source], source.cwd, source.branch, source.session);
+  const sources = loadWatchers().map((watcher) => watcher.source);
+  expect(sources).toHaveLength(2);
+  expect(sources).not.toContainEqual(
+    expect.objectContaining({ cwd: evicted.cwd }),
+  );
+  expect(sources).toContainEqual(expect.objectContaining({ cwd: kept.cwd }));
 });

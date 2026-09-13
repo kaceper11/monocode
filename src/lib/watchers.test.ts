@@ -2,8 +2,10 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { emitAttention, emittedAttention } from "./attention";
 import {
+  deliveryWatcherFor,
   ensureDeliveryWatcher,
   loadWatchers,
+  openWatchSheet,
   removeWatcher,
   saveWatcher,
   setWatcherEnabled,
@@ -13,8 +15,10 @@ import {
   watchGithubPrUrl,
   watcherPollKey,
   MAX_WATCHER_SEEN,
+  OPEN_WATCH_SHEET,
   type Watcher,
   type WatcherSource,
+  type WatchSheetRequest,
 } from "./watchers";
 
 const JIRA_SOURCE: WatcherSource = {
@@ -316,5 +320,75 @@ describe("produced-delivery auto watchers", () => {
     // branch or checkout is untouched.
     unwatchAzurePrDelivery(AZURE_TARGET, "/repo", "main");
     expect(loadWatchers()).toHaveLength(0);
+  });
+
+  it("ignores azure sources without a branch — detached checkouts link but don't watch", () => {
+    ensureDeliveryWatcher({ ...AZURE_PR, branch: "" });
+    ensureDeliveryWatcher({ ...CI, branch: "" });
+    expect(loadWatchers()).toHaveLength(0);
+  });
+
+  it("scope teardown keeps a watcher still linked elsewhere and rebinds its owner", () => {
+    ensureDeliveryWatcher(AZURE_PR); // bound s1
+    const watcher = loadWatchers()[0];
+    updateWatcher(watcher.id, (row) => ({
+      ...row,
+      cursor: "c1",
+      seen: ["k1"],
+    }));
+    unwatchDeliveryScope({ sessionIds: ["s1"] }, () => ({
+      sessionId: "s2",
+    }));
+    const kept = loadWatchers();
+    expect(kept).toHaveLength(1);
+    expect(kept[0].id).toBe(watcher.id);
+    // Same watcher, watermark included — only the dead owner was rebound.
+    expect(kept[0].source).toMatchObject({ sessionId: "s2" });
+    expect(kept[0].seen).toEqual(["k1"]);
+    expect(kept[0].cursor).toBe("c1");
+    // No surviving link → lifted.
+    unwatchDeliveryScope({ sessionIds: ["s2"] }, () => false);
+    expect(loadWatchers()).toHaveLength(0);
+  });
+
+  it("scope teardown without a coverage predicate lifts every bound auto watcher", () => {
+    ensureDeliveryWatcher(AZURE_PR);
+    unwatchDeliveryScope({ sessionIds: ["s1"] });
+    expect(loadWatchers()).toHaveLength(0);
+  });
+
+  it("openWatchSheet edits the watcher already covering a delivery", () => {
+    ensureDeliveryWatcher(AZURE_PR);
+    const watcher = loadWatchers()[0];
+    const requests: WatchSheetRequest[] = [];
+    const listener = (event: Event) =>
+      requests.push((event as CustomEvent<WatchSheetRequest>).detail);
+    window.addEventListener(OPEN_WATCH_SHEET, listener);
+    try {
+      // Same delivery, another session — still the same watcher.
+      openWatchSheet({
+        source: { ...AZURE_PR, sessionId: "s9" },
+        name: "Watch reviews",
+      });
+      expect(requests[0].existing?.id).toBe(watcher.id);
+      // Non-delivery sources never dedupe this way.
+      openWatchSheet({ source: JIRA_SOURCE, name: "Jira" });
+      expect(requests[1].existing).toBeUndefined();
+      // A different delivery doesn't attach it either.
+      openWatchSheet({
+        source: { ...AZURE_PR, branch: "main" },
+        name: "Other",
+      });
+      expect(requests[2].existing).toBeUndefined();
+    } finally {
+      window.removeEventListener(OPEN_WATCH_SHEET, listener);
+    }
+  });
+
+  it("deliveryWatcherFor finds manual and auto watchers alike", () => {
+    expect(deliveryWatcherFor(AZURE_PR)).toBeUndefined();
+    saveWatcher(draft({ source: AZURE_PR }));
+    expect(deliveryWatcherFor(AZURE_PR)?.name).toBe("Jira · ENG");
+    expect(deliveryWatcherFor(JIRA_SOURCE)).toBeUndefined();
   });
 });

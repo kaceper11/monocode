@@ -5,13 +5,16 @@ import {
   type ProjectRepository,
 } from "./projects";
 import type { LinkedWorkItem } from "./session";
-import { allAzurePrAssociations } from "./azureRepos";
-import { allCiSources } from "./azurePipelines";
+import { allAzurePrAssociations, azurePrKey } from "./azureRepos";
+import { allCiSources, ciKey } from "./azurePipelines";
 import { listTaskPrDrafts, taskPrRowKey } from "./taskPrs";
+import { parseGithubWorkItemUrl } from "./sessionWorkItem";
 import {
   ensureDeliveryWatcher,
   unwatchDeliveryScope,
   watchGithubPrUrl,
+  type DeliverySurvival,
+  type DeliveryWatcherSource,
 } from "./watchers";
 
 const KEY = "monocode.taskWorkspaces.v1";
@@ -629,7 +632,7 @@ export function reviseTask(
     };
   });
   if (!next) throw new Error("Task no longer exists");
-  for (const child of dropped) unwatchDeliveryScope(childDeliveryScope(child));
+  for (const child of dropped) teardownDeliveryScope(childDeliveryScope(child));
   return next;
 }
 
@@ -716,7 +719,7 @@ export function removeTaskAttempt(taskId: string, attemptId: string) {
   const dropped = task.children.filter(
     (child) => child.attemptId === attemptId,
   );
-  unwatchDeliveryScope({
+  teardownDeliveryScope({
     sessionIds: dropped.flatMap((child) => child.sessionIds),
     cwds: dropped.flatMap((child) =>
       child.workingCopy ? [child.workingCopy] : [],
@@ -855,6 +858,82 @@ const childDeliveryScope = (child: TaskChild) => ({
   cwds: child.workingCopy ? [child.workingCopy] : [],
 });
 
+type DeliveryScope = {
+  sessionIds?: readonly string[];
+  cwds?: readonly string[];
+};
+
+/** A stored link still covering the delivery from OUTSIDE the torn-down
+ * scope keeps its watcher. Rows bound to the scope itself don't count —
+ * they stay on disk but their owner is gone. Coverage can't span
+ * checkouts, so a shared working copy still loses the watcher. */
+function deliveryLinkedOutsideScope(scope: DeliveryScope) {
+  const sessionIds = new Set(scope.sessionIds ?? []);
+  const cwds = new Set((scope.cwds ?? []).map(pathKey));
+  const bound = (cwd: string, sessions: readonly (string | undefined)[]) =>
+    cwds.has(pathKey(cwd)) ||
+    sessions.some((id) => id !== undefined && sessionIds.has(id));
+  return (source: DeliveryWatcherSource): DeliverySurvival => {
+    if (source.kind === "azure-pr") {
+      const key = azurePrKey(source.target);
+      const row = allAzurePrAssociations().find(
+        (row) =>
+          row?.target &&
+          azurePrKey(row.target) === key &&
+          pathKey(row.cwd) === pathKey(source.cwd) &&
+          row.branch === source.branch &&
+          !bound(row.cwd, [row.sourceSessionId]),
+      );
+      return row ? { sessionId: row.sourceSessionId } : false;
+    }
+    if (source.kind === "azure-ci") {
+      const key = ciKey(source.target);
+      const row = allCiSources().find(
+        (row) =>
+          row?.target &&
+          ciKey(row.target) === key &&
+          pathKey(row.cwd) === pathKey(source.cwd) &&
+          row.branch === source.branch &&
+          !bound(row.cwd, [row.session]),
+      );
+      return row ? { sessionId: row.session } : false;
+    }
+    // github-pr — coverage comes from another task child's saved PR result.
+    const drafts = listTaskPrDrafts();
+    for (const task of loadTaskWorkspaces()) {
+      for (const child of task.children) {
+        if (
+          !child.workingCopy ||
+          pathKey(child.workingCopy) !== pathKey(source.cwd) ||
+          bound(child.workingCopy, [
+            ...(task.sessionIds ?? []),
+            ...child.sessionIds,
+          ])
+        )
+          continue;
+        const result = drafts[taskPrRowKey(task.id, child.id)]?.result;
+        if (result?.provider !== "github") continue;
+        const parsed = parseGithubWorkItemUrl(result.url);
+        if (
+          parsed?.kind !== "pr" ||
+          parsed.repo.toLowerCase() !== source.repo.toLowerCase() ||
+          parsed.number !== source.number
+        )
+          continue;
+        return { sessionId: child.sessionIds[0] ?? task.sessionIds?.[0] };
+      }
+    }
+    return false;
+  };
+}
+
+/** Scope teardown that keeps watchers whose delivery another live scope
+ * still links — e.g. pruning one session when a sibling session's stored
+ * row covers the same PR at this checkout. */
+function teardownDeliveryScope(scope: DeliveryScope) {
+  unwatchDeliveryScope(scope, deliveryLinkedOutsideScope(scope));
+}
+
 /** Un-archiving restores the task's produced-delivery watchers from the
  * links that stayed saved — symmetric with the teardown above. Links whose
  * watcher the user removed by hand stay uncovered: `ensureDeliveryWatcher`
@@ -879,7 +958,11 @@ function rewatchDeliveryScope(task: TaskWorkspace) {
       repositoryName: row.repositoryName,
       cwd: row.cwd,
       branch: row.branch,
-      ...(row.sourceSessionId ? { sessionId: row.sourceSessionId } : {}),
+      // Rows matched on cwd alone can carry a dead or foreign session —
+      // only bind owners this task still holds.
+      ...(row.sourceSessionId && sessionIds.has(row.sourceSessionId)
+        ? { sessionId: row.sourceSessionId }
+        : {}),
     });
   }
   for (const row of allCiSources()) {
@@ -891,7 +974,9 @@ function rewatchDeliveryScope(task: TaskWorkspace) {
       remote: row.remote,
       cwd: row.cwd,
       branch: row.branch,
-      ...(row.session ? { sessionId: row.session } : {}),
+      ...(row.session && sessionIds.has(row.session)
+        ? { sessionId: row.session }
+        : {}),
     });
   }
   const drafts = listTaskPrDrafts();
@@ -909,7 +994,7 @@ function rewatchDeliveryScope(task: TaskWorkspace) {
 /** Removes the task record only — sessions, worktrees and branches stay. */
 export function removeTask(taskId: string) {
   const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-  if (task) unwatchDeliveryScope(taskDeliveryScope(task));
+  if (task) teardownDeliveryScope(taskDeliveryScope(task));
   saveTaskWorkspaces(
     loadTaskWorkspaces().filter((entry) => entry.id !== taskId),
   );
@@ -918,7 +1003,7 @@ export function removeTask(taskId: string) {
 export function archiveTask(taskId: string, archived = true) {
   const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
   if (task) {
-    if (archived) unwatchDeliveryScope(taskDeliveryScope(task));
+    if (archived) teardownDeliveryScope(taskDeliveryScope(task));
     else rewatchDeliveryScope(task);
   }
   updateTask(taskId, (task) => ({ ...task, archived }));
@@ -934,7 +1019,7 @@ export function removeTaskChild(taskId: string, childId: string) {
       "This is the task's last repository checkout — remove the task instead.",
     );
   const removed = task.children.find((child) => child.id === childId);
-  if (removed) unwatchDeliveryScope(childDeliveryScope(removed));
+  if (removed) teardownDeliveryScope(childDeliveryScope(removed));
   updateTask(taskId, (task) => ({
     ...task,
     children: task.children.filter((child) => child.id !== childId),
@@ -968,7 +1053,7 @@ export function pruneTaskSession(sessionId: string) {
     return { ...task, sessionIds, children };
   });
   if (changed) saveTaskWorkspaces(next);
-  unwatchDeliveryScope({ sessionIds: [sessionId] });
+  teardownDeliveryScope({ sessionIds: [sessionId] });
 }
 
 /** Reverse lookup — which task child owns an ordinary session. `cwd` is

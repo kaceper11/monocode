@@ -593,23 +593,35 @@ export function saveAzurePrAssociation(
         reviewers: value.pr.reviewers.slice(0, 50),
       },
     });
-  localStorage.setItem(ASSOCIATIONS_KEY, JSON.stringify(rows.slice(0, 100)));
+  const kept = rows.slice(0, 100);
+  localStorage.setItem(ASSOCIATIONS_KEY, JSON.stringify(kept));
   if (typeof window !== "undefined") window.dispatchEvent(new Event(AZURE_PR_ASSOCIATIONS_CHANGED));
   // A saved link owns a review watcher: registered on first link, lifted only
   // when no remaining row — in any session scope — still covers the delivery
   // at this checkout+branch. Switching the displayed PR keeps the old link's
   // row, so its watcher stays too. A terminal re-save also keeps the row —
   // the next poll retires the watcher with its goodbye row instead.
-  const covered = (target: AzurePrTarget) =>
-    rows.some(
+  const covered = (target: AzurePrTarget, atCwd: string, atBranch: string) =>
+    kept.some(
       (row) =>
         row?.target &&
         azurePrKey(row.target) === azurePrKey(target) &&
-        pathKey(row.cwd) === pathKey(cwd) &&
-        row.branch === branch,
+        pathKey(row.cwd) === pathKey(atCwd) &&
+        row.branch === atBranch,
     );
   for (const row of scopeRows)
-    if (!covered(row.target)) unwatchAzurePrDelivery(row.target, cwd, branch);
+    if (!covered(row.target, cwd, branch))
+      unwatchAzurePrDelivery(row.target, cwd, branch);
+  // Rows the cap pushed out can orphan a watcher — lift it when nothing
+  // kept still covers their delivery.
+  for (const row of rows.slice(100))
+    if (
+      row?.target &&
+      typeof row.cwd === "string" &&
+      typeof row.branch === "string" &&
+      !covered(row.target, row.cwd, row.branch)
+    )
+      unwatchAzurePrDelivery(row.target, row.cwd, row.branch);
   if (value && value.pr.status === "active" && !linked) {
     const sessionId = session ?? value.sourceSessionId;
     ensureDeliveryWatcher({
