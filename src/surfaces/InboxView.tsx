@@ -1523,7 +1523,9 @@ export function InboxDetail({
   const providerKey = (sessionId: string, kind: "pr" | "ci") => JSON.stringify([contextTicketKey(item), sessionId, kind]);
   const deliveryProvider = (sessionId: string, kind: "pr" | "ci") => {
     const saved = deliveryProviders[providerKey(sessionId, kind)];
-    return saved === "github" || saved === "azure" || saved === "gitlab" ? saved : item.provider === "github" || item.provider === "azure" || item.provider === "gitlab" ? item.provider : undefined;
+    const provider = saved === "github" || saved === "azure" || saved === "gitlab" ? saved : item.provider === "github" || item.provider === "azure" || item.provider === "gitlab" ? item.provider : undefined;
+    // GitLab pipelines ride the MR surface — never a standalone CI delivery.
+    return provider === "gitlab" && kind === "ci" ? undefined : provider;
   };
   const saveProvider = (sessionId: string, kind: "pr" | "ci", provider: string) => {
     if (provider !== "" && provider !== "github" && provider !== "azure" && provider !== "gitlab") return;
@@ -2015,7 +2017,7 @@ export function InboxDetail({
                   )) : null}
                   {onOpenDelivery && session.cwd ? <button type="button" aria-label={`Delivery providers for ${title}`} className="h-6 rounded-md px-1.5 text-[11px] text-content/40 hover:bg-content/5" onClick={() => setChoosingProviders(choosingProviders === session.id ? null : session.id)}>Providers</button> : null}
                   {choosingProviders === session.id ? <span className="flex flex-wrap items-center gap-2 rounded-md border border-content/10 p-2">
-                    {([['pr', 'PR provider'], ['ci', 'CI provider']] as const).map(([kind, label]) => <span key={kind} className="text-[11px] text-content/60">{label}<Select label={`${label} for ${title}`} value={deliveryProvider(session.id, kind) ?? ""} options={[{value:"", label:item.provider === "github" || item.provider === "azure" || item.provider === "gitlab" ? "Use ticket provider" : "Choose provider"}, {value:"github",label:kind === "pr" ? "GitHub" : "GitHub checks"}, {value:"azure",label:kind === "pr" ? "Azure Repos" : "Azure Pipelines"}, {value:"gitlab",label:kind === "pr" ? "GitLab" : "GitLab pipelines"}]} onChange={value => saveProvider(session.id, kind, value)} /></span>)}
+                    {([['pr', 'PR provider'], ['ci', 'CI provider']] as const).map(([kind, label]) => <span key={kind} className="text-[11px] text-content/60">{label}<Select label={`${label} for ${title}`} value={deliveryProvider(session.id, kind) ?? ""} options={[{value:"", label:item.provider === "github" || item.provider === "azure" || item.provider === "gitlab" ? "Use ticket provider" : "Choose provider"}, {value:"github",label:kind === "pr" ? "GitHub" : "GitHub checks"}, {value:"azure",label:kind === "pr" ? "Azure Repos" : "Azure Pipelines"}, ...(kind === "pr" ? [{value:"gitlab",label:"GitLab"}] : [])]} onChange={value => saveProvider(session.id, kind, value)} /></span>)}
                     <button type="button" className="px-2 py-1 text-[11px]" onClick={() => setChoosingProviders(null)}>Done</button>
                   </span> : null}
                 </span>

@@ -361,6 +361,73 @@ it("re-arms actions when a hidden tab is re-shown mid-request", async () => {
   }
 });
 
+it("does not let a stale in-flight reply wipe state after a hide/re-show", async () => {
+  let release: (value: unknown) => void = () => undefined;
+  const gate = new Promise((resolve) => (release = resolve));
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  const cleanup = await setup();
+  try {
+    await click("Merge requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("Unresolved");
+      }),
+    );
+    await expandThread();
+    await typeReply("first draft");
+    // Park the reply call while the tab hides and re-shows.
+    vi.mocked(invoke).mockImplementation(async (command, args) =>
+      command === "gitlab_mr_discussion_reply" ? gate : original(command, args),
+    );
+    await act(async () => button("Reply").click());
+    await click("Files");
+    await click("Merge requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("Unresolved");
+      }),
+    );
+    await expandThread();
+    await typeReply("second draft");
+    await act(async () => release("https://gitlab.example.com/x#note_1"));
+    // The stale completion must not clear the new draft or leave the
+    // thread stuck in a busy state.
+    const reply = document.querySelector(
+      'textarea[aria-label="Reply to discussion"]',
+    ) as HTMLTextAreaElement;
+    expect(reply.value).toBe("second draft");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(button("Reply").disabled).toBe(false);
+      }),
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+it("keeps the MR readable when discussions fail to load", async () => {
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  vi.mocked(invoke).mockImplementation(async (command, args) =>
+    command === "gitlab_mr_discussions"
+      ? Promise.reject(new Error("Discussions unavailable"))
+      : original(command, args),
+  );
+  const cleanup = await setup();
+  try {
+    await click("Merge requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("!7 Improve login");
+      }),
+    );
+    expect(document.body.textContent).toContain("Discussions unavailable");
+    expect(document.body.textContent).not.toContain("No review discussions.");
+  } finally {
+    await cleanup();
+  }
+});
+
 it("resolves the project from the checkout when no repo is bound", async () => {
   const cleanup = await setup({ repo: "" });
   try {

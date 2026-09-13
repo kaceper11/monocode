@@ -97,9 +97,7 @@ const repoInflight = new Map<string, Promise<string>>();
 const detailsByKey = new Map<string, GitlabWorkItemDetails>();
 const threadByKey = new Map<string, GitlabWorkItemThread>();
 const threadInflight = new Map<string, Promise<GitlabWorkItemThread>>();
-const diffByKey = new Map<string, GitlabMrDiff>();
 const diffInflight = new Map<string, Promise<GitlabMrDiff>>();
-const discussionByKey = new Map<string, GitlabWorkItemThread>();
 const discussionInflight = new Map<string, Promise<GitlabWorkItemThread>>();
 
 function itemKey(cwd: string, kind: GitlabKind, number: number): string {
@@ -112,9 +110,7 @@ export function clearGitlabCache() {
   detailsByKey.clear();
   threadByKey.clear();
   threadInflight.clear();
-  diffByKey.clear();
   diffInflight.clear();
-  discussionByKey.clear();
   discussionInflight.clear();
 }
 
@@ -153,7 +149,9 @@ export async function gitlabRepo(cwd: string): Promise<string> {
   if (inflight) return inflight;
   const pending = invoke<string>("gitlab_repo", { cwd })
     .then((repo) => {
-      repoByPath.set(key, repo);
+      // A later force/invalidate removed or replaced this entry — don't
+      // let the stale write repopulate the cache.
+      if (repoInflight.get(key) === pending) repoByPath.set(key, repo);
       return repo;
     })
     .finally(() => {
@@ -229,7 +227,7 @@ export async function gitlabWorkItemThread(
     number,
   })
     .then((thread) => {
-      threadByKey.set(key, thread);
+      if (threadInflight.get(key) === pending) threadByKey.set(key, thread);
       return thread;
     })
     .finally(() => {
@@ -254,14 +252,9 @@ export async function gitlabWorkItemComment(
   const key = itemKey(cwd, kind, number);
   threadByKey.delete(key);
   threadInflight.delete(key);
+  // A top-level note on an MR lands as a new individual_note discussion.
+  if (kind === "pr") invalidateDiscussions(cwd, number);
   return url;
-}
-
-export function peekGitlabMrDiff(
-  cwd: string,
-  number: number,
-): GitlabMrDiff | null {
-  return diffByKey.get(itemKey(cwd, "pr", number)) ?? null;
 }
 
 export async function gitlabMrDiff(
@@ -272,10 +265,6 @@ export async function gitlabMrDiff(
   const cached = diffInflight.get(key);
   if (cached) return cached;
   const pending = invoke<GitlabMrDiff>("gitlab_mr_diff", { cwd, number })
-    .then((diff) => {
-      diffByKey.set(key, diff);
-      return diff;
-    })
     .finally(() => {
       if (diffInflight.get(key) === pending) diffInflight.delete(key);
     });
@@ -299,13 +288,6 @@ export function gitlabMrForBranch(
   return invoke<GitlabWorkItem>("gitlab_mr_for_branch", { cwd, branch });
 }
 
-export function peekGitlabMrDiscussions(
-  cwd: string,
-  number: number,
-): GitlabWorkItemThread | null {
-  return discussionByKey.get(itemKey(cwd, "pr", number)) ?? null;
-}
-
 /** Discussions keep diff positions; unlike flat notes they carry
  * `threadId` (the discussion id) so replies and resolve target exactly. */
 export async function gitlabMrDiscussions(
@@ -314,31 +296,22 @@ export async function gitlabMrDiscussions(
   options?: { force?: boolean },
 ): Promise<GitlabWorkItemThread> {
   const key = itemKey(cwd, "pr", number);
-  if (options?.force) {
-    discussionByKey.delete(key);
-    discussionInflight.delete(key);
-  }
+  if (options?.force) discussionInflight.delete(key);
   const cached = discussionInflight.get(key);
   if (cached) return cached;
   const pending = invoke<GitlabWorkItemThread>("gitlab_mr_discussions", {
     cwd,
     number,
-  })
-    .then((thread) => {
-      discussionByKey.set(key, thread);
-      return thread;
-    })
-    .finally(() => {
-      if (discussionInflight.get(key) === pending)
-        discussionInflight.delete(key);
-    });
+  }).finally(() => {
+    if (discussionInflight.get(key) === pending)
+      discussionInflight.delete(key);
+  });
   discussionInflight.set(key, pending);
   return pending;
 }
 
 const invalidateDiscussions = (cwd: string, number: number) => {
   const key = itemKey(cwd, "pr", number);
-  discussionByKey.delete(key);
   discussionInflight.delete(key);
   // The flat notes thread behind the inbox summary lists the same replies.
   threadByKey.delete(key);

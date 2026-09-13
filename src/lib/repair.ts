@@ -584,25 +584,6 @@ export async function githubCiRepair(input: {
   };
 }
 
-/** True when a git remote URL points at the GitLab project path — covers
- * https/ssh transports, a `.git` suffix and a relative-URL-root prefix. */
-const gitlabRemoteMatches = (url: string, repo: string) => {
-  const repoPath = repo.trim().toLowerCase();
-  if (!repoPath) return false;
-  const trimmed = url
-    .trim()
-    .toLowerCase()
-    .replace(/[?#].*$/, "")
-    .replace(/\.git\/?$/, "")
-    .replace(/\/+$/, "");
-  const path = trimmed.includes("://")
-    ? (trimmed.split("://")[1]?.split("/").slice(1).join("/") ?? "")
-    : trimmed.includes(":")
-      ? trimmed.slice(trimmed.indexOf(":") + 1)
-      : "";
-  return path === repoPath || path.endsWith(`/${repoPath}`);
-};
-
 /** GitLab MR-head binding for a repair: the checkout must resolve to the
  * MR's project and sit at its head commit on its source branch. A mismatch
  * is a visible error, never a silent fixup. */
@@ -616,20 +597,15 @@ async function gitlabRepairHead(input: {
     throw new Error("The merge request is no longer open. Refresh and retry.");
   if (!state.headSha || !state.headRefName)
     throw new Error("GitLab did not report the MR head. Refresh and retry.");
-  // `state.repo` is resolved fresh inside the backend — unlike the cached
-  // gitlabRepo it always reflects the checkout as it is now.
-  if (state.repo.toLowerCase() !== input.repo.trim().toLowerCase())
+  // `state.repo` is resolved fresh inside the backend by matching a remote
+  // against the configured GitLab host — that already binds this checkout
+  // to the project. `ciContext`'s remote list only knows GitHub/Azure
+  // hosts, so the resolved project path is the remote binding here.
+  if (state.repo.trim().toLowerCase() !== input.repo.trim().toLowerCase())
     throw new Error(
       `This checkout resolves to ${state.repo || "no GitLab project"}; the MR belongs to ${input.repo}. Open that project's checkout.`,
     );
   const checkout = await ciContext(input.cwd);
-  const remote = checkout.remotes.find((row) =>
-    gitlabRemoteMatches(row.url, input.repo),
-  );
-  if (!remote)
-    throw new Error(
-      `This checkout has no remote for ${input.repo}. Open the MR's checkout.`,
-    );
   if (
     checkout.commit !== state.headSha ||
     checkout.branch !== state.headRefName
@@ -642,7 +618,7 @@ async function gitlabRepairHead(input: {
       cwd: checkout.cwd,
       branch: checkout.branch,
       commit: checkout.commit,
-      remote: remote.url,
+      remote: state.repo,
     },
     state,
   };
@@ -768,10 +744,16 @@ export async function validateRepair(
   if (!context.entries.length || !context.instruction?.trim())
     throw new Error("Select evidence and enter a repair instruction.");
   const checkout = await ciContext(evidence.head.cwd);
+  // GitLab evidence binds the backend-resolved project path — `remotes`
+  // only knows GitHub/Azure hosts; the gitlab branches below re-verify the
+  // project through gitlab_mr_state instead.
+  const isGitlab =
+    evidence.kind === "gitlab-comments" || evidence.kind === "gitlab-ci";
   if (
     checkout.commit !== evidence.head.commit ||
     checkout.branch !== evidence.head.branch ||
-    !checkout.remotes.some((row) => row.url === evidence.head.remote)
+    (!isGitlab &&
+      !checkout.remotes.some((row) => row.url === evidence.head.remote))
   )
     throw new Error("Checkout changed. Close this draft and Refresh evidence.");
   if (evidence.kind === "ci") {

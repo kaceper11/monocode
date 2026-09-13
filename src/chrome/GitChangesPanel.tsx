@@ -303,8 +303,12 @@ export function GitChangesPanel({
     return () => { deliveryGeneration.current++; };
   }, [viewCwd, index?.branch, index?.remote, index?.upstream, sourceSessionId, enabled, deliveryTick]);
   const defaultProvider = repository?.cwd === viewCwd && repository.branch === index?.branch ? repository.provider : undefined;
-  const providerFor = (kind: "pr" | "ci") => deliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind)
-    ?? ((kind === "pr" ? prs.length : pipelines.length) ? "azure" : defaultProvider);
+  const providerFor = (kind: "pr" | "ci") => {
+    // GitLab pipelines ride the MR surface — never a standalone CI delivery.
+    const provider = deliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind)
+      ?? ((kind === "pr" ? prs.length : pipelines.length) ? "azure" : defaultProvider);
+    return provider === "gitlab" && kind === "ci" ? undefined : provider;
+  };
   const openDelivery = async (kind: "pr" | "ci") => {
     const provider = providerFor(kind);
     if (!provider) { setChoosingProviders(true); return; }
@@ -426,7 +430,7 @@ export function GitChangesPanel({
         );})}
         <details open={choosingProviders} onToggle={event => setChoosingProviders(event.currentTarget.open)} className="px-3 text-[11px] text-content/45">
           <summary className="cursor-pointer py-1">Providers</summary>
-          <div className="space-y-1 pb-2">{(["pr", "ci"] as const).map(kind => <div key={kind} className="flex items-center justify-between gap-2"><span>{kind === "pr" ? "PR" : "CI"}</span><Select disabled={!enabled || !index || deliveryBusy} label={kind === "pr" ? "PR provider" : "CI provider"} value={deliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind) ?? ""} options={[{value:"",label:"Automatic"},{value:"github",label:kind === "pr" ? "GitHub" : "GitHub checks"},{value:"azure",label:kind === "pr" ? "Azure Repos" : "Azure Pipelines"},{value:"gitlab",label:kind === "pr" ? "GitLab" : "GitLab pipelines"}]} onChange={value => {
+          <div className="space-y-1 pb-2">{(["pr", "ci"] as const).map(kind => <div key={kind} className="flex items-center justify-between gap-2"><span>{kind === "pr" ? "PR" : "CI"}</span><Select disabled={!enabled || !index || deliveryBusy} label={kind === "pr" ? "PR provider" : "CI provider"} value={deliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind) ?? ""} options={[{value:"",label:"Automatic"},{value:"github",label:kind === "pr" ? "GitHub" : "GitHub checks"},{value:"azure",label:kind === "pr" ? "Azure Repos" : "Azure Pipelines"},...(kind === "pr" ? [{value:"gitlab",label:"GitLab"}] : [])]} onChange={value => {
             try { saveDeliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind, value as DeliveryProvider | ""); setDeliveryError(""); }
             catch { setDeliveryError("Could not save provider choice. Try again."); }
           }} /></div>)}</div>

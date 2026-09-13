@@ -465,10 +465,17 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       (delivery.sourceSessionId !== undefined &&
         (typeof delivery.sourceSessionId !== "string" ||
           !delivery.sourceSessionId)) ||
+      // Only providers this build can render: github opens externally and
+      // never produces a delivery file, so a persisted one is malformed.
       (delivery.provider !== undefined &&
-        !["azure", "github", "gitlab"].includes(
-          delivery.provider as string,
-        )) ||
+        !["azure", "gitlab"].includes(delivery.provider as string)) ||
+      // A GitLab tab without repo+number identity cannot render its MR.
+      (delivery.provider === "gitlab" &&
+        (typeof delivery.repo !== "string" ||
+          !delivery.repo.trim() ||
+          typeof delivery.number !== "number" ||
+          !Number.isInteger(delivery.number) ||
+          delivery.number <= 0)) ||
       (delivery.repo !== undefined && typeof delivery.repo !== "string") ||
       (delivery.number !== undefined &&
         (typeof delivery.number !== "number" ||

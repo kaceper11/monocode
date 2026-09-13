@@ -6730,12 +6730,13 @@ export default function App({
     if (!current()) return;
     if (sessionWorkCwd(sessionsRef.current.find(value => value.id === sessionId) ?? session) !== cwd)
       throw new Error("The conversation checkout changed. Open its review again.");
+    // Reject before saving — a dead CI choice must not persist.
+    if (provider === "gitlab" && kind === "ci") throw new Error(GITLAB_CI_ON_MR);
     saveDeliveryProvider(cwd, checkout.branch, sessionId, kind, provider);
     if (provider === "github") {
       await openGitHubDelivery(cwd, kind, () => current() && sessionWorkCwd(sessionsRef.current.find(value => value.id === sessionId) ?? session) === cwd, prUrl);
       return;
     }
-    if (provider === "gitlab" && kind === "ci") throw new Error(GITLAB_CI_ON_MR);
     // GitLab delivery tabs bind to the inbox item's own MR identity when it
     // carries one; otherwise to the open MR for the checkout's branch.
     const target = provider === "gitlab" ? (gitlabTarget ?? await gitlabDeliveryTarget(cwd, checkout.branch)) : undefined;

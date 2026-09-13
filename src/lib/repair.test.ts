@@ -285,11 +285,13 @@ it("rejects GitLab evidence when the MR head or discussions moved", async () => 
   let changed = false;
   vi.mocked(invoke).mockImplementation(async (command) => {
     if (command === "azure_ci_context")
+      // ciContext never lists GitLab remotes — the MR's project binding
+      // comes from the backend-resolved state.repo, not the remote list.
       return {
         cwd: "/work/web",
         branch: "feature",
         commit: "head",
-        remotes: [{ name: "origin", url: "https://gitlab.example.com/acme/web" }],
+        remotes: [],
       };
     if (command === "gitlab_repo") return "acme/web";
     if (command === "gitlab_mr_state")
@@ -322,6 +324,65 @@ it("rejects GitLab evidence when the MR head or discussions moved", async () => 
   await expect(validateRepair(draft.evidence, draft.context)).rejects.toThrow(
     "Selected discussions changed",
   );
+});
+
+it("rejects GitLab pipeline evidence when the pipeline moved or vanished", async () => {
+  const { gitlabPipelineRepair } = await import("./repair");
+  const { clearGitlabCache } = await import("./gitlab");
+  clearGitlabCache();
+  const base = {
+    number: 7,
+    title: "Improve login",
+    url: "https://gitlab.example.com/acme/web/-/merge_requests/7",
+    state: "open",
+    repo: "acme/web",
+    headSha: "head",
+    headRefName: "feature",
+    baseRefName: "main",
+    mergeStatus: "",
+    blockingDiscussionsResolved: true,
+    approvalsRequired: 0,
+    approvalsLeft: 0,
+    approved: false,
+    draft: false,
+  };
+  let pipeline: unknown = {
+    id: 77,
+    sha: "head",
+    status: "failed",
+    url: "https://gitlab.example.com/acme/web/-/pipelines/77",
+  };
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "azure_ci_context")
+      return { cwd: "/work/web", branch: "feature", commit: "head", remotes: [] };
+    if (command === "gitlab_mr_state") return { ...base, pipeline };
+    throw new Error(`Unexpected ${command}`);
+  });
+  const draft = await gitlabPipelineRepair({
+    cwd: "/work/web",
+    repo: "acme/web",
+    number: 7,
+  });
+  expect(draft.evidence.scope).toBe("gitlab-ci:acme/web#7");
+  expect(draft.evidence.kind === "gitlab-ci" && draft.evidence.pipeline.id).toBe(
+    77,
+  );
+  await validateRepair(draft.evidence, draft.context);
+  // A re-run replacing the head pipeline must fail closed.
+  pipeline = { id: 78, sha: "head", status: "failed" };
+  await expect(validateRepair(draft.evidence, draft.context)).rejects.toThrow(
+    "Pipeline evidence changed",
+  );
+  // So must a vanished pipeline.
+  pipeline = null;
+  await expect(validateRepair(draft.evidence, draft.context)).rejects.toThrow(
+    "Pipeline evidence changed",
+  );
+  // And a non-failing pipeline cannot be prepared at all.
+  pipeline = { id: 77, sha: "head", status: "running" };
+  await expect(
+    gitlabPipelineRepair({ cwd: "/work/web", repo: "acme/web", number: 7 }),
+  ).rejects.toThrow("No failing pipeline");
 });
 
 it("prepares comments in a verified PR checkout without retargeting the source conversation", async () => {
