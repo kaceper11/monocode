@@ -50,6 +50,11 @@ export type DeliveryTabSource = {
   kind: "pr" | "ci";
   branch: string;
   sourceSessionId?: string;
+  /** PR/CI provider this tab is bound to; missing means Azure. */
+  provider?: "azure" | "github" | "gitlab";
+  /** Provider-scoped PR identity — owner/repo (GitHub) or project path (GitLab). */
+  repo?: string;
+  number?: number;
 };
 
 /** A saved project command bound to a terminal tab. `runId` bumps on each
@@ -492,7 +497,7 @@ export function isSessionChangesTab(
 
 export function editorTabKey(file: FilePaneTab): string {
   if (file.delivery)
-    return `delivery:${JSON.stringify([file.cwd, file.delivery.kind, file.delivery.branch, file.delivery.sourceSessionId])}`;
+    return `delivery:${JSON.stringify([file.cwd, file.delivery.kind, file.delivery.branch, file.delivery.sourceSessionId, file.delivery.provider, file.delivery.repo, file.delivery.number])}`;
   if (file.terminal) return `terminal:${file.id}`;
   if (file.browser) return `browser:${file.cwd}:${file.browser.url}`;
   if (file.plan) return `plan:${file.plan.blockId}`;

@@ -5,6 +5,7 @@ import { gitPrStatus } from "./fs";
 import { deliveryProvider, saveDeliveryProvider, repositoryProvider, resolvePrProviders, openGitHubDelivery } from "./deliveryProviders";
 vi.mock("@tauri-apps/plugin-opener", () => ({openUrl: vi.fn()}));
 vi.mock("./fs", () => ({gitPrStatus: vi.fn()}));
+vi.mock("./gitlab", () => ({gitlabMrForBranch: vi.fn()}));
 beforeEach(() => { const rows = new Map<string, string>(); vi.stubGlobal("localStorage", {getItem:(key:string) => rows.get(key) ?? null, setItem:(key:string,value:string) => rows.set(key,value)}); });
 afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks(); });
 it("resolves known remotes without choosing between ambiguous providers", () => {
@@ -45,6 +46,17 @@ it("keeps PR and CI choices scoped to checkout, branch and conversation", () => 
   expect(deliveryProvider("/repo", "feature", "other", "ci")).toBeUndefined();
   saveDeliveryProvider("/repo", "feature", "owner", "ci", "");
   expect(deliveryProvider("/repo", "feature", "owner", "ci")).toBeUndefined();
+});
+it("binds GitLab delivery to the project the backend resolved", async () => {
+  const { gitlabDeliveryTarget } = await import("./deliveryProviders");
+  const { gitlabMrForBranch } = await import("./gitlab");
+  vi.mocked(gitlabMrForBranch).mockResolvedValue({repo: "acme/web", number: 7} as never);
+  await expect(gitlabDeliveryTarget("/repo", "feature")).resolves.toEqual({repo: "acme/web", number: 7});
+  await expect(gitlabDeliveryTarget("/repo", " ")).rejects.toThrow("No branch");
+  vi.mocked(gitlabMrForBranch).mockRejectedValueOnce(new Error("No open merge request for this branch"));
+  await expect(gitlabDeliveryTarget("/repo", "feature")).rejects.toThrow("No open merge request");
+  vi.mocked(gitlabMrForBranch).mockResolvedValueOnce({repo: "", number: 7} as never);
+  await expect(gitlabDeliveryTarget("/repo", "feature")).rejects.toThrow("does not resolve");
 });
 it("opens the selected GitHub PR/checks and discards stale navigation", async () => {
   vi.mocked(gitPrStatus).mockResolvedValue({number:3,title:"Fix",state:"OPEN",url:"https://github.com/team/repo/pull/3?tab=files"});
