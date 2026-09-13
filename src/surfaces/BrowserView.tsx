@@ -1,4 +1,5 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { readText as readClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   useCallback,
   useEffect,
@@ -930,11 +931,11 @@ function EmptyBrowserState({
   const [value, setValue] = useState(suggested ?? "");
   const [error, setError] = useState("");
   const paste = () => {
-    // Explicit paste gesture — a programmatic read on mount trips the macOS
-    // paste-consent prompt. A clipboard URL opens straight away; anything
-    // else just fills the field for editing.
-    void navigator.clipboard
-      ?.readText()
+    // Reads the pasteboard natively — `navigator.clipboard.readText` in
+    // WKWebView shows a floating "Paste" consent bubble even on a real
+    // click, so the paste goes through the plugin instead. A clipboard
+    // URL opens straight away; anything else fills the field for editing.
+    void readClipboardText()
       .then((text) => {
         const url = browserClipboardUrl(text);
         if (url) onSubmit(url);

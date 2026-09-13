@@ -37,6 +37,7 @@
     "@streamdown/code": "^1.1.1",
     "@streamdown/mermaid": "^1.0.2",
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.3",
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-process": "^2.3.1",

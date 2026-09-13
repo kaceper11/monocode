@@ -30,6 +30,7 @@ cpal = "0.18.2"
 hound = "3.5.1"
 sha2 = "0.10"
 whisper-rs = "0.16"
+tauri-plugin-clipboard-manager = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
