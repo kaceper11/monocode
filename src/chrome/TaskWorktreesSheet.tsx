@@ -253,14 +253,20 @@ export function TaskWorktreesSheet({
       setBatch({ ...batch, phase: "done", removed, failures });
     });
 
-  /** Hand a skipped/failed row back to the full manager's reviewed flow.
-   * Before the batch ran, the task record stays — the delete is simply
-   * cancelled; after, it is already gone. */
-  const reviewEntry = (entry: RemovalEntry) => {
+  /** Hand a skipped/failed row back to the full manager's reviewed flow —
+   * dirty or process-bound entries go straight to the guarded removal
+   * confirmation, the rest to the detail view. The record is already gone
+   * by then; the delete itself is never revisited. */
+  const reviewEntry = (skip: BulkSkip | { entry: RemovalEntry }) => {
+    const { entry } = skip;
+    const safety = "safety" in skip ? skip.safety : undefined;
     onClose();
     openWorktreeManager({
       cwd: batch?.contexts.get(pathKey(entry.path)) ?? entry.path,
       path: entry.path,
+      ...(safety && (safety.dirty || safety.processes.length)
+        ? { action: "remove" as const }
+        : {}),
     });
   };
 

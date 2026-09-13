@@ -39,9 +39,10 @@ export function WorktreeRemovalBatch({
   confirmLabel?: string;
   onCancel: () => void;
   onConfirm: () => void;
-  /** Review handoff for skipped/failed rows — omit to hide the buttons
-   * (e.g. a phase where reviewing would abandon a pending action). */
-  onReview?: (entry: RemovalEntry) => void;
+  /** Review handoff for skipped/failed rows — receives the full row so the
+   * caller can route leftover work (dirty files, bound processes) straight
+   * to the guarded removal confirmation. Omit to hide the buttons. */
+  onReview?: (skip: BulkSkip | { entry: RemovalEntry }) => void;
   onDone: () => void;
 }) {
   return (
@@ -119,7 +120,7 @@ export function WorktreeRemovalBatch({
                 <button
                   type="button"
                   className="shrink-0 rounded border border-content/10 px-1.5 py-0.5 text-[11px] hover:bg-content/5"
-                  onClick={() => onReview(skip.entry)}
+                  onClick={() => onReview(skip)}
                 >
                   Review
                 </button>
@@ -149,7 +150,7 @@ export function WorktreeRemovalBatch({
                 <button
                   type="button"
                   className="shrink-0 rounded border border-content/10 px-1.5 py-0.5 text-[11px] hover:bg-content/5"
-                  onClick={() => onReview(failure.entry)}
+                  onClick={() => onReview(failure)}
                 >
                   Review
                 </button>
