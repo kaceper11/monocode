@@ -74,6 +74,8 @@ type Props = {
   onNewTerminal?: () => void;
   onShowTerminal?: () => void;
   onOpenBrowser?: () => void;
+  /** A browser tab is open in the active workspace tab. */
+  browserActive?: boolean;
   projectTerminalActive?: boolean;
   onOpenSettings?: () => void;
   onOpenInbox?: () => void;
@@ -551,6 +553,7 @@ function TitleBarComponent({
   onNewTerminal,
   onShowTerminal,
   onOpenBrowser,
+  browserActive = false,
   projectTerminalActive = false,
   onOpenSettings,
   onOpenInbox,
@@ -751,7 +754,12 @@ function TitleBarComponent({
         ) : null}
         {!projectless && onOpenBrowser ? (
           <IconButton
-            label={`Open URL in Browser (${MOD}${SHIFT}B)`}
+            label={
+              browserActive
+                ? "Browser"
+                : `Open URL in Browser (${MOD}${SHIFT}B)`
+            }
+            accent={browserActive}
             onClick={onOpenBrowser}
           >
             <Globe className="size-3.5" strokeWidth={1.75} />

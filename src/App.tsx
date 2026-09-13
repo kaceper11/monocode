@@ -1269,6 +1269,9 @@ export default function App({
     );
   activeRef.current = active;
   const sessionDefaults = active ?? sessions[0];
+  const browserOpen = !!activeTab?.editorPanes.some((pane) =>
+    pane.files.some((file) => file.browser),
+  );
   // Saved commands resolve their owning project at open: explicit id → rail
   // path → the active task's project → the current folder's project.
   const commandsProject = !commandsMenu
@@ -8222,6 +8225,7 @@ export default function App({
             onNewTerminal={onNewTerminal}
             onShowTerminal={onShowProjectTerminal}
             onOpenBrowser={() => onOpenBrowser("")}
+            browserActive={browserOpen}
             projectTerminalActive={
               !!currentProjectDock && currentProjectDock.pane.files.length > 0
             }
