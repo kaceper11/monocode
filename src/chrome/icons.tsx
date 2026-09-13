@@ -151,6 +151,14 @@ const UnfoldVerticalIcon: IconSvgElement = [
   ["path", { d: "M7 17L12 22L17 17", ...stroke, key: "5" }],
 ];
 
+/** Filled stop square — reads as "stop", unlike the stroked Square checkbox look. */
+const StopIcon: IconSvgElement = [
+  [
+    "rect",
+    { x: "6", y: "6", width: "12", height: "12", rx: "2", fill: "currentColor", key: "0" },
+  ],
+];
+
 export const AlertCircle = wrap(AlertCircleIcon, "AlertCircle");
 export const AppWindow = wrap(AppWindowIcon, "AppWindow");
 export const Archive = wrap(Archive02Icon, "Archive");
@@ -247,6 +255,7 @@ export const SlidersHorizontal = wrap(
 );
 export const Sparkles = wrap(SparklesIcon, "Sparkles");
 export const Square = wrap(SquareIcon, "Square");
+export const Stop = wrap(StopIcon, "Stop");
 export const SquarePlus = wrap(AddSquareIcon, "SquarePlus");
 export const Star = wrap(StarIcon, "Star");
 export const StickyNote = wrap(Note01Icon, "StickyNote");

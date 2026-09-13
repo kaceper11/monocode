@@ -27,6 +27,7 @@ mod menu;
 mod notes;
 mod notifications;
 mod power;
+mod proc_stats;
 mod project_logo;
 mod pty;
 mod rate_limits;
@@ -410,7 +411,9 @@ pub fn run() {
             pty::pty_write,
             pty::pty_resize,
             pty::pty_status,
+            pty::pty_resources,
             pty::pty_kill,
+            pty::pty_kill_workload,
             pty::pty_kill_all,
             session_store::session_upsert,
             session_store::session_list_by_project,

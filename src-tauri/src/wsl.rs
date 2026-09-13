@@ -116,60 +116,83 @@ fn wsl_command() -> Result<Command, String> {
     Ok(command)
 }
 
+/// Env marker tagging a terminal's whole Linux tree — env is inherited by
+/// every descendant, so `pty_stats` can attribute /proc usage per terminal
+/// without correlating wsl.exe and Linux pids. `pty_kill_workload` finds
+/// the same tree by marker.
 #[cfg(any(windows, test))]
-fn terminal_args(location: &Location) -> Vec<String> {
-    wsl_args(
-        &location.distribution,
-        &location.path,
-        "/usr/bin/env",
-        &[
-            "TERM=xterm-256color".into(),
-            "COLORTERM=truecolor".into(),
-            "TERM_PROGRAM=MonoCode".into(),
-            "/bin/sh".into(),
-            "-c".into(),
-            "exec \"${SHELL:-/bin/sh}\" -l".into(),
-        ],
-    )
+fn marker_env(marker: Option<&str>) -> Option<String> {
+    let marker = marker?;
+    let valid = marker.len() <= 128
+        && marker
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    if !valid {
+        // An unmarked terminal spawns fine but has no Linux-side resource
+        // attribution and ignores workload kills — never silent.
+        eprintln!("monocode: rejecting WSL terminal marker {marker:?}");
+    }
+    valid.then(|| format!("MONOCODE_PTY={marker}"))
+}
+
+/// Shared PTY environment for interactive and exec terminals.
+#[cfg(any(windows, test))]
+fn pty_env(marker: Option<&str>) -> Vec<String> {
+    let mut env = vec![
+        "TERM=xterm-256color".into(),
+        "COLORTERM=truecolor".into(),
+        "TERM_PROGRAM=MonoCode".into(),
+    ];
+    env.extend(marker_env(marker));
+    env
+}
+
+#[cfg(any(windows, test))]
+fn terminal_args(location: &Location, marker: Option<&str>) -> Vec<String> {
+    let mut env = pty_env(marker);
+    env.extend([
+        "/bin/sh".into(),
+        "-c".into(),
+        "exec \"${SHELL:-/bin/sh}\" -l".into(),
+    ]);
+    wsl_args(&location.distribution, &location.path, "/usr/bin/env", &env)
 }
 
 #[cfg(windows)]
-pub fn terminal_command(location: &Location) -> Result<Command, String> {
+pub fn terminal_command(location: &Location, marker: Option<&str>) -> Result<Command, String> {
     let _: String = request(location, "canonical", json!({}))?;
     let mut command = wsl_command()?;
-    command.args(terminal_args(location));
+    command.args(terminal_args(location, marker));
     Ok(command)
 }
 
 #[cfg(any(windows, test))]
-fn exec_args(location: &Location, exec: &str) -> Vec<String> {
+fn exec_args(location: &Location, exec: &str, marker: Option<&str>) -> Vec<String> {
     // Mirror the interactive terminal: terminal env vars, then the user's
     // login shell — `/bin/sh -lc` alone lands in dash with no `.bashrc` PATH
     // (nvm, ~/.local/bin), so bashisms and user tools would fail a step that
     // works interactively. `sh -c '…' name arg` makes the exec line `$1`.
-    wsl_args(
-        &location.distribution,
-        &location.path,
-        "/usr/bin/env",
-        &[
-            "TERM=xterm-256color".into(),
-            "COLORTERM=truecolor".into(),
-            "TERM_PROGRAM=MonoCode".into(),
-            "/bin/sh".into(),
-            "-c".into(),
-            "exec \"${SHELL:-/bin/sh}\" -l -c \"$1\"".into(),
-            "monocode-exec".into(),
-            exec.into(),
-        ],
-    )
+    let mut env = pty_env(marker);
+    env.extend([
+        "/bin/sh".into(),
+        "-c".into(),
+        "exec \"${SHELL:-/bin/sh}\" -l -c \"$1\"".into(),
+        "monocode-exec".into(),
+        exec.into(),
+    ]);
+    wsl_args(&location.distribution, &location.path, "/usr/bin/env", &env)
 }
 
 /// One command line inside the distribution — a saved command step. `wsl.exe`
 /// propagates the shell's exit code, so the PTY exit carries the step result.
 #[cfg(windows)]
-pub fn exec_command(location: &Location, exec: &str) -> Result<Command, String> {
+pub fn exec_command(
+    location: &Location,
+    exec: &str,
+    marker: Option<&str>,
+) -> Result<Command, String> {
     verify_location(location)?;
-    exec_command_verified(location, exec)
+    exec_command_verified(location, exec, marker)
 }
 
 /// The bridge round trip that proves `location` is still reachable — callers
@@ -181,11 +204,45 @@ pub(crate) fn verify_location(location: &Location) -> Result<(), String> {
 }
 
 /// Build a step command for a location `verify_location` already checked.
+/// `marker` tags a terminal-bound step's tree for resource sampling;
+/// unattributed runs (checks) pass `None`.
 #[cfg(windows)]
-pub(crate) fn exec_command_verified(location: &Location, exec: &str) -> Result<Command, String> {
+pub(crate) fn exec_command_verified(
+    location: &Location,
+    exec: &str,
+    marker: Option<&str>,
+) -> Result<Command, String> {
     let mut command = wsl_command()?;
-    command.args(exec_args(location, exec));
+    command.args(exec_args(location, exec, marker));
     Ok(command)
+}
+
+/// Per-marker Linux resource usage reported by the bridge — `pty_stats`.
+#[derive(Deserialize)]
+pub struct WslPtyStat {
+    pub cpu_pct: f32,
+    pub rss_bytes: u64,
+    pub processes: u32,
+    pub workload: bool,
+    pub top: Option<String>,
+}
+
+/// One `/proc` scan inside the distribution, keyed by terminal marker.
+#[cfg(windows)]
+pub fn pty_stats(location: &Location) -> Result<HashMap<String, WslPtyStat>, String> {
+    request(location, "pty_stats", json!({}))
+}
+
+/// TERM every marked process except the root shell, then KILL survivors —
+/// the terminal's workload dies, its shell stays.
+#[cfg(windows)]
+pub fn signal_workload(location: &Location, marker: &str) -> Result<(), String> {
+    request::<Value>(
+        location,
+        "signal",
+        json!({"marker": marker, "action": "workload"}),
+    )?;
+    Ok(())
 }
 
 pub struct LinuxProcess {
@@ -540,6 +597,7 @@ impl Bridge {
                         | "resolve_agents"
                         | "agent_exec"
                         | "agent_environment"
+                        | "pty_stats"
                 )
             ) {
                 let result = reads.request(request);
@@ -1156,7 +1214,7 @@ with tempfile.TemporaryDirectory(prefix='monocode-env-') as directory:
     #[test]
     fn distribution_identity_and_arguments_preserve_linux_paths() {
         let value = Location::new("Ubuntu Work", "/home/me/Zażółć repo/Case").unwrap();
-        let terminal = terminal_args(&value);
+        let terminal = terminal_args(&value, None);
         assert_eq!(
             &terminal[..6],
             [
@@ -1169,8 +1227,11 @@ with tempfile.TemporaryDirectory(prefix='monocode-env-') as directory:
             ]
         );
         assert_eq!(terminal.last().unwrap(), "exec \"${SHELL:-/bin/sh}\" -l");
+        // A terminal marker rides as an env var so the whole tree inherits it.
+        let marked = terminal_args(&value, Some("pty-1"));
+        assert!(marked.iter().any(|arg| arg == "MONOCODE_PTY=pty-1"));
         assert_eq!(
-            exec_args(&value, "docker system prune -f"),
+            exec_args(&value, "docker system prune -f", None),
             vec![
                 "--distribution",
                 "Ubuntu Work",
@@ -1931,5 +1992,30 @@ assert not any(call[0] == 'signal' for call in calls)
             .request(json!({"op":"connect", "path":path}))
             .unwrap_err()
             .contains("Reconnect"));
+    }
+
+    /// No /proc on a unix host — the pty ops must degrade to empty results
+    /// instead of erroring, and marker validation must still reject.
+    #[cfg(unix)]
+    #[test]
+    fn real_bridge_pty_ops_degrade_without_proc() {
+        let mut command = Command::new("python3");
+        command.args(["-u", "-c", SCRIPT]);
+        let bridge = Bridge::start(&mut command).unwrap();
+        let path = std::env::temp_dir().to_string_lossy().into_owned();
+        assert_eq!(
+            bridge
+                .request(json!({"op":"pty_stats", "path":path}))
+                .unwrap(),
+            json!({})
+        );
+        let signaled = bridge
+            .request(json!({"op":"signal","path":path,"marker":"abc-1","action":"workload"}))
+            .unwrap();
+        assert_eq!(signaled["signaled"], 0);
+        assert!(bridge
+            .request(json!({"op":"signal","path":path,"marker":"bad;rm","action":"workload"}))
+            .is_err());
+        assert!(bridge.alive.load(Ordering::SeqCst));
     }
 }

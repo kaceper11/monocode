@@ -29,6 +29,8 @@ AGENT_BINARIES = {}
 ATTACHMENTS = None
 ATTACHMENT_BYTES = 0
 ATTACHMENT_COUNT = 0
+# marker -> (sample time, {pid: jiffies}) for per-terminal CPU deltas.
+PROC_STATS = {}
 
 
 def absolute(value):
@@ -367,6 +369,100 @@ def agent_authenticated(provider):
     return False if checks.get("strict") else None
 
 
+def _proc_marker(pid_dir):
+    """MONOCODE_PTY value from one process's environment, or None. environ is
+    readable for same-user processes only; anything else is skipped."""
+    try:
+        with open(os.path.join(pid_dir, "environ"), "rb") as stream:
+            # 1 MiB — a small 64 KB cap could truncate the marker out of
+            # a large inherited environment.
+            data = stream.read(1024 * 1024)
+    except OSError:
+        return None
+    for field in data.split(b"\0"):
+        if field.startswith(b"MONOCODE_PTY="):
+            try:
+                marker = field[13:].decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+            return marker if marker and len(marker) <= 128 else None
+    return None
+
+
+def _proc_stat(pid_dir):
+    """(comm, state, utime+stime jiffies, starttime) from
+    /proc/<pid>/stat. comm sits between the only parens, so splitting
+    after the last ')' is safe even when comm holds spaces or parens."""
+    try:
+        text = Path(pid_dir, "stat").read_text()
+    except OSError:
+        return None
+    end = text.rfind(")")
+    if end < 0:
+        return None
+    fields = text[end + 2 :].split()
+    if len(fields) < 20:
+        return None
+    try:
+        return (
+            text[text.find("(") + 1 : end],
+            fields[0],
+            int(fields[11]) + int(fields[12]),
+            int(fields[19]),
+        )
+    except ValueError:
+        return None
+
+
+def _scan_marked():
+    """Yields (pid, marker, parsed /proc stat) for marked processes."""
+    scanned = 0
+    try:
+        proc = os.scandir("/proc")
+    except OSError:
+        return
+    for entry in proc:
+        if scanned >= 8192 or not entry.name.isdigit():
+            continue
+        scanned += 1
+        marker = _proc_marker(entry.path)
+        if not marker:
+            continue
+        parsed = _proc_stat(entry.path)
+        if parsed:
+            yield int(entry.name), marker, parsed
+
+
+def _marked_pids(marker):
+    """{pid: starttime} of every process carrying MONOCODE_PTY=<marker>."""
+    return {
+        pid: parsed[3]
+        for pid, entry_marker, parsed in _scan_marked()
+        if entry_marker == marker
+    }
+
+
+def _alive(pid):
+    """Live and not a zombie — kill(pid, 0) alone reports zombies alive."""
+    parsed = _proc_stat(f"/proc/{pid}")
+    if parsed is not None:
+        return parsed[1] != "Z"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill(pid, sig):
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def handle(request):
     op = request["op"]
     path = absolute(request["path"])
@@ -433,6 +529,90 @@ def handle(request):
         if code and not out.strip():
             raise ValueError(err.decode("utf-8", errors="replace").strip())
         return out.decode("utf-8", errors="replace")
+    if op == "pty_stats":
+        # Every terminal spawned through wsl.exe carries MONOCODE_PTY=<id> in
+        # its environment — env is inherited, so the marker identifies the
+        # whole tree without a wsl.exe↔Linux pid map. One /proc pass serves
+        # all terminals in this distribution.
+        now = time.monotonic()
+        hz = os.sysconf("SC_CLK_TCK")
+        page = os.sysconf("SC_PAGE_SIZE")
+        trees = {}
+        for pid_key, marker, parsed in _scan_marked():
+            comm, _state, jiffies, start = parsed
+            try:
+                resident = int(Path("/proc", str(pid_key), "statm").read_text().split()[1]) * page
+            except (OSError, IndexError, ValueError):
+                resident = 0
+            slot = trees.setdefault(marker, {"pids": {}, "rss": 0})
+            slot["pids"][pid_key] = (jiffies, resident, comm, start)
+            slot["rss"] += resident
+        result = {}
+        for marker, slot in trees.items():
+            pids = slot["pids"]
+            prev = PROC_STATS.get(marker)
+            PROC_STATS[marker] = (now, {pid: p[0] for pid, p in pids.items()})
+            cpu = {}
+            if prev:
+                elapsed = now - prev[0]
+                # A stale baseline (panel closed for minutes) would dilute
+                # the reading to ~0 — treat it as a fresh sample.
+                if 0.05 < elapsed < 60:
+                    for pid, (jiffies, _, _, _) in pids.items():
+                        used = max(0, jiffies - prev[1].get(pid, 0))
+                        cpu[pid] = used / hz / elapsed * 100
+            # The shell spawned first, so the earliest-starttime marked
+            # process is the root — reparented orphans (daemonized dev
+            # servers, setsid children) stay workload members and remain
+            # killable instead of escaping as extra roots. Ties (same
+            # jiffy) break on the lower pid — the earlier fork.
+            root = min(pids, key=lambda pid: (pids[pid][3], pid))
+            members = [pid for pid in pids if pid != root]
+            top = None
+            if members:
+                best = max(members, key=lambda pid: (cpu.get(pid, 0), pids[pid][1]))
+                top = pids[best][2]
+            result[marker] = {
+                "cpu_pct": sum(cpu.values()),
+                "rss_bytes": slot["rss"],
+                "processes": len(pids),
+                "workload": bool(members),
+                "top": top,
+            }
+        for marker in list(PROC_STATS):
+            if marker not in trees:
+                del PROC_STATS[marker]
+        return result
+    if op == "signal":
+        marker = request.get("marker", "")
+        if (
+            not isinstance(marker, str)
+            or not marker
+            or len(marker) > 128
+            or any(not (c.isalnum() or c in "-_") for c in marker)
+        ):
+            raise ValueError("Invalid terminal marker")
+        if request.get("action") != "workload":
+            raise ValueError("Unknown signal action")
+        pids = _marked_pids(marker)
+        root = min(pids, key=lambda pid: (pids[pid], pid)) if pids else None
+        targets = [pid for pid in pids if pid != root]
+        signaled = len(targets)
+        for pid in targets:
+            _kill(pid, signal.SIGTERM)
+        # Same TERM→KILL escalation the host PTY kill uses, kept inside one
+        # bridge round trip so survivors cannot outlive the request.
+        deadline = time.monotonic() + 1.0
+        while targets and time.monotonic() < deadline:
+            targets = [pid for pid in targets if _alive(pid)]
+            if targets:
+                time.sleep(0.05)
+        # A target that died during the wait may have had its pid recycled
+        # by an unrelated process — re-verify the marker before KILLing.
+        for pid in targets:
+            if _proc_marker(f"/proc/{pid}") == marker:
+                _kill(pid, signal.SIGKILL)
+        return {"signaled": signaled}
     if op == "home":
         return str(Path.home())
     if op == "skill_entries":
