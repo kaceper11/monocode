@@ -42,6 +42,8 @@ type Props = {
   pane: EditorPane;
   focused: boolean;
   visible: boolean;
+  /** Another leaf is expanded over this pane — hide native webviews. */
+  occluded?: boolean;
   dirtyFileIds: Set<string>;
   fileErrorCounts: Map<string, number>;
   sessions: Session[];
@@ -69,6 +71,7 @@ function FilePaneComponent({
   pane,
   focused,
   visible,
+  occluded,
   dirtyFileIds,
   fileErrorCounts,
   sessions,
@@ -189,6 +192,7 @@ function FilePaneComponent({
                 <BrowserView
                   file={file}
                   active={visible && file.id === pane.activeFileId}
+                  occluded={occluded}
                   onMetaChange={(patch) =>
                     onBrowserMetaChange?.(file.id, patch)
                   }
@@ -229,6 +233,7 @@ export const FilePane = memo(FilePaneComponent, (previous, next) => {
     previous.pane !== next.pane ||
     previous.focused !== next.focused ||
     previous.visible !== next.visible ||
+    previous.occluded !== next.occluded ||
     previous.dirtyFileIds !== next.dirtyFileIds ||
     previous.fileErrorCounts !== next.fileErrorCounts ||
     previous.onFocus !== next.onFocus ||

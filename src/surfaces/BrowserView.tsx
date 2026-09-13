@@ -9,7 +9,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, ExternalLink, Globe, PanelTop, Pencil, Plus, RefreshCw, Star, Trash2, X } from "../chrome/icons";
+import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, ExternalLink, Globe, Maximize2, Minimize2, Pencil, Plus, RefreshCw, Star, Trash2, X } from "../chrome/icons";
 import { Popover } from "../chrome/Popover";
 import {
   browserAgentContext,
@@ -52,6 +52,9 @@ type Props = {
   file: FilePaneTab & { browser: BrowserTabSource };
   /** The tab is the active tab of a pane that is on screen. */
   active: boolean;
+  /** Another pane is expanded over this one — the DOM rect still reports
+   * layout, so the webview must be hidden explicitly. */
+  occluded?: boolean;
   onMetaChange?: (patch: BrowserMetaPatch) => void;
 };
 
@@ -67,7 +70,12 @@ const BOUNDS_POLL_MS = 800;
  * positioned over `hostRef`. The webview is created lazily on first
  * activation and destroyed on unmount — hiding only toggles visibility.
  */
-export function BrowserView({ file, active, onMetaChange }: Props) {
+export function BrowserView({
+  file,
+  active,
+  occluded,
+  onMetaChange,
+}: Props) {
   const label = `browser-${file.id}`;
   const url = file.browser.url;
   const hostRef = useRef<HTMLDivElement>(null);
@@ -366,9 +374,9 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
     };
   }, [syncBounds]);
 
-  const collapsed = !!file.browser.collapsed;
+  const expanded = !!file.browser.expanded;
   const wantShow =
-    opened && active && !overlayOpen && status !== "failed" && !collapsed;
+    opened && active && !overlayOpen && status !== "failed" && !occluded;
   wantShowRef.current = wantShow;
   useEffect(() => {
     if (!opened) return;
@@ -545,11 +553,15 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
             <Plus className="size-3.5" strokeWidth={1.75} />
           </ToolbarButton>
           <ToolbarButton
-            title={collapsed ? "Expand page" : "Collapse page"}
-            pressed={collapsed}
-            onClick={() => onMetaChange?.({ collapsed: !collapsed })}
+            title={expanded ? "Back to split view" : "Fill the workspace"}
+            pressed={expanded}
+            onClick={() => onMetaChange?.({ expanded: !expanded })}
           >
-            <PanelTop className="size-3.5" strokeWidth={1.75} />
+            {expanded ? (
+              <Minimize2 className="size-3.5" strokeWidth={1.75} />
+            ) : (
+              <Maximize2 className="size-3.5" strokeWidth={1.75} />
+            )}
           </ToolbarButton>
         </div>
       ) : null}
@@ -611,7 +623,7 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
           </button>
         </div>
       ) : null}
-      <div className={`relative min-h-0 flex-1 ${collapsed ? "hidden" : ""}`}>
+      <div className="relative min-h-0 flex-1">
         <div ref={hostRef} className="absolute inset-0" />
         {!url ? (
           <EmptyBrowserState

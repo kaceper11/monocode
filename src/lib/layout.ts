@@ -77,8 +77,8 @@ export type BrowserTabSource = {
   url: string;
   /** Last document title reported by the page. */
   title?: string;
-  /** Page collapsed to just the toolbar; the webview stays loaded. */
-  collapsed?: boolean;
+  /** Leaf expands to cover the whole pane area; other leaves stay mounted. */
+  expanded?: boolean;
 };
 
 export type FilePaneTab = {
@@ -254,7 +254,7 @@ export function newBrowserTab(cwd: string, url: string): FilePaneTab {
 export type BrowserMetaPatch = {
   url?: string;
   title?: string;
-  collapsed?: boolean;
+  expanded?: boolean;
 };
 
 /** Page-side state the webview reports back; keeps tab + snapshot current. */
@@ -271,18 +271,18 @@ export function updateBrowserTab(
       const url = patch.url?.trim();
       const title =
         patch.title !== undefined ? patch.title.trim() : file.browser.title;
-      const collapsed = patch.collapsed ?? file.browser.collapsed;
+      const expanded = patch.expanded ?? file.browser.expanded;
       if (
         (!url || url === file.browser.url) &&
         title === file.browser.title &&
-        collapsed === file.browser.collapsed
+        expanded === file.browser.expanded
       )
         return file;
       paneChanged = true;
       const browser: BrowserTabSource = {
         url: url ?? file.browser.url,
         ...(title ? { title } : {}),
-        ...(collapsed ? { collapsed: true } : {}),
+        ...(expanded ? { expanded: true } : {}),
       };
       return { ...file, ...(url ? { path: url } : {}), browser };
     });

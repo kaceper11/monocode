@@ -250,6 +250,15 @@ function PaneTreeComponent({
   const leaves = layoutLeaves(tree);
   const sashes = layoutSashes(tree);
   const inSplit = leaves.length > 1;
+  // A browser tab flagged `expanded` zooms its leaf over the whole tree —
+  // tmux-style pane zoom. Other leaves stay mounted underneath (sessions
+  // keep running, composer keeps its draft); only their native webviews
+  // must be told to hide via `occluded`.
+  const expandedLeafId = leaves.find((leaf) => {
+    const pane = editorPanes.find((entry) => entry.id === leaf.id);
+    const file = pane?.files.find((entry) => entry.id === pane.activeFileId);
+    return !!file?.browser?.expanded;
+  })?.id;
 
   const startPaneDrag = useCallback(
     (fromId: string, event: ReactPointerEvent<HTMLElement>) => {
@@ -340,16 +349,27 @@ function PaneTreeComponent({
           "--chat-background-width": `${100 / leaf.rect.w}%`,
           "--chat-background-height": `${100 / leaf.rect.h}%`,
         } as CSSProperties;
+        const expanded = leaf.id === expandedLeafId;
         return (
           <div
             key={leaf.id}
             data-pane-id={leaf.id}
-            className={`absolute flex min-h-0 min-w-0 flex-col overflow-hidden ${dragging ? "opacity-40" : ""}`}
+            className={`absolute flex min-h-0 min-w-0 flex-col overflow-hidden ${dragging ? "opacity-40" : ""} ${expanded ? "bg-background-base" : ""}`}
             style={{
-              left: `${leaf.rect.x * 100}%`,
-              top: `${leaf.rect.y * 100}%`,
-              width: `${leaf.rect.w * 100}%`,
-              height: `${leaf.rect.h * 100}%`,
+              ...(expanded
+                ? {
+                    left: 0,
+                    top: 0,
+                    width: "100%",
+                    height: "100%",
+                    zIndex: 30,
+                  }
+                : {
+                    left: `${leaf.rect.x * 100}%`,
+                    top: `${leaf.rect.y * 100}%`,
+                    width: `${leaf.rect.w * 100}%`,
+                    height: `${leaf.rect.h * 100}%`,
+                  }),
               ...backgroundStyle,
             }}
           >
@@ -360,6 +380,7 @@ function PaneTreeComponent({
               <FilePane
                 pane={editorPane}
                 visible={visible}
+                occluded={!!expandedLeafId && !expanded}
                 focused={focusedId === editorPane.id}
                 dirtyFileIds={dirtyFileIds}
                 fileErrorCounts={fileErrorCounts}
@@ -440,7 +461,7 @@ function PaneTreeComponent({
           </div>
         );
       })}
-      {sashes.map((sash) => (
+      {(expandedLeafId ? [] : sashes).map((sash) => (
         <Sash
           key={`${sash.splitId}:${sash.index}`}
           sash={sash}

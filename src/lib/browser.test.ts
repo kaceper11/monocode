@@ -294,7 +294,7 @@ describe("browser tabs in the layout", () => {
     expect(next.editorPanes[0].files[0].path).toBe("http://localhost:3000/");
   });
 
-  it("updateBrowserTab toggles collapsed without touching url or title", () => {
+  it("updateBrowserTab toggles expanded without touching url or title", () => {
     const browser = {
       ...newBrowserTab("/repo", "http://localhost:3000/"),
       id: "b1",
@@ -303,20 +303,20 @@ describe("browser tabs in the layout", () => {
       ...newTab("s1"),
       editorPanes: [{ id: "p1", files: [browser], activeFileId: "b1" }],
     };
-    const collapsed = updateBrowserTab(tab, "b1", { collapsed: true });
-    const entry = collapsed.editorPanes[0].files[0];
-    expect(entry.browser?.collapsed).toBe(true);
+    const expanded = updateBrowserTab(tab, "b1", { expanded: true });
+    const entry = expanded.editorPanes[0].files[0];
+    expect(entry.browser?.expanded).toBe(true);
     expect(entry.browser?.url).toBe("http://localhost:3000/");
 
-    // A later navigation patch keeps the collapsed flag.
-    const navigated = updateBrowserTab(collapsed, "b1", {
+    // A later navigation patch keeps the expanded flag.
+    const navigated = updateBrowserTab(expanded, "b1", {
       url: "http://localhost:3000/next",
     });
-    expect(navigated.editorPanes[0].files[0].browser?.collapsed).toBe(true);
+    expect(navigated.editorPanes[0].files[0].browser?.expanded).toBe(true);
 
-    const expanded = updateBrowserTab(navigated, "b1", { collapsed: false });
+    const restored = updateBrowserTab(navigated, "b1", { expanded: false });
     expect(
-      expanded.editorPanes[0].files[0].browser?.collapsed,
+      restored.editorPanes[0].files[0].browser?.expanded,
     ).toBeUndefined();
   });
 });
@@ -356,7 +356,7 @@ describe("browser tabs in the workspace snapshot", () => {
     expect(file?.browser?.title).toBe("App");
   });
 
-  it("round-trips the collapsed flag only when true", () => {
+  it("round-trips the expanded flag only when true", () => {
     const parsed = parseWorkspaceSnapshot(
       snapshotWith([
         {
@@ -365,20 +365,20 @@ describe("browser tabs in the workspace snapshot", () => {
           cwd: "/repo",
           browser: {
             url: "http://localhost:3000/",
-            collapsed: true,
+            expanded: true,
           },
         },
         {
           id: "b2",
           path: "http://localhost:4000/",
           cwd: "/repo",
-          browser: { url: "http://localhost:4000/", collapsed: "yes" },
+          browser: { url: "http://localhost:4000/", expanded: "yes" },
         },
       ]),
     );
     const files = parsed?.tabs[0].editorPanes[0].files;
-    expect(files?.[0].browser?.collapsed).toBe(true);
-    expect(files?.[1].browser?.collapsed).toBeUndefined();
+    expect(files?.[0].browser?.expanded).toBe(true);
+    expect(files?.[1].browser?.expanded).toBeUndefined();
   });
 
   it.each([
