@@ -7,6 +7,8 @@ import {
 } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
+  ChevronDown,
+  ChevronRight,
   Copy,
   Eye,
   FolderOpen,
@@ -286,6 +288,7 @@ function InventoryTab({
 }): ReactNode {
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const [query, setQuery] = useState("");
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const needle = query.trim().toLowerCase();
 
   const counts = useMemo(() => {
@@ -390,6 +393,8 @@ function InventoryTab({
             tab={tab}
             needle={needle}
             pending={pending}
+            collapsed={collapsed}
+            onCollapseChange={setCollapsed}
             onToggle={onToggle}
             onRemove={onRemove}
             onCopyPath={onCopyPath}
@@ -475,6 +480,8 @@ function ProviderGroups({
   tab,
   needle,
   pending,
+  collapsed,
+  onCollapseChange,
   onToggle,
   onRemove,
   onCopyPath,
@@ -485,6 +492,8 @@ function ProviderGroups({
   tab: Exclude<ExtensionTab, "skills" | "instructions">;
   needle: string;
   pending: Set<string>;
+  collapsed: Set<string>;
+  onCollapseChange: (next: Set<string>) => void;
   onToggle: (toggle: ToggleRef, enabled: boolean) => void;
   onRemove: (remove: RemoveRef, label: string) => void;
   onCopyPath: (path: string) => void;
@@ -505,6 +514,15 @@ function ProviderGroups({
       return { provider, entries, files };
     })
     .filter((group) => group.entries.length > 0 || group.files.length > 0);
+  const toggleCollapsed = (provider: string): void => {
+    const next = new Set(collapsed);
+    if (next.has(provider)) {
+      next.delete(provider);
+    } else {
+      next.add(provider);
+    }
+    onCollapseChange(next);
+  };
 
   if (groups.length === 0) {
     return (
@@ -517,15 +535,31 @@ function ProviderGroups({
     <div className="space-y-5">
       {groups.map(({ provider, entries, files }) => (
         <section key={provider.provider}>
-          <h3 className="flex items-center gap-1.5 pb-1.5 text-[11px] font-medium uppercase tracking-wide text-content/45">
-            <ProviderMark provider={provider.provider} />
-            {providerTitle(provider.provider)}
-            {!provider.detected ? (
+          <h3 className="pb-1.5 text-[11px] font-medium uppercase tracking-wide text-content/45">
+            <button
+              type="button"
+              aria-expanded={!collapsed.has(provider.provider)}
+              onClick={() => toggleCollapsed(provider.provider)}
+              className="flex w-full items-center gap-1.5 rounded text-left hover:text-content/70"
+            >
+              {collapsed.has(provider.provider) ? (
+                <ChevronRight className="size-3 shrink-0" strokeWidth={2} />
+              ) : (
+                <ChevronDown className="size-3 shrink-0" strokeWidth={2} />
+              )}
+              <ProviderMark provider={provider.provider} />
+              {providerTitle(provider.provider)}
               <span className="font-normal normal-case tracking-normal text-content/30">
-                — no install found, config files only
+                {entries.length + files.length}
               </span>
-            ) : null}
+              {!provider.detected ? (
+                <span className="font-normal normal-case tracking-normal text-content/30">
+                  — no install found, config files only
+                </span>
+              ) : null}
+            </button>
           </h3>
+          {collapsed.has(provider.provider) ? null : (
           <div className="overflow-hidden rounded-lg border border-content/10">
             {entries.map((entry, index) => (
               <div
@@ -598,6 +632,7 @@ function ProviderGroups({
               </div>
             ) : null}
           </div>
+          )}
         </section>
       ))}
     </div>
