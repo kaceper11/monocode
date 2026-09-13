@@ -2293,22 +2293,6 @@ export default function App({
     onOpenTerminal(active?.cwd ?? projectCwd);
   }, [active?.cwd, onOpenTerminal, projectCwd]);
 
-  const onShowProjectTerminal = useCallback(() => {
-    const dock = findProjectTerminal(projectTerminalsRef.current, projectCwd);
-    if (dock && dock.pane.files.length > 0) {
-      if (!dock.open) {
-        setProjectTerminals((prev) =>
-          mapProjectTerminal(prev, projectCwd, (entry) =>
-            withDockOpen(entry, true),
-          ),
-        );
-      }
-      focusProjectTerminal();
-      return;
-    }
-    onOpenTerminal(active?.cwd ?? projectCwd);
-  }, [active?.cwd, focusProjectTerminal, onOpenTerminal, projectCwd]);
-
   const onNewTerminalInSession = useCallback(
     (sessionId: string) => {
       const session = sessionsRef.current.find(
@@ -4373,6 +4357,63 @@ export default function App({
     },
     [dismissOverlays],
   );
+
+  /** Title-bar globe toggle: with no browser open in the active workspace
+   * it opens one (the remembered page); with browsers open it closes them
+   * all. The remembered per-worktree URL restores the last page on the
+   * next open, so toggling off and on brings the browser back. */
+  const onToggleBrowser = useCallback(() => {
+    const tab = tabsRef.current.find(
+      (entry) => entry.id === activeTabIdRef.current,
+    );
+    if (!tab) return;
+    if (
+      !tab.editorPanes.some((pane) => pane.files.some((file) => file.browser))
+    ) {
+      onOpenBrowser();
+      return;
+    }
+    // A tab that is only a lone browser pane — closing the browser is
+    // closing the workspace tab itself.
+    if (
+      leafIds(tab.layout).length === 1 &&
+      tab.editorPanes.length === 1 &&
+      tab.editorPanes[0].files.every((file) => file.browser)
+    ) {
+      onCloseTab(tab.id);
+      return;
+    }
+    let layout = tab.layout;
+    let focusedId = tab.focusedId;
+    const editorPanes = tab.editorPanes.flatMap((pane) => {
+      const files = pane.files.filter((file) => !file.browser);
+      if (files.length > 0) {
+        return [
+          {
+            ...pane,
+            files,
+            activeFileId: files.some((file) => file.id === pane.activeFileId)
+              ? pane.activeFileId
+              : files[0].id,
+          },
+        ];
+      }
+      const sibling = siblingLeafId(layout, pane.id);
+      const without = removePane(layout, pane.id);
+      if (!without) return [pane];
+      layout = without;
+      if (focusedId === pane.id) focusedId = sibling ?? firstLeafId(without);
+      return [];
+    });
+    setTabs((prev) =>
+      prev.map((entry) =>
+        entry.id === tab.id ? { ...entry, layout, focusedId, editorPanes } : entry,
+      ),
+    );
+    setComposerFocused(
+      sessionsRef.current.some((session) => session.id === focusedId),
+    );
+  }, [onCloseTab, onOpenBrowser]);
 
   useEffect(() => {
     const listener = (event: Event) => {
@@ -8226,11 +8267,13 @@ export default function App({
             onSelect={activateTab}
             onNew={onNew}
             onNewTerminal={onNewTerminal}
-            onShowTerminal={onShowProjectTerminal}
-            onOpenBrowser={() => onOpenBrowser()}
+            onShowTerminal={onToggleProjectTerminal}
+            onOpenBrowser={onToggleBrowser}
             browserActive={browserOpen}
-            projectTerminalActive={
-              !!currentProjectDock && currentProjectDock.pane.files.length > 0
+            projectTerminalActive={dockVisible}
+            projectTerminalExists={
+              !!currentProjectDock &&
+              currentProjectDock.pane.files.length > 0
             }
             onOpenSettings={onOpenSettings}
             onOpenInbox={onOpenInbox}

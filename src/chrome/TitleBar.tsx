@@ -76,7 +76,10 @@ type Props = {
   onOpenBrowser?: () => void;
   /** A browser tab is open in the active workspace tab. */
   browserActive?: boolean;
+  /** The project terminal dock is open. */
   projectTerminalActive?: boolean;
+  /** The project terminal dock exists (open or hidden). */
+  projectTerminalExists?: boolean;
   onOpenSettings?: () => void;
   onOpenInbox?: () => void;
   onOpenNotes?: () => void;
@@ -555,6 +558,7 @@ function TitleBarComponent({
   onOpenBrowser,
   browserActive = false,
   projectTerminalActive = false,
+  projectTerminalExists = false,
   onOpenSettings,
   onOpenInbox,
   onOpenNotes,
@@ -740,11 +744,15 @@ function TitleBarComponent({
         {!projectless && (onShowTerminal || onNewTerminal) ? (
           <IconButton
             label={
-              projectTerminalActive ? "Terminal" : `New Terminal (${MOD}\`)`
+              projectTerminalActive
+                ? "Hide Terminal"
+                : projectTerminalExists
+                  ? "Show Terminal"
+                  : `New Terminal (${MOD}\`)`
             }
             accent={projectTerminalActive}
             onClick={
-              projectTerminalActive
+              projectTerminalExists
                 ? (onShowTerminal ?? onNewTerminal)
                 : onNewTerminal
             }
