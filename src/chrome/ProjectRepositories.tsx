@@ -117,6 +117,7 @@ export function ProjectRepositories({
   /** Repository id being relocated through the shared folder picker. */
   const locating = useRef<string | null>(null);
   const [pending, setPending] = useState<PendingRepo[]>([]);
+  const [queueSetName, setQueueSetName] = useState("");
   const [scanning, setScanning] = useState(false);
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [setName, setSetName] = useState("");
@@ -264,8 +265,8 @@ export function ProjectRepositories({
   };
 
   /** Writes memberships for the given families — materializing the project on
-   * first use. Returns the commonDir keys that failed so a queue can keep
-   * them. */
+   * first use. Returns the target record plus the commonDir keys that failed
+   * so a queue can keep them. */
   const commitFamilies = (found: RepositoryFamily[], nameHint?: string) => {
     const target = ensureProject(nameHint);
     const errors: string[] = [];
@@ -293,7 +294,7 @@ export function ProjectRepositories({
       }
     }
     if (errors.length) setError(errors.join("\n"));
-    return failed;
+    return { failed, target };
   };
 
   /** A single explicit pick commits immediately — unless the group is still
@@ -350,16 +351,32 @@ export function ProjectRepositories({
   };
 
   /** Commits the queued entries — the only batched write. In import mode a
-   * clean submit creates the project and closes the sheet; failures keep the
-   * sheet open with just the failed rows left. */
+   * clean submit creates the project, optionally saves the queue as a set,
+   * and closes the sheet; failures keep the sheet open with just the failed
+   * rows left. */
   const submitPending = () => {
     if (!pending.length) return;
     setError("");
-    const failed = commitFamilies(pending.map((item) => item.family));
+    const importing = groupImport && !project;
+    const { failed, target } = commitFamilies(
+      pending.map((item) => item.family),
+    );
     setPending((prev) =>
       prev.filter((item) => failed.has(pathKey(item.family.commonDir))),
     );
-    if (groupImport && !project && !failed.size) onClose();
+    if (!importing || failed.size) return;
+    const setLabel = queueSetName.trim();
+    if (setLabel) {
+      const committed = new Set(
+        pending.map((item) => pathKey(item.family.commonDir)),
+      );
+      const ids = (loadProjects().find((p) => p.id === target.id)
+        ?.repositories ?? [])
+        .filter((repo) => committed.has(pathKey(repo.commonDir)))
+        .map((repo) => repo.id);
+      if (ids.length) saveRepositorySet(target.id, setLabel, ids);
+    }
+    onClose();
   };
 
   const pickAdd = () => {
@@ -700,6 +717,15 @@ export function ProjectRepositories({
                     );
                   })}
                 </ul>
+                {groupImport && !project ? (
+                  <input
+                    value={queueSetName}
+                    onChange={(event) => setQueueSetName(event.target.value)}
+                    placeholder="Optional: save these as a repository set — name"
+                    aria-label="Repository set name"
+                    className={`${inputClass} py-1 text-[12px]`}
+                  />
+                ) : null}
                 <div className="flex items-center justify-end gap-2 pt-1">
                   <button
                     type="button"
