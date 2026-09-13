@@ -90,7 +90,7 @@ export type RailProjectItem = RecentProject & { project?: ProjectRecord };
 const KEY = "monocode.projects.v1";
 const PROJECTS_CHANGED = "monocode:projects-changed";
 const MAX_PROJECTS = 100;
-const MAX_REPOSITORIES = 50;
+export const MAX_REPOSITORIES = 50;
 const MAX_SETS = 50;
 const MAX_COMMANDS = 100;
 const MAX_COMMAND_GROUPS = 50;
@@ -510,14 +510,18 @@ export function addRepositoryToProject(
   );
   if (owner?.id === projectId)
     return { error: "Repository is already in this project." };
+  // Check before the write — the same pass would otherwise evict the repo
+  // from its owner while adding nothing, losing the membership entirely.
+  if (target.repositories.length >= MAX_REPOSITORIES)
+    return {
+      error: `This project already has ${MAX_REPOSITORIES} repositories.`,
+    };
   const entry: ProjectRepository = { ...repo, id: crypto.randomUUID() };
   const next = projects.map((project) => {
     if (project.id === owner?.id)
       return removeRepositoryEntry(project, key);
-    if (project.id === projectId) {
-      if (project.repositories.length >= MAX_REPOSITORIES) return project;
+    if (project.id === projectId)
       return { ...project, repositories: [...project.repositories, entry] };
-    }
     return project;
   });
   saveProjects(next);

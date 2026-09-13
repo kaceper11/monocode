@@ -285,6 +285,32 @@ describe("project grouping on the rail", () => {
     expect(sections.projects.map((item) => item.path)).toEqual(["/tmp/app"]);
     expect(sections.projects[0].project?.id).toBe(project.id);
   });
+
+  it("renders a group once when its sentinel row and a member recent share the rail", () => {
+    const group = createProjectGroup("Team");
+    addRepositoryToProject(group.id, {
+      commonDir: "/tmp/lib/.git",
+      anchor: "/tmp/lib",
+    });
+    const families = new Map([
+      [pathKey("/tmp/lib"), family("/tmp/lib/.git", "/tmp/lib")],
+    ]);
+    // The stored project injects its sentinel row while /tmp/lib stays a
+    // recent — grouping must merge them into a single project row.
+    const sections = projectRailSections(
+      [{ path: "/tmp/lib", openedAt: 1 }],
+      "/tmp/lib",
+      [projectRailKey(group.id), "/tmp/lib"],
+      [],
+      families,
+      loadProjects(),
+    );
+    const rows = sections.projects.filter(
+      (item) => item.project?.id === group.id,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].path).toBe(projectRailKey(group.id));
+  });
 });
 
 describe("forgetProject", () => {

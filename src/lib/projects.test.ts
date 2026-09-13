@@ -14,6 +14,7 @@ import {
   isProjectRailKey,
   loadProjects,
   locateRepository,
+  MAX_REPOSITORIES,
   moveRepositorySet,
   projectContainsPath,
   projectForPath,
@@ -209,6 +210,40 @@ describe("membership", () => {
           (r) => pathKey(r.commonDir) === pathKey("/tmp/c/.git"),
         ),
     ).toBe(false);
+  });
+
+  it("rejects a move into a full project and keeps the original owner", () => {
+    const source = ensureProjectForPath(
+      "/tmp/a",
+      family("/tmp/a/.git", "/tmp/a"),
+    );
+    const full = ensureProjectForPath(
+      "/tmp/b",
+      family("/tmp/b/.git", "/tmp/b"),
+    );
+    for (let i = 0; i < MAX_REPOSITORIES - 1; i += 1) {
+      expect(
+        addRepositoryToProject(full.id, {
+          commonDir: `/tmp/r${i}/.git`,
+          anchor: `/tmp/r${i}`,
+        }).error,
+      ).toBeUndefined();
+    }
+    // The anchor repo plus the fillers put the target at the cap.
+    expect(
+      addRepositoryToProject(full.id, {
+        commonDir: "/tmp/a/.git",
+        anchor: "/tmp/a",
+      }).error,
+    ).toContain("50");
+    const projects = loadProjects();
+    const owner = projects.find((p) =>
+      p.repositories.some(
+        (r) => pathKey(r.commonDir) === pathKey("/tmp/a/.git"),
+      ),
+    );
+    // The failed move must not have evicted the repo from its old project.
+    expect(owner?.id).toBe(source.id);
   });
 
   it("removing a repository prunes it from saved sets", () => {

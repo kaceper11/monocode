@@ -621,12 +621,40 @@ export function ProjectRail({
     saveProjectRailOrder(next);
   };
 
-  const onTogglePin = (path: string) => {
-    const isPinned = pinnedPaths.some((pinned) =>
-      sameProjectPath(pinned, path),
-    );
+  /** Recent paths whose verified family belongs to the project — the paths the
+   * rail actually lists for it. */
+  const memberRecentPaths = (project: ProjectRecord) =>
+    recents
+      .filter((item) => projectContainsPath(project, item.path, families))
+      .map((item) => item.path);
+
+  /** Every normalized key a grouped row can be pinned under — its row path,
+   * the project anchor and sentinel key, member repository anchors and member
+   * recents. A pin stored against any of them must resolve, or a member-pinned
+   * row offers "Pin project" again with no way to unpin. */
+  const pinKeys = (path: string, project?: ProjectRecord) => {
+    const keys = new Set([pathKey(path)]);
+    if (project) {
+      if (project.anchor) keys.add(pathKey(project.anchor));
+      keys.add(pathKey(projectRailKey(project.id)));
+      for (const repo of project.repositories)
+        if (repo.anchor) keys.add(pathKey(repo.anchor));
+      for (const member of memberRecentPaths(project))
+        keys.add(pathKey(member));
+    }
+    return keys;
+  };
+
+  const isRowPinned = (path: string, project?: ProjectRecord) => {
+    const keys = pinKeys(path, project);
+    return pinnedPaths.some((pinned) => keys.has(pathKey(pinned)));
+  };
+
+  const onTogglePin = (path: string, project?: ProjectRecord) => {
+    const keys = pinKeys(path, project);
+    const isPinned = pinnedPaths.some((pinned) => keys.has(pathKey(pinned)));
     const next = isPinned
-      ? pinnedPaths.filter((pinned) => !sameProjectPath(pinned, path))
+      ? pinnedPaths.filter((pinned) => !keys.has(pathKey(pinned)))
       : [...pinnedPaths, path];
     setPinnedPaths(next);
     savePinnedProjects(next);
@@ -635,13 +663,6 @@ export function ProjectRail({
   const menuProject = projectMenu?.projectId
     ? storedProjects.find((entry) => entry.id === projectMenu.projectId)
     : undefined;
-
-  /** Recent paths whose verified family belongs to the project — the paths the
-   * rail actually lists for it. */
-  const memberRecentPaths = (project: ProjectRecord) =>
-    recents
-      .filter((item) => projectContainsPath(project, item.path, families))
-      .map((item) => item.path);
 
   const removeProjectEntry = (
     path: string,
@@ -672,8 +693,13 @@ export function ProjectRail({
     const { path, projectKey, projectId } = projectMenu;
     const displayName =
       menuProject?.name ??
-      resolveTabGroupLabel(projectKey, groupLabels, basename(path));
-    if (action === "pin" || action === "unpin") onTogglePin(path);
+      resolveTabGroupLabel(
+        projectKey,
+        groupLabels,
+        isProjectRailKey(path) ? "Project" : basename(path),
+      );
+    if (action === "pin" || action === "unpin")
+      onTogglePin(path, menuProject);
     else if (action === "new-task") onNewTask?.(path, projectId);
     else if (action === "commands") {
       onOpenCommands?.({
@@ -940,9 +966,7 @@ export function ProjectRail({
           onClose={() => setProjectMenu(null)}
           showActions={false}
           extraItems={projectMenuExtraItems(
-            pinnedPaths.some((pinned) =>
-              sameProjectPath(pinned, projectMenu.path),
-            ),
+            isRowPinned(projectMenu.path, menuProject),
             Boolean(onRemoveProject),
             !isProjectRailKey(projectMenu.path),
           )}
@@ -1420,7 +1444,7 @@ function ProjectSection({
   pinned: boolean;
   searchActive: boolean;
   onSelect: (path: string) => void;
-  onTogglePin: (path: string) => void;
+  onTogglePin: (path: string, project?: ProjectRecord) => void;
   onContextMenu: (item: RailProjectItem, event: MouseEvent<HTMLElement>) => void;
   onOpenMenu: (
     item: RailProjectItem,
@@ -2367,7 +2391,7 @@ function ProjectCard({
   sortable: SortableHandle;
   index: number;
   onSelect: (path: string) => void;
-  onTogglePin: (path: string) => void;
+  onTogglePin: (path: string, project?: ProjectRecord) => void;
   onContextMenu: (item: RailProjectItem, event: MouseEvent<HTMLElement>) => void;
   onOpenMenu: (
     item: RailProjectItem,
@@ -2542,7 +2566,7 @@ function ProjectCard({
         onPointerDown={(event) => event.stopPropagation()}
         onClick={(event) => {
           event.stopPropagation();
-          onTogglePin(item.path);
+          onTogglePin(item.path, item.project);
         }}
         className={`absolute ${worktreeControls ? "left-6" : "left-2"} top-1/2 grid size-4 -translate-y-1/2 place-items-center rounded-sm text-content/55 opacity-0 pointer-events-none transition-opacity hover:text-content group-hover:pointer-events-auto group-hover:opacity-100`}
       >

@@ -10,6 +10,7 @@ import { probeRepositoryFamily } from "../hooks/useRepositoryFamilies";
 import {
   addRepositoryToProject,
   createProjectGroup,
+  deleteProject,
   deleteRepositorySet,
   ensureProjectForPath,
   familyForRepository,
@@ -190,7 +191,18 @@ export function ProjectRepositories({
     if (!project) return;
     let cancelled = false;
     for (const repo of project.repositories) {
-      if (familyForRepository(repo, families)) continue;
+      if (familyForRepository(repo, families)) {
+        // Verified through another probe (rail expansion, a locate elsewhere)
+        // — a stale "missing" flag must clear too.
+        if (repo.id)
+          setMissing((prev) => {
+            if (!prev.has(repo.id)) return prev;
+            const next = new Set(prev);
+            next.delete(repo.id);
+            return next;
+          });
+        continue;
+      }
       void probeRepositoryFamily(repo.anchor).then((found) => {
         if (cancelled) return;
         if (!found)
@@ -228,27 +240,37 @@ export function ProjectRepositories({
   );
 
   /** Splits probed families into queueable items vs already-covered ones.
-   * Members of this project and already-queued repositories are skipped. */
+   * Membership is read from the store — a submit or instant add may have
+   * landed while a folder scan was still probing children. */
   const stageable = (found: (RepositoryFamily | null)[]) => {
-    const memberKeys = new Set(members.map((repo) => pathKey(repo.commonDir)));
+    const targetId = projectId ?? createdId ?? project?.id;
+    const all = loadProjects();
+    const stored = targetId
+      ? all.find((entry) => entry.id === targetId)
+      : undefined;
+    const memberKeys = new Set(
+      (stored?.repositories ?? members).map((repo) =>
+        pathKey(repo.commonDir),
+      ),
+    );
     const queuedKeys = new Set(
       pending.map((item) => pathKey(item.family.commonDir)),
     );
     const items: PendingRepo[] = [];
     let covered = 0;
-    for (const family of found) {
-      if (!family) continue;
-      const key = pathKey(family.commonDir);
+    for (const probed of found) {
+      if (!probed) continue;
+      const key = pathKey(probed.commonDir);
       if (memberKeys.has(key) || queuedKeys.has(key)) {
         covered++;
         continue;
       }
       queuedKeys.add(key);
-      const owner = findProjectByCommonDir(family.commonDir, projects)?.project;
+      const owner = findProjectByCommonDir(probed.commonDir, all)?.project;
       items.push({
-        family,
+        family: probed,
         owner:
-          owner && owner.id !== project?.id
+          owner && owner.id !== targetId
             ? (owner.name ??
               (owner.anchor ? basename(owner.anchor) : "another project"))
             : undefined,
@@ -258,15 +280,31 @@ export function ProjectRepositories({
   };
 
   const stage = (result: { items: PendingRepo[]; covered: number }) => {
-    if (result.items.length) setPending((prev) => [...prev, ...result.items]);
-    else if (result.covered)
-      setError("That repository is already in this project or queued.");
+    // Dedupe against the live queue inside the update — a second scan or an
+    // instant add may have staged the same repository in the meantime.
+    setPending((prev) => {
+      const queued = new Set(
+        prev.map((item) => pathKey(item.family.commonDir)),
+      );
+      const fresh = result.items.filter(
+        (item) => !queued.has(pathKey(item.family.commonDir)),
+      );
+      return fresh.length ? [...prev, ...fresh] : prev;
+    });
+    if (!result.items.length && result.covered)
+      setError(
+        result.covered === 1
+          ? "That repository is already in this project or queued."
+          : "Those repositories are already in this project or queued.",
+      );
   };
 
   /** Writes memberships for the given families — materializing the project on
-   * first use. Returns the commonDir keys that failed so a queue can keep
-   * them. */
+   * first use. A just-created group is rolled back when nothing lands, so a
+   * fully-failed import leaves no empty row. Returns the commonDir keys that
+   * failed so a queue can keep them. */
   const commitFamilies = (found: RepositoryFamily[], nameHint?: string) => {
+    const creating = groupImport && !project;
     const target = ensureProject(nameHint);
     const errors: string[] = [];
     const failed = new Set<string>();
@@ -291,6 +329,10 @@ export function ProjectRepositories({
         errors.push(result.error);
         failed.add(key);
       }
+    }
+    if (creating && failed.size === found.length) {
+      deleteProject(target.id);
+      setCreatedId(undefined);
     }
     if (errors.length) setError(errors.join("\n"));
     return failed;
@@ -368,9 +410,9 @@ export function ProjectRepositories({
       setPickOpen(true);
       return;
     }
-    void pickFolder("Choose a repository or a folder of repositories").then(
-      addPicked,
-    );
+    void pickFolder("Choose a repository or a folder of repositories")
+      .then(addPicked)
+      .catch((reason) => setError(String(reason)));
   };
 
   const reconnect = (repo: ProjectRepository) => {
@@ -419,9 +461,9 @@ export function ProjectRepositories({
       setPickOpen(true);
       return;
     }
-    void pickFolder("Locate repository").then((picked) =>
-      locateInto(repo, picked),
-    );
+    void pickFolder("Locate repository")
+      .then((picked) => locateInto(repo, picked))
+      .catch((reason) => setError(String(reason)));
   };
 
   const commitSet = () => {
@@ -517,7 +559,11 @@ export function ProjectRepositories({
             className={inputClass}
             onBlur={(event) => {
               const name = event.target.value.trim();
-              if (!name) return;
+              if (!name) {
+                // Clearing the field restores the folder-derived preview.
+                if (groupImport && !project) setImportName("");
+                return;
+              }
               if (project) {
                 if (name !== title) renameProject(project.id, name);
               } else if (groupImport) {
@@ -661,7 +707,11 @@ export function ProjectRepositories({
                   {pending.map((item) => {
                     const key = pathKey(item.family.commonDir);
                     const label =
-                      basename(item.family.checkout) || item.family.checkout;
+                      basename(item.family.checkout) ||
+                      basename(
+                        item.family.worktrees[0]?.path ??
+                          item.family.commonDir,
+                      );
                     return (
                       <li
                         key={key}
@@ -725,7 +775,9 @@ export function ProjectRepositories({
             {candidates.length ? (
               <div className="mt-2">
                 <p className="mb-0.5 text-[11px] text-content/45">
-                  Already verified — click to add:
+                  {groupImport && !project
+                    ? "Already verified — click to queue:"
+                    : "Already verified — click to add:"}
                 </p>
                 <ul className="flex max-h-40 flex-col gap-px overflow-y-auto">
                   {candidates.map((entry) => {
@@ -733,7 +785,11 @@ export function ProjectRepositories({
                       entry.commonDir,
                       projects,
                     )?.project;
-                    const label = basename(entry.checkout) || entry.checkout;
+                    const label =
+                      basename(entry.checkout) ||
+                      basename(
+                        entry.worktrees[0]?.path ?? entry.commonDir,
+                      );
                     return (
                       <li key={pathKey(entry.commonDir)}>
                         <button
@@ -929,7 +985,10 @@ export function ProjectRepositories({
         ) : null}
 
         {error ? (
-          <p role="alert" className="text-[12px] leading-tight text-red-300">
+          <p
+            role="alert"
+            className="whitespace-pre-wrap text-[12px] leading-tight text-red-300"
+          >
             {error}
           </p>
         ) : null}

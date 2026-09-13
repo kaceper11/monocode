@@ -6,6 +6,11 @@ import { LAYER, PopoverLayerOffset } from "../lib/layers";
 
 export type ModalSize = "sm" | "md" | "lg";
 
+/** Open dialogs in mount order — only the topmost answers Escape, so Esc in a
+ * nested dialog (e.g. the WSL picker inside a sheet) never tears down the
+ * dialog underneath. */
+const openModals: symbol[] = [];
+
 const WIDTH: Record<ModalSize, string> = {
   sm: "w-[min(420px,calc(100vw-24px))]",
   md: "w-[min(560px,calc(100vw-24px))]",
@@ -82,16 +87,26 @@ export function ModalPanel({
     return () => window.removeEventListener("keydown", contain);
   }, [trapFocus]);
 
+  const modalId = useRef(Symbol("modal")).current;
+  useEffect(() => {
+    openModals.push(modalId);
+    return () => {
+      const index = openModals.lastIndexOf(modalId);
+      if (index >= 0) openModals.splice(index, 1);
+    };
+  }, [modalId]);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented) return;
+      if (openModals[openModals.length - 1] !== modalId) return;
       event.preventDefault();
       event.stopPropagation();
       onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, modalId]);
 
   return (
     <div
