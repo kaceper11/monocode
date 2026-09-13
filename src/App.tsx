@@ -26,6 +26,7 @@ import {
 } from "./lib/attention";
 import {
   deriveLocalAttention,
+  railReachableFamilies,
   worktreeCleanupAttention,
 } from "./lib/attentionSources";
 import {
@@ -7156,17 +7157,29 @@ export default function App({
     for (const session of sessions) touch(sessionWorkCwd(session), Date.now());
     return activity;
   }, [history, sessions]);
+  // The cleanup nudge only covers repositories the rail can show —
+  // incidentally probed families must not raise attention rows.
+  const attentionFamilies = useMemo(
+    () =>
+      railReachableFamilies({
+        families: verifiedFamilies,
+        recents,
+        currentCwd: projectCwd,
+        projects: projectsList,
+      }),
+    [verifiedFamilies, recents, projectCwd, projectsList],
+  );
   const worktreeAttention = useMemo(
     () =>
       worktreeCleanupAttention({
-        families: verifiedFamilies,
+        families: attentionFamilies,
         recents,
         sessionActivity: worktreeSessionActivity,
         currentCwd: projectCwd,
         hidden: hiddenWorkingCopies(hiddenWorktreeRaw),
       }),
     [
-      verifiedFamilies,
+      attentionFamilies,
       recents,
       worktreeSessionActivity,
       projectCwd,
