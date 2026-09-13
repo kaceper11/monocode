@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  railReachableFamilies,
   STALE_WORKTREE_AGE,
   worktreeCleanupAttention,
 } from "./attentionSources";
+import type { ProjectRecord } from "./projects";
 import type { RecentProject } from "./recents";
 import type { RepositoryFamily, WorkingCopy } from "./repositoryFamilies";
 
@@ -225,5 +227,73 @@ describe("worktreeCleanupAttention", () => {
       ]),
     })[0];
     expect(changed.signature).not.toBe(first.signature);
+  });
+});
+
+const familyAt = (
+  root: string,
+  ...worktrees: WorkingCopy[]
+): RepositoryFamily => ({
+  commonDir: `${root}/.git`,
+  checkout: root,
+  worktrees,
+});
+
+const project = (over: Partial<ProjectRecord> = {}): ProjectRecord => ({
+  id: "p1",
+  repositories: [],
+  sets: [],
+  commands: [],
+  commandGroups: [],
+  ...over,
+});
+
+describe("railReachableFamilies", () => {
+  it("returns nothing when the rail is empty", () => {
+    const out = railReachableFamilies({
+      families: new Map([
+        [
+          "/stray",
+          familyAt("/stray", copy("/stray", { main: true })),
+        ],
+      ]),
+      recents: [],
+      currentCwd: "",
+      projects: [],
+    });
+    expect(out.size).toBe(0);
+  });
+
+  it("keeps families reached by recents and drops unreachable ones", () => {
+    const out = railReachableFamilies({
+      families: new Map([
+        ["/repo", familyAt("/repo", copy("/repo", { main: true }))],
+        ["/stray", familyAt("/stray", copy("/stray", { main: true }))],
+      ]),
+      recents: recents(["/repo", NOW]),
+      currentCwd: "",
+      projects: [],
+    });
+    expect([...out.keys()]).toEqual(["/repo"]);
+  });
+
+  it("reaches the open checkout and stored project members", () => {
+    const out = railReachableFamilies({
+      families: new Map([
+        ["/open", familyAt("/open", copy("/open", { main: true }))],
+        ["/member", familyAt("/member", copy("/member", { main: true }))],
+        ["/stray", familyAt("/stray", copy("/stray", { main: true }))],
+      ]),
+      recents: [],
+      currentCwd: "/open",
+      projects: [
+        project({
+          repositories: [
+            { id: "r1", commonDir: "/member/.git", anchor: "/member" },
+          ],
+        }),
+      ],
+    });
+    expect(new Set(out.keys())).toEqual(new Set(["/open", "/member"]));
   });
 });

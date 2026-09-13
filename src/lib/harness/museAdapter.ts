@@ -8,6 +8,7 @@ import {
   respondMuseApproval,
   respondMuseQuestion,
   sendMuseTurn,
+  setMuseRuntimeMode,
   steerMuseTurn,
   stopMuseSession,
 } from "./muse";
@@ -24,6 +25,7 @@ export const museAdapter: HarnessAdapter = {
   steerTurn: steerMuseTurn,
   cancelTurn: cancelMuseTurn,
   respondApproval: respondMuseApproval,
+  setRuntimeMode: setMuseRuntimeMode,
   respondQuestion: respondMuseQuestion,
   keepQuestionOpen: keepMuseQuestionOpen,
   stopSession: stopMuseSession,

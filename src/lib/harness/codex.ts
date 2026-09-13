@@ -15,7 +15,10 @@ import {
   buildTurnSteerParams,
   isRecoverableThreadResumeError,
   mapApprovalRequest,
+  codexSubagentStates,
+  codexSubagentThreadIds,
   mapCodexNotification,
+  mapCodexSubagentSteps,
   stringField,
   toCodexApprovalDecision,
   type CodexApprovalKind,
@@ -27,7 +30,10 @@ import {
   listCodexModels,
 } from "./codexCatalog";
 import { codexQuestions, codexQuestionResponse } from "./codexQuestions";
-import { codexMcpConfirmation } from "./codexElicitation";
+import {
+  codexMcpConfirmation,
+  isCodexComputerUseAccessConfirmation,
+} from "./codexElicitation";
 import { joinStreamText, snapshotRemainder } from "./streamText";
 import { acquireSharedStart } from "./liveStart";
 import { markTurn } from "../turnTiming";
@@ -46,6 +52,8 @@ type PendingApproval = {
   rpcId: JsonRpcId;
   threadId: string;
   kind: CodexApprovalKind;
+  /** Consent that must carry the user's decision even under full-access. */
+  mustPrompt?: boolean;
   resolve: (decision: ApprovalOutcome) => void;
 };
 
@@ -88,6 +96,12 @@ type Live = {
   threadModel: string;
   /** Server requests received before the live session was bound. */
   earlyRequests: { id: JsonRpcId; method: string; params: unknown }[];
+  /** Child thread id -> the agent tool row that spawned it. */
+  subagentThreads: Map<string, string>;
+  /** Child notifications that arrived before their row was known. */
+  pendingSubagent: Map<string, Array<{ method: string; params: unknown }>>;
+  /** Agent rows still running, by call id, with the name to settle them under. */
+  openAgentRows: Map<string, string>;
 };
 
 type Resume = {
@@ -189,6 +203,28 @@ export async function steerCodexTurn(input: SteerTurnInput): Promise<void> {
   await live.rpc.request("turn/steer", params);
 }
 
+/**
+ * Apply a UI access-mode change to the live thread: parked approvals the new
+ * mode would have answered itself are settled immediately. The running turn's
+ * server-side sandbox/approval policy was fixed at `turn/start`; the mode
+ * fully applies to new approval requests and to the next turn's policy.
+ */
+export function setCodexRuntimeMode(
+  sessionId: string,
+  runtimeMode: RuntimeMode,
+): void {
+  const live = liveByThread.get(sessionId);
+  if (!live || live.runtimeMode === runtimeMode) return;
+  live.runtimeMode = runtimeMode;
+  for (const [uiId, pending] of live.approvals) {
+    if (pending.mustPrompt) continue;
+    const decision = autoApproval(runtimeMode, pending.kind);
+    if (!decision) continue;
+    live.approvals.delete(uiId);
+    pending.resolve(decision);
+  }
+}
+
 export function respondCodexApproval(
   sessionId: string,
   requestId: number,
@@ -208,7 +244,10 @@ export function respondCodexQuestion(
   liveByThread.get(sessionId)?.questions.get(requestId)?.resolve(reply);
 }
 
-export function keepCodexQuestionOpen(sessionId: string, requestId: number): void {
+export function keepCodexQuestionOpen(
+  sessionId: string,
+  requestId: number,
+): void {
   const live = liveByThread.get(sessionId);
   const pending = live?.questions.get(requestId);
   if (!live || !pending || pending.timer === undefined) return;
@@ -518,6 +557,9 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       emittedReasoning: "",
       threadModel,
       earlyRequests,
+      subagentThreads: new Map(),
+      pendingSubagent: new Map(),
+      openAgentRows: new Map(),
     };
     liveRef.current = live;
     liveByThread.set(input.sessionId, live);
@@ -664,10 +706,18 @@ function handleNotification(live: Live, method: string, params: unknown): void {
     }
     return;
   }
-  // Child requests use this connection too, but their transcript and lifecycle
-  // notifications must not change the parent's turn or clear its approvals.
-  const threadId = stringField(rec, "threadId");
-  if (threadId && threadId !== live.threadId) return;
+  // Child threads share this connection. Their lifecycle must not touch the
+  // parent's turn or clear its approvals, but what they do is the inside of a
+  // subagent — mirror it onto the row that spawned them.
+  const threadId =
+    stringField(rec, "threadId") ??
+    (method === "thread/started"
+      ? stringField(asRecord(rec?.thread), "id")
+      : undefined);
+  if (threadId && threadId !== live.threadId) {
+    handleSubagentNotification(live, threadId, method, params);
+    return;
+  }
   // A Codex turn is a sequence of items. Completing an agentMessage does not
   // mean the turn is over — more tools and messages can still arrive. Only
   // turn/completed (and turn/aborted) settle sendCodexTurn, which is what the
@@ -679,8 +729,14 @@ function handleNotification(live: Live, method: string, params: unknown): void {
       mapped.diagnostic,
     );
   }
+  // Codex describes one spawned agent through more than one item type. The
+  // first row to name a child thread owns it; a later item for the same thread
+  // would otherwise stand up a second agent that never does anything.
+  const duplicate = bindSubagentThreads(live, method, rec);
   const snapshot = method === "item/completed";
   for (const event of mapped.events) {
+    if (duplicate && duplicateAgentRow(event)) continue;
+    trackAgentRow(live, event);
     if (event.type === "message.delta") {
       publishCodexText(live, "assistant", event.text, snapshot);
       continue;
@@ -691,12 +747,177 @@ function handleNotification(live: Live, method: string, params: unknown): void {
     }
     live.onEvent(event);
   }
+  // Metadata and steps can arrive before the spawn. Create its row first.
+  for (const childId of codexSubagentThreadIds(asRecord(rec?.item) ?? {})) {
+    const owner = live.subagentThreads.get(childId);
+    if (!owner) continue;
+    const backlog = live.pendingSubagent.get(childId);
+    live.pendingSubagent.delete(childId);
+    for (const pending of backlog ?? [])
+      emitSubagentSteps(live, owner, pending.method, pending.params);
+  }
+  settleSubagentRows(live, rec);
   if (mapped.activeTurnId !== undefined) {
     live.activeTurnId = mapped.activeTurnId;
   }
   if (mapped.turnCompleted) {
     finishActiveTurn(live);
   }
+}
+
+/**
+ * How many notifications a not-yet-identified child thread may bank. Codex can
+ * stream a subagent's first calls before the spawn item reports which thread it
+ * created, and those calls are the most interesting ones — but an unrecognised
+ * thread must not be able to grow this without bound.
+ */
+const MAX_PENDING_SUBAGENT = 64;
+
+/**
+ * Learns which agent row a child thread belongs to.
+ * Returns true when every thread this item names already belongs to another
+ * row, which makes the item a second description of an agent we already show.
+ */
+function bindSubagentThreads(
+  live: Live,
+  method: string,
+  rec: Record<string, unknown> | null,
+): boolean {
+  if (method !== "item/started" && method !== "item/completed") return false;
+  const item = asRecord(rec?.item);
+  if (!item) return false;
+  const itemType = stringField(item, "type") ?? "";
+  if (itemType !== "subAgentActivity" && itemType !== "collabAgentToolCall") {
+    return false;
+  }
+  const callId = stringField(item, "id");
+  if (!callId) return false;
+  const children = codexSubagentThreadIds(item).filter(
+    (childId) => childId !== live.threadId,
+  );
+  let claimed = 0;
+  for (const childId of children) {
+    const owner = live.subagentThreads.get(childId);
+    if (owner) {
+      const model = stringField(item, "model");
+      if (model && item.tool === "spawnAgent")
+        live.onEvent({
+          type: "tool.updated",
+          callId: owner,
+          kind: "agent",
+          agentModel: model,
+        });
+      if (owner !== callId) claimed += 1;
+      continue;
+    }
+    live.subagentThreads.set(childId, callId);
+  }
+  return children.length > 0 && claimed === children.length;
+}
+
+/**
+ * An agent row for a child thread another row already owns. A failure still
+ * gets its row — the reason a run died is the one thing worth a line of its
+ * own — but a duplicate "running" or "done" is just noise.
+ */
+function duplicateAgentRow(event: HarnessEvent): boolean {
+  if (event.type !== "tool.started" && event.type !== "tool.updated") {
+    return false;
+  }
+  return event.kind === "agent" && event.status !== "failed";
+}
+
+/**
+ * A child thread's notification. Until the spawn item says which row the thread
+ * belongs to, keep it: dropping it loses the opening moves of the run.
+ */
+function handleSubagentNotification(
+  live: Live,
+  threadId: string,
+  method: string,
+  params: unknown,
+): void {
+  const callId = live.subagentThreads.get(threadId);
+  if (callId) {
+    emitSubagentSteps(live, callId, method, params);
+    return;
+  }
+  if (
+    method !== "item/started" &&
+    method !== "item/completed" &&
+    method !== "thread/started"
+  )
+    return;
+  const backlog = live.pendingSubagent.get(threadId) ?? [];
+  if (backlog.length >= MAX_PENDING_SUBAGENT) return;
+  backlog.push({ method, params });
+  live.pendingSubagent.set(threadId, backlog);
+}
+
+function emitSubagentSteps(
+  live: Live,
+  callId: string,
+  method: string,
+  params: unknown,
+): void {
+  for (const event of mapCodexSubagentSteps(callId, method, params)) {
+    live.onEvent(event);
+  }
+}
+
+/** Remembers an agent row while it runs, so the turn can close it out. */
+function trackAgentRow(live: Live, event: HarnessEvent): void {
+  if (event.type !== "tool.started" && event.type !== "tool.updated") return;
+  if (event.kind !== "agent") return;
+  if (event.status === "in_progress" || event.status === "pending") {
+    live.openAgentRows.set(event.callId, event.title ?? "Subagent");
+    return;
+  }
+  live.openAgentRows.delete(event.callId);
+}
+
+/**
+ * Settles spawned agents from the per-agent state a collab item reports. The
+ * spawn call returns immediately; this is the first word on whether the agent
+ * it started actually finished.
+ */
+function settleSubagentRows(
+  live: Live,
+  rec: Record<string, unknown> | null,
+): void {
+  const item = asRecord(rec?.item);
+  if (!item) return;
+  for (const state of codexSubagentStates(item)) {
+    const callId = live.subagentThreads.get(state.threadId);
+    const title = callId ? live.openAgentRows.get(callId) : undefined;
+    if (!callId || !title) continue;
+    live.openAgentRows.delete(callId);
+    live.onEvent({
+      type: "tool.updated",
+      callId,
+      title,
+      kind: "agent",
+      status: state.status,
+      ...(state.message ? { detail: state.message } : {}),
+    });
+  }
+}
+
+/**
+ * A turn cannot end with an agent still working. Codex does not always report
+ * a closing state for every child, and a row left running would hop forever.
+ */
+function closeOpenAgentRows(live: Live): void {
+  for (const [callId, title] of live.openAgentRows) {
+    live.onEvent({
+      type: "tool.updated",
+      callId,
+      title,
+      kind: "agent",
+      status: "completed",
+    });
+  }
+  live.openAgentRows.clear();
 }
 
 function publishCodexText(
@@ -720,6 +941,7 @@ function publishCodexText(
 
 function finishActiveTurn(live: Live, extraEvents: HarnessEvent[] = []): void {
   clearServerRequests(live);
+  closeOpenAgentRows(live);
   live.turnEndPending = false;
   live.activeTurnId = null;
   live.emittedAssistant = "";
@@ -840,9 +1062,21 @@ async function handleServerRequest(
       });
       return;
     }
+    if (
+      !live.planning &&
+      live.runtimeMode === "full-access" &&
+      isCodexComputerUseAccessConfirmation(params)
+    ) {
+      await live.rpc.respond(id, {
+        action: "accept",
+        content: confirmation.content,
+        _meta: null,
+      });
+      return;
+    }
     const uiId = live.nextApprovalUiId++;
-    const pending = waitApproval(live, uiId, id, "permissions", threadId);
-    // MCP consent must carry the user's decision, including in Full Access.
+    const pending = waitApproval(live, uiId, id, "permissions", threadId, true);
+    // Other MCP consent must carry the user's decision, including in Full Access.
     live.onEvent({
       type: "approval.requested",
       requestId: uiId,
@@ -960,9 +1194,10 @@ function waitApproval(
   rpcId: JsonRpcId,
   kind: CodexApprovalKind,
   threadId: string,
+  mustPrompt = false,
 ): Promise<ApprovalOutcome> {
   return new Promise<ApprovalOutcome>((resolve) => {
-    live.approvals.set(uiId, { rpcId, threadId, kind, resolve });
+    live.approvals.set(uiId, { rpcId, threadId, kind, mustPrompt, resolve });
   }).finally(() => {
     live.approvals.delete(uiId);
   });

@@ -4,6 +4,7 @@ import {
   forgetFxSession,
   respondFxApproval,
   sendFxTurn,
+  setFxRuntimeMode,
   steerFxTurn,
   stopFxSession,
 } from "./fx";
@@ -18,6 +19,7 @@ export const fxAdapter: HarnessAdapter = {
   steerTurn: steerFxTurn,
   cancelTurn: cancelFxTurn,
   respondApproval: respondFxApproval,
+  setRuntimeMode: setFxRuntimeMode,
   stopSession: stopFxSession,
   forgetSession: forgetFxSession,
   bindSession: bindFxSession,

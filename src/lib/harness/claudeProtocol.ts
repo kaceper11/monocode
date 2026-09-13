@@ -20,8 +20,9 @@ import {
 import { streamTextDelta } from "./streamText";
 import type { ApprovalDecision, HarnessEvent } from "./types";
 
-/** Claude Code versions that first ship Opus 5 / Fable 5 / Opus 4.8 / 4.7. */
+/** Claude Code versions that first ship Opus 5 / Sonnet 5 / Fable 5 / Opus 4.8 / 4.7. */
 export const MINIMUM_CLAUDE_OPUS_5_VERSION = "2.1.219";
+export const MINIMUM_CLAUDE_SONNET_5_VERSION = "2.1.197";
 export const MINIMUM_CLAUDE_FABLE_5_VERSION = "2.1.169";
 export const MINIMUM_CLAUDE_OPUS_4_8_VERSION = "2.1.154";
 export const MINIMUM_CLAUDE_OPUS_4_7_VERSION = "2.1.111";
@@ -757,6 +758,26 @@ export function assistantTextBlocks(rec: Record<string, unknown>): string[] {
   });
 }
 
+/** Reasoning a message carries, used to mirror a subagent's thinking. */
+export function assistantThinkingBlocks(rec: Record<string, unknown>): string[] {
+  const message = asRecord(rec.message);
+  const content = message?.content;
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((block) => {
+    const row = asRecord(block);
+    if (stringField(row, "type") !== "thinking") return [];
+    const text = typeof row?.thinking === "string" ? row.thinking : "";
+    return text ? [text] : [];
+  });
+}
+
+/** Provider id of an assistant message, for keying steps mirrored from it. */
+export function assistantMessageId(
+  rec: Record<string, unknown>,
+): string | undefined {
+  return stringField(asRecord(rec.message), "id");
+}
+
 export function assistantToolUses(rec: Record<string, unknown>): Array<{
   id: string;
   name: string;
@@ -951,13 +972,17 @@ export function summarizeToolRequest(
   }
 }
 
+/**
+ * Spawn-signature for the CLI process. `runtimeMode` is deliberately absent:
+ * it is applied through `set_permission_mode` on a live session, so a mode
+ * change must not force a respawn.
+ */
 export function claudeSettingsKey(input: {
   model: string;
   effort?: string;
   fast?: string;
   thinking?: string;
   context?: string;
-  runtimeMode: RuntimeMode;
   hooks?: boolean;
 }): string {
   return [
@@ -966,7 +991,6 @@ export function claudeSettingsKey(input: {
     input.fast ?? "",
     input.thinking ?? "",
     input.context ?? "",
-    input.runtimeMode,
     input.hooks === false ? "nohooks" : "hooks",
   ].join("|");
 }

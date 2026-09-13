@@ -14,6 +14,7 @@ import {
   isProjectRailKey,
   loadProjects,
   locateRepository,
+  MAX_REPOSITORIES,
   moveRepositorySet,
   projectContainsPath,
   projectForPath,
@@ -211,6 +212,40 @@ describe("membership", () => {
     ).toBe(false);
   });
 
+  it("rejects a move into a full project and keeps the original owner", () => {
+    const source = ensureProjectForPath(
+      "/tmp/a",
+      family("/tmp/a/.git", "/tmp/a"),
+    );
+    const full = ensureProjectForPath(
+      "/tmp/b",
+      family("/tmp/b/.git", "/tmp/b"),
+    );
+    for (let i = 0; i < MAX_REPOSITORIES - 1; i += 1) {
+      expect(
+        addRepositoryToProject(full.id, {
+          commonDir: `/tmp/r${i}/.git`,
+          anchor: `/tmp/r${i}`,
+        }).error,
+      ).toBeUndefined();
+    }
+    // The anchor repo plus the fillers put the target at the cap.
+    expect(
+      addRepositoryToProject(full.id, {
+        commonDir: "/tmp/a/.git",
+        anchor: "/tmp/a",
+      }).error,
+    ).toContain("50");
+    const projects = loadProjects();
+    const owner = projects.find((p) =>
+      p.repositories.some(
+        (r) => pathKey(r.commonDir) === pathKey("/tmp/a/.git"),
+      ),
+    );
+    // The failed move must not have evicted the repo from its old project.
+    expect(owner?.id).toBe(source.id);
+  });
+
   it("removing a repository prunes it from saved sets", () => {
     const project = ensureProjectForPath(
       "/tmp/app",
@@ -313,6 +348,36 @@ describe("saved sets", () => {
     expect(loadProjects()[0].sets[0].name).toBe("Pair");
     deleteRepositorySet(project.id, one.id);
     expect(loadProjects()[0].sets.map((set) => set.id)).toEqual([two.id]);
+  });
+
+  it("updates a set's name and membership in place when given its id", () => {
+    const project = ensureProjectForPath(
+      "/tmp/app",
+      family("/tmp/app/.git", "/tmp/app"),
+    );
+    addRepositoryToProject(project.id, {
+      commonDir: "/tmp/b/.git",
+      anchor: "/tmp/b",
+    });
+    const [a, b] = loadProjects()[0].repositories;
+    saveRepositorySet(project.id, "First", [a.id]);
+    saveRepositorySet(project.id, "Second", [a.id]);
+    const [first, second] = loadProjects()[0].sets;
+    // Editing keeps the row's position and identity; dropped members and
+    // non-members are filtered out.
+    expect(
+      saveRepositorySet(project.id, "Pair", [a.id, b.id, "foreign"], first.id)
+        .error,
+    ).toBeUndefined();
+    const sets = loadProjects()[0].sets;
+    expect(sets.map((set) => set.id)).toEqual([first.id, second.id]);
+    expect(sets[0].name).toBe("Pair");
+    expect(sets[0].repositoryIds).toEqual([a.id, b.id]);
+    // An update to a missing set writes nothing.
+    expect(
+      saveRepositorySet(project.id, "Nope", [a.id], "missing").error,
+    ).toBeUndefined();
+    expect(loadProjects()[0].sets).toHaveLength(2);
   });
 });
 

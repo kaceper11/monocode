@@ -6,6 +6,7 @@ import {
   respondOpenCodeApproval,
   respondOpenCodeQuestion,
   sendOpenCodeTurn,
+  setOpenCodeRuntimeMode,
   steerOpenCodeTurn,
   stopOpenCodeSession,
 } from "./opencode";
@@ -27,6 +28,7 @@ export const openCodeAdapter: HarnessAdapter = {
   steerTurn: steerOpenCodeTurn,
   cancelTurn: cancelOpenCodeTurn,
   respondApproval: respondOpenCodeApproval,
+  setRuntimeMode: setOpenCodeRuntimeMode,
   respondQuestion: respondOpenCodeQuestion,
   stopSession: stopOpenCodeSession,
   forgetSession: forgetOpenCodeSession,

@@ -5,6 +5,7 @@ import {
   respondCursorApproval,
   respondCursorQuestion,
   sendCursorTurn,
+  setCursorRuntimeMode,
   steerCursorTurn,
   stopCursorSession,
 } from "./cursor";
@@ -25,6 +26,7 @@ export const cursorAdapter: HarnessAdapter = {
   steerTurn: steerCursorTurn,
   cancelTurn: cancelCursorTurn,
   respondApproval: respondCursorApproval,
+  setRuntimeMode: setCursorRuntimeMode,
   respondQuestion: respondCursorQuestion,
   stopSession: stopCursorSession,
   forgetSession: forgetCursorSession,

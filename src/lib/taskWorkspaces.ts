@@ -844,15 +844,18 @@ export function childForRepository(
   task: TaskWorkspace,
   repositoryId: string,
   attemptId?: string,
+  /** Strict mode: an attempt with no copy of this repository is an honest
+   * miss, never another attempt's checkout. */
+  strict?: boolean,
 ): TaskChild | undefined {
   const matches = task.children.filter(
     (child) => child.repositoryId === repositoryId,
   );
   if (!matches.length) return undefined;
-  if (attemptId)
-    return (
-      matches.find((child) => child.attemptId === attemptId) ?? matches[0]
-    );
+  if (attemptId) {
+    const own = matches.find((child) => child.attemptId === attemptId);
+    return strict ? own : (own ?? matches[0]);
+  }
   const primary = task.attempts[0]?.id;
   return (
     matches.find(

@@ -9,6 +9,7 @@ mod azure_repos;
 mod browser;
 mod chat_background;
 mod checkpoint;
+mod checks;
 mod confluence;
 mod cursor_store;
 pub mod dictation;
@@ -286,6 +287,7 @@ pub fn run() {
             fs::git_github_pr_diff,
             fs::git_update_from_default,
             fs::git_sync_branch,
+            checks::run_check,
             fs::git_merge_context,
             fs::git_merge_abort,
             inbox_media::fetch_inbox_media,
@@ -295,6 +297,7 @@ pub fn run() {
             gitlab::gitlab_set_config,
             gitlab::gitlab_repo,
             gitlab::gitlab_list_work_items,
+            gitlab::gitlab_list_todos,
             gitlab::gitlab_work_item_details,
             gitlab::gitlab_work_item_thread,
             gitlab::gitlab_work_item_comment,
@@ -373,6 +376,7 @@ pub fn run() {
             skills::list_skills,
             search::search_project,
             cursor_store::cursor_tool_calls,
+            cursor_store::cursor_subagent_runs,
             harness::harness_resolve_cursor,
             harness::harness_resolve_codex,
             harness::harness_resolve_opencode,
@@ -528,6 +532,7 @@ fn reap_harness_children(handle: &tauri::AppHandle) {
     if let Some(host) = handle.try_state::<dictation::DictationHost>() {
         host.shutdown();
     }
+    checks::reap_running();
 }
 
 #[cfg(all(debug_assertions, target_os = "macos"))]

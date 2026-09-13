@@ -38,6 +38,7 @@ const {
   cancelCopilotTurn,
   respondCopilotApproval,
   respondCopilotQuestion,
+  setCopilotRuntimeMode,
   stopCopilotSession,
   copilotCommandProvider,
 } = await import("./copilot");
@@ -386,6 +387,69 @@ describe("copilot live turn", () => {
     reply(promptId, { stopReason: "end_turn" });
     await turn;
     await stopCopilotSession("t6");
+  });
+
+  it("pushes the new mode and settles a parked approval on a mid-conversation change", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "t14");
+    await waitFor(() => byMethod("session/set_mode").length > 0, "set_mode");
+    reply(lastByMethod("session/set_mode")!.id, {});
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
+    const promptId = lastByMethod("session/prompt")!.id;
+
+    onLine!(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 78,
+        method: "session/request_permission",
+        params: {
+          sessionId: "C1",
+          toolCall: {
+            toolCallId: "call_10",
+            title: "Ran npm test",
+            kind: "execute",
+            status: "pending",
+            rawInput: { command: "npm test" },
+          },
+          options: [
+            { optionId: "allow_once", name: "Allow once" },
+            { optionId: "reject_once", name: "Reject" },
+          ],
+        },
+      }),
+    );
+    await waitFor(
+      () => events.some((e) => e.type === "approval.requested"),
+      "approval.requested",
+    );
+
+    // supervised -> auto pushes the advertised autonomous mode and the
+    // parked approval is auto-answered without another UI round trip.
+    setCopilotRuntimeMode("t14", "auto");
+    await waitFor(
+      () => byMethod("session/set_mode").length > 1,
+      "set_mode auto",
+    );
+    expect(lastByMethod("session/set_mode")!.params.modeId).toBe(
+      "autonomous",
+    );
+    reply(lastByMethod("session/set_mode")!.id, {});
+
+    await waitFor(
+      () => parse().some((m) => m.id === 78 && m.result),
+      "permission response",
+    );
+    const response = parse().find((m) => m.id === 78 && m.result);
+    expect(response!.result.outcome.optionId).toBe("allow_once");
+    expect(
+      events.some(
+        (e) => e.type === "approval.resolved" && e.decision === "allow",
+      ),
+    ).toBe(true);
+
+    reply(promptId, { stopReason: "end_turn" });
+    await turn;
+    await stopCopilotSession("t14");
   });
 
   it("routes elicitation requests to the question UI", async () => {

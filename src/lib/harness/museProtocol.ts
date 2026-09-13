@@ -479,6 +479,10 @@ export function museItemEvent(
       (leaf ? `${formatAgentType(leaf)} subagent` : "Subagent");
     const status = museItemStatus(rec.status, terminal);
     const failure = terminal ? stringField(rec, "failureReason") : undefined;
+    const summary = terminal
+      ? stringField(asRecord(rec.result), "summary")
+      : undefined;
+    const detail = cap(failure ?? summary ?? "");
     return [
       {
         type: phase === "started" ? "tool.started" : "tool.updated",
@@ -486,7 +490,7 @@ export function museItemEvent(
         title,
         kind: "agent",
         status,
-        ...(failure ? { detail: cap(failure) } : {}),
+        ...(detail ? { detail } : {}),
       },
     ];
   }

@@ -6,7 +6,8 @@ import {
 } from "./attention";
 import { composeToolTitle } from "./harness/preview";
 import { displayPath, isEqualOrInside, pathKey, projectName } from "./paths";
-import type { RecentProject } from "./recents";
+import type { ProjectRecord } from "./projects";
+import { collectRailProjects, type RecentProject } from "./recents";
 import {
   lastWorkingCopyUse,
   staleWorkingCopy,
@@ -176,6 +177,38 @@ function signatureHash(parts: readonly string[]): string {
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
   return hash.toString(36);
+}
+
+/**
+ * Repository families reachable from the rail — recents, the open checkout,
+ * stored project anchors and their member repositories. The shared verified
+ * map also holds families probed incidentally (task worktree verification,
+ * sheet locates); those must not raise cleanup rows for repositories the
+ * user never added.
+ */
+export function railReachableFamilies(input: {
+  families: ReadonlyMap<string, RepositoryFamily>;
+  recents: RecentProject[];
+  currentCwd: string;
+  projects: readonly ProjectRecord[];
+}): Map<string, RepositoryFamily> {
+  const railPaths = [
+    ...collectRailProjects(input.recents, input.currentCwd).values(),
+  ].map((item) => item.path);
+  for (const project of input.projects) {
+    if (project.anchor) railPaths.push(project.anchor);
+    for (const repo of project.repositories) railPaths.push(repo.anchor);
+  }
+  const commonDirs = new Set<string>();
+  for (const path of railPaths) {
+    const family = input.families.get(pathKey(path));
+    if (family) commonDirs.add(pathKey(family.commonDir));
+  }
+  return new Map(
+    [...input.families].filter(([, family]) =>
+      commonDirs.has(pathKey(family.commonDir)),
+    ),
+  );
 }
 
 /**

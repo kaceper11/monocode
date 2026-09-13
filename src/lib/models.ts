@@ -1,7 +1,7 @@
 import { copilotEffortSetting } from "./harness/copilotEffort";
 import { pathKey, wslLocation } from "./paths";
-import type { HarnessId } from "./session";
-import { HARNESSES } from "./session";
+import type { HarnessId, RuntimeMode } from "./session";
+import { DEFAULT_RUNTIME_MODE, HARNESSES, RUNTIME_MODES } from "./session";
 
 export type ModelSettingChoice = {
   value: string;
@@ -250,6 +250,7 @@ const HIDDEN_PICKER_PROVIDERS_KEY = "monocode.hiddenPickerProviders";
 const LAST_MODEL_KEY = "monocode.lastModel";
 const LAST_MODEL_SETTINGS_KEY = "monocode.lastModelSettings";
 const DEFAULT_MODELS_KEY = "monocode.defaultModels";
+const DEFAULT_RUNTIME_MODE_KEY = "monocode.defaultRuntimeMode";
 const RECENT_MODELS_KEY = "monocode.recentModels";
 const RECENT_MODEL_LIMIT = 6;
 
@@ -493,9 +494,14 @@ export function resolveModel(
       ),
     );
     if (bySetting) return bySetting;
+    const comparableSlug = comparableNativeId(harness, slug);
     const prefix = available.find((model) => {
       const native = model.nativeId ?? nativeIdFrom(model.id);
-      return native.startsWith(slug) || slug.startsWith(native);
+      const comparableNative = comparableNativeId(harness, native);
+      return (
+        comparableNative.startsWith(comparableSlug) ||
+        comparableSlug.startsWith(comparableNative)
+      );
     });
     if (prefix) return prefix;
   }
@@ -803,6 +809,27 @@ export function defaultSessionChoice(cwd?: string): LastModelChoice {
   return { harness, model: preferredModelId(harness, cwd) };
 }
 
+/** Access mode new conversations start in; `supervised` until configured. */
+export function loadDefaultRuntimeMode(): RuntimeMode {
+  try {
+    const raw = localStorage.getItem(DEFAULT_RUNTIME_MODE_KEY);
+    if ((RUNTIME_MODES as string[]).includes(raw ?? "")) {
+      return raw as RuntimeMode;
+    }
+    return DEFAULT_RUNTIME_MODE;
+  } catch {
+    return DEFAULT_RUNTIME_MODE;
+  }
+}
+
+export function saveDefaultRuntimeMode(mode: RuntimeMode) {
+  try {
+    localStorage.setItem(DEFAULT_RUNTIME_MODE_KEY, mode);
+  } catch {
+    // private mode / quota
+  }
+}
+
 export function loadLastModelChoice(cwd?: string): LastModelChoice | null {
   try {
     const raw = localStorage.getItem(modelPreferenceKey(LAST_MODEL_KEY, cwd));
@@ -926,6 +953,11 @@ export function nativeIdFrom(id: string): string {
   const slug = colon >= 0 ? trimmed.slice(colon + 1) : trimmed;
   const bracket = slug.indexOf("[");
   return bracket >= 0 ? slug.slice(0, bracket) : slug;
+}
+
+/** Claude's live catalog uses `opus`; its startup fallback uses `claude-opus-5`. */
+function comparableNativeId(harness: HarnessId, id: string): string {
+  return harness === "claude" ? id.replace(/^claude-/, "") : id;
 }
 
 function pickDefaultId(harness: HarnessId, models: AgentModel[]): string {

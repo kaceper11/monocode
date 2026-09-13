@@ -11,7 +11,10 @@ import {
 } from "./child";
 import {
   askUserQuestionAllowInput,
+  asRecord,
+  assistantMessageId,
   assistantTextBlocks,
+  assistantThinkingBlocks,
   assistantToolUses,
   contextFromResult,
   contextUsedFromAssistant,
@@ -56,6 +59,7 @@ import {
   turnStatusFromResult,
   type ClaudeCliSettings,
   type ClaudeControlRequest,
+  type ClaudePermissionMode,
 } from "./claudeProtocol";
 import { isAgentToolName } from "./preview";
 import { joinStreamText, snapshotRemainder } from "./streamText";
@@ -84,6 +88,7 @@ type ApprovalOutcome = ApprovalDecision | "cancelled";
 
 type PendingApproval = {
   requestId: string;
+  kind: string;
   input: Record<string, unknown>;
   resolve: (decision: ApprovalOutcome) => void;
 };
@@ -114,6 +119,8 @@ type Live = {
   claudeSessionId: string;
   runtimeMode: RuntimeMode;
   planning: boolean;
+  /** Last permission mode confirmed written to the wire — retries dedupe on it. */
+  pushedMode: ClaudePermissionMode;
   settingsKey: string;
   onEvent: (event: HarnessEvent) => void;
   approvals: Map<number, PendingApproval>;
@@ -201,10 +208,12 @@ export async function sendClaudeTurn(input: SendTurnInput): Promise<void> {
   if (cancelledThreads.delete(input.sessionId)) return;
 
   live.onEvent = input.onEvent;
-  live.runtimeMode = input.runtimeMode;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      // Posture applies when the queued turn actually runs — applying it at
+      // enqueue time would flip the running turn's permission handling.
+      applyClaudeRuntimeMode(input.sessionId, live, input.runtimeMode);
       live.cancelled = false;
       live.muteUpdates = false;
       try {
@@ -228,10 +237,10 @@ export async function compactClaudeContext(
   if (cancelledThreads.delete(input.sessionId)) return;
 
   live.onEvent = input.onEvent;
-  live.runtimeMode = input.runtimeMode;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      applyClaudeRuntimeMode(input.sessionId, live, input.runtimeMode);
       live.cancelled = false;
       live.muteUpdates = false;
       live.manualCompaction = true;
@@ -269,6 +278,63 @@ export async function steerClaudeTurn(input: SteerTurnInput): Promise<void> {
   if (content.length === 0) return;
 
   await writeJson(input.sessionId, message);
+}
+
+/**
+ * Apply a UI access-mode change to a running CLI: push the matching
+ * `set_permission_mode` control so the process stops (or resumes) gating on
+ * its own, then settle parked approvals the new mode already covers. Asks the
+ * mode still escalates stay pending for the user.
+ */
+export function setClaudeRuntimeMode(
+  sessionId: string,
+  runtimeMode: RuntimeMode,
+): void {
+  const live = liveByThread.get(sessionId);
+  if (!live) return;
+  applyClaudeRuntimeMode(sessionId, live, runtimeMode);
+}
+
+/** What the wire mode must be: plan turns always stay gated as "plan". */
+function desiredPermissionMode(
+  live: Live,
+  runtimeMode: RuntimeMode,
+): ClaudePermissionMode {
+  if (live.planning) return "plan";
+  return runtimeModeToPermission(runtimeMode) ?? "default";
+}
+
+function applyClaudeRuntimeMode(
+  sessionId: string,
+  live: Live,
+  runtimeMode: RuntimeMode,
+): void {
+  const changed = live.runtimeMode !== runtimeMode;
+  live.runtimeMode = runtimeMode;
+  const desired = desiredPermissionMode(live, runtimeMode);
+  if (live.pushedMode !== desired) {
+    void writeJson(
+      sessionId,
+      buildControlRequest(nextControlId(live), {
+        subtype: "set_permission_mode",
+        mode: desired,
+      }),
+    )
+      .then(() => {
+        live.pushedMode = desired;
+      })
+      .catch(() => undefined);
+  }
+  if (!changed) return;
+  for (const [uiId, pending] of live.approvals) {
+    if (
+      runtimeMode === "full-access" ||
+      (runtimeMode === "auto-accept-edits" && pending.kind === "edit")
+    ) {
+      live.approvals.delete(uiId);
+      pending.resolve("allow");
+    }
+  }
 }
 
 export function respondClaudeApproval(
@@ -368,7 +434,11 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     existing.planning === planning
   ) {
     existing.onEvent = input.onEvent;
-    existing.runtimeMode = input.runtimeMode;
+    // A queued send must not retarget the running turn's posture; the queued
+    // task applies its own mode when it starts.
+    if (!existing.activeTurn) {
+      applyClaudeRuntimeMode(input.sessionId, existing, input.runtimeMode);
+    }
     return existing;
   }
   if (existing) {
@@ -401,6 +471,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     claudeSessionId,
     runtimeMode: input.runtimeMode,
     planning,
+    pushedMode: launch.permissionMode ?? "default",
     settingsKey,
     onEvent: input.onEvent,
     approvals: new Map(),
@@ -653,7 +724,7 @@ function handleStreamEvent(live: Live, rec: Record<string, unknown>): void {
   const started = toolStartFromEvent(rec);
   if (started) {
     if (subagent) {
-      noteSubagentTool(live, rec, started.name, started.input);
+      noteSubagentTool(live, rec, started.id, started.name, started.input);
       return;
     }
     const tool: InFlightTool = {
@@ -670,6 +741,9 @@ function handleStreamEvent(live: Live, rec: Record<string, unknown>): void {
       callId: tool.id,
       title: tool.title,
       kind: toolKindFromName(tool.name),
+      ...(isAgentToolName(tool.name) && stringField(tool.input, "model")
+        ? { agentModel: stringField(tool.input, "model") }
+        : {}),
       status: isAgentToolName(tool.name) ? "in_progress" : "pending",
       preview: previewFromTool(tool.name, tool.input),
     });
@@ -692,6 +766,9 @@ function handleStreamEvent(live: Live, rec: Record<string, unknown>): void {
       callId: tool.id,
       title: tool.title,
       kind: toolKindFromName(tool.name),
+      ...(isAgentToolName(tool.name) && stringField(tool.input, "model")
+        ? { agentModel: stringField(tool.input, "model") }
+        : {}),
       status: "pending",
       detail: summarizeToolRequest(tool.name, parsed),
       preview: previewFromTool(tool.name, parsed),
@@ -703,8 +780,9 @@ function handleStreamEvent(live: Live, rec: Record<string, unknown>): void {
 
 function handleAssistant(live: Live, rec: Record<string, unknown>): void {
   if (isSubagentMessage(rec)) {
+    noteSubagentNarration(live, rec);
     for (const use of assistantToolUses(rec)) {
-      noteSubagentTool(live, rec, use.name, use.input);
+      noteSubagentTool(live, rec, use.id, use.name, use.input);
     }
     return;
   }
@@ -734,6 +812,9 @@ function handleAssistant(live: Live, rec: Record<string, unknown>): void {
       callId: tool.id,
       title: tool.title,
       kind: toolKindFromName(tool.name),
+      ...(isAgentToolName(tool.name) && stringField(tool.input, "model")
+        ? { agentModel: stringField(tool.input, "model") }
+        : {}),
       status: isAgentToolName(tool.name) ? "in_progress" : "pending",
       preview: previewFromTool(tool.name, tool.input),
     });
@@ -746,7 +827,10 @@ function handleAssistant(live: Live, rec: Record<string, unknown>): void {
 }
 
 function handleUser(live: Live, rec: Record<string, unknown>): void {
-  if (isSubagentMessage(rec)) return;
+  if (isSubagentMessage(rec)) {
+    noteSubagentResults(live, rec);
+    return;
+  }
   for (const result of toolResultsFromUserMessage(rec)) {
     const tool = live.toolsById.get(result.toolUseId);
     if (!tool) continue;
@@ -762,6 +846,17 @@ function handleUser(live: Live, rec: Record<string, unknown>): void {
       detail: result.text || undefined,
       preview: previewFromTool(tool.name, tool.input, result.text),
     });
+    // What a subagent hands back is the last thing it said, so it closes out
+    // that agent's own trail rather than sitting on the parent row as detail.
+    if (isAgentToolName(tool.name) && result.text.trim() && !result.isError) {
+      live.onEvent({
+        type: "agent.step",
+        callId: tool.id,
+        stepId: `${tool.id}:report`,
+        kind: "message",
+        text: result.text,
+      });
+    }
   }
 }
 
@@ -889,7 +984,13 @@ async function handleControlRequest(
   }
 
   const uiId = live.nextApprovalUiId++;
-  const pending = waitApproval(live, uiId, control.requestId, input);
+  const pending = waitApproval(
+    live,
+    uiId,
+    control.requestId,
+    input,
+    toolKindFromName(toolName),
+  );
   live.onEvent({
     type: "approval.requested",
     requestId: uiId,
@@ -937,9 +1038,10 @@ function waitApproval(
   uiId: number,
   requestId: string,
   input: Record<string, unknown>,
+  kind: string,
 ): Promise<ApprovalOutcome> {
   return new Promise<ApprovalOutcome>((resolve) => {
-    live.approvals.set(uiId, { requestId, input, resolve });
+    live.approvals.set(uiId, { requestId, kind, input, resolve });
   }).finally(() => {
     live.approvals.delete(uiId);
   });
@@ -1081,37 +1183,141 @@ function handleToolProgress(live: Live, rec: Record<string, unknown>): void {
       ? live.toolsById.get(progress.parentToolUseId)
       : undefined);
   if (!tool || !isAgentToolName(tool.name)) return;
-  const detail = progress.subagentType
-    ? `${progress.subagentType.replace(/[_-]+/g, " ")} subagent`
-    : progress.toolName;
   live.onEvent({
     type: "tool.updated",
     callId: tool.id,
     title: tool.title,
     kind: "agent",
     status: "in_progress",
-    ...(detail ? { detail } : {}),
   });
+  // Progress names the call in flight. That is a step in the run, not the
+  // result of it, so it goes to the panel rather than onto the Agent row.
+  if (progress.toolName) {
+    live.onEvent({
+      type: "agent.step",
+      callId: tool.id,
+      stepId: progress.toolUseId,
+      kind: "tool",
+      text: progress.toolName,
+      status: "in_progress",
+      ...(progress.subagentType ? { agentType: progress.subagentType } : {}),
+    });
+  }
 }
 
+/**
+ * The Agent call a subagent message belongs to, or nothing when the message
+ * came from somewhere the parent transcript has no row for.
+ */
+function subagentParent(
+  live: Live,
+  rec: Record<string, unknown>,
+): InFlightTool | undefined {
+  const parentId = stringField(rec, "parent_tool_use_id");
+  if (!parentId) return undefined;
+  const parent = live.toolsById.get(parentId);
+  if (!parent || !isAgentToolName(parent.name)) return undefined;
+  return parent;
+}
+
+/**
+ * A call a subagent made, mirrored onto the Agent row that spawned it. The
+ * parent keeps its own "still running" status; the step is what the panel
+ * under that row reads back.
+ */
 function noteSubagentTool(
   live: Live,
   rec: Record<string, unknown>,
+  id: string,
   name: string,
   input: Record<string, unknown>,
 ): void {
-  const parentId = stringField(rec, "parent_tool_use_id");
-  if (!parentId) return;
-  const parent = live.toolsById.get(parentId);
-  if (!parent || !isAgentToolName(parent.name)) return;
+  const parent = subagentParent(live, rec);
+  if (!parent) return;
+  const title = toolTitle(name, input);
+  // No detail: the Agent row's detail is the report the run hands back, and
+  // writing the call of the moment there would leave whatever the subagent
+  // happened to do last standing in as its result.
   live.onEvent({
     type: "tool.updated",
     callId: parent.id,
     title: parent.title,
     kind: "agent",
     status: "in_progress",
-    detail: toolTitle(name, input),
   });
+  if (!id) return;
+  const preview = previewFromTool(name, input);
+  live.onEvent({
+    type: "agent.step",
+    callId: parent.id,
+    stepId: id,
+    kind: "tool",
+    text: title,
+    toolKind: toolKindFromName(name),
+    status: "in_progress",
+    ...(preview ? { preview } : {}),
+  });
+}
+
+/**
+ * What a subagent said and thought on its way through the work. Its prose
+ * never joins the parent transcript — that would read as the main agent
+ * talking — but it is the most legible thing in the panel for its own row.
+ */
+function noteSubagentNarration(
+  live: Live,
+  rec: Record<string, unknown>,
+): void {
+  const parent = subagentParent(live, rec);
+  if (!parent) return;
+  const model = stringField(asRecord(rec.message), "model");
+  if (model)
+    live.onEvent({
+      type: "tool.updated",
+      callId: parent.id,
+      kind: "agent",
+      agentModel: model,
+    });
+  const messageId = assistantMessageId(rec) ?? crypto.randomUUID();
+  const thinking = assistantThinkingBlocks(rec).join("").trim();
+  if (thinking) {
+    live.onEvent({
+      type: "agent.step",
+      callId: parent.id,
+      stepId: `${messageId}:thinking`,
+      kind: "reasoning",
+      text: thinking,
+    });
+  }
+  const text = assistantTextBlocks(rec).join("").trim();
+  if (text) {
+    live.onEvent({
+      type: "agent.step",
+      callId: parent.id,
+      stepId: `${messageId}:text`,
+      kind: "message",
+      text,
+    });
+  }
+}
+
+/** Settles the subagent's own tool rows once their results come back. */
+function noteSubagentResults(
+  live: Live,
+  rec: Record<string, unknown>,
+): void {
+  const parent = subagentParent(live, rec);
+  if (!parent) return;
+  for (const result of toolResultsFromUserMessage(rec)) {
+    live.onEvent({
+      type: "agent.step",
+      callId: parent.id,
+      stepId: result.toolUseId,
+      kind: "tool",
+      text: "",
+      status: result.isError ? "failed" : "completed",
+    });
+  }
 }
 
 function isBackgroundedAgentTool(live: Live, toolUseId: string): boolean {
@@ -1262,7 +1468,6 @@ function settingsKeyFor(input: HarnessSessionInput): string {
     fast: input.modelSettings?.fast,
     thinking: input.modelSettings?.thinking,
     context: input.modelSettings?.context,
-    runtimeMode: input.runtimeMode,
     hooks: loadClaudeHooks(),
   });
 }

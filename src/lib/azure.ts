@@ -293,6 +293,7 @@ export async function azureThread(
         threadId: "",
         replies: [],
       })),
+    commits: [],
     truncated: raw.more,
     reviewDecision: "",
     baseRefName: "",

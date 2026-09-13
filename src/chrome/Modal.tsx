@@ -6,6 +6,11 @@ import { LAYER, PopoverLayerOffset } from "../lib/layers";
 
 export type ModalSize = "sm" | "md" | "lg";
 
+/** Open dialogs in mount order — only the topmost answers Escape, so Esc in a
+ * nested dialog (e.g. the WSL picker inside a sheet) never tears down the
+ * dialog underneath. */
+const openModals: symbol[] = [];
+
 const WIDTH: Record<ModalSize, string> = {
   sm: "w-[min(420px,calc(100vw-24px))]",
   md: "w-[min(560px,calc(100vw-24px))]",
@@ -16,6 +21,14 @@ const TOP: Record<ModalSize, string> = {
   sm: "top-[22%]",
   md: "top-[10%]",
   lg: "top-[6%]",
+};
+
+/** Hard ceiling: top offset plus 24px of bottom breathing room, so no dialog
+ * can grow past the viewport even when callers forget a max-height. */
+const MAX_H: Record<ModalSize, string> = {
+  sm: "max-h-[calc(78vh-24px)]",
+  md: "max-h-[calc(90vh-24px)]",
+  lg: "max-h-[calc(94vh-24px)]",
 };
 
 type Props = {
@@ -74,20 +87,30 @@ export function ModalPanel({
     return () => window.removeEventListener("keydown", contain);
   }, [trapFocus]);
 
+  const modalId = useRef(Symbol("modal")).current;
+  useEffect(() => {
+    openModals.push(modalId);
+    return () => {
+      const index = openModals.lastIndexOf(modalId);
+      if (index >= 0) openModals.splice(index, 1);
+    };
+  }, [modalId]);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented) return;
+      if (openModals[openModals.length - 1] !== modalId) return;
       event.preventDefault();
       event.stopPropagation();
       onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, modalId]);
 
   return (
     <div
-      className={`absolute left-1/2 ${TOP[size]} ${WIDTH[size]} -translate-x-1/2`}
+      className={`absolute left-1/2 ${TOP[size]} ${MAX_H[size]} ${WIDTH[size]} -translate-x-1/2 flex flex-col`}
     >
       <div
         role="dialog"
@@ -95,7 +118,7 @@ export function ModalPanel({
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
         onMouseDown={(event) => event.stopPropagation()}
-        className={`modal-panel flex flex-col overflow-hidden rounded-2xl border border-content/10 bg-background-base/55 shadow-2xl backdrop-blur-xl ${className ?? ""}`}
+        className={`modal-panel flex min-h-0 flex-col overflow-hidden rounded-2xl border border-content/10 bg-background-base/55 shadow-2xl backdrop-blur-xl ${className ?? ""}`}
       >
         <header className="flex shrink-0 items-start gap-2 px-4 pt-3">
           <div className="min-w-0 flex-1 pt-0.5">

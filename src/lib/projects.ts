@@ -47,6 +47,19 @@ export type ProjectCommandGroup = {
   commandIds: string[];
 };
 
+/** Checks-on-finish (#92): run one saved command when an agent turn ends in
+ * this project. `commandId` can outlive the command it names — a stale id is
+ * surfaced as a configuration error rather than silently cleared, so deleting
+ * a command never removes evidence of what verification used to run. */
+export type ProjectVerify = {
+  commandId: string;
+  /** "notify" ends at an attention row; "fix" also sends the bounded failure
+   * tail back to the owning session (capped consecutive sends per run). */
+  mode: "notify" | "fix";
+  /** Disabled config is kept so re-enabling restores the chosen command. */
+  enabled?: boolean;
+};
+
 /** Durable product boundary. Owns an explicit list of repositories, saved
  * sets and saved commands; never merges them into one Git repository. */
 export type ProjectRecord = {
@@ -61,6 +74,8 @@ export type ProjectRecord = {
   sets: SavedRepositorySet[];
   commands: ProjectCommand[];
   commandGroups: ProjectCommandGroup[];
+  /** Post-turn check configuration; absent when never configured. */
+  verify?: ProjectVerify;
   /** Last-active working copy inside the project — the open target. */
   lastPath?: string;
 };
@@ -75,7 +90,7 @@ export type RailProjectItem = RecentProject & { project?: ProjectRecord };
 const KEY = "monocode.projects.v1";
 const PROJECTS_CHANGED = "monocode:projects-changed";
 const MAX_PROJECTS = 100;
-const MAX_REPOSITORIES = 50;
+export const MAX_REPOSITORIES = 50;
 const MAX_SETS = 50;
 const MAX_COMMANDS = 100;
 const MAX_COMMAND_GROUPS = 50;
@@ -204,6 +219,19 @@ function sanitizeCommandGroup(value: unknown): ProjectCommandGroup | null {
   };
 }
 
+function sanitizeVerify(value: unknown): ProjectVerify | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const commandId =
+    typeof record.commandId === "string" ? record.commandId.slice(0, 128) : "";
+  if (!commandId) return undefined;
+  return {
+    commandId,
+    mode: record.mode === "fix" ? "fix" : "notify",
+    ...(record.enabled === false ? { enabled: false } : {}),
+  };
+}
+
 function sanitizeProject(value: unknown): ProjectRecord | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
@@ -269,6 +297,9 @@ function sanitizeProject(value: unknown): ProjectRecord | null {
     sets,
     commands,
     commandGroups,
+    ...(sanitizeVerify(record.verify)
+      ? { verify: sanitizeVerify(record.verify) }
+      : {}),
     ...(typeof record.lastPath === "string" && record.lastPath
       ? { lastPath: normalizePath(record.lastPath) }
       : {}),
@@ -479,14 +510,18 @@ export function addRepositoryToProject(
   );
   if (owner?.id === projectId)
     return { error: "Repository is already in this project." };
+  // Check before the write — the same pass would otherwise evict the repo
+  // from its owner while adding nothing, losing the membership entirely.
+  if (target.repositories.length >= MAX_REPOSITORIES)
+    return {
+      error: `This project already has ${MAX_REPOSITORIES} repositories.`,
+    };
   const entry: ProjectRepository = { ...repo, id: crypto.randomUUID() };
   const next = projects.map((project) => {
     if (project.id === owner?.id)
       return removeRepositoryEntry(project, key);
-    if (project.id === projectId) {
-      if (project.repositories.length >= MAX_REPOSITORIES) return project;
+    if (project.id === projectId)
       return { ...project, repositories: [...project.repositories, entry] };
-    }
     return project;
   });
   saveProjects(next);
@@ -607,15 +642,23 @@ export function saveRepositorySet(
   projectId: string,
   name: string,
   repositoryIds: string[],
+  setId?: string,
 ): { error?: string } {
   const trimmed = name.trim().slice(0, 200);
   if (!trimmed) return { error: "Name the set." };
   if (!repositoryIds.length) return { error: "Select repositories first." };
   updateProject(projectId, (project) => {
-    if (project.sets.length >= MAX_SETS) return project;
     const memberIds = new Set(project.repositories.map((repo) => repo.id));
     const ids = repositoryIds.filter((id) => memberIds.has(id));
     if (!ids.length) return project;
+    if (setId)
+      return {
+        ...project,
+        sets: project.sets.map((set) =>
+          set.id === setId ? { ...set, name: trimmed, repositoryIds: ids } : set,
+        ),
+      };
+    if (project.sets.length >= MAX_SETS) return project;
     return {
       ...project,
       sets: [
@@ -713,6 +756,37 @@ export function saveProjectCommand(
         : [...project.commands, entry];
     return { ...project, commands };
   });
+  return {};
+}
+
+/** Points checks-on-finish at a saved command — or clears it with `null`.
+ * The command must exist: a stale `commandId` can only arrive through a
+ * deleted command, never through this setter. */
+export function setProjectVerify(
+  projectId: string,
+  verify: Omit<ProjectVerify, "enabled"> & { enabled?: boolean } | null,
+): { error?: string } {
+  if (verify) {
+    const current = loadProjects().find((entry) => entry.id === projectId);
+    if (!current) return { error: "Project not found." };
+    // Updates to the existing (possibly deleted) command id stay allowed —
+    // pausing a stale config must work even though its command is gone.
+    if (
+      !current.commands.some((item) => item.id === verify.commandId) &&
+      current.verify?.commandId !== verify.commandId
+    )
+      return { error: "Choose a saved command for the check." };
+  }
+  updateProject(projectId, (project) => ({
+    ...project,
+    verify: verify
+      ? {
+          commandId: verify.commandId,
+          mode: verify.mode === "fix" ? "fix" : "notify",
+          ...(verify.enabled === false ? { enabled: false } : {}),
+        }
+      : undefined,
+  }));
   return {};
 }
 
@@ -853,9 +927,16 @@ export function groupRailProjectsByMembership(
 ): ProjectRailSections {
   if (!projects.length) return sections;
   const byAnchor = new Map<string, ProjectRecord>();
-  for (const project of projects)
+  const byRepositoryAnchor = new Map<string, ProjectRecord>();
+  const byRailKey = new Map<string, ProjectRecord>();
+  for (const project of projects) {
     if (project.anchor)
       byAnchor.set(pathKey(project.anchor), project);
+    for (const repo of project.repositories)
+      if (repo.anchor)
+        byRepositoryAnchor.set(pathKey(repo.anchor), project);
+    byRailKey.set(pathKey(projectRailKey(project.id)), project);
+  }
   const represented = new Set<string>();
   const group = (items: RailProjectItem[]) => {
     const out: RailProjectItem[] = [];
@@ -865,7 +946,11 @@ export function groupRailProjectsByMembership(
       const family = families.get(itemKey);
       const member =
         family && findProjectByCommonDir(family.commonDir, projects);
-      const project = member?.project ?? byAnchor.get(itemKey);
+      const project =
+        member?.project ??
+        byAnchor.get(itemKey) ??
+        byRepositoryAnchor.get(itemKey) ??
+        byRailKey.get(itemKey);
       if (!project) {
         out.push(item);
         continue;
