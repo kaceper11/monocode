@@ -410,6 +410,13 @@ import { useSessionReminders } from "./hooks/useSessionReminders";
 import { ReminderNotices } from "./chrome/ReminderNotices";
 import { nextUnseenFinishedSessions } from "./lib/sessionDone";
 import {
+  resolveVerifyForSession,
+  sendCheckToAgent,
+  setVerifyHooks,
+  suppressVerifyTurn,
+  verifyTurnFinished,
+} from "./lib/verify";
+import {
   loadNotificationsEnabled,
   NOTIFICATION_CLICK_EVENT,
   notifySession,
@@ -1116,6 +1123,9 @@ export default function App({
 
       turnGen.current.set(sessionId, (turnGen.current.get(sessionId) ?? 0) + 1);
       flushHarnessEvents();
+      // Removal stops the turn — the busy→idle edge must not verify work
+      // that is being cancelled for archive/delete.
+      suppressVerifyTurn(open);
       await Promise.all(
         sessionChildHarnesses(open).map((harness) =>
           cancelHarnessTurn(harness, sessionId).catch(() => undefined),
@@ -1433,6 +1443,21 @@ export default function App({
     focusedForDoneRef.current = activeSessionId;
   }
   const unseenFinishedIds = unseenFinishedRef.current;
+
+  // Checks on finish (#92): every busy→idle edge is a candidate turn-end.
+  // verify.ts claims the turn, resolves the project's check command and runs
+  // it headlessly; the outcome lands in the attention queue.
+  const verifyBusyRef = useRef(busySessionIds);
+  useEffect(() => {
+    const previous = verifyBusyRef.current;
+    verifyBusyRef.current = busySessionIds;
+    if (previous === busySessionIds) return;
+    for (const id of previous) {
+      if (busySessionIds.has(id)) continue;
+      const session = sessionsRef.current.find((row) => row.id === id);
+      if (session) verifyTurnFinished(session);
+    }
+  }, [busySessionIds]);
 
   const liveAgents = useMemo(
     () =>
@@ -3730,6 +3755,8 @@ export default function App({
                 (session) => session.id === activeTab?.focusedId,
               ),
             );
+            // Gone from the workspace either way — its check row dies with it.
+            resolveVerifyForSession(sessionId);
             if (mode === "archive") {
               const archived =
                 savedSummary ??
@@ -5212,6 +5239,7 @@ export default function App({
       const loaded = await getSession(sessionId).catch(() => null);
       if (loaded) return true;
       pruneTaskSession(sessionId);
+      resolveVerifyForSession(sessionId);
       return false;
     },
     [],
@@ -6472,6 +6500,9 @@ export default function App({
       turnGen.current.set(sessionId, (turnGen.current.get(sessionId) ?? 0) + 1);
       flushHarnessEvents();
       if (session) {
+        // The busy→idle edge below would otherwise verify a turn the user
+        // deliberately cut short.
+        suppressVerifyTurn(session);
         for (const id of sessionChildHarnesses(session)) {
           void cancelHarnessTurn(id, sessionId);
         }
@@ -7172,6 +7203,11 @@ export default function App({
           case "open-automations":
             openSettings("automations");
             return;
+          case "check-fix": {
+            const error = await sendCheckToAgent(action.runId);
+            if (error) throw new Error(error);
+            return;
+          }
           case "reconnect":
             openSettings("inbox", action.source);
             return;
@@ -7338,6 +7374,24 @@ export default function App({
           Promise.resolve({ error: "No run handler." }),
       }),
     [],
+  );
+
+  // Checks on finish (#92) dispatch through the same bound-session path as
+  // watchers: live-state validation inside verify.ts, queued follow-up here.
+  useEffect(
+    () =>
+      setVerifyHooks({
+        getSession: (sessionId) =>
+          sessionsRef.current.find((row) => row.id === sessionId),
+        sendToSession: async (sessionId, text, action) => {
+          const accepted = await onSubmit(sessionId, text, [], {
+            followUpBehavior: "queue",
+            action,
+          });
+          return accepted !== false;
+        },
+      }),
+    [onSubmit],
   );
 
   // The schedule engine owns due-time/catch-up policy; these hooks are its

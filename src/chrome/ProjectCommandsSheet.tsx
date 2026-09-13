@@ -10,6 +10,7 @@ import {
   repositoryDisplayName,
   saveProjectCommand,
   saveProjectCommandGroup,
+  setProjectVerify,
   subscribeProjects,
   type CommandStep,
   type ProjectCommand,
@@ -26,6 +27,7 @@ import {
 import { ContextCheckbox } from "./InboxContextPicker";
 import { Modal } from "./Modal";
 import { Select } from "./Select";
+import { MAX_FIX_SENDS, resolveVerifyForProject } from "../lib/verify";
 import {
   Check,
   ChevronDown,
@@ -606,6 +608,85 @@ export function ProjectCommandsSheet({
                 <Plus className="size-3.5" strokeWidth={1.75} />
                 New project command
               </button>
+            </div>
+            <div>
+              <span className={labelClass}>Checks on finish</span>
+              {commands.length === 0 ? (
+                <p className="py-1.5 text-[12px] text-content/45">
+                  Save a project command first.
+                </p>
+              ) : (
+                <div className="flex items-center gap-2 py-1">
+                  <div className="min-w-0 flex-1">
+                    <Select
+                      label="Finish check command"
+                      value={project.verify?.commandId ?? ""}
+                      options={[
+                        { value: "", label: "Off" },
+                        ...commands.map((command) => ({
+                          value: command.id,
+                          label: command.name,
+                        })),
+                        // A deleted command stays listed so the stale
+                        // binding is visible instead of silently clearing.
+                        ...(project.verify &&
+                        !commands.some(
+                          (item) => item.id === project.verify?.commandId,
+                        )
+                          ? [
+                              {
+                                value: project.verify.commandId,
+                                label: "Deleted command",
+                              },
+                            ]
+                          : []),
+                      ]}
+                      onChange={(value) => {
+                        if (!value) {
+                          // "Off" clears the config; its live rows go too.
+                          resolveVerifyForProject(project.id);
+                          setProjectVerify(project.id, null);
+                          return;
+                        }
+                        setProjectVerify(project.id, {
+                          commandId: value,
+                          mode: project.verify?.mode ?? "notify",
+                        });
+                      }}
+                    />
+                  </div>
+                  {project.verify ? (
+                    <div className="w-44 shrink-0">
+                      <Select
+                        label="On failure"
+                        value={project.verify.mode}
+                        options={[
+                          { value: "notify", label: "Notify me" },
+                          {
+                            value: "fix",
+                            label: `Send to agent (≤${MAX_FIX_SENDS})`,
+                          },
+                        ]}
+                        onChange={(value) =>
+                          setProjectVerify(project.id, {
+                            commandId: project.verify?.commandId ?? "",
+                            mode: value === "fix" ? "fix" : "notify",
+                          })
+                        }
+                      />
+                    </div>
+                  ) : null}
+                </div>
+              )}
+              {project.verify ? (
+                <p className="text-[11px] text-content/40">
+                  {commands.some(
+                    (item) => item.id === project.verify?.commandId,
+                  )
+                    ? "Runs when an agent turn ends in this project — only while MonoCode is open. A failure offers to hand the output tail back to the same agent."
+                    : "The selected command was deleted — pick a saved command."}
+                </p>
+              ) : null}
             </div>
             <div>
               <span className={labelClass}>Reusable — every project</span>

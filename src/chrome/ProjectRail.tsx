@@ -1,4 +1,5 @@
 import { WslBadge } from "./WslBadge";
+import { dropVerifyForProject } from "../lib/verify";
 import {
   Archive,
   Check,
@@ -662,6 +663,7 @@ export function ProjectRail({
     // checkouts, worktrees, branches and credentials stay on disk. Purge still
     // applies the existing per-path session cleanup.
     deleteProject(project.id);
+    dropVerifyForProject(project.id);
     const members = memberRecentPaths(project);
     for (const member of members)
       onRemoveProject?.(member, { purgeData });

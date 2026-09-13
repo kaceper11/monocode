@@ -168,7 +168,21 @@ fn exec_args(location: &Location, exec: &str) -> Vec<String> {
 /// propagates the shell's exit code, so the PTY exit carries the step result.
 #[cfg(windows)]
 pub fn exec_command(location: &Location, exec: &str) -> Result<Command, String> {
+    verify_location(location)?;
+    exec_command_verified(location, exec)
+}
+
+/// The bridge round trip that proves `location` is still reachable — callers
+/// running several steps verify once, then build via `exec_command_verified`.
+#[cfg(windows)]
+pub(crate) fn verify_location(location: &Location) -> Result<(), String> {
     let _: String = request(location, "canonical", json!({}))?;
+    Ok(())
+}
+
+/// Build a step command for a location `verify_location` already checked.
+#[cfg(windows)]
+pub(crate) fn exec_command_verified(location: &Location, exec: &str) -> Result<Command, String> {
     let mut command = wsl_command()?;
     command.args(exec_args(location, exec));
     Ok(command)

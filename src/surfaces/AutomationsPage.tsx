@@ -24,6 +24,19 @@ import {
   type Schedule,
 } from "../lib/schedules";
 import { runScheduleNow } from "../lib/scheduleEngine";
+import {
+  loadProjects,
+  projectsSnapshot,
+  setProjectVerify,
+  subscribeProjects,
+} from "../lib/projects";
+import {
+  subscribeVerify,
+  verifyRunsFor,
+  verifySnapshot,
+  verifyStoreFromSnapshot,
+  type CheckRunRecord,
+} from "../lib/verify";
 import { formatRelativeTime } from "../lib/githubTasks";
 import { displayPath } from "../lib/paths";
 import { HARNESS_TITLE } from "../lib/session";
@@ -32,6 +45,14 @@ const button =
   "rounded-md border border-content/15 px-2 py-1 text-[12px] text-content/70 hover:bg-content/10 hover:text-content disabled:opacity-40";
 
 const MODE_LABEL = { notify: "Notify", draft: "Draft", run: "Run" } as const;
+
+const CHECK_STATUS_LABEL: Record<CheckRunRecord["status"], string> = {
+  passed: "passed",
+  failed: "failed",
+  timeout: "timeout",
+  error: "error",
+  skipped: "skipped",
+};
 
 /**
  * Settings → Automations (#23, #24, #76). Watchers poll and schedules fire
@@ -46,6 +67,18 @@ export function AutomationsPage() {
     () => (schedulesRaw ? loadSchedules() : []),
     [schedulesRaw],
   );
+  const projectsRaw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
+  const verifyRaw = useSyncExternalStore(subscribeVerify, verifySnapshot);
+  const checkedProjects = useMemo(() => {
+    const store = verifyStoreFromSnapshot(verifyRaw);
+    return loadProjects()
+      .filter((project) => project.verify)
+      .map((project) => ({
+        project,
+        runs: verifyRunsFor(project.id, store),
+      }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectsRaw, verifyRaw]);
 
   const remove = async (watcher: Watcher) => {
     if (
@@ -182,6 +215,122 @@ export function AutomationsPage() {
                 </div>
               </li>
             ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="space-y-3">
+        <h3 className="text-[13px] font-medium text-content/80">
+          Checks on finish
+        </h3>
+        <p className="text-[13px] text-content/60">
+          Run a saved command when an agent turn ends — the outcome lands in
+          the Attention queue while MonoCode is open. Pick the command per
+          project in its saved-commands sheet; a failed run can hand the
+          output tail back to the same agent.
+        </p>
+        {checkedProjects.length === 0 ? (
+          <p className="rounded-lg border border-dashed border-content/15 px-4 py-6 text-center text-[13px] text-content/45">
+            No checks configured. Choose a finish command in a project’s saved
+            commands.
+          </p>
+        ) : (
+          <ul className="space-y-2">
+            {checkedProjects.map(({ project, runs }) => {
+              const verify = project.verify;
+              if (!verify) return null;
+              const command = project.commands.find(
+                (item) => item.id === verify.commandId,
+              );
+              const last = runs[runs.length - 1];
+              return (
+                <li
+                  key={project.id}
+                  className="rounded-lg border border-content/10 px-3 py-2.5"
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate text-[13px] font-medium">
+                      {project.name ??
+                        (project.anchor
+                          ? displayPath(project.anchor)
+                          : "Project")}
+                    </span>
+                    <span className="shrink-0 rounded bg-content/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-content/50">
+                      {verify.mode === "fix" ? "Auto-fix" : "Notify"}
+                    </span>
+                    <span className="shrink-0 text-[11px] text-content/40">
+                      {verify.enabled === false ? "Paused" : "On"}
+                    </span>
+                  </div>
+                  <p className="mt-0.5 truncate text-[12px] text-content/50">
+                    {command?.name ?? "Deleted command — reconfigure in saved commands"}
+                  </p>
+                  {last ? (
+                    <p
+                      className={`mt-1 text-[12px] ${
+                        last.status === "failed" ||
+                        last.status === "timeout" ||
+                        last.status === "error"
+                          ? "text-red-400"
+                          : "text-content/55"
+                      }`}
+                    >
+                      Last: {CHECK_STATUS_LABEL[last.status]}
+                      {last.detail ? ` — ${last.detail}` : ""} ·{" "}
+                      {formatRelativeTime(new Date(last.at).toISOString())}
+                      {last.sentToAgent ? " · sent to agent" : ""}
+                    </p>
+                  ) : null}
+                  {runs.length > 1 ? (
+                    <ul className="mt-1.5 space-y-0.5">
+                      {/* The latest run is already the "Last:" line above. */}
+                      {runs.slice(-4, -1).map((run) => (
+                        <li
+                          key={run.id}
+                          className="flex items-baseline gap-2 text-[11px] text-content/45"
+                        >
+                          <span className="w-10 shrink-0 text-right tabular-nums">
+                            {formatRelativeTime(new Date(run.at).toISOString())}
+                          </span>
+                          <span
+                            className={`shrink-0 ${
+                              run.status === "failed" ||
+                              run.status === "timeout" ||
+                              run.status === "error"
+                                ? "text-red-400"
+                                : run.status === "skipped"
+                                  ? "text-content/35"
+                                  : ""
+                            }`}
+                          >
+                            {CHECK_STATUS_LABEL[run.status]}
+                          </span>
+                          <span className="min-w-0 truncate">
+                            {run.sessionTitle}
+                            {run.detail ? ` — ${run.detail}` : ""}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  <div className="mt-2 flex gap-1.5">
+                    <button
+                      type="button"
+                      className={button}
+                      onClick={() =>
+                        setProjectVerify(project.id, {
+                          commandId: verify.commandId,
+                          mode: verify.mode,
+                          enabled: verify.enabled === false,
+                        })
+                      }
+                    >
+                      {verify.enabled === false ? "Resume" : "Pause"}
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
           </ul>
         )}
       </section>

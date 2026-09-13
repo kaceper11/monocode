@@ -11,6 +11,7 @@ import {
 import {
   childForRepository,
   preferredTaskChild,
+  type TaskChild,
   type TaskWorkspace,
 } from "./taskWorkspaces";
 
@@ -215,6 +216,10 @@ export function resolveCommandTarget(input: {
   command: { repositoryId?: string; relativeCwd?: string };
   project?: ProjectRecord;
   task?: TaskWorkspace | null;
+  /** Run in this specific child — the copy a session actually worked in —
+   * rather than the task's primary child. Bound commands keep their
+   * repository but take the child's attempt. */
+  child?: TaskChild;
   /** Folder a reusable command was launched from when no project owns it. */
   fallbackCwd?: string;
 }): ResolvedCommandTarget | { error: string } {
@@ -232,10 +237,20 @@ export function resolveCommandTarget(input: {
     }
     label = repositoryDisplayName(repo);
     if (task) {
-      const child = childForRepository(task, command.repositoryId);
+      // A `child` input means "the copy this session worked in" — an attempt
+      // without one is an honest miss, not a reason to run in another
+      // attempt's checkout.
+      const child = childForRepository(
+        task,
+        command.repositoryId,
+        input.child?.attemptId,
+        Boolean(input.child?.attemptId),
+      );
       if (!child) {
         return {
-          error: `${label} is not part of task “${task.name}”.`,
+          error: input.child?.attemptId
+            ? `This attempt has no copy of ${label} yet.`
+            : `${label} is not part of task “${task.name}”.`,
         };
       }
       if (!child.workingCopy) {
@@ -250,7 +265,7 @@ export function resolveCommandTarget(input: {
       source = "repository";
     }
   } else if (task) {
-    const child = taskPrimaryChild(task);
+    const child = input.child ?? taskPrimaryChild(task);
     if (!child?.workingCopy) {
       return { error: `Task “${task.name}” has no working copy yet.` };
     }
