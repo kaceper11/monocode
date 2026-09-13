@@ -211,7 +211,9 @@ import { ProjectCommandsSheet } from "./chrome/ProjectCommandsSheet";
 import type { PopoverAnchor } from "./chrome/Popover";
 import {
   OPEN_BOUND_PROCESS,
+  OPEN_WORKTREE_MANAGER,
   type BoundProcess,
+  type WorktreeManagerRequest,
 } from "./lib/worktreeRemoval";
 import {
   applyGroupedReorder,
@@ -7140,8 +7142,21 @@ export default function App({
     subscribeWorkingCopyPreferences,
     hiddenWorkingCopiesSnapshot,
   );
-  const [worktreeManager, setWorktreeManager] = useState<string | null>(null);
+  const [worktreeManager, setWorktreeManager] =
+    useState<WorktreeManagerRequest | null>(null);
   const [worktreeManagerBusy, setWorktreeManagerBusy] = useState(false);
+  // Rails, sheets and menus open the shared modal through this event instead
+  // of threading a callback through every layer.
+  useEffect(() => {
+    const open = (event: Event) => {
+      setWorktreeManagerBusy(false);
+      setWorktreeManager(
+        (event as CustomEvent<WorktreeManagerRequest>).detail,
+      );
+    };
+    window.addEventListener(OPEN_WORKTREE_MANAGER, open);
+    return () => window.removeEventListener(OPEN_WORKTREE_MANAGER, open);
+  }, []);
   // Live + persisted sessions across every checkout. `sidebarHistory` is
   // cwd-filtered; task details and worktree staleness must see sessions in
   // sibling working copies too.
@@ -7558,7 +7573,7 @@ export default function App({
             return;
           case "open-worktrees":
             setWorktreeManagerBusy(false);
-            setWorktreeManager(action.cwd);
+            setWorktreeManager({ cwd: action.cwd, select: action.paths });
             return;
           case "open-url":
             await openUrl(action.url);
@@ -8483,7 +8498,11 @@ export default function App({
           }}
         >
           <WorktreePanel
-            cwd={worktreeManager}
+            key={JSON.stringify(worktreeManager)}
+            cwd={worktreeManager.cwd}
+            initialPath={worktreeManager.path}
+            initialAction={worktreeManager.action}
+            initialSelect={worktreeManager.select}
             activeCwd={projectCwd}
             onClose={() => setWorktreeManager(null)}
             onOpen={(path) => {

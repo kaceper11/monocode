@@ -10,7 +10,9 @@ import type { ProjectRecord } from "./projects";
 import { collectRailProjects, type RecentProject } from "./recents";
 import {
   lastWorkingCopyUse,
+  staleWorkingCopy,
   workingCopyAge,
+  STALE_WORKING_COPY_AGE,
   type RepositoryFamily,
 } from "./repositoryFamilies";
 import type { RepairRecord } from "./repair";
@@ -163,7 +165,7 @@ function repairItems(record: RepairRecord, sessions: Session[]): AttentionItem[]
 /** A working copy counts as stale when Git marks it missing/prunable, or
  * when its last recorded MonoCode use is older than this. Unknown activity
  * is never stale — a fresh or externally-used copy has no recorded use. */
-export const STALE_WORKTREE_AGE = 14 * 24 * 60 * 60 * 1000;
+export const STALE_WORKTREE_AGE = STALE_WORKING_COPY_AGE;
 
 /** Small stable hash for signatures — fingerprints the stale set without
  * embedding whole paths. */
@@ -253,8 +255,7 @@ export function worktreeCleanupAttention(input: {
       // missing registration too.
       if (entry.locked) return false;
       if (entry.missing || entry.prunable) return true;
-      const used = lastUse(entry);
-      return used !== null && now - used > STALE_WORKTREE_AGE;
+      return staleWorkingCopy(entry, lastUse(entry), now);
     });
     if (!stale.length) continue;
     const missing = stale.filter(
@@ -268,9 +269,7 @@ export function worktreeCleanupAttention(input: {
     // verified-family map key, and the manager seeds its list from it.
     const member =
       family.worktrees.find((entry) => !entry.missing && !entry.prunable)
-        ?.path ??
-      family.checkout ??
-      stale[0].path;
+        ?.path ?? family.checkout;
     items.push({
       key: `worktree-stale:${pathKey(family.commonDir)}`,
       kind: "worktree",
@@ -304,6 +303,9 @@ export function worktreeCleanupAttention(input: {
       action: {
         kind: "open-worktrees",
         cwd: member,
+        // The manager lands on the stale set pre-checked; missing/prunable
+        // registrations are never selectable and sort into review instead.
+        paths: stale.map((entry) => entry.path),
       },
     });
   }

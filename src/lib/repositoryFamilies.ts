@@ -149,3 +149,21 @@ export function oldestWorkingCopies<T extends WorkingCopy>(
       a.path.localeCompare(b.path),
   );
 }
+
+/** A working copy counts as stale when its last recorded MonoCode use is
+ * older than this. Unknown activity is never stale — a fresh or
+ * externally-used copy has no recorded use. */
+export const STALE_WORKING_COPY_AGE = 14 * 24 * 60 * 60 * 1000;
+
+/** Stale-by-age only: usable copies whose recorded use is old. Missing and
+ * prunable registrations are never "old" — callers treat them separately
+ * (attention nudges count them; batch selection can never pick them). */
+export function staleWorkingCopy(
+  entry: WorkingCopy,
+  lastUse: number | null,
+  now = Date.now(),
+): boolean {
+  if (entry.main || entry.locked || entry.missing || entry.prunable)
+    return false;
+  return lastUse !== null && now - lastUse > STALE_WORKING_COPY_AGE;
+}
