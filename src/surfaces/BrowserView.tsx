@@ -867,24 +867,19 @@ function EmptyBrowserState({
 }) {
   const [value, setValue] = useState(suggested ?? "");
   const [error, setError] = useState("");
-  // A URL on the clipboard is a stronger hint than the remembered URL —
-  // prefill it unless the user has already typed. Silently falls back when
-  // clipboard access is denied or the contents aren't an http(s) link.
-  const touchedRef = useRef(false);
-  useEffect(() => {
-    let cancelled = false;
+  const paste = () => {
+    // Explicit paste gesture — a programmatic read on mount trips the macOS
+    // paste-consent prompt. A clipboard URL opens straight away; anything
+    // else just fills the field for editing.
     void navigator.clipboard
       ?.readText()
       .then((text) => {
-        const clipped = browserClipboardUrl(text);
-        if (cancelled || touchedRef.current || !clipped) return;
-        setValue(clipped);
+        const url = browserClipboardUrl(text);
+        if (url) onSubmit(url);
+        else setValue(text.trim());
       })
       .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  };
   return (
     <div className="absolute inset-0 grid place-items-center overflow-y-auto p-6">
       <form
@@ -909,7 +904,6 @@ function EmptyBrowserState({
         <input
           value={value}
           onChange={(event) => {
-            touchedRef.current = true;
             setValue(event.currentTarget.value);
             setError("");
           }}
@@ -925,13 +919,22 @@ function EmptyBrowserState({
         {error ? (
           <p className="mt-1.5 text-[11.5px] text-red-400">{error}</p>
         ) : null}
-        <button
-          type="submit"
-          disabled={!value.trim()}
-          className="mt-2.5 rounded-md bg-content px-3 py-1.5 text-[12px] font-medium text-background-base hover:bg-content/90 disabled:opacity-40"
-        >
-          Open
-        </button>
+        <div className="mt-2.5 flex items-center gap-2">
+          <button
+            type="submit"
+            disabled={!value.trim()}
+            className="rounded-md bg-content px-3 py-1.5 text-[12px] font-medium text-background-base hover:bg-content/90 disabled:opacity-40"
+          >
+            Open
+          </button>
+          <button
+            type="button"
+            onClick={paste}
+            className="rounded-md bg-content/10 px-3 py-1.5 text-[12px] font-medium text-content hover:bg-content/15"
+          >
+            Paste URL
+          </button>
+        </div>
         {favorites.length ? (
           <div className="mt-5">
             <p className="text-[11px] font-medium uppercase tracking-wide text-content/40">
