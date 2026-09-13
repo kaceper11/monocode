@@ -266,7 +266,11 @@ export function isAgentToolName(name: string): boolean {
     normalized === "agent" ||
     normalized === "task" ||
     normalized === "subagent" ||
-    normalized === "taskcreate"
+    normalized === "taskcreate" ||
+    normalized === "run_subagent" ||
+    normalized === "read_subagent" ||
+    normalized === "spawn_agent" ||
+    normalized === "sidekick"
   );
 }
 
@@ -291,7 +295,10 @@ export function agentToolTitle(
     coerceString(input.subagentType) ??
     coerceString(input.agent_type) ??
     coerceString(input.agentType) ??
-    coerceString(input.agent);
+    coerceString(input.agent) ??
+    coerceString(input.profile) ??
+    coerceString(input.profile_id) ??
+    coerceString(input.profileName);
   if (type) {
     const label = formatAgentType(type);
     return /subagent/i.test(label) ? label : `${label} subagent`;

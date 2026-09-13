@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AcpSubagents } from "./acpSubagents";
+import { acpEventsFromUpdate } from "./acp";
 import { eventsFromAcpUpdate as fxEvents } from "./fxProtocol";
 import { eventsFromAcpUpdate as grokEvents } from "./grokProtocol";
 import { applyHarnessEvent } from "./apply";
@@ -146,5 +147,143 @@ describe("ACP child routing", () => {
     expect(
       router.route(params, [{ type: "message.delta", text: "Done" }])[0],
     ).not.toMatchObject({ stepId: (first as { stepId: string }).stepId });
+  });
+
+  it("links Devin child updates through subagent_started run ids", () => {
+    const router = new AcpSubagents();
+    let session = newSession("devin", "/repo");
+    const push = (update: Record<string, unknown>) => {
+      const params = { sessionId: "parent", update };
+      for (const event of router.route(params, acpEventsFromUpdate(params))) {
+        session = applyHarnessEvent(session, event);
+      }
+    };
+    // The run_subagent call names the run it created; the update itself is
+    // not marked as a child.
+    push({
+      sessionUpdate: "tool_call",
+      toolCallId: "call-1",
+      kind: "other",
+      title: "run_subagent",
+      status: "in_progress",
+      _meta: {
+        "cognition.ai/subagent_started": {
+          agentId: "agent-7",
+          runId: "run-9",
+          task: "Review the diff",
+          profile: "reviewer",
+          model: "devin-review",
+        },
+      },
+      rawInput: { _toolName: "run_subagent", task: "Review the diff" },
+    });
+    const ctx = {
+      "cognition.ai/subagent_context": {
+        parentAgentId: "agent-7",
+        runId: "run-9",
+      },
+    };
+    push({
+      sessionUpdate: "agent_message_chunk",
+      _meta: ctx,
+      content: { type: "text", text: "Scanning " },
+    });
+    push({
+      sessionUpdate: "agent_message_chunk",
+      _meta: ctx,
+      content: { type: "text", text: "diff hunks." },
+    });
+    push({
+      sessionUpdate: "tool_call",
+      _meta: ctx,
+      toolCallId: "read-1",
+      kind: "read",
+      title: "Read auth.ts",
+      status: "in_progress",
+    });
+    push({
+      sessionUpdate: "tool_call_update",
+      _meta: ctx,
+      toolCallId: "read-1",
+      status: "completed",
+    });
+    push({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "Parent answer" },
+    });
+
+    const block = session.blocks.find(
+      (entry) => entry.tool?.callId === "call-1",
+    )!;
+    expect(block.tool?.kind).toBe("agent");
+    expect(block.text).toBe("Review the diff");
+    expect(block.agentRun?.model).toBe("devin-review");
+    expect(block.agentRun?.steps).toHaveLength(2);
+    expect(block.agentRun?.steps[0].text).toBe("Scanning diff hunks.");
+    expect(block.agentRun?.steps[1]).toMatchObject({
+      kind: "tool",
+      status: "completed",
+    });
+    expect(
+      session.blocks.some((entry) => entry.tool?.callId === "read-1"),
+    ).toBe(false);
+    expect(
+      session.blocks
+        .filter((entry) => entry.role === "assistant")
+        .map((entry) => entry.text),
+    ).toEqual(["Parent answer"]);
+  });
+
+  it("resolves flat subagent/agent_id attributes and copilot meta parents", () => {
+    const router = new AcpSubagents();
+    router.route(
+      {
+        update: {
+          sessionUpdate: "tool_call",
+          _meta: { "subagent/agent_id": "agent-8" },
+        },
+      },
+      [
+        {
+          type: "tool.started",
+          callId: "call-2",
+          title: "Spawn",
+          kind: "agent",
+        },
+      ],
+    );
+    expect(
+      router.route(
+        { update: { _meta: { "subagent/agent_id": "agent-8" } } },
+        [{ type: "message.delta", text: "attribute link" }],
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        type: "agent.step",
+        callId: "call-2",
+        text: "attribute link",
+      }),
+    ]);
+
+    router.route({}, [
+      {
+        type: "tool.started",
+        callId: "call-3",
+        title: "Delegate",
+        kind: "agent",
+      },
+    ]);
+    expect(
+      router.route(
+        { update: { _meta: { copilot: { parentToolCallId: "call-3" } } } },
+        [{ type: "message.delta", text: "copilot child" }],
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        type: "agent.step",
+        callId: "call-3",
+        text: "copilot child",
+      }),
+    ]);
   });
 });

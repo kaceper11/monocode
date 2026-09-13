@@ -31,6 +31,7 @@ import {
   type AcpConfigOption,
   type AcpHandlers,
 } from "./acp";
+import { AcpSubagents } from "./acpSubagents";
 import type { JsonRpcId } from "./jsonRpc";
 import {
   killChild,
@@ -68,6 +69,8 @@ type Live = {
   acp: AcpClient;
   acpSessionId: string;
   cwd: string;
+  /** Child task/agent activity routed onto its parent's transcript row. */
+  subagents: AcpSubagents;
   /** Reasoning effort this child was launched with (`--effort` is fixed). */
   launchEffort?: string;
   /** Last model the session reported or we set via `session/set_model`. */
@@ -567,6 +570,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       acp,
       acpSessionId,
       cwd: input.cwd,
+      subagents: new AcpSubagents(),
       launchEffort: effort,
       currentModelId: copilotCurrentModelId(setup, configOptions),
       modelPinned: false,
@@ -903,7 +907,10 @@ function handleNotification(live: Live, method: string, params: unknown) {
   // Replays (session/load) and muted windows still update the state above;
   // only transcript events are suppressed.
   if (live.muteUpdates) return;
-  for (const event of acpEventsFromUpdate(params)) {
+  for (const event of live.subagents.route(
+    params,
+    acpEventsFromUpdate(params),
+  )) {
     live.onEvent(event);
   }
 }
