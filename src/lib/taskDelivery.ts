@@ -51,7 +51,9 @@ export function deliveryStores(): DeliveryStores {
   return { prs: allAzurePrAssociations(), ci: allCiSources() };
 }
 
-function taskSessionIds(task: TaskWorkspace): Set<string> {
+/** Every session a task owns — the task-level conversation plus legacy
+ * per-child ids. */
+export function taskSessionIds(task: TaskWorkspace): Set<string> {
   const ids = new Set(task.sessionIds);
   for (const child of task.children)
     for (const id of child.sessionIds) ids.add(id);
@@ -59,30 +61,31 @@ function taskSessionIds(task: TaskWorkspace): Set<string> {
 }
 
 /**
- * Delivery links saved against one child checkout.
- *
- * `branches` are the names this child may be known under — the recorded
- * `child.branch` plus the observed head from diff stats/index. Links for the
- * recorded branch keep counting even when the checkout moved on: they belong
- * to the child's task branch, not to whatever someone checked out meanwhile.
- * A saved link counts when its scope session belongs to this task (or is
- * unassigned) and its own branch — or the PR's source ref — names a known
- * branch. With no known branch the child's links stay unknown rather than
- * guessed.
+ * The saved provider links bound to one child checkout, under the same rules
+ * {@link childDelivery} counts by: `branches` are the names this child may be
+ * known under — the recorded `child.branch` plus the observed head from diff
+ * stats/index. Links for the recorded branch keep matching even when the
+ * checkout moved on: they belong to the child's task branch, not to whatever
+ * someone checked out meanwhile. A saved link matches when its scope session
+ * belongs to this task (or is unassigned) and its own branch — or the PR's
+ * source ref — names a known branch. With no known branch the child's links
+ * stay unknown rather than guessed.
  */
-export function childDelivery(
+export function childDeliveryRows(
   task: TaskWorkspace,
   child: TaskChild,
   branches: readonly (string | null | undefined)[],
-  githubPr?: GitPr | null,
   stores: DeliveryStores = deliveryStores(),
-): TaskChildDelivery {
-  const delivery = { ...EMPTY_DELIVERY };
+): { prs: AzurePrAssociation[]; ci: CiSource[] } {
+  const out: { prs: AzurePrAssociation[]; ci: CiSource[] } = {
+    prs: [],
+    ci: [],
+  };
   const cwd = child.workingCopy;
-  if (!cwd) return delivery;
+  if (!cwd) return out;
   const cwdKey = pathKey(cwd);
   const known = new Set(branches.filter((b): b is string => !!b));
-  if (!known.size) return delivery;
+  if (!known.size) return out;
   const sessions = taskSessionIds(task);
   const scoped = (session: string | undefined) =>
     session === undefined || sessions.has(session);
@@ -92,12 +95,8 @@ export function childDelivery(
     if (!known.has(row.branch) && !known.has(shortRef(row.pr.sourceRefName)))
       continue;
     if (row.pr.status.toLowerCase() !== "active") continue;
-    delivery.prs += 1;
-    if (row.pr.reviewers.some((reviewer) => reviewer.vote < 0))
-      delivery.prNeedsAttention = true;
+    out.prs.push(row);
   }
-  if (githubPr && githubPr.state.toLowerCase() === "open") delivery.prs += 1;
-
   for (const row of stores.ci) {
     if (pathKey(row.cwd) !== cwdKey || !scoped(row.session)) continue;
     if (
@@ -105,6 +104,33 @@ export function childDelivery(
       !known.has(shortRef(row.last?.run.branch ?? ""))
     )
       continue;
+    out.ci.push(row);
+  }
+  return out;
+}
+
+/**
+ * Delivery links saved against one child checkout — counts and attention
+ * flags over {@link childDeliveryRows} plus the caller's cached GitHub PR.
+ */
+export function childDelivery(
+  task: TaskWorkspace,
+  child: TaskChild,
+  branches: readonly (string | null | undefined)[],
+  githubPr?: GitPr | null,
+  stores: DeliveryStores = deliveryStores(),
+): TaskChildDelivery {
+  const delivery = { ...EMPTY_DELIVERY };
+  if (!child.workingCopy || !branches.some(Boolean)) return delivery;
+  const rows = childDeliveryRows(task, child, branches, stores);
+  for (const row of rows.prs) {
+    delivery.prs += 1;
+    if (row.pr.reviewers.some((reviewer) => reviewer.vote < 0))
+      delivery.prNeedsAttention = true;
+  }
+  if (githubPr && githubPr.state.toLowerCase() === "open") delivery.prs += 1;
+
+  for (const row of rows.ci) {
     delivery.ci += 1;
     const run = row.last?.run;
     if (!run || !ciMatches(run)) continue;

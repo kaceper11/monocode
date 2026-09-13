@@ -11,8 +11,14 @@ import {
   parseAzurePrLocation,
   readAzurePrSection,
   saveAzurePrAssociation,
+  unbindAzurePrSession,
   type AzurePrAssociation,
 } from "./azureRepos";
+import {
+  ensureDeliveryWatcher,
+  loadWatchers,
+  removeWatcher,
+} from "./watchers";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 beforeEach(() => {
@@ -306,4 +312,262 @@ it("discovers multiple story PRs before branch matches, deduplicates identity, a
     loadAzurePrAssociation(association.cwd, "feature", "session-a")?.target
       .number,
   ).toBe(13);
+});
+
+it("auto-watches a newly linked PR and lifts the watcher on unlink", () => {
+  saveAzurePrAssociation(
+    association,
+    association.cwd,
+    "feature",
+    "session-a",
+  );
+  const watchers = loadWatchers();
+  expect(watchers).toHaveLength(1);
+  expect(watchers[0].auto).toBe(true);
+  expect(watchers[0].source).toEqual({
+    kind: "azure-pr",
+    target: association.target,
+    projectName: "Project",
+    repositoryName: "repo",
+    cwd: association.cwd,
+    branch: "feature",
+    sessionId: "session-a",
+  });
+  saveAzurePrAssociation(
+    null,
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  expect(loadWatchers()).toHaveLength(0);
+});
+
+it("does not resurrect a removed watcher on refresh; terminal status keeps it for the poll", () => {
+  saveAzurePrAssociation(
+    association,
+    association.cwd,
+    "feature",
+    "session-a",
+  );
+  const watcher = loadWatchers()[0];
+  removeWatcher(watcher.id);
+  // A re-save of the same scope+target is a refresh — no resurrection.
+  saveAzurePrAssociation(
+    association,
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  expect(loadWatchers()).toHaveLength(0);
+  // Unlinked and re-linked later — the watcher returns; a re-read reporting
+  // "abandoned" keeps the stored row, so the watcher stays for the poll-side
+  // retirement that emits the goodbye row.
+  saveAzurePrAssociation(
+    null,
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  saveAzurePrAssociation(association, association.cwd, "feature", "session-a");
+  expect(loadWatchers()).toHaveLength(1);
+  saveAzurePrAssociation(
+    { ...association, pr: { ...association.pr, status: "abandoned" } },
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  expect(loadWatchers()).toHaveLength(1);
+});
+
+it("keeps the previous link's watcher when the displayed PR switches", () => {
+  const second = {
+    ...association,
+    target: { ...association.target, number: 14 },
+    pr: { ...association.pr, pullRequestId: 14 },
+  };
+  saveAzurePrAssociation(association, association.cwd, "feature", "session-a");
+  // The panel always passes the current target as removeTarget — but the old
+  // row stays stored (the Saved-PR switcher lists it), so its watcher stays.
+  saveAzurePrAssociation(
+    second,
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  expect(
+    loadAzurePrAssociations(association.cwd, "feature", "session-a"),
+  ).toHaveLength(2);
+  expect(loadWatchers()).toHaveLength(2);
+  // Truly unlinking the old PR lifts only its watcher.
+  saveAzurePrAssociation(
+    null,
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  const watchers = loadWatchers();
+  expect(watchers).toHaveLength(1);
+  expect(watchers[0].source).toMatchObject({ target: { number: 14 } });
+});
+
+it("keeps the watcher while another session scope still links the PR", () => {
+  saveAzurePrAssociation(association, association.cwd, "feature", "session-a");
+  // The task sheet links every session sharing the copy — the second save
+  // dedupes the watcher but stores its own row.
+  saveAzurePrAssociation(
+    { ...association, sourceSessionId: "session-b" },
+    association.cwd,
+    "feature",
+    "session-b",
+  );
+  expect(loadWatchers()).toHaveLength(1);
+  // Unlinking under session-a leaves session-b's link — coverage survives.
+  saveAzurePrAssociation(
+    null,
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  expect(loadWatchers()).toHaveLength(1);
+  saveAzurePrAssociation(
+    null,
+    association.cwd,
+    "feature",
+    "session-b",
+    association.target,
+  );
+  expect(loadWatchers()).toHaveLength(0);
+});
+
+it("never auto-watches a link that is already terminal", () => {
+  saveAzurePrAssociation(
+    { ...association, pr: { ...association.pr, status: "completed" } },
+    association.cwd,
+    "feature",
+    "session-a",
+  );
+  expect(loadWatchers()).toHaveLength(0);
+});
+
+it("lifts the watcher of an association the cap evicts", () => {
+  // 100 stored rows; the next save pushes the last one out.
+  const seeded = Array.from({ length: 100 }, (_, i) => ({
+    ...association,
+    target: { ...association.target, number: 100 + i },
+    cwd: `/seeded/${i}`,
+    sourceSessionId: `s${i}`,
+  }));
+  localStorage.setItem(
+    "monocode.azurePrAssociations.v1",
+    JSON.stringify(seeded),
+  );
+  const evicted = seeded[99];
+  ensureDeliveryWatcher({
+    kind: "azure-pr",
+    target: evicted.target,
+    projectName: "P",
+    repositoryName: "R",
+    cwd: evicted.cwd,
+    branch: evicted.branch,
+  });
+  const kept = seeded[0];
+  ensureDeliveryWatcher({
+    kind: "azure-pr",
+    target: kept.target,
+    projectName: "P",
+    repositoryName: "R",
+    cwd: kept.cwd,
+    branch: kept.branch,
+  });
+  expect(loadWatchers()).toHaveLength(2);
+  saveAzurePrAssociation(
+    { ...association, sourceSessionId: "new" },
+    association.cwd,
+    "feature",
+    "new",
+  );
+  const sources = loadWatchers().map((watcher) => watcher.source);
+  expect(sources).toHaveLength(2);
+  expect(sources).not.toContainEqual(
+    expect.objectContaining({ cwd: evicted.cwd }),
+  );
+  expect(sources).toContainEqual(expect.objectContaining({ cwd: kept.cwd }));
+});
+
+it("shows session-less rows to session-scoped loads", () => {
+  const sessionless: AzurePrAssociation = {
+    ...association,
+    sourceSessionId: undefined,
+  };
+  saveAzurePrAssociation(sessionless, association.cwd, "feature");
+  expect(
+    loadAzurePrAssociations(association.cwd, "feature", "s1"),
+  ).toHaveLength(1);
+  expect(loadAzurePrAssociations(association.cwd, "feature")).toHaveLength(1);
+  // A different checkout stays isolated.
+  expect(loadAzurePrAssociations("/other", "feature", "s1")).toHaveLength(0);
+});
+
+it("adopts and unlinks a session-less row from a session scope", () => {
+  const sessionless: AzurePrAssociation = {
+    ...association,
+    sourceSessionId: undefined,
+  };
+  saveAzurePrAssociation(sessionless, association.cwd, "feature");
+  expect(loadWatchers()).toHaveLength(1);
+  // A session-bound save of the same PR adopts the row — no duplicate.
+  saveAzurePrAssociation(
+    { ...association, sourceSessionId: "s1" },
+    association.cwd,
+    "feature",
+    "s1",
+  );
+  const rows = loadAzurePrAssociations(association.cwd, "feature", "s1");
+  expect(rows).toHaveLength(1);
+  expect(rows[0].sourceSessionId).toBe("s1");
+  expect(loadWatchers()).toHaveLength(1);
+  // Unlinking from the session scope removes the adopted row + watcher.
+  saveAzurePrAssociation(
+    null,
+    association.cwd,
+    "feature",
+    "s1",
+    association.target,
+  );
+  expect(loadAzurePrAssociations(association.cwd, "feature", "s1")).toHaveLength(0);
+  expect(loadWatchers()).toHaveLength(0);
+});
+
+it("unbinds a deleted session from stored rows without unlinking", () => {
+  saveAzurePrAssociation(
+    { ...association, sourceSessionId: "s1" },
+    association.cwd,
+    "feature",
+    "s1",
+  );
+  saveAzurePrAssociation(
+    { ...association, sourceSessionId: "s2" },
+    association.cwd,
+    "feature",
+    "s2",
+  );
+  unbindAzurePrSession("s1");
+  let rows = loadAzurePrAssociations(association.cwd, "feature", "s2");
+  expect(rows).toHaveLength(2);
+  expect(rows.map((row) => row.sourceSessionId)).toEqual([
+    "s2",
+    undefined,
+  ]);
+  // Unbinding the second owner collapses the session-less twins.
+  unbindAzurePrSession("s2");
+  rows = loadAzurePrAssociations(association.cwd, "feature");
+  expect(rows).toHaveLength(1);
+  expect(rows[0].sourceSessionId).toBeUndefined();
 });

@@ -5,6 +5,25 @@ import {
   type ProjectRepository,
 } from "./projects";
 import type { LinkedWorkItem } from "./session";
+import {
+  allAzurePrAssociations,
+  azurePrKey,
+  unbindAzurePrSession,
+} from "./azureRepos";
+import {
+  allCiSources,
+  ciKey,
+  unbindCiSourceSession,
+} from "./azurePipelines";
+import { listTaskPrDrafts, taskPrRowKey } from "./taskPrs";
+import { parseGithubWorkItemUrl } from "./sessionWorkItem";
+import {
+  ensureDeliveryWatcher,
+  unwatchDeliveryScope,
+  watchGithubPrUrl,
+  type DeliverySurvival,
+  type DeliveryWatcherSource,
+} from "./watchers";
 
 const KEY = "monocode.taskWorkspaces.v1";
 const EVENT = "monocode:task-workspaces-changed";
@@ -580,9 +599,15 @@ export function reviseTask(
   if (!project) throw new Error("Project no longer exists");
   const name = revision.name.trim();
   if (!name) throw new Error("Enter a task name");
+  const dropped: TaskChild[] = [];
   const next = updateTask(taskId, (current) => {
     const kept = current.children.filter((child) =>
       revision.keepRepositoryIds.includes(child.repositoryId),
+    );
+    dropped.push(
+      ...current.children.filter(
+        (child) => !revision.keepRepositoryIds.includes(child.repositoryId),
+      ),
     );
     const drafts = revision.additions.filter(
       (child) => child && child.repositoryId,
@@ -615,6 +640,7 @@ export function reviseTask(
     };
   });
   if (!next) throw new Error("Task no longer exists");
+  for (const child of dropped) teardownDeliveryScope(childDeliveryScope(child));
   return next;
 }
 
@@ -698,6 +724,15 @@ export function removeTaskAttempt(taskId: string, attemptId: string) {
     throw new Error(
       "This attempt holds the task's last checkouts — remove the task instead.",
     );
+  const dropped = task.children.filter(
+    (child) => child.attemptId === attemptId,
+  );
+  teardownDeliveryScope({
+    sessionIds: dropped.flatMap((child) => child.sessionIds),
+    cwds: dropped.flatMap((child) =>
+      child.workingCopy ? [child.workingCopy] : [],
+    ),
+  });
   updateTask(taskId, (current) => {
     const removed = new Set(
       current.children
@@ -812,14 +847,190 @@ export function recordTaskActiveChild(taskId: string, childId: string) {
   );
 }
 
+/** Sessions and working copies a task's produced PR/CI links are bound to —
+ * the scope its auto watchers live in. */
+function taskDeliveryScope(task: TaskWorkspace) {
+  return {
+    sessionIds: [
+      ...(task.sessionIds ?? []),
+      ...task.children.flatMap((child) => child.sessionIds),
+    ],
+    cwds: task.children.flatMap((child) =>
+      child.workingCopy ? [child.workingCopy] : [],
+    ),
+  };
+}
+
+const childDeliveryScope = (child: TaskChild) => ({
+  sessionIds: child.sessionIds,
+  cwds: child.workingCopy ? [child.workingCopy] : [],
+});
+
+type DeliveryScope = {
+  sessionIds?: readonly string[];
+  cwds?: readonly string[];
+};
+
+/** A stored link still covering the delivery from OUTSIDE the torn-down
+ * scope keeps its watcher. Rows bound to the scope itself don't count —
+ * they stay on disk but their owner is gone. A live session owner keeps
+ * its link meaningful even at a torn-down checkout (the working copy stays
+ * on disk); session-less or dead-owner rows count only at surviving
+ * checkouts, and archived-task owners never count. */
+function deliveryLinkedOutsideScope(scope: DeliveryScope) {
+  const tornSessions = new Set(scope.sessionIds ?? []);
+  const tornCwds = new Set((scope.cwds ?? []).map(pathKey));
+  const tasks = loadTaskWorkspaces();
+  const associations = allAzurePrAssociations();
+  const ciSources = allCiSources();
+  const drafts = listTaskPrDrafts();
+  const archivedSessions = new Set(
+    tasks
+      .filter((task) => task.archived)
+      .flatMap((task) => [
+        ...(task.sessionIds ?? []),
+        ...task.children.flatMap((child) => child.sessionIds),
+      ]),
+  );
+  const live = (session?: string) =>
+    session !== undefined &&
+    !tornSessions.has(session) &&
+    !archivedSessions.has(session);
+  const inScope = (cwd: string, session?: string) =>
+    (session !== undefined && tornSessions.has(session)) ||
+    (tornCwds.has(pathKey(cwd)) && !live(session));
+  const covers = (cwd: string, session?: string) =>
+    !inScope(cwd, session) && (session === undefined || live(session));
+  return (source: DeliveryWatcherSource): DeliverySurvival => {
+    if (source.kind === "azure-pr") {
+      const key = azurePrKey(source.target);
+      const row = associations.find(
+        (row) =>
+          azurePrKey(row.target) === key &&
+          pathKey(row.cwd) === pathKey(source.cwd) &&
+          row.branch === source.branch &&
+          covers(row.cwd, row.sourceSessionId),
+      );
+      return row ? { sessionId: row.sourceSessionId } : false;
+    }
+    if (source.kind === "azure-ci") {
+      const key = ciKey(source.target);
+      const row = ciSources.find(
+        (row) =>
+          ciKey(row.target) === key &&
+          pathKey(row.cwd) === pathKey(source.cwd) &&
+          row.branch === source.branch &&
+          covers(row.cwd, row.session),
+      );
+      return row ? { sessionId: row.session } : false;
+    }
+    // github-pr — coverage comes from a live task child's saved PR result.
+    for (const task of tasks) {
+      if (task.archived) continue;
+      for (const child of task.children) {
+        if (
+          !child.workingCopy ||
+          pathKey(child.workingCopy) !== pathKey(source.cwd)
+        )
+          continue;
+        const owner =
+          child.sessionIds.find(live) ?? task.sessionIds?.find(live);
+        if (tornCwds.has(pathKey(child.workingCopy)) && !owner) continue;
+        const result = drafts[taskPrRowKey(task.id, child.id)]?.result;
+        if (result?.provider !== "github") continue;
+        const parsed = parseGithubWorkItemUrl(result.url);
+        if (
+          parsed?.kind !== "pr" ||
+          parsed.repo.toLowerCase() !== source.repo.toLowerCase() ||
+          parsed.number !== source.number
+        )
+          continue;
+        return { sessionId: owner };
+      }
+    }
+    return false;
+  };
+}
+
+/** Scope teardown that keeps watchers whose delivery another live scope
+ * still links — e.g. pruning one session when a sibling session's stored
+ * row covers the same PR at this checkout. */
+function teardownDeliveryScope(scope: DeliveryScope) {
+  unwatchDeliveryScope(scope, deliveryLinkedOutsideScope(scope));
+}
+
+/** Un-archiving restores the task's produced-delivery watchers from the
+ * links that stayed saved — symmetric with the teardown above. Links whose
+ * watcher the user removed by hand stay uncovered: `ensureDeliveryWatcher`
+ * sees no watcher and re-adds one, which is the intent here. */
+function rewatchDeliveryScope(task: TaskWorkspace) {
+  const sessionIds = new Set(taskDeliveryScope(task).sessionIds);
+  const cwds = new Set(
+    task.children.flatMap((child) =>
+      child.workingCopy ? [pathKey(child.workingCopy)] : [],
+    ),
+  );
+  const bound = (cwd: string, session?: string) =>
+    (session !== undefined && sessionIds.has(session)) ||
+    cwds.has(pathKey(cwd));
+  for (const row of allAzurePrAssociations()) {
+    if (row.pr.status !== "active" || !bound(row.cwd, row.sourceSessionId))
+      continue;
+    ensureDeliveryWatcher({
+      kind: "azure-pr",
+      target: row.target,
+      projectName: row.projectName,
+      repositoryName: row.repositoryName,
+      cwd: row.cwd,
+      branch: row.branch,
+      // Rows matched on cwd alone can carry a dead or foreign session —
+      // only bind owners this task still holds.
+      ...(row.sourceSessionId && sessionIds.has(row.sourceSessionId)
+        ? { sessionId: row.sourceSessionId }
+        : {}),
+    });
+  }
+  for (const row of allCiSources()) {
+    if (!bound(row.cwd, row.session)) continue;
+    ensureDeliveryWatcher({
+      kind: "azure-ci",
+      target: row.target,
+      definitionName: row.definitionName,
+      remote: row.remote,
+      cwd: row.cwd,
+      branch: row.branch,
+      ...(row.session && sessionIds.has(row.session)
+        ? { sessionId: row.session }
+        : {}),
+    });
+  }
+  const drafts = listTaskPrDrafts();
+  for (const child of task.children) {
+    const result = drafts[taskPrRowKey(task.id, child.id)]?.result;
+    if (result?.provider === "github" && child.workingCopy)
+      watchGithubPrUrl(
+        child.workingCopy,
+        result.url,
+        child.sessionIds[0] ?? task.sessionIds?.[0],
+      );
+  }
+}
+
 /** Removes the task record only — sessions, worktrees and branches stay. */
 export function removeTask(taskId: string) {
+  const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+  if (task) teardownDeliveryScope(taskDeliveryScope(task));
   saveTaskWorkspaces(
-    loadTaskWorkspaces().filter((task) => task.id !== taskId),
+    loadTaskWorkspaces().filter((entry) => entry.id !== taskId),
   );
 }
 
 export function archiveTask(taskId: string, archived = true) {
+  const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+  if (task) {
+    if (archived) teardownDeliveryScope(taskDeliveryScope(task));
+    else rewatchDeliveryScope(task);
+  }
   updateTask(taskId, (task) => ({ ...task, archived }));
 }
 
@@ -832,6 +1043,8 @@ export function removeTaskChild(taskId: string, childId: string) {
     throw new Error(
       "This is the task's last repository checkout — remove the task instead.",
     );
+  const removed = task.children.find((child) => child.id === childId);
+  if (removed) teardownDeliveryScope(childDeliveryScope(removed));
   updateTask(taskId, (task) => ({
     ...task,
     children: task.children.filter((child) => child.id !== childId),
@@ -865,6 +1078,12 @@ export function pruneTaskSession(sessionId: string) {
     return { ...task, sessionIds, children };
   });
   if (changed) saveTaskWorkspaces(next);
+  // Stored links keep their delivery but drop the dead owner — otherwise a
+  // stale row could cover a watcher and rebind it to a session that no
+  // longer exists.
+  unbindAzurePrSession(sessionId);
+  unbindCiSourceSession(sessionId);
+  teardownDeliveryScope({ sessionIds: [sessionId] });
 }
 
 /** Reverse lookup — which task child owns an ordinary session. `cwd` is

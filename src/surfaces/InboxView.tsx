@@ -46,6 +46,39 @@ import { InboxConnectMenu } from "../chrome/InboxConnectMenu";
 import { InboxProviderMark } from "../chrome/InboxProviderMark";
 import { ContextCheckbox, InboxContextPicker, useInboxContext } from "../chrome/InboxContextPicker";
 import { InboxRelated } from "../chrome/InboxRelated";
+import {
+  InboxMyWorkSection,
+  MyWorkBadges,
+  myWorkBadges,
+} from "../chrome/InboxMyWorkSection";
+import {
+  inboxMyWorkForItems,
+  type InboxMyWork,
+} from "../lib/inboxMyWork";
+import type { AttentionItem } from "../lib/attention";
+import {
+  listTaskPrDrafts,
+  subscribeTaskPrs,
+  taskPrsSnapshot,
+} from "../lib/taskPrs";
+import {
+  loadProjects,
+  projectsSnapshot,
+  subscribeProjects,
+} from "../lib/projects";
+import { deliveryStores } from "../lib/taskDelivery";
+import { AZURE_PR_ASSOCIATIONS_CHANGED } from "../lib/azureRepos";
+import { AZURE_CI_SOURCES_CHANGED } from "../lib/azurePipelines";
+import {
+  diffStatsVersion,
+  peekProjectDiffStats,
+  subscribeDiffStatsVersion,
+} from "../hooks/useProjectDiffStats";
+import {
+  branchPrVersion,
+  cachedBranchPr,
+  subscribeBranchPrVersion,
+} from "../hooks/useBranchPr";
 import type { InboxComposerCard } from "../lib/githubTasks";
 import { ProjectLogoIcon } from "../chrome/ProjectLogoIcon";
 import { ProjectMascot } from "../chrome/ProjectMascot";
@@ -348,6 +381,12 @@ type Props = {
   sessions?: readonly SessionSummary[];
   onOpenSession?: (sessionId: string) => void | Promise<void>;
   onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
+  /** Live session state for "my work" badges — mid-turn and input-blocked. */
+  busySessionIds?: ReadonlySet<string>;
+  needsInputSessionIds?: ReadonlySet<string>;
+  /** Visible attention queue rows — "waiting on you" joins per ticket. */
+  attentionItems?: readonly AttentionItem[];
+  onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
   /** Session-card destination to reveal after the Inbox list loads. */
   target?: LinkedWorkItem | null;
   visible?: boolean;
@@ -375,6 +414,10 @@ export function InboxView({
   sessions = [],
   onOpenSession,
   onOpenDelivery,
+  busySessionIds,
+  needsInputSessionIds,
+  attentionItems,
+  onAttentionAction,
   target = null,
   visible = true,
   conversationId,
@@ -832,6 +875,63 @@ export function InboxView({
   ]);
 
   const relatedSessionCounts = useMemo(() => inboxRelatedSessionCounts(visibleItems, sessions), [visibleItems, sessions]);
+
+  // "My work" inputs are all already-cached snapshots — the version ticks
+  // re-derive the join when a store publish lands; nothing here fetches.
+  const tasksRaw = useSyncExternalStore(
+    subscribeTaskWorkspaces,
+    taskWorkspacesSnapshot,
+  );
+  const projectsRaw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
+  const prDraftsRaw = useSyncExternalStore(subscribeTaskPrs, taskPrsSnapshot);
+  const statsVersion = useSyncExternalStore(
+    subscribeDiffStatsVersion,
+    diffStatsVersion,
+  );
+  const branchPrV = useSyncExternalStore(
+    subscribeBranchPrVersion,
+    branchPrVersion,
+  );
+  const [deliveryTick, setDeliveryTick] = useState(0);
+  useEffect(() => {
+    const bump = () => setDeliveryTick((value) => value + 1);
+    window.addEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, bump);
+    window.addEventListener(AZURE_CI_SOURCES_CHANGED, bump);
+    return () => {
+      window.removeEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, bump);
+      window.removeEventListener(AZURE_CI_SOURCES_CHANGED, bump);
+    };
+  }, []);
+  const myWorkByItem = useMemo(
+    () =>
+      inboxMyWorkForItems(visibleItems, {
+        sessions,
+        busySessionIds,
+        needsInputSessionIds,
+        tasks: loadTaskWorkspaces(),
+        projects: loadProjects(),
+        prDrafts: listTaskPrDrafts(),
+        stores: deliveryStores(),
+        attention: attentionItems,
+        branchForCwd: (cwd) => peekProjectDiffStats(cwd)?.branch,
+        githubPrFor: cachedBranchPr,
+      }),
+    // Snapshot strings above are the real inputs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      visibleItems,
+      sessions,
+      busySessionIds,
+      needsInputSessionIds,
+      attentionItems,
+      tasksRaw,
+      projectsRaw,
+      prDraftsRaw,
+      deliveryTick,
+      statsVersion,
+      branchPrV,
+    ],
+  );
   const selectTicketPreview = useCallback((item: InboxItem) => {
     const key = inboxItemKey(item);
     markInboxItemSeen({ key, updatedAt: item.updatedAt });
@@ -1159,6 +1259,7 @@ export function InboxView({
                       projectName(item.projectPath),
                     )}
                     relatedSessionCount={relatedSessionCounts.get(item) ?? 0}
+                    myWork={myWorkByItem.get(item)}
                     onSelect={selectTicketPreview}
                   /></div>
                 </li>
@@ -1270,6 +1371,8 @@ export function InboxView({
               onStartTask={onStartTask}
               onOpenDelivery={onOpenDelivery}
               onOpenSession={id => { setPreviewingTicket(false); return onOpenSession?.(id); }}
+              myWork={selected ? myWorkByItem.get(selected) : undefined}
+              onAttentionAction={onAttentionAction}
             />
           </div>
           {(conversationId && !previewingTicket) || (discussionOpen && selected) ? (
@@ -1301,6 +1404,8 @@ function InboxDetailBody({
   onStartTask,
   onOpenSession,
   onOpenDelivery,
+  myWork,
+  onAttentionAction,
 }: {
   item: InboxItem | null;
   cwd: string;
@@ -1311,6 +1416,8 @@ function InboxDetailBody({
   onStartTask?: (item: InboxItem, taskId: string | null) => void;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
   onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
+  myWork?: InboxMyWork;
+  onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
 }) {
   if (!item) {
     return (
@@ -1333,6 +1440,8 @@ function InboxDetailBody({
       onStartTask={onStartTask}
       onOpenSession={onOpenSession}
       onOpenDelivery={onOpenDelivery}
+      myWork={myWork}
+      onAttentionAction={onAttentionAction}
     />
   );
 }
@@ -1379,6 +1488,7 @@ const InboxCard = memo(function InboxCard({
   mascotName,
   mascotColor,
   relatedSessionCount,
+  myWork,
   onSelect,
 }: {
   item: InboxItem;
@@ -1387,6 +1497,7 @@ const InboxCard = memo(function InboxCard({
   mascotName: string | null;
   mascotColor: string;
   relatedSessionCount: number;
+  myWork?: InboxMyWork;
   onSelect: (item: InboxItem) => void;
 }) {
   useInboxSeenTick();
@@ -1407,6 +1518,7 @@ const InboxCard = memo(function InboxCard({
     key: inboxItemKey(item),
     updatedAt: item.updatedAt,
   });
+  const work = myWorkBadges(myWork);
 
   return (
     <button
@@ -1415,7 +1527,7 @@ const InboxCard = memo(function InboxCard({
       aria-current={active ? "true" : undefined}
       aria-label={`${jira || azure ? item.state : status.label} ${kindLabel.toLowerCase()} ${inboxItemRef(
         item,
-      )}: ${item.title}${unseen ? ", new" : ""}${relatedSessionCount > 0 ? `, ${relatedSessionCount} related ${relatedSessionCount === 1 ? "thread" : "threads"}` : ""}`}
+      )}: ${item.title}${unseen ? ", new" : ""}${relatedSessionCount > 0 ? `, ${relatedSessionCount} related ${relatedSessionCount === 1 ? "thread" : "threads"}` : ""}${work?.aria ? `, ${work.aria}` : ""}`}
       onClick={() => onSelect(item)}
       className={`flex w-full flex-col rounded-md border px-2.5 py-2 text-left ${
         active
@@ -1481,6 +1593,7 @@ const InboxCard = memo(function InboxCard({
           {jira || azure ? <span className="max-w-[55%] truncate" title={item.state}>{item.state} ·</span> : null}
           <span className="min-w-0 truncate">{source}</span>
         </span>
+        <MyWorkBadges work={myWork} />
         {!azure && item.labels.length > 0 ? (
           <span className="flex min-w-0 shrink-0 items-center gap-1">
             {item.labels.slice(0, 2).map((label) => (
@@ -1503,6 +1616,8 @@ export function InboxDetail({
   onStartTask,
   onOpenSession,
   onOpenDelivery,
+  myWork,
+  onAttentionAction,
 }: {
   item: InboxItem;
   cwd: string;
@@ -1513,6 +1628,8 @@ export function InboxDetail({
   onStartTask?: (item: InboxItem, taskId: string | null) => void;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
   onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
+  myWork?: InboxMyWork;
+  onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
 }) {
   const detailLock = useLockOverscroll<HTMLDivElement>();
   const [deliveryProviders, setDeliveryProviders] = useState<Record<string, "github" | "azure" | "gitlab">>(() => {
@@ -2200,6 +2317,14 @@ export function InboxDetail({
             <p className="text-[13px] text-content/45">No description</p>
           )}
           {(jira || azure) && galleryAttachments.length ? <TicketImages key={`${item.site}:${item.id}:${revision}`} item={item} attachments={galleryAttachments} /> : null}
+          {myWork?.hasWork ? (
+            <InboxMyWorkSection
+              work={myWork}
+              onOpenSession={onOpenSession}
+              onOpenDelivery={onOpenDelivery}
+              onOpenAttention={onAttentionAction}
+            />
+          ) : null}
           <InboxRelated key={`related:${inboxItemKey(item)}:${revision}`} item={item} />
           <InboxComments
             thread={thread}

@@ -232,25 +232,62 @@ export function boundLinkedContexts(links: LinkedWorkItem[]): LinkedWorkItem[] {
     : link);
 }
 
-/** Index links once instead of scanning all sessions for every visible Inbox row. */
-export function inboxRelatedSessionCounts<T extends { linkedWorkItem?: LinkedWorkItem }>(items: readonly InboxItem[], sessions: readonly T[]): Map<InboxItem, number> {
-  const identity = (item: InboxItem | LinkedWorkItem) => JSON.stringify([
-    item.provider ?? "github",
-    !item.provider || item.provider === "github" ? [item.repo.trim().toLowerCase(), item.kind, item.number] : item.url,
-  ]);
-  const index = new Map<string, Map<string, Set<T>>>();
-  for (const session of sessions) for (const link of sessionWorkItems(session)) {
-    const key = identity(link);
+const workItemIdentity = (item: InboxItem | LinkedWorkItem) => JSON.stringify([
+  item.provider ?? "github",
+  !item.provider || item.provider === "github" ? [item.repo.trim().toLowerCase(), item.kind, item.number] : item.url,
+]);
+
+export type WorkItemIndex<T> = Map<string, Map<string, Set<T>>>;
+
+/**
+ * Entities indexed by their linked-work-item identities — one pass for a
+ * whole caller's lookups. Account-scoped exactly like
+ * {@link inboxItemMatchesLinkedWorkItem}: an unscoped link joins every
+ * account, a scoped link only its own.
+ */
+export function indexByWorkItem<T>(
+  entities: readonly T[],
+  linksOf: (entity: T) => LinkedWorkItem[],
+): WorkItemIndex<T> {
+  const index: WorkItemIndex<T> = new Map();
+  for (const entity of entities) for (const link of linksOf(entity)) {
+    const key = workItemIdentity(link);
     let accounts = index.get(key);
     if (!accounts) index.set(key, accounts = new Map());
     const account = link.account || "";
     let related = accounts.get(account);
     if (!related) accounts.set(account, related = new Set());
-    related.add(session);
+    related.add(entity);
   }
-  return new Map(items.map(item => {
-    const accounts = index.get(identity(item));
-    const related = new Set([...(accounts?.get("") ?? []), ...(accounts?.get(item.account || "") ?? [])]);
-    return [item, related.size];
-  }));
+  return index;
+}
+
+/** Entities related to one item from a prebuilt {@link indexByWorkItem}. */
+export function relatedFromIndex<T>(
+  item: InboxItem,
+  index: WorkItemIndex<T>,
+): T[] {
+  const accounts = index.get(workItemIdentity(item));
+  return [
+    ...new Set([
+      ...(accounts?.get("") ?? []),
+      ...(accounts?.get(item.account || "") ?? []),
+    ]),
+  ];
+}
+
+/** Related sessions for every item in one indexed pass — same matching as
+ * {@link relatedSessionsForInboxItem} without the per-row rescan. */
+export function inboxRelatedSessionMap<T extends { linkedWorkItem?: LinkedWorkItem }>(
+  items: readonly InboxItem[],
+  sessions: readonly T[],
+): Map<InboxItem, T[]> {
+  const index = indexByWorkItem(sessions, sessionWorkItems);
+  return new Map(items.map(item => [item, relatedFromIndex(item, index)]));
+}
+
+/** Index links once instead of scanning all sessions for every visible Inbox row. */
+export function inboxRelatedSessionCounts<T extends { linkedWorkItem?: LinkedWorkItem }>(items: readonly InboxItem[], sessions: readonly T[]): Map<InboxItem, number> {
+  const map = inboxRelatedSessionMap(items, sessions);
+  return new Map([...map].map(([item, related]) => [item, related.length]));
 }

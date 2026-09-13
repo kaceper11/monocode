@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { contextFromText, type AgentContext } from "./agentContext";
 import type { LinkedWorkItem } from "./session";
 import { sessionWorkItems } from "./sessionWorkItem";
+import { pathKey } from "./paths";
+import { ensureDeliveryWatcher, unwatchAzurePrDelivery } from "./watchers";
 import type { AzureStatus } from "./azure";
 
 export type AzurePrTarget = {
@@ -531,7 +533,11 @@ export function loadAzurePrAssociations(
     (row) =>
       row.cwd === cwd &&
       row.branch === branch &&
-      row.sourceSessionId === session,
+      // A session-scoped view also owns session-less rows — they were linked
+      // at the checkout itself, so a pane must see (and be able to unlink)
+      // them instead of stacking a second row.
+      (row.sourceSessionId === session ||
+        (session !== undefined && row.sourceSessionId === undefined)),
   );
 }
 export const loadAzurePrAssociation = (
@@ -539,6 +545,34 @@ export const loadAzurePrAssociation = (
   branch: string,
   session?: string,
 ) => loadAzurePrAssociations(cwd, branch, session)[0] ?? null;
+/** A deleted session can no longer own a link — the row stays (the PR still
+ * belongs to the checkout) but drops the dead owner so coverage and watcher
+ * rebinds never point at it. Session-less twins collapse. */
+export function unbindAzurePrSession(sessionId: string) {
+  const rows = allAzurePrAssociations();
+  if (!rows.some((row) => row.sourceSessionId === sessionId)) return;
+  const seen = new Set<string>();
+  const next = rows
+    .map((row) =>
+      row.sourceSessionId === sessionId
+        ? { ...row, sourceSessionId: undefined }
+        : row,
+    )
+    .filter((row) => {
+      const key = JSON.stringify([
+        azurePrKey(row.target),
+        pathKey(row.cwd),
+        row.branch,
+        row.sourceSessionId ?? "",
+      ]);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  localStorage.setItem(ASSOCIATIONS_KEY, JSON.stringify(next));
+  if (typeof window !== "undefined")
+    window.dispatchEvent(new Event(AZURE_PR_ASSOCIATIONS_CHANGED));
+}
 export function saveAzurePrAssociation(
   value: AzurePrAssociation | null,
   cwd: string,
@@ -555,11 +589,30 @@ export function saveAzurePrAssociation(
   } catch {
     /* Recover only this feature's malformed data. */
   }
+  // The in-scope rows this write can drop or replace — captured before
+  // filtering so a departed link can lift its watcher below. A session-scoped
+  // write also owns session-less rows at this checkout: they get adopted into
+  // the session's scope instead of stacking a duplicate.
+  const scope = azurePrScope(cwd, branch, session);
+  const inScope = (row: AzurePrAssociation) =>
+    row?.target &&
+    (azurePrScope(row.cwd, row.branch, row.sourceSessionId) === scope ||
+      (session !== undefined &&
+        row.sourceSessionId === undefined &&
+        row.cwd === cwd &&
+        row.branch === branch));
+  const scopeRows = rows.filter(inScope);
+  // A re-save of an already-linked PR is a refresh — only a first-time link
+  // registers a watcher, so removing that watcher by hand sticks.
+  const linked = value?.target
+    ? scopeRows.some(
+        (row) => azurePrKey(row.target) === azurePrKey(value.target),
+      )
+    : false;
   rows = rows.filter(
     (row) =>
       row &&
-      (azurePrScope(row.cwd, row.branch, row.sourceSessionId) !==
-        azurePrScope(cwd, branch, session) ||
+      (!inScope(row) ||
         (!!(value?.target ?? removeTarget) &&
           !!row.target &&
           azurePrKey(row.target) !==
@@ -576,6 +629,45 @@ export function saveAzurePrAssociation(
         reviewers: value.pr.reviewers.slice(0, 50),
       },
     });
-  localStorage.setItem(ASSOCIATIONS_KEY, JSON.stringify(rows.slice(0, 100)));
+  const kept = rows.slice(0, 100);
+  localStorage.setItem(ASSOCIATIONS_KEY, JSON.stringify(kept));
   if (typeof window !== "undefined") window.dispatchEvent(new Event(AZURE_PR_ASSOCIATIONS_CHANGED));
+  // A saved link owns a review watcher: registered on first link, lifted only
+  // when no remaining row — in any session scope — still covers the delivery
+  // at this checkout+branch. Switching the displayed PR keeps the old link's
+  // row, so its watcher stays too. A terminal re-save also keeps the row —
+  // the next poll retires the watcher with its goodbye row instead.
+  const covered = (target: AzurePrTarget, atCwd: string, atBranch: string) =>
+    kept.some(
+      (row) =>
+        row?.target &&
+        azurePrKey(row.target) === azurePrKey(target) &&
+        pathKey(row.cwd) === pathKey(atCwd) &&
+        row.branch === atBranch,
+    );
+  for (const row of scopeRows)
+    if (!covered(row.target, cwd, branch))
+      unwatchAzurePrDelivery(row.target, cwd, branch);
+  // Rows the cap pushed out can orphan a watcher — lift it when nothing
+  // kept still covers their delivery.
+  for (const row of rows.slice(100))
+    if (
+      row?.target &&
+      typeof row.cwd === "string" &&
+      typeof row.branch === "string" &&
+      !covered(row.target, row.cwd, row.branch)
+    )
+      unwatchAzurePrDelivery(row.target, row.cwd, row.branch);
+  if (value && value.pr.status === "active" && !linked) {
+    const sessionId = session ?? value.sourceSessionId;
+    ensureDeliveryWatcher({
+      kind: "azure-pr",
+      target: value.target,
+      projectName: value.projectName,
+      repositoryName: value.repositoryName,
+      cwd,
+      branch,
+      ...(sessionId ? { sessionId } : {}),
+    });
+  }
 }

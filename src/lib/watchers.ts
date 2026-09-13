@@ -1,5 +1,7 @@
 import { HARNESSES, type HarnessId } from "./session";
 import { removeAttention, resolveAttentionWhere } from "./attention";
+import { pathKey } from "./paths";
+import { parseGithubWorkItemUrl } from "./sessionWorkItem";
 import type { AzurePrTarget } from "./azureRepos";
 import type { CiTarget } from "./azurePipelines";
 import type { JiraFilter } from "./jira";
@@ -81,6 +83,9 @@ export type Watcher = {
   source: WatcherSource;
   enabled: boolean;
   mode: WatcherMode;
+  /** Created by a produced-delivery link rather than the Watch sheet — task,
+   * link and session teardown lift only these; hand-made watchers stay. */
+  auto?: boolean;
   /** Saved #9 action used by draft/run modes. */
   actionId?: string;
   /** Where draft/run output goes — explicit checkout + agent. */
@@ -219,6 +224,7 @@ function sanitize(value: unknown): Watcher | null {
     source: value.source as WatcherSource,
     enabled: value.enabled !== false,
     mode,
+    ...(value.auto === true ? { auto: true } : {}),
     ...(clean(value.actionId, 128) ? { actionId: clean(value.actionId, 128) } : {}),
     ...(target ? { target } : {}),
     intervalSec: num(
@@ -335,6 +341,7 @@ export function saveWatcher(
     source: draft.source,
     enabled: draft.enabled !== false,
     mode: draft.mode ?? "notify",
+    ...(draft.auto === true ? { auto: true } : {}),
     ...(draft.actionId?.trim() ? { actionId: draft.actionId.trim() } : {}),
     ...(draft.target?.cwd ? { target: draft.target } : {}),
     intervalSec: num(
@@ -490,7 +497,240 @@ export type WatchSheetRequest = {
 };
 
 export function openWatchSheet(request: WatchSheetRequest) {
+  // A delivery already watched — by hand or by a produced link — opens for
+  // edit instead of stacking a second poller that would double-report.
+  const existing = request.existing ?? deliveryWatcherFor(request.source);
   window.dispatchEvent(
-    new CustomEvent<WatchSheetRequest>(OPEN_WATCH_SHEET, { detail: request }),
+    new CustomEvent<WatchSheetRequest>(OPEN_WATCH_SHEET, {
+      detail: existing ? { ...request, existing } : request,
+    }),
   );
+}
+
+/**
+ * Produced-delivery auto-watchers. Saving a PR or CI link the user's work
+ * produced registers a `notify` watcher bound to the same checkout/session,
+ * so review comments and CI failures surface without a manual Watch click.
+ * `auto` marks these rows: teardown paths (unlink, terminal status re-save,
+ * task close, session prune) lift only auto watchers — a watcher the user
+ * created by hand is never removed by them. The sheet can't re-point a
+ * delivery source, so editing one keeps its managed status — delete and
+ * recreate to own it.
+ */
+
+export type DeliveryWatcherSource = Extract<
+  WatcherSource,
+  { kind: "github-pr" | "azure-pr" | "azure-ci" }
+>;
+
+const isDeliverySource = (
+  source: WatcherSource,
+): source is DeliveryWatcherSource =>
+  source.kind === "github-pr" ||
+  source.kind === "azure-pr" ||
+  source.kind === "azure-ci";
+
+/** The same field tuples `azurePrKey`/`ciKey` build — inlined so this module
+ * keeps provider imports type-only. */
+const azurePrTuple = (target: AzurePrTarget) =>
+  JSON.stringify([
+    target.site,
+    target.accountId,
+    target.project,
+    target.repository,
+    target.number,
+  ]);
+const ciTuple = (target: CiTarget) =>
+  JSON.stringify([
+    target.site,
+    target.accountId,
+    target.project,
+    target.definition,
+    target.repositoryId,
+  ]);
+
+/** Canonical identity of the delivery a source polls. Owner fields
+ * (`sessionId`) are excluded: a watcher covering the same PR or pipeline
+ * under another session already serves the link, so a re-save must not stack
+ * a second row on it. */
+function deliveryWatchKey(source: WatcherSource): string | null {
+  switch (source.kind) {
+    case "github-pr":
+      return `gh-pr:${source.repo.toLowerCase()}:${source.number}:${pathKey(source.cwd)}`;
+    case "azure-pr":
+      return `azure-pr:${azurePrTuple(source.target)}:${pathKey(source.cwd)}:${source.branch}`;
+    case "azure-ci":
+      return `azure-ci:${ciTuple(source.target)}:${pathKey(source.cwd)}:${source.branch}`;
+    default:
+      return null;
+  }
+}
+
+/** Create the delivery watcher when none covers it — an existing watcher,
+ * even paused or hand-made, already serves this PR/pipeline. */
+export function ensureDeliveryWatcher(source: DeliveryWatcherSource): void {
+  // Detached checkouts link rows without a branch — nothing pollable.
+  if (!isSource(source)) return;
+  const key = deliveryWatchKey(source);
+  if (!key) return;
+  if (
+    loadWatchers().some(
+      (watcher) => deliveryWatchKey(watcher.source) === key,
+    )
+  )
+    return;
+  saveWatcher({
+    name: watcherSourceLabel(source),
+    source,
+    enabled: true,
+    mode: "notify",
+    auto: true,
+    intervalSec: WATCHER_INTERVAL_DEFAULT,
+    cooldownSec: WATCHER_COOLDOWN_DEFAULT,
+  });
+}
+
+/** Two sources poll the same delivery — same PR/pipeline at one
+ * checkout+branch, regardless of which session owns the link. */
+export function sameDeliverySource(
+  a: WatcherSource,
+  b: WatcherSource,
+): boolean {
+  const key = deliveryWatchKey(a);
+  return key !== null && key === deliveryWatchKey(b);
+}
+
+/** The watcher already covering this delivery — auto or manual, any
+ * session. Non-delivery sources return nothing. */
+export function deliveryWatcherFor(
+  source: WatcherSource,
+): Watcher | undefined {
+  const key = deliveryWatchKey(source);
+  if (!key) return undefined;
+  return loadWatchers().find(
+    (watcher) => deliveryWatchKey(watcher.source) === key,
+  );
+}
+
+/** Parse a just-created GitHub PR URL into its watcher — shared by the task
+ * sheet and the diff panel so both produce the identical source shape. */
+export function watchGithubPrUrl(
+  cwd: string,
+  url: string,
+  sessionId?: string,
+): void {
+  const parsed = parseGithubWorkItemUrl(url);
+  if (parsed?.kind !== "pr") return;
+  ensureDeliveryWatcher({
+    kind: "github-pr",
+    cwd,
+    repo: parsed.repo,
+    number: parsed.number,
+    ...(sessionId ? { sessionId } : {}),
+  });
+}
+
+function removeAutoDeliveryWatchers(
+  match: (source: DeliveryWatcherSource) => boolean,
+) {
+  for (const watcher of loadWatchers()) {
+    if (!watcher.auto || !isDeliverySource(watcher.source)) continue;
+    if (match(watcher.source)) removeWatcher(watcher.id);
+  }
+}
+
+/** Lift auto watchers for one delivery at one checkout+branch — any session.
+ * Callers invoke this only when no stored link still covers the delivery, so
+ * the watcher is orphaned regardless of which session it was bound to. */
+function unwatchDelivery(
+  kind: "azure-pr" | "azure-ci",
+  targetKey: string,
+  cwd: string,
+  branch: string,
+) {
+  const cwdKey = pathKey(cwd);
+  removeAutoDeliveryWatchers((source) => {
+    if (source.kind !== kind) return false;
+    const key =
+      kind === "azure-pr"
+        ? azurePrTuple(
+            (source as Extract<WatcherSource, { kind: "azure-pr" }>).target,
+          )
+        : ciTuple(
+            (source as Extract<WatcherSource, { kind: "azure-ci" }>).target,
+          );
+    return (
+      key === targetKey &&
+      pathKey(source.cwd) === cwdKey &&
+      source.branch === branch
+    );
+  });
+}
+
+/** No association row still links this PR at this checkout — nothing left to
+ * watch, whichever session scope the link lived in. */
+export function unwatchAzurePrDelivery(
+  target: AzurePrTarget,
+  cwd: string,
+  branch: string,
+) {
+  unwatchDelivery("azure-pr", azurePrTuple(target), cwd, branch);
+}
+
+/** No CI source row still links this pipeline at this checkout. */
+export function unwatchCiDelivery(
+  target: CiTarget,
+  cwd: string,
+  branch: string,
+) {
+  unwatchDelivery("azure-ci", ciTuple(target), cwd, branch);
+}
+
+/** What a torn-down scope's delivery watcher becomes: `false` lifts it;
+ * `{ sessionId }` keeps it because a link outside the scope still covers
+ * the delivery, rebinding the session owner this scope took with it. */
+export type DeliverySurvival = false | { sessionId?: string };
+
+/** Drop auto watchers bound to a gone scope — an archived or removed task's
+ * sessions and working copies, or a deleted session. A checkout shared with
+ * another live task still loses the watcher (coverage can't span checkouts);
+ * a delivery still linked under a session outside the scope keeps its
+ * watcher — watermark included — rebound to that link's session. */
+export function unwatchDeliveryScope(
+  scope: {
+    sessionIds?: readonly string[];
+    cwds?: readonly string[];
+  },
+  stillLinked?: (source: DeliveryWatcherSource) => DeliverySurvival,
+) {
+  const sessionIds = new Set(scope.sessionIds ?? []);
+  const cwds = new Set((scope.cwds ?? []).map(pathKey));
+  if (!sessionIds.size && !cwds.size) return;
+  for (const watcher of loadWatchers()) {
+    if (!watcher.auto || !isDeliverySource(watcher.source)) continue;
+    const source = watcher.source;
+    if (
+      !(
+        (source.sessionId !== undefined &&
+          sessionIds.has(source.sessionId)) ||
+        cwds.has(pathKey(source.cwd))
+      )
+    )
+      continue;
+    const survival = stillLinked?.(source) ?? false;
+    if (survival === false) {
+      removeWatcher(watcher.id);
+      continue;
+    }
+    if (source.sessionId === survival.sessionId) continue;
+    // updateWatcher — not saveWatcher — keeps the watermark: rebinding an
+    // owner is not a re-point, so seen/cursor must not reset.
+    const { sessionId: _dropped, ...unbound } = source;
+    updateWatcher(watcher.id, (row) => ({
+      ...row,
+      source: survival.sessionId
+        ? { ...unbound, sessionId: survival.sessionId }
+        : unbound,
+    }));
+  }
 }

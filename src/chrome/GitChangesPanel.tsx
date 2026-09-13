@@ -107,6 +107,7 @@ import {
   type ChangesView,
 } from "../lib/appearance";
 import { generateCommitMessage, generatePrContent } from "../lib/harness";
+import { watchGithubPrUrl } from "../lib/watchers";
 import { invalidateWatchedFiles } from "../lib/fileWatch";
 import { MOD } from "../lib/platform";
 import {
@@ -1247,6 +1248,7 @@ function ChangedFiles({
       content.base,
       content.head,
     );
+    watchGithubPrUrl(cwd, url.trim(), sourceSessionId);
     await openUrl(url.trim());
   };
 
