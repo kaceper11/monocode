@@ -48,8 +48,10 @@ import {
   ArrowLeft,
   Check,
   ChevronRight,
+  Eye,
   Folder,
   GitBranch,
+  Loader,
   Plus,
   RefreshCw,
   Search,
@@ -67,6 +69,26 @@ type Worktree = {
   users: string[];
   lastUsed?: number | null;
 };
+
+/** Short status chip for a row or the detail heading — the same ordering
+ * the list footer uses: availability first, then role, then use. */
+function statusLabel(entry: Worktree, cwd: string, activeCwd: string) {
+  return entry.missing
+    ? "missing"
+    : entry.prunable
+      ? "stale"
+      : entry.locked
+        ? "locked"
+        : entry.main
+          ? "main"
+          : pathKey(entry.path) === pathKey(cwd)
+            ? "current"
+            : isEqualOrInside(activeCwd, entry.path)
+              ? "in use"
+              : !entry.branch
+                ? "detached"
+                : null;
+}
 
 /** Same displayed entry — lets refresh() keep detail object identity so the
  * safety fetch effect does not refire and flash "Checking worktree…". */
@@ -144,25 +166,6 @@ export function WorktreePanel({
   const [safety, setSafety] = useState<WorktreeSafety | null>(null);
   const [safetyError, setSafetyError] = useState("");
   const openedInitial = useRef(detail != null);
-  useEffect(() => {
-    if (!detail) return;
-    let cancelled = false;
-    setSafety(null);
-    setSafetyError("");
-    void invoke<WorktreeSafety>("git_worktree_safety", {
-      cwd,
-      path: detail.path,
-    })
-      .then((value) => {
-        if (!cancelled) setSafety(value);
-      })
-      .catch((error) => {
-        if (!cancelled) setSafetyError(String(error));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [cwd, detail]);
   const [refs, setRefs] = useState<Ref[]>([]);
   const [base, setBase] = useState(initialBase);
   const [creating, setCreating] = useState(
@@ -197,6 +200,31 @@ export function WorktreePanel({
   useEffect(() => {
     setRemovalFailure(null);
   }, [cwd, detail?.path]);
+  // A mounted `initialAction` runs its own preflight inside the mount
+  // `run` — the display-safety fetch stays quiet until it settles so the
+  // detail never paints a racy "Checking…" state ahead of the confirm.
+  const [actionPending, setActionPending] = useState(
+    () => initialAction === "remove",
+  );
+  useEffect(() => {
+    if (!detail || confirmation || actionPending) return;
+    let cancelled = false;
+    setSafety(null);
+    setSafetyError("");
+    void invoke<WorktreeSafety>("git_worktree_safety", {
+      cwd,
+      path: detail.path,
+    })
+      .then((value) => {
+        if (!cancelled) setSafety(value);
+      })
+      .catch((error) => {
+        if (!cancelled) setSafetyError(String(error));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [cwd, detail, confirmation, actionPending]);
   const [forceReview, setForceReview] = useState<{
     token: string;
     fileCount: number;
@@ -303,7 +331,26 @@ export function WorktreePanel({
     }
   };
   useEffect(() => {
-    void run(async () => {});
+    void run(async () => {
+      // Land straight on the reviewed confirmation inside the mount pass —
+      // one busy cycle, one refresh, no detail-view flicker.
+      if (initialAction === "remove" && detail) {
+        initialActionFired.current = true;
+        try {
+          await preflightRemove(detail);
+        } finally {
+          setActionPending(false);
+        }
+      }
+    }).finally(() => {
+      // An unseeded target defers to the `initialActionFired` effect —
+      // release the gate so the detail/list can render. StrictMode's
+      // second mount run early-returns here; it must not drop the gate
+      // while the first run's preflight is still in flight.
+      if (initialAction === "remove" && !initialActionFired.current)
+        setActionPending(false);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount only
   }, []);
   useEffect(() => {
     if (!busy && !creating && !choosingBase && !confirmation && !detail && !bulk)
@@ -376,45 +423,54 @@ export function WorktreePanel({
     });
   };
   const family = getVerifiedFamilies().get(pathKey(cwd));
-  const startRemove = (entry: Worktree) =>
-    void run(async () => {
-      setForceReview(null);
-      setForceFiles(null);
-      setStopConfirm(false);
-      setRemoving(false);
-      setRemovalFailure(null);
-      // Fresh preflight: identity, file state and target-bound processes.
-      const current = await invoke<WorktreeSafety>("git_worktree_safety", {
-        cwd,
-        path: entry.path,
-      });
-      if (current.entry.locked)
-        throw new Error(
-          `This working copy is locked (${current.entry.locked}). Unlock it with Git, then retry.`,
-        );
-      const fallbacks = removalFallbacks(entry.path, current.siblings, recents);
-      if (current.dirty) {
-        const review = await invoke<NonNullable<typeof forceReview>>(
-          "git_worktree_removal_preview",
-          { cwd, path: entry.path, includeFiles: false },
-        );
-        setForceReview(review);
-      }
-      setFallbackPath(fallbacks[0]?.path ?? null);
-      setConfirmation({
-        entry: current.entry,
-        action: "remove",
-        processes: current.processes,
-        fallbacks,
-        host: current.host,
-      });
+  // The panel is family-scoped and `cwd` may be any member — resolve the
+  // repository root from the family's main checkout so the context line
+  // always names the repository, not whichever copy opened the panel.
+  const repoRoot =
+    family?.worktrees.find((entry) => entry.main)?.path ??
+    family?.checkout ??
+    cwd;
+  const repoName = repoRoot.split("/").filter(Boolean).pop() ?? repoRoot;
+  /** Fresh preflight for one removal: identity, file state, target-bound
+   * processes — then the reviewed confirmation. Shared by the row/detail
+   * actions and the mounted `initialAction`. */
+  const preflightRemove = async (entry: Worktree) => {
+    setForceReview(null);
+    setForceFiles(null);
+    setStopConfirm(false);
+    setRemoving(false);
+    setRemovalFailure(null);
+    const current = await invoke<WorktreeSafety>("git_worktree_safety", {
+      cwd,
+      path: entry.path,
     });
-  // A mounted `initialAction` jumps straight to the reviewed confirmation
-  // once the seeded detail exists — `startRemove` re-preflights first. It
-  // waits out the mount refresh: `run` early-returns while another run holds
-  // `pending`. The guard must read the ref — `busy` is still false during
-  // the mount effect pass, so checking state would latch the flag while
-  // `startRemove` no-ops.
+    if (current.entry.locked)
+      throw new Error(
+        `This working copy is locked (${current.entry.locked}). Unlock it with Git, then retry.`,
+      );
+    const fallbacks = removalFallbacks(entry.path, current.siblings, recents);
+    if (current.dirty) {
+      const review = await invoke<NonNullable<typeof forceReview>>(
+        "git_worktree_removal_preview",
+        { cwd, path: entry.path, includeFiles: false },
+      );
+      setForceReview(review);
+    }
+    setFallbackPath(fallbacks[0]?.path ?? null);
+    setConfirmation({
+      entry: current.entry,
+      action: "remove",
+      processes: current.processes,
+      fallbacks,
+      host: current.host,
+    });
+  };
+  const startRemove = (entry: Worktree) =>
+    void run(() => preflightRemove(entry));
+  // When `initialPath` seeds no cached entry, the mount refresh finds it
+  // first — the action then fires once the detail and a free `pending`
+  // slot exist. The guard must read the ref: `busy` is still false during
+  // the mount effect pass.
   const initialActionFired = useRef(false);
   useEffect(() => {
     if (
@@ -667,7 +723,7 @@ export function WorktreePanel({
                     <button
                       key={candidate.path}
                       type="button"
-                      className="flex w-full items-center gap-1.5 py-0.5 text-left hover:bg-content/5"
+                      className="flex w-full min-w-0 items-center gap-1.5 py-0.5 text-left hover:bg-content/5"
                       onClick={() => setFallbackPath(candidate.path)}
                     >
                       <Check
@@ -839,32 +895,73 @@ export function WorktreePanel({
             </button>
           </div>
         </div>
+      ) : actionPending && initialPath ? (
+        <div className="space-y-2 px-3 py-2.5">
+          <p className="flex items-center gap-2 text-content/60">
+            <Loader
+              className="size-3.5 shrink-0 animate-spin text-content/50"
+              aria-hidden="true"
+            />
+            Checking worktree…
+          </p>
+        </div>
       ) : detail ? (
         <div className="space-y-2 px-3 py-2.5">
           <button
             type="button"
-            className={rowClass}
+            className={`-ml-2 ${rowClass}`}
             disabled={busy}
             onClick={() => setDetail(null)}
           >
             <ArrowLeft className="size-3.5" />
-            Worktrees
+            {repoName}
           </button>
-          <p className="truncate font-medium">
-            {detail.branch?.replace("refs/heads/", "") ?? "Detached worktree"}
-          </p>
-          <p
-            className="truncate text-[11px] text-content/70"
-            title={prettyCwd(detail.path)}
-          >
-            {prettyCwd(detail.path)}
-          </p>
-          <p
-            title="Latest recorded conversation update or project open in MonoCode. External activity is not tracked."
-            className="text-content/70"
-          >
-            {workingCopyAge(lastWorkingCopyUse(detail, recents))} in MonoCode
-          </p>
+          <div className="flex items-center gap-2">
+            <p className="min-w-0 flex-1 truncate font-medium">
+              {detail.branch?.replace("refs/heads/", "") ??
+                "Detached worktree"}
+            </p>
+            {statusLabel(detail, cwd, activeCwd) ? (
+              <span className="shrink-0 rounded bg-content/8 px-1.5 py-0.5 text-[10px] text-content/60">
+                {statusLabel(detail, cwd, activeCwd)}
+              </span>
+            ) : null}
+          </div>
+          <div className="space-y-1 border-y border-content/10 py-2 text-[11px]">
+            <div className="flex items-baseline gap-3">
+              <span className="w-14 shrink-0 text-content/45">Path</span>
+              <span
+                className="min-w-0 flex-1 truncate font-mono text-content/75"
+                title={prettyCwd(detail.path)}
+              >
+                {prettyCwd(detail.path)}
+              </span>
+            </div>
+            <div className="flex items-baseline gap-3">
+              <span className="w-14 shrink-0 text-content/45">Commit</span>
+              <span className="min-w-0 flex-1 truncate font-mono text-content/75">
+                {detail.head.slice(0, 10)}
+              </span>
+            </div>
+            <div
+              className="flex items-baseline gap-3"
+              title="Latest recorded conversation update or project open in MonoCode. External activity is not tracked."
+            >
+              <span className="w-14 shrink-0 text-content/45">Activity</span>
+              <span className="min-w-0 flex-1 truncate text-content/75">
+                {workingCopyAge(lastWorkingCopyUse(detail, recents))} in
+                MonoCode
+              </span>
+            </div>
+            {taskClaims.get(pathKey(detail.path)) ? (
+              <div className="flex items-baseline gap-3">
+                <span className="w-14 shrink-0 text-content/45">Task</span>
+                <span className="min-w-0 flex-1 truncate text-content/75">
+                  {taskClaims.get(pathKey(detail.path))}
+                </span>
+              </div>
+            ) : null}
+          </div>
           {!safety && (
             <p className="text-content/70">
               {detail.missing || detail.prunable
@@ -914,13 +1011,10 @@ export function WorktreePanel({
           )}
           <details className="text-[11px] text-content/70">
             <summary className="cursor-pointer">
-              Location and{" "}
               {detail.missing || detail.prunable || detail.locked
-                ? "recovery"
-                : "details"}
+                ? "Recovery"
+                : "Details"}
             </summary>
-            <p className="break-all py-1">{prettyCwd(detail.path)}</p>
-            <p className="font-mono">{detail.head}</p>
             {(detail.missing || detail.prunable) && (
               <p className="pt-1">
                 Restore the original folder, or run Git worktree repair from a
@@ -955,6 +1049,7 @@ export function WorktreePanel({
                 }
               }}
             >
+              <Eye className="size-3.5" />
               {hidden.some((path) => pathKey(path) === pathKey(detail.path))
                 ? "Show in project"
                 : "Hide from project"}
@@ -1057,9 +1152,9 @@ export function WorktreePanel({
           </div>
           <p
             className="truncate px-2.5 py-2 text-content/50"
-            title={prettyCwd(cwd)}
+            title={prettyCwd(repoRoot)}
           >
-            Repository · {cwd.split("/").pop()}
+            Repository · {repoName}
           </p>
           <div className="space-y-0.5 px-1.5 py-1.5">
             <button
@@ -1154,7 +1249,20 @@ export function WorktreePanel({
         </>
       ) : (
         <>
-          <label className="flex items-center gap-2 border-b border-content/10 px-2 py-2.5 text-content/50">
+          <p
+            className="flex items-center gap-1.5 truncate px-2.5 pt-2 text-[10px] text-content/50"
+            title={prettyCwd(repoRoot)}
+          >
+            <Folder
+              className="size-3 shrink-0 text-content/40"
+              strokeWidth={1.75}
+            />
+            <span className="truncate">
+              {repoName} · {entries.length}{" "}
+              {entries.length === 1 ? "worktree" : "worktrees"}
+            </span>
+          </p>
+          <label className="mt-0.5 flex items-center gap-2 border-b border-content/10 px-2 py-2 text-content/50">
             <Search className="size-3.5 shrink-0" strokeWidth={1.75} />
             <input
               ref={search}
@@ -1192,9 +1300,7 @@ export function WorktreePanel({
           </label>
           <div className="flex items-center justify-between px-2.5 pt-2 text-[10px] text-content/60">
             <span>
-              {selecting
-                ? "Select worktrees to remove"
-                : "Last used in MonoCode"}
+              {selecting ? "Select worktrees to remove" : "Last used"}
             </span>
             <div className="flex items-center gap-1">
               {selecting ? (
@@ -1258,15 +1364,13 @@ export function WorktreePanel({
                   {selecting ? (
                     <span
                       aria-hidden="true"
-                      className={`grid size-3.5 shrink-0 place-items-center rounded-[4px] border ${
+                      className={`grid size-4 shrink-0 place-items-center rounded border transition-colors ${
                         isChecked
-                          ? "border-accent bg-accent text-background-base"
-                          : "border-content/30"
+                          ? "border-content/60 bg-content/10 text-content"
+                          : "border-content/25 text-transparent"
                       }`}
                     >
-                      {isChecked ? (
-                        <Check className="size-2.5" strokeWidth={2.5} />
-                      ) : null}
+                      <Check className="size-3" strokeWidth={2} />
                     </span>
                   ) : pathKey(entry.path) === pathKey(cwd) ? (
                     <Check className="size-3.5 shrink-0" strokeWidth={1.75} />
@@ -1292,19 +1396,7 @@ export function WorktreePanel({
                     </span>
                   </span>
                   <span className="shrink-0 text-[10px] text-content/40">
-                    {entry.missing
-                      ? "missing"
-                      : entry.locked
-                        ? "locked"
-                        : entry.main
-                          ? "main"
-                          : pathKey(entry.path) === pathKey(cwd)
-                            ? "current"
-                            : isEqualOrInside(activeCwd, entry.path)
-                              ? "in use"
-                              : !entry.branch
-                                ? "detached"
-                                : ""}
+                    {statusLabel(entry, cwd, activeCwd)}
                   </span>
                 </button>
                 <button

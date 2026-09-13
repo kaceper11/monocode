@@ -334,20 +334,18 @@ export function TaskWorktreesSheet({
                         ? "In use — switch away before removing it"
                         : prettyCwd(child.workingCopy!)
                     }
-                    className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-content/5 disabled:opacity-45"
+                    className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-content/5 disabled:opacity-45"
                     onClick={() => toggle(child)}
                   >
                     <span
                       aria-hidden="true"
-                      className={`grid size-3.5 shrink-0 place-items-center rounded-[4px] border ${
+                      className={`grid size-4 shrink-0 place-items-center rounded border transition-colors ${
                         isChecked
-                          ? "border-accent bg-accent text-background-base"
-                          : "border-content/30"
+                          ? "border-content/60 bg-content/10 text-content"
+                          : "border-content/25 text-transparent"
                       }`}
                     >
-                      {isChecked ? (
-                        <Check className="size-2.5" strokeWidth={2.5} />
-                      ) : null}
+                      <Check className="size-3" strokeWidth={2} />
                     </span>
                     <GitBranch
                       className="size-3 shrink-0 text-content/40"

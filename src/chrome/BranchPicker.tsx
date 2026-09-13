@@ -393,7 +393,15 @@ export function BranchPicker({
                   setBusy(value);
                 }}
                 onOpen={onOpenWorktree}
-                onClose={() => dismiss(true)}
+                onClose={() => {
+                  // The panel closes itself mid-`run` after a completed
+                  // removal — before its finally clears the busy flag. A
+                  // programmatic close is not a user dismissal, so it must
+                  // bypass that guard or the popover stays open on a stale
+                  // confirmation.
+                  worktreeBusy.current = false;
+                  dismiss(true);
+                }}
               />
             ) : (
               <>
@@ -519,7 +527,7 @@ function BranchList({
                         ? "bg-content/15 text-content"
                         : "bg-content/10 text-content hover:bg-content/15"
                     }`
-                  : `flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left disabled:opacity-60 ${
+                  : `flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left disabled:opacity-60 ${
                       highlighted || selected
                         ? "bg-content/10 text-content"
                         : "text-content hover:bg-content/5"
