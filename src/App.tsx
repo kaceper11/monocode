@@ -106,7 +106,7 @@ import { runUpdateFlow } from "./lib/updater";
 import { displayAttachments, prepareAttachments } from "./lib/attachments";
 import {
   basename,
-  gitMergeAbort,
+  gitDiffIndex,
   gitUpdateFromDefault,
   listDir,
   notifyGitChanged,
@@ -115,6 +115,13 @@ import {
   type GitFileDiffKind,
   type GitHistoryCommit,
 } from "./lib/fs";
+import {
+  acquireSyncSlot,
+  offerMergeResolution,
+  syncHostLabel,
+  syncPreflightRefusal,
+  syncWithDefaultBranch,
+} from "./lib/syncDefault";
 import {
   invalidateProjectFiles,
   prefetchProjectFiles,
@@ -6868,86 +6875,137 @@ export default function App({
       item: AttentionItem,
       action: Extract<AttentionAction, { kind: "update-branch" }>,
     ) => {
-      // The binding names the branch this row was emitted for — merging into
-      // a checkout that has since moved would corrupt the wrong branch.
-      if (action.branch) {
-        const checkout = await ciContext(action.cwd);
-        if (checkout.branch !== action.branch) {
+      // Same guard as the menu/panel flow — a bare "~" would probe $HOME.
+      if (!action.cwd || action.cwd === "~") {
+        await message("This row has no working copy to update.", {
+          title: item.title,
+          kind: "warning",
+        });
+        return;
+      }
+      // Share the menu/panel sync slot — confirmations must not stack on
+      // the same working copy even when the entry points differ.
+      const release = acquireSyncSlot(action.cwd);
+      if (!release) {
+        await message(
+          "A sync or update is already running on this working copy — wait for it to finish.",
+          { title: item.title, kind: "warning" },
+        );
+        return;
+      }
+      try {
+        // The confirm must not describe an impossible operation — run the
+        // same preflight the menu/panel flow does before asking.
+        const index = await gitDiffIndex(action.cwd);
+        const refusal = syncPreflightRefusal(index);
+        if (refusal) {
+          await message(refusal, { title: item.title, kind: "warning" });
+          return;
+        }
+        // The binding names the branch this row was emitted for — merging
+        // into a checkout that has since moved would corrupt the wrong
+        // one. Rows without a binding pin the live branch instead.
+        if (action.branch && index.branch !== action.branch) {
           await message(
-            `Checkout is on ${checkout.branch || "detached HEAD"}, not ${action.branch}. Switch back or dismiss the row.`,
+            `Checkout is on ${index.branch || "detached HEAD"}, not ${action.branch}. Switch back or dismiss the row.`,
             { title: item.title, kind: "warning" },
           );
           return;
         }
-      }
-      const baseLabel = action.base
-        ? `the ${action.base} branch`
-        : "the remote default branch";
-      let mode: "merge" | "rebase" = "merge";
-      if (
-        !(await ask(
-          `Fetch ${baseLabel} and merge it into this checkout? The tree must be clean; conflicts stay in place for you to resolve.`,
-          { title: item.title, kind: "info", okLabel: "Merge", cancelLabel: "Cancel" },
-        ))
-      ) {
+        const branch = action.branch ?? index.branch;
+        if (!branch) {
+          await message(
+            `${action.cwd} has no branch checked out — nothing to update.`,
+            { title: item.title, kind: "warning" },
+          );
+          return;
+        }
+        // A bare base name is fetched from the checkout's remote — name it
+        // so the confirm can't hide a multi-remote surprise.
+        const baseLabel = action.base
+          ? `the ${action.base.includes("/") ? action.base : `${index.remote ?? "remote"}/${action.base}`} branch`
+          : `the ${index.remote ?? "remote"} default branch`;
+        const where = `\n\nWorking copy: ${action.cwd}\nHost: ${syncHostLabel(action.cwd)}`;
+        let mode: "merge" | "rebase" = "merge";
         if (
           !(await ask(
-            `Rebase onto ${baseLabel} instead?`,
-            { title: "Update branch", kind: "info", okLabel: "Rebase", cancelLabel: "Cancel" },
+            `Fetch ${baseLabel} and merge it into ${branch}? The tree must be clean; conflicts stay in place for you to resolve. Nothing is pushed.${where}`,
+            { title: item.title, kind: "info", okLabel: "Merge", cancelLabel: "Rebase instead…" },
           ))
-        )
-          return;
-        mode = "rebase";
-      }
-      const result = await gitUpdateFromDefault(action.cwd, mode, action.base);
-      notifyGitChanged(action.cwd);
-      if (result.outcome === "conflicts") {
-        const session = action.sessionId
-          ? sessionsRef.current.find((row) => row.id === action.sessionId)
-          : undefined;
-        const list = result.conflicts.slice(0, 10).join("\n");
-        const send = session
-          ? await ask(
-              `${result.conflicts.length} conflicted file${result.conflicts.length === 1 ? "" : "s"}:\n${list}\n\nSend the conflict list to the owning conversation?`,
-              { title: "Merge conflicts", kind: "warning", okLabel: "Send to agent", cancelLabel: "Resolve manually" },
-            )
-          : false;
-        if (send && session) {
-          requestAgentContext({
-            context: contextFromText(
-              `Merge conflicts in ${result.branch}`,
-              `Merging ${result.updatedFrom} into ${result.branch} left ${result.conflicts.length} conflicted file${result.conflicts.length === 1 ? "" : "s"}:\n\n${result.conflicts.join("\n")}\n\nResolve the conflicts in this checkout — keep both sides' intent. Do not push or merge.`,
-              action.cwd,
-            ),
-            cwd: action.cwd,
-            sourceSessionId: session.id,
-          });
-        } else if (
-          await ask(
-            `Leave the ${result.conflicts.length} conflicted file${result.conflicts.length === 1 ? "" : "s"} in the tree, or abort the ${mode}?`,
-            { title: "Merge conflicts", kind: "warning", okLabel: `Abort ${mode}`, cancelLabel: "Keep conflicts" },
-          )
         ) {
-          await gitMergeAbort(action.cwd);
-          notifyGitChanged(action.cwd);
+          if (
+            !(await ask(
+              `Rebase ${branch} onto ${baseLabel}? Nothing is pushed.${where}`,
+              { title: item.title, kind: "info", okLabel: "Rebase", cancelLabel: "Cancel" },
+            ))
+          )
+            return;
+          mode = "rebase";
         }
-        return;
+        // Pin the branch the confirm named — it can move during the
+        // dialogs or the fetch itself.
+        const result = await gitUpdateFromDefault(
+          action.cwd,
+          mode,
+          action.base,
+          branch,
+        );
+        if (result.outcome === "conflicts") {
+          // Same resolution flow as a panel/menu sync — live merge state is
+          // re-read on send, and a sessionless row gets the picker.
+          await offerMergeResolution(
+            {
+              cwd: action.cwd,
+              sessionId: action.sessionId,
+              title: item.title,
+            },
+            result.updatedFrom,
+            result.conflicts,
+            mode,
+          );
+          return;
+        }
+        // The condition the row described is handled locally — mute it by
+        // signature so the next poll (still-behind remote state) doesn't
+        // immediately resurface it; a real state change re-emits it.
+        dismissAttention(item.key, item.signature);
+        await message(
+          result.outcome === "up-to-date"
+            ? `${result.branch} is already up to date with ${result.updatedFrom}.`
+            : mode === "rebase"
+              ? `Rebased ${result.branch} onto ${result.updatedFrom}. Nothing was pushed.`
+              : `Merged ${result.updatedFrom} into ${result.branch}. Nothing was pushed.`,
+          { title: item.title },
+        );
+      } finally {
+        // Any outcome — merged, conflicts, refusal, or a failed merge the
+        // backend unwound — can have changed the tree; refresh, then free
+        // the slot so a follow-up sync isn't refused.
+        notifyGitChanged(action.cwd);
+        release();
       }
-      // The condition the row described is handled locally — mute it by
-      // signature so the next poll (still-behind remote state) doesn't
-      // immediately resurface it; a real state change re-emits it.
-      dismissAttention(item.key, item.signature);
-      await message(
-        result.outcome === "up-to-date"
-          ? `${result.branch} is already up to date with ${result.updatedFrom}.`
-          : mode === "rebase"
-            ? `Rebased ${result.branch} onto ${result.updatedFrom}. Nothing was pushed.`
-            : `Merged ${result.updatedFrom} into ${result.branch}. Nothing was pushed.`,
-        { title: item.title },
-      );
     },
     [],
   );
+
+  /** Session-row "Sync with remote default": the session owns its working
+   * copy — the sync runs there and conflicts route back to this
+   * conversation. The shared flow confirms the exact ref/host first. */
+  const onSyncSessionDefault = useCallback(async (summary: SessionSummary) => {
+    const cwd = sessionWorkCwd(summary);
+    try {
+      await syncWithDefaultBranch({
+        cwd,
+        sessionId: summary.id,
+        title: sessionDisplayTitle(summary.title, summary.harness),
+      });
+    } catch (error) {
+      await message(error instanceof Error ? error.message : String(error), {
+        title: "Sync with remote default",
+        kind: "warning",
+      });
+    }
+  }, []);
 
   const onAttentionAction = useCallback(
     async (item: AttentionItem) => {
@@ -7883,6 +7941,7 @@ export default function App({
         onArchiveSessions={onArchiveHistorySessions}
         onPinSession={onPinHistorySession}
         onPinSessions={onPinHistorySessions}
+        onSyncSession={onSyncSessionDefault}
         reminders={sessionReminders.reminders}
         onSetReminders={sessionReminders.schedule}
         onCancelReminders={sessionReminders.cancel}

@@ -270,6 +270,8 @@ pub fn run() {
             fs::git_github_pr_state,
             fs::git_github_pr_diff,
             fs::git_update_from_default,
+            fs::git_sync_branch,
+            fs::git_merge_context,
             fs::git_merge_abort,
             inbox_media::fetch_inbox_media,
             inbox_context::inbox_context_document,
