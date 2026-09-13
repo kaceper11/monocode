@@ -377,6 +377,7 @@ pub fn run() {
             skills::list_skills,
             agent_config::agent_config_inventory,
             agent_config::agent_config_set_enabled,
+            agent_config::agent_config_remove,
             search::search_project,
             cursor_store::cursor_tool_calls,
             cursor_store::cursor_subagent_runs,

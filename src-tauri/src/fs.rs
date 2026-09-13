@@ -5722,7 +5722,7 @@ fn copy_recursive(from: &Path, to: &Path) -> Result<(), String> {
     }
 }
 
-fn rename_path_sync(path: &str, name: &str) -> Result<String, String> {
+pub(crate) fn rename_path_sync(path: &str, name: &str) -> Result<String, String> {
     if let Some(location) = wsl::location(path)? {
         return wsl::path_request(&location, "rename", json!({"name":name}));
     }

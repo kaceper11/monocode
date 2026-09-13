@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::dirs_home;
-use crate::fs::expand_home;
+use crate::fs::{expand_home, rename_path_sync};
 use crate::wsl;
 
 const MAX_CONFIG_BYTES: u64 = 8 * 1024 * 1024;
@@ -44,6 +44,25 @@ pub struct ToggleRequest {
     pub invert: bool,
 }
 
+/// Where and how an inventory entry can be removed from its config file.
+/// `format` "file" means the entry is itself a file, removed by renaming it
+/// to `<name>.monocode-bak` so the removal stays recoverable.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveRef {
+    pub file: String,
+    /// "json" | "toml" | "file"
+    pub format: String,
+    /// Member path (JSON) or table/member path (TOML). Numeric segments in a
+    /// JSON path address array elements by index.
+    #[serde(default)]
+    pub path: Vec<String>,
+    /// Remove one element from the array at `path` instead of a member; for
+    /// TOML array-of-tables it disambiguates the block by name/command.
+    #[serde(default)]
+    pub array_item: Option<String>,
+}
+
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerEntry {
@@ -59,6 +78,7 @@ pub struct McpServerEntry {
     /// for Claude project servers, "waiting for approval".
     pub enabled: Option<bool>,
     pub toggle: Option<ToggleRef>,
+    pub remove: Option<RemoveRef>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -75,6 +95,7 @@ pub struct PluginEntry {
     pub managed: bool,
     pub enabled: Option<bool>,
     pub toggle: Option<ToggleRef>,
+    pub remove: Option<RemoveRef>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -96,6 +117,7 @@ pub struct HookEntry {
     pub file: String,
     pub scope: String,
     pub refs: Vec<HookRef>,
+    pub remove: Option<RemoveRef>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -647,6 +669,281 @@ fn set_json_bool(text: &str, path: &[String], member: &str, value: bool) -> Resu
     Ok(insert_json_member(&text, &spans, open_idx, member, literal))
 }
 
+/// Token index of the value addressed by `path`, descending objects by member
+/// name and arrays by numeric index. Empty path = the root value.
+fn json_value_idx(text: &str, spans: &[JSpan], path: &[String]) -> Option<usize> {
+    let mut idx = spans
+        .iter()
+        .position(|s| matches!(s.tok, JTok::Open | JTok::ArrOpen))?;
+    for segment in path {
+        match spans[idx].tok {
+            JTok::Open => {
+                let mut depth = 0usize;
+                let mut j = idx + 1;
+                let mut found = None;
+                while j < spans.len() {
+                    match spans[j].tok {
+                        JTok::Open | JTok::ArrOpen => depth += 1,
+                        JTok::Close | JTok::ArrClose => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        JTok::Str
+                            if depth == 0
+                                && spans.get(j + 1).map(|s| s.tok) == Some(JTok::Colon)
+                                && unquote_json(text, &spans[j]).as_deref()
+                                    == Some(segment.as_str()) =>
+                        {
+                            found = Some(j + 2);
+                            break;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                idx = found?;
+            }
+            JTok::ArrOpen => {
+                let target: usize = segment.parse().ok()?;
+                let mut depth = 0usize;
+                let mut j = idx + 1;
+                let mut seen = 0usize;
+                let mut found = None;
+                while j < spans.len() {
+                    match spans[j].tok {
+                        JTok::Open | JTok::ArrOpen => {
+                            if depth == 0 {
+                                if seen == target {
+                                    found = Some(j);
+                                    break;
+                                }
+                                seen += 1;
+                            }
+                            depth += 1;
+                        }
+                        JTok::Close | JTok::ArrClose => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        JTok::Comma if depth == 0 => {}
+                        _ if depth == 0 => {
+                            if seen == target {
+                                found = Some(j);
+                                break;
+                            }
+                            seen += 1;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                idx = found?;
+            }
+            _ => return None,
+        }
+    }
+    Some(idx)
+}
+
+/// Token index just past the value starting at token `idx`.
+fn json_value_end(spans: &[JSpan], idx: usize) -> Option<usize> {
+    match spans.get(idx)?.tok {
+        JTok::Open | JTok::ArrOpen => {
+            let mut depth = 0usize;
+            for (j, s) in spans.iter().enumerate().skip(idx) {
+                match s.tok {
+                    JTok::Open | JTok::ArrOpen => depth += 1,
+                    JTok::Close | JTok::ArrClose => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => Some(idx + 1),
+    }
+}
+
+/// Token range (lo..hi) of the element addressed by the last path segment:
+/// `"key": value` for objects, the element for arrays.
+fn json_element_tokens(text: &str, spans: &[JSpan], path: &[String]) -> Option<(usize, usize)> {
+    let (last, parent_path) = path.split_last()?;
+    let parent = json_value_idx(text, spans, parent_path)?;
+    match spans[parent].tok {
+        JTok::Open => {
+            let mut depth = 0usize;
+            let mut j = parent + 1;
+            while j < spans.len() {
+                match spans[j].tok {
+                    JTok::Open | JTok::ArrOpen => depth += 1,
+                    JTok::Close | JTok::ArrClose => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    JTok::Str
+                        if depth == 0
+                            && spans.get(j + 1).map(|s| s.tok) == Some(JTok::Colon)
+                            && unquote_json(text, &spans[j]).as_deref() == Some(last.as_str()) =>
+                    {
+                        return Some((j, json_value_end(spans, j + 2)?));
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        JTok::ArrOpen => {
+            let target: usize = last.parse().ok()?;
+            let mut depth = 0usize;
+            let mut j = parent + 1;
+            let mut seen = 0usize;
+            while j < spans.len() {
+                match spans[j].tok {
+                    JTok::Open | JTok::ArrOpen => {
+                        if depth == 0 && seen == target {
+                            return Some((j, json_value_end(spans, j)?));
+                        }
+                        depth += 1;
+                        if depth == 1 {
+                            seen += 1;
+                        }
+                    }
+                    JTok::Close | JTok::ArrClose => {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    JTok::Comma if depth == 0 => {}
+                    _ if depth == 0 => {
+                        if seen == target {
+                            return Some((j, j + 1));
+                        }
+                        seen += 1;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Cut the byte range covering the element, plus one comma and the newline a
+/// full-line element leaves behind.
+fn json_cut(text: &str, spans: &[JSpan], lo: usize, hi: usize) -> String {
+    let mut start = spans[lo].start;
+    let mut end = spans[hi - 1].end;
+    if spans.get(hi).map(|s| s.tok) == Some(JTok::Comma) {
+        end = spans[hi].end;
+        if text.as_bytes().get(end) == Some(&b'\n') {
+            end += 1;
+        }
+    } else if lo > 0 && spans[lo - 1].tok == JTok::Comma {
+        start = spans[lo - 1].start;
+    }
+    format!("{}{}", &text[..start], &text[end..])
+}
+
+/// Remove the member or array element at `path` (numeric segments index into
+/// arrays), preserving JSONC comments and formatting.
+fn remove_json_at(text: &str, path: &[String]) -> Result<String, String> {
+    let spans = json_spans(text).map_err(|e| format!("Cannot parse {e}"))?;
+    let (lo, hi) =
+        json_element_tokens(text, &spans, path).ok_or("Entry not found in config file")?;
+    Ok(json_cut(text, &spans, lo, hi))
+}
+
+/// Remove the element of the array at `path` matching `item` — a string
+/// (ignoring a leading `-` disable marker), or `{package|name: item}`.
+fn remove_json_array_item(text: &str, path: &[String], item: &str) -> Result<String, String> {
+    let spans = json_spans(text).map_err(|e| format!("Cannot parse {e}"))?;
+    let arr = json_value_idx(text, &spans, path).ok_or("Config section not found")?;
+    if spans[arr].tok != JTok::ArrOpen {
+        return Err("Config section is not a list".into());
+    }
+    let mut depth = 0usize;
+    let mut j = arr + 1;
+    while j < spans.len() {
+        let s = spans[j];
+        match s.tok {
+            JTok::Open | JTok::ArrOpen => {
+                if depth == 0 {
+                    let end = json_value_end(&spans, j).ok_or("Unbalanced array")?;
+                    if s.tok == JTok::Open {
+                        // Object element: match its package/name member.
+                        let mut d = 0usize;
+                        let mut k = j + 1;
+                        while k < end {
+                            match spans[k].tok {
+                                JTok::Open | JTok::ArrOpen => d += 1,
+                                JTok::Close | JTok::ArrClose => {
+                                    if d == 0 {
+                                        break;
+                                    }
+                                    d -= 1;
+                                }
+                                JTok::Str
+                                    if d == 0
+                                        && spans.get(k + 1).map(|t| t.tok) == Some(JTok::Colon)
+                                        && matches!(
+                                            unquote_json(text, &spans[k]).as_deref(),
+                                            Some("package") | Some("name")
+                                        )
+                                        && unquote_json(text, &spans[k + 2]).as_deref()
+                                            == Some(item) =>
+                                {
+                                    return Ok(json_cut(text, &spans, j, end));
+                                }
+                                _ => {}
+                            }
+                            k += 1;
+                        }
+                    }
+                    j = end;
+                    continue;
+                }
+                depth += 1;
+            }
+            JTok::Close | JTok::ArrClose => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            JTok::Comma if depth == 0 => {}
+            _ if depth == 0 => {
+                let matches_item = if s.tok == JTok::Str {
+                    unquote_json(text, &s)
+                        .map(|v| v.trim_start_matches('-') == item)
+                        .unwrap_or(false)
+                } else {
+                    span_string(text, &s).trim_start_matches('-') == item
+                };
+                if matches_item {
+                    return Ok(json_cut(text, &spans, j, j + 1));
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    Err("Entry not found in config list".into())
+}
+
 // ---------------------------------------------------------------------------
 // TOML: line-oriented table scan + in-place boolean set. Enough for
 // `[mcp_servers.*]`, `[plugins.*]`, `[marketplaces.*]` — not a general parser.
@@ -1004,6 +1301,187 @@ fn set_toml_bool(text: &str, path: &[String], member: &str, value: bool) -> Resu
     ))
 }
 
+/// Length of the TOML value starting at `value`'s first byte — through the
+/// balancing `]` for arrays, else the first `#` comment or newline.
+fn toml_value_len(value: &str) -> usize {
+    if value.starts_with('[') {
+        let mut depth = 0i32;
+        let mut quote = 0u8;
+        let bytes = value.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if quote != 0 {
+                if quote == b'"' && b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == quote {
+                    quote = 0;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'"' | b'\'' => quote = b,
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        return value.len();
+    }
+    let nl = value.find('\n').unwrap_or(value.len());
+    toml_comment_pos(&value[..nl]).unwrap_or(nl)
+}
+
+/// Byte ranges of member `key` inside `body`: (member line start, member end
+/// past the trailing newline, value start, value end).
+fn toml_member_span(body: &str, key: &str) -> Option<(usize, usize, usize, usize)> {
+    let mut offset = 0usize;
+    let mut in_multiline: Option<u8> = None;
+    for line in body.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let inside = in_multiline.is_some();
+        in_multiline = toml_multiline_next(line, in_multiline);
+        if inside {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(eq) = find_toml_eq(trimmed) {
+            let name = trimmed[..eq].trim().trim_matches('"').trim_matches('\'');
+            if name == key {
+                let eq_abs = line_start + (line.len() - trimmed.len()) + eq;
+                let after_eq = &body[eq_abs + 1..];
+                let value_start = eq_abs + 1 + (after_eq.len() - after_eq.trim_start().len());
+                let value_end = value_start + toml_value_len(after_eq.trim_start());
+                let member_end = body[value_end..]
+                    .find('\n')
+                    .map(|n| value_end + n + 1)
+                    .unwrap_or(body.len());
+                return Some((line_start, member_end, value_start, value_end));
+            }
+        }
+    }
+    None
+}
+
+/// Drop one element from a TOML array's text, keeping brackets and commas
+/// balanced. `value` is the raw value (may span lines).
+fn toml_list_remove(value: &str, item: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' && bytes[i] != b'\'' {
+            i += 1;
+            continue;
+        }
+        let quote = bytes[i];
+        let start = i;
+        i += 1;
+        while i < bytes.len() {
+            if quote == b'"' && bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == quote {
+                break;
+            }
+            i += 1;
+        }
+        let end = (i + 1).min(bytes.len());
+        if unquote_toml_string(&value[start..end]) == item {
+            // Cut the element plus one adjacent comma.
+            let mut cut_start = start;
+            let mut cut_end = end;
+            let mut j = end;
+            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\r') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b',' {
+                cut_end = j + 1;
+                // Swallow the newline a full-line element leaves behind.
+                if bytes.get(cut_end) == Some(&b'\n') {
+                    cut_end += 1;
+                }
+            } else {
+                let mut k = start;
+                while k > 0 && matches!(bytes[k - 1], b' ' | b'\t' | b'\r' | b'\n') {
+                    k -= 1;
+                }
+                if k > 0 && bytes[k - 1] == b',' {
+                    cut_start = k - 1;
+                }
+            }
+            return Some(format!("{}{}", &value[..cut_start], &value[cut_end..]));
+        }
+        i = end;
+    }
+    None
+}
+
+/// Remove a TOML table block or member. With `array_item`, either selects the
+/// `[[table]]` whose `name`/`command` matches, or removes one element of a
+/// `key = [...]` member.
+fn remove_toml(text: &str, path: &[String], array_item: Option<&str>) -> Result<String, String> {
+    let tables = toml_tables(text);
+    let matching: Vec<&TomlTable> = tables.iter().filter(|t| t.path == path).collect();
+    if !matching.is_empty() {
+        let target = if matching.len() == 1 {
+            matching[0]
+        } else {
+            let needle = array_item.ok_or("Entry is ambiguous")?;
+            matching
+                .iter()
+                .copied()
+                .find(|t| {
+                    let body = &text[t.body_start..t.end];
+                    ["name", "command"].iter().any(|k| {
+                        toml_get(body, k)
+                            .map(|v| unquote_toml_string(&v) == needle)
+                            .unwrap_or(false)
+                    })
+                })
+                .ok_or("Entry not found in config file")?
+        };
+        return Ok(format!("{}{}", &text[..target.start], &text[target.end..]));
+    }
+    let key = path.last().ok_or("Invalid config path")?;
+    let parent = &path[..path.len() - 1];
+    let (body_start, body_end) = if parent.is_empty() {
+        (0, tables.first().map(|t| t.start).unwrap_or(text.len()))
+    } else {
+        let table = toml_table(&tables, parent).ok_or("Config section not found")?;
+        (table.body_start, table.end)
+    };
+    let body = &text[body_start..body_end];
+    let (ms, me, vs, ve) = toml_member_span(body, key).ok_or("Entry not found in config file")?;
+    if let Some(item) = array_item {
+        let new_value = toml_list_remove(&body[vs..ve], item).ok_or("Entry not found in list")?;
+        return Ok(format!(
+            "{}{}{}",
+            &text[..body_start + vs],
+            new_value,
+            &text[body_start + ve..]
+        ));
+    }
+    Ok(format!(
+        "{}{}",
+        &text[..body_start + ms],
+        &text[body_start + me..]
+    ))
+}
+
 fn unquote_toml_string(value: &str) -> String {
     let v = value.trim();
     if v.len() >= 2
@@ -1240,6 +1718,7 @@ fn claude_extensions(ctx: &Ctx) -> ProviderExtensions {
                 &file,
                 &mut out.mcp_servers,
                 None,
+                &jp(&["mcpServers"]),
             );
             let local = value["projects"][ctx.project_native.as_str()].clone();
             mcp_map_entries(
@@ -1248,9 +1727,16 @@ fn claude_extensions(ctx: &Ctx) -> ProviderExtensions {
                 &file,
                 &mut out.mcp_servers,
                 None,
+                &jp(&["projects", ctx.project_native.as_str(), "mcpServers"]),
             );
             // Devin also reads hooks out of ~/.claude.json.
-            collect_hooks_map(&value["hooks"], &file, "user", &mut out.hooks);
+            collect_hooks_map(
+                &value["hooks"],
+                &file,
+                "user",
+                &mut out.hooks,
+                &jp(&["hooks"]),
+            );
             let p = &value["projects"][ctx.project_native.as_str()];
             approve_all = p["enableAllProjectMcpServers"].as_bool().unwrap_or(false);
             for name in p["enabledMcpjsonServers"].as_array().into_iter().flatten() {
@@ -1305,6 +1791,7 @@ fn claude_extensions(ctx: &Ctx) -> ProviderExtensions {
                 &file,
                 &mut out.mcp_servers,
                 None,
+                &jp(&["mcpServers"]),
             );
             for entry in &mut out.mcp_servers[start..] {
                 entry.enabled = if approve_all || approved.contains(&entry.name) {
@@ -1433,6 +1920,9 @@ fn claude_extensions(ctx: &Ctx) -> ProviderExtensions {
                 None => None,
             },
             toggle,
+            // The entry lives in a CLI-owned registry, not an editable config
+            // section — no removal.
+            remove: None,
         });
     }
 
@@ -1445,7 +1935,13 @@ fn claude_extensions(ctx: &Ctx) -> ProviderExtensions {
     ] {
         if let Some(text) = read_config_text(&file) {
             if let Some(value) = parse_json_file(&text) {
-                collect_hooks_map(&value["hooks"], &js(&file), scope, &mut out.hooks);
+                collect_hooks_map(
+                    &value["hooks"],
+                    &js(&file),
+                    scope,
+                    &mut out.hooks,
+                    &jp(&["hooks"]),
+                );
             }
         }
     }
@@ -1583,12 +2079,12 @@ fn codex_family_extensions(
         {
             if let Some(value) = parse_json_file(&text) {
                 // Codex wraps the map in "hooks"; a bare map also parses.
-                let hooks = if value["hooks"].is_object() {
-                    &value["hooks"]
+                let (hooks, root) = if value["hooks"].is_object() {
+                    (&value["hooks"], jp(&["hooks"]))
                 } else {
-                    &value
+                    (&value, Vec::new())
                 };
-                collect_hooks_map(hooks, &file, scope, &mut out.hooks);
+                collect_hooks_map(hooks, &file, scope, &mut out.hooks, &root);
             }
         }
     }
@@ -1609,12 +2105,12 @@ fn codex_family_extensions(
                 let path = PathBuf::from(&entry.path);
                 if let Some(text) = read_config_text(&path) {
                     if let Some(value) = parse_json_file(&text) {
-                        let hooks = if value["hooks"].is_object() {
-                            &value["hooks"]
+                        let (hooks, root) = if value["hooks"].is_object() {
+                            (&value["hooks"], jp(&["hooks"]))
                         } else {
-                            &value
+                            (&value, Vec::new())
                         };
-                        collect_hooks_map(hooks, &entry.path, scope, &mut out.hooks);
+                        collect_hooks_map(hooks, &entry.path, scope, &mut out.hooks, &root);
                     }
                 }
             }
@@ -1675,6 +2171,12 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                     member: "enabled".into(),
                     invert: false,
                 }),
+                remove: Some(RemoveRef {
+                    file: file.into(),
+                    format: "toml".into(),
+                    path: table.path.clone(),
+                    array_item: None,
+                }),
             });
         } else if table.path.len() == 1 && table.path[0] == "plugins" {
             // Grok's list form: [plugins] with name lists in enabled/disabled
@@ -1700,6 +2202,12 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                     managed: false,
                     enabled: Some(true),
                     toggle: None,
+                    remove: Some(RemoveRef {
+                        file: file.into(),
+                        format: "toml".into(),
+                        path: jp(&["plugins", "enabled"]),
+                        array_item: Some(name.clone()),
+                    }),
                 });
             }
             for name in &disabled_list {
@@ -1716,6 +2224,12 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                     managed: false,
                     enabled: Some(false),
                     toggle: None,
+                    remove: Some(RemoveRef {
+                        file: file.into(),
+                        format: "toml".into(),
+                        path: jp(&["plugins", "disabled"]),
+                        array_item: Some(name.clone()),
+                    }),
                 });
             }
             for p in &paths {
@@ -1729,6 +2243,12 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                     managed: false,
                     enabled: None,
                     toggle: None,
+                    remove: Some(RemoveRef {
+                        file: file.into(),
+                        format: "toml".into(),
+                        path: jp(&["plugins", "paths"]),
+                        array_item: Some(p.clone()),
+                    }),
                 });
             }
         } else if table.path.len() == 2 && table.path[0] == "plugins" {
@@ -1750,6 +2270,12 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                     member: "enabled".into(),
                     invert: false,
                 }),
+                remove: Some(RemoveRef {
+                    file: file.into(),
+                    format: "toml".into(),
+                    path: table.path.clone(),
+                    array_item: None,
+                }),
             });
         } else if table.path.len() == 2 && table.path[0] == "marketplaces" {
             let body = &text[table.body_start..table.end];
@@ -1763,6 +2289,12 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                 managed: false,
                 enabled: None,
                 toggle: None,
+                remove: Some(RemoveRef {
+                    file: file.into(),
+                    format: "toml".into(),
+                    path: table.path.clone(),
+                    array_item: None,
+                }),
             });
         }
     }
@@ -1778,10 +2310,16 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                     event: table.path[1].clone(),
                     matcher: toml_get(body, "matcher").map(|v| unquote_toml_string(&v)),
                     kind: "command".into(),
-                    command: Some(command),
+                    command: Some(command.clone()),
                     file: file.into(),
                     scope: scope.into(),
                     refs: Vec::new(),
+                    remove: Some(RemoveRef {
+                        file: file.into(),
+                        format: "toml".into(),
+                        path: table.path.clone(),
+                        array_item: Some(command),
+                    }),
                 });
             }
         }
@@ -1807,6 +2345,12 @@ fn parse_codex_toml(text: &str, file: &str, scope: &str, out: &mut ProviderExten
                 file: file.into(),
                 scope: scope.into(),
                 refs: Vec::new(),
+                remove: Some(RemoveRef {
+                    file: file.into(),
+                    format: "toml".into(),
+                    path: jp(&["notify"]),
+                    array_item: None,
+                }),
             });
         }
     }
@@ -1855,9 +2399,16 @@ fn cursor_extensions(ctx: &Ctx) -> ProviderExtensions {
                 &file,
                 &mut out.mcp_servers,
                 None,
+                &jp(&["mcpServers"]),
             );
         } else {
-            collect_flat_hooks(&value["hooks"], &file, scope, &mut out.hooks);
+            collect_flat_hooks(
+                &value["hooks"],
+                &file,
+                scope,
+                &mut out.hooks,
+                &jp(&["hooks"]),
+            );
         }
     }
     out
@@ -1918,6 +2469,7 @@ fn opencode_extensions(ctx: &Ctx) -> ProviderExtensions {
             &file,
             &mut out.mcp_servers,
             Some(&MCP_TOGGLE_OPENCODE),
+            &jp(&["mcp"]),
         );
         mcp_map_entries(
             &value["mcp"]["servers"],
@@ -1925,6 +2477,7 @@ fn opencode_extensions(ctx: &Ctx) -> ProviderExtensions {
             &file,
             &mut out.mcp_servers,
             Some(&MCP_TOGGLE_OPENCODE_NESTED),
+            &jp(&["mcp", "servers"]),
         );
         // v1 `plugin` + v2 `plugins` arrays; `-name` disables, objects carry
         // {package, options}.
@@ -1955,6 +2508,12 @@ fn opencode_extensions(ctx: &Ctx) -> ProviderExtensions {
                         managed: false,
                         enabled: Some(enabled),
                         toggle: None,
+                        remove: Some(RemoveRef {
+                            file: file.clone(),
+                            format: "json".into(),
+                            path: jp(&[key]),
+                            array_item: Some(id.to_string()),
+                        }),
                     });
                 }
             }
@@ -1984,6 +2543,12 @@ fn opencode_extensions(ctx: &Ctx) -> ProviderExtensions {
                 managed: false,
                 enabled: None,
                 toggle: None,
+                remove: Some(RemoveRef {
+                    file: entry.path.clone(),
+                    format: "file".into(),
+                    path: Vec::new(),
+                    array_item: None,
+                }),
             });
         }
     }
@@ -2079,27 +2644,67 @@ fn pi_family_extensions(ctx: &Ctx, provider: &str, dir: &str) -> ProviderExtensi
             &file,
             &mut out.mcp_servers,
             None,
+            &jp(&["mcpServers"]),
         );
-        mcp_map_entries(&value["mcp"], scope, &file, &mut out.mcp_servers, None);
+        mcp_map_entries(
+            &value["mcp"],
+            scope,
+            &file,
+            &mut out.mcp_servers,
+            None,
+            &jp(&["mcp"]),
+        );
         // settings.json `packages` (npm:/git: specs) + `extensions` (paths);
         // package.json carries the same under a `pi` manifest key.
-        let root = if name == "package.json" {
+        let manifest = name == "package.json";
+        let root = if manifest {
             value["pi"].clone()
         } else {
             value.clone()
         };
+        let root_path: Vec<String> = if manifest { jp(&["pi"]) } else { Vec::new() };
         for section in ["packages", "extensions"] {
             match &root[section] {
                 Value::Array(items) => {
                     for item in items {
                         if let Some(name) = item.as_str() {
-                            push_extension(&mut out.plugins, name, &file, scope);
+                            push_extension(
+                                &mut out.plugins,
+                                name,
+                                &file,
+                                scope,
+                                Some(RemoveRef {
+                                    file: file.clone(),
+                                    format: "json".into(),
+                                    path: root_path
+                                        .iter()
+                                        .cloned()
+                                        .chain([section.to_string()])
+                                        .collect(),
+                                    array_item: Some(name.to_string()),
+                                }),
+                            );
                         }
                     }
                 }
                 Value::Object(map) => {
                     for name in map.keys() {
-                        push_extension(&mut out.plugins, name, &file, scope);
+                        push_extension(
+                            &mut out.plugins,
+                            name,
+                            &file,
+                            scope,
+                            Some(RemoveRef {
+                                file: file.clone(),
+                                format: "json".into(),
+                                path: root_path
+                                    .iter()
+                                    .cloned()
+                                    .chain([section.to_string(), name.clone()])
+                                    .collect(),
+                                array_item: None,
+                            }),
+                        );
                     }
                 }
                 _ => {}
@@ -2128,13 +2733,30 @@ fn pi_family_extensions(ctx: &Ctx, provider: &str, dir: &str) -> ProviderExtensi
             if !(is_file || entry.is_dir) {
                 continue;
             }
-            push_extension(&mut out.plugins, &entry.name, &entry.path, scope);
+            push_extension(
+                &mut out.plugins,
+                &entry.name,
+                &entry.path,
+                scope,
+                Some(RemoveRef {
+                    file: entry.path.clone(),
+                    format: "file".into(),
+                    path: Vec::new(),
+                    array_item: None,
+                }),
+            );
         }
     }
     out
 }
 
-fn push_extension(plugins: &mut Vec<PluginEntry>, name: &str, file: &str, scope: &str) {
+fn push_extension(
+    plugins: &mut Vec<PluginEntry>,
+    name: &str,
+    file: &str,
+    scope: &str,
+    remove: Option<RemoveRef>,
+) {
     if plugins.iter().any(|p| p.id == name) {
         return;
     }
@@ -2148,6 +2770,7 @@ fn push_extension(plugins: &mut Vec<PluginEntry>, name: &str, file: &str, scope:
         managed: false,
         enabled: None,
         toggle: None,
+        remove,
     });
 }
 
@@ -2245,9 +2868,16 @@ fn devin_extensions(ctx: &Ctx) -> ProviderExtensions {
             &file,
             &mut out.mcp_servers,
             Some(&MCP_TOGGLE_DISABLED),
+            &jp(&["mcpServers"]),
         );
         if name.starts_with("config") {
-            collect_hooks_map(&value["hooks"], &file, scope, &mut out.hooks);
+            collect_hooks_map(
+                &value["hooks"],
+                &file,
+                scope,
+                &mut out.hooks,
+                &jp(&["hooks"]),
+            );
         }
     }
     for (path, scope) in &hook_files {
@@ -2256,7 +2886,7 @@ fn devin_extensions(ctx: &Ctx) -> ProviderExtensions {
         };
         if let Some(value) = parse_json_file(&text) {
             // The whole file is the hooks map.
-            collect_hooks_map(&value, &js(path), scope, &mut out.hooks);
+            collect_hooks_map(&value, &js(path), scope, &mut out.hooks, &Vec::new());
         }
     }
 
@@ -2292,6 +2922,7 @@ fn devin_extensions(ctx: &Ctx) -> ProviderExtensions {
                             managed: false,
                             enabled: Some(true),
                             toggle: None,
+                            remove: None,
                         });
                     }
                 }
@@ -2369,10 +3000,24 @@ fn copilot_extensions(ctx: &Ctx) -> ProviderExtensions {
             &file,
             &mut out.mcp_servers,
             None,
+            &jp(&["mcpServers"]),
         );
-        mcp_map_entries(&value["servers"], scope, &file, &mut out.mcp_servers, None);
+        mcp_map_entries(
+            &value["servers"],
+            scope,
+            &file,
+            &mut out.mcp_servers,
+            None,
+            &jp(&["servers"]),
+        );
         // Settings files can carry a hooks map too.
-        collect_hooks_map(&value["hooks"], &file, scope, &mut out.hooks);
+        collect_hooks_map(
+            &value["hooks"],
+            &file,
+            scope,
+            &mut out.hooks,
+            &jp(&["hooks"]),
+        );
     }
     // Hook files: ~/.copilot/hooks/*.json (user) + .github/hooks/*.json.
     let mut hook_dirs: Vec<(PathBuf, &str)> = vec![(ctx.project_join(".github/hooks"), "project")];
@@ -2391,12 +3036,12 @@ fn copilot_extensions(ctx: &Ctx) -> ProviderExtensions {
             let Some(value) = parse_json_file(&text) else {
                 continue;
             };
-            let map = if value["hooks"].is_object() {
-                &value["hooks"]
+            let (map, root) = if value["hooks"].is_object() {
+                (&value["hooks"], jp(&["hooks"]))
             } else {
-                &value
+                (&value, Vec::new())
             };
-            collect_hooks_map(map, &js(&path), scope, &mut out.hooks);
+            collect_hooks_map(map, &js(&path), scope, &mut out.hooks, &root);
         }
     }
     out
@@ -2472,12 +3117,12 @@ fn generic_extensions(
                 "config.toml" => parse_codex_toml(&text, &f, "user", &mut out),
                 "hooks.json" => {
                     if let Some(value) = parse_json_file(&text) {
-                        let map = if value["hooks"].is_object() {
-                            &value["hooks"]
+                        let (map, root) = if value["hooks"].is_object() {
+                            (&value["hooks"], jp(&["hooks"]))
                         } else {
-                            &value
+                            (&value, Vec::new())
                         };
-                        collect_hooks_map(map, &f, "user", &mut out.hooks);
+                        collect_hooks_map(map, &f, "user", &mut out.hooks, &root);
                     }
                 }
                 _ => {
@@ -2485,7 +3130,14 @@ fn generic_extensions(
                         // mcp.json is a bare {name: server} map; settings/config
                         // nest it under mcpServers or mcp.
                         if file == "mcp.json" && !value["mcpServers"].is_object() {
-                            mcp_map_entries(&value, "user", &f, &mut out.mcp_servers, None);
+                            mcp_map_entries(
+                                &value,
+                                "user",
+                                &f,
+                                &mut out.mcp_servers,
+                                None,
+                                &Vec::new(),
+                            );
                         }
                         mcp_map_entries(
                             &value["mcpServers"],
@@ -2493,8 +3145,16 @@ fn generic_extensions(
                             &f,
                             &mut out.mcp_servers,
                             None,
+                            &jp(&["mcpServers"]),
                         );
-                        mcp_map_entries(&value["mcp"], "user", &f, &mut out.mcp_servers, None);
+                        mcp_map_entries(
+                            &value["mcp"],
+                            "user",
+                            &f,
+                            &mut out.mcp_servers,
+                            None,
+                            &jp(&["mcp"]),
+                        );
                     }
                 }
             }
@@ -2515,9 +3175,23 @@ fn generic_extensions(
             &f,
             &mut out.mcp_servers,
             None,
+            &jp(&["mcpServers"]),
         );
-        mcp_map_entries(&value["mcp"], "project", &f, &mut out.mcp_servers, None);
-        collect_hooks_map(&value["hooks"], &f, "project", &mut out.hooks);
+        mcp_map_entries(
+            &value["mcp"],
+            "project",
+            &f,
+            &mut out.mcp_servers,
+            None,
+            &jp(&["mcp"]),
+        );
+        collect_hooks_map(
+            &value["hooks"],
+            &f,
+            "project",
+            &mut out.hooks,
+            &jp(&["hooks"]),
+        );
     }
     out
 }
@@ -2580,15 +3254,23 @@ fn mcp_command_parts(entry: &Value) -> (Option<String>, Vec<String>) {
     (command, parts)
 }
 
+/// Build a JSON member path from segments.
+fn jp(segs: &[&str]) -> Vec<String> {
+    segs.iter().map(|s| s.to_string()).collect()
+}
+
 /// `mcpServers`-style map: `{name: {command,args,env,url,type,disabled?}}`.
 /// With `toggle`, entries expose the provider's native enable flag; without it
-/// `disabled` is still read for display but no switch is offered.
+/// `disabled` is still read for display but no switch is offered. `section` is
+/// the JSON path of the map itself inside `file` (empty for a root-level map)
+/// and drives each entry's removal target.
 fn mcp_map_entries(
     map_value: &Value,
     scope: &str,
     file: &str,
     out: &mut Vec<McpServerEntry>,
     toggle: Option<&McpToggleSpec>,
+    section: &[String],
 ) {
     let Some(map) = map_value.as_object() else {
         return;
@@ -2657,23 +3339,51 @@ fn mcp_map_entries(
                 member: t.member.into(),
                 invert: t.invert,
             }),
+            remove: Some(RemoveRef {
+                file: file.into(),
+                format: "json".into(),
+                path: section
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(name.clone()))
+                    .collect(),
+                array_item: None,
+            }),
         });
     }
 }
 
 /// Claude-style `{Event: [{matcher?, hooks:[{type,command,...}]}]}` maps.
-fn collect_hooks_map(hooks: &Value, file: &str, scope: &str, out: &mut Vec<HookEntry>) {
+/// `root` is the JSON path of the map inside `file`, so each hook's removal
+/// target can be expressed as member/array-index path.
+fn collect_hooks_map(
+    hooks: &Value,
+    file: &str,
+    scope: &str,
+    out: &mut Vec<HookEntry>,
+    root: &[String],
+) {
     let Some(map) = hooks.as_object() else {
         return;
+    };
+    let hook_remove = |segments: &[String]| RemoveRef {
+        file: file.into(),
+        format: "json".into(),
+        path: root
+            .iter()
+            .cloned()
+            .chain(segments.iter().cloned())
+            .collect(),
+        array_item: None,
     };
     for (event, groups) in map {
         let Some(groups) = groups.as_array() else {
             continue;
         };
-        for group in groups {
+        for (gi, group) in groups.iter().enumerate() {
             let matcher = group["matcher"].as_str().map(String::from);
             if let Some(list) = group["hooks"].as_array() {
-                for hook in list {
+                for (hi, hook) in list.iter().enumerate() {
                     let kind = hook["type"].as_str().unwrap_or("command");
                     let command = hook["command"]
                         .as_str()
@@ -2687,6 +3397,12 @@ fn collect_hooks_map(hooks: &Value, file: &str, scope: &str, out: &mut Vec<HookE
                         file: file.into(),
                         scope: scope.into(),
                         refs: Vec::new(),
+                        remove: Some(hook_remove(&[
+                            event.clone(),
+                            gi.to_string(),
+                            "hooks".into(),
+                            hi.to_string(),
+                        ])),
                     });
                 }
             } else {
@@ -2703,6 +3419,7 @@ fn collect_hooks_map(hooks: &Value, file: &str, scope: &str, out: &mut Vec<HookE
                         file: file.into(),
                         scope: scope.into(),
                         refs: Vec::new(),
+                        remove: Some(hook_remove(&[event.clone(), gi.to_string()])),
                     });
                 }
             }
@@ -2711,7 +3428,13 @@ fn collect_hooks_map(hooks: &Value, file: &str, scope: &str, out: &mut Vec<HookE
 }
 
 /// Cursor-style flat `{event: [{command|prompt, matcher?}]}` maps.
-fn collect_flat_hooks(hooks: &Value, file: &str, scope: &str, out: &mut Vec<HookEntry>) {
+fn collect_flat_hooks(
+    hooks: &Value,
+    file: &str,
+    scope: &str,
+    out: &mut Vec<HookEntry>,
+    root: &[String],
+) {
     let Some(map) = hooks.as_object() else {
         return;
     };
@@ -2719,7 +3442,7 @@ fn collect_flat_hooks(hooks: &Value, file: &str, scope: &str, out: &mut Vec<Hook
         let Some(list) = list.as_array() else {
             continue;
         };
-        for entry in list {
+        for (i, entry) in list.iter().enumerate() {
             let command = entry["command"]
                 .as_str()
                 .or_else(|| entry["prompt"].as_str());
@@ -2732,6 +3455,16 @@ fn collect_flat_hooks(hooks: &Value, file: &str, scope: &str, out: &mut Vec<Hook
                     file: file.into(),
                     scope: scope.into(),
                     refs: Vec::new(),
+                    remove: Some(RemoveRef {
+                        file: file.into(),
+                        format: "json".into(),
+                        path: root
+                            .iter()
+                            .cloned()
+                            .chain([event.clone(), i.to_string()])
+                            .collect(),
+                        array_item: None,
+                    }),
                 });
             }
         }
@@ -3319,6 +4052,143 @@ pub fn agent_config_set_enabled(
     write_config_text(&path, &next)
 }
 
+/// Sections whose members/tables may be removed, mirroring `toggle_allowed`.
+/// Dedicated map files (`mcp.json`, `hooks.json`, …) and files inside a
+/// `hooks/` directory are themselves entry maps, so any top-level member
+/// counts as a removable entry.
+fn remove_allowed(
+    remove: &RemoveRef,
+    path: &Path,
+    project: &Path,
+    home: Option<&Path>,
+) -> Result<(), String> {
+    if remove.path.len() > 8 || remove.path.iter().any(|s| s.is_empty() || s == "..") {
+        return Err("Invalid config path".into());
+    }
+    if !path.is_absolute()
+        || path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("Invalid config file path".into());
+    }
+    if !path_within(path, project) && !home.is_some_and(|h| path_within(path, h)) {
+        return Err("Refusing to write outside the project and home directory".into());
+    }
+    if remove.format == "file" {
+        // File removal renames to <name>.monocode-bak — recoverable — so the
+        // project/home bounds above suffice.
+        return Ok(());
+    }
+    let section = remove.path.first().map(String::as_str).unwrap_or("");
+    let section_ok = match remove.format.as_str() {
+        "json" => matches!(
+            section,
+            "mcpServers"
+                | "mcp"
+                | "mcp_servers"
+                | "servers"
+                | "plugin"
+                | "plugins"
+                | "packages"
+                | "extensions"
+                | "hooks"
+                | "pi"
+                | "projects"
+                | "enabledPlugins"
+                | "enabledMcpjsonServers"
+                | "disabledMcpjsonServers"
+        ),
+        "toml" => matches!(
+            section,
+            "mcp_servers" | "plugins" | "marketplaces" | "hooks" | "notify"
+        ),
+        other => return Err(format!("Unsupported config format: {other}")),
+    };
+    if section_ok {
+        return Ok(());
+    }
+    let dedicated = remove.format == "json"
+        && (path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            matches!(
+                n,
+                "mcp.json" | "mcp_config.json" | "mcp.jsonc" | "hooks.json" | "hooks.v1.json"
+            )
+        }) || path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("hooks"));
+    if dedicated {
+        return Ok(());
+    }
+    Err("This config section cannot be removed".into())
+}
+
+/// Rename a file to `<name>.monocode-bak` so removal stays recoverable.
+fn remove_config_file(path: &Path) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Invalid file path")?;
+    let mut last_err = "Could not rename file".to_string();
+    for i in 0..10 {
+        let candidate = if i == 0 {
+            format!("{name}.monocode-bak")
+        } else {
+            format!("{name}.monocode-bak-{i}")
+        };
+        match rename_path_sync(&path.to_string_lossy(), &candidate) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if !e.to_lowercase().contains("exist") {
+                    return Err(e);
+                }
+                last_err = e;
+            }
+        }
+    }
+    Err(last_err)
+}
+
+#[tauri::command(async)]
+pub fn agent_config_remove(cwd: String, remove: RemoveRef) -> Result<(), String> {
+    let project = expand_home(&cwd);
+    let home = home_for(&project);
+    let path = expand_home(&remove.file);
+    remove_allowed(&remove, &path, &project, home.as_deref())?;
+    if remove.format == "file" {
+        return remove_config_file(&path);
+    }
+    let text = read_config_text(&path).ok_or("Config file could not be read")?;
+    let next = match remove.format.as_str() {
+        "json" => match &remove.array_item {
+            Some(item) => remove_json_array_item(&text, &remove.path, item)?,
+            None => remove_json_at(&text, &remove.path)?,
+        },
+        "toml" => remove_toml(&text, &remove.path, remove.array_item.as_deref())?,
+        other => return Err(format!("Unsupported config format: {other}")),
+    };
+    if next == text {
+        return Err("Entry not found in config file".into());
+    }
+    // Never leave a syntactically broken file behind.
+    if remove.format == "json" && parse_json_file(&next).is_none() {
+        return Err("Removal would produce invalid JSON — aborted".into());
+    }
+    let backup = path.with_file_name(format!(
+        "{}.monocode-bak",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config")
+    ));
+    let _ = write_config_text(&backup, &text);
+    write_config_text(&path, &next)
+}
+
 // ---------------------------------------------------------------------------
 // tests
 
@@ -3418,7 +4288,7 @@ mod tests {
         )
         .unwrap();
         let mut out = Vec::new();
-        collect_hooks_map(&value, "f", "project", &mut out);
+        collect_hooks_map(&value, "f", "project", &mut out, &Vec::new());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].event, "PreToolUse");
         assert_eq!(out[0].matcher.as_deref(), Some("exec"));
@@ -3567,6 +4437,7 @@ mod tests {
             "f.json",
             &mut out,
             Some(&MCP_TOGGLE_OPENCODE),
+            &jp(&["mcp"]),
         );
         // "servers" is a container, not a server named "servers".
         assert_eq!(out.len(), 1);
@@ -3586,6 +4457,7 @@ mod tests {
             "f.json",
             &mut nested,
             Some(&MCP_TOGGLE_OPENCODE_NESTED),
+            &jp(&["mcp", "servers"]),
         );
         assert_eq!(
             nested[0].toggle.as_ref().map(|t| t.path.clone()),
@@ -3600,7 +4472,7 @@ mod tests {
         )
         .unwrap();
         let mut out = Vec::new();
-        collect_hooks_map(&value, "f", "user", &mut out);
+        collect_hooks_map(&value, "f", "user", &mut out, &Vec::new());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].command.as_deref(), Some("say hi"));
         assert_eq!(out[0].matcher.as_deref(), Some("boot"));
@@ -3618,6 +4490,7 @@ mod tests {
             file: "/home/u/.claude/settings.json".into(),
             scope: "user".into(),
             refs: Vec::new(),
+            remove: None,
         };
         // User hooks resolve relative to the settings file's dir.
         assert_eq!(hook_base(&hook, project), PathBuf::from("/home/u/.claude"));
@@ -3626,5 +4499,145 @@ mod tests {
         assert_eq!(hook_base(&hook, project), project);
         hook.scope = "local".into();
         assert_eq!(hook_base(&hook, project), project);
+    }
+
+    #[test]
+    fn json_remove_member_positions() {
+        // First, middle and last members all cut cleanly with one comma.
+        let text = "{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": 3\n}";
+        for key in ["a", "b", "c"] {
+            let next = remove_json_at(text, &[key.into()]).unwrap();
+            let reparsed: Value = serde_json::from_str(&next).unwrap();
+            assert!(reparsed.get(key).is_none(), "{key} still present");
+            assert_eq!(reparsed.as_object().unwrap().len(), 2);
+        }
+        let next = remove_json_at(text, &["b".into()]).unwrap();
+        let reparsed: Value = serde_json::from_str(&next).unwrap();
+        assert_eq!(reparsed, serde_json::json!({"a": 1, "c": 3}));
+        // Single-line object keeps it single-line.
+        let flat = "{\"a\": 1, \"b\": 2}";
+        assert_eq!(remove_json_at(flat, &["a".into()]).unwrap(), "{ \"b\": 2}");
+    }
+
+    #[test]
+    fn json_remove_nested_and_array_index() {
+        // Nested member and array-index descent (hook-style paths).
+        let text = r#"{"mcpServers": {"a": {"command": "x"}, "b": {"url": "u"}},
+            "hooks": {"Pre": [{"matcher": "m", "hooks": [{"type": "command", "command": "one"}, {"type": "command", "command": "two"}]}]}}"#;
+        let next = remove_json_at(text, &jp(&["mcpServers", "a"])).unwrap();
+        let reparsed: Value = serde_json::from_str(&next).unwrap();
+        assert!(reparsed["mcpServers"].get("a").is_none());
+        assert!(reparsed["mcpServers"].get("b").is_some());
+
+        let path = jp(&["hooks", "Pre", "0", "hooks", "0"]);
+        let next = remove_json_at(text, &path).unwrap();
+        let reparsed: Value = serde_json::from_str(&next).unwrap();
+        let hooks = reparsed["hooks"]["Pre"][0]["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0]["command"], "two");
+    }
+
+    #[test]
+    fn json_remove_array_item_forms() {
+        // String elements, "-disabled" markers, and {package} objects.
+        let text = r#"{"plugin": ["a", "-b", {"package": "c", "options": {}}]}"#;
+        for (item, gone) in [("a", "a"), ("b", "b"), ("c", "c")] {
+            let next = remove_json_array_item(text, &jp(&["plugin"]), item).unwrap();
+            let reparsed: Value = serde_json::from_str(&next).unwrap();
+            let list = reparsed["plugin"].as_array().unwrap();
+            assert_eq!(list.len(), 2);
+            assert!(!list
+                .iter()
+                .any(|v| v.as_str() == Some(gone) || v["package"].as_str() == Some(gone)));
+        }
+    }
+
+    #[test]
+    fn json_remove_keeps_utf8_and_comments() {
+        let text = "{\n  // keep me\n  \"n\": \"héllo—✓\",\n  \"m\": 1\n}";
+        let next = remove_json_at(text, &["n".into()]).unwrap();
+        assert!(next.contains("// keep me"));
+        let reparsed = parse_json_file(&next).unwrap();
+        assert_eq!(reparsed, serde_json::json!({"m": 1}));
+    }
+
+    #[test]
+    fn toml_remove_table_member_and_list_item() {
+        let text = "# top\n[mcp_servers.a]\nenabled = true\n\n[mcp_servers.b]\ncommand = \"x\"\n\n[plugins]\nenabled = [\"one\", \"two\"]\n";
+        // Whole-table removal keeps the other table and the header comment.
+        let next = remove_toml(text, &jp(&["mcp_servers", "a"]), None).unwrap();
+        assert!(!next.contains("mcp_servers.a"));
+        assert!(next.contains("# top"));
+        assert!(next.contains("[mcp_servers.b]"));
+        // Member-line removal.
+        let next = remove_toml(text, &jp(&["mcp_servers", "b", "command"]), None).unwrap();
+        assert!(next.contains("[mcp_servers.b]"));
+        assert!(!next.contains("command = \"x\""));
+        // List-element removal.
+        let next = remove_toml(text, &jp(&["plugins", "enabled"]), Some("one")).unwrap();
+        assert!(next.contains("enabled = [ \"two\"]") || next.contains("\"two\""));
+        assert!(!next.contains("\"one\""));
+        // Root member (notify) removal.
+        let notify = "notify = \"x.sh\"\n[mcp_servers.a]\nenabled = true\n";
+        let next = remove_toml(notify, &jp(&["notify"]), None).unwrap();
+        assert!(!next.contains("notify"));
+        assert!(next.contains("[mcp_servers.a]"));
+    }
+
+    #[test]
+    fn toml_remove_array_table_by_name() {
+        let text = "[[hooks.a]]\ncommand = \"one\"\n\n[[hooks.a]]\ncommand = \"two\"\n";
+        let next = remove_toml(text, &jp(&["hooks", "a"]), Some("one")).unwrap();
+        assert!(!next.contains("\"one\""));
+        assert!(next.contains("command = \"two\""));
+    }
+
+    #[test]
+    fn remove_binding_restricts_targets() {
+        let project = Path::new("/repo");
+        let home = Path::new("/home/u");
+        let entry = RemoveRef {
+            file: "/home/u/.codex/config.toml".into(),
+            format: "toml".into(),
+            path: jp(&["mcp_servers", "x"]),
+            array_item: None,
+        };
+        assert!(remove_allowed(
+            &entry,
+            Path::new("/home/u/.codex/config.toml"),
+            project,
+            Some(home)
+        )
+        .is_ok());
+        // Outside project/home is refused.
+        assert!(remove_allowed(&entry, Path::new("/etc/x"), project, Some(home)).is_err());
+        // `..` components are refused even under home.
+        assert!(
+            remove_allowed(&entry, Path::new("/home/u/../etc/x"), project, Some(home)).is_err()
+        );
+        // Unknown sections are refused.
+        let other = RemoveRef {
+            file: "/home/u/app/settings.json".into(),
+            format: "json".into(),
+            path: jp(&["theme"]),
+            array_item: None,
+        };
+        assert!(remove_allowed(
+            &other,
+            Path::new("/home/u/app/settings.json"),
+            project,
+            Some(home)
+        )
+        .is_err());
+        // Dedicated map files accept root members.
+        let map = RemoveRef {
+            file: "/home/u/.fx/mcp.json".into(),
+            format: "json".into(),
+            path: jp(&["myserver"]),
+            array_item: None,
+        };
+        assert!(
+            remove_allowed(&map, Path::new("/home/u/.fx/mcp.json"), project, Some(home)).is_ok()
+        );
     }
 }

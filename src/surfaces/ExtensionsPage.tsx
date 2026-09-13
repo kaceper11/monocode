@@ -6,13 +6,21 @@ import {
   type ReactNode,
 } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { Copy, Eye, FolderOpen, RefreshCw, Search } from "../chrome/icons";
+import {
+  Copy,
+  Eye,
+  FolderOpen,
+  RefreshCw,
+  Search,
+  Trash2,
+} from "../chrome/icons";
 import { HarnessIcon } from "../chrome/HarnessIcon";
 import { Toggle } from "../chrome/Toggle";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import { copyText } from "../lib/clipboard";
 import {
   agentConfigInventory,
+  agentConfigRemove,
   agentConfigSetEnabled,
   type AgentConfigInventory,
   type HookEntry,
@@ -20,6 +28,7 @@ import {
   type McpServerEntry,
   type PluginEntry,
   type ProviderExtensions,
+  type RemoveRef,
   type ToggleRef,
 } from "../lib/agentConfig";
 import { HARNESS_TITLE, type HarnessId } from "../lib/session";
@@ -119,6 +128,32 @@ export function ExtensionsPage({
       );
   };
 
+  const onRemove = (remove: RemoveRef, label: string): void => {
+    const fileLabel = remove.file.split("/").pop() ?? remove.file;
+    const message =
+      remove.format === "file"
+        ? `Remove ${label}? It is renamed to ${fileLabel}.monocode-bak so you can restore it.`
+        : `Remove ${label} from ${fileLabel}? A ${fileLabel}.monocode-bak backup is kept.`;
+    if (!window.confirm(message)) return;
+    const key = removeKey(remove);
+    setPending((keys) => new Set(keys).add(key));
+    setActionError(null);
+    void agentConfigRemove(cwd, remove)
+      .then(() => setReload((value) => value + 1))
+      .catch((err: unknown) => {
+        setActionError(
+          `Could not remove it: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      })
+      .finally(() =>
+        setPending((keys) => {
+          const next = new Set(keys);
+          next.delete(key);
+          return next;
+        }),
+      );
+  };
+
   const onReveal = (path: string): void => {
     setActionError(null);
     // explorer.exe needs the backslash UNC form for WSL paths.
@@ -199,6 +234,7 @@ export function ExtensionsPage({
       pending={pending}
       onRefresh={() => setReload((value) => value + 1)}
       onToggle={onToggle}
+      onRemove={onRemove}
       onReveal={onReveal}
       onCopyPath={onCopyPath}
       onOpen={onOpen}
@@ -208,6 +244,15 @@ export function ExtensionsPage({
 
 function toggleKey(toggle: ToggleRef): string {
   return `${toggle.file}${toggle.path.join(".")}${toggle.member}`;
+}
+
+function removeKey(remove: RemoveRef): string {
+  return `R:${remove.file}${remove.path.join(".")}${remove.arrayItem ?? ""}`;
+}
+
+/** Removal of a standalone file/directory (renamed to .monocode-bak). */
+function fileRemove(path: string): RemoveRef {
+  return { file: path, format: "file", path: [], arrayItem: null };
 }
 
 function InventoryTab({
@@ -220,6 +265,7 @@ function InventoryTab({
   pending,
   onRefresh,
   onToggle,
+  onRemove,
   onReveal,
   onCopyPath,
   onOpen,
@@ -233,6 +279,7 @@ function InventoryTab({
   pending: Set<string>;
   onRefresh: () => void;
   onToggle: (toggle: ToggleRef, enabled: boolean) => void;
+  onRemove: (remove: RemoveRef, label: string) => void;
   onReveal: (path: string) => void;
   onCopyPath: (path: string) => void;
   onOpen: (path: string) => void;
@@ -331,6 +378,8 @@ function InventoryTab({
           <InstructionsList
             entries={inventory.instructions}
             needle={needle}
+            pending={pending}
+            onRemove={onRemove}
             onCopyPath={onCopyPath}
             onReveal={onReveal}
             onOpen={onOpen}
@@ -342,6 +391,7 @@ function InventoryTab({
             needle={needle}
             pending={pending}
             onToggle={onToggle}
+            onRemove={onRemove}
             onCopyPath={onCopyPath}
             onReveal={onReveal}
             onOpen={onOpen}
@@ -349,11 +399,12 @@ function InventoryTab({
         )}
 
         <p className="pt-3 text-[12px] text-content/40">
-          Inventory and enable flags only — nothing here runs hooks or starts
-          servers. Toggles write a single flag in the provider's own config and
-          keep a <span className="font-sans">.monocode-bak</span> copy; entries
-          without a switch have no native enable flag in that file. Env values
-          are never displayed.
+          Nothing here runs hooks or starts servers. Toggles write a single
+          flag in the provider's own config; removal cuts the entry or renames
+          the file — every change keeps a{" "}
+          <span className="font-sans">.monocode-bak</span> copy. Entries without
+          a switch have no native enable flag in that file. Env values are
+          never displayed.
         </p>
       </div>
     </div>
@@ -425,6 +476,7 @@ function ProviderGroups({
   needle,
   pending,
   onToggle,
+  onRemove,
   onCopyPath,
   onReveal,
   onOpen,
@@ -434,6 +486,7 @@ function ProviderGroups({
   needle: string;
   pending: Set<string>;
   onToggle: (toggle: ToggleRef, enabled: boolean) => void;
+  onRemove: (remove: RemoveRef, label: string) => void;
   onCopyPath: (path: string) => void;
   onReveal: (path: string) => void;
   onOpen: (path: string) => void;
@@ -485,6 +538,7 @@ function ProviderGroups({
                     provider={provider.provider}
                     pending={pending}
                     onToggle={onToggle}
+                    onRemove={onRemove}
                     onCopyPath={onCopyPath}
                     onReveal={onReveal}
                     onOpen={onOpen}
@@ -494,6 +548,7 @@ function ProviderGroups({
                     entry={entry as PluginEntry}
                     pending={pending}
                     onToggle={onToggle}
+                    onRemove={onRemove}
                     onCopyPath={onCopyPath}
                     onReveal={onReveal}
                     onOpen={onOpen}
@@ -501,6 +556,8 @@ function ProviderGroups({
                 ) : (
                   <HookRow
                     entry={entry as HookEntry}
+                    pending={pending}
+                    onRemove={onRemove}
                     onCopyPath={onCopyPath}
                     onReveal={onReveal}
                     onOpen={onOpen}
@@ -524,6 +581,12 @@ function ProviderGroups({
                       {file.path}
                       {` · ${file.kind} · ${formatSize(file.size)}`}
                     </p>
+                    <RemoveButton
+                      remove={fileRemove(file.path)}
+                      label={file.path.split("/").pop() ?? file.path}
+                      pending={pending}
+                      onRemove={onRemove}
+                    />
                     <RowActions
                       path={file.path}
                       onCopyPath={onCopyPath}
@@ -538,6 +601,33 @@ function ProviderGroups({
         </section>
       ))}
     </div>
+  );
+}
+
+function RemoveButton({
+  remove,
+  label,
+  pending,
+  onRemove,
+}: {
+  remove: RemoveRef | null;
+  /** Entry name, used for the confirm dialog and accessible label. */
+  label: string;
+  pending: Set<string>;
+  onRemove: (remove: RemoveRef, label: string) => void;
+}) {
+  if (!remove) return null;
+  return (
+    <button
+      type="button"
+      aria-label={`Remove ${label}`}
+      title={remove.format === "file" ? "Remove file" : "Remove from config"}
+      disabled={pending.has(removeKey(remove))}
+      onClick={() => onRemove(remove, label)}
+      className="grid size-5 shrink-0 place-items-center rounded text-content/40 hover:bg-red-400/15 hover:text-red-300 disabled:opacity-40"
+    >
+      <Trash2 className="size-3" strokeWidth={1.75} />
+    </button>
   );
 }
 
@@ -632,6 +722,7 @@ function McpRow({
   provider,
   pending,
   onToggle,
+  onRemove,
   onCopyPath,
   onReveal,
   onOpen,
@@ -640,6 +731,7 @@ function McpRow({
   provider: string;
   pending: Set<string>;
   onToggle: (toggle: ToggleRef, enabled: boolean) => void;
+  onRemove: (remove: RemoveRef, label: string) => void;
   onCopyPath: (path: string) => void;
   onReveal: (path: string) => void;
   onOpen: (path: string) => void;
@@ -690,6 +782,12 @@ function McpRow({
           {entry.file}
           {entry.detail ? ` · ${entry.detail}` : ""}
         </p>
+        <RemoveButton
+          remove={entry.remove}
+          label={entry.name}
+          pending={pending}
+          onRemove={onRemove}
+        />
         <RowActions
           path={entry.file}
           onCopyPath={onCopyPath}
@@ -705,6 +803,7 @@ function PluginRow({
   entry,
   pending,
   onToggle,
+  onRemove,
   onCopyPath,
   onReveal,
   onOpen,
@@ -712,6 +811,7 @@ function PluginRow({
   entry: PluginEntry;
   pending: Set<string>;
   onToggle: (toggle: ToggleRef, enabled: boolean) => void;
+  onRemove: (remove: RemoveRef, label: string) => void;
   onCopyPath: (path: string) => void;
   onReveal: (path: string) => void;
   onOpen: (path: string) => void;
@@ -754,6 +854,12 @@ function PluginRow({
         >
           {entry.detail ?? entry.file}
         </p>
+        <RemoveButton
+          remove={entry.remove}
+          label={entry.id}
+          pending={pending}
+          onRemove={onRemove}
+        />
         <RowActions
           path={entry.file}
           onCopyPath={onCopyPath}
@@ -767,11 +873,15 @@ function PluginRow({
 
 function HookRow({
   entry,
+  pending,
+  onRemove,
   onCopyPath,
   onReveal,
   onOpen,
 }: {
   entry: HookEntry;
+  pending: Set<string>;
+  onRemove: (remove: RemoveRef, label: string) => void;
   onCopyPath: (path: string) => void;
   onReveal: (path: string) => void;
   onOpen: (path: string) => void;
@@ -832,6 +942,12 @@ function HookRow({
         >
           {entry.file}
         </p>
+        <RemoveButton
+          remove={entry.remove}
+          label={entry.command ?? entry.event}
+          pending={pending}
+          onRemove={onRemove}
+        />
         <RowActions
           path={entry.file}
           onCopyPath={onCopyPath}
@@ -852,12 +968,16 @@ const KIND_LABEL: Record<string, string> = {
 function InstructionsList({
   entries,
   needle,
+  pending,
+  onRemove,
   onCopyPath,
   onReveal,
   onOpen,
 }: {
   entries: InstructionEntry[];
   needle: string;
+  pending: Set<string>;
+  onRemove: (remove: RemoveRef, label: string) => void;
   onCopyPath: (path: string) => void;
   onReveal: (path: string) => void;
   onOpen: (path: string) => void;
@@ -917,6 +1037,12 @@ function InstructionsList({
             >
               <Eye className="size-3" strokeWidth={1.75} />
             </button>
+            <RemoveButton
+              remove={fileRemove(entry.path)}
+              label={entry.name}
+              pending={pending}
+              onRemove={onRemove}
+            />
             <RowActions
               path={entry.path}
               onCopyPath={onCopyPath}

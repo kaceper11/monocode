@@ -15,6 +15,18 @@ export type ToggleRef = {
   invert: boolean;
 };
 
+/**
+ * Where and how an entry can be removed. `"file"` means the entry is itself a
+ * file/directory, renamed to `<name>.monocode-bak` so removal stays
+ * recoverable. `arrayItem` removes one element of the list at `path`.
+ */
+export type RemoveRef = {
+  file: string;
+  format: "json" | "toml" | "file";
+  path: string[];
+  arrayItem?: string | null;
+};
+
 export type McpServerEntry = {
   name: string;
   /** "project" | "user" | "local" */
@@ -31,6 +43,7 @@ export type McpServerEntry = {
    */
   enabled: boolean | null;
   toggle: ToggleRef | null;
+  remove: RemoveRef | null;
 };
 
 export type PluginEntry = {
@@ -45,6 +58,7 @@ export type PluginEntry = {
   managed: boolean;
   enabled: boolean | null;
   toggle: ToggleRef | null;
+  remove: RemoveRef | null;
 };
 
 export type HookRef = {
@@ -62,6 +76,7 @@ export type HookEntry = {
   file: string;
   scope: string;
   refs: HookRef[];
+  remove: RemoveRef | null;
 };
 
 export type InstructionEntry = {
@@ -110,4 +125,13 @@ export function agentConfigSetEnabled(
   enabled: boolean,
 ): Promise<void> {
   return invoke<void>("agent_config_set_enabled", { cwd, toggle, enabled });
+}
+
+/**
+ * Remove an entry from its config file — a JSON member or list element, a
+ * TOML table or member — or rename a standalone file to `.monocode-bak`.
+ * Same project/home bounds and `.monocode-bak` backup as the toggle path.
+ */
+export function agentConfigRemove(cwd: string, remove: RemoveRef): Promise<void> {
+  return invoke<void>("agent_config_remove", { cwd, remove });
 }
