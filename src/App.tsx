@@ -246,6 +246,7 @@ import {
   promoteLastAssistantToPlan,
   respondHarnessApproval,
   respondHarnessQuestion,
+  setHarnessRuntimeMode,
   keepHarnessQuestionOpen,
   sendHarnessTurn,
   prewarmHarness,
@@ -384,6 +385,7 @@ import {
 } from "./lib/workspaceTabGroups";
 import { runSessionRemoval } from "./lib/sessionRemoval";
 import {
+  DEFAULT_RUNTIME_MODE,
   HARNESS_LABEL,
   HARNESS_TITLE,
   canReplaceSessionTitle,
@@ -436,6 +438,13 @@ import { useSessionReminders } from "./hooks/useSessionReminders";
 import { ReminderNotices } from "./chrome/ReminderNotices";
 import { LinkedWorkItemUpdateNotice } from "./chrome/LinkedWorkItemUpdateNotice";
 import { nextUnseenFinishedSessions } from "./lib/sessionDone";
+import {
+  resolveVerifyForSession,
+  sendCheckToAgent,
+  setVerifyHooks,
+  suppressVerifyTurn,
+  verifyTurnFinished,
+} from "./lib/verify";
 import {
   loadNotificationsEnabled,
   NOTIFICATION_CLICK_EVENT,
@@ -1156,6 +1165,9 @@ export default function App({
 
       turnGen.current.set(sessionId, (turnGen.current.get(sessionId) ?? 0) + 1);
       flushHarnessEvents();
+      // Removal stops the turn — the busy→idle edge must not verify work
+      // that is being cancelled for archive/delete.
+      suppressVerifyTurn(open);
       await Promise.all(
         sessionChildHarnesses(open).map((harness) =>
           cancelHarnessTurn(harness, sessionId).catch(() => undefined),
@@ -1476,6 +1488,21 @@ export default function App({
     focusedForDoneRef.current = activeSessionId;
   }
   const unseenFinishedIds = unseenFinishedRef.current;
+
+  // Checks on finish (#92): every busy→idle edge is a candidate turn-end.
+  // verify.ts claims the turn, resolves the project's check command and runs
+  // it headlessly; the outcome lands in the attention queue.
+  const verifyBusyRef = useRef(busySessionIds);
+  useEffect(() => {
+    const previous = verifyBusyRef.current;
+    verifyBusyRef.current = busySessionIds;
+    if (previous === busySessionIds) return;
+    for (const id of previous) {
+      if (busySessionIds.has(id)) continue;
+      const session = sessionsRef.current.find((row) => row.id === id);
+      if (session) verifyTurnFinished(session);
+    }
+  }, [busySessionIds]);
 
   const liveAgents = useMemo(
     () =>
@@ -1995,7 +2022,7 @@ export default function App({
     setInboxViewOpen(false);
     setNotesViewOpen(false);
     const cwd = active?.cwd ?? sessionDefaults?.cwd ?? projectCwd;
-    const session = newDefaultSession(cwd, sessionDefaults?.runtimeMode);
+    const session = newDefaultSession(cwd);
     const tab = newTab(session.id);
     setSessions((prev) => [...prev, session]);
     appendTab(tab, cwd);
@@ -2006,7 +2033,6 @@ export default function App({
     active?.cwd,
     appendTab,
     sessionDefaults?.cwd,
-    sessionDefaults?.runtimeMode,
     projectCwd,
   ]);
 
@@ -2168,7 +2194,7 @@ export default function App({
         projectCwd;
       const title = card.title.trim();
       const session = {
-        ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
+        ...newDefaultSession(cwd),
         ...(title ? { title } : {}),
         noteCard: card,
       };
@@ -2182,7 +2208,6 @@ export default function App({
       active?.cwd,
       appendTab,
       sessionDefaults?.cwd,
-      sessionDefaults?.runtimeMode,
       projectCwd,
     ],
   );
@@ -2264,7 +2289,6 @@ export default function App({
       if (!activeTab) return;
       const session = newDefaultSession(
         sessionDefaults?.cwd ?? projectCwd,
-        sessionDefaults?.runtimeMode,
       );
       setSessions((prev) => [...prev, session]);
       setTabs((prev) =>
@@ -2279,7 +2303,7 @@ export default function App({
       );
       setComposerFocused(true);
     },
-    [activeTab, projectCwd, sessionDefaults?.cwd, sessionDefaults?.runtimeMode],
+    [activeTab, projectCwd, sessionDefaults?.cwd],
   );
 
   const focusProjectTerminal = useCallback(() => {
@@ -2753,14 +2777,7 @@ export default function App({
               );
               return;
             }
-            const seed = sessionsRef.current[0];
-            const session = newSession(
-              seed?.harness ?? "claude",
-              file.cwd || projectCwd,
-              seed?.model,
-              seed?.runtimeMode,
-              seed?.modelSettings,
-            );
+            const session = newDefaultSession(file.cwd || projectCwd);
             setSessions((prev) => [...prev, session]);
             setTabs((prev) =>
               prev.map((entry) =>
@@ -3719,10 +3736,7 @@ export default function App({
         replaceTarget,
         scope: tabCloseScope,
         createReplacement: (seed) =>
-          newDefaultSession(
-            seed?.cwd ?? projectCwdRef.current,
-            seed?.runtimeMode,
-          ),
+          newDefaultSession(seed?.cwd ?? projectCwdRef.current),
       });
       if (!result) return;
 
@@ -3806,12 +3820,8 @@ export default function App({
             dirtyFiles: dirtyFilesRef.current,
           }),
           createReplacement: (latest) =>
-            newSession(
-              latest?.harness ?? seed?.harness ?? "cursor",
+            newDefaultSession(
               latest?.cwd ?? seed?.cwd ?? sidebarCwd,
-              latest?.model ?? seed?.model,
-              latest?.runtimeMode ?? seed?.runtimeMode,
-              latest?.modelSettings ?? open?.modelSettings,
             ),
           confirmClose: async (closedTabs) => {
             const files = filesInWorkspaceTabs(closedTabs);
@@ -3888,6 +3898,8 @@ export default function App({
                 (session) => session.id === activeTab?.focusedId,
               ),
             );
+            // Gone from the workspace either way — its check row dies with it.
+            resolveVerifyForSession(sessionId);
             if (mode === "archive") {
               const archived =
                 savedSummary ??
@@ -4084,13 +4096,7 @@ export default function App({
       ) {
         setProjectCwd(normalized);
         setRecents(rememberProject(normalized));
-        const session = newSession(
-          current.harness,
-          normalized,
-          current.model,
-          current.runtimeMode,
-          current.modelSettings,
-        );
+        const session = newDefaultSession(normalized);
         const tab = newTab(session.id);
         setSessions((prev) => [...prev, session]);
         appendTab(tab, normalized);
@@ -4166,14 +4172,6 @@ export default function App({
       const normalized = normalizeProjectPath(path);
       if (!looksLikeProject(normalized)) return;
 
-      const activeWorkspace = tabsRef.current.find(
-        (entry) => entry.id === activeTabIdRef.current,
-      );
-      const current = activeWorkspace
-        ? sessionsRef.current.find(
-            (session) => session.id === activeWorkspace.focusedId,
-          )
-        : undefined;
       const decision = planProjectReturn({
         memory: readProjectReturnMemory(),
         tabs: tabsRef.current,
@@ -4202,14 +4200,7 @@ export default function App({
         }
       }
 
-      const seed = current ?? sessionsRef.current[0];
-      const session = newSession(
-        seed?.harness ?? "claude",
-        normalized,
-        seed?.model,
-        seed?.runtimeMode,
-        seed?.modelSettings,
-      );
+      const session = newDefaultSession(normalized);
       const tab = newTab(session.id);
       setProjectCwd(normalized);
       setRecents(rememberProject(normalized));
@@ -4338,8 +4329,7 @@ export default function App({
       let nextActiveTabId = activeTabIdRef.current;
 
       if (nextTabs.length === 0) {
-        const fallback = nextSessions[0];
-        const session = newDefaultSession("~", fallback?.runtimeMode);
+        const session = newDefaultSession("~");
         const tab = newTab(session.id);
         nextSessions = [...nextSessions, session];
         nextTabs = [tab];
@@ -4706,9 +4696,15 @@ export default function App({
 
   const onRuntimeModeChange = useCallback(
     (sessionId: string, runtimeMode: RuntimeMode) => {
-      setSessions((prev) =>
-        prev.map((s) => (s.id === sessionId ? { ...s, runtimeMode } : s)),
+      const session = sessionsRef.current.find((s) => s.id === sessionId);
+      sessionsRef.current = sessionsRef.current.map((s) =>
+        s.id === sessionId ? { ...s, runtimeMode } : s,
       );
+      setSessions(sessionsRef.current);
+      if (!session) return;
+      for (const harness of sessionChildHarnesses(session)) {
+        setHarnessRuntimeMode(harness, sessionId, runtimeMode);
+      }
     },
     [],
   );
@@ -5486,6 +5482,7 @@ export default function App({
       const loaded = await getSession(sessionId).catch(() => null);
       if (loaded) return true;
       pruneTaskSession(sessionId);
+      resolveVerifyForSession(sessionId);
       return false;
     },
     [],
@@ -5691,7 +5688,7 @@ export default function App({
         );
       if (!host?.workingCopy) return undefined;
       const session = {
-        ...newDefaultSession(host.workingCopy, sessionDefaults?.runtimeMode),
+        ...newDefaultSession(host.workingCopy),
         title: fresh.name,
         ...(fresh.ticket ? { linkedWorkItem: fresh.ticket } : {}),
       };
@@ -5733,7 +5730,6 @@ export default function App({
       appendTab,
       onSelectHistorySession,
       onSubmit,
-      sessionDefaults?.runtimeMode,
       taskSessionAlive,
     ],
   );
@@ -6746,6 +6742,9 @@ export default function App({
       turnGen.current.set(sessionId, (turnGen.current.get(sessionId) ?? 0) + 1);
       flushHarnessEvents();
       if (session) {
+        // The busy→idle edge below would otherwise verify a turn the user
+        // deliberately cut short.
+        suppressVerifyTurn(session);
         for (const id of sessionChildHarnesses(session)) {
           void cancelHarnessTurn(id, sessionId);
         }
@@ -7526,6 +7525,11 @@ export default function App({
           case "open-automations":
             openSettings("automations");
             return;
+          case "check-fix": {
+            const error = await sendCheckToAgent(action.runId);
+            if (error) throw new Error(error);
+            return;
+          }
           case "reconnect":
             openSettings("inbox", action.source);
             return;
@@ -7668,7 +7672,15 @@ export default function App({
           : undefined;
       }
       const session = {
-        ...newSession(target.harness, target.cwd, target.model),
+        // Unattended runs stay supervised — parked approvals are what the
+        // attention row reviews, and the conversation default must not
+        // silently lift that.
+        ...newSession(
+          target.harness,
+          target.cwd,
+          target.model,
+          DEFAULT_RUNTIME_MODE,
+        ),
         title: formatSessionTitle(target.harness, watcher.name),
       };
       sessionsRef.current = [...sessionsRef.current, session];
@@ -7696,6 +7708,24 @@ export default function App({
           Promise.resolve({ error: "No run handler." }),
       }),
     [],
+  );
+
+  // Checks on finish (#92) dispatch through the same bound-session path as
+  // watchers: live-state validation inside verify.ts, queued follow-up here.
+  useEffect(
+    () =>
+      setVerifyHooks({
+        getSession: (sessionId) =>
+          sessionsRef.current.find((row) => row.id === sessionId),
+        sendToSession: async (sessionId, text, action) => {
+          const accepted = await onSubmit(sessionId, text, [], {
+            followUpBehavior: "queue",
+            action,
+          });
+          return accepted !== false;
+        },
+      }),
+    [onSubmit],
   );
 
   // The schedule engine owns due-time/catch-up policy; these hooks are its
@@ -7746,7 +7776,13 @@ export default function App({
           : undefined;
       }
       const session = {
-        ...newSession(schedule.target.harness, schedule.target.cwd, schedule.target.model),
+        // Same as watcher runs: unattended work stays supervised.
+        ...newSession(
+          schedule.target.harness,
+          schedule.target.cwd,
+          schedule.target.model,
+          DEFAULT_RUNTIME_MODE,
+        ),
         title: formatSessionTitle(schedule.target.harness, schedule.name),
       };
       sessionsRef.current = [...sessionsRef.current, session];

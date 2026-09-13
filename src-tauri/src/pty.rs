@@ -544,7 +544,7 @@ fn working_dir(cwd: &str) -> std::path::PathBuf {
     dirs_home().map(std::path::PathBuf::from).unwrap_or(path)
 }
 
-fn default_shell() -> (String, Vec<String>) {
+pub(crate) fn default_shell() -> (String, Vec<String>) {
     #[cfg(windows)]
     {
         if let Ok(comspec) = std::env::var("COMSPEC") {
@@ -581,7 +581,7 @@ fn default_shell() -> (String, Vec<String>) {
 /// `$ErrorActionPreference='Stop'` makes those throw, and a native exe's own
 /// code still wins via `$LASTEXITCODE`.
 #[cfg(any(windows, test))]
-fn windows_exec_args(shell: &str, exec: &str) -> Vec<String> {
+pub(crate) fn windows_exec_args(shell: &str, exec: &str) -> Vec<String> {
     let name = shell
         .rsplit(['/', '\\'])
         .next()

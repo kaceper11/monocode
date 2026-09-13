@@ -7,6 +7,7 @@ import {
   respondClaudeApproval,
   respondClaudeQuestion,
   sendClaudeTurn,
+  setClaudeRuntimeMode,
   steerClaudeTurn,
   stopClaudeSession,
 } from "./claude";
@@ -29,6 +30,7 @@ export const claudeAdapter: HarnessAdapter = {
   steerTurn: steerClaudeTurn,
   cancelTurn: cancelClaudeTurn,
   respondApproval: respondClaudeApproval,
+  setRuntimeMode: setClaudeRuntimeMode,
   respondQuestion: respondClaudeQuestion,
   stopSession: stopClaudeSession,
   forgetSession: forgetClaudeSession,

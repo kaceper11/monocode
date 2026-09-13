@@ -235,6 +235,47 @@ export async function steerMuseTurn(input: SteerTurnInput): Promise<void> {
   await live.rpc.request("turn/steer", params, CONTROL_TIMEOUT_MS);
 }
 
+/**
+ * Apply a UI access-mode change to a running host: push the wire-selected
+ * approval mode and settle parked asks the new mode auto-decides. The sandbox
+ * posture (`--disable-sandbox`) is a spawn flag the stale postureKey turns
+ * into a respawn on the next turn.
+ */
+export function setMuseRuntimeMode(
+  sessionId: string,
+  runtimeMode: RuntimeMode,
+): void {
+  const live = liveByThread.get(sessionId);
+  if (!live) return;
+  const changed = live.runtimeMode !== runtimeMode;
+  live.runtimeMode = runtimeMode;
+  const mode = museApprovalMode(runtimeMode, live.planning);
+  if (mode !== live.appliedMode) {
+    void live.rpc
+      .request(
+        "session/setApprovalMode",
+        { commandId: newCommandId(), mode, sessionId: live.museSessionId },
+        CONTROL_TIMEOUT_MS,
+      )
+      .then(() => {
+        live.appliedMode = mode;
+      })
+      .catch((error: unknown) => {
+        try {
+          ignoreUnsupportedControl("session/setApprovalMode", error);
+        } catch {
+          // A wedged transport is recycled by the next turn's ensureLive.
+        }
+      });
+  }
+  if (!changed) return;
+  for (const [uiId, pending] of live.approvals) {
+    if (pending.decidedLocally) continue;
+    const auto = museAutoDecision(runtimeMode, live.planning, pending.kind);
+    if (auto) respondMuseApproval(sessionId, uiId, auto);
+  }
+}
+
 export function respondMuseApproval(
   sessionId: string,
   requestId: number,

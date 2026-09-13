@@ -7,6 +7,7 @@ import type { NoteCardMeta, NoteComposerCard } from "./notes";
 import type { LinkedWorkItemUpdateCard } from "./linkedWorkItemActivity";
 import {
   defaultSessionChoice,
+  loadDefaultRuntimeMode,
   preferredModelId,
   preferredModelSettings,
   resolveModel,
@@ -379,7 +380,7 @@ export function newSession(
   harness: HarnessId = "claude",
   cwd = "~",
   model?: string,
-  runtimeMode: RuntimeMode = DEFAULT_RUNTIME_MODE,
+  runtimeMode: RuntimeMode = loadDefaultRuntimeMode(),
   modelSettings?: Record<string, string>,
 ): Session {
   const resolved = resolveModel(harness, model ?? preferredModelId(harness, cwd), cwd);
@@ -398,7 +399,7 @@ export function newSession(
 /** New conversation using the Providers defaults. */
 export function newDefaultSession(
   cwd = "~",
-  runtimeMode: RuntimeMode = DEFAULT_RUNTIME_MODE,
+  runtimeMode: RuntimeMode = loadDefaultRuntimeMode(),
 ): Session {
   const choice = defaultSessionChoice(cwd);
   return newSession(choice.harness, cwd, choice.model, runtimeMode);

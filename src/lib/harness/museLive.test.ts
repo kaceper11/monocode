@@ -32,6 +32,7 @@ const {
   compactMuseContext,
   respondMuseApproval,
   respondMuseQuestion,
+  setMuseRuntimeMode,
   stopMuseSession,
   bindMuseSession,
   __museTestReset,
@@ -302,6 +303,70 @@ describe("muse live turn sequence", () => {
     });
     await turn;
     await stopMuseSession("t3");
+  });
+
+  it("pushes allowAll and auto-decides a parked approval on a mid-conversation change", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "run tests", "t3b");
+    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
+
+    serverRequest(78, "approval/request", {
+      approvalId: "a2",
+      sessionId: "MS1",
+      turnId: "T1",
+      itemId: "i3",
+      toolCallId: "call_3",
+      toolName: "bash",
+      rawArgs: JSON.stringify({ command: "npm test" }),
+      currentRequirementId: { approvalId: "a2", sourceIndex: 0 },
+      availableChoices: [
+        { choiceId: "ch-allow", label: "Allow once", decision: "approved", scope: "once" },
+        { choiceId: "ch-deny", label: "Deny", decision: "denied", scope: "once" },
+      ],
+      subject: { kind: "shell", command: "npm test" },
+    });
+    await waitFor(
+      () => events.some((e) => e.type === "approval.requested"),
+      "approval.requested",
+    );
+
+    setMuseRuntimeMode("t3b", "full-access");
+    await waitFor(
+      () => byMethod("session/setApprovalMode").length > 0,
+      "session/setApprovalMode",
+    );
+    const setMode = lastByMethod("session/setApprovalMode")!;
+    expect(setMode.params.mode).toBe("allowAll");
+    reply(setMode.id, {});
+
+    await waitFor(
+      () => byMethod("approval/decide").length > 0,
+      "approval/decide",
+    );
+    const decide = lastByMethod("approval/decide")!;
+    expect(decide.params).toMatchObject({
+      approvalId: "a2",
+      choiceId: "ch-allow",
+    });
+    reply(decide.id, {
+      approvalId: "a2",
+      commandId: decide.params.commandId,
+      status: "accepted",
+      terminal: true,
+    });
+    expect(
+      events.some(
+        (e) => e.type === "approval.resolved" && e.decision === "allow",
+      ),
+    ).toBe(true);
+
+    notify("turn/completed", {
+      sessionId: "MS1",
+      turnId: "T1",
+      terminal: "completed",
+    });
+    await turn;
+    await stopMuseSession("t3b");
   });
 
   it("re-asks when Muse reports a stale approval requirement", async () => {

@@ -64,6 +64,14 @@ import type {
   SteerTurnInput,
 } from "./types";
 
+/** A parked permission request, kept with enough context to re-decide it when
+ * the access mode changes mid-conversation. */
+type PendingApproval = {
+  kind?: string;
+  optionIds: string[];
+  resolve: (decision: ApprovalDecision) => void;
+};
+
 type Live = {
   threadId: string;
   acp: AcpClient;
@@ -99,7 +107,7 @@ type Live = {
   runtimeMode: RuntimeMode;
   planning: boolean;
   onEvent: (event: HarnessEvent) => void;
-  approvals: Map<string, (decision: ApprovalDecision) => void>;
+  approvals: Map<string, PendingApproval>;
   questions: Map<string, (reply: UserQuestionReply) => void>;
   turns: Promise<void>;
 };
@@ -273,7 +281,36 @@ export function respondCopilotApproval(
   requestId: number,
   decision: ApprovalDecision,
 ) {
-  liveByThread.get(sessionId)?.approvals.get(String(requestId))?.(decision);
+  liveByThread
+    .get(sessionId)
+    ?.approvals.get(String(requestId))
+    ?.resolve(decision);
+}
+
+/**
+ * Apply a UI access-mode change: push `session/set_mode` to the provider and
+ * settle parked asks the new mode auto-answers so they do not linger for the
+ * user.
+ */
+export function setCopilotRuntimeMode(
+  sessionId: string,
+  runtimeMode: RuntimeMode,
+): void {
+  const live = liveByThread.get(sessionId);
+  if (!live) return;
+  const changed = live.runtimeMode !== runtimeMode;
+  live.runtimeMode = runtimeMode;
+  void applyRuntimeMode(live, runtimeMode, live.planning).catch(
+    () => undefined,
+  );
+  if (!changed) return;
+  for (const [key, pending] of live.approvals) {
+    if (!acpAutoOption(runtimeMode, pending.kind, pending.optionIds)) {
+      continue;
+    }
+    live.approvals.delete(key);
+    pending.resolve("allow");
+  }
 }
 
 export function respondCopilotQuestion(
@@ -286,7 +323,7 @@ export function respondCopilotQuestion(
 
 /** Settle parked approvals/questions so handlers can't outlive the child. */
 function settlePending(live: Live) {
-  for (const [, resolve] of live.approvals) resolve("deny");
+  for (const [, pending] of live.approvals) pending.resolve("deny");
   live.approvals.clear();
   for (const [, resolve] of live.questions) resolve({ kind: "skipped" });
   live.questions.clear();
@@ -1002,7 +1039,11 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
 
   const key = String(requestId);
   const decision = await new Promise<ApprovalDecision>((resolve) => {
-    live.approvals.set(key, resolve);
+    live.approvals.set(key, {
+      kind: request.kind,
+      optionIds: request.optionIds,
+      resolve,
+    });
   });
   live.approvals.delete(key);
   live.onEvent({ type: "approval.resolved", requestId, decision });

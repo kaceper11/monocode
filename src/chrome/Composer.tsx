@@ -1768,7 +1768,7 @@ export function Composer({
                     onClose={() => ref.current?.focus()}
                   />
                 ) : null}
-                {harness !== "fx" ? (
+                {harness !== "fx" && harness !== "pi" && harness !== "omp" ? (
                   <AccessPicker
                     value={runtimeMode}
                     busy={busy}

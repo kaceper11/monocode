@@ -8,6 +8,7 @@ import {
   respondCodexApproval,
   respondCodexQuestion,
   sendCodexTurn,
+  setCodexRuntimeMode,
   steerCodexTurn,
   stopCodexSession,
 } from "./codex";
@@ -30,6 +31,7 @@ export const codexAdapter: HarnessAdapter = {
   steerTurn: steerCodexTurn,
   cancelTurn: cancelCodexTurn,
   respondApproval: respondCodexApproval,
+  setRuntimeMode: setCodexRuntimeMode,
   respondQuestion: respondCodexQuestion,
   keepQuestionOpen: keepCodexQuestionOpen,
   stopSession: stopCodexSession,

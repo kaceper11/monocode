@@ -58,6 +58,7 @@ const {
   respondOpenCodeApproval,
   respondOpenCodeQuestion,
   sendOpenCodeTurn,
+  setOpenCodeRuntimeMode,
   stopOpenCodeSession,
 } = await import("./opencode");
 import type { HarnessEvent } from "./types";
@@ -249,6 +250,154 @@ describe("OpenCode event stream recovery", () => {
     });
     await second;
     expect(secondEvents).toContainEqual({ type: "message.completed" });
+  });
+});
+
+describe("OpenCode runtime mode changes", () => {
+  it("pushes fresh rules and settles an edit ask the new mode allows", async () => {
+    const events: HarnessEvent[] = [];
+    const { done } = await startTurn(events);
+    onSseEvent?.({
+      type: "permission.asked",
+      properties: {
+        id: "permission_edit",
+        sessionID: "session_1",
+        permission: "edit",
+        patterns: ["/repo/file.ts"],
+        metadata: { filepath: "/repo/file.ts" },
+        tool: { messageID: "message_1", callID: "call_edit" },
+      },
+    });
+    await waitFor(
+      () => events.some((event) => event.type === "approval.requested"),
+      "edit approval",
+    );
+    const approval = events.find(
+      (event) => event.type === "approval.requested",
+    )!;
+
+    setOpenCodeRuntimeMode("opencode-live", "auto-accept-edits");
+
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.some(
+          ([input]) =>
+            input.method === "PATCH" &&
+            new URL(input.url).pathname === "/session/session_1",
+        ),
+      "permission rules update",
+    );
+    const patch = harnessHttp.mock.calls.find(
+      ([input]) =>
+        input.method === "PATCH" &&
+        new URL(input.url).pathname === "/session/session_1",
+    )![0];
+    expect(JSON.parse(patch.body!)).toEqual({
+      permission: [
+        { permission: "*", pattern: "*", action: "ask" },
+        { permission: "question", pattern: "*", action: "allow" },
+        { permission: "edit", pattern: "*", action: "allow" },
+      ],
+    });
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.some(
+          ([input]) =>
+            new URL(input.url).pathname ===
+            "/permission/permission_edit/reply",
+        ),
+      "edit reply",
+    );
+    expect(events).toContainEqual({
+      type: "approval.resolved",
+      requestId: approval.requestId,
+      decision: "allow",
+    });
+
+    idle();
+    await done;
+  });
+
+  it("restores ask-everything rules when the mode tightens", async () => {
+    const events: HarnessEvent[] = [];
+    const { done } = await startTurn(events);
+    onSseEvent?.({
+      type: "permission.asked",
+      properties: {
+        id: "permission_edit",
+        sessionID: "session_1",
+        permission: "edit",
+        patterns: ["/repo/file.ts"],
+        metadata: {},
+        tool: { messageID: "message_1", callID: "call_edit" },
+      },
+    });
+    await waitFor(
+      () => events.some((event) => event.type === "approval.requested"),
+      "edit approval",
+    );
+
+    setOpenCodeRuntimeMode("opencode-live", "auto-accept-edits");
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.some(
+          ([input]) =>
+            new URL(input.url).pathname ===
+            "/permission/permission_edit/reply",
+        ),
+      "edit settled",
+    );
+
+    setOpenCodeRuntimeMode("opencode-live", "supervised");
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.filter(
+          ([input]) =>
+            input.method === "PATCH" &&
+            new URL(input.url).pathname === "/session/session_1",
+        ).length === 2,
+      "rules restored",
+    );
+    const patch = harnessHttp.mock.calls.filter(
+      ([input]) =>
+        input.method === "PATCH" &&
+        new URL(input.url).pathname === "/session/session_1",
+    )[1][0];
+    expect(JSON.parse(patch.body!)).toEqual({
+      permission: [
+        { permission: "*", pattern: "*", action: "ask" },
+        { permission: "question", pattern: "*", action: "allow" },
+      ],
+    });
+
+    onSseEvent?.({
+      type: "permission.asked",
+      properties: {
+        id: "permission_edit_2",
+        sessionID: "session_1",
+        permission: "edit",
+        patterns: ["/repo/other.ts"],
+        metadata: {},
+        tool: { messageID: "message_2", callID: "call_edit_2" },
+      },
+    });
+    await waitFor(
+      () =>
+        events.filter((event) => event.type === "approval.requested").length ===
+        2,
+      "fresh ask parks",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(
+      harnessHttp.mock.calls.some(
+        ([input]) =>
+          new URL(input.url).pathname ===
+          "/permission/permission_edit_2/reply",
+      ),
+    ).toBe(false);
+
+    idle();
+    await done;
   });
 });
 

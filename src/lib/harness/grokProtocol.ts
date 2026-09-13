@@ -1,4 +1,5 @@
 import { promptBlocks, type PromptContentBlock } from "../attachments";
+import { acpAutoOption } from "./acp";
 import type { AgentModel, ModelSetting, ModelSettingChoice } from "../models";
 import type { Attachment, RuntimeMode, ToolPreview } from "../session";
 import { normalizeTaskListStatus } from "../taskList";
@@ -177,37 +178,8 @@ export function grokAuthError(error: unknown): Error {
   return new Error(`Grok Build did not start. ${detail}`);
 }
 
-export function pickAutoOption(
-  runtimeMode: RuntimeMode,
-  kind: string | undefined,
-  optionIds: string[],
-): string | null {
-  if (optionIds.length === 0) return null;
-  const tool = (kind ?? "").toLowerCase();
-  if (runtimeMode === "supervised") return null;
-  if (
-    runtimeMode === "auto-accept-edits" &&
-    (tool === "execute" || tool === "other" || tool === "fetch")
-  ) {
-    return null;
-  }
-  if (runtimeMode === "full-access") {
-    return pickOption(optionIds, [
-      "allow-always",
-      "allow_always",
-      "allow-once",
-      "allow_once",
-      "allow",
-    ]);
-  }
-  return pickOption(optionIds, [
-    "allow-once",
-    "allow_once",
-    "allow-always",
-    "allow_always",
-    "allow",
-  ]);
-}
+/** Grok asks carry the same ACP option vocabulary as the other ACP adapters. */
+export const pickAutoOption = acpAutoOption;
 
 export function permissionOptionId(
   decision: ApprovalDecision,

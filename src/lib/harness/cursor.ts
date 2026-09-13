@@ -66,6 +66,14 @@ type PendingToolEnrichment = {
   attempts: number;
 };
 
+/** A parked permission request, kept with enough context to re-decide it when
+ * the access mode changes mid-conversation. */
+type PendingApproval = {
+  kind?: string;
+  optionIds: string[];
+  resolve: (decision: ApprovalDecision) => void;
+};
+
 type Live = {
   subagents: AcpSubagents;
   acp: AcpClient;
@@ -78,7 +86,7 @@ type Live = {
   runtimeMode: RuntimeMode;
   planning: boolean;
   onEvent: (event: HarnessEvent) => void;
-  approvals: Map<string, (decision: ApprovalDecision) => void>;
+  approvals: Map<string, PendingApproval>;
   questions: Map<string, (reply: UserQuestionReply) => void>;
   /** Synthetic requestId source for ACP requests with non-numeric ids. */
   nextRequestId: number;
@@ -126,11 +134,13 @@ export async function sendCursorTurn(input: SendTurnInput): Promise<void> {
   if (cancelledThreads.delete(input.sessionId)) return;
 
   live.onEvent = input.onEvent;
-  live.runtimeMode = input.runtimeMode;
-  live.planning = input.intent === "plan";
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      // Posture applies when the queued turn actually runs — applying it at
+      // enqueue time would flip the running turn's permission handling.
+      live.runtimeMode = input.runtimeMode;
+      live.planning = input.intent === "plan";
       live.cancelled = false;
       live.muteUpdates = false;
       scheduleCursorToolEnrichment(live, 0);
@@ -169,7 +179,31 @@ export function respondCursorApproval(
   requestId: number,
   decision: ApprovalDecision,
 ) {
-  liveByThread.get(sessionId)?.approvals.get(String(requestId))?.(decision);
+  liveByThread
+    .get(sessionId)
+    ?.approvals.get(String(requestId))
+    ?.resolve(decision);
+}
+
+/**
+ * Cursor polices permissions client-side, so a mode change takes effect on the
+ * very next request; parked asks the new mode already auto-answers are settled
+ * now instead of lingering for the user.
+ */
+export function setCursorRuntimeMode(
+  sessionId: string,
+  runtimeMode: RuntimeMode,
+): void {
+  const live = liveByThread.get(sessionId);
+  if (!live || live.runtimeMode === runtimeMode) return;
+  live.runtimeMode = runtimeMode;
+  for (const [key, pending] of live.approvals) {
+    if (!pickAutoOption(runtimeMode, pending.kind, pending.optionIds)) {
+      continue;
+    }
+    live.approvals.delete(key);
+    pending.resolve("allow");
+  }
 }
 
 export function respondCursorQuestion(
@@ -196,7 +230,7 @@ export async function cancelCursorTurn(sessionId: string): Promise<void> {
   live.backgroundAgentTools.clear();
   if (live.toolEnrichmentTimer) clearTimeout(live.toolEnrichmentTimer);
   live.toolEnrichmentTimer = undefined;
-  for (const [, resolve] of live.approvals) resolve("deny");
+  for (const [, pending] of live.approvals) pending.resolve("deny");
   live.approvals.clear();
   for (const [, resolve] of live.questions) resolve({ kind: "skipped" });
   live.questions.clear();
@@ -219,7 +253,7 @@ export async function stopCursorSession(sessionId: string): Promise<void> {
     live.pendingToolEnrichments.clear();
     live.agentTools.clear();
     live.backgroundAgentTools.clear();
-    for (const [, resolve] of live.approvals) resolve("deny");
+    for (const [, pending] of live.approvals) pending.resolve("deny");
     live.approvals.clear();
     for (const [, resolve] of live.questions) resolve({ kind: "skipped" });
     live.questions.clear();
@@ -251,8 +285,6 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
   const existing = liveByThread.get(input.sessionId);
   if (existing && existing.cwd === input.cwd) {
     existing.onEvent = input.onEvent;
-    existing.runtimeMode = input.runtimeMode;
-    existing.planning = input.intent === "plan";
     return existing;
   }
   if (existing) {
@@ -746,7 +778,7 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
   });
 
   const decision = await new Promise<ApprovalDecision>((resolve) => {
-    live.approvals.set(String(requestId), resolve);
+    live.approvals.set(String(requestId), { kind, optionIds, resolve });
   });
   live.approvals.delete(String(requestId));
   live.onEvent({ type: "approval.resolved", requestId, decision });

@@ -27,6 +27,7 @@ const {
   steerDevinTurn,
   cancelDevinTurn,
   respondDevinApproval,
+  setDevinRuntimeMode,
   stopDevinSession,
 } = await import("./devin");
 import type { HarnessEvent } from "./types";
@@ -250,6 +251,75 @@ describe("devin live turn sequence", () => {
     reply(promptId, { stopReason: "end_turn" });
     await turn;
     await stopDevinSession("t3");
+  });
+
+  it("pushes the new mode and settles a parked approval on a mid-conversation change", async () => {
+    const events: HarnessEvent[] = [];
+    const turn = sendDevinTurn(baseInput(events, "run tests", "t12") as never);
+
+    await waitFor(() => byMethod("initialize").length > 0, "initialize");
+    reply(byMethod("initialize")[0].id, {
+      protocolVersion: 1,
+      agentCapabilities: { loadSession: true },
+    });
+    await waitFor(() => byMethod("session/new").length > 0, "session/new");
+    reply(byMethod("session/new")[0].id, {
+      ...SETUP,
+      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+    });
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
+    const promptId = lastByMethod("session/prompt").id;
+
+    onLine!(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 77,
+        method: "session/request_permission",
+        params: {
+          sessionId: "S1",
+          toolCall: {
+            toolCallId: "call_1",
+            title: "Ran npm test",
+            kind: "execute",
+            status: "pending",
+            rawInput: { command: "npm test" },
+          },
+          options: [
+            { optionId: "allow_once", name: "Allow once" },
+            { optionId: "reject_once", name: "Reject" },
+          ],
+        },
+      }),
+    );
+    await waitFor(
+      () => events.some((e) => e.type === "approval.requested"),
+      "approval.requested",
+    );
+
+    setDevinRuntimeMode("t12", "full-access");
+    await waitFor(
+      () => byMethod("session/set_mode").length > 0,
+      "session/set_mode",
+    );
+    const setMode = lastByMethod("session/set_mode")!;
+    expect(setMode.params.modeId).toBe("bypass");
+    reply(setMode.id, {});
+
+    await waitFor(
+      () => parse().some((m) => m.id === 77 && m.result),
+      "permission response",
+    );
+    const response = parse().find((m) => m.id === 77 && m.result);
+    expect(response.result.outcome.optionId).toBe("allow_once");
+    expect(
+      events.some(
+        (e) => e.type === "approval.resolved" && e.decision === "allow",
+      ),
+    ).toBe(true);
+
+    reply(promptId, { stopReason: "end_turn" });
+    await turn;
+    await stopDevinSession("t12");
   });
 
   it("answers a permission request that carries a string JSON-RPC id", async () => {

@@ -52,6 +52,8 @@ type PendingApproval = {
   rpcId: JsonRpcId;
   threadId: string;
   kind: CodexApprovalKind;
+  /** Consent that must carry the user's decision even under full-access. */
+  mustPrompt?: boolean;
   resolve: (decision: ApprovalOutcome) => void;
 };
 
@@ -199,6 +201,28 @@ export async function steerCodexTurn(input: SteerTurnInput): Promise<void> {
   }
 
   await live.rpc.request("turn/steer", params);
+}
+
+/**
+ * Apply a UI access-mode change to the live thread: parked approvals the new
+ * mode would have answered itself are settled immediately. The running turn's
+ * server-side sandbox/approval policy was fixed at `turn/start`; the mode
+ * fully applies to new approval requests and to the next turn's policy.
+ */
+export function setCodexRuntimeMode(
+  sessionId: string,
+  runtimeMode: RuntimeMode,
+): void {
+  const live = liveByThread.get(sessionId);
+  if (!live || live.runtimeMode === runtimeMode) return;
+  live.runtimeMode = runtimeMode;
+  for (const [uiId, pending] of live.approvals) {
+    if (pending.mustPrompt) continue;
+    const decision = autoApproval(runtimeMode, pending.kind);
+    if (!decision) continue;
+    live.approvals.delete(uiId);
+    pending.resolve(decision);
+  }
 }
 
 export function respondCodexApproval(
@@ -1051,7 +1075,7 @@ async function handleServerRequest(
       return;
     }
     const uiId = live.nextApprovalUiId++;
-    const pending = waitApproval(live, uiId, id, "permissions", threadId);
+    const pending = waitApproval(live, uiId, id, "permissions", threadId, true);
     // Other MCP consent must carry the user's decision, including in Full Access.
     live.onEvent({
       type: "approval.requested",
@@ -1170,9 +1194,10 @@ function waitApproval(
   rpcId: JsonRpcId,
   kind: CodexApprovalKind,
   threadId: string,
+  mustPrompt = false,
 ): Promise<ApprovalOutcome> {
   return new Promise<ApprovalOutcome>((resolve) => {
-    live.approvals.set(uiId, { rpcId, threadId, kind, resolve });
+    live.approvals.set(uiId, { rpcId, threadId, kind, mustPrompt, resolve });
   }).finally(() => {
     live.approvals.delete(uiId);
   });

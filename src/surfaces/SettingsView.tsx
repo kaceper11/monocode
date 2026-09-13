@@ -109,12 +109,14 @@ import {
   getModelSnapshot,
   isPickerProviderVisible,
   loadDefaultModels,
+  loadDefaultRuntimeMode,
   loadLastModelChoice,
   modelsFor,
   modelCatalogStatus,
   hasLiveCatalog,
   resolveModel,
   saveDefaultModel,
+  saveDefaultRuntimeMode,
   saveLastModelChoice,
   savePickerProviderVisible,
   subscribeModels,
@@ -130,8 +132,11 @@ import {
 import {
   HARNESSES,
   HARNESS_TITLE,
+  RUNTIME_MODE_LABEL,
+  RUNTIME_MODES,
   sessionDisplayTitle,
   type HarnessId,
+  type RuntimeMode,
 } from "../lib/session";
 import {
   loadSessionSidebarFilters,
@@ -382,6 +387,9 @@ function GeneralPage({
   const [composerEffortVisible, setComposerEffortVisible] = useState(
     loadComposerEffortVisible,
   );
+  const [defaultRuntimeMode, setDefaultRuntimeMode] = useState<RuntimeMode>(
+    loadDefaultRuntimeMode,
+  );
   const [composerRunner, setComposerRunner] = useState(loadComposerRunner);
   const [gridArcadeEnabled, setGridArcadeEnabled] = useState(
     loadGridArcadeEnabled,
@@ -453,6 +461,12 @@ function GeneralPage({
   const onComposerEffortVisible = (next: boolean) => {
     saveComposerEffortVisible(next);
     setComposerEffortVisible(next);
+  };
+
+  const onDefaultRuntimeMode = (next: string) => {
+    const mode = next as RuntimeMode;
+    saveDefaultRuntimeMode(mode);
+    setDefaultRuntimeMode(mode);
   };
 
   const onComposerRunner = (next: boolean) => {
@@ -538,6 +552,20 @@ function GeneralPage({
             { value: "steer", label: "Steer" },
           ]}
           onChange={onFollowUpBehavior}
+        />
+      </Row>
+      <Row
+        label="New conversation access"
+        description="The access mode every new conversation starts in. Change a running conversation from the access picker on its composer."
+      >
+        <Select
+          label="New conversation access"
+          value={defaultRuntimeMode}
+          options={RUNTIME_MODES.map((mode) => ({
+            value: mode,
+            label: RUNTIME_MODE_LABEL[mode],
+          }))}
+          onChange={onDefaultRuntimeMode}
         />
       </Row>
       <Row

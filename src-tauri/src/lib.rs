@@ -9,6 +9,7 @@ mod azure_repos;
 mod browser;
 mod chat_background;
 mod checkpoint;
+mod checks;
 mod confluence;
 mod cursor_store;
 pub mod dictation;
@@ -286,6 +287,7 @@ pub fn run() {
             fs::git_github_pr_diff,
             fs::git_update_from_default,
             fs::git_sync_branch,
+            checks::run_check,
             fs::git_merge_context,
             fs::git_merge_abort,
             inbox_media::fetch_inbox_media,
@@ -530,6 +532,7 @@ fn reap_harness_children(handle: &tauri::AppHandle) {
     if let Some(host) = handle.try_state::<dictation::DictationHost>() {
         host.shutdown();
     }
+    checks::reap_running();
 }
 
 #[cfg(all(debug_assertions, target_os = "macos"))]

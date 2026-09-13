@@ -972,13 +972,17 @@ export function summarizeToolRequest(
   }
 }
 
+/**
+ * Spawn-signature for the CLI process. `runtimeMode` is deliberately absent:
+ * it is applied through `set_permission_mode` on a live session, so a mode
+ * change must not force a respawn.
+ */
 export function claudeSettingsKey(input: {
   model: string;
   effort?: string;
   fast?: string;
   thinking?: string;
   context?: string;
-  runtimeMode: RuntimeMode;
   hooks?: boolean;
 }): string {
   return [
@@ -987,7 +991,6 @@ export function claudeSettingsKey(input: {
     input.fast ?? "",
     input.thinking ?? "",
     input.context ?? "",
-    input.runtimeMode,
     input.hooks === false ? "nohooks" : "hooks",
   ].join("|");
 }
