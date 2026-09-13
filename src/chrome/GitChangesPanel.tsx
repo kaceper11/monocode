@@ -1172,9 +1172,14 @@ function ChangedFiles({
     if (!index || !canSyncDefault || busyRef.current) return;
     setBusy("sync-default");
     try {
-      await syncWithDefaultBranch({ cwd, sessionId: sourceSessionId });
-      mutated(undefined, undefined, true);
-      reloadPr();
+      const result = await syncWithDefaultBranch({ cwd, sessionId: sourceSessionId });
+      // A merge or a conflicted state changed the tree — invalidate
+      // watchers and the PR row. A cancel/refusal/up-to-date changed
+      // nothing locally (runSync already refreshed the index).
+      if (result?.outcome === "merged" || result?.outcome === "conflicted") {
+        mutated(undefined, undefined, true);
+        reloadPr();
+      }
     } catch (error) {
       fail(error);
       mutated(undefined, undefined, true);
@@ -1201,7 +1206,10 @@ function ChangedFiles({
     if (!index?.opInProgress || busyRef.current) return;
     setBusy("merge-abort");
     try {
+      // Nothing in progress (a stale banner) or a confirmed abort both end
+      // with a refresh — a declined confirm is the only no-op.
       if (await abortMerge({ cwd })) mutated(undefined, undefined, true);
+      else mutated();
     } catch (error) {
       fail(error);
       mutated();

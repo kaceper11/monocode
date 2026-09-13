@@ -6866,18 +6866,6 @@ export default function App({
       item: AttentionItem,
       action: Extract<AttentionAction, { kind: "update-branch" }>,
     ) => {
-      // The binding names the branch this row was emitted for — merging into
-      // a checkout that has since moved would corrupt the wrong branch.
-      if (action.branch) {
-        const checkout = await ciContext(action.cwd);
-        if (checkout.branch !== action.branch) {
-          await message(
-            `Checkout is on ${checkout.branch || "detached HEAD"}, not ${action.branch}. Switch back or dismiss the row.`,
-            { title: item.title, kind: "warning" },
-          );
-          return;
-        }
-      }
       // Share the menu/panel sync slot — confirmations must not stack on
       // the same working copy even when the entry points differ.
       const release = acquireSyncSlot(action.cwd);
@@ -6889,20 +6877,33 @@ export default function App({
         return;
       }
       try {
+        // The binding names the branch this row was emitted for — merging
+        // into a checkout that has since moved would corrupt the wrong one.
+        if (action.branch) {
+          const checkout = await ciContext(action.cwd);
+          if (checkout.branch !== action.branch) {
+            await message(
+              `Checkout is on ${checkout.branch || "detached HEAD"}, not ${action.branch}. Switch back or dismiss the row.`,
+              { title: item.title, kind: "warning" },
+            );
+            return;
+          }
+        }
         const baseLabel = action.base
           ? `the ${action.base} branch`
           : "the remote default branch";
+        const branchLabel = action.branch ?? "the current branch";
         const where = `\n\nWorking copy: ${action.cwd}\nHost: ${syncHostLabel(action.cwd)}`;
         let mode: "merge" | "rebase" = "merge";
         if (
           !(await ask(
-            `Fetch ${baseLabel} and merge it into this checkout? The tree must be clean; conflicts stay in place for you to resolve.${where}`,
-            { title: item.title, kind: "info", okLabel: "Merge", cancelLabel: "Cancel" },
+            `Fetch ${baseLabel} and merge it into ${branchLabel}? The tree must be clean; conflicts stay in place for you to resolve.${where}`,
+            { title: item.title, kind: "info", okLabel: "Merge", cancelLabel: "Rebase instead…" },
           ))
         ) {
           if (
             !(await ask(
-              `Rebase onto ${baseLabel} instead?${where}`,
+              `Rebase ${branchLabel} onto ${baseLabel}?${where}`,
               { title: "Update branch", kind: "info", okLabel: "Rebase", cancelLabel: "Cancel" },
             ))
           )
@@ -6917,7 +6918,6 @@ export default function App({
           action.base,
           action.branch,
         );
-        notifyGitChanged(action.cwd);
         if (result.outcome === "conflicts") {
           // Same resolution flow as a panel/menu sync — live merge state is
           // re-read on send, and a sessionless row gets the picker.
@@ -6946,6 +6946,10 @@ export default function App({
           { title: item.title },
         );
       } finally {
+        // Any outcome — merged, conflicts, refusal, or a failed merge the
+        // backend unwound — can have changed the tree; refresh, then free
+        // the slot so a follow-up sync isn't refused.
+        notifyGitChanged(action.cwd);
         release();
       }
     },

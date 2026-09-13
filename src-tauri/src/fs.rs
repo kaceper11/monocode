@@ -603,7 +603,7 @@ pub struct GitMergeContext {
     pub conflicts: Vec<String>,
     /// Short SHA of the head being applied (MERGE_HEAD…) when known.
     pub merge_head: Option<String>,
-    /// A remote-tracking ref verified to name MERGE_HEAD, e.g.
+    /// A remote-tracking ref verified to name the incoming head, e.g.
     /// "origin/main" — never guessed from the default branch.
     pub incoming_ref: Option<String>,
     /// Bounded combined diff of the conflicted paths — both sides.
@@ -626,11 +626,13 @@ fn git_merge_context_for(root: &Path) -> Result<GitMergeContext, String> {
     let state = git_op_state_uncached(root);
     let conflicts = git_unmerged_paths(root);
     // The ref the operation is actually applying — a merge's MERGE_HEAD, a
-    // rebase's recorded onto commit — resolved from live state, never
-    // assumed to be the remote default.
+    // rebase's recorded onto commit, a pick/revert's recorded head —
+    // resolved from live state, never assumed to be the remote default.
     let incoming_head: Option<String> = match state.op {
         "merge" => git_stdout(root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]),
-        "rebase" => git_rebase_onto(root),
+        "rebase" => GitDir::resolve(root).and_then(|dir| git_rebase_onto(&dir)),
+        "cherry-pick" => git_stdout(root, &["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"]),
+        "revert" => git_stdout(root, &["rev-parse", "-q", "--verify", "REVERT_HEAD"]),
         _ => None,
     };
     let incoming_ref = incoming_head.and_then(|head| {
@@ -690,7 +692,7 @@ fn git_merge_context_for(root: &Path) -> Result<GitMergeContext, String> {
 /// one. Detection only; nothing here decides anything.
 #[derive(Clone, Default)]
 struct GitOpState {
-    /// "" or "merge" | "rebase" | "cherry-pick" | "revert".
+    /// "" or "merge" | "rebase" | "am" | "cherry-pick" | "revert".
     op: &'static str,
     /// Short SHA of the head being applied (MERGE_HEAD, REBASE_HEAD…).
     head: Option<String>,
@@ -702,10 +704,10 @@ impl GitOpState {
     }
 }
 
-/// Probes git for the operation in progress — up to five subprocess calls,
-/// and on WSL each is a serialized bridge round-trip. Callers that decide
-/// or mutate use this directly; the polled `git_diff_index` path uses the
-/// briefly cached `git_op_state` instead.
+/// Probes git for the operation in progress — a few subprocess calls plus
+/// gitdir file probes, and on WSL each is a serialized bridge round-trip.
+/// Callers that decide or mutate use this directly; the polled
+/// `git_diff_index` path uses the briefly cached `git_op_state` instead.
 fn git_op_state_uncached(root: &Path) -> GitOpState {
     let head = |name: &str| git_stdout(root, &["rev-parse", "-q", "--verify", "--short", name]);
     if let Some(sha) = head("MERGE_HEAD") {
@@ -719,10 +721,21 @@ fn git_op_state_uncached(root: &Path) -> GitOpState {
     // is the reliable signal — a rebase stopped at `break`/`exec` and a
     // mid-run `git am` carry neither REBASE_HEAD nor a current patch.
     let rebase_head = head("REBASE_HEAD");
-    let (merge_dir, apply_dir) = git_rebase_dirs(root);
+    let dir = GitDir::resolve(root);
+    let (merge_dir, apply_dir) = dir
+        .as_ref()
+        .map(git_rebase_dirs)
+        .unwrap_or_default();
     if rebase_head.is_some() || merge_dir || apply_dir {
+        // `git am` shares rebase-apply but is a different operation — the
+        // `applying` marker distinguishes it, and it aborts differently.
+        let op = if apply_dir && !merge_dir && dir.as_ref().is_some_and(git_rebase_apply_is_am) {
+            "am"
+        } else {
+            "rebase"
+        };
         return GitOpState {
-            op: "rebase",
+            op,
             head: rebase_head,
         };
     }
@@ -742,8 +755,10 @@ fn git_op_state_uncached(root: &Path) -> GitOpState {
 }
 
 /// Operation state changes on a human timescale while `git_diff_index` is
-/// polled every couple of seconds per panel — cache it briefly so a poll
-/// doesn't respawn the five detection calls.
+/// polled every couple of seconds per panel — cache it briefly so bursts
+/// and multiple panels share one probe. The TTL stays under the poll
+/// interval so a state change is reflected within a poll or two; the
+/// traded-away cost is that a lone panel still probes each poll.
 const GIT_OP_TTL: Duration = Duration::from_millis(1500);
 
 static GIT_OP_CACHE: Mutex<Option<HashMap<PathBuf, (Instant, GitOpState)>>> = Mutex::new(None);
@@ -797,12 +812,16 @@ fn git_abort_in_progress_inner(root: &Path) -> Result<(), String> {
     // also carry CHERRY_PICK_HEAD, and `cherry-pick --abort` would error
     // while the rebase stays wedged — it must be aborted as a rebase.
     // `git am` shares the rebase-apply dir but needs `am --abort`.
-    let (merge_dir, apply_dir) = git_rebase_dirs(root);
+    let dir = GitDir::resolve(root);
+    let (merge_dir, apply_dir) = dir
+        .as_ref()
+        .map(git_rebase_dirs)
+        .unwrap_or_default();
     if git_stdout(root, &["rev-parse", "-q", "--verify", "REBASE_HEAD"]).is_some()
         || merge_dir
         || apply_dir
     {
-        if apply_dir && !merge_dir && git_rebase_apply_is_am(root) {
+        if apply_dir && !merge_dir && dir.as_ref().is_some_and(git_rebase_apply_is_am) {
             return git_checked(root, &["am", "--abort"]);
         }
         return git_checked(root, &["rebase", "--abort"]);
@@ -844,27 +863,43 @@ fn merge_guard_key(root: &Path) -> String {
     root.to_string_lossy().trim_end_matches('/').to_string()
 }
 
-struct MergeGuard(String);
+struct MergeGuard(Vec<String>);
 
 impl MergeGuard {
     fn acquire(root: &Path) -> Option<Self> {
+        // Cheap pre-check on the caller's spelling — a refused retry skips
+        // the canonicalizing `rev-parse`, which on WSL would otherwise
+        // stall behind the in-flight fetch on the serialized bridge.
+        let raw = root.to_string_lossy().into_owned();
+        {
+            let set = MERGE_IN_FLIGHT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if set.contains(&raw) {
+                return None;
+            }
+        }
         let key = merge_guard_key(root);
         let mut set = MERGE_IN_FLIGHT
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if !set.insert(key.clone()) {
+        if set.contains(&raw) || set.contains(&key) {
             return None;
         }
-        Some(Self(key))
+        set.insert(raw.clone());
+        set.insert(key.clone());
+        Some(Self(vec![raw, key]))
     }
 }
 
 impl Drop for MergeGuard {
     fn drop(&mut self) {
-        MERGE_IN_FLIGHT
+        let mut set = MERGE_IN_FLIGHT
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&self.0);
+            .unwrap_or_else(|error| error.into_inner());
+        for key in &self.0 {
+            set.remove(key);
+        }
     }
 }
 
@@ -905,32 +940,54 @@ impl GitMergeOutcome {
 
 /// Fetch and merge/rebase can stall on a dead network or a signing prompt;
 /// a stall must not hold the merge guard — and refuse the checkout —
-/// forever. WSL calls are already bounded by the bridge.
+/// forever. The same limit reaches the WSL bridge so the guest kills the
+/// child group rather than the request watchdog killing the connection.
 const GIT_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 const GIT_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// An entry inside the worktree's gitdir, on the owning host — a host
-/// path, or a WSL location bound to the guest path for bridge requests.
+/// A worktree's resolved gitdir, on the host or inside WSL — resolving
+/// `--absolute-git-dir` once per probe keeps serialized bridge round-trips
+/// off the per-file helpers.
+enum GitDir {
+    Host(PathBuf),
+    Wsl(wsl::Location),
+}
+
+/// An entry inside a `GitDir` — host path or WSL guest location.
 enum GitDirEntry {
     Host(PathBuf),
     Wsl(wsl::Location),
 }
 
-fn git_dir_entry(root: &Path, name: &str) -> Option<GitDirEntry> {
-    let gitdir = git_stdout(root, &["rev-parse", "--absolute-git-dir"])?;
-    let path = format!("{gitdir}/{name}");
-    match wsl::path_location(root).ok().flatten() {
-        Some(location) => location.with_path(&path).ok().map(GitDirEntry::Wsl),
-        None => Some(GitDirEntry::Host(PathBuf::from(path))),
+impl GitDir {
+    fn resolve(root: &Path) -> Option<Self> {
+        let gitdir = git_stdout(root, &["rev-parse", "--absolute-git-dir"])?;
+        match wsl::path_location(root).ok().flatten() {
+            Some(location) => location.with_path(&gitdir).ok().map(GitDir::Wsl),
+            None => Some(GitDir::Host(PathBuf::from(gitdir))),
+        }
+    }
+
+    fn entry(&self, name: &str) -> Option<GitDirEntry> {
+        match self {
+            GitDir::Host(dir) => Some(GitDirEntry::Host(dir.join(name))),
+            GitDir::Wsl(dir) => dir
+                .with_path(&format!("{}/{name}", dir.path))
+                .ok()
+                .map(GitDirEntry::Wsl),
+        }
     }
 }
 
 /// The commit an in-progress rebase was started onto — git records it in
 /// `rebase-merge/onto` (or `rebase-apply/onto`) inside the worktree's own
 /// gitdir.
-fn git_rebase_onto(root: &Path) -> Option<String> {
+fn git_rebase_onto(dir: &GitDir) -> Option<String> {
     for name in ["rebase-merge/onto", "rebase-apply/onto"] {
-        let text = match git_dir_entry(root, name)? {
+        let Some(entry) = dir.entry(name) else {
+            continue;
+        };
+        let text = match entry {
             GitDirEntry::Host(path) => std::fs::read_to_string(path).ok(),
             GitDirEntry::Wsl(file) => wsl::request::<String>(&file, "read_text", json!({})).ok(),
         };
@@ -946,11 +1003,11 @@ fn git_rebase_onto(root: &Path) -> Option<String> {
 /// reliable signal: a rebase stopped at `break`/`exec` or a mid-run
 /// `git am` carries neither `REBASE_HEAD` nor a current patch, so
 /// `rebase --show-current-patch` misses it entirely.
-fn git_rebase_dirs(root: &Path) -> (bool, bool) {
-    let exists = |name: &str| match git_dir_entry(root, name) {
+fn git_rebase_dirs(dir: &GitDir) -> (bool, bool) {
+    let exists = |name: &str| match dir.entry(name) {
         Some(GitDirEntry::Host(path)) => path.is_dir(),
         // `canonical` resolves only when the guest path exists.
-        Some(GitDirEntry::Wsl(dir)) => wsl::path_request(&dir, "canonical", json!({})).is_ok(),
+        Some(GitDirEntry::Wsl(entry)) => wsl::path_request(&entry, "canonical", json!({})).is_ok(),
         None => false,
     };
     (exists("rebase-merge"), exists("rebase-apply"))
@@ -959,28 +1016,62 @@ fn git_rebase_dirs(root: &Path) -> (bool, bool) {
 /// Which apply lane a `rebase-apply` state belongs to — `git am` sets the
 /// `applying` marker and must be aborted with `am --abort`; a rebase-apply
 /// rebase leaves it absent.
-fn git_rebase_apply_is_am(root: &Path) -> bool {
-    match git_dir_entry(root, "rebase-apply/applying") {
+fn git_rebase_apply_is_am(dir: &GitDir) -> bool {
+    match dir.entry("rebase-apply/applying") {
         Some(GitDirEntry::Host(path)) => path.is_file(),
         Some(GitDirEntry::Wsl(file)) => wsl::path_request(&file, "canonical", json!({})).is_ok(),
         None => false,
     }
 }
 
+/// Modification time of a gitdir entry — distinguishes an operation file
+/// written by this run from one a foreign process wrote first.
+fn git_dir_entry_mtime(dir: &GitDir, name: &str) -> Option<SystemTime> {
+    match dir.entry(name)? {
+        GitDirEntry::Host(path) => path.metadata().ok()?.modified().ok(),
+        GitDirEntry::Wsl(file) => {
+            #[derive(Deserialize)]
+            struct Stat {
+                #[serde(rename = "mtimeMs")]
+                mtime_ms: Option<i64>,
+            }
+            let stats: Vec<Stat> =
+                wsl::request(&file, "stat", json!({"paths": [file.path]})).ok()?;
+            let ms = stats.first()?.mtime_ms?;
+            Some(UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64))
+        }
+    }
+}
+
 /// True only when the operation in progress is provably the one this run
 /// just started — a merge of ours records the FETCH_HEAD we fetched as
-/// MERGE_HEAD, a rebase of ours records it as the onto commit. Anything
-/// else belongs to the user (an operation started in a terminal while
-/// this one was in flight) and must be left untouched.
-fn git_own_op_in_progress(root: &Path, mode: &str) -> bool {
+/// MERGE_HEAD, a rebase of ours records it as the onto commit, and the
+/// marker file must be no older than `started` (a same-commit op begun by
+/// the user in the fetch window is foreign — left alone). Anything else
+/// belongs to the user and must be left untouched.
+fn git_own_op_in_progress(root: &Path, mode: &str, started: SystemTime) -> bool {
     let verify = |name: &str| git_stdout(root, &["rev-parse", "-q", "--verify", name]);
     let Some(fetched) = verify("FETCH_HEAD") else {
         return false;
     };
+    let Some(dir) = GitDir::resolve(root) else {
+        return false;
+    };
     if mode == "merge" {
-        return verify("MERGE_HEAD").as_deref() == Some(fetched.as_str());
+        verify("MERGE_HEAD").as_deref() == Some(fetched.as_str())
+            && git_dir_entry_mtime(&dir, "MERGE_HEAD")
+                .map(|mtime| mtime >= started)
+                .unwrap_or(false)
+    } else {
+        git_rebase_onto(&dir).as_deref() == Some(fetched.as_str())
+            && ["rebase-merge/onto", "rebase-apply/onto"]
+                .iter()
+                .any(|name| {
+                    git_dir_entry_mtime(&dir, name)
+                        .map(|mtime| mtime >= started)
+                        .unwrap_or(false)
+                })
     }
-    git_rebase_onto(root).as_deref() == Some(fetched.as_str())
 }
 
 fn git_merge_incoming(
@@ -1024,6 +1115,12 @@ fn git_merge_incoming(
             "No remote configured for this checkout.",
         ));
     };
+    // The name becomes `git fetch <remote>` argv — a leading dash would be
+    // flag injection; git itself cannot create such a remote, but refuse
+    // rather than forward it.
+    if remote.starts_with('-') {
+        return Ok(GitMergeOutcome::refused("The remote name is not usable."));
+    }
     // `base` arrives as the PR's target branch — provider data, not trusted
     // argv. "refs/heads/main" and "origin/main" normalize to the remote
     // branch; a prefix naming another configured remote ("upstream/main")
@@ -1037,7 +1134,9 @@ fn git_merge_incoming(
             // ("release/1.0" beside a "release" remote) stays on the default
             // remote when its tracking ref exists; otherwise the longest
             // configured remote prefix wins so "a/b/main" parses when the
-            // remote itself is "a/b".
+            // remote itself is "a/b". Residual ambiguity: a tracking ref
+            // that was never fetched (custom refspecs) can't prove the
+            // branch interpretation — the remote prefix then wins.
             let on_default = git_ref_exists(root, &format!("refs/remotes/{remote}/{name}"));
             let (remote, name) = if on_default {
                 (remote.clone(), name.to_string())
@@ -1086,13 +1185,17 @@ fn git_merge_incoming(
     // No pathspec — a checkout rooted below the repository root must still
     // refuse when files elsewhere in the worktree are dirty. The flag keeps
     // a `status.showUntrackedFiles=no` user config from hiding changes.
-    let Some(status) = git_run(root, &["status", "--porcelain", "--untracked-files=normal"]) else {
-        return Err("git status failed — cannot verify the tree is clean.".into());
+    let dirty_count = || -> Result<usize, String> {
+        let Some(status) = git_run(root, &["status", "--porcelain", "--untracked-files=normal"])
+        else {
+            return Err("git status failed — cannot verify the tree is clean.".into());
+        };
+        Ok(status
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count())
     };
-    let dirty = status
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count();
+    let dirty = dirty_count()?;
     if dirty > 0 {
         return Ok(GitMergeOutcome::refused(format!(
             "{dirty} uncommitted change{}. Commit or stash before syncing — nothing is stashed automatically.",
@@ -1105,8 +1208,9 @@ fn git_merge_incoming(
         GIT_FETCH_TIMEOUT,
     )?;
     // The fetch window is long — re-verify before merging: an operation
-    // started in a terminal meanwhile must not be absorbed or unwound, and
-    // the confirmed branch may have moved.
+    // started in a terminal meanwhile must not be absorbed or unwound, the
+    // confirmed branch may have moved, and the owning agent may have
+    // dirtied the tree — the contract refuses to merge into any of those.
     if git_op_in_progress(root) {
         return Ok(GitMergeOutcome::refused(
             "An operation started in this working copy while fetching — nothing was merged. Resolve or abort it, then sync again.",
@@ -1117,6 +1221,13 @@ fn git_merge_incoming(
             "The checkout moved off {branch} while fetching — nothing was merged. Confirm the sync again on the right branch."
         )));
     }
+    let dirty = dirty_count()?;
+    if dirty > 0 {
+        return Ok(GitMergeOutcome::refused(format!(
+            "{dirty} uncommitted change{} appeared while fetching — nothing was merged. Commit or stash, then sync again.",
+            if dirty == 1 { "" } else { "s" }
+        )));
+    }
     // Custom fetch refspecs can leave `remote/base` stale or missing —
     // FETCH_HEAD always names the commit this fetch wrote.
     let synced_with = format!("{fetch_remote}/{base_name}");
@@ -1124,6 +1235,14 @@ fn git_merge_incoming(
     // fails; the merge still fast-forwards, exactly like `git pull` into an
     // empty clone.
     let head_exists = git_stdout(root, &["rev-parse", "-q", "--verify", "HEAD"]).is_some();
+    // A missing/corrupt FETCH_HEAD makes the rev-list below fail and would
+    // otherwise read as "0 behind" — a false up-to-date. Require it to
+    // resolve before trusting any comparison or running the merge.
+    if git_stdout(root, &["rev-parse", "-q", "--verify", "FETCH_HEAD"]).is_none() {
+        return Err(format!(
+            "git fetch {fetch_remote} {base_name} produced no FETCH_HEAD — cannot verify what was fetched; nothing was merged."
+        ));
+    }
     let incoming = if head_exists {
         "HEAD..FETCH_HEAD"
     } else {
@@ -1152,19 +1271,45 @@ fn git_merge_incoming(
     let commit_count = git_stdout(root, &["rev-list", "--count", incoming])
         .and_then(|text| text.parse().ok())
         .unwrap_or(commits.len() as i64);
+    // `--no-autostash` overrides a user's merge.autoStash/rebase.autoStash
+    // — the contract is to refuse a dirty tree, never to stash one.
+    let merge_started = SystemTime::now();
     let result = if mode == "merge" {
         git_command_output_bounded(
             root,
-            &["merge", "--no-edit", "FETCH_HEAD"],
+            &["merge", "--no-edit", "--no-autostash", "FETCH_HEAD"],
             GIT_MERGE_TIMEOUT,
         )
     } else {
-        git_command_output_bounded(root, &["rebase", "FETCH_HEAD"], GIT_MERGE_TIMEOUT)
+        git_command_output_bounded(
+            root,
+            &["rebase", "--no-autostash", "FETCH_HEAD"],
+            GIT_MERGE_TIMEOUT,
+        )
     };
     // A timed-out or killed run can leave op state behind — drop the
     // cached answer before looking at the result.
     git_op_cache_forget(root);
-    let result = result?;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            // A timed-out or output-capped merge can still have left real
+            // conflict state — report it as conflicted instead of failing.
+            let conflicts = git_unmerged_paths(root);
+            if !conflicts.is_empty() {
+                return Ok(GitMergeOutcome {
+                    outcome: "conflicted",
+                    branch,
+                    synced_with,
+                    commits,
+                    commit_count,
+                    conflicts,
+                    reason: String::new(),
+                });
+            }
+            return Err(error);
+        }
+    };
     if result.status.success() {
         return Ok(GitMergeOutcome {
             outcome: "merged",
@@ -1183,7 +1328,7 @@ fn git_merge_incoming(
         // started is unwound to a clean tree. An operation someone else
         // started is reported and left alone — never auto-aborted.
         let detail = String::from_utf8_lossy(&result.stderr).trim().to_string();
-        if git_own_op_in_progress(root, mode) {
+        if git_own_op_in_progress(root, mode, merge_started) {
             let _ = git_abort_in_progress(root);
             return Err(if detail.is_empty() {
                 format!("git {mode} {synced_with} failed — aborted to a clean tree")
@@ -1229,7 +1374,15 @@ fn git_merge_abort_for(root: &Path) -> Result<(), String> {
     if !git_is_work_tree(root) {
         return Err("Not a git repository".into());
     }
-    git_abort_in_progress(root)
+    git_abort_in_progress(root).map_err(|error| {
+        // A killed fetch/merge can orphan index.lock — the abort then
+        // fails on the lock, not the operation; say what to remove.
+        if error.contains("index.lock") {
+            format!("{error} — a previous git process may have been killed; remove the stale lock in the repository's .git directory and retry.")
+        } else {
+            error
+        }
+    })
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -4151,16 +4304,17 @@ pub(crate) fn git_command_output(
     git_command(root, args).output().map_err(|e| e.to_string())
 }
 
-/// The same dispatch as `git_command_output`, but the host-side process is
-/// killed after `timeout` so a stalled fetch/merge cannot hold the merge
-/// guard forever. WSL calls are already bounded by the bridge.
+/// The same dispatch as `git_command_output`, but bounded: the host-side
+/// process is killed after `timeout` (a stalled fetch/merge cannot hold
+/// the merge guard forever), and the WSL bridge gets the same limit so a
+/// slow fetch isn't cut by the guest's 25s default.
 fn git_command_output_bounded(
     root: &Path,
     args: &[&str],
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
     if let Some(location) = wsl::path_location(root)? {
-        return wsl::git(&location, args, None);
+        return wsl::git_bounded(&location, args, None, Some(timeout));
     }
     crate::bounded_process::output(&mut git_command(root, args), timeout, 256 * 1024)
 }
@@ -7891,24 +8045,32 @@ mod tests {
         };
         assert_ne!(head, other);
         let git_dir = work.0.join(".git");
+        // `started` precedes the fixture writes, like a real run's
+        // timestamp precedes its own merge — a marker older than the run
+        // (a same-commit op the user started first) is never ours.
+        let started = SystemTime::now() - Duration::from_secs(5);
+        let future = SystemTime::now() + Duration::from_secs(60);
         // A foreign merge records a MERGE_HEAD that is not the FETCH_HEAD
         // this run fetched — it must never be aborted by us.
         std::fs::write(git_dir.join("MERGE_HEAD"), format!("{head}\n")).unwrap();
-        assert!(!git_own_op_in_progress(&work.0, "merge"));
-        // The merge this run started: MERGE_HEAD is exactly FETCH_HEAD.
+        assert!(!git_own_op_in_progress(&work.0, "merge", started));
+        // The merge this run started: MERGE_HEAD is exactly FETCH_HEAD and
+        // was written inside the run's window.
         std::fs::write(git_dir.join("FETCH_HEAD"), format!("{other}\n")).unwrap();
         std::fs::write(git_dir.join("MERGE_HEAD"), format!("{other}\n")).unwrap();
-        assert!(git_own_op_in_progress(&work.0, "merge"));
+        assert!(git_own_op_in_progress(&work.0, "merge", started));
+        assert!(!git_own_op_in_progress(&work.0, "merge", future));
         // A foreign rebase (onto a different base) is never ours to abort —
         // `git rebase FETCH_HEAD` records the fetched commit as its onto.
         std::fs::remove_file(git_dir.join("MERGE_HEAD")).unwrap();
-        assert!(!git_own_op_in_progress(&work.0, "merge"));
+        assert!(!git_own_op_in_progress(&work.0, "merge", started));
         let rebase_merge = git_dir.join("rebase-merge");
         std::fs::create_dir_all(&rebase_merge).unwrap();
         std::fs::write(rebase_merge.join("onto"), format!("{head}\n")).unwrap();
-        assert!(!git_own_op_in_progress(&work.0, "rebase"));
+        assert!(!git_own_op_in_progress(&work.0, "rebase", started));
         std::fs::write(rebase_merge.join("onto"), format!("{other}\n")).unwrap();
-        assert!(git_own_op_in_progress(&work.0, "rebase"));
+        assert!(git_own_op_in_progress(&work.0, "rebase", started));
+        assert!(!git_own_op_in_progress(&work.0, "rebase", future));
         let _ = git_abort_in_progress(&work.0);
     }
 
@@ -7934,6 +8096,58 @@ mod tests {
         assert_eq!(context.op, "rebase");
         git_abort_in_progress(&work.0).unwrap();
         assert!(!git_op_state_uncached(&work.0).in_progress());
+    }
+
+    #[test]
+    fn git_op_state_and_abort_cover_cherry_pick_and_revert() {
+        let tmp = tmp("op-state-sequencer");
+        if !git(&tmp.0, &["init", "-b", "main"]) || !commit_file(&tmp.0, "a.txt", "base\n", "base")
+        {
+            return;
+        }
+        // Two commits to pick/revert that conflict with a local change.
+        if !commit_file(&tmp.0, "a.txt", "theirs\n", "theirs") {
+            return;
+        }
+        let Some(theirs) = git_stdout(&tmp.0, &["rev-parse", "HEAD"]) else {
+            return;
+        };
+        if !commit_file(&tmp.0, "a.txt", "more\n", "theirs 2") {
+            return;
+        }
+        let Some(theirs2) = git_stdout(&tmp.0, &["rev-parse", "HEAD"]) else {
+            return;
+        };
+        if !git(&tmp.0, &["reset", "--hard", "HEAD~2"])
+            || !commit_file(&tmp.0, "a.txt", "ours\n", "ours")
+        {
+            return;
+        }
+
+        // Cherry-pick conflict: detected, labeled, and abortable.
+        if git(&tmp.0, &["cherry-pick", &theirs]) {
+            return; // needs a real conflict
+        }
+        let state = git_op_state_uncached(&tmp.0);
+        assert_eq!(state.op, "cherry-pick");
+        let expected = git_stdout(&tmp.0, &["rev-parse", "--short", &theirs]);
+        assert_eq!(
+            state.head, expected,
+            "cherry-pick must identify the picked commit",
+        );
+        git_abort_in_progress(&tmp.0).unwrap();
+        assert_eq!(git_op_state_uncached(&tmp.0).op, "");
+
+        // Revert conflict: same coverage.
+        if git(&tmp.0, &["revert", "--no-edit", &theirs2]) {
+            return;
+        }
+        let state = git_op_state_uncached(&tmp.0);
+        assert_eq!(state.op, "revert");
+        let expected = git_stdout(&tmp.0, &["rev-parse", "--short", &theirs2]);
+        assert_eq!(state.head, expected);
+        git_abort_in_progress(&tmp.0).unwrap();
+        assert_eq!(git_op_state_uncached(&tmp.0).op, "");
     }
 
     #[test]
@@ -8012,7 +8226,7 @@ mod tests {
             .map(|output| !output.status.success())
             .unwrap_or(false));
         let state = git_op_state_uncached(&work.0);
-        assert_eq!(state.op, "rebase", "am state must be detected");
+        assert_eq!(state.op, "am", "am state must be labeled honestly");
         git_abort_in_progress(&work.0).unwrap();
         assert!(!git_op_state_uncached(&work.0).in_progress());
         assert!(!work.0.join(".git").join("rebase-apply").exists());

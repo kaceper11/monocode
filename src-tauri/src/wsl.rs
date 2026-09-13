@@ -494,6 +494,12 @@ impl Bridge {
         })
     }
     fn request(&self, request: Value) -> Result<Value, String> {
+        self.request_bounded(request, REQUEST_TIMEOUT)
+    }
+
+    /// Same request path with a caller-chosen deadline — long git
+    /// operations (fetch/merge) need more than the 30s default.
+    fn request_bounded(&self, request: Value, timeout: Duration) -> Result<Value, String> {
         // Read-only filesystem operations have a separate bounded channel so a
         // slow Git/CLI command cannot block navigation or file polling. All Git
         // commands and mutations remain serialized on the original channel.
@@ -577,7 +583,7 @@ impl Bridge {
         let mut encoded = Vec::with_capacity(size);
         serde_json::to_writer(&mut encoded, &request).map_err(|e| e.to_string())?;
         encoded.push(b'\n');
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         let mut slot = self.io.lock().map_err(|_| "WSL IO lock poisoned")?;
         loop {
             if !self.alive.load(Ordering::SeqCst) {
@@ -694,6 +700,21 @@ pub fn request<T: DeserializeOwned>(
     arguments["op"] = op.into();
     arguments["path"] = location.path.clone().into();
     serde_json::from_value(bridge.request(arguments)?)
+        .map_err(|e| format!("Invalid WSL result: {e}"))
+}
+
+/// `request` with a caller-chosen deadline — for ops whose own timeout
+/// exceeds `REQUEST_TIMEOUT` (a fetch/merge on a slow link).
+pub fn request_bounded<T: DeserializeOwned>(
+    location: &Location,
+    op: &str,
+    mut arguments: Value,
+    timeout: Duration,
+) -> Result<T, String> {
+    let bridge = bridge_for(location)?;
+    arguments["op"] = op.into();
+    arguments["path"] = location.path.clone().into();
+    serde_json::from_value(bridge.request_bounded(arguments, timeout)?)
         .map_err(|e| format!("Invalid WSL result: {e}"))
 }
 
@@ -918,6 +939,18 @@ pub fn git(
     args: &[&str],
     input: Option<&[u8]>,
 ) -> Result<std::process::Output, String> {
+    git_bounded(location, args, input, None)
+}
+
+/// `git` with a guest-side command timeout — the bridge kills the child
+/// group at the limit, and the request deadline gets matching slack so a
+/// long fetch/merge isn't killed mid-write by the default 30s cap.
+pub fn git_bounded(
+    location: &Location,
+    args: &[&str],
+    input: Option<&[u8]>,
+    timeout: Option<Duration>,
+) -> Result<std::process::Output, String> {
     use base64::Engine;
     #[derive(Deserialize)]
     struct Capture {
@@ -925,11 +958,15 @@ pub fn git(
         stdout: String,
         stderr: String,
     }
-    let captured: Capture = request(
-        location,
-        "git",
-        json!({"args":args,"input":input.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))}),
-    )?;
+    let arguments = json!({
+        "args": args,
+        "input": input.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+        "timeout": timeout.map(|limit| limit.as_secs()),
+    });
+    let captured: Capture = match timeout {
+        Some(limit) => request_bounded(location, "git", arguments, limit + Duration::from_secs(15)),
+        None => request(location, "git", arguments),
+    }?;
     #[cfg(unix)]
     let status = {
         use std::os::unix::process::ExitStatusExt;

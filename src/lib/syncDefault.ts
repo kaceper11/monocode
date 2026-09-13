@@ -9,7 +9,7 @@ import {
   type GitSyncResult,
 } from "./fs";
 import { boundAgentContext, requestAgentContext } from "./agentContext";
-import { wslLocation } from "./paths";
+import { pathKey, wslLocation } from "./paths";
 import { IS_MAC, IS_WIN } from "./platform";
 
 /** A working copy to sync, optionally owned by a conversation. */
@@ -27,6 +27,8 @@ export function opLabel(op: string | undefined): string {
   switch (op) {
     case "rebase":
       return "Rebase";
+    case "am":
+      return "Patch apply";
     case "cherry-pick":
       return "Cherry-pick";
     case "revert":
@@ -60,10 +62,12 @@ export function syncConfirmText(cwd: string, index: GitDiffIndex): string {
   ].join("\n");
 }
 
-/** Pre-flight: the confirmation must describe an operation that can run.
- * These mirror the backend refusals so the user is told plainly instead of
- * confirming an impossible fetch+merge. Returns the refusal text, or null
- * when a sync is at least plausible. */
+/** Pre-flight: the confirmation should describe an operation that can run.
+ * These mirror most backend refusals so the user is told plainly instead
+ * of confirming an impossible fetch+merge — residual gaps (a dirty file
+ * outside a subdirectory-scoped index, an op or dirty file appearing after
+ * the read) still refuse honestly at the backend. Returns the refusal
+ * text, or null when a sync is at least plausible. */
 function syncPreflightRefusal(index: GitDiffIndex): string | null {
   if (index.opInProgress)
     return `A ${index.op || "merge"} is already in progress in this working copy — resolve or abort it first.`;
@@ -84,11 +88,15 @@ const syncInFlight = new Set<string>();
 
 /** Claim the working copy's sync slot for a sibling flow (the attention
  * update path) so its confirmations can't overlap a menu/panel sync.
- * Returns the release callback, or undefined when a sync is in flight. */
+ * Returns the release callback, or undefined when a sync is in flight.
+ * Keyed on `pathKey` — the spellings the various callers hand over are
+ * not all normalized the same way; a subdirectory spelling can still
+ * slip through (the backend guard catches that case as a refusal). */
 export function acquireSyncSlot(cwd: string): (() => void) | undefined {
-  if (syncInFlight.has(cwd)) return undefined;
-  syncInFlight.add(cwd);
-  return () => syncInFlight.delete(cwd);
+  const key = pathKey(cwd);
+  if (syncInFlight.has(key)) return undefined;
+  syncInFlight.add(key);
+  return () => syncInFlight.delete(key);
 }
 
 /**
@@ -218,13 +226,24 @@ export async function offerMergeResolution(
       );
     return;
   }
+  // The banner stays live while this dialog waits — the operation may
+  // already have been aborted (or finished) elsewhere; never abort blind.
+  const live = await gitMergeContext(target.cwd).catch(() => null);
+  if (live && !live.merging) {
+    await message(`The ${op} is no longer in progress — nothing to abort.`, {
+      title,
+      kind: "info",
+    });
+    return;
+  }
+  const liveOp = live ? opLabel(live.op) : opLabel(op);
   if (
     await ask(
-      `Keep the conflicts in the tree, or abort the ${op} and restore the previous state?`,
+      `Keep the conflicts in the tree, or abort the ${liveOp.toLowerCase()} and restore the previous state?`,
       {
         title,
         kind: "warning",
-        okLabel: `Abort ${op}`,
+        okLabel: `Abort ${liveOp}`,
         cancelLabel: "Keep conflicts",
       },
     )
@@ -267,7 +286,7 @@ export async function sendMergeConflictsToAgent(
     `Branch: ${branch}`,
     `Operation: ${op.toLowerCase()}`,
     `Incoming head: ${incoming ?? "unknown"}`,
-    `Conflicted paths (${countLabel}):`,
+    `Conflicted paths (${countLabel}, relative to the repository root):`,
     paths,
     "",
     `Work only in this working copy and host. Do not abort the ${op.toLowerCase()}, do not commit or push — stage resolved files and leave the tree ready for review in the diff view.`,
@@ -309,7 +328,9 @@ export async function sendMergeConflictsToAgent(
 export async function abortMerge(target: SyncTarget): Promise<boolean> {
   const merge = await gitMergeContext(target.cwd).catch(() => null);
   if (merge && !merge.merging) return false;
-  const op = opLabel(merge?.op).toLowerCase();
+  // A failed state read still offers the confirmed abort — but names no
+  // operation rather than guessing "merge" for a possibly-different op.
+  const op = merge ? opLabel(merge.op).toLowerCase() : "operation";
   if (
     !(await ask(
       `Abort the ${op} in ${target.cwd} and restore the previous state?`,
