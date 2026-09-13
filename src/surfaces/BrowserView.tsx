@@ -153,6 +153,10 @@ export function BrowserView({
   const currentRef = useRef(url);
   /** Mirror of `recording` for the page-event subscription. */
   const recordingRef = useRef(false);
+  /** The origin-move stop notice survives the Finished half of the same
+   * navigation (and a redirect's second URL) instead of being cleared by
+   * it — cleared on the next genuinely different navigation. */
+  const stopNoticeRef = useRef(false);
 
   const [opened, setOpened] = useState(false);
   const [status, setStatus] = useState<LoadStatus>("idle");
@@ -169,6 +173,9 @@ export function BrowserView({
   const [recording, setRecording] = useState(false);
   const [recordStart, setRecordStart] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
+  /** A steps session ran this mount — gates the steps-send so it doesn't
+   * pay for a full capture just to refuse an empty trail. */
+  const [recordedOnce, setRecordedOnce] = useState(false);
   const [bookmarksOpen, setBookmarksOpen] = useState(false);
   const favorites = useSyncExternalStore(
     subscribeBrowserFavorites,
@@ -235,15 +242,14 @@ export function BrowserView({
   );
 
   /** Stop the steps session; the page-side flag is the real gate, the
-   * eval just flips it — harmless on a page where it no longer exists.
-   * Awaits the toggle so a steps-send can stop before capturing. */
+   * eval just flips it — harmless on a page where it no longer exists. */
   const stopRecording = useCallback(
-    (message?: string): Promise<void> => {
+    (message?: string): void => {
       recordingRef.current = false;
       setRecording(false);
       setRecordStart(null);
       if (message) setNotice(message);
-      return browserSetRecording(label, false).catch(() => undefined);
+      void browserSetRecording(label, false).catch(() => undefined);
     },
     [label],
   );
@@ -251,11 +257,18 @@ export function BrowserView({
   const toggleRecording = useCallback(() => {
     const next = !recordingRef.current;
     void browserSetRecording(label, next)
-      .then(() => {
+      .then((applied) => {
+        // No hook on this page (e.g. still on its first load) — starting
+        // would show an indicator that records nothing.
+        if (next && !applied) {
+          setNotice("Can't record steps on this page");
+          return;
+        }
         recordingRef.current = next;
         setRecording(next);
         setRecordStart(next ? Date.now() : null);
         setElapsed(0);
+        if (next) setRecordedOnce(true);
       })
       .catch((error) =>
         setNotice(error instanceof Error ? error.message : String(error)),
@@ -278,36 +291,62 @@ export function BrowserView({
       switch (event.kind) {
         case "navigate": {
           const next = event.url ?? "";
+          const prev = currentRef.current;
           // The session flag can't cross origins — make the end visible
           // instead of leaving a dead indicator running.
-          const movedOrigin =
-            urlOrigin(currentRef.current) !== urlOrigin(next);
+          const movedOrigin = urlOrigin(prev) !== urlOrigin(next);
+          const stopped = movedOrigin && recordingRef.current;
           currentRef.current = next;
           setCurrent(next);
           setDraft(next);
           setCanBack(event.canBack);
           setCanForward(event.canForward);
-          setNotice(null);
+          if (stopped) {
+            stopNoticeRef.current = true;
+            stopRecording(
+              "Recording stopped — the page moved to a different site",
+            );
+          } else if (stopNoticeRef.current) {
+            // `navigate` fires for both Started and Finished of a commit
+            // (a redirect produces two different URLs) — consume the flag
+            // so that second event doesn't clear the stop notice.
+            stopNoticeRef.current = false;
+          } else if (next !== prev) {
+            setNotice(null);
+          }
           setPopup(null);
           setFailure("");
           setStatus("loading");
           armWatchdog(next);
           onMetaChangeRef.current?.({ url: next });
           rememberBrowserUrl(cwdRef.current, next);
-          if (movedOrigin && recordingRef.current) {
-            void stopRecording(
-              "Recording stopped — the page moved to a different site",
-            );
-          }
           break;
         }
         case "load-started":
           setStatus("loading");
           break;
-        case "load-finished":
+        case "load-finished": {
           clearWatchdog();
           setStatus("ready");
+          // Keep the indicator honest: a recreated webview lost the flag
+          // with its fresh sessionStorage — re-assert it (idempotent, the
+          // trail survives); a document that can't record — about:/data:
+          // never emit `navigate`, so this is the only signal — stops it.
+          if (recordingRef.current) {
+            if (/^https?:/.test(event.url ?? "")) {
+              void browserSetRecording(label, true).then((applied) => {
+                if (!applied && recordingRef.current) {
+                  stopRecording(
+                    "Recording stopped — this page can't be recorded",
+                  );
+                }
+              });
+            } else {
+              stopRecording("Recording stopped — this page can't be recorded");
+            }
+          }
           break;
+        }
         case "title":
           onMetaChangeRef.current?.({ title: event.title ?? "" });
           break;
@@ -578,15 +617,15 @@ export function BrowserView({
 
   /** Explicit user action (#43): screenshot + bounded DOM/console summary →
    * destination picker. Page content stays data — never an instruction.
-   * `includeSteps` adds the recorded session's trail; an active recording
-   * is stopped first so the capture holds the finished session. */
+   * `includeSteps` snapshots the recorded session's trail — it does not
+   * stop the session (the toggle owns that), so cancelling the picker
+   * loses nothing and an in-flight interaction can't be truncated. */
   const captureForAgent = useCallback(
     (includeSteps = false) => {
       if (capturing) return;
       setCapturing(true);
       void (async () => {
         try {
-          if (includeSteps && recordingRef.current) await stopRecording();
           const capture = await browserCapture(label);
           if (includeSteps && !capture.steps.length) {
             setNotice("No steps recorded — press the record button first");
@@ -613,7 +652,7 @@ export function BrowserView({
         }
       })();
     },
-    [capturing, label, stopRecording],
+    [capturing, label],
   );
 
   const wsl = wslLocation(file.cwd);
@@ -703,7 +742,7 @@ export function BrowserView({
           ) : null}
           <ToolbarButton
             title="Send page and recorded steps to an agent"
-            disabled={!opened || capturing}
+            disabled={!opened || capturing || (!recording && !recordedOnce)}
             onClick={() => captureForAgent(true)}
           >
             <ListBullet className="size-3.5" strokeWidth={1.75} />

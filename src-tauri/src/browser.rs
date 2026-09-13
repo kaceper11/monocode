@@ -36,7 +36,6 @@ const MAX_CAPTURE_CONTROL_LEN: usize = 120;
 const MAX_CAPTURE_CONSOLE: usize = 40;
 const MAX_CAPTURE_CONSOLE_LEN: usize = 400;
 const MAX_CAPTURE_STEPS: usize = 60;
-const MAX_STEP_KIND: usize = 16;
 const MAX_STEP_TEXT: usize = 240;
 const MAX_HEADINGS: usize = 12;
 const MAX_HEADING_LEN: usize = 120;
@@ -53,6 +52,10 @@ const MAX_SCREENSHOT_BYTES: usize = 4 * 1024 * 1024;
 /// sessionStorage, so same-origin navigations keep recording while a
 /// different origin can neither read the steps nor keep the session.
 const PAGE_TAP_SCRIPT: &str = r#"(() => {
+  // wry injects init scripts into subframes on Windows; the trail lives in
+  // sessionStorage, which same-origin iframes share — restrict everything
+  // to the top frame so embeds can't clobber or pollute it.
+  if (window.top !== window) return;
   const cap = 100;
   const buf = [];
   const clip = (v) => {
@@ -97,9 +100,9 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
   const REC_KEY = "monocode.rec";
   const TRAIL_CAP = 80;
   const SECRET_KEY =
-    /token|secret|password|passwd|pwd|apikey|api_key|key|auth|session|code|sig|credential/i;
+    /token|secret|password|passwd|pwd|apikey|api_key|key|auth|session|code|sig|credential|jwt|saml|assertion|bearer|nonce/i;
   const redactParams = (s) =>
-    (s || "").replace(/([?&#])([\w.%-]+)=([^&#]*)/g, (m, sep, k) =>
+    (s || "").replace(/([?&#])([^=&#]+)=([^&#]*)/g, (m, sep, k) =>
       SECRET_KEY.test(k) ? sep + k + "=…" : m,
     );
   const cleanUrl = (raw) => {
@@ -145,7 +148,9 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
         el.autocomplete,
         el.getAttribute("aria-label"),
       ].join(" ");
-      return /pass|secret|token|cvv|card|cc-|ssn|cred/i.test(hint);
+      return /pass|secret|token|cvv|card|cc-|ssn|cred|otp|pin|2fa|mfa|verif|one.?time|code|auth/i.test(
+        hint,
+      );
     } catch (e) {
       return true;
     }
@@ -158,7 +163,6 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
         (e) =>
           e &&
           typeof e.text === "string" &&
-          typeof e.kind === "string" &&
           typeof e.at === "number" &&
           isFinite(e.at),
       );
@@ -174,25 +178,31 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
   } catch (e) {
     window.__monocodeRec = false;
   }
-  const step = (kind, text) => {
+  const step = (text) => {
     try {
       if (!window.__monocodeRec) return;
-      trail.push({ at: Date.now(), kind, text: String(text).slice(0, 240) });
+      trail.push({ at: Date.now(), text: String(text).slice(0, 240) });
       if (trail.length > TRAIL_CAP) trail.splice(0, trail.length - TRAIL_CAP);
       saveTrail();
     } catch (e) {}
   };
+  let lastNav = cleanUrl(location.href);
   // The record toggle: a fresh session clears the previous trail and opens
   // on the current page; stopping just drops the flag — the finished trail
-  // stays readable until the next session or the webview dies.
+  // stays readable until the next session or the webview dies. Idempotent:
+  // the app re-asserts the flag after loads in case the webview was
+  // recreated, and that must not wipe the trail on a plain reload.
   window.__monocodeSetRec = (on) => {
-    window.__monocodeRec = !!on;
+    on = !!on;
+    if (on === window.__monocodeRec) return;
+    window.__monocodeRec = on;
     try {
       sessionStorage.setItem(REC_KEY, on ? "1" : "0");
     } catch (e) {}
     if (on) {
       trail.length = 0;
-      step("open", "Opened " + cleanUrl(location.href));
+      lastNav = cleanUrl(location.href);
+      step("Opened " + lastNav);
     }
   };
   window.__monocodeLabel = label;
@@ -212,7 +222,7 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
           const ty = (el.getAttribute("type") || "").toLowerCase();
           if (ty === "checkbox" || ty === "radio") return;
         }
-        step("click", "Clicked " + label(el));
+        step("Clicked " + label(el));
       } catch (err) {}
     },
     true,
@@ -228,17 +238,16 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
         if (tag === "select") {
           const opt = el.options && el.options[el.selectedIndex];
           const chosen = (((opt && opt.text) || el.value || "") + "").trim().slice(0, 60);
-          step("select", 'Selected "' + chosen + '" in ' + label(el));
+          step('Selected "' + chosen + '" in ' + label(el));
         } else if (type === "checkbox") {
-          step("check", (el.checked ? "Checked " : "Unchecked ") + label(el));
+          step((el.checked ? "Checked " : "Unchecked ") + label(el));
         } else if (type === "radio") {
-          step("radio", "Selected " + label(el));
+          step("Selected " + label(el));
         } else if (tag === "input" || tag === "textarea") {
           if (sensitive(el)) {
-            step("input", "Edited " + label(el));
+            step("Edited " + label(el));
           } else {
             step(
-              "input",
               'Typed "' + String(el.value).slice(0, 80) + '" in ' + label(el),
             );
           }
@@ -249,7 +258,7 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
   );
   window.addEventListener(
     "submit",
-    (e) => step("submit", "Submitted " + label(e.target)),
+    (e) => step("Submitted " + label(e.target)),
     true,
   );
   window.addEventListener(
@@ -260,13 +269,22 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
         const el = e.target;
         if (!el || !el.matches || !el.matches("input,textarea,[contenteditable]"))
           return;
-        step("key", "Pressed Enter in " + label(el));
+        step("Pressed Enter in " + label(el));
       } catch (err) {}
     },
     true,
   );
-  const navigated = () =>
-    step("navigate", "Navigated to " + cleanUrl(location.href));
+  // Frameworks spam replaceState (scroll restoration, URL-synced state) —
+  // record a location only when it actually changed, or repeats would
+  // evict real steps from the bounded trail.
+  const navigated = () => {
+    try {
+      const url = cleanUrl(location.href);
+      if (url === lastNav) return;
+      lastNav = url;
+      step("Navigated to " + url);
+    } catch (e) {}
+  };
   window.addEventListener("popstate", navigated);
   window.addEventListener("hashchange", navigated);
   for (const fn of ["pushState", "replaceState"]) {
@@ -278,7 +296,7 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
     };
   }
   // A mid-session page load belongs to the trail too.
-  step("open", "Opened " + cleanUrl(location.href));
+  step("Opened " + lastNav);
 })()"#;
 
 /// Bounded visible-DOM + console read. wry serializes the completion
@@ -296,8 +314,15 @@ const SUMMARY_SCRIPT: &str = r#"(() => {
       const r = el.getBoundingClientRect();
       if (!r.width || !r.height || r.bottom < 0 || r.top > innerHeight) continue;
       const tag = (el.tagName || "").toLowerCase();
+      const type = ((el.getAttribute && el.getAttribute("type")) || "").toLowerCase();
+      // A free-text field's value is user input (possibly a password) —
+      // it is never a label. Button/submit values and a select's chosen
+      // option are fine.
+      const editable =
+        tag === "textarea" ||
+        (tag === "input" && type !== "button" && type !== "submit");
       let label =
-        (el.innerText || el.value || el.placeholder ||
+        (el.innerText || (editable ? "" : el.value) || el.placeholder ||
           el.getAttribute("aria-label") || el.getAttribute("title") || "")
           .trim();
       if (!label && tag === "a") label = el.getAttribute("href") || "";
@@ -330,7 +355,6 @@ const SUMMARY_SCRIPT: &str = r#"(() => {
         entry && typeof entry.at === "number" && isFinite(entry.at)
           ? entry.at
           : 0,
-      kind: String((entry && entry.kind) || "").slice(0, 16),
       text: String((entry && entry.text) || "").slice(0, 240),
     }));
   } catch (e) {}
@@ -881,18 +905,40 @@ pub fn browser_set_visible(window: Window, label: String, visible: bool) -> Resu
     .map_err(|error| error.to_string())
 }
 
-/// Flip the page-side steps recorder on or off. The flag lives in the
-/// page's sessionStorage so a same-origin reload keeps recording; the eval
-/// reaches `__monocodeSetRec`, which simply doesn't exist on a page the
-/// init script never ran on — the toggle is a no-op there.
+/// Flip the page-side steps recorder on or off; returns whether the page
+/// actually has the hook (a page where the init script can't run — e.g.
+/// still on its first load — silently has no flag otherwise, and the
+/// toolbar indicator would lie). The flag lives in the page's
+/// sessionStorage so a same-origin reload keeps recording; the app also
+/// re-asserts it after loads to heal a recreated webview — the page-side
+/// setter is idempotent so that re-assert never wipes the trail. Async
+/// for the same reason `browser_probe` is: the eval callback arrives on
+/// the main thread.
 #[tauri::command]
-pub fn browser_set_recording(window: Window, label: String, on: bool) -> Result<(), String> {
-    find_webview(&window, &label)?
-        .eval(format!(
-            "window.__monocodeSetRec && window.__monocodeSetRec({})",
+pub async fn browser_set_recording(
+    window: Window,
+    label: String,
+    on: bool,
+) -> Result<bool, String> {
+    let view = find_webview(&window, &label)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    view.eval_with_callback(
+        format!(
+            "!!(window.__monocodeSetRec && (window.__monocodeSetRec({}), true))",
             if on { "true" } else { "false" }
-        ))
-        .map_err(|error| error.to_string())
+        ),
+        move |result| {
+            let _ = tx.send(result);
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        rx.recv_timeout(PROBE_TIMEOUT)
+            .map_err(|_| "Recording toggle timed out".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map(|result| result.trim() == "true")
 }
 
 /// Read the live location so the tab can tell "never loaded" apart from a
@@ -933,7 +979,6 @@ pub struct BrowserConsoleLine {
 pub struct BrowserStep {
     /// `Date.now()` in the page — meaningful only as a relative offset.
     at: f64,
-    kind: String,
     text: String,
 }
 
@@ -993,7 +1038,6 @@ struct PageConsoleLine {
 #[derive(Deserialize)]
 struct PageStep {
     at: Option<f64>,
-    kind: Option<String>,
     text: Option<String>,
 }
 
@@ -1207,10 +1251,6 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
         .into_iter()
         .map(|entry| BrowserStep {
             at: entry.at.unwrap_or(0.0),
-            kind: clip_chars(
-                &entry.kind.unwrap_or_else(|| "step".to_string()),
-                MAX_STEP_KIND,
-            ),
             text: clip_chars(&entry.text.unwrap_or_default(), MAX_STEP_TEXT),
         })
         .collect::<Vec<_>>()

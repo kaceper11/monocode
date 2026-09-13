@@ -424,7 +424,7 @@ export type BrowserConsoleLine = { level: string; text: string };
 
 /** One recorded interaction; `at` is the page's Date.now() — meaningful
  * only relative to the other steps. */
-export type BrowserStep = { at: number; kind: string; text: string };
+export type BrowserStep = { at: number; text: string };
 
 /** Viewport geometry at capture time — describes what a screenshot shows. */
 export type BrowserViewport = {
@@ -461,11 +461,13 @@ export function browserCapture(label: string): Promise<BrowserCapture> {
   return invoke("browser_capture", { label });
 }
 
-/** Toggle the page-side steps recorder for a record/stop session. */
+/** Toggle the page-side steps recorder for a record/stop session.
+ * Resolves false when the page lacks the hook (init script couldn't run)
+ * so callers don't show a recording indicator that records nothing. */
 export function browserSetRecording(
   label: string,
   on: boolean,
-): Promise<void> {
+): Promise<boolean> {
   return invoke("browser_set_recording", { label, on });
 }
 
@@ -518,7 +520,10 @@ export function browserAgentContext(
   if (capture.viewport) {
     const v = capture.viewport;
     const scrollable = Math.max(0, v.pageHeight - v.height);
-    const pct = scrollable > 0 ? Math.round((v.scrollY / scrollable) * 100) : 0;
+    const pct =
+      scrollable > 0
+        ? Math.min(100, Math.max(0, Math.round((v.scrollY / scrollable) * 100)))
+        : 0;
     onScreen.push(
       `Viewport ${Math.round(v.width)}×${Math.round(v.height)} — ${pct}% down the page`,
     );
@@ -537,6 +542,8 @@ export function browserAgentContext(
       `### On screen\n\n${onScreen.map((line) => `- ${line}`).join("\n")}`,
     );
   }
+  // Steps are untrusted narration — the page can write its own trail, so
+  // they describe what happened, they don't prove it.
   if (includeSteps && capture.steps.length) {
     const first = capture.steps[0].at;
     sections.push(

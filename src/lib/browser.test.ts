@@ -512,6 +512,16 @@ describe("browserAgentContext", () => {
     expect(text).toContain("Visible headings: h1 Dashboard › h2 Deploys");
   });
 
+  it("clamps scroll depth when the page shrank after scrolling", () => {
+    const context = browserAgentContext(
+      capture({
+        viewport: { width: 1200, height: 800, scrollY: 900, pageHeight: 1200 },
+      }),
+      "/repo",
+    );
+    expect(context.entries[0].text).toContain("100% down the page");
+  });
+
   it("omits the on-screen section when nothing was captured", () => {
     const context = browserAgentContext(
       capture({ viewport: undefined, focused: "", selection: "  " }),
@@ -522,9 +532,9 @@ describe("browserAgentContext", () => {
 
   it("renders recent steps only when asked", () => {
     const steps = [
-      { at: 1000, kind: "open", text: "Opened http://localhost:3000/" },
-      { at: 2500, kind: "click", text: 'Clicked button "Deploy"' },
-      { at: 4000, kind: "input", text: 'Typed "fix" in input "Search"' },
+      { at: 1000, text: "Opened http://localhost:3000/" },
+      { at: 2500, text: 'Clicked button "Deploy"' },
+      { at: 4000, text: 'Typed "fix" in input "Search"' },
     ];
     const withSteps = browserAgentContext(capture({ steps }), "/repo", true);
     const text = withSteps.entries[0].text;
@@ -542,7 +552,6 @@ describe("browserAgentContext", () => {
     const steps = [
       {
         at: 0,
-        kind: "open",
         text: "Opened http://user:hunter2@localhost:3000/app",
       },
     ];
