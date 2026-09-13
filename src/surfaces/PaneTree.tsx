@@ -155,16 +155,23 @@ type PaneDrag = {
 };
 
 const DRAG_THRESHOLD = 5;
-/** A leaf docked while a browser is expanded is snapped to the full band
- * on the edge it already hugs — the agent keeps its own position and
- * size along that edge instead of jumping to a fixed right column. */
+/** Compact dock size while a browser is expanded: ~24rem, capped at a
+ * fraction of the pane area so the dock never dominates a small window. */
+const DOCK_PX = 24 * 16;
+const DOCK_FRAC = 0.4;
+
+/** A leaf docked while a browser is expanded keeps the edge it already
+ * hugs, shrunk to a compact band; the expanded pane fills the rest. */
 type DockBand = {
   side: "left" | "right" | "top" | "bottom";
   agent: LayoutRect;
   rest: LayoutRect;
 };
 
-function dockBand(rect: LayoutRect): DockBand {
+function dockBand(
+  rect: LayoutRect,
+  tree: { w: number; h: number },
+): DockBand {
   const E = 1e-3;
   let side: DockBand["side"];
   if (rect.h > 1 - E && rect.y < E) {
@@ -182,30 +189,35 @@ function dockBand(rect: LayoutRect): DockBand {
       d[a] <= d[b] ? a : b,
     );
   }
+  const span = tree.w > 0 ? Math.min(DOCK_PX / tree.w, DOCK_FRAC) : DOCK_FRAC;
+  const spanY =
+    tree.h > 0 ? Math.min(DOCK_PX / tree.h, DOCK_FRAC) : DOCK_FRAC;
+  const w = Math.min(rect.w, span);
+  const h = Math.min(rect.h, spanY);
   switch (side) {
     case "left":
       return {
         side,
-        agent: { x: 0, y: 0, w: rect.w, h: 1 },
-        rest: { x: rect.w, y: 0, w: 1 - rect.w, h: 1 },
+        agent: { x: 0, y: 0, w, h: 1 },
+        rest: { x: w, y: 0, w: 1 - w, h: 1 },
       };
     case "right":
       return {
         side,
-        agent: { x: 1 - rect.w, y: 0, w: rect.w, h: 1 },
-        rest: { x: 0, y: 0, w: 1 - rect.w, h: 1 },
+        agent: { x: 1 - w, y: 0, w, h: 1 },
+        rest: { x: 0, y: 0, w: 1 - w, h: 1 },
       };
     case "top":
       return {
         side,
-        agent: { x: 0, y: 0, w: 1, h: rect.h },
-        rest: { x: 0, y: rect.h, w: 1, h: 1 - rect.h },
+        agent: { x: 0, y: 0, w: 1, h },
+        rest: { x: 0, y: h, w: 1, h: 1 - h },
       };
     default:
       return {
         side,
-        agent: { x: 0, y: 1 - rect.h, w: 1, h: rect.h },
-        rest: { x: 0, y: 0, w: 1, h: 1 - rect.h },
+        agent: { x: 0, y: 1 - h, w: 1, h },
+        rest: { x: 0, y: 0, w: 1, h: 1 - h },
       };
   }
 }
@@ -286,6 +298,19 @@ function PaneTreeComponent({
     setDraft(null);
   }, [layout]);
 
+  // The expanded-browser dock needs pixel bounds; rects stay fractional.
+  const [treeSize, setTreeSize] = useState({ w: 0, h: 0 });
+  useEffect(() => {
+    const el = treeRef.current;
+    if (!el) return;
+    const update = () =>
+      setTreeSize({ w: el.clientWidth, h: el.clientHeight });
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
   // A sash drag re-renders this tree every frame. `SessionPane` compares props
   // shallowly, so handing it a fresh drag handler each frame would re-render
   // the whole session subtree (transcript, composer, picker) per frame.
@@ -306,8 +331,8 @@ function PaneTreeComponent({
   const sashes = layoutSashes(tree);
   const inSplit = leaves.length > 1;
   // A browser tab flagged `expanded` zooms its leaf over the tree —
-  // tmux-style pane zoom — while the focused session keeps its own edge:
-  // docked as the full band it already occupies, everything else covered.
+  // tmux-style pane zoom — while the focused session keeps its own edge,
+  // shrunk to a compact dock band; everything else stays covered.
   // Other leaves stay mounted underneath (sessions keep running,
   // composers keep drafts); only their native webviews must be told to
   // hide via `occluded`.
@@ -325,7 +350,8 @@ function PaneTreeComponent({
           )?.id)
     : undefined;
   const chatRect = leaves.find((leaf) => leaf.id === chatLeafId)?.rect;
-  const band = expandedLeafId && chatRect ? dockBand(chatRect) : null;
+  const band =
+    expandedLeafId && chatRect ? dockBand(chatRect, treeSize) : null;
   // A session spanning nearly the whole area leaves a useless sliver —
   // expand fully and let it stay covered instead.
   const dock = band && band.rest.w > 0.05 && band.rest.h > 0.05 ? band : null;
