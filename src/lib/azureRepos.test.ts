@@ -13,6 +13,7 @@ import {
   saveAzurePrAssociation,
   type AzurePrAssociation,
 } from "./azureRepos";
+import { loadWatchers, removeWatcher } from "./watchers";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 beforeEach(() => {
@@ -306,4 +307,81 @@ it("discovers multiple story PRs before branch matches, deduplicates identity, a
     loadAzurePrAssociation(association.cwd, "feature", "session-a")?.target
       .number,
   ).toBe(13);
+});
+
+it("auto-watches a newly linked PR and lifts the watcher on unlink", () => {
+  saveAzurePrAssociation(
+    association,
+    association.cwd,
+    "feature",
+    "session-a",
+  );
+  const watchers = loadWatchers();
+  expect(watchers).toHaveLength(1);
+  expect(watchers[0].auto).toBe(true);
+  expect(watchers[0].source).toEqual({
+    kind: "azure-pr",
+    target: association.target,
+    projectName: "Project",
+    repositoryName: "repo",
+    cwd: association.cwd,
+    branch: "feature",
+    sessionId: "session-a",
+  });
+  saveAzurePrAssociation(
+    null,
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  expect(loadWatchers()).toHaveLength(0);
+});
+
+it("does not resurrect a removed watcher on refresh; terminal status lifts it", () => {
+  saveAzurePrAssociation(
+    association,
+    association.cwd,
+    "feature",
+    "session-a",
+  );
+  const watcher = loadWatchers()[0];
+  removeWatcher(watcher.id);
+  // A re-save of the same scope+target is a refresh — no resurrection.
+  saveAzurePrAssociation(
+    association,
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  expect(loadWatchers()).toHaveLength(0);
+  // Unlinked and re-linked later, then re-read as abandoned — it leaves.
+  saveAzurePrAssociation(
+    null,
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  saveAzurePrAssociation(association, association.cwd, "feature", "session-a");
+  expect(loadWatchers()).toHaveLength(1);
+  saveAzurePrAssociation(
+    { ...association, pr: { ...association.pr, status: "abandoned" } },
+    association.cwd,
+    "feature",
+    "session-a",
+    association.target,
+  );
+  expect(loadWatchers()).toHaveLength(0);
+});
+
+it("never auto-watches a link that is already terminal", () => {
+  saveAzurePrAssociation(
+    { ...association, pr: { ...association.pr, status: "completed" } },
+    association.cwd,
+    "feature",
+    "session-a",
+  );
+  expect(loadWatchers()).toHaveLength(0);
 });

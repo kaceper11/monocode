@@ -13,6 +13,7 @@ import {
   type CiRun,
   type CiSource,
 } from "./azurePipelines";
+import { loadWatchers, removeWatcher } from "./watchers";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 beforeEach(() => {
   const rows = new Map<string, string>();
@@ -148,4 +149,33 @@ it("binds selected log reads and handoff to exact run, attempt, head and source 
   expect(JSON.stringify(context)).toContain("wsl://Ubuntu/work/repo");
   expect(JSON.stringify(context)).toContain("session owner");
   expect(context.entries[0].truncated).toBe(true);
+});
+
+it("auto-watches newly linked pipelines and lifts them when the scope drops them", () => {
+  saveCiSources([source], source.cwd, source.branch, source.session);
+  const watchers = loadWatchers();
+  expect(watchers).toHaveLength(1);
+  expect(watchers[0].auto).toBe(true);
+  expect(watchers[0].source).toEqual({
+    kind: "azure-ci",
+    target: source.target,
+    definitionName: "Tests",
+    remote: source.remote,
+    cwd: source.cwd,
+    branch: source.branch,
+    sessionId: "owner",
+  });
+  // Re-saving the same set is a refresh — no duplicate.
+  saveCiSources([source], source.cwd, source.branch, source.session);
+  expect(loadWatchers()).toHaveLength(1);
+  // Dropping the source lifts its watcher.
+  saveCiSources([], source.cwd, source.branch, source.session);
+  expect(loadWatchers()).toHaveLength(0);
+});
+
+it("a hand-removed watcher is not resurrected by a source re-save", () => {
+  saveCiSources([source], source.cwd, source.branch, source.session);
+  removeWatcher(loadWatchers()[0].id);
+  saveCiSources([source], source.cwd, source.branch, source.session);
+  expect(loadWatchers()).toHaveLength(0);
 });

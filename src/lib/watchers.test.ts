@@ -1,12 +1,17 @@
 // @vitest-environment happy-dom
-import { beforeEach, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { emitAttention, emittedAttention } from "./attention";
 import {
+  ensureDeliveryWatcher,
   loadWatchers,
   removeWatcher,
   saveWatcher,
   setWatcherEnabled,
+  syncCiWatchers,
+  unwatchAzurePrDelivery,
+  unwatchDeliveryScope,
   updateWatcher,
+  watchGithubPrUrl,
   watcherPollKey,
   MAX_WATCHER_SEEN,
   type Watcher,
@@ -194,4 +199,157 @@ it("poll key shares fetches only across identical bindings", () => {
     draft({ source: { ...prSource, sessionId: "s1" } }),
   ).watcher!;
   expect(watcherPollKey(a)).not.toBe(watcherPollKey(b));
+});
+
+describe("produced-delivery auto watchers", () => {
+  const GH_PR: WatcherSource = {
+    kind: "github-pr",
+    cwd: "/repo",
+    repo: "acme/app",
+    number: 9,
+    sessionId: "s1",
+  };
+  const AZURE_TARGET = {
+    site: "https://dev.azure.com/team",
+    accountId: "a",
+    project: "p",
+    repository: "r",
+    number: 7,
+  };
+  const AZURE_PR: WatcherSource = {
+    kind: "azure-pr",
+    target: AZURE_TARGET,
+    projectName: "P",
+    repositoryName: "R",
+    cwd: "/repo",
+    branch: "feat",
+    sessionId: "s1",
+  };
+  const CI_TARGET = {
+    site: "https://dev.azure.com/team",
+    accountId: "a",
+    project: "p",
+    definition: 5,
+    repositoryId: "r",
+    repositoryType: "TfsGit",
+    repositoryUrl: "https://dev.azure.com/team/p/_git/r",
+  };
+  const CI: WatcherSource = {
+    kind: "azure-ci",
+    target: CI_TARGET,
+    definitionName: "Tests",
+    remote: CI_TARGET.repositoryUrl,
+    cwd: "/repo",
+    branch: "feat",
+    sessionId: "s1",
+  };
+  const ciSource = {
+    target: CI_TARGET,
+    definitionName: "Tests",
+    projectName: "P",
+    remote: CI_TARGET.repositoryUrl,
+    cwd: "/repo",
+    branch: "feat",
+    session: "s1",
+  };
+
+  it("registers a notify watcher marked auto for each delivery kind", () => {
+    for (const source of [GH_PR, AZURE_PR, CI]) ensureDeliveryWatcher(source);
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(3);
+    for (const watcher of watchers) {
+      expect(watcher.auto).toBe(true);
+      expect(watcher.mode).toBe("notify");
+      expect(watcher.enabled).toBe(true);
+    }
+    expect(watchers[0].source).toEqual(GH_PR);
+    expect(watchers[1].source).toEqual(AZURE_PR);
+    expect(watchers[2].source).toEqual(CI);
+  });
+
+  it("dedupes a re-save and a hand-made watcher for the same delivery", () => {
+    ensureDeliveryWatcher(GH_PR);
+    ensureDeliveryWatcher({ ...GH_PR, sessionId: "other" });
+    expect(loadWatchers()).toHaveLength(1);
+    // A manually created watcher for the same PR blocks the auto one.
+    localStorage.clear();
+    saveWatcher(draft({ source: GH_PR }));
+    ensureDeliveryWatcher(GH_PR);
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].auto).toBeUndefined();
+    // And a paused auto watcher is not duplicated either.
+    localStorage.clear();
+    ensureDeliveryWatcher(GH_PR);
+    setWatcherEnabled(loadWatchers()[0].id, false);
+    ensureDeliveryWatcher(GH_PR);
+    expect(loadWatchers()).toHaveLength(1);
+  });
+
+  it("parses a created GitHub PR URL into a watcher and ignores issues", () => {
+    watchGithubPrUrl("/repo", "https://github.com/Acme/App/pull/42", "s1");
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).toEqual({
+      kind: "github-pr",
+      cwd: "/repo",
+      repo: "Acme/App",
+      number: 42,
+      sessionId: "s1",
+    });
+    watchGithubPrUrl("/repo", "https://github.com/acme/app/issues/42");
+    expect(loadWatchers()).toHaveLength(1);
+  });
+
+  it("lifts auto watchers bound to a gone task scope, sparing hand-made and unrelated ones", () => {
+    ensureDeliveryWatcher(GH_PR); // session s1, cwd /repo
+    ensureDeliveryWatcher({ ...GH_PR, sessionId: "s2", cwd: "/other" });
+    saveWatcher(draft({ source: GH_PR, name: "Manual" }));
+    unwatchDeliveryScope({ sessionIds: ["s1"], cwds: [] });
+    let watchers = loadWatchers();
+    expect(watchers).toHaveLength(2); // manual /repo + auto /other
+    expect(watchers.map((watcher) => watcher.name)).toContain("Manual");
+    unwatchDeliveryScope({ cwds: ["/other"] });
+    watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].name).toBe("Manual");
+  });
+
+  it("unwatchAzurePrDelivery lifts only the matching scope+target", () => {
+    ensureDeliveryWatcher(AZURE_PR);
+    ensureDeliveryWatcher({ ...AZURE_PR, sessionId: undefined, branch: "main" });
+    expect(loadWatchers()).toHaveLength(2);
+    unwatchAzurePrDelivery(AZURE_TARGET, "/repo", "feat", "s1");
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).toMatchObject({ branch: "main" });
+  });
+
+  it("syncCiWatchers registers new sources, lifts departed ones, never resurrects", () => {
+    syncCiWatchers([], [ciSource], "/repo", "feat", "s1");
+    expect(loadWatchers()).toHaveLength(1);
+    const id = loadWatchers()[0].id;
+    // Re-saving the same set changes nothing.
+    syncCiWatchers([ciSource], [ciSource], "/repo", "feat", "s1");
+    expect(loadWatchers()).toHaveLength(1);
+    // A hand-removed watcher is not resurrected by a refresh.
+    removeWatcher(id);
+    syncCiWatchers([ciSource], [ciSource], "/repo", "feat", "s1");
+    expect(loadWatchers()).toHaveLength(0);
+    // Removing the source lifts its watcher; a second source survives.
+    ensureDeliveryWatcher(CI);
+    const other = {
+      ...ciSource,
+      target: { ...CI_TARGET, definition: 6 },
+    };
+    syncCiWatchers([ciSource], [ciSource, other], "/repo", "feat", "s1");
+    expect(loadWatchers()).toHaveLength(2);
+    syncCiWatchers([ciSource, other], [other], "/repo", "feat", "s1");
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).toMatchObject({
+      kind: "azure-ci",
+      target: { definition: 6 },
+    });
+  });
 });

@@ -38,6 +38,7 @@ import {
   updateTask,
   updateTaskChild,
 } from "./taskWorkspaces";
+import { ensureDeliveryWatcher, loadWatchers, saveWatcher } from "./watchers";
 
 function family(commonDir: string, checkout: string): RepositoryFamily {
   return {
@@ -1053,5 +1054,110 @@ describe("suggestTaskBranch", () => {
     );
     expect(suggestTaskBranch("Fix — auth", refs)).toBe("fix-auth");
     expect(suggestTaskBranch("", [])).toBe("task");
+  });
+});
+
+describe("delivery watcher teardown", () => {
+  const autoGhPr = (cwd: string, number: number, sessionId?: string) =>
+    ensureDeliveryWatcher({
+      kind: "github-pr",
+      cwd,
+      repo: "acme/app",
+      number,
+      ...(sessionId ? { sessionId } : {}),
+    });
+  const autoCi = (cwd: string, sessionId?: string) =>
+    ensureDeliveryWatcher({
+      kind: "azure-ci",
+      target: {
+        site: "https://dev.azure.com/team",
+        accountId: "a",
+        project: "p",
+        definition: 5,
+        repositoryId: "r",
+        repositoryType: "TfsGit",
+        repositoryUrl: "u",
+      },
+      definitionName: "Tests",
+      remote: "u",
+      cwd,
+      branch: "feat",
+      ...(sessionId ? { sessionId } : {}),
+    });
+
+  it("lifts a task's auto watchers on archive — and they stay lifted", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    updateTaskChild(task.id, task.children[0].id, { sessionIds: ["s1"] });
+    autoGhPr("/tmp/app-copy", 3, "s1"); // session-bound
+    autoCi("/tmp/app-copy"); // checkout-bound, no session
+    autoGhPr("/elsewhere", 4, "s9"); // unrelated
+    expect(loadWatchers()).toHaveLength(3);
+    archiveTask(task.id);
+    expect(loadWatchers().map((watcher) => watcher.source)).toEqual([
+      expect.objectContaining({ cwd: "/elsewhere" }),
+    ]);
+    archiveTask(task.id, false);
+    expect(loadWatchers()).toHaveLength(1); // no resurrection
+  });
+
+  it("lifts a removed task's watchers and keeps hand-made ones", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    autoGhPr("/tmp/app-copy", 3);
+    saveWatcher({
+      name: "Manual",
+      source: { kind: "github-pr", cwd: "/tmp/app-copy", repo: "acme/app", number: 8 },
+      enabled: true,
+      mode: "notify",
+      intervalSec: 300,
+      cooldownSec: 900,
+    });
+    removeTask(task.id);
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].name).toBe("Manual");
+  });
+
+  it("lifts only the removed child's scope", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+        { repositoryId: lib.id, mode: "existing", workingCopy: "/tmp/lib-copy" },
+      ],
+    });
+    autoGhPr("/tmp/app-copy", 3);
+    autoGhPr("/tmp/lib-copy", 4);
+    removeTaskChild(task.id, task.children[0].id);
+    expect(loadWatchers().map((watcher) => watcher.source)).toEqual([
+      expect.objectContaining({ cwd: "/tmp/lib-copy" }),
+    ]);
+  });
+
+  it("lifts session-bound watchers when the session is pruned", () => {
+    autoGhPr("/tmp/app-copy", 3, "s1");
+    autoGhPr("/tmp/app-copy", 4, "s2");
+    pruneTaskSession("s1");
+    expect(loadWatchers().map((watcher) => watcher.source)).toEqual([
+      expect.objectContaining({ sessionId: "s2" }),
+    ]);
   });
 });

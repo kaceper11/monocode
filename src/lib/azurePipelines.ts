@@ -1,6 +1,7 @@
 export const AZURE_CI_SOURCES_CHANGED = "monocode:azure-ci-sources";
 import { invoke } from "@tauri-apps/api/core";
 import { contextFromText } from "./agentContext";
+import { syncCiWatchers } from "./watchers";
 
 export type CiTarget = {
   site: string;
@@ -278,22 +279,29 @@ export function saveCiSources(
   branch: string,
   session?: string,
 ) {
-  let others: CiSource[] = [];
+  let rows: CiSource[] = [];
   try {
-    const rows = JSON.parse(localStorage.getItem(KEY) ?? "[]");
-    if (Array.isArray(rows))
-      others = rows.filter(
-        (row) =>
-          row &&
-          ciScope(row.cwd, row.branch, row.session) !==
-            ciScope(cwd, branch, session),
-      );
+    const stored = JSON.parse(localStorage.getItem(KEY) ?? "[]");
+    if (Array.isArray(stored)) rows = stored;
   } catch {
     /* Recover this feature's malformed cache. */
   }
+  const scope = ciScope(cwd, branch, session);
+  // Scope members before this write — `syncCiWatchers` diffs them against the
+  // new set so only first-time links register and departed ones are lifted.
+  const previous = rows.filter(
+    (row) =>
+      row &&
+      row.target &&
+      ciScope(row.cwd, row.branch, row.session) === scope,
+  );
+  const others = rows.filter(
+    (row) => row && ciScope(row.cwd, row.branch, row.session) !== scope,
+  );
   localStorage.setItem(
     KEY,
     JSON.stringify([...sources.slice(0, 20), ...others].slice(0, 100)),
   );
   if (typeof window !== "undefined") window.dispatchEvent(new Event(AZURE_CI_SOURCES_CHANGED));
+  syncCiWatchers(previous, sources.slice(0, 20), cwd, branch, session);
 }

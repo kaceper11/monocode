@@ -67,6 +67,7 @@ import {
   type TaskChild,
   type TaskWorkspace,
 } from "../lib/taskWorkspaces";
+import { watchGithubPrUrl } from "../lib/watchers";
 import { repositoryDisplayName } from "../lib/projects";
 import { useProjectBranchesState } from "../hooks/useProjectBranches";
 import { Modal } from "./Modal";
@@ -573,6 +574,11 @@ export function TaskPrSheet({
         const isDraft = draft?.draft === true;
         if (provider === "github") {
           const url = await gitPrCreate(cwd, title, body, target, branch, isDraft);
+          watchGithubPrUrl(
+            cwd,
+            url,
+            task?.sessionIds?.[0] ?? row.child.sessionIds[0],
+          );
           saveTaskPrDraft(taskId, id, {
             target,
             title,

@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { contextFromText, type AgentContext } from "./agentContext";
 import type { LinkedWorkItem } from "./session";
 import { sessionWorkItems } from "./sessionWorkItem";
+import { ensureDeliveryWatcher, unwatchAzurePrDelivery } from "./watchers";
 import type { AzureStatus } from "./azure";
 
 export type AzurePrTarget = {
@@ -555,6 +556,17 @@ export function saveAzurePrAssociation(
   } catch {
     /* Recover only this feature's malformed data. */
   }
+  // A re-save of an already-linked PR is a refresh — only a first-time link
+  // registers a watcher, so removing that watcher by hand sticks.
+  const linked = value?.target
+    ? rows.some(
+        (row) =>
+          row?.target &&
+          azurePrScope(row.cwd, row.branch, row.sourceSessionId) ===
+            azurePrScope(cwd, branch, session) &&
+          azurePrKey(row.target) === azurePrKey(value.target),
+      )
+    : false;
   rows = rows.filter(
     (row) =>
       row &&
@@ -578,4 +590,31 @@ export function saveAzurePrAssociation(
     });
   localStorage.setItem(ASSOCIATIONS_KEY, JSON.stringify(rows.slice(0, 100)));
   if (typeof window !== "undefined") window.dispatchEvent(new Event(AZURE_PR_ASSOCIATIONS_CHANGED));
+  // The saved link now owns a review watcher — created on first link, lifted
+  // on unlink or when a re-read reports the PR terminal. A same-target save
+  // (`value.target` == `removeTarget`) is a refresh: neither registers nor
+  // lifts, so the user's watcher state survives it.
+  const refreshed =
+    !!removeTarget &&
+    !!value?.target &&
+    azurePrKey(removeTarget) === azurePrKey(value.target);
+  if (removeTarget && !refreshed)
+    unwatchAzurePrDelivery(removeTarget, cwd, branch, session);
+  if (value) {
+    const sessionId = session ?? value.sourceSessionId;
+    if (value.pr.status === "active") {
+      if (!linked)
+        ensureDeliveryWatcher({
+          kind: "azure-pr",
+          target: value.target,
+          projectName: value.projectName,
+          repositoryName: value.repositoryName,
+          cwd,
+          branch,
+          ...(sessionId ? { sessionId } : {}),
+        });
+    } else {
+      unwatchAzurePrDelivery(value.target, cwd, branch, session);
+    }
+  }
 }

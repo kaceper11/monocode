@@ -5,6 +5,7 @@ import {
   type ProjectRepository,
 } from "./projects";
 import type { LinkedWorkItem } from "./session";
+import { unwatchDeliveryScope } from "./watchers";
 
 const KEY = "monocode.taskWorkspaces.v1";
 const EVENT = "monocode:task-workspaces-changed";
@@ -580,9 +581,15 @@ export function reviseTask(
   if (!project) throw new Error("Project no longer exists");
   const name = revision.name.trim();
   if (!name) throw new Error("Enter a task name");
+  const dropped: TaskChild[] = [];
   const next = updateTask(taskId, (current) => {
     const kept = current.children.filter((child) =>
       revision.keepRepositoryIds.includes(child.repositoryId),
+    );
+    dropped.push(
+      ...current.children.filter(
+        (child) => !revision.keepRepositoryIds.includes(child.repositoryId),
+      ),
     );
     const drafts = revision.additions.filter(
       (child) => child && child.repositoryId,
@@ -615,6 +622,7 @@ export function reviseTask(
     };
   });
   if (!next) throw new Error("Task no longer exists");
+  for (const child of dropped) unwatchDeliveryScope(childDeliveryScope(child));
   return next;
 }
 
@@ -698,6 +706,15 @@ export function removeTaskAttempt(taskId: string, attemptId: string) {
     throw new Error(
       "This attempt holds the task's last checkouts — remove the task instead.",
     );
+  const dropped = task.children.filter(
+    (child) => child.attemptId === attemptId,
+  );
+  unwatchDeliveryScope({
+    sessionIds: dropped.flatMap((child) => child.sessionIds),
+    cwds: dropped.flatMap((child) =>
+      child.workingCopy ? [child.workingCopy] : [],
+    ),
+  });
   updateTask(taskId, (current) => {
     const removed = new Set(
       current.children
@@ -812,14 +829,39 @@ export function recordTaskActiveChild(taskId: string, childId: string) {
   );
 }
 
+/** Sessions and working copies a task's produced PR/CI links are bound to —
+ * the scope its auto watchers live in. */
+function taskDeliveryScope(task: TaskWorkspace) {
+  return {
+    sessionIds: [
+      ...(task.sessionIds ?? []),
+      ...task.children.flatMap((child) => child.sessionIds),
+    ],
+    cwds: task.children.flatMap((child) =>
+      child.workingCopy ? [child.workingCopy] : [],
+    ),
+  };
+}
+
+const childDeliveryScope = (child: TaskChild) => ({
+  sessionIds: child.sessionIds,
+  cwds: child.workingCopy ? [child.workingCopy] : [],
+});
+
 /** Removes the task record only — sessions, worktrees and branches stay. */
 export function removeTask(taskId: string) {
+  const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+  if (task) unwatchDeliveryScope(taskDeliveryScope(task));
   saveTaskWorkspaces(
-    loadTaskWorkspaces().filter((task) => task.id !== taskId),
+    loadTaskWorkspaces().filter((entry) => entry.id !== taskId),
   );
 }
 
 export function archiveTask(taskId: string, archived = true) {
+  if (archived) {
+    const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+    if (task) unwatchDeliveryScope(taskDeliveryScope(task));
+  }
   updateTask(taskId, (task) => ({ ...task, archived }));
 }
 
@@ -832,6 +874,8 @@ export function removeTaskChild(taskId: string, childId: string) {
     throw new Error(
       "This is the task's last repository checkout — remove the task instead.",
     );
+  const removed = task.children.find((child) => child.id === childId);
+  if (removed) unwatchDeliveryScope(childDeliveryScope(removed));
   updateTask(taskId, (task) => ({
     ...task,
     children: task.children.filter((child) => child.id !== childId),
@@ -865,6 +909,7 @@ export function pruneTaskSession(sessionId: string) {
     return { ...task, sessionIds, children };
   });
   if (changed) saveTaskWorkspaces(next);
+  unwatchDeliveryScope({ sessionIds: [sessionId] });
 }
 
 /** Reverse lookup — which task child owns an ordinary session. `cwd` is
