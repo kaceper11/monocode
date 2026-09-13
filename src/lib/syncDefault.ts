@@ -37,7 +37,7 @@ export function opLabel(op: string | undefined): string {
 }
 
 /** Execution host for confirmations and agent context — never guessed. */
-function syncHostLabel(cwd: string): string {
+export function syncHostLabel(cwd: string): string {
   const wsl = wslLocation(cwd);
   if (wsl) return `WSL · ${wsl.distribution}`;
   return IS_WIN ? "Windows" : IS_MAC ? "macOS" : "Linux";
@@ -77,6 +77,20 @@ function syncPreflightRefusal(index: GitDiffIndex): string | null {
   return null;
 }
 
+/** One flow per working copy at a time — dialogs don't block the UI, so
+ * without this a second menu click could stack confirmations while the
+ * first run still waits for an answer. */
+const syncInFlight = new Set<string>();
+
+/** Claim the working copy's sync slot for a sibling flow (the attention
+ * update path) so its confirmations can't overlap a menu/panel sync.
+ * Returns the release callback, or undefined when a sync is in flight. */
+export function acquireSyncSlot(cwd: string): (() => void) | undefined {
+  if (syncInFlight.has(cwd)) return undefined;
+  syncInFlight.add(cwd);
+  return () => syncInFlight.delete(cwd);
+}
+
 /**
  * Confirm → fetch → merge `remote/<default>` → report. Returns the raw
  * result (undefined when the user cancels). A failed pre-read throws —
@@ -95,6 +109,25 @@ export async function syncWithDefaultBranch(
     });
     return undefined;
   }
+  const release = acquireSyncSlot(target.cwd);
+  if (!release) {
+    await message(
+      "A sync or update is already running on this working copy — wait for it to finish.",
+      { title, kind: "warning" },
+    );
+    return undefined;
+  }
+  try {
+    return await runSync(target, title);
+  } finally {
+    release();
+  }
+}
+
+async function runSync(
+  target: SyncTarget,
+  title: string,
+): Promise<GitSyncResult | undefined> {
   const index = await gitDiffIndex(target.cwd);
   const refusal = syncPreflightRefusal(index);
   if (refusal) {
@@ -117,8 +150,14 @@ export async function syncWithDefaultBranch(
   switch (result.outcome) {
     case "merged": {
       const list = result.commits.slice(0, 10).join("\n");
+      // commitCount is exact even when the subject list is capped —
+      // say so rather than presenting a truncated list as complete.
+      const more =
+        result.commitCount > result.commits.slice(0, 10).length
+          ? `\n… and ${result.commitCount - result.commits.slice(0, 10).length} more`
+          : "";
       await message(
-        `Merged ${result.syncedWith} into ${result.branch} — ${result.commitCount} incoming commit${result.commitCount === 1 ? "" : "s"}${list ? `:\n${list}` : "."}\n\nNothing was pushed.`,
+        `Merged ${result.syncedWith} into ${result.branch} — ${result.commitCount} incoming commit${result.commitCount === 1 ? "" : "s"}${list ? `:\n${list}${more}` : "."}\n\nNothing was pushed.`,
         { title },
       );
       break;
@@ -156,10 +195,13 @@ export async function offerMergeResolution(
 ): Promise<void> {
   const title = target.title || "Merge conflicts";
   const list = conflicts.slice(0, 10).join("\n");
+  // The backend caps at 100 — at the cap the count is honest but the list
+  // is truncated; the shown slice is capped at 10 either way.
+  const count = conflicts.length === 100 ? "100+" : `${conflicts.length}`;
   const action =
     op === "rebase" ? `Rebasing onto ${syncedWith}` : `Merging ${syncedWith}`;
   const send = await ask(
-    `${action} left ${conflicts.length} conflicted file${conflicts.length === 1 ? "" : "s"}${list ? `:\n${list}` : ""}\n\nThe conflicted state is preserved in the working copy. Send the merge context to ${target.sessionId ? "the owning conversation" : "an agent"}?`,
+    `${action} left ${count} conflicted file${conflicts.length === 1 ? "" : "s"}${list ? `:\n${list}` : ""}\n\nThe conflicted state is preserved in the working copy. Send the merge context to ${target.sessionId ? "the owning conversation" : "an agent"}?`,
     {
       title,
       kind: "warning",
@@ -213,6 +255,10 @@ export async function sendMergeConflictsToAgent(
   const paths = merge.conflicts.length
     ? merge.conflicts.join("\n")
     : "(no unmerged paths — the operation is still in progress)";
+  // The backend caps the list at 100 — at the cap, say so rather than
+  // presenting a truncated list as complete.
+  const countLabel =
+    merge.conflicts.length === 100 ? "first 100" : `${merge.conflicts.length}`;
   const text = [
     `A ${op.toLowerCase()} in ${branch} stopped with conflicts in this working copy. Resolve it in place — preserve both sides' intent, then run the checks this repository offers.`,
     "",
@@ -221,7 +267,7 @@ export async function sendMergeConflictsToAgent(
     `Branch: ${branch}`,
     `Operation: ${op.toLowerCase()}`,
     `Incoming head: ${incoming ?? "unknown"}`,
-    `Conflicted paths (${merge.conflicts.length}):`,
+    `Conflicted paths (${countLabel}):`,
     paths,
     "",
     `Work only in this working copy and host. Do not abort the ${op.toLowerCase()}, do not commit or push — stage resolved files and leave the tree ready for review in the diff view.`,
@@ -257,10 +303,13 @@ export async function sendMergeConflictsToAgent(
   return true;
 }
 
-/** Explicit abort of the operation in progress — always confirmed. */
+/** Explicit abort of the operation in progress — always confirmed. The
+ * uncached merge context names the real op (a 1.5s-stale index could
+ * mislabel it) and short-circuits a stale banner when nothing is running. */
 export async function abortMerge(target: SyncTarget): Promise<boolean> {
-  const index = await gitDiffIndex(target.cwd).catch(() => null);
-  const op = opLabel(index?.op).toLowerCase();
+  const merge = await gitMergeContext(target.cwd).catch(() => null);
+  if (merge && !merge.merging) return false;
+  const op = opLabel(merge?.op).toLowerCase();
   if (
     !(await ask(
       `Abort the ${op} in ${target.cwd} and restore the previous state?`,

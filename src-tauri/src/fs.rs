@@ -515,9 +515,15 @@ pub async fn git_update_from_default(
     cwd: String,
     mode: String,
     base: Option<String>,
+    expected_branch: Option<String>,
 ) -> Result<GitUpdateResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let outcome = git_merge_incoming(&expand_home(&cwd), &mode, base.as_deref(), None)?;
+        let outcome = git_merge_incoming(
+            &expand_home(&cwd),
+            &mode,
+            base.as_deref(),
+            expected_branch.as_deref(),
+        )?;
         if outcome.outcome == "refused" {
             return Err(outcome.reason);
         }
@@ -619,33 +625,38 @@ fn git_merge_context_for(root: &Path) -> Result<GitMergeContext, String> {
     }
     let state = git_op_state_uncached(root);
     let conflicts = git_unmerged_paths(root);
-    // The ref the merge is actually applying — resolved from MERGE_HEAD,
-    // not assumed to be the remote default.
-    let incoming_ref = if state.op == "merge" {
+    // The ref the operation is actually applying — a merge's MERGE_HEAD, a
+    // rebase's recorded onto commit — resolved from live state, never
+    // assumed to be the remote default.
+    let incoming_head: Option<String> = match state.op {
+        "merge" => git_stdout(root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]),
+        "rebase" => git_rebase_onto(root),
+        _ => None,
+    };
+    let incoming_ref = incoming_head.and_then(|head| {
         git_run(
             root,
             &[
                 "for-each-ref",
                 "--format=%(refname:short)",
                 "--points-at",
-                "MERGE_HEAD",
+                &head,
                 "refs/remotes/",
             ],
         )
         .and_then(|text| text.lines().next().map(str::to_string))
-    } else {
-        None
-    };
+    });
     let diff = if conflicts.is_empty() {
         String::new()
     } else {
-        // `:(top)` anchors each pathspec at the repository root —
+        // `:(top,literal)` anchors each pathspec at the repository root —
         // `conflicts` is root-relative while the checkout may be a
-        // subdirectory.
+        // subdirectory — and matches the name literally so glob magic or
+        // a leading `:(` in a filename cannot misfire.
         let specs: Vec<String> = conflicts
             .iter()
             .take(40)
-            .map(|path| format!(":(top){path}"))
+            .map(|path| format!(":(top,literal){path}"))
             .collect();
         let mut args = vec!["diff", "--"];
         args.extend(specs.iter().map(String::as_str));
@@ -704,16 +715,12 @@ fn git_op_state_uncached(root: &Path) -> GitOpState {
         };
     }
     // Rebase before cherry-pick/revert: the sequencer can share those head
-    // files, and a rebase must be aborted as a rebase. A conflicted rebase
-    // may carry no REBASE_HEAD at all — `--show-current-patch` still sees
-    // the rebase-merge/rebase-apply state (and works over WSL, where a
-    // `--git-path` result isn't a host path).
+    // files, and a rebase must be aborted as a rebase. Directory existence
+    // is the reliable signal — a rebase stopped at `break`/`exec` and a
+    // mid-run `git am` carry neither REBASE_HEAD nor a current patch.
     let rebase_head = head("REBASE_HEAD");
-    if rebase_head.is_some()
-        || git_command_output(root, &["rebase", "--show-current-patch"])
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    {
+    let (merge_dir, apply_dir) = git_rebase_dirs(root);
+    if rebase_head.is_some() || merge_dir || apply_dir {
         return GitOpState {
             op: "rebase",
             head: rebase_head,
@@ -789,11 +796,15 @@ fn git_abort_in_progress_inner(root: &Path) -> Result<(), String> {
     // Rebase before the sequencer heads: a rebase stopped on a pick can
     // also carry CHERRY_PICK_HEAD, and `cherry-pick --abort` would error
     // while the rebase stays wedged — it must be aborted as a rebase.
+    // `git am` shares the rebase-apply dir but needs `am --abort`.
+    let (merge_dir, apply_dir) = git_rebase_dirs(root);
     if git_stdout(root, &["rev-parse", "-q", "--verify", "REBASE_HEAD"]).is_some()
-        || git_command_output(root, &["rebase", "--show-current-patch"])
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+        || merge_dir
+        || apply_dir
     {
+        if apply_dir && !merge_dir && git_rebase_apply_is_am(root) {
+            return git_checked(root, &["am", "--abort"]);
+        }
         return git_checked(root, &["rebase", "--abort"]);
     }
     if git_stdout(root, &["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"]).is_some() {
@@ -802,7 +813,7 @@ fn git_abort_in_progress_inner(root: &Path) -> Result<(), String> {
     if git_stdout(root, &["rev-parse", "-q", "--verify", "REVERT_HEAD"]).is_some() {
         return git_checked(root, &["revert", "--abort"]);
     }
-    Err("No merge or rebase in progress.".into())
+    Err("No merge, rebase, cherry-pick or revert in progress.".into())
 }
 
 /// One merge-into-checkout run per working copy across `git_sync_branch`,
@@ -898,24 +909,78 @@ impl GitMergeOutcome {
 const GIT_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 const GIT_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// An entry inside the worktree's gitdir, on the owning host — a host
+/// path, or a WSL location bound to the guest path for bridge requests.
+enum GitDirEntry {
+    Host(PathBuf),
+    Wsl(wsl::Location),
+}
+
+fn git_dir_entry(root: &Path, name: &str) -> Option<GitDirEntry> {
+    let gitdir = git_stdout(root, &["rev-parse", "--absolute-git-dir"])?;
+    let path = format!("{gitdir}/{name}");
+    match wsl::path_location(root).ok().flatten() {
+        Some(location) => location.with_path(&path).ok().map(GitDirEntry::Wsl),
+        None => Some(GitDirEntry::Host(PathBuf::from(path))),
+    }
+}
+
+/// The commit an in-progress rebase was started onto — git records it in
+/// `rebase-merge/onto` (or `rebase-apply/onto`) inside the worktree's own
+/// gitdir.
+fn git_rebase_onto(root: &Path) -> Option<String> {
+    for name in ["rebase-merge/onto", "rebase-apply/onto"] {
+        let text = match git_dir_entry(root, name)? {
+            GitDirEntry::Host(path) => std::fs::read_to_string(path).ok(),
+            GitDirEntry::Wsl(file) => wsl::request::<String>(&file, "read_text", json!({})).ok(),
+        };
+        if let Some(text) = text {
+            return Some(text.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Rebase state directories — `rebase-merge` for the merge backend,
+/// `rebase-apply` for `git am` and the apply backend. Existence is the
+/// reliable signal: a rebase stopped at `break`/`exec` or a mid-run
+/// `git am` carries neither `REBASE_HEAD` nor a current patch, so
+/// `rebase --show-current-patch` misses it entirely.
+fn git_rebase_dirs(root: &Path) -> (bool, bool) {
+    let exists = |name: &str| match git_dir_entry(root, name) {
+        Some(GitDirEntry::Host(path)) => path.is_dir(),
+        // `canonical` resolves only when the guest path exists.
+        Some(GitDirEntry::Wsl(dir)) => wsl::path_request(&dir, "canonical", json!({})).is_ok(),
+        None => false,
+    };
+    (exists("rebase-merge"), exists("rebase-apply"))
+}
+
+/// Which apply lane a `rebase-apply` state belongs to — `git am` sets the
+/// `applying` marker and must be aborted with `am --abort`; a rebase-apply
+/// rebase leaves it absent.
+fn git_rebase_apply_is_am(root: &Path) -> bool {
+    match git_dir_entry(root, "rebase-apply/applying") {
+        Some(GitDirEntry::Host(path)) => path.is_file(),
+        Some(GitDirEntry::Wsl(file)) => wsl::path_request(&file, "canonical", json!({})).is_ok(),
+        None => false,
+    }
+}
+
 /// True only when the operation in progress is provably the one this run
-/// just started — a merge of ours always records the FETCH_HEAD we fetched
-/// as MERGE_HEAD. Anything else belongs to the user (a merge started in a
-/// terminal while this one was in flight) and must be left untouched.
+/// just started — a merge of ours records the FETCH_HEAD we fetched as
+/// MERGE_HEAD, a rebase of ours records it as the onto commit. Anything
+/// else belongs to the user (an operation started in a terminal while
+/// this one was in flight) and must be left untouched.
 fn git_own_op_in_progress(root: &Path, mode: &str) -> bool {
     let verify = |name: &str| git_stdout(root, &["rev-parse", "-q", "--verify", name]);
+    let Some(fetched) = verify("FETCH_HEAD") else {
+        return false;
+    };
     if mode == "merge" {
-        let merge_head = verify("MERGE_HEAD");
-        return merge_head.is_some() && merge_head == verify("FETCH_HEAD");
+        return verify("MERGE_HEAD").as_deref() == Some(fetched.as_str());
     }
-    // Our rebase leaves rebase state and no foreign merge head. A foreign
-    // rebase started in the same instant is indistinguishable — accepted,
-    // the window is the gap between the entry check and `git rebase`.
-    verify("MERGE_HEAD").is_none()
-        && (verify("REBASE_HEAD").is_some()
-            || git_command_output(root, &["rebase", "--show-current-patch"])
-                .map(|output| output.status.success())
-                .unwrap_or(false))
+    git_rebase_onto(root).as_deref() == Some(fetched.as_str())
 }
 
 fn git_merge_incoming(
@@ -968,25 +1033,38 @@ fn git_merge_incoming(
         Some(raw) => {
             let name = raw.trim().trim_start_matches("refs/heads/");
             let remotes = git_remote_names(root);
-            let (remote, name) = match name.split_once('/') {
-                Some((prefix, rest))
-                    if !rest.is_empty() && remotes.iter().any(|item| item == prefix) =>
-                {
-                    (prefix.to_string(), rest.to_string())
-                }
-                _ => (
-                    remote.clone(),
-                    name.strip_prefix(&format!("{remote}/"))
-                        .unwrap_or(name)
-                        .to_string(),
-                ),
+            // A branch name that merely begins with another remote's name
+            // ("release/1.0" beside a "release" remote) stays on the default
+            // remote when its tracking ref exists; otherwise the longest
+            // configured remote prefix wins so "a/b/main" parses when the
+            // remote itself is "a/b".
+            let on_default = git_ref_exists(root, &format!("refs/remotes/{remote}/{name}"));
+            let (remote, name) = if on_default {
+                (remote.clone(), name.to_string())
+            } else if let Some((prefix, rest)) = remotes
+                .iter()
+                .filter_map(|item| {
+                    name.strip_prefix(&format!("{item}/"))
+                        .map(|rest| (item, rest))
+                })
+                .filter(|(_, rest)| !rest.is_empty())
+                .max_by_key(|(item, _)| item.len())
+            {
+                (prefix.clone(), rest.to_string())
+            } else {
+                (remote.clone(), name.to_string())
             };
-            // It becomes `git fetch <remote> <name>` argv — ":" is a refspec
-            // and a leading "-" or "+" mangles the fetch semantics.
+            // It becomes `git fetch <remote> <name>` argv — ":" is a refspec,
+            // a leading "-" or "+" mangles the fetch semantics, and "@{…}"
+            // expands to local reflog state, not the provider's branch.
             if name.is_empty() {
                 return Ok(GitMergeOutcome::refused("The base branch is empty."));
             }
-            if name.starts_with('-') || name.starts_with('+') || name.contains(':') {
+            if name.starts_with('-')
+                || name.starts_with('+')
+                || name.contains(':')
+                || name.contains("@{")
+            {
                 return Ok(GitMergeOutcome::refused(format!(
                     "'{name}' is not a remote branch name."
                 )));
@@ -1026,6 +1104,19 @@ fn git_merge_incoming(
         &["fetch", &fetch_remote, &base_name],
         GIT_FETCH_TIMEOUT,
     )?;
+    // The fetch window is long — re-verify before merging: an operation
+    // started in a terminal meanwhile must not be absorbed or unwound, and
+    // the confirmed branch may have moved.
+    if git_op_in_progress(root) {
+        return Ok(GitMergeOutcome::refused(
+            "An operation started in this working copy while fetching — nothing was merged. Resolve or abort it, then sync again.",
+        ));
+    }
+    if git_head_branch(root).as_deref() != Some(branch.as_str()) {
+        return Ok(GitMergeOutcome::refused(format!(
+            "The checkout moved off {branch} while fetching — nothing was merged. Confirm the sync again on the right branch."
+        )));
+    }
     // Custom fetch refspecs can leave `remote/base` stale or missing —
     // FETCH_HEAD always names the commit this fetch wrote.
     let synced_with = format!("{fetch_remote}/{base_name}");
@@ -1069,8 +1160,11 @@ fn git_merge_incoming(
         )
     } else {
         git_command_output_bounded(root, &["rebase", "FETCH_HEAD"], GIT_MERGE_TIMEOUT)
-    }?;
+    };
+    // A timed-out or killed run can leave op state behind — drop the
+    // cached answer before looking at the result.
     git_op_cache_forget(root);
+    let result = result?;
     if result.status.success() {
         return Ok(GitMergeOutcome {
             outcome: "merged",
@@ -4071,8 +4165,7 @@ fn git_command_output_bounded(
     crate::bounded_process::output(&mut git_command(root, args), timeout, 256 * 1024)
 }
 
-fn git_checked_bounded(root: &Path, args: &[&str], timeout: Duration) -> Result<(), String> {
-    let output = git_command_output_bounded(root, args, timeout)?;
+fn git_check_output(output: std::process::Output, args: &[&str]) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
     }
@@ -4089,22 +4182,12 @@ fn git_checked_bounded(root: &Path, args: &[&str], timeout: Duration) -> Result<
     Err(format!("git {} failed", args.join(" ")))
 }
 
+fn git_checked_bounded(root: &Path, args: &[&str], timeout: Duration) -> Result<(), String> {
+    git_check_output(git_command_output_bounded(root, args, timeout)?, args)
+}
+
 pub(crate) fn git_checked(root: &Path, args: &[&str]) -> Result<(), String> {
-    let output = git_command_output(root, args)?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let msg = stderr.trim();
-    if !msg.is_empty() {
-        return Err(msg.to_string());
-    }
-    let msg = stdout.trim();
-    if !msg.is_empty() {
-        return Err(msg.to_string());
-    }
-    Err(format!("git {} failed", args.join(" ")))
+    git_check_output(git_command_output(root, args)?, args)
 }
 
 fn git_blob(root: &Path, spec: &str) -> Option<Vec<u8>> {
@@ -4456,10 +4539,12 @@ fn git_default_branch(root: &Path, remote: Option<&str>) -> Option<String> {
                 &format!("refs/remotes/{remote}/HEAD"),
             ],
         ) {
-            if let Some((_, name)) = head.split_once('/') {
+            // Strip exactly this remote's prefix — remote names may contain
+            // "/" (e.g. "a/b/HEAD" → "a/b/main"), so a first-segment split
+            // would keep remote path segments in the branch name.
+            if let Some(name) = head.strip_prefix(&format!("{remote}/")) {
                 return Some(name.to_string());
             }
-            return Some(head);
         }
         for name in ["main", "master"] {
             if git_ref_exists(root, &format!("refs/remotes/{remote}/{name}")) {
@@ -7589,9 +7674,9 @@ mod tests {
                 .count(),
             1
         );
-        // The legacy command surfaces the same refusal as an error.
-        let legacy = git_merge_incoming(&work.0, "merge", None, None).unwrap();
-        assert_eq!(legacy.reason, outcome.reason);
+        // A second run reports the same refusal deterministically.
+        let again = git_merge_incoming(&work.0, "merge", None, None).unwrap();
+        assert_eq!(again.reason, outcome.reason);
         std::fs::remove_file(work.0.join("dirty.txt")).unwrap();
 
         // A merge already in progress is refused, not stacked.
@@ -7747,8 +7832,9 @@ mod tests {
             return;
         }
         // Provider data is not argv: a ":" would be a refspec, a leading
-        // "-" a fetch flag, and "+…" a forced update.
-        for bad in ["-x", "+main", "main:refs/heads/hacked", ".."] {
+        // "-" a fetch flag, "+…" a forced update, and "@{…}" a local
+        // reflog expansion resolved against the wrong branch.
+        for bad in ["-x", "+main", "main:refs/heads/hacked", "..", "@{-1}"] {
             let outcome = git_merge_incoming(&work.0, "merge", Some(bad), None).unwrap();
             assert_eq!(outcome.outcome, "refused", "base {bad:?}");
         }
@@ -7813,9 +7899,122 @@ mod tests {
         std::fs::write(git_dir.join("FETCH_HEAD"), format!("{other}\n")).unwrap();
         std::fs::write(git_dir.join("MERGE_HEAD"), format!("{other}\n")).unwrap();
         assert!(git_own_op_in_progress(&work.0, "merge"));
-        // And a foreign rebase in flight is not ours to abort either.
+        // A foreign rebase (onto a different base) is never ours to abort —
+        // `git rebase FETCH_HEAD` records the fetched commit as its onto.
         std::fs::remove_file(git_dir.join("MERGE_HEAD")).unwrap();
         assert!(!git_own_op_in_progress(&work.0, "merge"));
+        let rebase_merge = git_dir.join("rebase-merge");
+        std::fs::create_dir_all(&rebase_merge).unwrap();
+        std::fs::write(rebase_merge.join("onto"), format!("{head}\n")).unwrap();
+        assert!(!git_own_op_in_progress(&work.0, "rebase"));
+        std::fs::write(rebase_merge.join("onto"), format!("{other}\n")).unwrap();
+        assert!(git_own_op_in_progress(&work.0, "rebase"));
         let _ = git_abort_in_progress(&work.0);
+    }
+
+    #[test]
+    fn git_merge_incoming_rebase_conflicts_are_reported_as_rebase() {
+        let Some((remote, work)) = sync_pair("sync-rebase") else {
+            return;
+        };
+        if !git(&work.0, &["checkout", "-b", "feature"])
+            || !commit_file(&work.0, "f.txt", "a\nB-feat\nc\n", "feat change")
+            || !commit_file(&remote.0, "f.txt", "a\nB-main\nc\n", "main change")
+        {
+            return;
+        }
+        let outcome = git_merge_incoming(&work.0, "rebase", None, None).unwrap();
+        assert_eq!(outcome.outcome, "conflicted");
+        assert!(!outcome.conflicts.is_empty());
+        // The state is a rebase — detection, context and abort all agree.
+        let state = git_op_state_uncached(&work.0);
+        assert_eq!(state.op, "rebase");
+        let context = git_merge_context_for(&work.0).unwrap();
+        assert!(context.merging);
+        assert_eq!(context.op, "rebase");
+        git_abort_in_progress(&work.0).unwrap();
+        assert!(!git_op_state_uncached(&work.0).in_progress());
+    }
+
+    #[test]
+    fn git_merge_incoming_honors_a_remote_prefix_in_base() {
+        // A second remote whose main carries a unique commit — base
+        // "upstream/main" must fetch upstream, never origin.
+        let Some((remote, work)) = sync_pair("sync-prefix") else {
+            return;
+        };
+        // A clone shares history so the merge can run; its extra commit is
+        // only reachable through upstream/main.
+        let other = tmp("sync-prefix-upstream");
+        if !git(
+            &tmp("sync-prefix-clone-src").0,
+            &[
+                "clone",
+                &remote.0.to_string_lossy(),
+                &other.0.to_string_lossy(),
+            ],
+        ) || !commit_file(&other.0, "upstream.txt", "up\n", "upstream work")
+            || !git(
+                &work.0,
+                &["remote", "add", "upstream", &other.0.to_string_lossy()],
+            )
+        {
+            return;
+        }
+        let outcome = git_merge_incoming(&work.0, "merge", Some("upstream/main"), None).unwrap();
+        assert_eq!(outcome.outcome, "merged");
+        assert_eq!(outcome.synced_with, "upstream/main");
+        assert!(work.0.join("upstream.txt").exists());
+    }
+
+    #[test]
+    fn git_rebase_dirs_detect_states_without_a_head_or_patch() {
+        // A rebase stopped at `break`/`exec` and a mid-run `git am` carry
+        // neither REBASE_HEAD nor a current patch — only the state dirs.
+        let Some((_remote, work)) = sync_pair("sync-state-dirs") else {
+            return;
+        };
+        let git_dir = work.0.join(".git");
+        assert!(!git_op_state_uncached(&work.0).in_progress());
+        std::fs::create_dir(git_dir.join("rebase-merge")).unwrap();
+        let state = git_op_state_uncached(&work.0);
+        assert_eq!(state.op, "rebase");
+        std::fs::remove_dir(git_dir.join("rebase-merge")).unwrap();
+        let apply = git_dir.join("rebase-apply");
+        std::fs::create_dir(&apply).unwrap();
+        assert_eq!(git_op_state_uncached(&work.0).op, "rebase");
+        std::fs::remove_dir(&apply).unwrap();
+        assert!(!git_op_state_uncached(&work.0).in_progress());
+    }
+
+    #[test]
+    fn git_am_state_is_detected_and_aborted_via_am() {
+        let Some((_remote, work)) = sync_pair("sync-am") else {
+            return;
+        };
+        // A patch whose context doesn't apply leaves rebase-apply state
+        // with the `applying` marker — `rebase --abort` refuses it; only
+        // `am --abort` unwinds it.
+        if !commit_file(&work.0, "f.txt", "base\n", "base")
+            || !commit_file(&work.0, "f.txt", "patched\n", "patched")
+            || !git(&work.0, &["format-patch", "-1", "HEAD", "-o", "."])
+            || !commit_file(&work.0, "f.txt", "other\n", "other")
+        {
+            return;
+        }
+        let patch = std::fs::read_dir(&work.0)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".patch"))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned());
+        let Some(patch) = patch else { return };
+        assert!(git_command_output(&work.0, &["am", &patch])
+            .map(|output| !output.status.success())
+            .unwrap_or(false));
+        let state = git_op_state_uncached(&work.0);
+        assert_eq!(state.op, "rebase", "am state must be detected");
+        git_abort_in_progress(&work.0).unwrap();
+        assert!(!git_op_state_uncached(&work.0).in_progress());
+        assert!(!work.0.join(".git").join("rebase-apply").exists());
     }
 }

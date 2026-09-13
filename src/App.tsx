@@ -114,7 +114,12 @@ import {
   type GitFileDiffKind,
   type GitHistoryCommit,
 } from "./lib/fs";
-import { offerMergeResolution, syncWithDefaultBranch } from "./lib/syncDefault";
+import {
+  acquireSyncSlot,
+  offerMergeResolution,
+  syncHostLabel,
+  syncWithDefaultBranch,
+} from "./lib/syncDefault";
 import {
   invalidateProjectFiles,
   prefetchProjectFiles,
@@ -6873,54 +6878,76 @@ export default function App({
           return;
         }
       }
-      const baseLabel = action.base
-        ? `the ${action.base} branch`
-        : "the remote default branch";
-      let mode: "merge" | "rebase" = "merge";
-      if (
-        !(await ask(
-          `Fetch ${baseLabel} and merge it into this checkout? The tree must be clean; conflicts stay in place for you to resolve.`,
-          { title: item.title, kind: "info", okLabel: "Merge", cancelLabel: "Cancel" },
-        ))
-      ) {
-        if (
-          !(await ask(
-            `Rebase onto ${baseLabel} instead?`,
-            { title: "Update branch", kind: "info", okLabel: "Rebase", cancelLabel: "Cancel" },
-          ))
-        )
-          return;
-        mode = "rebase";
-      }
-      const result = await gitUpdateFromDefault(action.cwd, mode, action.base);
-      notifyGitChanged(action.cwd);
-      if (result.outcome === "conflicts") {
-        // Same resolution flow as a panel/menu sync — live merge state is
-        // re-read on send, and a sessionless row gets the picker.
-        await offerMergeResolution(
-          {
-            cwd: action.cwd,
-            sessionId: action.sessionId,
-            title: item.title,
-          },
-          result.updatedFrom,
-          result.conflicts,
-          mode,
+      // Share the menu/panel sync slot — confirmations must not stack on
+      // the same working copy even when the entry points differ.
+      const release = acquireSyncSlot(action.cwd);
+      if (!release) {
+        await message(
+          "A sync or update is already running on this working copy — wait for it to finish.",
+          { title: item.title, kind: "warning" },
         );
         return;
       }
-      // The condition the row described is handled locally — mute it by
-      // signature so the next poll (still-behind remote state) doesn't
-      // immediately resurface it; a real state change re-emits it.
-      dismissAttention(item.key, item.signature);
-      await message(
-        result.outcome === "up-to-date"
-          ? `${result.branch} is already up to date with ${result.updatedFrom}.`
-          : mode === "rebase"
-            ? `Rebased ${result.branch} onto ${result.updatedFrom}. Nothing was pushed.`
-            : `Merged ${result.updatedFrom} into ${result.branch}. Nothing was pushed.`,
-        { title: item.title },
-      );
+      try {
+        const baseLabel = action.base
+          ? `the ${action.base} branch`
+          : "the remote default branch";
+        const where = `\n\nWorking copy: ${action.cwd}\nHost: ${syncHostLabel(action.cwd)}`;
+        let mode: "merge" | "rebase" = "merge";
+        if (
+          !(await ask(
+            `Fetch ${baseLabel} and merge it into this checkout? The tree must be clean; conflicts stay in place for you to resolve.${where}`,
+            { title: item.title, kind: "info", okLabel: "Merge", cancelLabel: "Cancel" },
+          ))
+        ) {
+          if (
+            !(await ask(
+              `Rebase onto ${baseLabel} instead?${where}`,
+              { title: "Update branch", kind: "info", okLabel: "Rebase", cancelLabel: "Cancel" },
+            ))
+          )
+            return;
+          mode = "rebase";
+        }
+        // Pin the branch the row was emitted for — it can move during the
+        // confirm dialogs or the fetch itself.
+        const result = await gitUpdateFromDefault(
+          action.cwd,
+          mode,
+          action.base,
+          action.branch,
+        );
+        notifyGitChanged(action.cwd);
+        if (result.outcome === "conflicts") {
+          // Same resolution flow as a panel/menu sync — live merge state is
+          // re-read on send, and a sessionless row gets the picker.
+          await offerMergeResolution(
+            {
+              cwd: action.cwd,
+              sessionId: action.sessionId,
+              title: item.title,
+            },
+            result.updatedFrom,
+            result.conflicts,
+            mode,
+          );
+          return;
+        }
+        // The condition the row described is handled locally — mute it by
+        // signature so the next poll (still-behind remote state) doesn't
+        // immediately resurface it; a real state change re-emits it.
+        dismissAttention(item.key, item.signature);
+        await message(
+          result.outcome === "up-to-date"
+            ? `${result.branch} is already up to date with ${result.updatedFrom}.`
+            : mode === "rebase"
+              ? `Rebased ${result.branch} onto ${result.updatedFrom}. Nothing was pushed.`
+              : `Merged ${result.updatedFrom} into ${result.branch}. Nothing was pushed.`,
+          { title: item.title },
+        );
+      } finally {
+        release();
+      }
     },
     [],
   );

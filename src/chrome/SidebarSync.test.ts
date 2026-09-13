@@ -132,9 +132,23 @@ describe("sidebar sync-with-default menu item", () => {
     ).not.toBe("session-2");
   });
 
-  it("is hidden without a handler or on a multi-select menu", () => {
+  it("is hidden without a handler", () => {
     props.onSyncSession = undefined;
     act(() => render());
+    expect(syncItem(openMenu("session-1"))).toBeUndefined();
+  });
+
+  it("is hidden on a multi-select menu — one sync acts on one copy", () => {
+    act(() => render());
+    // Shift-click both cards to select them, then right-click one — the
+    // menu targets the whole selection.
+    for (const id of ["session-1", "session-2"]) {
+      act(() => {
+        card(id).dispatchEvent(
+          new MouseEvent("click", { bubbles: true, shiftKey: true }),
+        );
+      });
+    }
     expect(syncItem(openMenu("session-1"))).toBeUndefined();
   });
 });

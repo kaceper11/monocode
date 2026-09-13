@@ -843,7 +843,9 @@ it("shows merge state with send-to-owning-agent and abort controls", async () =>
   };
   const aborted: string[] = [];
   vi.mocked(invoke).mockImplementation(async (command, args) => {
-    if (command === "git_diff_index") return mergeIndex;
+    // Fresh object per read — mutating in place would make the cached
+    // index compare equal and the banner would never re-render.
+    if (command === "git_diff_index") return { ...mergeIndex };
     if (command === "git_merge_context")
       return {
         merging: true,
@@ -897,6 +899,11 @@ it("shows merge state with send-to-owning-agent and abort controls", async () =>
     // Abort goes through an explicit confirm, then clears the banner.
     await act(async () => button("Abort merge")!.click());
     expect(aborted).toEqual(["/repo"]);
+    // The abort notifies GIT_CHANGED; the next index read reports no op
+    // and the banner clears instead of sticking on a stale snapshot.
+    await vi.waitFor(() => {
+      expect(host.textContent).not.toContain("Merge in progress");
+    });
   } finally {
     await act(async () => root.unmount());
     host.remove();

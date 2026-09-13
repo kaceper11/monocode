@@ -454,9 +454,7 @@ it("still sends when the index read fails — merge state is authoritative", asy
 
 it("aborts only after an explicit confirm naming the operation", async () => {
   mockInvoke((command) =>
-    command === "git_diff_index"
-      ? { ...cleanIndex, opInProgress: true, op: "rebase" }
-      : null,
+    command === "git_merge_context" ? mergeContext({ op: "rebase" }) : null,
   );
   vi.mocked(ask).mockResolvedValueOnce(false);
   expect(await abortMerge({ cwd: "/repo" })).toBe(false);
@@ -466,4 +464,58 @@ it("aborts only after an explicit confirm naming the operation", async () => {
   vi.mocked(ask).mockResolvedValueOnce(true);
   expect(await abortMerge({ cwd: "/repo" })).toBe(true);
   expect(invokedCommands()).toContain("git_merge_abort");
+});
+
+it("skips the abort dialog entirely when nothing is in progress", async () => {
+  mockInvoke((command) =>
+    command === "git_merge_context"
+      ? mergeContext({ merging: false, op: "", conflicts: [] })
+      : null,
+  );
+  expect(await abortMerge({ cwd: "/repo" })).toBe(false);
+  expect(ask).not.toHaveBeenCalled();
+  expect(invokedCommands()).not.toContain("git_merge_abort");
+});
+
+it("refuses a second sync while one is still awaiting confirmation", async () => {
+  let resolveFirst: ((value: boolean) => void) | undefined;
+  vi.mocked(ask).mockImplementationOnce(
+    () => new Promise((resolve) => (resolveFirst = resolve)),
+  );
+  mockInvoke((command) => {
+    if (command === "git_diff_index") return cleanIndex;
+    if (command === "git_sync_branch")
+      return syncResult({ outcome: "up-to-date" });
+    return null;
+  });
+  const first = syncWithDefaultBranch({ cwd: "/repo" });
+  await vi.waitFor(() => expect(vi.mocked(ask)).toHaveBeenCalledTimes(1));
+  const second = await syncWithDefaultBranch({ cwd: "/repo" });
+  expect(second).toBeUndefined();
+  expect(vi.mocked(message).mock.calls.at(-1)?.[0]).toContain(
+    "already running",
+  );
+  expect(invokedCommands()).not.toContain("git_sync_branch");
+  resolveFirst?.(false);
+  await first;
+});
+
+it("tells the user when the operation ended before the context was sent", async () => {
+  // ask#1 confirm sync → true; ask#2 send → true; but the merge resolved
+  // meanwhile — git_merge_context reports nothing in progress.
+  vi.mocked(ask).mockResolvedValueOnce(true).mockResolvedValueOnce(true);
+  mockInvoke((command) => {
+    if (command === "git_diff_index") return cleanIndex;
+    if (command === "git_sync_branch")
+      return syncResult({ outcome: "conflicted", conflicts: ["a.ts"] });
+    if (command === "git_merge_context")
+      return mergeContext({ merging: false, op: "", conflicts: [] });
+    return null;
+  });
+  const result = await syncWithDefaultBranch({ cwd: "/repo" });
+  expect(result?.outcome).toBe("conflicted");
+  expect(vi.mocked(message).mock.calls.at(-1)?.[0]).toContain(
+    "no longer in progress",
+  );
+  expect(requestAgentContext).not.toHaveBeenCalled();
 });

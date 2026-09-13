@@ -1796,7 +1796,7 @@ function MergeBanner({
         <span className="min-w-0 truncate">
           {op} in progress
           {conflicts.length
-            ? ` — ${conflicts.length} conflicted file${conflicts.length === 1 ? "" : "s"}`
+            ? ` — ${conflicts.length === 100 ? "100+" : conflicts.length} conflicted file${conflicts.length === 1 ? "" : "s"}`
             : ""}
         </span>
       </p>

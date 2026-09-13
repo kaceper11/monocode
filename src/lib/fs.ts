@@ -260,8 +260,14 @@ export function gitUpdateFromDefault(
   cwd: string,
   mode: "merge" | "rebase",
   base?: string,
+  expectedBranch?: string,
 ): Promise<GitUpdateResult> {
-  return invoke<GitUpdateResult>("git_update_from_default", { cwd, mode, base });
+  return invoke<GitUpdateResult>("git_update_from_default", {
+    cwd,
+    mode,
+    base,
+    expectedBranch,
+  });
 }
 
 /** Abort an in-progress merge or rebase, leaving the checkout clean. */
