@@ -4,14 +4,18 @@ import {
   useEffect,
   useRef,
   useState,
+  useSyncExternalStore,
   type FormEvent,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import { Camera, ChevronLeft, ChevronRight, ExternalLink, Globe, RefreshCw, X } from "../chrome/icons";
+import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, ExternalLink, Globe, Pencil, Plus, RefreshCw, Star, Trash2, X } from "../chrome/icons";
+import { Popover } from "../chrome/Popover";
 import {
   browserAgentContext,
   browserCapture,
   browserClose,
+  browserFavorites,
   browserGoBack,
   browserGoForward,
   browserNavigate,
@@ -20,10 +24,18 @@ import {
   browserReload,
   browserSetBounds,
   browserSetVisible,
+  browserTabLabel,
+  isBrowserFavorite,
   normalizeBrowserUrl,
   rememberedBrowserUrl,
   rememberBrowserUrl,
+  removeBrowserFavorite,
+  requestBrowserOpen,
   subscribeBrowser,
+  subscribeBrowserFavorites,
+  toggleBrowserFavorite,
+  updateBrowserFavorite,
+  type BrowserFavorite,
 } from "../lib/browser";
 import { requestAgentContext } from "../lib/agentContext";
 import type { BrowserMetaPatch, FilePaneTab } from "../lib/layout";
@@ -55,7 +67,7 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
   const url = file.browser.url;
   const hostRef = useRef<HTMLDivElement>(null);
   const openedRef = useRef(false);
-  const openingRef = useRef(false);
+  const openingRef = useRef<Promise<void> | null>(null);
   const shownRef = useRef(false);
   const boundsRef = useRef<{ x: number; y: number; width: number; height: number } | null>(null);
   const watchdogRef = useRef<number | null>(null);
@@ -76,6 +88,12 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
   const [failure, setFailure] = useState("");
   const [overlayOpen, setOverlayOpen] = useState(false);
   const [capturing, setCapturing] = useState(false);
+  const [favoritesAnchor, setFavoritesAnchor] = useState<HTMLElement | null>(null);
+  const favorites = useSyncExternalStore(
+    subscribeBrowserFavorites,
+    browserFavorites,
+  );
+  const favorited = !!current && favorites.some((fav) => fav.url === current);
 
   const clearWatchdog = useCallback(() => {
     if (watchdogRef.current != null) window.clearTimeout(watchdogRef.current);
@@ -220,34 +238,55 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
     void browserSetBounds(label, next).catch(() => undefined);
   }, [label]);
 
-  // Lazily create the webview the first time the tab is on screen with a URL.
+  // Lazily create the webview the first time the tab is on screen with a
+  // URL. A dep change or StrictMode remount can land while the native call
+  // is still in flight: the stale run's continuation must close the child
+  // it just created (it arrives visible), and the fresh run waits for the
+  // in-flight open before issuing its own — never drops its URL.
   useEffect(() => {
-    if (!active || !url || openedRef.current || openingRef.current) return;
-    openingRef.current = true;
-    setStatus("opening");
+    if (!active || !url || openedRef.current) return;
     let alive = true;
-    void (async () => {
-      try {
-        const rect = hostRef.current?.getBoundingClientRect();
-        const bounds = rect
-          ? { x: rect.x, y: rect.y, width: Math.max(1, rect.width), height: Math.max(1, rect.height) }
-          : { x: 0, y: 0, width: 1, height: 1 };
-        await browserOpen(label, url, bounds);
-        if (!alive) return;
-        openedRef.current = true;
-        shownRef.current = true;
-        boundsRef.current = bounds;
-        setOpened(true);
-        setStatus("loading");
-        armWatchdog(url);
-      } catch (error) {
-        if (!alive) return;
-        setStatus("failed");
-        setFailure(error instanceof Error ? error.message : String(error));
-      } finally {
-        openingRef.current = false;
+    const open = async () => {
+      while (openingRef.current) {
+        try {
+          await openingRef.current;
+        } catch {
+          // The in-flight run already reported its own failure.
+        }
+        if (!alive || openedRef.current) return;
       }
-    })();
+      const pending = (async () => {
+        try {
+          const rect = hostRef.current?.getBoundingClientRect();
+          const bounds = rect
+            ? { x: rect.x, y: rect.y, width: Math.max(1, rect.width), height: Math.max(1, rect.height) }
+            : { x: 0, y: 0, width: 1, height: 1 };
+          await browserOpen(label, url, bounds);
+          if (!alive) {
+            void browserClose(label).catch(() => undefined);
+            return;
+          }
+          openedRef.current = true;
+          shownRef.current = true;
+          boundsRef.current = bounds;
+          setOpened(true);
+          setStatus("loading");
+          armWatchdog(url);
+        } catch (error) {
+          if (!alive) return;
+          setStatus("failed");
+          setFailure(error instanceof Error ? error.message : String(error));
+        }
+      })();
+      openingRef.current = pending;
+      try {
+        await pending;
+      } finally {
+        if (openingRef.current === pending) openingRef.current = null;
+      }
+    };
+    setStatus("opening");
+    void open();
     return () => {
       alive = false;
     };
@@ -264,28 +303,45 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
     [label, clearWatchdog],
   );
 
-  // Native content sits above DOM chrome — hide it while a menu, dialog or
-  // popover from our side is open so the overlay is reachable. Overlays are
-  // portaled to body inside plain wrapper divs, so the match has to descend
-  // into each body child, not just test the child itself.
+  // Native content sits above DOM chrome — hide it while a menu, dialog,
+  // popover or floating panel from our side is open so the overlay stays
+  // reachable. Overlays are portaled to body inside plain wrapper divs, so
+  // the match has to descend, not just test top-level children. Scans are
+  // rAF-coalesced and skipped entirely until a webview exists.
   useEffect(() => {
-    const OVERLAY = '[role="dialog"], [role="menu"], [data-explorer-menu], [data-popover-side]';
+    const OVERLAY =
+      '[role="dialog"], [role="menu"], [data-explorer-menu], [data-popover-side], [data-app-overlay]';
+    let queued = 0;
     const check = () => {
-      const host = hostRef.current;
-      const has = Array.from(
-        document.body.querySelectorAll<HTMLElement>(OVERLAY),
-      ).some(
-        (el) =>
-          !(host && (host.contains(el) || el.contains(host))) &&
-          !el.closest("[aria-hidden='true'], [inert], .hidden") &&
-          !!el.getClientRects().length,
-      );
-      setOverlayOpen(has);
+      if (queued) return;
+      queued = requestAnimationFrame(() => {
+        queued = 0;
+        if (!openedRef.current) return;
+        const host = hostRef.current;
+        const has = Array.from(
+          document.body.querySelectorAll<HTMLElement>(OVERLAY),
+        ).some(
+          (el) =>
+            !(host && (host.contains(el) || el.contains(host))) &&
+            !el.closest("[aria-hidden='true'], [inert], .hidden") &&
+            !!el.getClientRects().length,
+        );
+        setOverlayOpen(has);
+      });
     };
     const observer = new MutationObserver(check);
-    observer.observe(document.body, { childList: true, subtree: true });
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      // Overlays can also be hidden purely by attribute on an ancestor.
+      attributes: true,
+      attributeFilter: ["aria-hidden", "inert", "class", "hidden"],
+    });
     check();
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      if (queued) cancelAnimationFrame(queued);
+    };
   }, []);
 
   // Track the host rect: ResizeObserver covers resizes, window resize covers
@@ -339,11 +395,14 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
       setStatus("loading");
       armWatchdog(normalized);
       void browserNavigate(label, normalized).catch((error) => {
+        // The navigation never started — drop the watchdog so it can't
+        // overwrite this specific error with a generic one seconds later.
+        clearWatchdog();
         setStatus("ready");
         setNotice(error instanceof Error ? error.message : String(error));
       });
     },
-    [label, armWatchdog],
+    [label, armWatchdog, clearWatchdog],
   );
 
   const onSubmitUrl = (event: FormEvent) => {
@@ -454,7 +513,42 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
           >
             <ExternalLink className="size-3.5" strokeWidth={1.75} />
           </ToolbarButton>
+          <ToolbarButton
+            title={favorited ? "Remove bookmark" : "Bookmark this page"}
+            disabled={!current}
+            onClick={() =>
+              toggleBrowserFavorite(current, file.browser.title?.trim() || "")
+            }
+          >
+            <Star
+              className={`size-3.5 ${favorited ? "fill-current text-amber-400" : ""}`}
+              strokeWidth={1.75}
+            />
+          </ToolbarButton>
+          <ToolbarButton
+            title="Bookmarks"
+            onClick={(event) => setFavoritesAnchor(event.currentTarget)}
+          >
+            <ChevronDown className="size-3.5" strokeWidth={1.75} />
+          </ToolbarButton>
+          <ToolbarButton
+            title="New browser tab"
+            onClick={() => requestBrowserOpen("", file.cwd)}
+          >
+            <Plus className="size-3.5" strokeWidth={1.75} />
+          </ToolbarButton>
         </div>
+      ) : null}
+      {favoritesAnchor ? (
+        <BrowserFavoritesMenu
+          anchor={favoritesAnchor}
+          current={current}
+          onPick={(target) => {
+            setFavoritesAnchor(null);
+            navigate(target);
+          }}
+          onClose={() => setFavoritesAnchor(null)}
+        />
       ) : null}
       {notice || popup || draftError ? (
         <div className="flex shrink-0 items-center gap-2 border-b border-content/10 bg-content/5 px-3 py-1.5 text-[12px] text-content/75">
@@ -508,6 +602,7 @@ export function BrowserView({ file, active, onMetaChange }: Props) {
         {!url ? (
           <EmptyBrowserState
             suggested={rememberedBrowserUrl(file.cwd)}
+            favorites={favorites}
             onSubmit={(value) => onMetaChangeRef.current?.({ url: value })}
           />
         ) : status === "failed" ? (
@@ -553,7 +648,7 @@ function ToolbarButton({
 }: {
   title: string;
   disabled?: boolean;
-  onClick: () => void;
+  onClick: (event: ReactMouseEvent<HTMLButtonElement>) => void;
   children: ReactNode;
 }) {
   return (
@@ -570,17 +665,180 @@ function ToolbarButton({
   );
 }
 
+function BrowserFavoritesMenu({
+  anchor,
+  current,
+  onPick,
+  onClose,
+}: {
+  anchor: HTMLElement;
+  current: string;
+  onPick: (url: string) => void;
+  onClose: () => void;
+}) {
+  const favorites = useSyncExternalStore(
+    subscribeBrowserFavorites,
+    browserFavorites,
+  );
+  const [editing, setEditing] = useState<{
+    id: string;
+    title: string;
+    url: string;
+  } | null>(null);
+  const [editError, setEditError] = useState("");
+
+  return (
+    <Popover
+      anchor={anchor}
+      side="bottom"
+      align="end"
+      gap={4}
+      width={300}
+      onDismiss={onClose}
+      role="menu"
+      aria-label="Bookmarks"
+      className="overflow-y-auto overscroll-none p-1"
+    >
+      {current && !isBrowserFavorite(current) ? (
+        <>
+          <button
+            type="button"
+            role="menuitem"
+            className="flex h-7 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] leading-none text-content hover:bg-content/5"
+            onClick={() => toggleBrowserFavorite(current)}
+          >
+            <Star className="size-3.5 shrink-0 text-content/50" strokeWidth={1.75} />
+            <span className="min-w-0 flex-1 truncate">Bookmark this page</span>
+          </button>
+          <div role="separator" className="my-1 h-px bg-content/10" />
+        </>
+      ) : null}
+      {favorites.map((fav) =>
+        editing?.id === fav.id ? (
+          <form
+            key={fav.id}
+            className="flex flex-col gap-1.5 px-2 py-1.5"
+            onSubmit={(event) => {
+              event.preventDefault();
+              try {
+                normalizeBrowserUrl(editing.url);
+              } catch (err) {
+                setEditError(
+                  err instanceof Error ? err.message : String(err),
+                );
+                return;
+              }
+              updateBrowserFavorite(fav.id, {
+                title: editing.title,
+                url: editing.url,
+              });
+              setEditing(null);
+            }}
+          >
+            <input
+              value={editing.title}
+              onChange={(event) =>
+                setEditing({ ...editing, title: event.currentTarget.value })
+              }
+              placeholder="Name"
+              aria-label="Bookmark name"
+              autoFocus
+              className="h-6 w-full rounded-md border border-content/10 bg-content/5 px-2 text-[12px] text-content outline-none focus:border-content/25"
+            />
+            <input
+              value={editing.url}
+              onChange={(event) => {
+                setEditing({ ...editing, url: event.currentTarget.value });
+                setEditError("");
+              }}
+              placeholder="URL"
+              aria-label="Bookmark URL"
+              spellCheck={false}
+              autoCapitalize="off"
+              className="h-6 w-full rounded-md border border-content/10 bg-content/5 px-2 font-mono text-[11.5px] text-content outline-none focus:border-content/25"
+            />
+            {editError ? (
+              <p className="text-[11px] text-red-400">{editError}</p>
+            ) : null}
+            <div className="flex items-center gap-1">
+              <button
+                type="submit"
+                aria-label="Save bookmark"
+                className="grid size-5 place-items-center rounded text-content/60 hover:bg-content/10 hover:text-content"
+              >
+                <Check className="size-3" strokeWidth={2} />
+              </button>
+              <button
+                type="button"
+                aria-label="Cancel"
+                className="grid size-5 place-items-center rounded text-content/50 hover:bg-content/10 hover:text-content"
+                onClick={() => {
+                  setEditing(null);
+                  setEditError("");
+                }}
+              >
+                <X className="size-3" strokeWidth={1.75} />
+              </button>
+            </div>
+          </form>
+        ) : (
+          <div key={fav.id} className="group flex items-center gap-1">
+            <button
+              type="button"
+              role="menuitem"
+              className="flex h-7 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-left text-[13px] leading-none text-content hover:bg-content/5"
+              onClick={() => onPick(fav.url)}
+              title={fav.url}
+            >
+              <Globe className="size-3.5 shrink-0 text-content/50" strokeWidth={1.75} />
+              <span className="min-w-0 flex-1 truncate">
+                {fav.title || browserTabLabel(fav.url)}
+              </span>
+            </button>
+            <button
+              type="button"
+              aria-label="Edit bookmark"
+              className="grid size-5 shrink-0 place-items-center rounded text-content/40 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100"
+              onClick={() => {
+                setEditing({ id: fav.id, title: fav.title, url: fav.url });
+                setEditError("");
+              }}
+            >
+              <Pencil className="size-3" strokeWidth={1.75} />
+            </button>
+            <button
+              type="button"
+              aria-label="Delete bookmark"
+              className="grid size-5 shrink-0 place-items-center rounded text-content/40 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100"
+              onClick={() => removeBrowserFavorite(fav.id)}
+            >
+              <Trash2 className="size-3" strokeWidth={1.75} />
+            </button>
+          </div>
+        ),
+      )}
+      {!favorites.length ? (
+        <p className="px-2 py-1.5 text-[12px] text-content/45">
+          No bookmarks yet — open a page and star it.
+        </p>
+      ) : null}
+    </Popover>
+  );
+}
+
 function EmptyBrowserState({
   suggested,
+  favorites,
   onSubmit,
 }: {
   suggested?: string;
+  favorites: BrowserFavorite[];
   onSubmit: (url: string) => void;
 }) {
   const [value, setValue] = useState(suggested ?? "");
   const [error, setError] = useState("");
   return (
-    <div className="absolute inset-0 grid place-items-center p-6">
+    <div className="absolute inset-0 grid place-items-center overflow-y-auto p-6">
       <form
         className="w-full max-w-sm"
         onSubmit={(event) => {
@@ -624,6 +882,32 @@ function EmptyBrowserState({
         >
           Open
         </button>
+        {favorites.length ? (
+          <div className="mt-5">
+            <p className="text-[11px] font-medium uppercase tracking-wide text-content/40">
+              Bookmarks
+            </p>
+            <div className="mt-1.5 flex flex-col gap-0.5">
+              {favorites.slice(0, 8).map((fav) => (
+                <button
+                  key={fav.id}
+                  type="button"
+                  className="flex items-center gap-2 rounded-md px-2 py-1 text-left text-[12.5px] text-content/75 hover:bg-content/5 hover:text-content"
+                  onClick={() => onSubmit(fav.url)}
+                  title={fav.url}
+                >
+                  <Globe
+                    className="size-3.5 shrink-0 text-content/40"
+                    strokeWidth={1.75}
+                  />
+                  <span className="min-w-0 flex-1 truncate">
+                    {fav.title || browserTabLabel(fav.url)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
       </form>
     </div>
   );

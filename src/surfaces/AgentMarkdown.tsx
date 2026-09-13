@@ -28,7 +28,7 @@ import {
 import type { PluggableList } from "unified";
 import { ExplorerMenu, type ExplorerMenuItem } from "../chrome/ExplorerMenu";
 import { FileTypeIcon } from "../chrome/FileTypeIcon";
-import { isLocalhostUrl, requestLinkChoice } from "../lib/browser";
+import { isHttpUrl, isLocalhostUrl, requestLinkChoice } from "../lib/browser";
 import { createLazyMermaidPlugin } from "./mermaidPlugin";
 import {
   displayPath,
@@ -216,7 +216,7 @@ function MarkdownLink({
           return;
         }
         event.preventDefault();
-        if (href && /^https?:\/\//i.test(href)) {
+        if (href && isHttpUrl(href)) {
           if (isLocalhostUrl(href)) {
             requestLinkChoice({
               url: href,

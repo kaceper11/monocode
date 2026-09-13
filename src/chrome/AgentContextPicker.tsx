@@ -110,6 +110,7 @@ export function AgentContextPicker({
     ? "Conversation closed. Choose another."
     : !tickets &&
         request.context.attachments.length &&
+        !request.attachmentsOptional &&
         !harnessSupportsAttachments(target.harness)
       ? "This agent does not support attachments."
       : destination === "new" && (!fresh.cwd || fresh.cwd === "~")

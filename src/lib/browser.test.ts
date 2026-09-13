@@ -2,12 +2,18 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   browserAgentContext,
+  browserFavorites,
   browserTabLabel,
+  isBrowserFavorite,
   isLocalhostUrl,
   normalizeBrowserUrl,
   rememberedBrowserUrl,
   rememberBrowserUrl,
+  removeBrowserFavorite,
   sanitizeCaptureUrl,
+  subscribeBrowserFavorites,
+  toggleBrowserFavorite,
+  updateBrowserFavorite,
   type BrowserCapture,
 } from "./browser";
 import {
@@ -112,6 +118,88 @@ describe("remembered browser URL", () => {
   it("ignores non-http values", () => {
     rememberBrowserUrl("/repo/a", "file:///etc/passwd");
     expect(rememberedBrowserUrl("/repo/a")).toBeUndefined();
+  });
+
+  it("never persists embedded credentials", () => {
+    rememberBrowserUrl("/repo/a", "http://user:hunter2@localhost:3000/app");
+    expect(rememberedBrowserUrl("/repo/a")).toBe("http://localhost:3000/app");
+    expect(localStorage.getItem("monocode.browserUrls")).not.toContain(
+      "hunter2",
+    );
+  });
+});
+
+describe("browser bookmarks", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("toggles a page in and out", () => {
+    expect(toggleBrowserFavorite("http://localhost:3000/", "Dev App")).toBe(
+      true,
+    );
+    expect(isBrowserFavorite("http://localhost:3000/")).toBe(true);
+    expect(browserFavorites()[0]).toMatchObject({
+      url: "http://localhost:3000/",
+      title: "Dev App",
+    });
+    expect(toggleBrowserFavorite("http://localhost:3000/")).toBe(false);
+    expect(browserFavorites()).toHaveLength(0);
+  });
+
+  it("renames and re-points a bookmark", () => {
+    toggleBrowserFavorite("http://localhost:3000/", "Dev App");
+    const id = browserFavorites()[0].id;
+    updateBrowserFavorite(id, { title: "  Dashboard  ", url: "localhost:4000" });
+    expect(browserFavorites()[0]).toMatchObject({
+      id,
+      title: "Dashboard",
+      url: "https://localhost:4000/",
+    });
+  });
+
+  it("keeps the edited entry when its new URL collides", () => {
+    toggleBrowserFavorite("http://a.test/", "A");
+    toggleBrowserFavorite("http://b.test/", "B");
+    const [b, a] = browserFavorites();
+    expect(b.url).toBe("http://b.test/");
+    updateBrowserFavorite(b.id, { url: "http://a.test/" });
+    const list = browserFavorites();
+    expect(list).toHaveLength(1);
+    expect(list[0].id).toBe(b.id);
+    expect(list[0].title).toBe("B");
+    expect(a.id).not.toBe(list[0].id);
+  });
+
+  it("keeps the old URL when the edit is invalid", () => {
+    toggleBrowserFavorite("http://localhost:3000/", "Dev");
+    const id = browserFavorites()[0].id;
+    updateBrowserFavorite(id, { url: "file:///etc/passwd" });
+    expect(browserFavorites()[0].url).toBe("http://localhost:3000/");
+  });
+
+  it("notifies subscribers on write and foreign storage", () => {
+    const seen: number[] = [];
+    const unsub = subscribeBrowserFavorites(() =>
+      seen.push(browserFavorites().length),
+    );
+    toggleBrowserFavorite("http://localhost:3000/", "Dev");
+    removeBrowserFavorite(browserFavorites()[0].id);
+    unsub();
+    expect(seen).toEqual([1, 0]);
+  });
+
+  it("drops malformed or non-http entries when reading", () => {
+    localStorage.setItem(
+      "monocode.browserFavorites",
+      JSON.stringify([
+        { id: "ok", url: "http://localhost:3000/", title: "Dev" },
+        { id: "bad", url: "file:///etc/passwd", title: "Nope" },
+        { url: "http://localhost:4000/" },
+        "garbage",
+      ]),
+    );
+    expect(browserFavorites()).toEqual([
+      { id: "ok", url: "http://localhost:3000/", title: "Dev" },
+    ]);
   });
 });
 

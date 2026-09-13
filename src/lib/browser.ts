@@ -175,7 +175,7 @@ export function rememberBrowserUrl(cwd: string, url: string) {
     const all = readRemembered();
     const key = pathKey(cwd);
     delete all[key];
-    all[key] = { url, at: Date.now() };
+    all[key] = { url: sanitizeCaptureUrl(url), at: Date.now() };
     const keys = Object.keys(all);
     if (keys.length > REMEMBERED_LIMIT) {
       keys
@@ -187,6 +187,137 @@ export function rememberBrowserUrl(cwd: string, url: string) {
   } catch {
     // private mode / quota
   }
+}
+
+// --- Bookmarks: a small global list, editable from the toolbar ---
+
+export type BrowserFavorite = {
+  id: string;
+  url: string;
+  title: string;
+};
+
+const FAVORITES_KEY = "monocode.browserFavorites";
+const FAVORITES_LIMIT = 100;
+const FAVORITES_EVENT = "monocode:browser-favorites";
+/** Raw-string memo so useSyncExternalStore sees a stable snapshot between
+ * writes while still noticing edits from other windows. */
+let favoritesCache: { raw: string | null; list: BrowserFavorite[] } | null =
+  null;
+
+export function browserFavorites(): BrowserFavorite[] {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(FAVORITES_KEY);
+  } catch {
+    // private mode
+  }
+  if (favoritesCache && favoritesCache.raw === raw) return favoritesCache.list;
+  const list = (() => {
+    try {
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter(
+          (entry): entry is BrowserFavorite =>
+            !!entry &&
+            typeof entry === "object" &&
+            typeof (entry as BrowserFavorite).id === "string" &&
+            typeof (entry as BrowserFavorite).url === "string" &&
+            isHttpUrl((entry as BrowserFavorite).url),
+        )
+        .slice(0, FAVORITES_LIMIT)
+        .map((entry) => ({
+          id: entry.id,
+          url: entry.url,
+          title: typeof entry.title === "string" ? entry.title : "",
+        }));
+    } catch {
+      return [];
+    }
+  })();
+  favoritesCache = { raw, list };
+  return list;
+}
+
+function writeFavorites(list: BrowserFavorite[]) {
+  try {
+    localStorage.setItem(
+      FAVORITES_KEY,
+      JSON.stringify(list.slice(0, FAVORITES_LIMIT)),
+    );
+  } catch {
+    // private mode / quota
+  }
+  window.dispatchEvent(new Event(FAVORITES_EVENT));
+}
+
+/** Subscribe to bookmark edits; returns unsubscribe. */
+export function subscribeBrowserFavorites(onChange: () => void): () => void {
+  const handler = (event: Event) => {
+    if (
+      event instanceof StorageEvent &&
+      event.key != null &&
+      event.key !== FAVORITES_KEY
+    )
+      return;
+    onChange();
+  };
+  window.addEventListener(FAVORITES_EVENT, handler);
+  window.addEventListener("storage", handler);
+  return () => {
+    window.removeEventListener(FAVORITES_EVENT, handler);
+    window.removeEventListener("storage", handler);
+  };
+}
+
+export function isBrowserFavorite(url: string): boolean {
+  return browserFavorites().some((entry) => entry.url === url);
+}
+
+/** Bookmark or unbookmark a page; returns whether it is now bookmarked. */
+export function toggleBrowserFavorite(url: string, title = ""): boolean {
+  const list = browserFavorites();
+  const existing = list.find((entry) => entry.url === url);
+  if (existing) {
+    writeFavorites(list.filter((entry) => entry.id !== existing.id));
+    return false;
+  }
+  writeFavorites([
+    { id: crypto.randomUUID(), url, title: title.slice(0, 200) },
+    ...list,
+  ]);
+  return true;
+}
+
+export function updateBrowserFavorite(
+  id: string,
+  patch: { title?: string; url?: string },
+) {
+  const list = browserFavorites();
+  const next = list.map((entry) => {
+    if (entry.id !== id) return entry;
+    let url = entry.url;
+    if (patch.url !== undefined) {
+      try {
+        url = normalizeBrowserUrl(patch.url);
+      } catch {
+        url = entry.url;
+      }
+    }
+    const title =
+      patch.title !== undefined ? patch.title.trim().slice(0, 200) : entry.title;
+    return { ...entry, url, title };
+  });
+  // An edited URL may now collide with another entry — keep the edited one.
+  const editedUrl = next.find((entry) => entry.id === id)?.url;
+  writeFavorites(
+    next.filter((entry) => entry.id === id || entry.url !== editedUrl),
+  );
+}
+
+export function removeBrowserFavorite(id: string) {
+  writeFavorites(browserFavorites().filter((entry) => entry.id !== id));
 }
 
 // --- Native webview commands ---
@@ -313,11 +444,13 @@ export function browserAgentContext(
   const url = sanitizeCaptureUrl(capture.url);
   const wsl = wslLocation(cwd);
   const origin = [
-    url,
+    url || null,
     cwd,
     wsl ? `WSL ${wsl.distribution}` : "native host",
     `captured ${new Date().toISOString()}`,
-  ].join(" · ");
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const sections: string[] = [];
   if (capture.text?.trim()) {
     sections.push(`### Visible text\n\n${capture.text.trim()}`);
@@ -348,12 +481,13 @@ export function browserAgentContext(
       data: capture.screenshot,
     });
   }
+  const label = capture.title?.trim() || browserTabLabel(url);
   return boundAgentContext({
     id: crypto.randomUUID(),
     entries: [
       {
         id: crypto.randomUUID(),
-        title: `Browser: ${capture.title?.trim() || browserTabLabel(url)}`,
+        title: label ? `Browser: ${label}` : "Browser",
         origin,
         text: sections.join("\n\n"),
       },
@@ -370,12 +504,18 @@ const handlers = new Map<string, Set<BrowserHandler>>();
 let subscription: Promise<() => void> | null = null;
 
 function ensureSubscription() {
-  subscription ??= listen<BrowserEventPayload>(BROWSER_EVENT_NAME, (event) => {
+  if (subscription) return;
+  const pending = listen<BrowserEventPayload>(BROWSER_EVENT_NAME, (event) => {
     const payload = event.payload;
     if (payload.window !== getCurrentWindow().label) return;
     for (const handler of handlers.get(payload.label) ?? []) {
       handler(payload);
     }
+  });
+  subscription = pending;
+  // A rejected listen() must not poison the window's stream forever.
+  pending.catch(() => {
+    if (subscription === pending) subscription = null;
   });
 }
 

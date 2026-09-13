@@ -20,6 +20,7 @@ import {
 } from "./projectTerminal";
 import { normalizeProjectPath } from "./recents";
 import { pathKey } from "./paths";
+import { isHttpUrl } from "./browser";
 import { sanitizeSteps } from "./projects";
 import { reconcileProjectReturn, type ProjectReturnMemory } from "./projectReturn";
 import type { InboxAskContext } from "./inboxAsk";
@@ -540,7 +541,7 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
     const browser = source as Record<string, unknown>;
     if (
       typeof browser.url !== "string" ||
-      !/^https?:\/\//i.test(browser.url) ||
+      !isHttpUrl(browser.url) ||
       browser.url.length > 8192 ||
       [
         "plan",

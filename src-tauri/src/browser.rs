@@ -34,6 +34,8 @@ const MAX_CAPTURE_CONTROLS: usize = 40;
 const MAX_CAPTURE_CONTROL_LEN: usize = 120;
 const MAX_CAPTURE_CONSOLE: usize = 40;
 const MAX_CAPTURE_CONSOLE_LEN: usize = 400;
+/// A full-pane PNG base64'd over IPC and into agent context — cap it.
+const MAX_SCREENSHOT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Page-local console ring buffer. Injected before any page script runs;
 /// it writes into the page's own context only — nothing calls back into
@@ -75,8 +77,11 @@ const CONSOLE_TAP_SCRIPT: &str = r#"(() => {
   window.__monocodeConsole = buf;
 })()"#;
 
-/// Bounded visible-DOM + console read. Completion value is a JSON string
-/// parsed and re-bounded by the Rust side — the page is untrusted.
+/// Bounded visible-DOM + console read. wry serializes the completion
+/// value itself, so the script returns an object; the Rust side still
+/// re-bounds everything — the page is untrusted, and __monocodeConsole is
+/// page-writable, so entries are normalized here before they ever reach
+/// JSON.
 const SUMMARY_SCRIPT: &str = r#"(() => {
   const controls = [];
   try {
@@ -103,16 +108,18 @@ const SUMMARY_SCRIPT: &str = r#"(() => {
   } catch (e) {}
   let log = [];
   try {
-    log = Array.isArray(window.__monocodeConsole)
-      ? window.__monocodeConsole.slice(-40)
+    const raw = Array.isArray(window.__monocodeConsole)
+      ? window.__monocodeConsole
       : [];
+    log = raw.slice(-40).map((entry) => ({
+      level: String((entry && entry.level) || "log").slice(0, 16),
+      text: String((entry && entry.text) || "").slice(0, 400),
+    }));
   } catch (e) {}
-  // wry serializes the completion value itself — return the object, not a
-  // JSON string, or the result arrives double-encoded.
   return {
-    url: location.href,
-    title: document.title || "",
-    text: text.slice(0, 6000),
+    url: String(location.href || "").slice(0, 8192),
+    title: String(document.title || "").slice(0, 200),
+    text: String(text).slice(0, 6000),
     controls,
     console: log,
   };
@@ -195,9 +202,11 @@ struct BrowserNotice {
 }
 
 impl BrowserNotice {
-    fn new(kind: &'static str) -> Self {
+    /// For struct-update syntax: `..BrowserNotice::empty()` — `kind` is
+    /// always supplied by the caller's literal.
+    fn empty() -> Self {
         Self {
-            kind,
+            kind: "",
             url: None,
             title: None,
             reason: None,
@@ -234,6 +243,11 @@ fn allowed_url(url: &Url, app_origin: Option<&str>) -> Result<(), String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("{}: links aren't allowed in Browser", url.scheme()));
     }
+    // Embedded credentials would otherwise be remembered, shown in the
+    // address bar and emitted in events — refuse them outright.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("URLs with embedded credentials aren't allowed".into());
+    }
     if let Some(host) = url.host_str() {
         if LOCAL_HOSTS.contains(&host) {
             return Err("that address belongs to MonoCode".into());
@@ -265,6 +279,11 @@ fn app_origin<R: Runtime>(window: &Window<R>) -> Option<String> {
 }
 
 fn find_webview<R: Runtime>(window: &Window<R>, label: &str) -> Result<tauri::Webview<R>, String> {
+    // The window's own shell webview shares this namespace — a bad label
+    // must never resolve to it (browser_close would destroy the app UI).
+    if label == window.label() {
+        return Err("Invalid browser label".into());
+    }
     window
         .webviews()
         .into_iter()
@@ -307,8 +326,11 @@ pub struct BrowserBounds {
     height: f64,
 }
 
+/// Async like `browser_probe`: Tauri documents that creating a webview in a
+/// synchronous command can deadlock on Windows (the WebView2 controller
+/// pumps a nested message loop inside the IPC dispatch).
 #[tauri::command]
-pub fn browser_open(
+pub async fn browser_open(
     window: Window,
     app: AppHandle,
     label: String,
@@ -339,6 +361,8 @@ pub fn browser_open(
     let nav_app = app.clone();
     let nav_window = window_label.clone();
     let nav_label = label.clone();
+    let nav_origin = origin.clone();
+    let page_origin = origin.clone();
     let new_window_app = app.clone();
     let new_window_window = window_label.clone();
     let new_window_label = label.clone();
@@ -357,43 +381,31 @@ pub fn browser_open(
         .focused(false)
         .initialization_script(CONSOLE_TAP_SCRIPT)
         .on_navigation(move |url| {
-            let (can_back, can_forward) = match allowed_url(url, origin.as_deref()) {
-                Ok(()) => {
-                    let state = nav_app.state::<BrowserState>();
-                    let mut guard = state.history.lock().unwrap();
-                    let history = guard
-                        .entry(key.clone())
-                        .or_insert_with(|| History::new(url.as_str()));
-                    history.push(url.as_str());
-                    (history.can_back(), history.can_forward())
-                }
-                Err(reason) => {
-                    emit(
-                        &nav_app,
-                        &nav_label,
-                        &nav_window,
-                        BrowserNotice {
-                            kind: "blocked",
-                            url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
-                            reason: Some(reason),
-                            ..BrowserNotice::new("")
-                        },
-                    );
-                    return false;
-                }
+            // Policy gate only. WKWebView reports subframe navigations here
+            // too and wry does not pass targetFrame, so this callback can't
+            // tell a main-frame commit from an iframe — history and the
+            // address bar update live in on_page_load, which is main-frame
+            // only. about:/blob:/data: are allowed for the pervasive
+            // srcdoc/blank iframe cases; they never gain invoke authority.
+            let verdict = match url.scheme() {
+                "http" | "https" => allowed_url(url, nav_origin.as_deref()),
+                "about" | "blob" | "data" => Ok(()),
+                scheme => Err(format!("{scheme}: links aren't allowed in Browser")),
             };
-            emit(
-                &nav_app,
-                &nav_label,
-                &nav_window,
-                BrowserNotice {
-                    kind: "navigate",
-                    url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
-                    can_back,
-                    can_forward,
-                    ..BrowserNotice::new("")
-                },
-            );
+            if let Err(reason) = verdict {
+                emit(
+                    &nav_app,
+                    &nav_label,
+                    &nav_window,
+                    BrowserNotice {
+                        kind: "blocked",
+                        url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
+                        reason: Some(reason),
+                        ..BrowserNotice::empty()
+                    },
+                );
+                return false;
+            }
             true
         })
         .on_new_window(move |url, _features| {
@@ -405,36 +417,65 @@ pub fn browser_open(
                     BrowserNotice {
                         kind: "popup",
                         url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
-                        ..BrowserNotice::new("")
+                        ..BrowserNotice::empty()
                     },
                 );
             }
             NewWindowResponse::Deny
         })
         .on_page_load(move |webview, payload| {
-            let kind = match payload.event() {
-                PageLoadEvent::Started => "load-started",
-                PageLoadEvent::Finished => "load-finished",
-            };
+            // Page-load events are main-frame only on both engines, so this
+            // is where the committed URL is recorded and reported. Started
+            // carries the requested URL (early bar feedback); Finished
+            // carries the post-redirect URL and earns the history slot.
+            let url = payload.url();
+            let committed = matches!(url.scheme(), "http" | "https")
+                && allowed_url(url, page_origin.as_deref()).is_ok();
             let (can_back, can_forward) = {
                 let state = page_load_app.state::<BrowserState>();
                 let key = history_key(&page_load_window, &page_load_label);
-                let guard = state.history.lock().unwrap();
-                guard
-                    .get(&key)
-                    .map(|history| (history.can_back(), history.can_forward()))
-                    .unwrap_or((false, false))
+                let mut guard = state.history.lock().unwrap();
+                match payload.event() {
+                    PageLoadEvent::Finished if committed => guard
+                        .get_mut(&key)
+                        .map(|history| {
+                            history.push(url.as_str());
+                            (history.can_back(), history.can_forward())
+                        })
+                        .unwrap_or((false, false)),
+                    _ => guard
+                        .get(&key)
+                        .map(|history| (history.can_back(), history.can_forward()))
+                        .unwrap_or((false, false)),
+                }
             };
+            if committed {
+                emit(
+                    &page_load_app,
+                    webview.label(),
+                    &page_load_window,
+                    BrowserNotice {
+                        kind: "navigate",
+                        url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
+                        can_back,
+                        can_forward,
+                        ..BrowserNotice::empty()
+                    },
+                );
+            }
             emit(
                 &page_load_app,
                 webview.label(),
                 &page_load_window,
                 BrowserNotice {
-                    kind,
-                    url: Some(payload.url().as_str().chars().take(MAX_URL_LEN).collect()),
+                    kind: match payload.event() {
+                        PageLoadEvent::Started => "load-started",
+                        PageLoadEvent::Finished => "load-finished",
+                    },
+                    url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
                     can_back,
                     can_forward,
-                    ..BrowserNotice::new("")
+                    ..BrowserNotice::empty()
                 },
             );
         })
@@ -446,7 +487,7 @@ pub fn browser_open(
                 BrowserNotice {
                     kind: "title",
                     title: Some(title.chars().take(MAX_TITLE_LEN).collect()),
-                    ..BrowserNotice::new("")
+                    ..BrowserNotice::empty()
                 },
             );
         })
@@ -460,7 +501,7 @@ pub fn browser_open(
                         kind: "download",
                         url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
                         reason: Some("Downloads are not allowed in Browser".into()),
-                        ..BrowserNotice::new("")
+                        ..BrowserNotice::empty()
                     },
                 );
             }
@@ -548,9 +589,11 @@ pub fn browser_set_visible(window: Window, label: String, visible: bool) -> Resu
 
 /// Read the live location so the tab can tell "never loaded" apart from a
 /// page that is merely slow — WKWebView shows nothing for a refused
-/// connection, and WebView2's own error page still reports `about:blank`
-/// for a short while. Async: the eval callback is delivered on the main
-/// thread, so a synchronous command would deadlock waiting for it.
+/// connection. Async: the eval callback is delivered on the main thread,
+/// so a synchronous command would deadlock waiting for it. Before the
+/// first committed navigation WKWebView runs evals without invoking the
+/// completion callback, so a probe there resolves via timeout rather than
+/// reporting about:blank.
 #[tauri::command]
 pub async fn browser_probe(window: Window, label: String) -> Result<String, String> {
     let view = find_webview(&window, &label)?;
@@ -570,7 +613,7 @@ pub async fn browser_probe(window: Window, label: String) -> Result<String, Stri
     .map_err(|error| error.to_string())?
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserConsoleLine {
     level: String,
@@ -744,23 +787,30 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
     let shot_detail = start_screenshot(&view, shot_tx).err();
 
     let (summary, screenshot) = tauri::async_runtime::spawn_blocking(move || {
+        // One deadline for both halves — a slow page must not make a
+        // capture take twice the timeout.
+        let deadline = std::time::Instant::now() + CAPTURE_TIMEOUT;
         let summary = page_rx.recv_timeout(CAPTURE_TIMEOUT).ok();
-        let screenshot = shot_rx.recv_timeout(CAPTURE_TIMEOUT).ok().flatten();
+        let screenshot = shot_rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .ok()
+            .flatten();
         (summary, screenshot)
     })
     .await
     .map_err(|error| error.to_string())?;
 
-    let page: PageSummary = summary
+    let parsed = summary
         .as_deref()
-        .and_then(|raw| serde_json::from_str(raw).ok())
-        .unwrap_or(PageSummary {
-            url: None,
-            title: None,
-            text: None,
-            controls: None,
-            console: None,
-        });
+        .map(|raw| serde_json::from_str::<PageSummary>(raw).ok());
+    let summary_ok = matches!(parsed, Some(Some(_)));
+    let page = parsed.flatten().unwrap_or(PageSummary {
+        url: None,
+        title: None,
+        text: None,
+        controls: None,
+        console: None,
+    });
 
     let controls = page
         .controls
@@ -790,10 +840,34 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
         .rev()
         .collect();
 
+    let (screenshot, shot_detail) = match (screenshot, shot_detail) {
+        (Some(bytes), _) if bytes.len() > MAX_SCREENSHOT_BYTES => {
+            (None, Some("screenshot too large to attach".to_string()))
+        }
+        pair => pair,
+    };
     let screenshot_b64 = screenshot.map(|bytes| {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(bytes)
     });
+
+    let summary_detail = if summary.is_none() {
+        Some("summary timed out")
+    } else if !summary_ok {
+        Some("summary unreadable")
+    } else {
+        None
+    };
+    let detail = match (summary_detail, shot_detail) {
+        (None, None) => None,
+        (a, b) => Some(
+            [a, b.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+    };
 
     Ok(BrowserCapture {
         url: clip_chars(&page.url.unwrap_or_default(), MAX_URL_LEN),
@@ -802,10 +876,6 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
         controls,
         console,
         screenshot: screenshot_b64,
-        detail: match (summary.is_none(), shot_detail) {
-            (true, Some(reason)) => Some(format!("Summary timed out; screenshot: {reason}")),
-            (true, None) => Some("Summary timed out".into()),
-            (false, reason) => reason,
-        },
+        detail,
     })
 }

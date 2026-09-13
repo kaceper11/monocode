@@ -166,7 +166,9 @@ import {
   type WorkspaceTab,
 } from "./lib/layout";
 import {
+  browserTabLabel,
   isBrowserOpenRequest,
+  normalizeBrowserUrl,
   OPEN_BROWSER_EVENT,
 } from "./lib/browser";
 import { releaseNotesForVersion, releaseNotesTitle } from "./lib/releaseNotes";
@@ -4346,7 +4348,16 @@ export default function App({
         cwd ||
         (source ? sessionWorkCwd(source) : activeRef.current?.cwd) ||
         projectCwdRef.current;
-      const file = newBrowserTab(workdir, url);
+      // Normalize so the dedupe key is canonical (http://x vs http://x/).
+      let target = url;
+      if (target) {
+        try {
+          target = normalizeBrowserUrl(target);
+        } catch {
+          // Keep the raw value — BrowserView surfaces the parse error.
+        }
+      }
+      const file = newBrowserTab(workdir, target);
       setTabs((prev) =>
         prev.map((entry) =>
           entry.id === tab.id ? openEditorTab(entry, file) : entry,
@@ -8568,7 +8579,9 @@ function toTitleTab(
         ? `plan:${file.plan.blockId}`
         : file.releaseNotes
           ? `release-notes:${file.releaseNotes.version}`
-          : file.path;
+          : file.browser
+            ? `browser:${file.browser.url}`
+            : file.path;
     if (seenKeys.has(key)) return;
     seenKeys.add(key);
     files.push(
@@ -8577,7 +8590,9 @@ function toTitleTab(
           ? releaseNotesTitle(file.releaseNotes.version)
           : file.terminal
             ? terminalTabLabel(file)
-            : basename(file.path)),
+            : file.browser
+              ? browserTabLabel(file.browser.url, file.browser.title)
+              : basename(file.path)),
     );
   };
   const focusedPane =
