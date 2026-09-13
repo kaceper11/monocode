@@ -718,13 +718,22 @@ export function ProjectRepositories({
                   })}
                 </ul>
                 {groupImport && !project ? (
-                  <input
-                    value={queueSetName}
-                    onChange={(event) => setQueueSetName(event.target.value)}
-                    placeholder="Optional: save these as a repository set — name"
-                    aria-label="Repository set name"
-                    className={`${inputClass} py-1 text-[12px]`}
-                  />
+                  <div className="flex items-center gap-2">
+                    <FolderTree
+                      className="size-3.5 shrink-0 text-content/40"
+                      strokeWidth={1.5}
+                    />
+                    <span className="shrink-0 text-[11px] text-content/50">
+                      Also save as a set
+                    </span>
+                    <input
+                      value={queueSetName}
+                      onChange={(event) => setQueueSetName(event.target.value)}
+                      placeholder="Set name (optional)"
+                      aria-label="Repository set name"
+                      className={`${inputClass} min-w-0 flex-1 py-1 text-[12px]`}
+                    />
+                  </div>
                 ) : null}
                 <div className="flex items-center justify-end gap-2 pt-1">
                   <button
@@ -749,33 +758,38 @@ export function ProjectRepositories({
               </div>
             ) : null}
             {candidates.length ? (
-              <>
-                <p className="mt-2 text-[11px] text-content/45">
-                  Already verified:
+              <div className="mt-2">
+                <p className="mb-0.5 text-[11px] text-content/45">
+                  Already verified — click to add:
                 </p>
-                <ul className="mt-0.5 flex max-h-40 flex-col gap-px overflow-y-auto">
+                <ul className="flex max-h-40 flex-col gap-px overflow-y-auto">
                   {candidates.map((entry) => {
                     const owner = findProjectByCommonDir(
                       entry.commonDir,
                       projects,
                     )?.project;
+                    const label = basename(entry.checkout) || entry.checkout;
                     return (
                       <li key={pathKey(entry.commonDir)}>
                         <button
                           type="button"
-                          title={prettyCwd(entry.checkout)}
                           onClick={() => {
                             setError("");
                             addFamily(entry);
                           }}
-                          className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+                          className="flex w-full min-w-0 items-center gap-2 rounded-lg px-1.5 py-1 text-left hover:bg-content/5"
                         >
                           <GitBranch
                             className="size-3.5 shrink-0 text-content/40"
                             strokeWidth={1.5}
                           />
-                          <span className="min-w-0 flex-1 truncate">
-                            {basename(entry.checkout) || entry.checkout}
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate text-[12px] leading-tight text-content">
+                              {label}
+                            </span>
+                            <span className="block truncate text-[10px] leading-tight text-content/45">
+                              {prettyCwd(entry.checkout)}
+                            </span>
                           </span>
                           {owner ? (
                             <span className="shrink-0 text-[10px] text-content/45">
@@ -786,12 +800,16 @@ export function ProjectRepositories({
                                   : "another project")}
                             </span>
                           ) : null}
+                          <Plus
+                            className="size-3.5 shrink-0 text-content/40"
+                            strokeWidth={1.75}
+                          />
                         </button>
                       </li>
                     );
                   })}
                 </ul>
-              </>
+              </div>
             ) : null}
           </div>
         </div>
