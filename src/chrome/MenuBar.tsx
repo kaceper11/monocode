@@ -116,7 +116,7 @@ export function MenuBar({
           onToggleTerminal?.();
           break;
         case "open_browser":
-          requestBrowserOpen("");
+          requestBrowserOpen();
           break;
         case "new_window":
           void invoke("open_new_window").catch(() => {});

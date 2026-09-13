@@ -170,6 +170,7 @@ import {
   isBrowserOpenRequest,
   normalizeBrowserUrl,
   OPEN_BROWSER_EVENT,
+  rememberedBrowserUrl,
 } from "./lib/browser";
 import { releaseNotesForVersion, releaseNotesTitle } from "./lib/releaseNotes";
 import { mergeOrderedSubset, orderByIds } from "./lib/reorder";
@@ -4335,10 +4336,10 @@ export default function App({
   );
 
   /** Open (or focus) a browser tab for `url` in the current workspace tab.
-   * An empty url yields the URL-entry state — opening is always the user's
-   * explicit choice. `cwd` is the worktree the link came from. */
+   * `undefined` opens the worktree's remembered page; "" is a deliberate
+   * blank tab (URL-entry state). `cwd` is the worktree the link came from. */
   const onOpenBrowser = useCallback(
-    (url: string, cwd?: string) => {
+    (url?: string, cwd?: string) => {
       dismissOverlays();
       const tab = tabsRef.current.find(
         (entry) => entry.id === activeTabIdRef.current,
@@ -4351,8 +4352,10 @@ export default function App({
         cwd ||
         (source ? sessionWorkCwd(source) : activeRef.current?.cwd) ||
         projectCwdRef.current;
+      // No URL = open the worktree's remembered page directly; only a
+      // deliberately blank request (the toolbar's +) lands on the form.
+      let target = url ?? rememberedBrowserUrl(workdir) ?? "";
       // Normalize so the dedupe key is canonical (http://x vs http://x/).
-      let target = url;
       if (target) {
         try {
           target = normalizeBrowserUrl(target);
@@ -7720,7 +7723,7 @@ export default function App({
         else if (cmd === "next-project")
           run("next-project", () => a.onNavigateProjectList(1));
         else if (cmd === "open-browser")
-          run("open-browser", () => a.onOpenBrowser(""));
+          run("open-browser", () => a.onOpenBrowser());
         else if ("focus" in cmd)
           run(`focus-${cmd.focus}`, () => a.onFocusDir(cmd.focus));
         else run(`activate-${cmd.activate}`, () => a.onActivate(cmd.activate));
@@ -7824,7 +7827,7 @@ export default function App({
       listen("open_search", () => actions.current.onOpenSearch()),
       listen("open_inbox", () => actions.current.onOpenInbox()),
       listen("open_notes", () => actions.current.onOpenNotes()),
-      listen("open_browser", () => actions.current.onOpenBrowser("")),
+      listen("open_browser", () => actions.current.onOpenBrowser()),
       listen<{ section?: string }>("open_settings", ({ payload }) => actions.current.openSettings(isSettingsSectionId(payload?.section) ? payload.section : undefined)),
       listen("check_for_updates", () => {
         void runUpdateFlow(true);
@@ -8224,7 +8227,7 @@ export default function App({
             onNew={onNew}
             onNewTerminal={onNewTerminal}
             onShowTerminal={onShowProjectTerminal}
-            onOpenBrowser={() => onOpenBrowser("")}
+            onOpenBrowser={() => onOpenBrowser()}
             browserActive={browserOpen}
             projectTerminalActive={
               !!currentProjectDock && currentProjectDock.pane.files.length > 0

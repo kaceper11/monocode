@@ -41,11 +41,12 @@ export type BrowserEventPayload = {
 };
 
 export type BrowserOpenRequest = {
-  url: string;
+  /** Omitted = open the worktree's remembered URL; "" = blank new tab. */
+  url?: string;
   cwd?: string;
 };
 
-export function requestBrowserOpen(url: string, cwd?: string) {
+export function requestBrowserOpen(url?: string, cwd?: string) {
   window.dispatchEvent(
     new CustomEvent<BrowserOpenRequest>(OPEN_BROWSER_EVENT, {
       detail: { url, cwd },
@@ -58,7 +59,7 @@ export function isBrowserOpenRequest(
 ): event is CustomEvent<BrowserOpenRequest> {
   if (!(event instanceof CustomEvent)) return false;
   const detail = event.detail as Partial<BrowserOpenRequest> | null;
-  return !!detail && typeof detail.url === "string";
+  return !!detail && (detail.url === undefined || typeof detail.url === "string");
 }
 
 export type LinkChoiceRequest = {
