@@ -127,7 +127,6 @@ import {
 } from "../lib/tabGroups";
 import { useDragResize } from "../hooks/useDragResize";
 import { useGitFileStatuses } from "../hooks/useGitFileStatuses";
-import { useInboxUnseen } from "../hooks/useInboxUnseen";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import { useProjectDiffStats } from "../hooks/useProjectDiffStats";
 import { useSortable } from "../hooks/useSortable";
@@ -289,6 +288,9 @@ type Props = {
   onToggleProjectRail?: () => void;
   projectRailOpen?: boolean;
   unseenFinishedIds?: Set<string>;
+  inboxUnseen?: boolean;
+  /** Linked GitHub work changed after the session last advanced. */
+  linkedSessionUpdateIds?: ReadonlySet<string>;
   settingsOpen?: boolean;
   settingsSection?: SettingsSectionId;
   onOpenSettings?: () => void;
@@ -378,6 +380,8 @@ function SidebarComponent({
   onToggleProjectRail,
   projectRailOpen = true,
   unseenFinishedIds: unseenFinishedIdsProp,
+  inboxUnseen = false,
+  linkedSessionUpdateIds = new Set(),
   settingsOpen = false,
   settingsSection = "general",
   onOpenSettings,
@@ -388,7 +392,6 @@ function SidebarComponent({
   onDismissUpdate,
 }: Props) {
   const gitRoot = gitCwd || cwd;
-  const inboxUnseen = useInboxUnseen(recents, cwd);
   const resize = useDragResize({
     min: MIN_WIDTH,
     max: () => Math.min(MAX_WIDTH, Math.floor(window.innerWidth * 0.5)),
@@ -1069,6 +1072,7 @@ function SidebarComponent({
         isSelected={selectedSessionIds.has(session.id)}
         busy={busySessionIds.has(session.id)}
         done={unseenFinishedIds.has(session.id)}
+        linkedUpdate={linkedSessionUpdateIds.has(session.id)}
         needsApproval={approvalSessionIds.has(session.id)}
         dropTarget={isSessionDrop("session", session.id)}
         compact={compact}
@@ -2441,6 +2445,7 @@ function SessionCard({
   isSelected,
   busy,
   done,
+  linkedUpdate,
   needsApproval,
   dropTarget,
   compact = false,
@@ -2461,6 +2466,7 @@ function SessionCard({
   isSelected: boolean;
   busy: boolean;
   done: boolean;
+  linkedUpdate: boolean;
   needsApproval: boolean;
   dropTarget?: boolean;
   compact?: boolean;
@@ -2519,6 +2525,13 @@ function SessionCard({
     </span>
   );
 
+  const linkedUpdateDot = linkedUpdate ? (
+    <span
+      title={`Linked ${session.linkedWorkItem?.kind === "pr" ? "PR" : "issue"} updated since this session`}
+      aria-label="Linked work item updated"
+      className="size-1.5 shrink-0 rounded-full bg-accent"
+    />
+  ) : null;
   const workItemBadge = sessionWorkItems(session).map(linkedWorkItem => (
     <button
       type="button"
@@ -2697,7 +2710,7 @@ function SessionCard({
         }}
         onContextMenu={onContextMenu}
         onKeyDown={onKeyDown}
-        className={`relative border flex w-full touch-none flex-col rounded-md px-2.5 text-left ${
+        className={`relative border flex w-full cursor-default select-none touch-none flex-col rounded-md px-2.5 text-left ${
           compact ? "py-1.5" : "py-2"
         } ${dragging ? "opacity-40" : ""} ${
           dropTarget
@@ -2726,6 +2739,8 @@ function SessionCard({
               </span>
             </span>
             <span className="flex shrink-0 items-center gap-1.5">
+              {linkedUpdateDot}
+              {workItemBadge}
               {status}
             </span>
           </span>
@@ -2747,6 +2762,8 @@ function SessionCard({
           {collision ? <WorktreeCollisionBadge files={collision} /> : null}
           {compact ? (
             <span className="flex shrink-0 items-center gap-1.5">
+              {linkedUpdateDot}
+              {workItemBadge}
               {status}
             </span>
           ) : null}

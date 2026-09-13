@@ -167,10 +167,12 @@ import {
   type LinearTeam,
 } from "../lib/linear";
 import { loadTabGroupLabels, resolveTabGroupLabel } from "../lib/tabGroups";
+import type { OpenFileFn } from "../lib/search";
 import {
   filterKeybindings,
   KEYBINDINGS,
   loadClaudeHooks,
+  loadComposerEffortVisible,
   loadComposerRunner,
   loadDiffViewer,
   loadFollowUpBehavior,
@@ -179,6 +181,7 @@ import {
   loadLiveAgentsEnabled,
   loadNotesEnabled,
   saveClaudeHooks,
+  saveComposerEffortVisible,
   saveComposerRunner,
   saveDiffViewer,
   saveFollowUpBehavior,
@@ -215,7 +218,7 @@ import {
   type UpdaterSnapshot,
 } from "../lib/updater";
 
-import { SkillsPage } from "./SkillsPage";
+import { ExtensionsPage } from "./ExtensionsPage";
 import { AutomationsPage } from "./AutomationsPage";
 
 export type SettingsAnchor = "github" | "gitlab" | "linear" | "jira" | "azure";
@@ -242,6 +245,8 @@ type Props = {
   onRestoreProject?: (path: string) => void;
   onDeleteProject?: (path: string) => void;
   onOpenWhatsNew: (version: string) => void;
+  /** Opens instruction/config files in the editor when available. */
+  onOpenFile?: OpenFileFn;
 };
 
 export function SettingsView({
@@ -257,6 +262,7 @@ export function SettingsView({
   onRestoreProject,
   onDeleteProject,
   onOpenWhatsNew,
+  onOpenFile,
 }: Props) {
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   useEffect(() => {
@@ -271,13 +277,14 @@ export function SettingsView({
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || event.defaultPrevented) return;
       event.preventDefault();
       event.stopPropagation();
       onCloseRef.current();
     };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    // Let dialogs and other Settings controls handle Escape first.
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   return (
@@ -315,39 +322,52 @@ export function SettingsView({
         {IS_MAC ? null : <WindowControls />}
       </div>
 
-      <div
-        ref={lockOverscroll}
-        className="min-h-0 flex-1 overflow-y-auto overscroll-none"
-      >
-        <div className="mx-auto w-full max-w-5xl px-8 py-8">
-          <PageHeader
-            title={settingsSectionLabel(section)}
-            description={settingsSectionDescription(section)}
-          />
-          {section === "general" ? (
-            <GeneralPage onOpenWhatsNew={onOpenWhatsNew} />
-          ) : null}
-          {section === "appearance" ? (
-            <AppearancePage appearance={appearance} />
-          ) : null}
-          {section === "keybindings" ? <KeybindingsPage /> : null}
-          {section === "providers" ? <ProvidersPage key={cwd} cwd={cwd} /> : null}
-          {section === "inbox" ? <InboxPage /> : null}
-          {section === "automations" ? <AutomationsPage /> : null}
-          {section === "skills" ? <SkillsPage key={cwd} cwd={cwd} /> : null}
-          {section === "archive" ? (
-            <ArchivePage
-              cwd={cwd}
-              sessions={sessions}
-              onOpenSession={onOpenSession}
-              onArchiveSession={onArchiveSession}
-              onDeleteSession={onDeleteSession}
-              onRestoreProject={onRestoreProject}
-              onDeleteProject={onDeleteProject}
+      {section === "skills" ? (
+        <ExtensionsPage
+          key={cwd}
+          cwd={cwd}
+          onOpenFile={onOpenFile}
+          header={
+            <PageHeader
+              title={settingsSectionLabel(section)}
+              description={settingsSectionDescription(section)}
             />
-          ) : null}
+          }
+        />
+      ) : (
+        <div
+          ref={lockOverscroll}
+          className="min-h-0 flex-1 overflow-y-auto overscroll-none"
+        >
+          <div className="mx-auto w-full max-w-5xl px-8 py-8">
+            <PageHeader
+              title={settingsSectionLabel(section)}
+              description={settingsSectionDescription(section)}
+            />
+            {section === "general" ? (
+              <GeneralPage onOpenWhatsNew={onOpenWhatsNew} />
+            ) : null}
+            {section === "appearance" ? (
+              <AppearancePage appearance={appearance} />
+            ) : null}
+            {section === "keybindings" ? <KeybindingsPage /> : null}
+            {section === "providers" ? <ProvidersPage key={cwd} cwd={cwd} /> : null}
+            {section === "inbox" ? <InboxPage /> : null}
+            {section === "automations" ? <AutomationsPage /> : null}
+            {section === "archive" ? (
+              <ArchivePage
+                cwd={cwd}
+                sessions={sessions}
+                onOpenSession={onOpenSession}
+                onArchiveSession={onArchiveSession}
+                onDeleteSession={onDeleteSession}
+                onRestoreProject={onRestoreProject}
+                onDeleteProject={onDeleteProject}
+              />
+            ) : null}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -364,6 +384,9 @@ function GeneralPage({
   const [diffViewer, setDiffViewer] = useState<DiffViewer>(loadDiffViewer);
   const [followUpBehavior, setFollowUpBehavior] =
     useState<FollowUpBehavior>(loadFollowUpBehavior);
+  const [composerEffortVisible, setComposerEffortVisible] = useState(
+    loadComposerEffortVisible,
+  );
   const [defaultRuntimeMode, setDefaultRuntimeMode] = useState<RuntimeMode>(
     loadDefaultRuntimeMode,
   );
@@ -433,6 +456,11 @@ function GeneralPage({
   const onFollowUpBehavior = (next: FollowUpBehavior) => {
     saveFollowUpBehavior(next);
     setFollowUpBehavior(next);
+  };
+
+  const onComposerEffortVisible = (next: boolean) => {
+    saveComposerEffortVisible(next);
+    setComposerEffortVisible(next);
   };
 
   const onDefaultRuntimeMode = (next: string) => {
@@ -548,6 +576,16 @@ function GeneralPage({
           label="Anchor prompts to top"
           on={transcriptAnchor}
           onChange={onTranscriptAnchor}
+        />
+      </Row>
+      <Row
+        label="Effort control"
+        description="Show the current effort as a separate control beside the model picker for quicker changes. When off, effort stays inside the model menu."
+      >
+        <Toggle
+          label="Show effort beside model picker"
+          on={composerEffortVisible}
+          onChange={onComposerEffortVisible}
         />
       </Row>
       <Row

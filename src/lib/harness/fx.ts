@@ -1,4 +1,5 @@
 import { nativeModelId } from "../models";
+import { AcpSubagents } from "./acpSubagents";
 import type { RuntimeMode } from "../session";
 import { AcpClient, type AcpHandlers } from "./acp";
 import type { JsonRpcId } from "./jsonRpc";
@@ -36,6 +37,7 @@ type SessionSetupResult = {
 };
 
 type Live = {
+  subagents: AcpSubagents;
   acp: AcpClient;
   acpSessionId: string;
   cwd: string;
@@ -341,6 +343,7 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
 
     const configOptions = readConfigOptions(setup?.configOptions);
     const live: Live = {
+      subagents: new AcpSubagents(),
       acp,
       acpSessionId,
       cwd: input.cwd,
@@ -491,7 +494,7 @@ function ignoreUnsupportedControl(method: string, error: unknown): void {
 
 function handleNotification(live: Live, method: string, params: unknown) {
   if (method !== "session/update") return;
-  for (const event of eventsFromAcpUpdate(params)) {
+  for (const event of live.subagents.route(params, eventsFromAcpUpdate(params))) {
     live.onEvent(event);
   }
 }

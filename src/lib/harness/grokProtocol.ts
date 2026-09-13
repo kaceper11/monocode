@@ -3,6 +3,7 @@ import { acpAutoOption } from "./acp";
 import type { AgentModel, ModelSetting, ModelSettingChoice } from "../models";
 import type { Attachment, RuntimeMode, ToolPreview } from "../session";
 import { normalizeTaskListStatus } from "../taskList";
+import { acpAgentInfo } from "./acpSubagents";
 import type { ApprovalDecision, HarnessEvent } from "./types";
 import type { UserQuestion, UserQuestionReply } from "../userQuestion";
 import { questionsFromUnknown, selectedAnswerLabels } from "../userQuestion";
@@ -377,6 +378,7 @@ export function eventsFromAcpUpdate(params: unknown): HarnessEvent[] {
         status,
         detail: cap(toolDetail(update, tool) ?? "") || undefined,
         preview,
+        ...acpAgentInfo(update, tool, toolKind, title, grok.input),
       },
     ];
   }

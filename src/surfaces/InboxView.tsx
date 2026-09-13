@@ -102,6 +102,7 @@ import {
   githubWorkItemComment,
   githubWorkItemDetails,
   githubWorkItemThread,
+  gitlabAttentionLabel,
   inboxItemKey,
   inboxItemRef,
   inboxItemStatus,
@@ -180,9 +181,11 @@ import {
 import {
   GITLAB_CHANGE_EVENT,
   gitlabConnected,
+  gitlabMrDiff,
   gitlabWorkItemComment,
   gitlabWorkItemDetails,
   gitlabWorkItemThread,
+  peekGitlabMrDiff,
   peekGitlabWorkItemDetails,
   peekGitlabWorkItemThread,
   type GitlabWorkItemThread,
@@ -1227,7 +1230,9 @@ export function InboxView({
                 : source === "linear"
                   ? "No Linear issues match these filters"
                   : source === "gitlab"
-                    ? "No GitLab items match these filters"
+                    ? activeFilters.assignedToMe
+                      ? "Nothing needs your attention"
+                      : "No GitLab items match these filters"
                     : "No issues or pull requests match these filters"
               : source === "linear"
                 ? "No Linear issues"
@@ -1514,6 +1519,10 @@ const InboxCard = memo(function InboxCard({
   const jira = item.provider === "jira";
   const azure = item.provider === "azure";
   const source = azure ? `${item.site?.split("/").pop()} / ${item.projectName}` : jira ? item.projectName : linear ? item.teamName || item.repo : item.repo || name;
+  const attentionLabel =
+    item.provider === "gitlab"
+      ? gitlabAttentionLabel(item.attentionReason ?? "")
+      : "";
   const unseen = isInboxEntryUnseen({
     key: inboxItemKey(item),
     updatedAt: item.updatedAt,
@@ -1527,7 +1536,7 @@ const InboxCard = memo(function InboxCard({
       aria-current={active ? "true" : undefined}
       aria-label={`${jira || azure ? item.state : status.label} ${kindLabel.toLowerCase()} ${inboxItemRef(
         item,
-      )}: ${item.title}${unseen ? ", new" : ""}${relatedSessionCount > 0 ? `, ${relatedSessionCount} related ${relatedSessionCount === 1 ? "thread" : "threads"}` : ""}${work?.aria ? `, ${work.aria}` : ""}`}
+      )}: ${item.title}${attentionLabel ? `, ${attentionLabel}` : ""}${unseen ? ", new" : ""}${relatedSessionCount > 0 ? `, ${relatedSessionCount} related ${relatedSessionCount === 1 ? "thread" : "threads"}` : ""}${work?.aria ? `, ${work.aria}` : ""}`}
       onClick={() => onSelect(item)}
       className={`flex w-full flex-col rounded-md border px-2.5 py-2 text-left ${
         active
@@ -1547,6 +1556,7 @@ const InboxCard = memo(function InboxCard({
           />
           <span className="min-w-0 truncate text-[11px] text-content/50">
             {jira || (azure && !item.delivery) ? "" : `${kindLabel} · `}{inboxItemRef(item)}
+            {attentionLabel ? ` · ${attentionLabel}` : ""}
           </span>
         </span>
         {relatedSessionCount > 0 || time || unseen ? (
@@ -1576,7 +1586,7 @@ const InboxCard = memo(function InboxCard({
       </span>
       <span className="mt-1 flex min-w-0 items-center gap-2">
         <span className="flex min-w-0 flex-1 items-center gap-1.5 text-[11px] text-content/45">
-          {linear || jira || azure ? null : logoPath ? (
+          {linear || jira || azure || !item.projectPath ? null : logoPath ? (
             <ProjectLogoIcon
               path={logoPath}
               className="size-3.5 shrink-0 rounded-sm"
@@ -1684,17 +1694,19 @@ export function InboxDetail({
   const cached = azure ? peekAzureDetails(item) : jira ? peekJiraDetails(item) : linear
     ? peekLinearIssueDetails(item.id ?? "")
     : gitlabKind
-      ? peekGitlabWorkItemDetails(item.projectPath, gitlabKind, item.number)
+      ? peekGitlabWorkItemDetails(item.repo, gitlabKind, item.number)
       : githubKind
         ? peekGithubWorkItemDetails(item.projectPath, githubKind, item.number)
         : null;
-  const cachedDiff = isPr && !gitlab
-    ? peekGithubPrDiff(item.projectPath, item.number)
+  const cachedDiff = isPr
+    ? gitlab
+      ? peekGitlabMrDiff(item.repo, item.number)
+      : peekGithubPrDiff(item.projectPath, item.number)
     : null;
   const cachedThread = azure ? peekAzureThread(item) : jira ? peekJiraThread(item) : linear
     ? peekLinearIssueThread(item.id ?? "")
     : gitlabKind
-      ? peekGitlabWorkItemThread(item.projectPath, gitlabKind, item.number)
+      ? peekGitlabWorkItemThread(item.repo, gitlabKind, item.number)
       : githubKind
         ? peekGithubWorkItemThread(item.projectPath, githubKind, item.number)
         : null;
@@ -1725,6 +1737,7 @@ export function InboxDetail({
   const context = useInboxContext(item);
   const [sendError, setSendError] = useState("");
   const [retry, setRetry] = useState(0);
+  const chooseStartProject = ticket || (gitlab && !item.projectPath);
   const status = ticket
     ? item.state || inboxItemStatus(item)
     : inboxItemStatus(item);
@@ -1733,7 +1746,12 @@ export function InboxDetail({
   const source = azure ? `${item.site?.split("/").pop()} / ${item.projectName}` : jira ? item.projectName : linear
     ? item.teamName || item.repo
     : item.repo || projectName(item.projectPath);
-  const markdownCwd = ticket ? startProject || cwd : item.projectPath || cwd;
+  const attentionLabel = gitlab
+    ? gitlabAttentionLabel(item.attentionReason ?? "")
+    : "";
+  const markdownCwd = chooseStartProject
+    ? startProject || cwd
+    : item.projectPath || cwd;
   const authorName = details?.author?.trim() ?? "";
   const extraAssignees = item.assignees.filter(
     (person) =>
@@ -1761,7 +1779,7 @@ export function InboxDetail({
     const cachedDetails = azure ? peekAzureDetails(item) : jira ? peekJiraDetails(item) : linear
       ? peekLinearIssueDetails(item.id ?? "")
       : gitlabKind
-        ? peekGitlabWorkItemDetails(item.projectPath, gitlabKind, item.number)
+        ? peekGitlabWorkItemDetails(item.repo, gitlabKind, item.number)
         : githubKind
           ? peekGithubWorkItemDetails(item.projectPath, githubKind, item.number)
           : null;
@@ -1779,7 +1797,7 @@ export function InboxDetail({
         ? linearIssueDetails(item.id)
         : Promise.reject(new Error("Missing Linear issue"))
       : gitlabKind
-        ? gitlabWorkItemDetails(item.projectPath, gitlabKind, item.number)
+        ? gitlabWorkItemDetails(item.repo, gitlabKind, item.number)
         : githubKind
           ? githubWorkItemDetails(item.projectPath, githubKind, item.number)
           : Promise.reject(new Error("Unknown inbox item"));
@@ -1806,6 +1824,7 @@ export function InboxDetail({
     item.id,
     item.number,
     item.projectPath,
+    item.repo,
     linear,
     revision,
     jira,
@@ -1846,7 +1865,7 @@ export function InboxDetail({
     }
     if (gitlabKind) {
       const cachedThread = peekGitlabWorkItemThread(
-        item.projectPath,
+        item.repo,
         gitlabKind,
         item.number,
       );
@@ -1859,7 +1878,7 @@ export function InboxDetail({
         setThreadError(null);
         setThread(null);
       }
-      void gitlabWorkItemThread(item.projectPath, gitlabKind, item.number)
+      void gitlabWorkItemThread(item.repo, gitlabKind, item.number)
         .then((next) => {
           if (cancelled) return;
           setThread(next);
@@ -1915,6 +1934,7 @@ export function InboxDetail({
     item.id,
     item.number,
     item.projectPath,
+    item.repo,
     linear,
     revision,
     jira,
@@ -1925,7 +1945,9 @@ export function InboxDetail({
     // GitLab MRs render the dedicated review surface, which loads its own diff.
     if (gitlab || !isPr || tab !== "code") return;
     let cancelled = false;
-    const cachedDiff = peekGithubPrDiff(item.projectPath, item.number);
+    const cachedDiff = gitlab
+      ? peekGitlabMrDiff(item.repo, item.number)
+      : peekGithubPrDiff(item.projectPath, item.number);
     if (cachedDiff) {
       setPrDiff(cachedDiff);
       setDiffLoading(false);
@@ -1935,7 +1957,9 @@ export function InboxDetail({
       setDiffError(null);
       setPrDiff(null);
     }
-    const pending = githubPrDiff(item.projectPath, item.number);
+    const pending = gitlab
+      ? gitlabMrDiff(item.repo, item.number)
+      : githubPrDiff(item.projectPath, item.number);
     void pending
       .then((next) => {
         if (cancelled) return;
@@ -1953,7 +1977,7 @@ export function InboxDetail({
     return () => {
       cancelled = true;
     };
-  }, [gitlab, isPr, item.number, item.projectPath, revision, tab]);
+  }, [gitlab, isPr, item.number, item.projectPath, item.repo, revision, tab]);
 
   const postComment = async (body: string) => {
     setPosting(true);
@@ -1971,21 +1995,13 @@ export function InboxDetail({
         return;
       }
       if (gitlabKind) {
-        await gitlabWorkItemComment(
-          item.projectPath,
-          gitlabKind,
-          item.number,
-          body,
-        );
+        await gitlabWorkItemComment(item.repo, gitlabKind, item.number, body);
         setReplyTo(null);
         try {
           setThread(
-            await gitlabWorkItemThread(
-              item.projectPath,
-              gitlabKind,
-              item.number,
-              { force: true },
-            ),
+            await gitlabWorkItemThread(item.repo, gitlabKind, item.number, {
+              force: true,
+            }),
           );
         } catch (err: unknown) {
           setPostError(err instanceof Error ? err.message : String(err));
@@ -2042,6 +2058,9 @@ export function InboxDetail({
             <statusMark.Icon className="size-3.5" strokeWidth={1.75} />
             {status}
           </span>
+          {attentionLabel ? (
+            <span className="shrink-0 text-accent">{attentionLabel}</span>
+          ) : null}
           {source ? <span className="truncate">{source}</span> : null}
         </div>
         <h1 title={item.title}
@@ -2154,7 +2173,7 @@ export function InboxDetail({
                 }
                 onClick={() => {
                   setSendError("");
-                  void Promise.resolve(onStartTask(ticket ? { ...item, projectPath: startProject } : item, null)).catch(reason => setSendError(String(reason)));
+                  void Promise.resolve(onStartTask(chooseStartProject ? { ...item, projectPath: startProject } : item, null)).catch(reason => setSendError(String(reason)));
                 }}
                 className={`${ACTION_FILLED} disabled:cursor-default disabled:opacity-40`}
               >
@@ -2172,13 +2191,13 @@ export function InboxDetail({
               >
                 <ChevronDown className="size-3.5" strokeWidth={1.75} />
               </button>
-              {ticket ? <InboxProjectPicker projects={projects} value={startProject} onChange={setStartProject} /> : null}
+              {chooseStartProject ? <InboxProjectPicker projects={projects} value={startProject} onChange={setStartProject} /> : null}
               {sendMenu ? (
                 <SendTargetMenu
                   anchor={sendAnchor}
                   onPick={(taskId) => {
                     setSendMenu(false);
-                    onStartTask?.(ticket ? { ...item, projectPath: startProject } : item, taskId);
+                    onStartTask?.(chooseStartProject ? { ...item, projectPath: startProject } : item, taskId);
                   }}
                   onClose={() => setSendMenu(false)}
                 />
@@ -2235,7 +2254,7 @@ export function InboxDetail({
         </div>
         {sendError ? <p role="alert" className="text-[12px] text-red-400">{sendError}</p> : null}
         <InboxContextPicker context={context}
-          destination={ticket ? <InboxProjectPicker projects={projects} value={startProject} onChange={setStartProject} /> : <span className="truncate" title={item.projectPath}>{projectName(item.projectPath)}</span>}
+          destination={chooseStartProject ? <InboxProjectPicker projects={projects} value={startProject} onChange={setStartProject} /> : <span className="truncate" title={item.projectPath}>{projectName(item.projectPath)}</span>}
           onConfirm={async (card) => {
             await onDiscuss?.(card);
           }} />

@@ -4,6 +4,7 @@ import type { RuntimeMode } from "../session";
 import type { UserQuestionReply } from "../userQuestion";
 import { questionPromptTitle } from "../userQuestion";
 import { AcpClient, type AcpHandlers } from "./acp";
+import { AcpSubagents } from "./acpSubagents";
 import type { JsonRpcId } from "./jsonRpc";
 import {
   killChild,
@@ -68,6 +69,8 @@ type Live = {
   acp: AcpClient;
   acpSessionId: string;
   cwd: string;
+  /** run_subagent child activity routed onto its parent's transcript row. */
+  subagents: AcpSubagents;
   modelConfigId: string;
   configOptions: DevinConfigOption[];
   /** Synthetic requestId source for ACP requests with non-numeric ids. */
@@ -604,6 +607,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       acp,
       acpSessionId,
       cwd: input.cwd,
+      subagents: new AcpSubagents(),
       modelConfigId: devinModelConfigId(configOptions),
       configOptions,
       nextRequestId: 1_000_000_000,
@@ -823,7 +827,10 @@ function handleNotification(live: Live, method: string, params: unknown) {
   // Replays (session/load) and muted windows still update the state above;
   // only transcript events are suppressed.
   if (live.muteUpdates) return;
-  for (const event of devinEventsFromUpdate(params)) {
+  for (const event of live.subagents.route(
+    params,
+    devinEventsFromUpdate(params),
+  )) {
     live.onEvent(event);
   }
 }
