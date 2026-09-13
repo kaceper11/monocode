@@ -124,6 +124,8 @@ beforeEach(() => {
       if (command === "git_github_work_item_thread") return thread;
       if (command === "git_github_work_item_comment")
         return "https://github.com/acme/app/pull/42#reply";
+      if (command === "git_github_submit_review")
+        return "https://github.com/acme/app/pull/42#pullrequestreview-7";
       if (command === "azure_ci_context")
         return {
           cwd: args.cwd,
@@ -371,6 +373,148 @@ it("embeds without the surface header for inbox detail", async () => {
       expect(document.body.textContent).toContain("src/file.ts:12");
     }));
     expect(document.querySelector("h2")).toBeNull();
+  } finally {
+    await cleanup();
+  }
+});
+
+async function typeText(selector: string, text: string) {
+  const input = document.querySelector(selector) as HTMLTextAreaElement;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )!.set!.call(input, text);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+async function addLineComment(label: string, text: string) {
+  const gutter = document.querySelector(
+    `[aria-label="${label}"]`,
+  ) as HTMLButtonElement;
+  expect(gutter).not.toBeNull();
+  await act(async () => gutter.click());
+  await typeText('[role="dialog"] textarea', text);
+  await click("Add to review");
+}
+
+it("submits an inline review pinned to the viewed head", async () => {
+  const cleanup = await setup();
+  try {
+    await click("Pull requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(
+          document.querySelector('[aria-label="Submit a review"]'),
+        ).not.toBeNull();
+      }),
+    );
+    await addLineComment("Comment on line 2", "Nit inline");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain(
+          "Review · 1 line comment",
+        );
+      }),
+    );
+    await click("Request changes");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(
+          vi.mocked(invoke).mock.calls.some(
+            ([command, args]) =>
+              command === "git_github_submit_review" &&
+              (args as Record<string, unknown>).repo === "acme/app" &&
+              (args as Record<string, unknown>).number === 42 &&
+              (args as Record<string, unknown>).commitId === "head42" &&
+              (args as Record<string, unknown>).event ===
+                "REQUEST_CHANGES" &&
+              JSON.stringify(
+                (args as Record<string, unknown>).comments,
+              ) ===
+                JSON.stringify([
+                  {
+                    path: "src/file.ts",
+                    line: 2,
+                    side: "RIGHT",
+                    body: "Nit inline",
+                  },
+                ]),
+          ),
+        ).toBe(true);
+      }),
+    );
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("Review submitted");
+      }),
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+it("approves with a summary and no inline comments", async () => {
+  const cleanup = await setup();
+  try {
+    await click("Pull requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(
+          document.querySelector('[aria-label="Submit a review"]'),
+        ).not.toBeNull();
+      }),
+    );
+    await typeText('textarea[aria-label="Review summary"]', "LGTM");
+    await click("Approve");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(
+          vi.mocked(invoke).mock.calls.some(
+            ([command, args]) =>
+              command === "git_github_submit_review" &&
+              (args as Record<string, unknown>).event === "APPROVE" &&
+              (args as Record<string, unknown>).body === "LGTM" &&
+              JSON.stringify(
+                (args as Record<string, unknown>).comments,
+              ) === "[]",
+          ),
+        ).toBe(true);
+      }),
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+it("drops pending line comments when the PR head moves", async () => {
+  const cleanup = await setup();
+  try {
+    await click("Pull requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(
+          document.querySelector('[aria-label="Submit a review"]'),
+        ).not.toBeNull();
+      }),
+    );
+    await addLineComment("Comment on line 2", "Stale draft");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("1 line comment");
+      }),
+    );
+    head = "head43";
+    await click("Refresh PR");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain(
+          "Comment on a diff line to include it in the review",
+        );
+      }),
+    );
+    expect(document.body.textContent).not.toContain("Stale draft");
   } finally {
     await cleanup();
   }

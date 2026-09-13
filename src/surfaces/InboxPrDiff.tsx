@@ -2,13 +2,19 @@ import { useMemo } from "react";
 import type { GithubPrDiff } from "../lib/githubTasks";
 import { mergePrDiff, parsePrPatch, type PrDiffFile } from "../lib/prDiff";
 import { blocksFromLines, type UnifiedLine } from "../lib/unifiedDiff";
-import { UnifiedDiffView, type UnifiedDiffFileModel } from "./UnifiedDiffView";
+import {
+  UnifiedDiffView,
+  type LineCommentComposer,
+  type UnifiedDiffFileModel,
+} from "./UnifiedDiffView";
 
 type Props = {
   diff: GithubPrDiff;
+  /** Remote review surfaces route line comments into their own review flow. */
+  lineCommentComposer?: LineCommentComposer;
 };
 
-export function InboxPrDiff({ diff }: Props) {
+export function InboxPrDiff({ diff, lineCommentComposer }: Props) {
   const files = useMemo(() => {
     const parsed = mergePrDiff(diff.files, parsePrPatch(diff.patch));
     return parsed.map((file) => toModel(file, diff.truncated));
@@ -22,6 +28,7 @@ export function InboxPrDiff({ diff }: Props) {
       fill={false}
       fileLayout="cards"
       initialExpansion="first"
+      lineCommentComposer={lineCommentComposer}
     />
   );
 }
@@ -44,6 +51,9 @@ function toModel(file: PrDiffFile, truncated: boolean): UnifiedDiffFileModel {
         : undefined,
     additions: file.additions,
     deletions: file.deletions,
+    // Remote diff — chat-bound hunk/line actions lose the PR binding, so the
+    // owning review surface provides the comment flow instead.
+    contextActions: false,
     blocks: blocksFromLines(lines),
   };
 }

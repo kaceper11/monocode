@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -6,12 +6,16 @@ import {
   githubPrDiff,
   githubPrState,
   githubRepo,
+  githubReviewAnchor,
   githubReviewDecisionLabel,
   githubReviewStateLabel,
+  githubSubmitReview,
   githubWorkItemComment,
   githubWorkItemThread,
   type GithubPrDiff,
   type GithubPrState,
+  type GithubReviewCommentDraft,
+  type GithubReviewEvent,
   type GithubWorkItemComment,
   type GithubWorkItemThread,
 } from "../lib/githubTasks";
@@ -21,12 +25,18 @@ import {
   type RepairEvidence,
 } from "../lib/repair";
 import { requestAgentContext, type AgentContext } from "../lib/agentContext";
+import { diffCommentLocation } from "../lib/diffComment";
 import { notifyGitChanged } from "../lib/fs";
 import { openProjectPath } from "../lib/recents";
 import { openWatchSheet } from "../lib/watchers";
+import type { UnifiedLine } from "../lib/unifiedDiff";
 import { RepairStatus } from "./RepairStatus";
+import { Popover } from "./Popover";
+import { X } from "./icons";
 import { InboxPrDiff } from "../surfaces/InboxPrDiff";
 import { AgentMarkdown } from "../surfaces/AgentMarkdown";
+import type { DiffCommentComposerTarget } from "../surfaces/DiffCommentComposer";
+import type { LineCommentComposer } from "../surfaces/UnifiedDiffView";
 
 const button =
   "rounded-md px-2 py-1 text-[12px] text-content hover:bg-content/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40";
@@ -120,10 +130,16 @@ function GithubPrPanel({
   const [error, setError] = useState("");
   const [verified, setVerified] = useState(false);
   const [repairRefresh, setRepairRefresh] = useState(0);
+  const [reviewComments, setReviewComments] = useState<
+    GithubReviewCommentDraft[]
+  >([]);
+  const [reviewUrl, setReviewUrl] = useState("");
+  const [reviewNonce, setReviewNonce] = useState(0);
   const generation = useRef(0);
   const pending = useRef(false);
   const mounted = useRef(true);
   const repairDraft = useRef<{ key: string; instruction: string } | null>(null);
+  const reviewedHead = useRef("");
   const scope = githubPrScope(repo || boundRepo || cwd, number);
 
   useEffect(() => {
@@ -176,6 +192,12 @@ function GithubPrPanel({
       if (!current()) return;
       if (state.number !== number)
         throw new Error("GitHub returned a different PR. Check the repository binding.");
+      // A new head moves the diff — pending line comments anchor to the head
+      // they were drafted against, so drop them rather than submit stale.
+      if (reviewedHead.current && reviewedHead.current !== state.headRefOid) {
+        setReviewComments([]);
+      }
+      reviewedHead.current = state.headRefOid;
       setPr(state);
       setDiff(nextDiff);
       setThread(nextThread);
@@ -242,6 +264,57 @@ function GithubPrPanel({
       notifyGitChanged(cwd);
       openProjectPath(path);
     });
+
+  const addReviewComment = useCallback(
+    (path: string, line: UnifiedLine, body: string) => {
+      const anchor = githubReviewAnchor(line);
+      if (!anchor) return;
+      setReviewUrl("");
+      setReviewComments((current) =>
+        [
+          ...current.filter(
+            (comment) =>
+              !(
+                comment.path === path &&
+                comment.line === anchor.line &&
+                comment.side === anchor.side
+              ),
+          ),
+          { path, ...anchor, body },
+        ].slice(-50),
+      );
+    },
+    [],
+  );
+
+  const removeReviewComment = useCallback((index: number) => {
+    setReviewComments((current) =>
+      current.filter((_, row) => row !== index),
+    );
+  }, []);
+
+  const submitReview = async (event: GithubReviewEvent, body: string) => {
+    let submitted = false;
+    await run(async (current) => {
+      if (!pr?.headRefOid)
+        throw new Error(
+          "Refresh the PR to read its head before reviewing.",
+        );
+      const url = await githubSubmitReview(cwd, repo, number, {
+        commitId: pr.headRefOid,
+        event,
+        body,
+        comments: reviewComments,
+      });
+      if (!current()) return;
+      setReviewComments([]);
+      setReviewUrl(url);
+      // Remount the sections so the summary field resets with the comments.
+      setReviewNonce((value) => value + 1);
+      submitted = true;
+    });
+    if (submitted) void refresh();
+  };
 
   const threads = (thread?.comments ?? []).filter(isReviewThread);
   const conversation = (thread?.comments ?? []).filter(
@@ -381,7 +454,7 @@ function GithubPrPanel({
         ) : null}
         {verified && pr ? (
           <GithubPrSections
-            key={`${pr.headRefOid}:${repairRefresh}`}
+            key={`${pr.headRefOid}:${repairRefresh}:${reviewNonce}`}
             cwd={cwd}
             number={number}
             pr={pr}
@@ -394,6 +467,11 @@ function GithubPrPanel({
             busy={busy}
             sendComments={sendComments}
             sendChecks={sendChecks}
+            reviewComments={reviewComments}
+            reviewUrl={reviewUrl}
+            addReviewComment={addReviewComment}
+            removeReviewComment={removeReviewComment}
+            submitReview={submitReview}
             onThreadRefresh={() => void refresh()}
           />
         ) : null}
@@ -420,6 +498,11 @@ function GithubPrSections({
   busy,
   sendComments,
   sendChecks,
+  reviewComments,
+  reviewUrl,
+  addReviewComment,
+  removeReviewComment,
+  submitReview,
   onThreadRefresh,
 }: {
   cwd: string;
@@ -434,9 +517,29 @@ function GithubPrSections({
   busy: boolean;
   sendComments: (comments: GithubWorkItemComment[]) => void;
   sendChecks: () => void;
+  reviewComments: GithubReviewCommentDraft[];
+  reviewUrl: string;
+  addReviewComment: (path: string, line: UnifiedLine, body: string) => void;
+  removeReviewComment: (index: number) => void;
+  submitReview: (event: GithubReviewEvent, body: string) => Promise<void>;
   onThreadRefresh: () => void;
 }) {
   const open = pr.state.trim().toUpperCase() === "OPEN";
+  const [reviewBody, setReviewBody] = useState("");
+  const commentComposer = useCallback<LineCommentComposer>(
+    ({ path, target, onDismiss }) => (
+      <PrReviewLineComposer
+        path={path}
+        target={target}
+        onAdd={(body) => {
+          addReviewComment(path, target.line, body);
+          onDismiss();
+        }}
+        onDismiss={onDismiss}
+      />
+    ),
+    [addReviewComment],
+  );
   return (
     <div className="space-y-2">
       {open && unresolved.length ? (
@@ -486,10 +589,101 @@ function GithubPrSections({
           </ul>
         )}
       </details>
+      {open ? (
+        <section
+          aria-label="Submit a review"
+          className="space-y-2 rounded-md border border-content/10 px-2 py-2"
+        >
+          <h4 className="text-content/60">
+            Review
+            {reviewComments.length
+              ? ` · ${reviewComments.length} line comment${reviewComments.length === 1 ? "" : "s"}`
+              : ""}
+          </h4>
+          {reviewComments.length ? (
+            <ul className="space-y-1">
+              {reviewComments.map((comment, index) => (
+                <li
+                  key={`${comment.path}:${comment.side}:${comment.line}`}
+                  className="flex items-start gap-1"
+                >
+                  <span
+                    className="min-w-0 flex-1 truncate text-content/70"
+                    title={`${comment.path}:${comment.line}\n${comment.body}`}
+                  >
+                    {comment.path}:{comment.line}
+                    {comment.side === "LEFT" ? " (removed line)" : ""} ·{" "}
+                    {comment.body}
+                  </span>
+                  <button
+                    type="button"
+                    title="Remove comment"
+                    aria-label="Remove comment"
+                    onClick={() => removeReviewComment(index)}
+                    className="grid size-5 shrink-0 place-items-center rounded text-content/45 hover:bg-content/10 hover:text-content"
+                  >
+                    <X className="size-3" strokeWidth={1.75} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-content/50">
+              Comment on a diff line to include it in the review.
+            </p>
+          )}
+          <textarea
+            aria-label="Review summary"
+            className={field}
+            rows={2}
+            maxLength={64_000}
+            placeholder="Review summary (optional)"
+            value={reviewBody}
+            disabled={busy}
+            onChange={(event) => setReviewBody(event.target.value)}
+          />
+          <div className="flex flex-wrap items-center gap-1">
+            <button
+              className={button}
+              disabled={
+                busy || (!reviewBody.trim() && !reviewComments.length)
+              }
+              onClick={() => void submitReview("COMMENT", reviewBody)}
+            >
+              Comment
+            </button>
+            <button
+              className={button}
+              disabled={busy}
+              onClick={() => void submitReview("APPROVE", reviewBody)}
+            >
+              Approve
+            </button>
+            <button
+              className={button}
+              disabled={busy}
+              onClick={() => void submitReview("REQUEST_CHANGES", reviewBody)}
+            >
+              Request changes
+            </button>
+            {reviewUrl ? (
+              <button
+                className={button}
+                onClick={() => void openUrl(reviewUrl).catch(() => undefined)}
+              >
+                Review submitted — open on GitHub
+              </button>
+            ) : null}
+          </div>
+        </section>
+      ) : null}
       <section aria-label="Pull request diff" className="space-y-1">
         <h4 className="text-content/60">Changed files</h4>
         {diff ? (
-          <InboxPrDiff diff={diff} />
+          <InboxPrDiff
+            diff={diff}
+            lineCommentComposer={open ? commentComposer : undefined}
+          />
         ) : (
           <p className="text-content/50">Diff unavailable. Refresh PR to retry.</p>
         )}
@@ -630,5 +824,93 @@ function GithubReviewThread({
         ) : null}
       </div>
     </details>
+  );
+}
+
+/** Gutter popover that drafts one inline comment into the pending review —
+ *  submitted together with the review event, not posted immediately. */
+function PrReviewLineComposer({
+  path,
+  target,
+  onAdd,
+  onDismiss,
+}: {
+  path: string;
+  target: DiffCommentComposerTarget;
+  onAdd: (body: string) => void;
+  onDismiss: () => void;
+}) {
+  const [comment, setComment] = useState("");
+  const location = diffCommentLocation({ path, line: target.line });
+  const add = () => {
+    const body = comment.trim();
+    if (!body) return;
+    onAdd(body);
+  };
+  return (
+    <Popover
+      anchor={target.anchor}
+      side="right"
+      align="start"
+      gap={6}
+      width={360}
+      onDismiss={onDismiss}
+      role="dialog"
+      aria-label={`Comment on ${location}`}
+      className="overflow-hidden"
+    >
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          add();
+        }}
+      >
+        <div className="flex items-center gap-2 border-b border-content/10 px-3 py-2">
+          <span
+            className="min-w-0 flex-1 truncate font-mono text-[11px] text-content/55"
+            title={location}
+          >
+            {location}
+          </span>
+          <button
+            type="button"
+            title="Cancel comment"
+            aria-label="Cancel comment"
+            onClick={onDismiss}
+            className="grid size-5 shrink-0 place-items-center rounded text-content/45 hover:bg-content/10 hover:text-content"
+          >
+            <X className="size-3" strokeWidth={1.75} />
+          </button>
+        </div>
+        <textarea
+          autoFocus
+          rows={3}
+          maxLength={64_000}
+          value={comment}
+          onChange={(event) => setComment(event.target.value)}
+          onKeyDown={(event) => {
+            if (
+              event.key === "Enter" &&
+              (event.metaKey || event.ctrlKey) &&
+              comment.trim()
+            ) {
+              event.preventDefault();
+              add();
+            }
+          }}
+          placeholder="Comment on this line…"
+          className="block max-h-40 min-h-20 w-full resize-y bg-transparent px-3 py-2 text-[13px] leading-5 text-content outline-none placeholder:text-content/35"
+        />
+        <div className="flex items-center justify-end gap-1 border-t border-content/10 p-1.5">
+          <button
+            type="submit"
+            disabled={!comment.trim()}
+            className="inline-flex h-7 items-center gap-1.5 rounded-lg bg-content/10 px-2.5 text-[12px] font-medium text-content hover:bg-content/15 disabled:cursor-default disabled:opacity-40"
+          >
+            Add to review
+          </button>
+        </div>
+      </form>
+    </Popover>
   );
 }

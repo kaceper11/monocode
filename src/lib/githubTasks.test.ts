@@ -7,6 +7,7 @@ import {
   formatGithubQuery,
   formatRelativeTime,
   githubAvatarUrl,
+  githubReviewAnchor,
   githubReviewDecisionLabel,
   githubReviewStateLabel,
   gitlabAttentionLabel,
@@ -145,6 +146,51 @@ describe("githubReviewStateLabel", () => {
     expect(githubReviewStateLabel("APPROVED")).toBe("Approved");
     expect(githubReviewStateLabel("COMMENTED")).toBe("Commented");
     expect(githubReviewStateLabel("PENDING")).toBe("");
+  });
+});
+
+describe("githubReviewAnchor", () => {
+  it("anchors deletions on the old side and other lines on the new", () => {
+    expect(
+      githubReviewAnchor({
+        kind: "del",
+        text: "-old",
+        oldNumber: 9,
+        newNumber: null,
+      }),
+    ).toEqual({ line: 9, side: "LEFT" });
+    expect(
+      githubReviewAnchor({
+        kind: "add",
+        text: "+new",
+        oldNumber: null,
+        newNumber: 4,
+      }),
+    ).toEqual({ line: 4, side: "RIGHT" });
+    expect(
+      githubReviewAnchor({
+        kind: "context",
+        text: " same",
+        oldNumber: 3,
+        newNumber: 3,
+      }),
+    ).toEqual({ line: 3, side: "RIGHT" });
+    expect(
+      githubReviewAnchor({
+        kind: "hunk",
+        text: "@@ -1 +1 @@",
+        oldNumber: null,
+        newNumber: null,
+      }),
+    ).toBeNull();
+    expect(
+      githubReviewAnchor({
+        kind: "del",
+        text: "-old",
+        oldNumber: null,
+        newNumber: null,
+      }),
+    ).toBeNull();
   });
 });
 

@@ -20,6 +20,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import { FileTypeIcon } from "../chrome/FileTypeIcon";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
@@ -27,7 +28,10 @@ import { useColorScheme } from "../hooks/useColorScheme";
 import type { ColorScheme } from "../lib/appearance";
 import { basename } from "../lib/fs";
 import { highlightDiffFile, type SyntaxToken } from "./syntaxTokens";
-import { DiffCommentComposer } from "./DiffCommentComposer";
+import {
+  DiffCommentComposer,
+  type DiffCommentComposerTarget,
+} from "./DiffCommentComposer";
 import {
   expandFold,
   selectedDiffHunk,
@@ -69,6 +73,14 @@ export type UnifiedDiffFileModel = {
 type FileLayout = "stacked" | "cards";
 type InitialExpansion = "all" | "first" | "none";
 
+/** Replaces the chat-bound line comment composer — remote review surfaces
+ *  route gutter comments into their own review flow. */
+export type LineCommentComposer = (props: {
+  path: string;
+  target: DiffCommentComposerTarget;
+  onDismiss: () => void;
+}) => ReactNode;
+
 type Props = {
   files: UnifiedDiffFileModel[];
   truncated?: boolean;
@@ -86,6 +98,7 @@ type Props = {
   onStageFile?: (id: string) => void;
   onDiscardFile?: (id: string) => void;
   onHunkAction?: (id: string, pos: number) => void;
+  lineCommentComposer?: LineCommentComposer;
   onValidateContext?: (
     id: string,
     revision: object | undefined,
@@ -106,6 +119,7 @@ export function UnifiedDiffView({
   onStageFile,
   onDiscardFile,
   onHunkAction,
+  lineCommentComposer,
   onValidateContext,
 }: Props) {
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
@@ -271,6 +285,7 @@ export function UnifiedDiffView({
               onStageFile={onStageFile}
               onDiscardFile={onDiscardFile}
               onHunkAction={onHunkAction}
+              lineCommentComposer={lineCommentComposer}
               onValidateContext={onValidateContext}
               bindRef={bindFileRef}
             />
@@ -300,6 +315,7 @@ type FileSectionProps = {
   onStageFile?: (id: string) => void;
   onDiscardFile?: (id: string) => void;
   onHunkAction?: (id: string, pos: number) => void;
+  lineCommentComposer?: LineCommentComposer;
   onValidateContext?: (
     id: string,
     revision: object | undefined,
@@ -321,6 +337,7 @@ const FileSection = memo(function FileSection({
   onStageFile,
   onDiscardFile,
   onHunkAction,
+  lineCommentComposer,
   onValidateContext,
   bindRef,
 }: FileSectionProps) {
@@ -449,6 +466,7 @@ const FileSection = memo(function FileSection({
             onReveal(file.id, foldId, total, direction);
           }}
           onHunkAction={onHunkAction}
+          lineCommentComposer={lineCommentComposer}
           onValidateContext={onValidateContext}
         />
       ) : null}
@@ -476,6 +494,7 @@ function equalFileSectionProps(
     previous.onStageFile === next.onStageFile &&
     previous.onDiscardFile === next.onDiscardFile &&
     previous.onHunkAction === next.onHunkAction &&
+    previous.lineCommentComposer === next.lineCommentComposer &&
     previous.onValidateContext === next.onValidateContext &&
     previous.bindRef === next.bindRef
   );
@@ -512,6 +531,7 @@ function FileBody({
   scrollerRef,
   onReveal,
   onHunkAction,
+  lineCommentComposer,
   onValidateContext,
 }: {
   file: UnifiedDiffFileModel;
@@ -521,6 +541,7 @@ function FileBody({
   scrollerRef: React.RefObject<HTMLDivElement | null>;
   onReveal: (foldId: string, direction: "up" | "down" | "all") => void;
   onHunkAction?: (id: string, pos: number) => void;
+  lineCommentComposer?: LineCommentComposer;
   onValidateContext?: (
     id: string,
     revision: object | undefined,
@@ -545,6 +566,7 @@ function FileBody({
       scrollerRef={scrollerRef}
       onReveal={onReveal}
       onHunkAction={onHunkAction}
+      lineCommentComposer={lineCommentComposer}
       onValidateContext={onValidateContext}
     />
   );
@@ -563,6 +585,7 @@ function VirtualRows({
   scrollerRef,
   onReveal,
   onHunkAction,
+  lineCommentComposer,
   onValidateContext,
 }: {
   fileId: string;
@@ -577,6 +600,7 @@ function VirtualRows({
   scrollerRef: React.RefObject<HTMLDivElement | null>;
   onReveal: (foldId: string, direction: "up" | "down" | "all") => void;
   onHunkAction?: (id: string, pos: number) => void;
+  lineCommentComposer?: LineCommentComposer;
   onValidateContext?: (
     id: string,
     revision: object | undefined,
@@ -791,7 +815,7 @@ function VirtualRows({
           }
           hunkAction={hunkAction}
           onComment={
-            contextActions &&
+            (contextActions || lineCommentComposer) &&
             lane === "gutter" &&
             row.type === "line" &&
             row.line.kind !== "hunk"
@@ -942,16 +966,24 @@ function VirtualRows({
         />
       ) : null}
       {commentTarget ? (
-        <DiffCommentComposer
-          path={filePath}
-          target={commentTarget}
-          onBeforeSend={
-            onValidateContext
-              ? () => onValidateContext(fileId, commentTarget.revision)
-              : undefined
-          }
-          onDismiss={() => setCommentTarget(null)}
-        />
+        lineCommentComposer ? (
+          lineCommentComposer({
+            path: filePath,
+            target: commentTarget,
+            onDismiss: () => setCommentTarget(null),
+          })
+        ) : (
+          <DiffCommentComposer
+            path={filePath}
+            target={commentTarget}
+            onBeforeSend={
+              onValidateContext
+                ? () => onValidateContext(fileId, commentTarget.revision)
+                : undefined
+            }
+            onDismiss={() => setCommentTarget(null)}
+          />
+        )
       ) : null}
     </>
   );
