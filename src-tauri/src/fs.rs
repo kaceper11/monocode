@@ -1128,7 +1128,7 @@ fn git_github_pr_state_for(root: &Path, number: i64) -> Result<GitHubPrState, St
 
 /// Strip control characters and bound length — check names, titles and URLs
 /// are untrusted provider data rendered in the queue and sent to agents.
-fn clean_field(raw: &str, max: usize) -> String {
+pub(crate) fn clean_field(raw: &str, max: usize) -> String {
     raw.chars()
         .filter(|c| !c.is_control() || *c == '\n')
         .take(max)

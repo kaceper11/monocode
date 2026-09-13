@@ -43,6 +43,7 @@ export type GitlabWorkItemComment = {
   path: string;
   line: number | null;
   resolved: boolean;
+  resolvable?: boolean;
   threadId: string;
   replies: GitlabWorkItemComment[];
 };
@@ -63,14 +64,41 @@ export type GitlabMrDiff = {
   truncated: boolean;
 };
 
+export type GitlabMrPipeline = {
+  id: number;
+  sha: string;
+  status: string;
+  url: string;
+};
+
+export type GitlabMrState = {
+  number: number;
+  title: string;
+  url: string;
+  state: string;
+  draft: boolean;
+  /** Project the backend resolved and read — fresh, unlike the repo cache. */
+  repo: string;
+  headSha: string;
+  headRefName: string;
+  baseRefName: string;
+  mergeStatus: string;
+  blockingDiscussionsResolved: boolean;
+  approvalsRequired: number;
+  approvalsLeft: number;
+  approved: boolean;
+  pipeline: GitlabMrPipeline | null;
+};
+
 export const GITLAB_CHANGE_EVENT = "monocode:gitlab-change";
 
 const repoByPath = new Map<string, string>();
+const repoInflight = new Map<string, Promise<string>>();
 const detailsByKey = new Map<string, GitlabWorkItemDetails>();
 const threadByKey = new Map<string, GitlabWorkItemThread>();
 const threadInflight = new Map<string, Promise<GitlabWorkItemThread>>();
-const diffByKey = new Map<string, GitlabMrDiff>();
 const diffInflight = new Map<string, Promise<GitlabMrDiff>>();
+const discussionInflight = new Map<string, Promise<GitlabWorkItemThread>>();
 
 function itemKey(cwd: string, kind: GitlabKind, number: number): string {
   return `${normalizeProjectPath(cwd)}:${kind}:${number}`;
@@ -78,11 +106,12 @@ function itemKey(cwd: string, kind: GitlabKind, number: number): string {
 
 export function clearGitlabCache() {
   repoByPath.clear();
+  repoInflight.clear();
   detailsByKey.clear();
   threadByKey.clear();
   threadInflight.clear();
-  diffByKey.clear();
   diffInflight.clear();
+  discussionInflight.clear();
 }
 
 export function gitlabConnected(): Promise<GitlabStatus> {
@@ -116,9 +145,20 @@ export async function gitlabRepo(cwd: string): Promise<string> {
   const key = normalizeProjectPath(cwd);
   const cached = repoByPath.get(key);
   if (cached !== undefined) return cached;
-  const repo = await invoke<string>("gitlab_repo", { cwd });
-  repoByPath.set(key, repo);
-  return repo;
+  const inflight = repoInflight.get(key);
+  if (inflight) return inflight;
+  const pending = invoke<string>("gitlab_repo", { cwd })
+    .then((repo) => {
+      // A later force/invalidate removed or replaced this entry — don't
+      // let the stale write repopulate the cache.
+      if (repoInflight.get(key) === pending) repoByPath.set(key, repo);
+      return repo;
+    })
+    .finally(() => {
+      if (repoInflight.get(key) === pending) repoInflight.delete(key);
+    });
+  repoInflight.set(key, pending);
+  return pending;
 }
 
 export function listGitlabWorkItems(
@@ -187,7 +227,7 @@ export async function gitlabWorkItemThread(
     number,
   })
     .then((thread) => {
-      threadByKey.set(key, thread);
+      if (threadInflight.get(key) === pending) threadByKey.set(key, thread);
       return thread;
     })
     .finally(() => {
@@ -212,14 +252,9 @@ export async function gitlabWorkItemComment(
   const key = itemKey(cwd, kind, number);
   threadByKey.delete(key);
   threadInflight.delete(key);
+  // A top-level note on an MR lands as a new individual_note discussion.
+  if (kind === "pr") invalidateDiscussions(cwd, number);
   return url;
-}
-
-export function peekGitlabMrDiff(
-  cwd: string,
-  number: number,
-): GitlabMrDiff | null {
-  return diffByKey.get(itemKey(cwd, "pr", number)) ?? null;
 }
 
 export async function gitlabMrDiff(
@@ -230,15 +265,89 @@ export async function gitlabMrDiff(
   const cached = diffInflight.get(key);
   if (cached) return cached;
   const pending = invoke<GitlabMrDiff>("gitlab_mr_diff", { cwd, number })
-    .then((diff) => {
-      diffByKey.set(key, diff);
-      return diff;
-    })
     .finally(() => {
       if (diffInflight.get(key) === pending) diffInflight.delete(key);
     });
   diffInflight.set(key, pending);
   return pending;
+}
+
+/** Review/merge/pipeline state for one merge request. */
+export function gitlabMrState(
+  cwd: string,
+  number: number,
+): Promise<GitlabMrState> {
+  return invoke<GitlabMrState>("gitlab_mr_state", { cwd, number });
+}
+
+/** The open merge request for a source branch, or a rejection. */
+export function gitlabMrForBranch(
+  cwd: string,
+  branch: string,
+): Promise<GitlabWorkItem> {
+  return invoke<GitlabWorkItem>("gitlab_mr_for_branch", { cwd, branch });
+}
+
+/** Discussions keep diff positions; unlike flat notes they carry
+ * `threadId` (the discussion id) so replies and resolve target exactly. */
+export async function gitlabMrDiscussions(
+  cwd: string,
+  number: number,
+  options?: { force?: boolean },
+): Promise<GitlabWorkItemThread> {
+  const key = itemKey(cwd, "pr", number);
+  if (options?.force) discussionInflight.delete(key);
+  const cached = discussionInflight.get(key);
+  if (cached) return cached;
+  const pending = invoke<GitlabWorkItemThread>("gitlab_mr_discussions", {
+    cwd,
+    number,
+  }).finally(() => {
+    if (discussionInflight.get(key) === pending)
+      discussionInflight.delete(key);
+  });
+  discussionInflight.set(key, pending);
+  return pending;
+}
+
+const invalidateDiscussions = (cwd: string, number: number) => {
+  const key = itemKey(cwd, "pr", number);
+  discussionInflight.delete(key);
+  // The flat notes thread behind the inbox summary lists the same replies.
+  threadByKey.delete(key);
+  threadInflight.delete(key);
+};
+
+/** Reply inside an existing discussion; returns the new note's URL. */
+export async function gitlabMrDiscussionReply(
+  cwd: string,
+  number: number,
+  discussionId: string,
+  body: string,
+): Promise<string> {
+  const url = await invoke<string>("gitlab_mr_discussion_reply", {
+    cwd,
+    number,
+    discussionId,
+    body: body.trim(),
+  });
+  invalidateDiscussions(cwd, number);
+  return url;
+}
+
+export async function gitlabMrDiscussionResolve(
+  cwd: string,
+  number: number,
+  discussionId: string,
+  resolved: boolean,
+): Promise<void> {
+  await invoke("gitlab_mr_discussion_resolve", {
+    cwd,
+    number,
+    discussionId,
+    resolved,
+  });
+  invalidateDiscussions(cwd, number);
 }
 
 export function notifyGitlabChange() {

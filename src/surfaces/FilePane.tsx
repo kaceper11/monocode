@@ -1,5 +1,6 @@
 import { AzurePrReview } from "../chrome/AzurePrReview";
 import { AzureCiReview } from "../chrome/AzureCiReview";
+import { GitlabMrReview } from "../chrome/GitlabMrReview";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { Activity, memo, useSyncExternalStore } from "react";
 import {
@@ -155,9 +156,10 @@ function FilePaneComponent({
             >
               {file.delivery ? (
                 <Activity mode={visible && file.id === pane.activeFileId ? "visible" : "hidden"}><div className="flex h-full min-h-0 flex-col">
-                  {file.delivery.kind === "pr" ? <AzurePrReview cwd={file.cwd} branch={file.delivery.branch} sourceSessionId={file.delivery.sourceSessionId}
-                    linkedWorkItem={sessions.find(session => session.id === file.delivery?.sourceSessionId)?.linkedWorkItem}
-                    enabled onReveal={() => onSelectFile(pane.id, file.id)} onClose={() => onCloseFile(pane.id, file.id)} />
+                  {file.delivery.provider === "gitlab" ? <GitlabMrReview cwd={file.cwd} repo={file.delivery.repo ?? ""} number={file.delivery.number ?? 0} branch={file.delivery.branch} sourceSessionId={file.delivery.sourceSessionId} enabled onReveal={() => onSelectFile(pane.id, file.id)} onClose={() => onCloseFile(pane.id, file.id)} />
+                    : file.delivery.kind === "pr" ? <AzurePrReview cwd={file.cwd} branch={file.delivery.branch} sourceSessionId={file.delivery.sourceSessionId}
+                      linkedWorkItem={sessions.find(session => session.id === file.delivery?.sourceSessionId)?.linkedWorkItem}
+                      enabled onReveal={() => onSelectFile(pane.id, file.id)} onClose={() => onCloseFile(pane.id, file.id)} />
                     : <AzureCiReview cwd={file.cwd} branch={file.delivery.branch} sourceSessionId={file.delivery.sourceSessionId} enabled onReveal={() => onSelectFile(pane.id, file.id)} onClose={() => onCloseFile(pane.id, file.id)} />}
                 </div></Activity>
               ) : isPlanTab(file) ? (

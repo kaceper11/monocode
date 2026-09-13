@@ -1,5 +1,6 @@
 import { Select } from "./Select";
-import { deliveryProvider, saveDeliveryProvider, resolvePrProviders, openGitHubDelivery, DELIVERY_PROVIDERS_CHANGED, type DeliveryProvider } from "../lib/deliveryProviders";
+import { deliveryProvider, saveDeliveryProvider, resolvePrProviders, openGitHubDelivery, gitlabDeliveryTarget, GITLAB_CI_ON_MR, DELIVERY_PROVIDERS_CHANGED, type DeliveryProvider } from "../lib/deliveryProviders";
+import { GITLAB_CHANGE_EVENT, gitlabRepo } from "../lib/gitlab";
 import { loadAzurePrAssociations, AZURE_PR_ASSOCIATIONS_CHANGED } from "../lib/azureRepos";
 import { loadCiSources, ciState, ciContext, AZURE_CI_SOURCES_CHANGED } from "../lib/azurePipelines";
 import type { DeliveryTabSource } from "../lib/layout";
@@ -245,11 +246,13 @@ export function GitChangesPanel({
     const refresh = () => refreshDelivery(value => value + 1);
     window.addEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, refresh);
     window.addEventListener(AZURE_CI_SOURCES_CHANGED, refresh);
+    window.addEventListener(GITLAB_CHANGE_EVENT, refresh);
     window.addEventListener("storage", refresh);
     window.addEventListener(DELIVERY_PROVIDERS_CHANGED, refresh);
     return () => {
       window.removeEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, refresh);
       window.removeEventListener(AZURE_CI_SOURCES_CHANGED, refresh);
+      window.removeEventListener(GITLAB_CHANGE_EVENT, refresh);
       window.removeEventListener("storage", refresh);
       window.removeEventListener(DELIVERY_PROVIDERS_CHANGED, refresh);
     };
@@ -285,17 +288,27 @@ export function GitChangesPanel({
     setDeliveryError("");
     setDeliveryBusy(false);
     deliveryPending.current = false;
-    if (enabled && index?.branch) void ciContext(viewCwd).then(context => {
-      if (generation === deliveryGeneration.current && context?.branch === index.branch)
-        // Same detection the PR sheet's "Auto" uses — the branch upstream's
-        // remote wins over the default remote.
-        setRepository({cwd: viewCwd, branch: context.branch, provider: resolvePrProviders({remotes: context.remotes, upstream: index.upstream, remote: index.remote}).detected});
+    if (enabled && index?.branch) void ciContext(viewCwd).then(async context => {
+      if (generation !== deliveryGeneration.current || context?.branch !== index.branch) return;
+      // Same detection the PR sheet's "Auto" uses — the branch upstream's
+      // remote wins over the default remote.
+      let provider = resolvePrProviders({remotes: context.remotes, upstream: index.upstream, remote: index.remote}).detected;
+      if (!provider)
+        // GitLab detection needs the configured host — a remote only counts
+        // as GitLab when it resolves through GitLab's own binding.
+        provider = await gitlabRepo(viewCwd).then(repo => repo.trim() ? "gitlab" as const : undefined).catch(() => undefined);
+      if (generation === deliveryGeneration.current)
+        setRepository({cwd: viewCwd, branch: context.branch, provider});
     }).catch(() => { /* Explicit provider selection remains available. */ });
     return () => { deliveryGeneration.current++; };
-  }, [viewCwd, index?.branch, index?.remote, index?.upstream, sourceSessionId, enabled]);
+  }, [viewCwd, index?.branch, index?.remote, index?.upstream, sourceSessionId, enabled, deliveryTick]);
   const defaultProvider = repository?.cwd === viewCwd && repository.branch === index?.branch ? repository.provider : undefined;
-  const providerFor = (kind: "pr" | "ci") => deliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind)
-    ?? ((kind === "pr" ? prs.length : pipelines.length) ? "azure" : defaultProvider);
+  const providerFor = (kind: "pr" | "ci") => {
+    // GitLab pipelines ride the MR surface — never a standalone CI delivery.
+    const provider = deliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind)
+      ?? ((kind === "pr" ? prs.length : pipelines.length) ? "azure" : defaultProvider);
+    return provider === "gitlab" && kind === "ci" ? undefined : provider;
+  };
   const openDelivery = async (kind: "pr" | "ci") => {
     const provider = providerFor(kind);
     if (!provider) { setChoosingProviders(true); return; }
@@ -305,7 +318,12 @@ export function GitChangesPanel({
     setDeliveryBusy(true); setDeliveryError("");
     try {
       if (provider === "github") await openGitHubDelivery(viewCwd, kind, () => generation === deliveryGeneration.current);
-      else onOpenDelivery?.(viewCwd, {kind, branch: index?.branch ?? "", sourceSessionId});
+      else if (provider === "gitlab") {
+        if (kind === "ci") throw new Error(GITLAB_CI_ON_MR);
+        const target = await gitlabDeliveryTarget(viewCwd, index?.branch ?? "");
+        if (generation !== deliveryGeneration.current) return;
+        onOpenDelivery?.(viewCwd, {kind, branch: index?.branch ?? "", sourceSessionId, provider: "gitlab", repo: target.repo, number: target.number});
+      } else onOpenDelivery?.(viewCwd, {kind, branch: index?.branch ?? "", sourceSessionId});
     } catch (error) { if (generation === deliveryGeneration.current) setDeliveryError(String(error instanceof Error ? error.message : error)); }
     finally { if (generation === deliveryGeneration.current) { deliveryPending.current = false; setDeliveryBusy(false); } }
   };
@@ -373,14 +391,14 @@ export function GitChangesPanel({
           ] as const
         ).map(([kind, label]) => {
           const provider = providerFor(kind);
-          const providerLabel = provider === "github" ? (kind === "pr" ? "GitHub" : "GitHub checks") : provider === "azure" ? (kind === "pr" ? "Azure Repos" : "Azure Pipelines") : "Choose provider";
+          const providerLabel = provider === "github" ? (kind === "pr" ? "GitHub" : "GitHub checks") : provider === "azure" ? (kind === "pr" ? "Azure Repos" : "Azure Pipelines") : provider === "gitlab" ? (kind === "pr" ? "GitLab" : "GitLab pipelines") : "Choose provider";
           const linked = provider === "azure";
           return (
           <button
             key={kind}
             type="button"
             aria-label={label}
-            disabled={!enabled || !index || deliveryBusy || (provider === "azure" && !onOpenDelivery)}
+            disabled={!enabled || !index || deliveryBusy || ((provider === "azure" || provider === "gitlab") && !onOpenDelivery)}
             className="group flex min-h-9 w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-content/70 hover:bg-content/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent disabled:opacity-40"
             onClick={() => void openDelivery(kind)}
           >
@@ -412,7 +430,7 @@ export function GitChangesPanel({
         );})}
         <details open={choosingProviders} onToggle={event => setChoosingProviders(event.currentTarget.open)} className="px-3 text-[11px] text-content/45">
           <summary className="cursor-pointer py-1">Providers</summary>
-          <div className="space-y-1 pb-2">{(["pr", "ci"] as const).map(kind => <div key={kind} className="flex items-center justify-between gap-2"><span>{kind === "pr" ? "PR" : "CI"}</span><Select disabled={!enabled || !index || deliveryBusy} label={kind === "pr" ? "PR provider" : "CI provider"} value={deliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind) ?? ""} options={[{value:"",label:"Automatic"},{value:"github",label:kind === "pr" ? "GitHub" : "GitHub checks"},{value:"azure",label:kind === "pr" ? "Azure Repos" : "Azure Pipelines"}]} onChange={value => {
+          <div className="space-y-1 pb-2">{(["pr", "ci"] as const).map(kind => <div key={kind} className="flex items-center justify-between gap-2"><span>{kind === "pr" ? "PR" : "CI"}</span><Select disabled={!enabled || !index || deliveryBusy} label={kind === "pr" ? "PR provider" : "CI provider"} value={deliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind) ?? ""} options={[{value:"",label:"Automatic"},{value:"github",label:kind === "pr" ? "GitHub" : "GitHub checks"},{value:"azure",label:kind === "pr" ? "Azure Repos" : "Azure Pipelines"},...(kind === "pr" ? [{value:"gitlab",label:"GitLab"}] : [])]} onChange={value => {
             try { saveDeliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind, value as DeliveryProvider | ""); setDeliveryError(""); }
             catch { setDeliveryError("Could not save provider choice. Try again."); }
           }} /></div>)}</div>
