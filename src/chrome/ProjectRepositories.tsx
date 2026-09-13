@@ -5,7 +5,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { basename, pickFolder } from "../lib/fs";
+import { basename, listDir, pickFolder } from "../lib/fs";
 import { probeRepositoryFamily } from "../hooks/useRepositoryFamilies";
 import {
   addRepositoryToProject,
@@ -26,6 +26,7 @@ import {
   subscribeProjects,
   type ProjectRecord,
   type ProjectRepository,
+  type SavedRepositorySet,
 } from "../lib/projects";
 import { IS_WIN } from "../lib/platform";
 import {
@@ -48,9 +49,11 @@ import {
   ChevronDown,
   ChevronUp,
   CircleAlert,
+  FolderOpen,
   FolderPlus,
   FolderTree,
   GitBranch,
+  Pencil,
   Plus,
   Trash2,
   X,
@@ -70,6 +73,20 @@ type Props = {
 const inputClass =
   "w-full rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-[13px] text-content outline-none ring-accent/40 focus:ring-1";
 
+/** A verified repository staged for addition — nothing is persisted until the
+ * user submits the queue. */
+type PendingRepo = {
+  family: RepositoryFamily;
+  checked: boolean;
+  /** Name of another project this repository would move from. */
+  owner?: string;
+};
+
+/** Probing one directory child per request; scan in small batches so a big
+ * parent folder does not burst the backend. */
+const SCAN_BATCH = 8;
+const SCAN_LIMIT = 200;
+
 /** The project repositories sheet: membership and saved repository sets for
  * one project. Edits here change associations only — never checkouts,
  * worktrees, sessions or credentials. */
@@ -87,9 +104,15 @@ export function ProjectRepositories({
   const [adding, setAdding] = useState(false);
   const [pickOpen, setPickOpen] = useState(false);
   const locating = useRef<string | null>(null);
+  /** What the shared folder picker feeds: a single repository, a folder scan,
+   * or a locate. Reset to "add" after every pick. */
+  const pickPurpose = useRef<"add" | "scan">("add");
+  const [pending, setPending] = useState<PendingRepo[]>([]);
+  const [scanning, setScanning] = useState(false);
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [setName, setSetName] = useState("");
   const [setNaming, setSetNaming] = useState(false);
+  const [editingSet, setEditingSet] = useState<string | null>(null);
   const [renamingSet, setRenamingSet] = useState<string | null>(null);
 
   const direct = projectId
@@ -162,37 +185,145 @@ export function ProjectRepositories({
     names.filter((name, index) => names.indexOf(name) !== index),
   );
 
-  const addFamily = (found: RepositoryFamily | null) => {
-    if (!found) {
-      setError("That folder is not a Git repository.");
-      return;
+  /** Splits probed families into queueable items vs already-covered ones.
+   * Members of this project and already-queued repositories are skipped. */
+  const stageable = (found: (RepositoryFamily | null)[]) => {
+    const memberKeys = new Set(members.map((repo) => pathKey(repo.commonDir)));
+    const queuedKeys = new Set(
+      pending.map((item) => pathKey(item.family.commonDir)),
+    );
+    const items: PendingRepo[] = [];
+    let covered = 0;
+    for (const family of found) {
+      if (!family) continue;
+      const key = pathKey(family.commonDir);
+      if (memberKeys.has(key) || queuedKeys.has(key)) {
+        covered++;
+        continue;
+      }
+      queuedKeys.add(key);
+      const owner = findProjectByCommonDir(family.commonDir, projects)?.project;
+      items.push({
+        family,
+        checked: true,
+        owner:
+          owner && owner.id !== project?.id
+            ? (owner.name ??
+              (owner.anchor ? basename(owner.anchor) : "another project"))
+            : undefined,
+      });
     }
-    const target = ensureProject();
-    const anchor = found.checkout || target.anchor;
-    if (!anchor) {
-      setError("Pick a working-copy folder for this repository.");
-      return;
-    }
-    const result = addRepositoryToProject(target.id, {
-      commonDir: found.commonDir,
-      anchor,
-    });
-    setError(result.error ?? "");
+    return { items, covered };
+  };
+
+  const stage = (result: { items: PendingRepo[]; covered: number }) => {
+    if (result.items.length) setPending((prev) => [...prev, ...result.items]);
+    else if (result.covered)
+      setError("That repository is already in this project or queued.");
   };
 
   const addPath = async (picked: string | null) => {
     if (!picked) return;
     setError("");
-    addFamily(await probeRepositoryFamily(picked));
+    const found = await probeRepositoryFamily(picked);
+    if (!found) {
+      setError("That folder is not a Git repository.");
+      return;
+    }
+    stage(stageable([found]));
+  };
+
+  /** Pick a parent folder and probe each immediate child directory. A picked
+   * repository stages itself instead of scanning inside its working tree. */
+  const scanPicked = async (picked: string | null) => {
+    if (!picked) return;
+    setError("");
+    setScanning(true);
+    try {
+      const own = await probeRepositoryFamily(picked);
+      if (own) {
+        stage(stageable([own]));
+        return;
+      }
+      const dirs = (await listDir(picked))
+        .filter(
+          (entry) => entry.isDir && !entry.ignored && !entry.name.startsWith("."),
+        )
+        .slice(0, SCAN_LIMIT);
+      const found: (RepositoryFamily | null)[] = [];
+      for (let i = 0; i < dirs.length; i += SCAN_BATCH)
+        found.push(
+          ...(await Promise.all(
+            dirs.slice(i, i + SCAN_BATCH).map((entry) =>
+              probeRepositoryFamily(entry.path),
+            ),
+          )),
+        );
+      const result = stageable(found);
+      stage(result);
+      if (!result.items.length && !result.covered)
+        setError("No Git repositories in that folder.");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  /** Commits the checked queue entries — the only write in the add flow. */
+  const submitPending = () => {
+    const chosen = pending.filter((item) => item.checked);
+    if (!chosen.length) return;
+    setError("");
+    const target = ensureProject();
+    const errors: string[] = [];
+    const failed = new Set<string>();
+    for (const item of chosen) {
+      const anchor =
+        item.family.checkout ||
+        target.anchor ||
+        item.family.worktrees.find((entry) => !entry.missing)?.path;
+      const key = pathKey(item.family.commonDir);
+      if (!anchor) {
+        errors.push(
+          `${basename(item.family.checkout) || item.family.commonDir}: no working-copy folder found.`,
+        );
+        failed.add(key);
+        continue;
+      }
+      const result = addRepositoryToProject(target.id, {
+        commonDir: item.family.commonDir,
+        anchor,
+      });
+      if (result.error) {
+        errors.push(result.error);
+        failed.add(key);
+      }
+    }
+    setPending((prev) =>
+      prev.filter((item) => failed.has(pathKey(item.family.commonDir))),
+    );
+    if (errors.length) setError(errors.join("\n"));
   };
 
   const pickRepository = () => {
     setError("");
+    pickPurpose.current = "add";
     if (IS_WIN) {
       setPickOpen(true);
       return;
     }
     void pickFolder("Choose repository").then(addPath);
+  };
+
+  const pickScanFolder = () => {
+    setError("");
+    pickPurpose.current = "scan";
+    if (IS_WIN) {
+      setPickOpen(true);
+      return;
+    }
+    void pickFolder("Choose a folder of repositories").then(scanPicked);
   };
 
   const reconnect = (repo: ProjectRepository) => {
@@ -253,26 +384,63 @@ export function ProjectRepositories({
     const ids = target.repositories
       .filter((repo) => selection.has(pathKey(repo.commonDir)))
       .map((repo) => repo.id);
-    const result = saveRepositorySet(target.id, setName, ids);
+    const result = saveRepositorySet(
+      target.id,
+      setName,
+      ids,
+      editingSet ?? undefined,
+    );
     if (result.error) setError(result.error);
     else {
       setError("");
       setSetName("");
       setSetNaming(false);
+      setEditingSet(null);
       setSelection(new Set());
     }
   };
 
-  // Repositories MonoCode already verified that are not members here.
+  /** Loads a saved set back into the checkboxes so its membership can be
+   * edited and re-saved under the same name. */
+  const editSet = (set: SavedRepositorySet) => {
+    const memberById = new Map(
+      members.map((repo) => [repo.id, repo] as const),
+    );
+    setSelection(
+      new Set(
+        set.repositoryIds.flatMap((id) => {
+          const repo = memberById.get(id);
+          return repo ? [pathKey(repo.commonDir)] : [];
+        }),
+      ),
+    );
+    setSetName(set.name);
+    setEditingSet(set.id);
+    setSetNaming(true);
+  };
+
+  const closeSetNaming = () => {
+    setSetNaming(false);
+    setEditingSet(null);
+    setSetName("");
+  };
+
+  // Repositories MonoCode already verified that are neither members here nor
+  // already queued for addition.
   const candidates = useMemo(() => {
     const unique = new Map<string, RepositoryFamily>();
     for (const family of families.values())
       unique.set(pathKey(family.commonDir), family);
     const memberKeys = new Set(members.map((repo) => pathKey(repo.commonDir)));
-    return [...unique.values()].filter(
-      (entry) => !memberKeys.has(pathKey(entry.commonDir)),
+    const queuedKeys = new Set(
+      pending.map((item) => pathKey(item.family.commonDir)),
     );
-  }, [families, members]);
+    return [...unique.values()].filter(
+      (entry) =>
+        !memberKeys.has(pathKey(entry.commonDir)) &&
+        !queuedKeys.has(pathKey(entry.commonDir)),
+    );
+  }, [families, members, pending]);
 
   return (
     <Modal
@@ -325,7 +493,7 @@ export function ProjectRepositories({
           {members.length === 0 ? (
             <p className="rounded-lg border border-content/10 px-2.5 py-2 text-[12px] text-content/45">
               No repositories yet. Add one explicitly — folders are never
-              scanned or auto-imported.
+              auto-imported.
             </p>
           ) : (
             <ul className="flex flex-col gap-px">
@@ -427,51 +595,150 @@ export function ProjectRepositories({
               <div className="flex items-center gap-2">
                 <button
                   type="button"
+                  disabled={scanning}
                   onClick={pickRepository}
-                  className="flex items-center gap-1.5 rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-[12px] text-content hover:bg-content/10"
+                  className="flex items-center gap-1.5 rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-[12px] text-content hover:bg-content/10 disabled:opacity-50"
                 >
                   <FolderPlus className="size-3.5" strokeWidth={1.75} />
                   Choose folder…
                 </button>
-                <p className="min-w-0 flex-1 text-[11px] leading-tight text-content/45">
-                  or pick a repository MonoCode already verified
-                </p>
+                <button
+                  type="button"
+                  disabled={scanning}
+                  title="Pick a parent folder — every Git repository directly inside is queued"
+                  onClick={pickScanFolder}
+                  className="flex items-center gap-1.5 rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-[12px] text-content hover:bg-content/10 disabled:opacity-50"
+                >
+                  <FolderOpen className="size-3.5" strokeWidth={1.75} />
+                  {scanning ? "Scanning…" : "Scan a folder…"}
+                </button>
               </div>
-              {candidates.length ? (
-                <ul className="mt-1.5 flex flex-col gap-px">
-                  {candidates.map((entry) => {
-                    const owner = findProjectByCommonDir(
-                      entry.commonDir,
-                      projects,
-                    )?.project;
-                    return (
-                      <li key={pathKey(entry.commonDir)}>
-                        <button
-                          type="button"
-                          title={prettyCwd(entry.checkout)}
-                          onClick={() => addFamily(entry)}
-                          className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+              <p className="mt-1.5 text-[11px] leading-tight text-content/45">
+                {pending.length
+                  ? "Queued repositories join the project when you submit."
+                  : "Picked repositories are queued — nothing changes until you submit."}
+              </p>
+              {pending.length ? (
+                <div className="mt-1.5 space-y-1">
+                  <ul className="flex flex-col gap-px">
+                    {pending.map((item) => {
+                      const key = pathKey(item.family.commonDir);
+                      const label =
+                        basename(item.family.checkout) || item.family.checkout;
+                      return (
+                        <li
+                          key={key}
+                          className="flex items-center gap-2 rounded-lg px-1.5 py-1 hover:bg-content/5"
                         >
+                          <ContextCheckbox
+                            label={`Select ${label}`}
+                            checked={item.checked}
+                            onChange={() =>
+                              setPending((prev) =>
+                                prev.map((entry) =>
+                                  entry === item
+                                    ? { ...entry, checked: !entry.checked }
+                                    : entry,
+                                ),
+                              )
+                            }
+                          />
                           <GitBranch
                             className="size-3.5 shrink-0 text-content/40"
                             strokeWidth={1.5}
                           />
-                          <span className="min-w-0 flex-1 truncate">
-                            {basename(entry.checkout) || entry.checkout}
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate text-[12px] leading-tight text-content">
+                              {label}
+                            </span>
+                            <span className="block truncate text-[10px] leading-tight text-content/45">
+                              {prettyCwd(item.family.checkout)}
+                            </span>
                           </span>
-                          {owner ? (
-                            <span className="shrink-0 text-[10px] text-content/45">
-                              Moves from {owner.name ??
-                                (owner.anchor
-                                  ? basename(owner.anchor)
-                                  : "another project")}
+                          {item.owner ? (
+                            <span className="shrink-0 text-[10px] text-amber-400">
+                              Moves from {item.owner}
                             </span>
                           ) : null}
-                        </button>
-                      </li>
-                    );
-                  })}
-                </ul>
+                          <button
+                            type="button"
+                            aria-label={`Remove ${label} from queue`}
+                            onClick={() =>
+                              setPending((prev) =>
+                                prev.filter((entry) => entry !== item),
+                              )
+                            }
+                            className="grid size-5 shrink-0 place-items-center rounded text-content/40 hover:bg-content/8 hover:text-content"
+                          >
+                            <X className="size-3" strokeWidth={1.75} />
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  <div className="flex items-center justify-end gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setPending([])}
+                      className="rounded-md px-2 py-1 text-[11px] text-content/60 hover:bg-content/8 hover:text-content"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!pending.some((item) => item.checked)}
+                      onClick={submitPending}
+                      className="rounded-md bg-content px-2.5 py-1 text-[11px] font-medium text-background-base disabled:opacity-40"
+                    >
+                      Add{" "}
+                      {pending.filter((item) => item.checked).length}{" "}
+                      {pending.filter((item) => item.checked).length === 1
+                        ? "repository"
+                        : "repositories"}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+              {candidates.length ? (
+                <>
+                  <p className="mt-2 text-[11px] text-content/45">
+                    Already verified:
+                  </p>
+                  <ul className="mt-0.5 flex flex-col gap-px">
+                    {candidates.map((entry) => {
+                      const owner = findProjectByCommonDir(
+                        entry.commonDir,
+                        projects,
+                      )?.project;
+                      return (
+                        <li key={pathKey(entry.commonDir)}>
+                          <button
+                            type="button"
+                            title={prettyCwd(entry.checkout)}
+                            onClick={() => stage(stageable([entry]))}
+                            className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+                          >
+                            <GitBranch
+                              className="size-3.5 shrink-0 text-content/40"
+                              strokeWidth={1.5}
+                            />
+                            <span className="min-w-0 flex-1 truncate">
+                              {basename(entry.checkout) || entry.checkout}
+                            </span>
+                            {owner ? (
+                              <span className="shrink-0 text-[10px] text-content/45">
+                                Moves from {owner.name ??
+                                  (owner.anchor
+                                    ? basename(owner.anchor)
+                                    : "another project")}
+                              </span>
+                            ) : null}
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </>
               ) : null}
             </div>
           ) : null}
@@ -486,7 +753,11 @@ export function ProjectRepositories({
               <button
                 type="button"
                 disabled={!selection.size}
-                onClick={() => setSetNaming(true)}
+                onClick={() => {
+                  setEditingSet(null);
+                  setSetName("");
+                  setSetNaming(true);
+                }}
                 className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-content/55 hover:bg-content/8 hover:text-content disabled:opacity-40"
               >
                 <Plus className="size-3" strokeWidth={1.75} />
@@ -513,13 +784,13 @@ export function ProjectRepositories({
                 <button
                   type="submit"
                   className="grid size-7 shrink-0 place-items-center rounded-md text-content/60 hover:bg-content/8 hover:text-content"
-                  aria-label="Save set"
+                  aria-label={editingSet ? "Update set" : "Save set"}
                 >
                   <Check className="size-3.5" strokeWidth={1.75} />
                 </button>
                 <button
                   type="button"
-                  onClick={() => setSetNaming(false)}
+                  onClick={closeSetNaming}
                   className="grid size-7 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/8 hover:text-content"
                   aria-label="Cancel"
                 >
@@ -575,6 +846,16 @@ export function ProjectRepositories({
                     <span className="flex shrink-0 items-center">
                       <button
                         type="button"
+                        aria-label={`Edit set ${set.name}`}
+                        title="Edit which repositories this set uses"
+                        aria-pressed={editingSet === set.id}
+                        onClick={() => editSet(set)}
+                        className={`grid size-5 place-items-center rounded text-content/45 hover:bg-content/8 hover:text-content ${editingSet === set.id ? "text-content" : ""}`}
+                      >
+                        <Pencil className="size-3" strokeWidth={1.75} />
+                      </button>
+                      <button
+                        type="button"
                         aria-label={`Move ${set.name} up`}
                         disabled={index === 0}
                         onClick={() => moveRepositorySet(project.id, set.id, -1)}
@@ -625,16 +906,20 @@ export function ProjectRepositories({
             setPickOpen(false);
             const target = locating.current;
             locating.current = null;
+            const purpose = pickPurpose.current;
+            pickPurpose.current = "add";
             if (target && project) {
               const repo = project.repositories.find(
                 (entry) => entry.id === target,
               );
               if (repo) void locateInto(repo, picked);
-            } else void addPath(picked);
+            } else if (purpose === "scan") void scanPicked(picked);
+            else void addPath(picked);
           }}
           onClose={() => {
             setPickOpen(false);
             locating.current = null;
+            pickPurpose.current = "add";
           }}
         />
       ) : null}

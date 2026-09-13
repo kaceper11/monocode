@@ -2,8 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { pathKey } from "./paths";
 import {
   addRepositoryToProject,
+  createProjectGroup,
   ensureProjectForPath,
+  isProjectRailKey,
   loadProjects,
+  projectRailKey,
 } from "./projects";
 import type { RepositoryFamily } from "./repositoryFamilies";
 import {
@@ -238,6 +241,49 @@ describe("project grouping on the rail", () => {
       "/tmp/app",
     ]);
     expect(sections.projects[1].project?.id).toBe(project.id);
+  });
+
+  it("renders a group project once — its sentinel row is not duplicated", () => {
+    const group = createProjectGroup("Team");
+    const sections = projectRailSections(
+      [{ path: "/tmp/else", openedAt: 1 }],
+      "/tmp/else",
+      ["/tmp/else", projectRailKey(group.id)],
+      [],
+      new Map(),
+      loadProjects(),
+    );
+    const rows = sections.projects.filter((item) =>
+      isProjectRailKey(item.path),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].project?.id).toBe(group.id);
+  });
+
+  it("collapses a member recent through its stored repository anchor before the family is probed", () => {
+    const project = ensureProjectForPath(
+      "/tmp/app",
+      family("/tmp/app/.git", "/tmp/app"),
+    );
+    addRepositoryToProject(project.id, {
+      commonDir: "/tmp/lib/.git",
+      anchor: "/tmp/lib",
+    });
+    // No verified families yet — the member recent still joins its project
+    // instead of briefly doubling the row.
+    const sections = projectRailSections(
+      [
+        { path: "/tmp/app", openedAt: 1 },
+        { path: "/tmp/lib", openedAt: 2 },
+      ],
+      "/tmp/app",
+      ["/tmp/app", "/tmp/lib"],
+      [],
+      new Map(),
+      loadProjects(),
+    );
+    expect(sections.projects.map((item) => item.path)).toEqual(["/tmp/app"]);
+    expect(sections.projects[0].project?.id).toBe(project.id);
   });
 });
 

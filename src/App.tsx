@@ -8313,8 +8313,7 @@ export default function App({
       {worktreeManager ? (
         <Modal
           title="Worktrees"
-          size="sm"
-          className="max-h-[80vh]"
+          size="md"
           // A removal batch must not be dismissed mid-run — the results
           // screen is where failures surface.
           onClose={() => {

@@ -314,6 +314,36 @@ describe("saved sets", () => {
     deleteRepositorySet(project.id, one.id);
     expect(loadProjects()[0].sets.map((set) => set.id)).toEqual([two.id]);
   });
+
+  it("updates a set's name and membership in place when given its id", () => {
+    const project = ensureProjectForPath(
+      "/tmp/app",
+      family("/tmp/app/.git", "/tmp/app"),
+    );
+    addRepositoryToProject(project.id, {
+      commonDir: "/tmp/b/.git",
+      anchor: "/tmp/b",
+    });
+    const [a, b] = loadProjects()[0].repositories;
+    saveRepositorySet(project.id, "First", [a.id]);
+    saveRepositorySet(project.id, "Second", [a.id]);
+    const [first, second] = loadProjects()[0].sets;
+    // Editing keeps the row's position and identity; dropped members and
+    // non-members are filtered out.
+    expect(
+      saveRepositorySet(project.id, "Pair", [a.id, b.id, "foreign"], first.id)
+        .error,
+    ).toBeUndefined();
+    const sets = loadProjects()[0].sets;
+    expect(sets.map((set) => set.id)).toEqual([first.id, second.id]);
+    expect(sets[0].name).toBe("Pair");
+    expect(sets[0].repositoryIds).toEqual([a.id, b.id]);
+    // An update to a missing set writes nothing.
+    expect(
+      saveRepositorySet(project.id, "Nope", [a.id], "missing").error,
+    ).toBeUndefined();
+    expect(loadProjects()[0].sets).toHaveLength(2);
+  });
 });
 
 describe("saved commands", () => {

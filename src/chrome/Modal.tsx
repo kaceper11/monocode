@@ -18,6 +18,14 @@ const TOP: Record<ModalSize, string> = {
   lg: "top-[6%]",
 };
 
+/** Hard ceiling: top offset plus 24px of bottom breathing room, so no dialog
+ * can grow past the viewport even when callers forget a max-height. */
+const MAX_H: Record<ModalSize, string> = {
+  sm: "max-h-[calc(78vh-24px)]",
+  md: "max-h-[calc(90vh-24px)]",
+  lg: "max-h-[calc(94vh-24px)]",
+};
+
 type Props = {
   onClose: () => void;
   title: string;
@@ -87,7 +95,7 @@ export function ModalPanel({
 
   return (
     <div
-      className={`absolute left-1/2 ${TOP[size]} ${WIDTH[size]} -translate-x-1/2`}
+      className={`absolute left-1/2 ${TOP[size]} ${MAX_H[size]} ${WIDTH[size]} -translate-x-1/2 flex flex-col`}
     >
       <div
         role="dialog"
@@ -95,7 +103,7 @@ export function ModalPanel({
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
         onMouseDown={(event) => event.stopPropagation()}
-        className={`modal-panel flex flex-col overflow-hidden rounded-2xl border border-content/10 bg-background-base/55 shadow-2xl backdrop-blur-xl ${className ?? ""}`}
+        className={`modal-panel flex min-h-0 flex-col overflow-hidden rounded-2xl border border-content/10 bg-background-base/55 shadow-2xl backdrop-blur-xl ${className ?? ""}`}
       >
         <header className="flex shrink-0 items-start gap-2 px-4 pt-3">
           <div className="min-w-0 flex-1 pt-0.5">

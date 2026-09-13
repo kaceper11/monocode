@@ -638,15 +638,23 @@ export function saveRepositorySet(
   projectId: string,
   name: string,
   repositoryIds: string[],
+  setId?: string,
 ): { error?: string } {
   const trimmed = name.trim().slice(0, 200);
   if (!trimmed) return { error: "Name the set." };
   if (!repositoryIds.length) return { error: "Select repositories first." };
   updateProject(projectId, (project) => {
-    if (project.sets.length >= MAX_SETS) return project;
     const memberIds = new Set(project.repositories.map((repo) => repo.id));
     const ids = repositoryIds.filter((id) => memberIds.has(id));
     if (!ids.length) return project;
+    if (setId)
+      return {
+        ...project,
+        sets: project.sets.map((set) =>
+          set.id === setId ? { ...set, name: trimmed, repositoryIds: ids } : set,
+        ),
+      };
+    if (project.sets.length >= MAX_SETS) return project;
     return {
       ...project,
       sets: [
@@ -915,9 +923,16 @@ export function groupRailProjectsByMembership(
 ): ProjectRailSections {
   if (!projects.length) return sections;
   const byAnchor = new Map<string, ProjectRecord>();
-  for (const project of projects)
+  const byRepositoryAnchor = new Map<string, ProjectRecord>();
+  const byRailKey = new Map<string, ProjectRecord>();
+  for (const project of projects) {
     if (project.anchor)
       byAnchor.set(pathKey(project.anchor), project);
+    for (const repo of project.repositories)
+      if (repo.anchor)
+        byRepositoryAnchor.set(pathKey(repo.anchor), project);
+    byRailKey.set(pathKey(projectRailKey(project.id)), project);
+  }
   const represented = new Set<string>();
   const group = (items: RailProjectItem[]) => {
     const out: RailProjectItem[] = [];
@@ -927,7 +942,11 @@ export function groupRailProjectsByMembership(
       const family = families.get(itemKey);
       const member =
         family && findProjectByCommonDir(family.commonDir, projects);
-      const project = member?.project ?? byAnchor.get(itemKey);
+      const project =
+        member?.project ??
+        byAnchor.get(itemKey) ??
+        byRepositoryAnchor.get(itemKey) ??
+        byRailKey.get(itemKey);
       if (!project) {
         out.push(item);
         continue;

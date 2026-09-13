@@ -397,6 +397,20 @@ export function WorktreePanel({
   const checkedCount = entries.filter((entry) =>
     checked.has(pathKey(entry.path)),
   ).length;
+  // Bulk-select works on the filtered list, so a search can stage a batch.
+  const selectableVisible = visibleEntries.filter(bulkSelectable);
+  const allVisibleChecked =
+    selectableVisible.length > 0 &&
+    selectableVisible.every((entry) => checked.has(pathKey(entry.path)));
+  const toggleAllVisible = () =>
+    setChecked((current) => {
+      const next = new Set(current);
+      for (const entry of selectableVisible) {
+        if (allVisibleChecked) next.delete(pathKey(entry.path));
+        else next.add(pathKey(entry.path));
+      }
+      return next;
+    });
   // Stable family context for the batch: a just-removed path can never
   // serve as cwd for the next preflight. Prefer the surviving main
   // checkout — never a missing or prunable registration.
@@ -432,12 +446,19 @@ export function WorktreePanel({
       if (!plan.removable.length && !plan.skipped.length) return;
       setBulk({ phase: "confirm", ...plan, removed: [], failures: [] });
     });
-  /** Hand a skipped/failed bulk entry back to the single-entry flow. */
-  const reviewEntry = (entry: Worktree) => {
+  /** Hand a skipped/failed bulk entry back to the single-entry flow. Leftover
+   * work (dirty files, bound processes) goes straight to the guarded removal
+   * confirmation — missing, prunable, locked or detached entries still land on
+   * the detail view where their recovery guidance lives. */
+  const reviewEntry = (skip: BulkSkip | { entry: Worktree }) => {
+    const { entry } = skip;
+    const safety = "safety" in skip ? skip.safety : undefined;
     setBulk(null);
     setSelecting(false);
     setChecked(new Set());
-    setDetail(entry);
+    if (safety && (safety.dirty || safety.processes.length))
+      startRemove(entry);
+    else setDetail(entry);
   };
   const confirmBulkRemove = () =>
     void run(async () => {
@@ -595,7 +616,7 @@ export function WorktreePanel({
                     <button
                       type="button"
                       className="shrink-0 rounded border border-content/10 px-1.5 py-0.5 text-[11px] hover:bg-content/5"
-                      onClick={() => reviewEntry(skip.entry)}
+                      onClick={() => reviewEntry(skip)}
                     >
                       Review
                     </button>
@@ -626,7 +647,7 @@ export function WorktreePanel({
                     <button
                       type="button"
                       className="shrink-0 rounded border border-content/10 px-1.5 py-0.5 text-[11px] hover:bg-content/5"
-                      onClick={() => reviewEntry(failure.entry)}
+                      onClick={() => reviewEntry(failure)}
                     >
                       Review
                     </button>
@@ -1244,6 +1265,16 @@ export function WorktreePanel({
                 : "Last used in MonoCode"}
             </span>
             <div className="flex items-center gap-1">
+              {selecting ? (
+                <button
+                  type="button"
+                  disabled={busy || !selectableVisible.length}
+                  className="rounded px-1.5 py-1 hover:bg-content/10 disabled:opacity-40"
+                  onClick={toggleAllVisible}
+                >
+                  {allVisibleChecked ? "None" : "All"}
+                </button>
+              ) : null}
               <button
                 type="button"
                 disabled={busy}
