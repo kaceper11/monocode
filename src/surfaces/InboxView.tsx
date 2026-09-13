@@ -347,7 +347,7 @@ type Props = {
   onStartTask?: (item: InboxItem, taskId: string | null) => void;
   sessions?: readonly SessionSummary[];
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string) => Promise<void>;
+  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
   /** Session-card destination to reveal after the Inbox list loads. */
   target?: LinkedWorkItem | null;
   visible?: boolean;
@@ -1310,7 +1310,7 @@ function InboxDetailBody({
   onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
   onStartTask?: (item: InboxItem, taskId: string | null) => void;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string) => Promise<void>;
+  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
 }) {
   if (!item) {
     return (
@@ -1512,7 +1512,7 @@ export function InboxDetail({
   onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
   onStartTask?: (item: InboxItem, taskId: string | null) => void;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string) => Promise<void>;
+  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
 }) {
   const detailLock = useLockOverscroll<HTMLDivElement>();
   const [deliveryProviders, setDeliveryProviders] = useState<Record<string, "github" | "azure" | "gitlab">>(() => {
@@ -1546,7 +1546,7 @@ export function InboxDetail({
     deliveryPending.current = true;
     setDeliveryBusy(true);
     setDeliveryError("");
-    try { await onOpenDelivery(sessionId, kind, () => deliveryMounted.current, provider, item.provider === "github" && item.kind === "pr" ? item.url : undefined); }
+    try { await onOpenDelivery(sessionId, kind, () => deliveryMounted.current, provider, item.provider === "github" && item.kind === "pr" ? item.url : undefined, item.provider === "gitlab" && item.kind === "pr" ? { repo: item.repo, number: item.number } : undefined); }
     catch (error) { if (deliveryMounted.current) setDeliveryError(error instanceof Error ? error.message : String(error)); }
     finally { deliveryPending.current = false; if (deliveryMounted.current) setDeliveryBusy(false); }
   };

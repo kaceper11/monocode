@@ -254,6 +254,7 @@ it("rejects GitLab evidence when the MR head or discussions moved", async () => 
     title: "Improve login",
     url: "https://gitlab.example.com/acme/web/-/merge_requests/7",
     state: "open",
+    repo: "acme/web",
     headSha: "head",
     headRefName: "feature",
     baseRefName: "main",

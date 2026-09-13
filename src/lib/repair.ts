@@ -39,7 +39,6 @@ import {
 import {
   gitlabMrDiscussions,
   gitlabMrState,
-  gitlabRepo,
   type GitlabMrState,
   type GitlabWorkItemComment,
 } from "./gitlab";
@@ -617,10 +616,11 @@ async function gitlabRepairHead(input: {
     throw new Error("The merge request is no longer open. Refresh and retry.");
   if (!state.headSha || !state.headRefName)
     throw new Error("GitLab did not report the MR head. Refresh and retry.");
-  const resolved = await gitlabRepo(input.cwd).catch(() => "");
-  if (resolved.toLowerCase() !== input.repo.toLowerCase())
+  // `state.repo` is resolved fresh inside the backend — unlike the cached
+  // gitlabRepo it always reflects the checkout as it is now.
+  if (state.repo.toLowerCase() !== input.repo.trim().toLowerCase())
     throw new Error(
-      `This checkout resolves to ${resolved || "no GitLab project"}; the MR belongs to ${input.repo}. Open that project's checkout.`,
+      `This checkout resolves to ${state.repo || "no GitLab project"}; the MR belongs to ${input.repo}. Open that project's checkout.`,
     );
   const checkout = await ciContext(input.cwd);
   const remote = checkout.remotes.find((row) =>
@@ -684,7 +684,7 @@ export async function gitlabCommentsRepair(input: {
   });
   const evidence: RepairEvidence = {
     kind: "gitlab-comments",
-    scope: `gitlab-mr:${input.repo}#${input.number}`,
+    scope: `gitlab-mr:${input.repo.trim()}#${input.number}`,
     head,
     repo: input.repo,
     number: input.number,
@@ -712,7 +712,7 @@ export async function gitlabCommentsRepair(input: {
   };
 }
 
-const FAILING_PIPELINE_STATUSES = ["failed", "canceled"];
+export const FAILING_PIPELINE_STATUSES = ["failed", "canceled"];
 
 /** "Fix pipeline" for a GitLab MR — the head pipeline, digested so a
  * replaced or re-run pipeline blocks dispatch of stale evidence. */
@@ -733,7 +733,7 @@ export async function gitlabPipelineRepair(input: {
   );
   const evidence: RepairEvidence = {
     kind: "gitlab-ci",
-    scope: `gitlab-ci:${input.repo}#${input.number}`,
+    scope: `gitlab-ci:${input.repo.trim()}#${input.number}`,
     head,
     repo: input.repo,
     number: input.number,
@@ -857,6 +857,10 @@ export async function validateRepair(
     const state = await gitlabMrState(evidence.head.cwd, evidence.number);
     if (state.state !== "open")
       throw new Error("MR is no longer open. Refresh evidence.");
+    if (state.repo.toLowerCase() !== evidence.repo.trim().toLowerCase())
+      throw new Error(
+        "The checkout resolves to a different project. Refresh evidence.",
+      );
     if (
       state.headSha !== evidence.head.commit ||
       state.headRefName !== evidence.head.branch
@@ -883,6 +887,10 @@ export async function validateRepair(
     const state = await gitlabMrState(evidence.head.cwd, evidence.number);
     if (state.state !== "open")
       throw new Error("MR is no longer open. Refresh evidence.");
+    if (state.repo.toLowerCase() !== evidence.repo.trim().toLowerCase())
+      throw new Error(
+        "The checkout resolves to a different project. Refresh evidence.",
+      );
     if (
       state.headSha !== evidence.head.commit ||
       state.headRefName !== evidence.head.branch

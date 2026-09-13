@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -136,6 +135,9 @@ pub struct GitlabMrState {
     pub url: String,
     pub state: String,
     pub draft: bool,
+    /// The project this state was actually read from — lets the surface
+    /// verify identity against a fresh resolution rather than a cache.
+    pub repo: String,
     pub head_sha: String,
     pub head_ref_name: String,
     pub base_ref_name: String,
@@ -329,12 +331,24 @@ pub async fn gitlab_mr_for_branch(
         let config = require_config(&app)?;
         let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
         let path = format!(
-            "/projects/{}/merge_requests?source_branch={}&state=opened&order_by=updated_at&sort=desc&per_page=1",
+            "/projects/{}/merge_requests?source_branch={}&state=opened&order_by=updated_at&sort=desc&per_page=10",
             encode_path_component(&repo),
             encode_path_component(&branch)
         );
         let response = gitlab_get(&config, &path)?;
-        parse_work_items(&response.value, "pr", &repo)?
+        let rows = response.value.as_array().cloned().unwrap_or_default();
+        // `source_branch` also matches MRs opened from forks — prefer the MR
+        // whose source project is this project.
+        let row = rows
+            .iter()
+            .find(|row| {
+                row.get("source_project_id").and_then(Value::as_i64)
+                    == row.get("project_id").and_then(Value::as_i64)
+            })
+            .or_else(|| rows.first())
+            .cloned()
+            .ok_or_else(|| "No open merge request for this branch".to_string())?;
+        parse_work_items(&Value::Array(vec![row]), "pr", &repo)?
             .into_iter()
             .next()
             .ok_or_else(|| "No open merge request for this branch".to_string())
@@ -350,6 +364,8 @@ pub async fn gitlab_mr_state(
     number: i64,
 ) -> Result<GitlabMrState, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // Validate before the git subprocess — a bad number must not pay for it.
+        validate_item("pr", number)?;
         let config = require_config(&app)?;
         let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
         gitlab_mr_state_for(&config, &repo, number)
@@ -365,6 +381,7 @@ pub async fn gitlab_mr_discussions(
     number: i64,
 ) -> Result<GitlabWorkItemThread, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        validate_item("pr", number)?;
         let config = require_config(&app)?;
         let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
         gitlab_mr_discussions_for(&config, &repo, number)
@@ -382,14 +399,14 @@ pub async fn gitlab_mr_discussion_reply(
     body: String,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let config = require_config(&app)?;
-        let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
         validate_item("pr", number)?;
         let discussion = validate_discussion_id(&discussion_id)?;
         let body = body.trim();
         if body.is_empty() {
             return Err("Reply cannot be empty".into());
         }
+        let config = require_config(&app)?;
+        let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
         let path = format!(
             "{}/discussions/{discussion}/notes",
             item_path(&repo, "pr", number)
@@ -415,15 +432,19 @@ pub async fn gitlab_mr_discussion_resolve(
     resolved: bool,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let config = require_config(&app)?;
-        let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
         validate_item("pr", number)?;
         let discussion = validate_discussion_id(&discussion_id)?;
+        let config = require_config(&app)?;
+        let repo = gitlab_repo_for(&expand_home(&cwd), &config.url)?;
         let path = format!(
-            "{}/discussions/{discussion}?resolved={resolved}",
+            "{}/discussions/{discussion}",
             item_path(&repo, "pr", number)
         );
-        gitlab_put_form(&config, &path, &[])?;
+        gitlab_put_form(
+            &config,
+            &path,
+            &[("resolved", if resolved { "true" } else { "false" })],
+        )?;
         Ok(())
     })
     .await
@@ -622,17 +643,22 @@ fn gitlab_mr_state_for(
     if value.get("iid").and_then(Value::as_i64) != Some(number) {
         return Err("GitLab returned a different merge request".into());
     }
-    // Approvals need a second read; a denied endpoint must not hide the MR.
-    let approvals = gitlab_get(
+    // Approvals need a second read. A denied endpoint (free tier, reporter
+    // role) must not hide the MR — but a real request failure should surface.
+    let approvals = match gitlab_get(
         config,
         &format!("{}/approvals", item_path(repo, "pr", number)),
-    )
-    .map(|response| response.value)
-    .unwrap_or_default();
+    ) {
+        Ok(response) => response.value,
+        Err(error) if error == "GitLab access token is invalid or lacks permission" => Value::Null,
+        Err(error) => return Err(error),
+    };
     // `head_pipeline` rides on the MR response on modern instances; older
-    // ones need the pipelines list.
-    let pipeline = parse_mr_pipeline(value.get("head_pipeline")).or_else(|| {
-        gitlab_get(
+    // ones omit the key entirely and need the pipelines list. A present-but-
+    // null value means the MR simply has no pipeline — don't refetch.
+    let pipeline = match value.get("head_pipeline") {
+        Some(head) => parse_mr_pipeline(Some(head)),
+        None => gitlab_get(
             config,
             &format!("{}/pipelines?per_page=1", item_path(repo, "pr", number)),
         )
@@ -643,32 +669,42 @@ fn gitlab_mr_state_for(
                 .as_array()
                 .and_then(|rows| rows.first())
                 .and_then(|row| parse_mr_pipeline(Some(row)))
-        })
-    });
-    parse_mr_state(value, number, &approvals, pipeline)
+        }),
+    };
+    parse_mr_state(value, number, repo, &approvals, pipeline)
+}
+
+/// GitLab's draft signals: the `draft`/`work_in_progress` flags plus the
+/// documented title prefixes instances older than the fields still carry.
+fn mr_is_draft(row: &Value, title: &str) -> bool {
+    let title = title.trim_start().to_ascii_lowercase();
+    row.get("draft").and_then(Value::as_bool).unwrap_or(false)
+        || row
+            .get("work_in_progress")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || title.starts_with("draft:")
+        || title.starts_with("[draft]")
+        || title.starts_with("(draft)")
+        || title.starts_with("draft -")
+        || title.starts_with("wip:")
 }
 
 fn parse_mr_state(
     value: &Value,
     number: i64,
+    repo: &str,
     approvals: &Value,
     pipeline: Option<GitlabMrPipeline>,
 ) -> Result<GitlabMrState, String> {
     let title = string_field(value, "title").unwrap_or_default();
-    let title_lower = title.to_ascii_lowercase();
-    let draft = value.get("draft").and_then(Value::as_bool).unwrap_or(false)
-        || value
-            .get("work_in_progress")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        || title_lower.starts_with("draft:")
-        || title_lower.starts_with("wip:");
     Ok(GitlabMrState {
         number,
-        title,
+        title: title.clone(),
         url: string_field(value, "web_url").unwrap_or_default(),
         state: normalize_state(&string_field(value, "state").unwrap_or_default()),
-        draft,
+        draft: mr_is_draft(value, &title),
+        repo: repo.to_string(),
         head_sha: string_field(value, "sha").unwrap_or_default(),
         head_ref_name: string_field(value, "source_branch").unwrap_or_default(),
         base_ref_name: string_field(value, "target_branch").unwrap_or_default(),
@@ -715,8 +751,11 @@ fn gitlab_mr_discussions_for(
     number: i64,
 ) -> Result<GitlabWorkItemThread, String> {
     validate_item("pr", number)?;
+    // Newest page first like gitlab_work_item_thread_for — the discussions a
+    // reviewer just left must not sit on a page we never fetch. Order is
+    // restored to oldest-first after parsing.
     let path = format!(
-        "{}/discussions?order_by=created_at&sort=asc&per_page=100",
+        "{}/discussions?order_by=created_at&sort=desc&per_page=100",
         item_path(repo, "pr", number)
     );
     let response = gitlab_get(config, &path)?;
@@ -742,6 +781,18 @@ fn parse_mr_discussions(
     let mut comments = Vec::new();
     for discussion in rows {
         let discussion_id = string_field(discussion, "id").unwrap_or_default();
+        // `individual_note` marks a standalone comment — anything else is a
+        // discussion thread, including resolvable threads without a diff
+        // position, which still block the merge.
+        let discussion_kind = if discussion
+            .get("individual_note")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "comment"
+        } else {
+            "review"
+        };
         let notes = match discussion.get("notes").and_then(Value::as_array) {
             Some(notes) => notes,
             None => continue,
@@ -771,11 +822,7 @@ fn parse_mr_discussions(
             let author = note.get("author");
             thread_comments.push(GitlabWorkItemComment {
                 id: id.to_string(),
-                kind: if path.is_empty() {
-                    "comment".into()
-                } else {
-                    "review".into()
-                },
+                kind: discussion_kind.into(),
                 author: author
                     .and_then(|author| string_field(author, "username"))
                     .or_else(|| author.and_then(|author| string_field(author, "name")))
@@ -807,6 +854,8 @@ fn parse_mr_discussions(
             comments.push(first);
         }
     }
+    // Rows arrived newest-first; display oldest-first like the notes thread.
+    comments.reverse();
     Ok(GitlabWorkItemThread {
         comments,
         truncated: has_next_page,
@@ -879,15 +928,7 @@ fn parse_work_item(row: &Value, kind: &str, repo: &str) -> Option<GitlabWorkItem
         return None;
     }
     let title = string_field(row, "title").unwrap_or_default();
-    let title_lower = title.to_ascii_lowercase();
-    let draft = kind == "pr"
-        && (row.get("draft").and_then(Value::as_bool).unwrap_or(false)
-            || row
-                .get("work_in_progress")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            || title_lower.starts_with("draft:")
-            || title_lower.starts_with("wip:"));
+    let draft = kind == "pr" && mr_is_draft(row, &title);
     Some(GitlabWorkItem {
         account: String::new(),
         kind: kind.into(),
@@ -1362,11 +1403,11 @@ fn encode_path_component(value: &str) -> String {
 }
 
 fn gitlab_repo_for(root: &Path, gitlab_url: &str) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(["config", "--get-regexp", r"^remote\..*\.url$"])
-        .current_dir(root)
-        .output()
-        .map_err(|_| "Could not run git".to_string())?;
+    // Routes through the shared Git runner so WSL checkouts resolve inside
+    // their distro and Windows never flashes a console window.
+    let output =
+        crate::fs::git_command_output(root, &["config", "--get-regexp", r"^remote\..*\.url$"])
+            .map_err(|_| "Could not run git".to_string())?;
     if !output.status.success() && output.status.code() != Some(1) {
         return Err("Could not read git remotes".into());
     }
@@ -1735,6 +1776,7 @@ mod tests {
                 "blocking_discussions_resolved": false,
             }),
             9,
+            "acme/web",
             &json!({ "approvals_required": 2, "approvals_left": 1, "approved": false }),
             Some(GitlabMrPipeline {
                 id: 77,
@@ -1746,6 +1788,7 @@ mod tests {
         .unwrap();
         assert_eq!(state.state, "open");
         assert!(state.draft);
+        assert_eq!(state.repo, "acme/web");
         assert_eq!(state.head_sha, "abc123def456");
         assert_eq!(state.merge_status, "need_rebase");
         assert!(!state.blocking_discussions_resolved);
@@ -1758,6 +1801,7 @@ mod tests {
         let state = parse_mr_state(
             &json!({ "iid": 3, "state": "merged", "sha": "f00", "merge_status": "can_be_merged" }),
             3,
+            "acme/web",
             &Value::Null,
             None,
         )
@@ -1771,8 +1815,19 @@ mod tests {
 
     #[test]
     fn parses_discussions_with_positions_and_replies() {
+        // The API is queried sort=desc — newest discussion first — and the
+        // parser restores oldest-first display order.
         let thread = parse_mr_discussions(
             &json!([
+                {
+                    "id": "cafe0002",
+                    "individual_note": true,
+                    "notes": [{
+                        "id": 20, "body": "Overall looks fine", "system": false,
+                        "created_at": "2026-09-09T11:00:00Z",
+                        "author": { "username": "sam" }
+                    }]
+                },
                 {
                     "id": "deadbeef01",
                     "notes": [
@@ -1792,14 +1847,6 @@ mod tests {
                         },
                         { "id": 12, "body": "ada resolved this", "system": true }
                     ]
-                },
-                {
-                    "id": "cafe0002",
-                    "notes": [{
-                        "id": 20, "body": "Overall looks fine", "system": false,
-                        "created_at": "2026-09-09T11:00:00Z",
-                        "author": { "username": "sam" }
-                    }]
                 }
             ]),
             "https://gitlab.example.com",
@@ -1821,6 +1868,82 @@ mod tests {
         let plain = &thread.comments[1];
         assert_eq!(plain.kind, "comment");
         assert!(plain.path.is_empty());
+    }
+
+    #[test]
+    fn resolvable_discussions_without_positions_stay_threads() {
+        let thread = parse_mr_discussions(
+            &json!([
+                {
+                    "id": "newest02",
+                    "notes": [{
+                        "id": 30, "body": "Please explain the approach", "system": false,
+                        "author": { "username": "ada" },
+                        "resolved": false, "resolvable": true
+                    }]
+                },
+                {
+                    "id": "oldest01",
+                    "notes": [{
+                        "id": 5, "body": "Removed this line?", "system": false,
+                        "author": { "username": "sam" },
+                        "resolved": false, "resolvable": true,
+                        "position": { "new_path": "src/app.ts", "new_line": null, "old_line": 7 }
+                    }]
+                }
+            ]),
+            "https://gitlab.example.com",
+            "acme/web",
+            9,
+            false,
+        )
+        .unwrap();
+        // Fetched newest-first; surfaced oldest-first.
+        assert_eq!(thread.comments[0].thread_id, "oldest01");
+        assert_eq!(thread.comments[1].thread_id, "newest02");
+        // A resolvable discussion with no diff position is still a review
+        // thread — it blocks the merge and must stay reachable.
+        assert_eq!(thread.comments[1].kind, "review");
+        assert!(thread.comments[1].resolvable);
+        // Removed-line notes anchor to the old line.
+        assert_eq!(thread.comments[0].line, Some(7));
+        assert_eq!(thread.comments[0].path, "src/app.ts");
+    }
+
+    #[test]
+    fn merge_state_flags_draft_without_title_prefix() {
+        let state = parse_mr_state(
+            &json!({ "iid": 4, "title": "Improve login", "state": "opened", "work_in_progress": true }),
+            4,
+            "acme/web",
+            &Value::Null,
+            None,
+        )
+        .unwrap();
+        assert!(state.draft);
+        let bracketed = parse_mr_state(
+            &json!({ "iid": 5, "title": "[Draft] Improve login", "state": "opened" }),
+            5,
+            "acme/web",
+            &Value::Null,
+            None,
+        )
+        .unwrap();
+        assert!(bracketed.draft);
+    }
+
+    #[test]
+    fn parses_pipeline_edges() {
+        assert!(parse_mr_pipeline(None).is_none());
+        assert!(parse_mr_pipeline(Some(&Value::Null)).is_none());
+        assert!(parse_mr_pipeline(Some(&json!({ "id": 0, "status": "failed" }))).is_none());
+        assert!(parse_mr_pipeline(Some(&json!({ "status": "failed" }))).is_none());
+        let pipeline = parse_mr_pipeline(Some(&json!({
+            "id": 42, "sha": "abc", "status": "running", "web_url": "https://x/p/42"
+        })))
+        .unwrap();
+        assert_eq!(pipeline.id, 42);
+        assert_eq!(pipeline.status, "running");
     }
 
     #[test]

@@ -24,6 +24,7 @@ const mr = {
   url: "https://gitlab.example.com/acme/web/-/merge_requests/7",
   state: "open",
   draft: false,
+  repo: "acme/web",
   headSha: "head42",
   headRefName: "feature",
   baseRefName: "main",
@@ -121,7 +122,8 @@ beforeEach(() => {
     .mockImplementation(async (command, raw) => {
       const args = (raw ?? {}) as Record<string, unknown>;
       if (command === "gitlab_repo") return remoteRepo;
-      if (command === "gitlab_mr_state") return { ...mr, headSha: head };
+      if (command === "gitlab_mr_state")
+        return { ...mr, headSha: head, repo: remoteRepo };
       if (command === "gitlab_mr_diff") return diff;
       if (command === "gitlab_mr_discussions") return discussions;
       if (command === "gitlab_mr_discussion_reply")
@@ -247,6 +249,20 @@ it("renders MR state, pipeline, anchored discussions and replies", async () => {
 });
 
 it("resolves and unresolves a resolvable discussion", async () => {
+  let resolved = false;
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  vi.mocked(invoke).mockImplementation(async (command, args) =>
+    command === "gitlab_mr_discussions"
+      ? {
+          ...discussions,
+          comments: discussions.comments.map((comment) =>
+            comment.threadId === "deadbeef01"
+              ? { ...comment, resolved }
+              : comment,
+          ),
+        }
+      : original(command, args),
+  );
   const cleanup = await setup();
   try {
     await click("Merge requests");
@@ -265,6 +281,96 @@ it("resolves and unresolves a resolvable discussion", async () => {
           (args as Record<string, unknown>).resolved === true,
       ),
     ).toBe(true);
+    resolved = true;
+    await click("Refresh MR");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(button("Unresolve")).toBeTruthy();
+      }),
+    );
+    await expandThread();
+    await click("Unresolve");
+    expect(
+      vi.mocked(invoke).mock.calls.some(
+        ([command, args]) =>
+          command === "gitlab_mr_discussion_resolve" &&
+          (args as Record<string, unknown>).resolved === false,
+      ),
+    ).toBe(true);
+  } finally {
+    await cleanup();
+  }
+});
+
+it("surfaces a resolve failure instead of swallowing it", async () => {
+  const cleanup = await setup();
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  vi.mocked(invoke).mockImplementation(async (command, args) =>
+    command === "gitlab_mr_discussion_resolve"
+      ? Promise.reject(new Error("Not permitted"))
+      : original(command, args),
+  );
+  try {
+    await click("Merge requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("Unresolved");
+      }),
+    );
+    await expandThread();
+    await click("Resolve");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("Not permitted");
+      }),
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+it("re-arms actions when a hidden tab is re-shown mid-request", async () => {
+  let release: (value: unknown) => void = () => undefined;
+  const gate = new Promise((resolve) => (release = resolve));
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  const cleanup = await setup();
+  try {
+    await click("Merge requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("Unresolved");
+      }),
+    );
+    await expandThread();
+    // Park the send flow on a state read it never finishes.
+    vi.mocked(invoke).mockImplementation(async (command, args) =>
+      command === "gitlab_mr_state" ? gate : original(command, args),
+    );
+    await act(async () => button("Send discussion to agent").click());
+    await click("Files");
+    await click("Merge requests");
+    await act(async () => release(null));
+    // Without the re-arm, pending stays true and every action stays disabled.
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(button("Refresh MR").disabled).toBe(false);
+      }),
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+it("resolves the project from the checkout when no repo is bound", async () => {
+  const cleanup = await setup({ repo: "" });
+  try {
+    await click("Merge requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("!7 Improve login");
+      }),
+    );
+    expect(document.body.textContent).toContain("acme/web");
   } finally {
     await cleanup();
   }
@@ -396,9 +502,11 @@ it("rejects a checkout bound to a different project", async () => {
         expect(document.body.textContent).toContain("bound to acme/web");
       }),
     );
+    // The surface read the state (state.repo is resolved fresh in the
+    // backend) and refused it — no writes are possible from this view.
     expect(
       vi.mocked(invoke).mock.calls.some(
-        ([command]) => command === "gitlab_mr_state",
+        ([command]) => command === "gitlab_mr_discussion_reply",
       ),
     ).toBe(false);
   } finally {

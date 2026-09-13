@@ -1,7 +1,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { gitPrStatus } from "./fs";
 import { parseAzurePrLocation } from "./azureRepos";
-import { gitlabMrForBranch, gitlabRepo } from "./gitlab";
+import { gitlabMrForBranch } from "./gitlab";
 
 export type DeliveryProvider = "github" | "azure" | "gitlab";
 export const DELIVERY_PROVIDERS_CHANGED = "monocode:delivery-providers";
@@ -69,6 +69,11 @@ export async function openGitHubDelivery(cwd: string, kind: "pr" | "ci", current
   target.pathname = target.pathname.replace(/\/$/, "") + (kind === "ci" ? "/checks" : "");
   await openUrl(target.href);
 }
+/** GitLab has no standalone branch-CI review — pipeline state rides on the
+ * merge request surface. */
+export const GITLAB_CI_ON_MR =
+  "GitLab pipelines are reviewed on the merge request — open PRs instead.";
+
 /**
  * The exact GitLab MR a delivery tab is bound to — the checkout's
  * configured-host project plus the open MR for its source branch. GitLab
@@ -81,8 +86,10 @@ export async function gitlabDeliveryTarget(
 ): Promise<{ repo: string; number: number }> {
   if (!branch.trim())
     throw new Error("No branch for this checkout. Open the MR branch or choose another provider.");
-  const repo = (await gitlabRepo(cwd)).trim();
-  if (!repo) throw new Error("This checkout does not resolve to a GitLab project.");
+  // `mr.repo` is resolved fresh in the backend — strictly more current than
+  // the cached gitlabRepo, so bind the tab to what the lookup actually used.
   const mr = await gitlabMrForBranch(cwd, branch);
-  return { repo, number: mr.number };
+  if (!mr.repo.trim())
+    throw new Error("This checkout does not resolve to a GitLab project.");
+  return { repo: mr.repo, number: mr.number };
 }

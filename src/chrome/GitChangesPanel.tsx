@@ -1,6 +1,6 @@
 import { Select } from "./Select";
-import { deliveryProvider, saveDeliveryProvider, resolvePrProviders, openGitHubDelivery, gitlabDeliveryTarget, DELIVERY_PROVIDERS_CHANGED, type DeliveryProvider } from "../lib/deliveryProviders";
-import { gitlabRepo } from "../lib/gitlab";
+import { deliveryProvider, saveDeliveryProvider, resolvePrProviders, openGitHubDelivery, gitlabDeliveryTarget, GITLAB_CI_ON_MR, DELIVERY_PROVIDERS_CHANGED, type DeliveryProvider } from "../lib/deliveryProviders";
+import { GITLAB_CHANGE_EVENT, gitlabRepo } from "../lib/gitlab";
 import { loadAzurePrAssociations, AZURE_PR_ASSOCIATIONS_CHANGED } from "../lib/azureRepos";
 import { loadCiSources, ciState, ciContext, AZURE_CI_SOURCES_CHANGED } from "../lib/azurePipelines";
 import type { DeliveryTabSource } from "../lib/layout";
@@ -246,11 +246,13 @@ export function GitChangesPanel({
     const refresh = () => refreshDelivery(value => value + 1);
     window.addEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, refresh);
     window.addEventListener(AZURE_CI_SOURCES_CHANGED, refresh);
+    window.addEventListener(GITLAB_CHANGE_EVENT, refresh);
     window.addEventListener("storage", refresh);
     window.addEventListener(DELIVERY_PROVIDERS_CHANGED, refresh);
     return () => {
       window.removeEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, refresh);
       window.removeEventListener(AZURE_CI_SOURCES_CHANGED, refresh);
+      window.removeEventListener(GITLAB_CHANGE_EVENT, refresh);
       window.removeEventListener("storage", refresh);
       window.removeEventListener(DELIVERY_PROVIDERS_CHANGED, refresh);
     };
@@ -299,7 +301,7 @@ export function GitChangesPanel({
         setRepository({cwd: viewCwd, branch: context.branch, provider});
     }).catch(() => { /* Explicit provider selection remains available. */ });
     return () => { deliveryGeneration.current++; };
-  }, [viewCwd, index?.branch, index?.remote, index?.upstream, sourceSessionId, enabled]);
+  }, [viewCwd, index?.branch, index?.remote, index?.upstream, sourceSessionId, enabled, deliveryTick]);
   const defaultProvider = repository?.cwd === viewCwd && repository.branch === index?.branch ? repository.provider : undefined;
   const providerFor = (kind: "pr" | "ci") => deliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind)
     ?? ((kind === "pr" ? prs.length : pipelines.length) ? "azure" : defaultProvider);
@@ -313,6 +315,7 @@ export function GitChangesPanel({
     try {
       if (provider === "github") await openGitHubDelivery(viewCwd, kind, () => generation === deliveryGeneration.current);
       else if (provider === "gitlab") {
+        if (kind === "ci") throw new Error(GITLAB_CI_ON_MR);
         const target = await gitlabDeliveryTarget(viewCwd, index?.branch ?? "");
         if (generation !== deliveryGeneration.current) return;
         onOpenDelivery?.(viewCwd, {kind, branch: index?.branch ?? "", sourceSessionId, provider: "gitlab", repo: target.repo, number: target.number});

@@ -77,6 +77,8 @@ export type GitlabMrState = {
   url: string;
   state: string;
   draft: boolean;
+  /** Project the backend resolved and read — fresh, unlike the repo cache. */
+  repo: string;
   headSha: string;
   headRefName: string;
   baseRefName: string;
@@ -91,6 +93,7 @@ export type GitlabMrState = {
 export const GITLAB_CHANGE_EVENT = "monocode:gitlab-change";
 
 const repoByPath = new Map<string, string>();
+const repoInflight = new Map<string, Promise<string>>();
 const detailsByKey = new Map<string, GitlabWorkItemDetails>();
 const threadByKey = new Map<string, GitlabWorkItemThread>();
 const threadInflight = new Map<string, Promise<GitlabWorkItemThread>>();
@@ -105,6 +108,7 @@ function itemKey(cwd: string, kind: GitlabKind, number: number): string {
 
 export function clearGitlabCache() {
   repoByPath.clear();
+  repoInflight.clear();
   detailsByKey.clear();
   threadByKey.clear();
   threadInflight.clear();
@@ -145,9 +149,18 @@ export async function gitlabRepo(cwd: string): Promise<string> {
   const key = normalizeProjectPath(cwd);
   const cached = repoByPath.get(key);
   if (cached !== undefined) return cached;
-  const repo = await invoke<string>("gitlab_repo", { cwd });
-  repoByPath.set(key, repo);
-  return repo;
+  const inflight = repoInflight.get(key);
+  if (inflight) return inflight;
+  const pending = invoke<string>("gitlab_repo", { cwd })
+    .then((repo) => {
+      repoByPath.set(key, repo);
+      return repo;
+    })
+    .finally(() => {
+      if (repoInflight.get(key) === pending) repoInflight.delete(key);
+    });
+  repoInflight.set(key, pending);
+  return pending;
 }
 
 export function listGitlabWorkItems(
@@ -327,6 +340,9 @@ const invalidateDiscussions = (cwd: string, number: number) => {
   const key = itemKey(cwd, "pr", number);
   discussionByKey.delete(key);
   discussionInflight.delete(key);
+  // The flat notes thread behind the inbox summary lists the same replies.
+  threadByKey.delete(key);
+  threadInflight.delete(key);
 };
 
 /** Reply inside an existing discussion; returns the new note's URL. */

@@ -1,18 +1,21 @@
 import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  GITLAB_CHANGE_EVENT,
   gitlabMrDiff,
   gitlabMrDiscussionReply,
   gitlabMrDiscussionResolve,
   gitlabMrDiscussions,
   gitlabMrState,
-  gitlabRepo,
+  peekGitlabMrDiff,
+  peekGitlabMrDiscussions,
   type GitlabMrDiff,
   type GitlabMrState,
   type GitlabWorkItemComment,
   type GitlabWorkItemThread,
 } from "../lib/gitlab";
 import {
+  FAILING_PIPELINE_STATUSES,
   gitlabCommentsRepair,
   gitlabPipelineRepair,
   type RepairEvidence,
@@ -29,13 +32,12 @@ const field =
 const message = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
-const FAILING_PIPELINE_STATUSES = ["failed", "canceled"];
 const isReviewThread = (comment: GitlabWorkItemComment) =>
   comment.kind === "review";
 
 /** Same shape as the repair evidence scope — project path case is
  * significant. */
-export function gitlabMrScope(repo: string, number: number): string {
+function gitlabMrScope(repo: string, number: number): string {
   return `gitlab-mr:${repo.trim()}#${number}`;
 }
 
@@ -145,8 +147,12 @@ function GitlabMrPanel({
   const [mr, setMr] = useState<GitlabMrState | null>(null);
   const [repo, setRepo] = useState(boundRepo);
   const [repoError, setRepoError] = useState("");
-  const [diff, setDiff] = useState<GitlabMrDiff | null>(null);
-  const [thread, setThread] = useState<GitlabWorkItemThread | null>(null);
+  const [diff, setDiff] = useState<GitlabMrDiff | null>(() =>
+    peekGitlabMrDiff(cwd, number),
+  );
+  const [thread, setThread] = useState<GitlabWorkItemThread | null>(() =>
+    peekGitlabMrDiscussions(cwd, number),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [verified, setVerified] = useState(false);
@@ -159,6 +165,10 @@ function GitlabMrPanel({
 
   useEffect(() => {
     mounted.current = true;
+    // An <Activity> hide interrupts in-flight actions; their finally blocks
+    // bail on the generation check, so re-arm the panel on re-show.
+    pending.current = false;
+    setBusy(false);
     return () => {
       mounted.current = false;
       generation.current++;
@@ -186,29 +196,30 @@ function GitlabMrPanel({
 
   const refresh = () =>
     run(async (current) => {
-      // The project binding is part of the MR identity — a checkout that
-      // resolves to a different project must not show this MR's number.
-      const resolved = (await gitlabRepo(cwd).catch(() => "")).trim();
-      if (!current()) return;
-      if (
-        boundRepo &&
-        resolved &&
-        resolved.toLowerCase() !== boundRepo.toLowerCase()
-      ) {
-        setVerified(false);
-        setRepoError(
-          `This checkout resolves to ${resolved}; the MR is bound to ${boundRepo}. Open a checkout of that project.`,
-        );
-        return;
-      }
-      setRepoError("");
-      if (resolved && resolved !== repo) setRepo(resolved);
       const [state, nextDiff, nextThread] = await Promise.all([
         gitlabMrState(cwd, number),
         gitlabMrDiff(cwd, number).catch(() => null),
         gitlabMrDiscussions(cwd, number, { force: true }),
       ]);
       if (!current()) return;
+      // `state.repo` is resolved fresh in the backend — the project binding
+      // is part of the MR identity, so a checkout that now resolves to a
+      // different project must not show this MR's number.
+      if (
+        boundRepo &&
+        state.repo.toLowerCase() !== boundRepo.toLowerCase()
+      ) {
+        setVerified(false);
+        setMr(null);
+        setDiff(null);
+        setThread(null);
+        setRepoError(
+          `This checkout resolves to ${state.repo}; the MR is bound to ${boundRepo}. Open a checkout of that project.`,
+        );
+        return;
+      }
+      setRepoError("");
+      if (state.repo && state.repo !== repo) setRepo(state.repo);
       if (state.number !== number)
         throw new Error(
           "GitLab returned a different merge request. Check the project binding.",
@@ -224,6 +235,13 @@ function GitlabMrPanel({
     // Read once on open or after an evidence refresh; never polls.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repairRefresh]);
+
+  useEffect(() => {
+    const onChange = () => void refresh();
+    window.addEventListener(GITLAB_CHANGE_EVENT, onChange);
+    return () => window.removeEventListener(GITLAB_CHANGE_EVENT, onChange);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const onRefreshEvidence = (instruction: string) => {
     repairDraft.current = { key: scope, instruction };
@@ -268,9 +286,9 @@ function GitlabMrPanel({
   const conversation = (thread?.comments ?? []).filter(
     (comment) => !isReviewThread(comment),
   );
-  const unresolved = threads.filter(
-    (comment) => comment.resolvable && !comment.resolved,
-  );
+  // Batch send matches the per-thread action: every unresolved review
+  // discussion, resolvable or not, is feedback the agent should see.
+  const unresolved = threads.filter((comment) => !comment.resolved);
   const pipeline = mr?.pipeline ?? null;
   const pipelineFailing =
     !!pipeline && FAILING_PIPELINE_STATUSES.includes(pipeline.status);
@@ -384,7 +402,10 @@ function GitlabMrPanel({
           </p>
         ) : null}
         {verified && mr ? (
-          <RepairStatus scope={gitlabMrScope(repo, number)} cwd={cwd} />
+          <>
+            <RepairStatus scope={gitlabMrScope(repo, number)} cwd={cwd} />
+            <RepairStatus scope={`gitlab-ci:${repo}#${number}`} cwd={cwd} />
+          </>
         ) : null}
         {verified && mr ? (
           <GitlabMrSections
@@ -494,7 +515,7 @@ function GitlabMrSections({
       <section aria-label="Review discussions" className="space-y-1">
         <h4 className="text-content/60">
           Discussions ({threads.length}
-          {thread?.truncated ? " · first page" : ""})
+          {thread?.truncated ? " · latest page" : ""})
         </h4>
         {threads.length === 0 ? <p>No review discussions.</p> : null}
         {threads.map((comment) => (
@@ -552,11 +573,14 @@ function GitlabReviewThread({
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
+    // Re-showing after an <Activity> hide must not keep a stale busy flag.
+    setActing("");
     return () => {
       mounted.current = false;
     };
   }, []);
-  const replies = (comment.replies ?? []).slice(0, 50);
+  const allReplies = comment.replies ?? [];
+  const replies = allReplies.slice(0, 50);
   const act = async (kind: "reply" | "resolve", action: () => Promise<void>) => {
     if (acting) return;
     setActing(kind);
@@ -595,6 +619,12 @@ function GitlabReviewThread({
         notes
       </summary>
       <div className="space-y-2 pt-2">
+        {allReplies.length > replies.length ? (
+          <p className="text-content/45">
+            Showing the first {replies.length} notes. Open on GitLab for the
+            rest.
+          </p>
+        ) : null}
         {[comment, ...replies].map((row) => (
           <div key={row.id}>
             <p className="text-content/55">{row.author}</p>
