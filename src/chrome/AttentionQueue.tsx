@@ -45,6 +45,8 @@ const KIND_ICON = {
   "pr-conflicts": GitMerge,
   "pr-done": GitPullRequestClosed,
   schedule: Clock,
+  check: Play,
+  worktree: GitBranch,
   watcher: Zap,
 } as const;
 
@@ -74,8 +76,12 @@ export function attentionActionLabel(item: AttentionItem): string {
       return item.kind === "pr-conflicts" ? "Resolve" : "Update branch";
     case "open-automations":
       return "Automations";
+    case "check-fix":
+      return "Send to agent";
     case "reconnect":
       return "Reconnect";
+    case "open-worktrees":
+      return "Clean up";
     case "open-url":
       return "Open";
     default:

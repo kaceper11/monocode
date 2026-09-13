@@ -15,8 +15,10 @@ import {
   layoutLeaves,
   layoutSashes,
   setSplitRatio,
+  type BrowserMetaPatch,
   type EditorPane,
   type LayoutNode,
+  type LayoutRect,
   type LayoutSash,
   type PaneEdge,
 } from "../lib/layout";
@@ -133,6 +135,7 @@ type Shared = {
   onMovePane: (fromId: string, toId: string, edge: PaneEdge) => void;
   onNewTerminal: (sessionId: string) => void;
   onTerminalMetaChange?: (fileId: string, patch: TerminalMetaPatch) => void;
+  onBrowserMetaChange?: (fileId: string, patch: BrowserMetaPatch) => void;
   onRunAgentAction?: (args: {
     sourceSessionId: string;
     cwd: string;
@@ -152,6 +155,72 @@ type PaneDrag = {
 };
 
 const DRAG_THRESHOLD = 5;
+/** Compact dock size while a browser is expanded: ~24rem, capped at a
+ * fraction of the pane area so the dock never dominates a small window. */
+const DOCK_PX = 24 * 16;
+const DOCK_FRAC = 0.4;
+
+/** A leaf docked while a browser is expanded keeps the edge it already
+ * hugs, shrunk to a compact band; the expanded pane fills the rest. */
+type DockBand = {
+  side: "left" | "right" | "top" | "bottom";
+  agent: LayoutRect;
+  rest: LayoutRect;
+};
+
+function dockBand(
+  rect: LayoutRect,
+  tree: { w: number; h: number },
+): DockBand {
+  const E = 1e-3;
+  let side: DockBand["side"];
+  if (rect.h > 1 - E && rect.y < E) {
+    side = rect.x + rect.w / 2 < 0.5 ? "left" : "right";
+  } else if (rect.w > 1 - E && rect.x < E) {
+    side = rect.y + rect.h / 2 < 0.5 ? "top" : "bottom";
+  } else {
+    const d = {
+      left: rect.x,
+      right: 1 - rect.x - rect.w,
+      top: rect.y,
+      bottom: 1 - rect.y - rect.h,
+    };
+    side = (Object.keys(d) as DockBand["side"][]).reduce((a, b) =>
+      d[a] <= d[b] ? a : b,
+    );
+  }
+  const span = tree.w > 0 ? Math.min(DOCK_PX / tree.w, DOCK_FRAC) : DOCK_FRAC;
+  const spanY =
+    tree.h > 0 ? Math.min(DOCK_PX / tree.h, DOCK_FRAC) : DOCK_FRAC;
+  const w = Math.min(rect.w, span);
+  const h = Math.min(rect.h, spanY);
+  switch (side) {
+    case "left":
+      return {
+        side,
+        agent: { x: 0, y: 0, w, h: 1 },
+        rest: { x: w, y: 0, w: 1 - w, h: 1 },
+      };
+    case "right":
+      return {
+        side,
+        agent: { x: 1 - w, y: 0, w, h: 1 },
+        rest: { x: 0, y: 0, w: 1 - w, h: 1 },
+      };
+    case "top":
+      return {
+        side,
+        agent: { x: 0, y: 0, w: 1, h },
+        rest: { x: 0, y: h, w: 1, h: 1 - h },
+      };
+    default:
+      return {
+        side,
+        agent: { x: 0, y: 1 - h, w: 1, h },
+        rest: { x: 0, y: 0, w: 1, h: 1 - h },
+      };
+  }
+}
 
 function PaneTreeComponent({
   sessionPortal,
@@ -210,6 +279,7 @@ function PaneTreeComponent({
   onMovePane,
   onNewTerminal,
   onTerminalMetaChange,
+  onBrowserMetaChange,
   onRunAgentAction,
 }: Props) {
   const treeRef = useRef<HTMLDivElement>(null);
@@ -227,6 +297,19 @@ function PaneTreeComponent({
   useEffect(() => {
     setDraft(null);
   }, [layout]);
+
+  // The expanded-browser dock needs pixel bounds; rects stay fractional.
+  const [treeSize, setTreeSize] = useState({ w: 0, h: 0 });
+  useEffect(() => {
+    const el = treeRef.current;
+    if (!el) return;
+    const update = () =>
+      setTreeSize({ w: el.clientWidth, h: el.clientHeight });
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   // A sash drag re-renders this tree every frame. `SessionPane` compares props
   // shallowly, so handing it a fresh drag handler each frame would re-render
@@ -247,6 +330,39 @@ function PaneTreeComponent({
   const leaves = layoutLeaves(tree);
   const sashes = layoutSashes(tree);
   const inSplit = leaves.length > 1;
+  // A browser tab flagged `expanded` zooms its leaf over the tree —
+  // tmux-style pane zoom — while the focused session keeps its own edge,
+  // shrunk to a compact dock band; everything else stays covered.
+  // Other leaves stay mounted underneath (sessions keep running,
+  // composers keep drafts); only their native webviews must be told to
+  // hide via `occluded`.
+  const expandedLeafId = leaves.find((leaf) => {
+    const pane = editorPanes.find((entry) => entry.id === leaf.id);
+    const file = pane?.files.find((entry) => entry.id === pane.activeFileId);
+    return !!file?.browser?.expanded;
+  })?.id;
+  const isSessionLeaf = (id: string) => sessions.some((s) => s.id === id);
+  const chatLeafId = expandedLeafId
+    ? (focusedId !== expandedLeafId && isSessionLeaf(focusedId)
+        ? focusedId
+        : leaves.find(
+            (leaf) => leaf.id !== expandedLeafId && isSessionLeaf(leaf.id),
+          )?.id)
+    : undefined;
+  const chatRect = leaves.find((leaf) => leaf.id === chatLeafId)?.rect;
+  const band =
+    expandedLeafId && chatRect ? dockBand(chatRect, treeSize) : null;
+  // A session spanning nearly the whole area leaves a useless sliver —
+  // expand fully and let it stay covered instead.
+  const dock = band && band.rest.w > 0.05 && band.rest.h > 0.05 ? band : null;
+  const dockBorder = dock
+    ? {
+        left: "border-r",
+        right: "border-l",
+        top: "border-b",
+        bottom: "border-t",
+      }[dock.side]
+    : "";
 
   const startPaneDrag = useCallback(
     (fromId: string, event: ReactPointerEvent<HTMLElement>) => {
@@ -331,22 +447,30 @@ function PaneTreeComponent({
         const session = sessions.find((entry) => entry.id === leaf.id);
         const dragging = drop?.fromId === leaf.id;
         const onPaneDragStart = inSplit ? paneDragStartFor(leaf.id) : undefined;
+        const expanded = leaf.id === expandedLeafId;
+        const docked = leaf.id === chatLeafId;
+        const rendered: LayoutRect = expanded
+          ? (dock?.rest ?? { x: 0, y: 0, w: 1, h: 1 })
+          : docked && dock
+            ? dock.agent
+            : leaf.rect;
         const backgroundStyle = {
-          "--chat-background-left": `${(-leaf.rect.x / leaf.rect.w) * 100}%`,
-          "--chat-background-top": `${(-leaf.rect.y / leaf.rect.h) * 100}%`,
-          "--chat-background-width": `${100 / leaf.rect.w}%`,
-          "--chat-background-height": `${100 / leaf.rect.h}%`,
+          "--chat-background-left": `${(-rendered.x / rendered.w) * 100}%`,
+          "--chat-background-top": `${(-rendered.y / rendered.h) * 100}%`,
+          "--chat-background-width": `${100 / rendered.w}%`,
+          "--chat-background-height": `${100 / rendered.h}%`,
         } as CSSProperties;
         return (
           <div
             key={leaf.id}
             data-pane-id={leaf.id}
-            className={`absolute flex min-h-0 min-w-0 flex-col overflow-hidden ${dragging ? "opacity-40" : ""}`}
+            className={`absolute flex min-h-0 min-w-0 flex-col overflow-hidden ${dragging ? "opacity-40" : ""} ${expanded || docked ? "bg-background-base" : ""} ${docked ? `${dockBorder} border-content/10` : ""}`}
             style={{
-              left: `${leaf.rect.x * 100}%`,
-              top: `${leaf.rect.y * 100}%`,
-              width: `${leaf.rect.w * 100}%`,
-              height: `${leaf.rect.h * 100}%`,
+              left: `${rendered.x * 100}%`,
+              top: `${rendered.y * 100}%`,
+              width: `${rendered.w * 100}%`,
+              height: `${rendered.h * 100}%`,
+              ...(expanded ? { zIndex: 30 } : docked ? { zIndex: 40 } : {}),
               ...backgroundStyle,
             }}
           >
@@ -357,6 +481,7 @@ function PaneTreeComponent({
               <FilePane
                 pane={editorPane}
                 visible={visible}
+                occluded={!!expandedLeafId && !expanded}
                 focused={focusedId === editorPane.id}
                 dirtyFileIds={dirtyFileIds}
                 fileErrorCounts={fileErrorCounts}
@@ -374,6 +499,7 @@ function PaneTreeComponent({
                 editorNavigation={editorNavigation}
                 onPaneDragStart={onPaneDragStart}
                 onTerminalMetaChange={onTerminalMetaChange}
+                onBrowserMetaChange={onBrowserMetaChange}
               />
             ) : session ? (
               <SessionSurface host={sessionPortal?.sessionId === session.id ? sessionPortal.host : undefined}>
@@ -436,7 +562,7 @@ function PaneTreeComponent({
           </div>
         );
       })}
-      {sashes.map((sash) => (
+      {(expandedLeafId ? [] : sashes).map((sash) => (
         <Sash
           key={`${sash.splitId}:${sash.index}`}
           sash={sash}

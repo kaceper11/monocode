@@ -48,6 +48,9 @@ vi.mock("@xterm/xterm", () => ({
     }
     attachCustomKeyEventHandler() {}
     attachCustomWheelEventHandler() {}
+    registerLinkProvider() {
+      return { dispose() {} };
+    }
     hasSelection() {
       return false;
     }

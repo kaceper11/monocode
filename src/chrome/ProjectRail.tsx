@@ -1,4 +1,5 @@
 import { WslBadge } from "./WslBadge";
+import { dropVerifyForProject } from "../lib/verify";
 import {
   Archive,
   Check,
@@ -45,7 +46,6 @@ import {
   familyForRepository,
   projectRailKey,
   isProjectRailKey,
-  createProjectGroup,
   renameProject,
   type ProjectRecord,
 } from "../lib/projects";
@@ -57,9 +57,13 @@ import {
   lastWorkingCopyUse,
   hiddenWorkingCopies,
   hiddenWorkingCopiesSnapshot,
+  setWorkingCopyHidden,
   subscribeWorkingCopyPreferences,
   type RepositoryFamily,
+  type WorkingCopy,
 } from "../lib/repositoryFamilies";
+import { copyText } from "../lib/clipboard";
+import { openWorktreeManager } from "../lib/worktreeRemoval";
 import { useDragResize } from "../hooks/useDragResize";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import {
@@ -137,14 +141,18 @@ import { TabGroupMenu, type TabGroupMenuExtraItem } from "./TabGroupMenu";
 import { TerminalSpinner } from "./TerminalSpinner";
 import { WorktreeCollisionBadge } from "./WorktreeCollisionBadge";
 import { Popover } from "./Popover";
+import { ExplorerMenu, type ExplorerMenuItem } from "./ExplorerMenu";
+import { TaskWorktreesSheet } from "./TaskWorktreesSheet";
 import { WorktreePanel } from "./WorktreePicker";
 import {
   archiveTask,
-  removeTask,
+  OPEN_TASK_DETAILS,
   repositoryForChild,
   subscribeTaskWorkspaces,
   taskChildRepoLabel,
+  taskChildrenForWorkingCopy,
   taskForSession,
+  taskMatchesQuery,
   taskWorkspacesSnapshot,
   loadTaskWorkspaces,
   projectForTask,
@@ -342,6 +350,11 @@ export function ProjectRail({
   const [repositoriesProject, setRepositoriesProject] = useState<{
     path: string;
     projectId?: string;
+    /** Import flow — the sheet queues repositories and creates the group only
+     * on submit; nothing lands in the rail before that. */
+    groupImport?: boolean;
+    /** Launch the folder picker as soon as the sheet opens. */
+    autoPick?: boolean;
   } | null>(null);
   const [taskMenu, setTaskMenu] = useState<{
     x: number;
@@ -350,14 +363,16 @@ export function ProjectRail({
     /** Right-clicked row — anchors follow-up popovers to the task itself. */
     rowRect?: DOMRect;
   } | null>(null);
+  // Delete goes through the worktree sheet — it can offer cleanup of the
+  // task's own working copies in the same flow.
+  const [deleteTaskId, setDeleteTaskId] = useState<string | null>(null);
   const tasksRaw = useSyncExternalStore(
     subscribeTaskWorkspaces,
     taskWorkspacesSnapshot,
   );
 
 
-  /** Task owning the focused session — drives the scope highlight across all
-   * of its repository rows, not just the host cwd. */
+  /** Task owning the focused session. */
   const activeTask = useMemo(
     () => (activeSessionId ? taskForSession(activeSessionId)?.task : undefined),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -367,11 +382,6 @@ export function ProjectRail({
   // still looking at another task's session; otherwise the focused
   // session's task is current.
   const currentTaskId = focusTaskId ?? activeTask?.id;
-  const scopeRepoIds = useMemo(
-    () =>
-      new Set(activeTask?.children.map((entry) => entry.repositoryId) ?? []),
-    [activeTask],
-  );
   const busySessionIds = useMemo(
     () =>
       new Set(
@@ -550,15 +560,11 @@ export function ProjectRail({
 
   const closeAddMenu = () => setAddMenu(null);
 
-  /** A pathless project — a pure group; opens its repositories sheet so the
-   * user can add members right away. The group is unnamed until renamed via
-   * its project menu. */
+  /** A pathless project — a pure group. The sheet queues repositories and
+   * materializes the group on the first submit, so an abandoned setup never
+   * leaves an empty project row behind. */
   const submitGroup = () => {
-    const project = createProjectGroup();
-    setRepositoriesProject({
-      path: projectRailKey(project.id),
-      projectId: project.id,
-    });
+    setRepositoriesProject({ path: "", groupImport: true });
   };
 
   const onProjectRename = (groupId: string, label: string) => {
@@ -624,12 +630,40 @@ export function ProjectRail({
     saveProjectRailOrder(next);
   };
 
-  const onTogglePin = (path: string) => {
-    const isPinned = pinnedPaths.some((pinned) =>
-      sameProjectPath(pinned, path),
-    );
+  /** Recent paths whose verified family belongs to the project — the paths the
+   * rail actually lists for it. */
+  const memberRecentPaths = (project: ProjectRecord) =>
+    recents
+      .filter((item) => projectContainsPath(project, item.path, families))
+      .map((item) => item.path);
+
+  /** Every normalized key a grouped row can be pinned under — its row path,
+   * the project anchor and sentinel key, member repository anchors and member
+   * recents. A pin stored against any of them must resolve, or a member-pinned
+   * row offers "Pin project" again with no way to unpin. */
+  const pinKeys = (path: string, project?: ProjectRecord) => {
+    const keys = new Set([pathKey(path)]);
+    if (project) {
+      if (project.anchor) keys.add(pathKey(project.anchor));
+      keys.add(pathKey(projectRailKey(project.id)));
+      for (const repo of project.repositories)
+        if (repo.anchor) keys.add(pathKey(repo.anchor));
+      for (const member of memberRecentPaths(project))
+        keys.add(pathKey(member));
+    }
+    return keys;
+  };
+
+  const isRowPinned = (path: string, project?: ProjectRecord) => {
+    const keys = pinKeys(path, project);
+    return pinnedPaths.some((pinned) => keys.has(pathKey(pinned)));
+  };
+
+  const onTogglePin = (path: string, project?: ProjectRecord) => {
+    const keys = pinKeys(path, project);
+    const isPinned = pinnedPaths.some((pinned) => keys.has(pathKey(pinned)));
     const next = isPinned
-      ? pinnedPaths.filter((pinned) => !sameProjectPath(pinned, path))
+      ? pinnedPaths.filter((pinned) => !keys.has(pathKey(pinned)))
       : [...pinnedPaths, path];
     setPinnedPaths(next);
     savePinnedProjects(next);
@@ -638,13 +672,6 @@ export function ProjectRail({
   const menuProject = projectMenu?.projectId
     ? storedProjects.find((entry) => entry.id === projectMenu.projectId)
     : undefined;
-
-  /** Recent paths whose verified family belongs to the project — the paths the
-   * rail actually lists for it. */
-  const memberRecentPaths = (project: ProjectRecord) =>
-    recents
-      .filter((item) => projectContainsPath(project, item.path, families))
-      .map((item) => item.path);
 
   const removeProjectEntry = (
     path: string,
@@ -662,6 +689,7 @@ export function ProjectRail({
     // checkouts, worktrees, branches and credentials stay on disk. Purge still
     // applies the existing per-path session cleanup.
     deleteProject(project.id);
+    dropVerifyForProject(project.id);
     const members = memberRecentPaths(project);
     for (const member of members)
       onRemoveProject?.(member, { purgeData });
@@ -674,8 +702,13 @@ export function ProjectRail({
     const { path, projectKey, projectId } = projectMenu;
     const displayName =
       menuProject?.name ??
-      resolveTabGroupLabel(projectKey, groupLabels, basename(path));
-    if (action === "pin" || action === "unpin") onTogglePin(path);
+      resolveTabGroupLabel(
+        projectKey,
+        groupLabels,
+        isProjectRailKey(path) ? "Project" : basename(path),
+      );
+    if (action === "pin" || action === "unpin")
+      onTogglePin(path, menuProject);
     else if (action === "new-task") onNewTask?.(path, projectId);
     else if (action === "commands") {
       onOpenCommands?.({
@@ -840,7 +873,6 @@ export function ProjectRail({
                 onTogglePin={onTogglePin}
                 onContextMenu={onProjectContextMenu}
                 onOpenMenu={openProjectMenu}
-                scopeRepoIds={scopeRepoIds}
                 groupLabels={groupLabels}
                 groupColors={groupColors}
                 groupCustomColors={groupCustomColors}
@@ -866,7 +898,6 @@ export function ProjectRail({
               onTogglePin={onTogglePin}
               onContextMenu={onProjectContextMenu}
               onOpenMenu={openProjectMenu}
-              scopeRepoIds={scopeRepoIds}
               groupLabels={groupLabels}
               groupColors={groupColors}
               groupCustomColors={groupCustomColors}
@@ -944,9 +975,7 @@ export function ProjectRail({
           onClose={() => setProjectMenu(null)}
           showActions={false}
           extraItems={projectMenuExtraItems(
-            pinnedPaths.some((pinned) =>
-              sameProjectPath(pinned, projectMenu.path),
-            ),
+            isRowPinned(projectMenu.path, menuProject),
             Boolean(onRemoveProject),
             !isProjectRailKey(projectMenu.path),
           )}
@@ -972,6 +1001,8 @@ export function ProjectRail({
         <ProjectRepositories
           path={repositoriesProject.path}
           projectId={repositoriesProject.projectId}
+          groupImport={repositoriesProject.groupImport}
+          autoPick={repositoriesProject.autoPick}
           families={families}
           onOpenPath={(path) => {
             setRepositoriesProject(null);
@@ -999,6 +1030,21 @@ export function ProjectRail({
               }}
             >
               Open folder…
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+              onClick={() => {
+                closeAddMenu();
+                setRepositoriesProject({
+                  path: "",
+                  groupImport: true,
+                  autoPick: true,
+                });
+              }}
+            >
+              Folder of repositories…
             </button>
             <button
               type="button"
@@ -1034,6 +1080,21 @@ export function ProjectRail({
               }}
             >
               Open task
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+              onClick={() => {
+                window.dispatchEvent(
+                  new CustomEvent(OPEN_TASK_DETAILS, {
+                    detail: taskMenu.task.id,
+                  }),
+                );
+                setTaskMenu(null);
+              }}
+            >
+              Task details…
             </button>
             <button
               type="button"
@@ -1093,20 +1154,22 @@ export function ProjectRail({
               role="menuitem"
               className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-red-400 hover:bg-content/5"
               onClick={() => {
-                // Sessions and working copies survive — only the record goes.
-                if (
-                  window.confirm(
-                    `Delete task “${taskMenu.task.name}”? Its sessions and working copies stay.`,
-                  )
-                )
-                  removeTask(taskMenu.task.id);
+                setDeleteTaskId(taskMenu.task.id);
                 setTaskMenu(null);
               }}
             >
-              Delete task
+              Delete task…
             </button>
           </div>
         </Popover>
+      ) : null}
+      {deleteTaskId ? (
+        <TaskWorktreesSheet
+          taskId={deleteTaskId}
+          cwd={cwd}
+          families={families}
+          onClose={() => setDeleteTaskId(null)}
+        />
       ) : null}
       <div
         role="separator"
@@ -1375,7 +1438,6 @@ function ProjectSection({
   onTogglePin,
   onContextMenu,
   onOpenMenu,
-  scopeRepoIds,
   groupLabels,
   groupColors,
   groupCustomColors,
@@ -1393,7 +1455,7 @@ function ProjectSection({
   pinned: boolean;
   searchActive: boolean;
   onSelect: (path: string) => void;
-  onTogglePin: (path: string) => void;
+  onTogglePin: (path: string, project?: ProjectRecord) => void;
   onContextMenu: (item: RailProjectItem, event: MouseEvent<HTMLElement>) => void;
   onOpenMenu: (
     item: RailProjectItem,
@@ -1401,7 +1463,6 @@ function ProjectSection({
     y: number,
     rowRect?: DOMRect,
   ) => void;
-  scopeRepoIds?: ReadonlySet<string>;
   groupLabels: Record<string, string>;
   groupColors: Record<string, number>;
   groupCustomColors: Record<string, string>;
@@ -1449,7 +1510,6 @@ function ProjectSection({
             onTogglePin={onTogglePin}
             onContextMenu={onContextMenu}
             onOpenMenu={onOpenMenu}
-            scopeRepoIds={scopeRepoIds}
             groupLabels={groupLabels}
             groupColors={groupColors}
             groupCustomColors={groupCustomColors}
@@ -1510,7 +1570,7 @@ function WorkingCopyRows({
   busyPaths,
   recents,
   onSelect,
-  onManage,
+  onOpenList,
 }: {
   family: RepositoryFamily;
   hidden: string[];
@@ -1518,18 +1578,146 @@ function WorkingCopyRows({
   busyPaths: Set<string>;
   recents: RecentProject[];
   onSelect: (path: string) => void;
-  onManage: (event: MouseEvent<HTMLButtonElement>, path?: string) => void;
+  /** Opens the full worktree panel anchored to the clicked button — the
+   * menu's "All worktrees…" escape hatch. */
+  onOpenList: (anchor: HTMLButtonElement) => void;
 }) {
   // One version subscription per rows block; per-copy results are peeked.
   useSyncExternalStore(
     subscribeWorktreeCollisionVersion,
     worktreeCollisionVersion,
   );
+  // Claim labels re-derive on every task store write.
+  const tasksRaw = useSyncExternalStore(
+    subscribeTaskWorkspaces,
+    taskWorkspacesSnapshot,
+  );
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    child: WorkingCopy;
+    anchor: HTMLButtonElement;
+  } | null>(null);
+  const menuClaim = useMemo(
+    () =>
+      menu ? taskChildrenForWorkingCopy(menu.child.path)[0] : undefined,
+    // tasksRaw changes on every store write.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [menu, tasksRaw],
+  );
   const children = family.worktrees.filter(
     (child) =>
       sameProjectPath(child.path, cwd) ||
       !hidden.some((path) => sameProjectPath(path, child.path)),
   );
+  /** A surviving member that can host the manager's Git calls — a removed,
+   * missing or targeted path can never be the context. */
+  const managerContext = (exclude?: string) => {
+    const usable = family.worktrees.filter(
+      (entry) =>
+        !entry.missing &&
+        !entry.prunable &&
+        (!exclude || pathKey(entry.path) !== pathKey(exclude)),
+    );
+    return (
+      usable.find((entry) => entry.main)?.path ??
+      usable[0]?.path ??
+      family.checkout
+    );
+  };
+  const menuItems = (child: WorkingCopy): ExplorerMenuItem[] => {
+    const isHidden = hidden.some((path) => sameProjectPath(path, child.path));
+    const unavailable = child.missing || !!child.prunable;
+    return [
+      {
+        kind: "item",
+        id: "open",
+        label: "Open",
+        disabled: unavailable,
+      },
+      { kind: "item", id: "copy", label: "Copy path" },
+      {
+        kind: "item",
+        id: "reveal",
+        label: REVEAL_LABEL,
+        // WSL paths can't be revealed from a host-shell call on macOS/Linux.
+        disabled: unavailable || (!!wslLocation(child.path) && !IS_WIN),
+      },
+      { kind: "sep" },
+      ...(!child.main
+        ? [
+            {
+              kind: "item" as const,
+              id: "hide",
+              label: isHidden ? "Show in project" : "Hide from project",
+            },
+          ]
+        : []),
+      { kind: "item", id: "details", label: "Details & cleanup…" },
+      { kind: "item", id: "all", label: "All worktrees…" },
+      { kind: "sep" },
+      {
+        kind: "item",
+        id: "remove",
+        label: "Remove Git worktree…",
+        danger: true,
+        disabled:
+          child.main ||
+          unavailable ||
+          !!child.locked ||
+          !child.branch,
+      },
+    ];
+  };
+  const pickMenuItem = (id: string) => {
+    const state = menu;
+    setMenu(null);
+    if (!state) return;
+    // `onPick` bypasses `onClose` — restore focus the same way. The …
+    // anchor is visibility:hidden off-hover, so focus the row button.
+    (
+      state.anchor.parentElement?.querySelector("button") ?? state.anchor
+    ).focus();
+    const child = state.child;
+    switch (id) {
+      case "open":
+        onSelect(child.path);
+        break;
+      case "copy":
+        void copyText(child.path).catch(() => {});
+        break;
+      case "reveal":
+        void revealPath(child.path).catch(() => {});
+        break;
+      case "hide":
+        try {
+          setWorkingCopyHidden(
+            child.path,
+            !hidden.some((path) => sameProjectPath(path, child.path)),
+          );
+        } catch {
+          /* storage quota — presentation only */
+        }
+        break;
+      case "details":
+        openWorktreeManager({
+          cwd: managerContext(child.path),
+          path: child.path,
+        });
+        break;
+      case "all":
+        onOpenList(state.anchor);
+        break;
+      case "remove":
+        // Delegates to the modal's reviewed confirmation — no check bypassed.
+        openWorktreeManager({
+          cwd: managerContext(child.path),
+          path: child.path,
+          action: "remove",
+        });
+        break;
+    }
+  };
   return (
     <>
       {children.map((child) => {
@@ -1576,16 +1764,51 @@ function WorkingCopyRows({
             ) : null}
             <button
               type="button"
-              title="Worktree details and cleanup"
-              aria-label={`Manage worktree ${name}`}
+              title="Worktree actions"
+              aria-label={`Actions for worktree ${name}`}
+              aria-haspopup="menu"
               className={`invisible absolute ${collision ? "right-11" : "right-1"} top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded-md text-content/40 hover:bg-content/10 hover:text-content group-hover/working-copy:visible group-focus-within/working-copy:visible focus-visible:ring-1 focus-visible:ring-content/30`}
-              onClick={(event) => onManage(event, child.path)}
+              onClick={(event) =>
+                setMenu({
+                  x: event.clientX,
+                  y: event.clientY,
+                  child,
+                  anchor: event.currentTarget,
+                })
+              }
             >
               <MoreHorizontal className="size-3" />
             </button>
           </div>
         );
       })}
+      {menu ? (
+        <ExplorerMenu
+          x={menu.x}
+          y={menu.y}
+          ariaLabel={`Worktree ${workingCopyName(menu.child, family)} actions`}
+          header={
+            <div className="px-2 py-1.5">
+              <p className="truncate text-[12px] font-medium text-content">
+                {workingCopyName(menu.child, family)}
+                {menuClaim ? ` · Task ${menuClaim.task.name}` : ""}
+              </p>
+              <p className="truncate text-[10px] text-content/45">
+                {prettyCwd(menu.child.path)}
+              </p>
+            </div>
+          }
+          items={menuItems(menu.child)}
+          onPick={pickMenuItem}
+          onClose={() => {
+            setMenu(null);
+            (
+              menu.anchor.parentElement?.querySelector("button") ??
+              menu.anchor
+            ).focus();
+          }}
+        />
+      ) : null}
     </>
   );
 }
@@ -1600,13 +1823,9 @@ function ProjectRepositoryRow({
   cwd,
   busyPaths,
   recents,
-  scoped = false,
   onSelect,
 }: {
   repo: ProjectRecord["repositories"][number];
-  /** The focused session's task spans this repository — secondary scope
-   * highlight alongside the host's `active` state. */
-  scoped?: boolean;
   families: ReadonlyMap<string, RepositoryFamily>;
   hidden: string[];
   cwd: string;
@@ -1615,9 +1834,7 @@ function ProjectRepositoryRow({
   onSelect: (path: string) => void;
 }) {
   const anchor = useRef<HTMLButtonElement>(null);
-  const [menu, setMenu] = useState<{ create: boolean; path?: string } | null>(
-    null,
-  );
+  const [menu, setMenu] = useState<{ create: boolean } | null>(null);
   const [working, setWorking] = useState(false);
   const family = familyForRepository(repo, families);
   const [expanded, setExpanded] = useExpandedRow(
@@ -1657,11 +1874,11 @@ function ProjectRepositoryRow({
           type="button"
           title={prettyCwd(repo.anchor)}
           aria-current={active ? "true" : undefined}
-          className={`flex h-7 w-full min-w-0 items-center gap-1.5 rounded-md pl-2 pr-7 text-left text-xs outline-none focus-visible:ring-1 focus-visible:ring-content/30 group-hover/repository:pr-12 ${active ? "bg-content/10 text-content" : scoped ? "bg-accent/10 text-content/80 hover:bg-accent/15" : "text-content/55 hover:bg-content/5 hover:text-content/85"}`}
+          className={`flex h-7 w-full min-w-0 items-center gap-1.5 rounded-md pl-2 pr-7 text-left text-xs outline-none focus-visible:ring-1 focus-visible:ring-content/30 group-hover/repository:pr-12 ${active ? "bg-content/10 text-content" : "text-content/55 hover:bg-content/5 hover:text-content/85"}`}
           onClick={openRepository}
         >
           <Folder
-            className={`size-3 shrink-0 ${scoped ? "text-accent/70" : "text-content/40"}`}
+            className="size-3 shrink-0 text-content/40"
             strokeWidth={1.5}
           />
           <span className="min-w-0 flex-1 truncate">{name}</span>
@@ -1715,9 +1932,9 @@ function ProjectRepositoryRow({
             busyPaths={busyPaths}
             recents={recents}
             onSelect={onSelect}
-            onManage={(event, path) => {
-              anchor.current = event.currentTarget;
-              setMenu({ create: false, path });
+            onOpenList={(el) => {
+              anchor.current = el;
+              setMenu({ create: false });
             }}
           />
         </div>
@@ -1739,9 +1956,8 @@ function ProjectRepositoryRow({
           className="flex flex-col overflow-hidden"
         >
           <WorktreePanel
-            key={`${menu.create}:${menu.path ?? ""}`}
+            key={String(menu.create)}
             initialCreate={menu.create}
-            initialPath={menu.path}
             activeCwd={cwd}
             cwd={
               family?.worktrees.find(
@@ -1794,6 +2010,9 @@ function TasksSection({
 }) {
   const [showArchived, setShowArchived] = useState(false);
   const [showAll, setShowAll] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [query, setQuery] = useState("");
+  const searchRef = useRef<HTMLInputElement>(null);
   // Re-read saved provider links when they change — one parse shared by all
   // rows; the rail never fetches live provider data itself.
   const [deliveryTick, setDeliveryTick] = useState(0);
@@ -1813,9 +2032,17 @@ function TasksSection({
   );
   if (!tasks.length && !archivedTasks.length) return null;
   // The rail stays compact — current and working tasks sort first, the
-  // long tail hides behind a toggle like the archived list.
-  const visibleTasks =
-    showAll || tasks.length <= TASK_RAIL_CAP ? tasks : tasks.slice(0, TASK_RAIL_CAP);
+  // long tail hides behind a toggle like the archived list. Filtering shows
+  // every match (live and archived) without the cap.
+  const filtering = Boolean(query.trim());
+  const visibleTasks = filtering
+    ? tasks.filter((task) => taskMatchesQuery(task, query))
+    : showAll || tasks.length <= TASK_RAIL_CAP
+      ? tasks
+      : tasks.slice(0, TASK_RAIL_CAP);
+  const visibleArchived = filtering
+    ? archivedTasks.filter((task) => taskMatchesQuery(task, query))
+    : archivedTasks;
   const row = (task: TaskWorkspace, archived = false) => {
     const project = projectForTask(task);
     return (
@@ -1856,6 +2083,19 @@ function TasksSection({
         <span className="min-w-0 flex-1 truncate px-1 text-xs text-content/50">
           Tasks
         </span>
+        <button
+          type="button"
+          title="Search tasks"
+          aria-label="Search tasks"
+          aria-expanded={searching}
+          onClick={() => {
+            setSearching(true);
+            searchRef.current?.focus();
+          }}
+          className={`grid size-5 shrink-0 place-items-center rounded-md hover:bg-content/8 hover:text-content ${searching ? "text-content" : "text-content/50"}`}
+        >
+          <Search className="size-3.5" strokeWidth={1.75} />
+        </button>
         {onNewTask ? (
           <button
             type="button"
@@ -1868,9 +2108,41 @@ function TasksSection({
           </button>
         ) : null}
       </div>
+      {searching ? (
+        <div className="px-3 pb-1.5">
+          <input
+            ref={searchRef}
+            autoFocus
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key !== "Escape") return;
+              event.preventDefault();
+              event.stopPropagation();
+              setQuery("");
+              setSearching(false);
+            }}
+            onBlur={() => {
+              if (!query) setSearching(false);
+            }}
+            placeholder="Filter tasks..."
+            aria-label="Filter tasks"
+            spellCheck={false}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            className="h-6 w-full rounded-md bg-content/6 px-2 text-[11px] text-content outline-none placeholder:text-content/35 focus:ring-1 focus:ring-content/25"
+          />
+        </div>
+      ) : null}
       <div className="flex flex-col gap-px px-2">
         {visibleTasks.map((task) => row(task))}
-        {tasks.length > visibleTasks.length ? (
+        {filtering && !visibleTasks.length && !visibleArchived.length ? (
+          <p className="px-4 pb-1 text-[11px] leading-tight text-content/40">
+            No matching tasks
+          </p>
+        ) : null}
+        {!filtering && tasks.length > visibleTasks.length ? (
           <button
             type="button"
             onClick={() => setShowAll(true)}
@@ -1880,23 +2152,23 @@ function TasksSection({
           </button>
         ) : null}
       </div>
-      {archivedTasks.length ? (
+      {visibleArchived.length ? (
         <div className="px-2 pt-1">
           <button
             type="button"
-            aria-expanded={showArchived}
+            aria-expanded={showArchived || filtering}
             onClick={() => setShowArchived((value) => !value)}
             className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-[11px] text-content/40 hover:bg-content/5 hover:text-content/60"
           >
             <ChevronDown
-              className={`size-3 shrink-0 transition-transform ${showArchived ? "" : "-rotate-90"}`}
+              className={`size-3 shrink-0 transition-transform ${showArchived || filtering ? "" : "-rotate-90"}`}
               strokeWidth={1.75}
             />
-            Archived · {archivedTasks.length}
+            Archived · {visibleArchived.length}
           </button>
-          {showArchived ? (
+          {showArchived || filtering ? (
             <div className="flex flex-col gap-px">
-              {archivedTasks.map((task) => row(task, true))}
+              {visibleArchived.map((task) => row(task, true))}
             </div>
           ) : null}
         </div>
@@ -2081,25 +2353,15 @@ function ProjectFamilyCard(
     families: ReadonlyMap<string, RepositoryFamily>;
     cwd: string;
     busyPaths: Set<string>;
-    scopeRepoIds?: ReadonlySet<string>;
   },
 ) {
-  const {
-    family,
-    families,
-    cwd,
-    busyPaths,
-    onSelect,
-    scopeRepoIds,
-  } = props;
+  const { family, families, cwd, busyPaths, onSelect } = props;
   const project = props.item.project;
   const multiRepo = (project?.repositories.length ?? 0) > 1;
   /** Anchorless group — no own folder; the row exists to hold members. */
   const isGroup = !!project && !project.anchor;
   const anchor = useRef<HTMLButtonElement>(null);
-  const [menu, setMenu] = useState<{ create: boolean; path?: string } | null>(
-    null,
-  );
+  const [menu, setMenu] = useState<{ create: boolean } | null>(null);
   const hiddenRaw = useSyncExternalStore(
     subscribeWorkingCopyPreferences,
     hiddenWorkingCopiesSnapshot,
@@ -2203,7 +2465,6 @@ function ProjectFamilyCard(
               cwd={cwd}
               busyPaths={busyPaths}
               recents={recents}
-              scoped={scopeRepoIds?.has(repo.id) ?? false}
               onSelect={onSelect}
             />
           ))}
@@ -2218,9 +2479,9 @@ function ProjectFamilyCard(
             busyPaths={busyPaths}
             recents={recents}
             onSelect={onSelect}
-            onManage={(event, path) => {
-              anchor.current = event.currentTarget;
-              setMenu({ create: false, path });
+            onOpenList={(el) => {
+              anchor.current = el;
+              setMenu({ create: false });
             }}
           />
         </div>
@@ -2248,9 +2509,8 @@ function ProjectFamilyCard(
           className="flex flex-col overflow-hidden"
         >
           <WorktreePanel
-            key={`${menu.create}:${menu.path ?? ""}`}
+            key={String(menu.create)}
             initialCreate={menu.create}
-            initialPath={menu.path}
             activeCwd={cwd}
             cwd={
               family?.worktrees.find(
@@ -2299,7 +2559,7 @@ function ProjectCard({
   sortable: SortableHandle;
   index: number;
   onSelect: (path: string) => void;
-  onTogglePin: (path: string) => void;
+  onTogglePin: (path: string, project?: ProjectRecord) => void;
   onContextMenu: (item: RailProjectItem, event: MouseEvent<HTMLElement>) => void;
   onOpenMenu: (
     item: RailProjectItem,
@@ -2474,7 +2734,7 @@ function ProjectCard({
         onPointerDown={(event) => event.stopPropagation()}
         onClick={(event) => {
           event.stopPropagation();
-          onTogglePin(item.path);
+          onTogglePin(item.path, item.project);
         }}
         className={`absolute ${worktreeControls ? "left-6" : "left-2"} top-1/2 grid size-4 -translate-y-1/2 place-items-center rounded-sm text-content/55 opacity-0 pointer-events-none transition-opacity hover:text-content group-hover:pointer-events-auto group-hover:opacity-100`}
       >

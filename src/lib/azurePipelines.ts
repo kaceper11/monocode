@@ -1,6 +1,8 @@
 export const AZURE_CI_SOURCES_CHANGED = "monocode:azure-ci-sources";
 import { invoke } from "@tauri-apps/api/core";
 import { contextFromText } from "./agentContext";
+import { pathKey } from "./paths";
+import { ensureDeliveryWatcher, unwatchCiDelivery } from "./watchers";
 
 export type CiTarget = {
   site: string;
@@ -269,8 +271,41 @@ export function loadCiSources(
   return allCiSources().filter(
     (row) =>
       ciScope(row.cwd, row.branch, row.session) ===
-      ciScope(cwd, branch, session),
+        ciScope(cwd, branch, session) ||
+      // A session-scoped view also owns session-less rows — they were linked
+      // at the checkout itself, so a pane must see (and unlink) them.
+      (session !== undefined &&
+        row.session === undefined &&
+        row.cwd === cwd &&
+        row.branch === branch),
   );
+}
+/** A deleted session can no longer own a source — the row stays (the
+ * pipeline still belongs to the checkout) but drops the dead owner so
+ * coverage and watcher rebinds never point at it. Session-less twins
+ * collapse. */
+export function unbindCiSourceSession(sessionId: string) {
+  const rows = allCiSources();
+  if (!rows.some((row) => row.session === sessionId)) return;
+  const seen = new Set<string>();
+  const next = rows
+    .map((row) =>
+      row.session === sessionId ? { ...row, session: undefined } : row,
+    )
+    .filter((row) => {
+      const key = JSON.stringify([
+        ciKey(row.target),
+        pathKey(row.cwd),
+        row.branch,
+        row.session ?? "",
+      ]);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  localStorage.setItem(KEY, JSON.stringify(next));
+  if (typeof window !== "undefined")
+    window.dispatchEvent(new Event(AZURE_CI_SOURCES_CHANGED));
 }
 export function saveCiSources(
   sources: CiSource[],
@@ -278,22 +313,66 @@ export function saveCiSources(
   branch: string,
   session?: string,
 ) {
-  let others: CiSource[] = [];
+  let rows: CiSource[] = [];
   try {
-    const rows = JSON.parse(localStorage.getItem(KEY) ?? "[]");
-    if (Array.isArray(rows))
-      others = rows.filter(
-        (row) =>
-          row &&
-          ciScope(row.cwd, row.branch, row.session) !==
-            ciScope(cwd, branch, session),
-      );
+    const stored = JSON.parse(localStorage.getItem(KEY) ?? "[]");
+    if (Array.isArray(stored)) rows = stored;
   } catch {
     /* Recover this feature's malformed cache. */
   }
-  localStorage.setItem(
-    KEY,
-    JSON.stringify([...sources.slice(0, 20), ...others].slice(0, 100)),
-  );
+  const scope = ciScope(cwd, branch, session);
+  // Scope members before this write — diffed against the new set below so
+  // only first-time links register a watcher and departed ones are lifted.
+  // A session-scoped write also owns session-less rows at this checkout.
+  const inScope = (row: CiSource) =>
+    row &&
+    row.target &&
+    (ciScope(row.cwd, row.branch, row.session) === scope ||
+      (session !== undefined &&
+        row.session === undefined &&
+        row.cwd === cwd &&
+        row.branch === branch));
+  const previous = rows.filter(inScope);
+  const others = rows.filter((row) => row && !inScope(row));
+  const merged = [...sources.slice(0, 20), ...others];
+  const stored = merged.slice(0, 100);
+  localStorage.setItem(KEY, JSON.stringify(stored));
   if (typeof window !== "undefined") window.dispatchEvent(new Event(AZURE_CI_SOURCES_CHANGED));
+  const before = new Set(previous.map((row) => ciKey(row.target)));
+  const covered = (target: CiTarget, atCwd: string, atBranch: string) =>
+    stored.some(
+      (row) =>
+        row?.target &&
+        ciKey(row.target) === ciKey(target) &&
+        pathKey(row.cwd) === pathKey(atCwd) &&
+        row.branch === atBranch,
+    );
+  for (const source of sources.slice(0, 20)) {
+    if (before.has(ciKey(source.target))) continue;
+    ensureDeliveryWatcher({
+      kind: "azure-ci",
+      target: source.target,
+      definitionName: source.definitionName,
+      remote: source.remote,
+      cwd,
+      branch,
+      ...(source.session ?? session
+        ? { sessionId: source.session ?? session }
+        : {}),
+    });
+  }
+  // A source leaves the scope → lift its watcher unless another scope's row
+  // still covers the same pipeline at this checkout+branch.
+  for (const row of previous)
+    if (!covered(row.target, cwd, branch))
+      unwatchCiDelivery(row.target, cwd, branch);
+  // Rows the cap pushed out can orphan a watcher — same coverage rule.
+  for (const row of merged.slice(100))
+    if (
+      row?.target &&
+      typeof row.cwd === "string" &&
+      typeof row.branch === "string" &&
+      !covered(row.target, row.cwd, row.branch)
+    )
+      unwatchCiDelivery(row.target, row.cwd, row.branch);
 }

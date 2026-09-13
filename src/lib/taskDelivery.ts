@@ -1,9 +1,11 @@
 import {
   allAzurePrAssociations,
+  azurePrKey,
   type AzurePrAssociation,
 } from "./azureRepos";
 import {
   allCiSources,
+  ciKey,
   ciMatches,
   ciState,
   type CiSource,
@@ -51,12 +53,29 @@ export function deliveryStores(): DeliveryStores {
   return { prs: allAzurePrAssociations(), ci: allCiSources() };
 }
 
-function taskSessionIds(task: TaskWorkspace): Set<string> {
+/** Every session a task owns — the task-level conversation plus legacy
+ * per-child ids. */
+export function taskSessionIds(task: TaskWorkspace): Set<string> {
   const ids = new Set(task.sessionIds);
   for (const child of task.children)
     for (const id of child.sessionIds) ids.add(id);
   return ids;
 }
+
+/**
+ * The saved provider links matched to one child checkout — the rows behind
+ * `childDelivery`'s counts, for callers (task details) that render the links
+ * themselves rather than a badge. Every status is kept; counting callers
+ * filter to the states they report.
+ */
+export type ChildDeliveryLinks = {
+  /** Matched Azure PR associations, any status. */
+  prs: AzurePrAssociation[];
+  /** The caller-supplied GitHub PR for this branch, if any. */
+  githubPr: GitPr | null;
+  /** Matched CI sources. */
+  ci: CiSource[];
+};
 
 /**
  * Delivery links saved against one child checkout.
@@ -70,6 +89,84 @@ function taskSessionIds(task: TaskWorkspace): Set<string> {
  * branch. With no known branch the child's links stay unknown rather than
  * guessed.
  */
+export function childDeliveryLinks(
+  task: TaskWorkspace,
+  child: TaskChild,
+  branches: readonly (string | null | undefined)[],
+  githubPr?: GitPr | null,
+  stores: DeliveryStores = deliveryStores(),
+): ChildDeliveryLinks {
+  const links: ChildDeliveryLinks = { prs: [], githubPr: githubPr ?? null, ci: [] };
+  const cwd = child.workingCopy;
+  if (!cwd) return links;
+  const cwdKey = pathKey(cwd);
+  const known = new Set(branches.filter((b): b is string => !!b));
+  if (!known.size) return links;
+  const sessions = taskSessionIds(task);
+  const scoped = (session: string | undefined) =>
+    session === undefined || sessions.has(session);
+
+  // The same link can be saved under several matching scopes (unassigned
+  // plus one or more task sessions) — dedupe on the provider identity.
+  const seenPrs = new Set<string>();
+  for (const row of stores.prs) {
+    if (pathKey(row.cwd) !== cwdKey || !scoped(row.sourceSessionId)) continue;
+    if (!known.has(row.branch) && !known.has(shortRef(row.pr.sourceRefName)))
+      continue;
+    const key = azurePrKey(row.target);
+    if (seenPrs.has(key)) continue;
+    seenPrs.add(key);
+    links.prs.push(row);
+  }
+
+  const seenCi = new Map<string, number>();
+  for (const row of stores.ci) {
+    if (pathKey(row.cwd) !== cwdKey || !scoped(row.session)) continue;
+    if (
+      !known.has(row.branch) &&
+      !known.has(shortRef(row.last?.run.branch ?? ""))
+    )
+      continue;
+    const key = ciKey(row.target);
+    const existing = seenCi.get(key);
+    if (existing !== undefined) {
+      // Duplicate scope — keep the copy with the freshest verified run.
+      if (
+        (row.last?.checkedAt ?? 0) >
+        (links.ci[existing].last?.checkedAt ?? 0)
+      )
+        links.ci[existing] = row;
+      continue;
+    }
+    seenCi.set(key, links.ci.length);
+    links.ci.push(row);
+  }
+  return links;
+}
+
+/**
+ * Delivery links saved against one child checkout — the active/open subset
+ * {@link childDelivery} counts by.
+ */
+export function childDeliveryRows(
+  task: TaskWorkspace,
+  child: TaskChild,
+  branches: readonly (string | null | undefined)[],
+  stores: DeliveryStores = deliveryStores(),
+): { prs: AzurePrAssociation[]; ci: CiSource[] } {
+  const links = childDeliveryLinks(task, child, branches, null, stores);
+  return {
+    prs: links.prs.filter(
+      (row) => row.pr.status.toLowerCase() === "active",
+    ),
+    ci: links.ci,
+  };
+}
+
+/**
+ * Delivery links saved against one child checkout — counts and attention
+ * flags over {@link childDeliveryRows} plus the caller's cached GitHub PR.
+ */
 export function childDelivery(
   task: TaskWorkspace,
   child: TaskChild,
@@ -78,33 +175,16 @@ export function childDelivery(
   stores: DeliveryStores = deliveryStores(),
 ): TaskChildDelivery {
   const delivery = { ...EMPTY_DELIVERY };
-  const cwd = child.workingCopy;
-  if (!cwd) return delivery;
-  const cwdKey = pathKey(cwd);
-  const known = new Set(branches.filter((b): b is string => !!b));
-  if (!known.size) return delivery;
-  const sessions = taskSessionIds(task);
-  const scoped = (session: string | undefined) =>
-    session === undefined || sessions.has(session);
-
-  for (const row of stores.prs) {
-    if (pathKey(row.cwd) !== cwdKey || !scoped(row.sourceSessionId)) continue;
-    if (!known.has(row.branch) && !known.has(shortRef(row.pr.sourceRefName)))
-      continue;
-    if (row.pr.status.toLowerCase() !== "active") continue;
+  if (!child.workingCopy || !branches.some(Boolean)) return delivery;
+  const rows = childDeliveryRows(task, child, branches, stores);
+  for (const row of rows.prs) {
     delivery.prs += 1;
     if (row.pr.reviewers.some((reviewer) => reviewer.vote < 0))
       delivery.prNeedsAttention = true;
   }
   if (githubPr && githubPr.state.toLowerCase() === "open") delivery.prs += 1;
 
-  for (const row of stores.ci) {
-    if (pathKey(row.cwd) !== cwdKey || !scoped(row.session)) continue;
-    if (
-      !known.has(row.branch) &&
-      !known.has(shortRef(row.last?.run.branch ?? ""))
-    )
-      continue;
+  for (const row of rows.ci) {
     delivery.ci += 1;
     const run = row.last?.run;
     if (!run || !ciMatches(run)) continue;

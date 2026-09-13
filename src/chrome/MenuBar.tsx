@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ExplorerMenu, type ExplorerMenuItem } from "./ExplorerMenu";
+import { requestBrowserOpen } from "../lib/browser";
 import { ALT, MOD, SHIFT } from "../lib/platform";
 import { runUpdateFlow } from "../lib/updater";
 
@@ -114,6 +115,9 @@ export function MenuBar({
         case "toggle_terminal":
           onToggleTerminal?.();
           break;
+        case "open_browser":
+          requestBrowserOpen();
+          break;
         case "new_window":
           void invoke("open_new_window").catch(() => {});
           break;
@@ -192,6 +196,8 @@ export function MenuBar({
           { kind: "item", id: "new_tab", label: "New Tab", shortcut: `${MOD}T` },
           { kind: "item", id: "new_terminal", label: "New Terminal", shortcut: `${MOD}\`` },
           { kind: "item", id: "new_window", label: "New Window", shortcut: `${MOD}${SHIFT}N` },
+          { kind: "sep" },
+          { kind: "item", id: "open_browser", label: "Open URL in Browser…", shortcut: `${MOD}${SHIFT}B` },
           { kind: "sep" },
           { kind: "item", id: "open_project", label: "Open Project…", shortcut: `${MOD}O` },
           { kind: "item", id: "open_search", label: "Search…", shortcut: `${MOD}K` },

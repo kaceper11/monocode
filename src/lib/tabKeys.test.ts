@@ -48,6 +48,17 @@ describe("tabCommand", () => {
     ).toBe("archive-session");
   });
 
+  it("opens the browser with Cmd+Shift+B or Ctrl+Shift+B", () => {
+    expect(
+      tabCommand(key({ key: "B", metaKey: true, shiftKey: true })),
+    ).toBe("open-browser");
+    expect(
+      tabCommand(key({ key: "b", ctrlKey: true, shiftKey: true })),
+    ).toBe("open-browser");
+    // Plain Cmd+B stays the sidebar toggle handled outside the keymap.
+    expect(tabCommand(key({ key: "b", metaKey: true }))).toBeNull();
+  });
+
   it.each([
     {},
     { metaKey: true },

@@ -20,7 +20,10 @@ import {
 } from "./azureRepos";
 import { unresolvedThread } from "./repair";
 import { ciContext, ciLookup, ciMatches } from "./azurePipelines";
-import { linkedWorkItemFromInboxItem } from "./sessionWorkItem";
+import {
+  linkedWorkItemFromInboxItem,
+  parseGithubWorkItemUrl,
+} from "./sessionWorkItem";
 import type { Watcher, WatcherSource } from "./watchers";
 
 /**
@@ -115,6 +118,13 @@ async function pollGithubPr(
     // freezes after the first poll.
     githubWorkItemThread(source.cwd, "pr", source.number, { force: true }),
   ]);
+  // `gh` resolves the PR through the checkout's current remote — a repointed
+  // remote would read an unrelated PR number and could fake a `done`.
+  const fetchedRepo = state.url
+    ? parseGithubWorkItemUrl(state.url)?.repo
+    : null;
+  if (fetchedRepo && fetchedRepo.toLowerCase() !== source.repo.toLowerCase())
+    throw new Error(`Checkout no longer points at ${source.repo}`);
   {
     const prState = state.state.toUpperCase();
     if (prState !== "OPEN") {

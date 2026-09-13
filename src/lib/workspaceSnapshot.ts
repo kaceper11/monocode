@@ -20,6 +20,7 @@ import {
 } from "./projectTerminal";
 import { normalizeProjectPath } from "./recents";
 import { pathKey } from "./paths";
+import { isHttpUrl } from "./browser";
 import { sanitizeSteps } from "./projects";
 import { reconcileProjectReturn, type ProjectReturnMemory } from "./projectReturn";
 import type { InboxAskContext } from "./inboxAsk";
@@ -469,6 +470,13 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
         !["azure", "github", "gitlab"].includes(
           delivery.provider as string,
         )) ||
+      // A GitLab tab without repo+number identity cannot render its MR.
+      (delivery.provider === "gitlab" &&
+        (typeof delivery.repo !== "string" ||
+          !delivery.repo.trim() ||
+          typeof delivery.number !== "number" ||
+          !Number.isInteger(delivery.number) ||
+          delivery.number <= 0)) ||
       (delivery.repo !== undefined && typeof delivery.repo !== "string") ||
       (delivery.number !== undefined &&
         (typeof delivery.number !== "number" ||
@@ -482,6 +490,7 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
         "terminal",
         "review",
         "changes",
+        "browser",
       ].some((key) => value[key] != null && value[key] !== false)
     )
       return null;
@@ -523,7 +532,8 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       releaseNotes != null ||
       commit != null ||
       value.changes === true ||
-      value.terminal === true)
+      value.terminal === true ||
+      value.browser != null)
   ) {
     return null;
   }
@@ -534,6 +544,7 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       value.changes === true ||
       sessionChanges != null ||
       value.terminal === true ||
+      value.browser != null ||
       commit != null)
   ) {
     return null;
@@ -544,9 +555,43 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       value.review === true ||
       value.changes === true ||
       sessionChanges != null ||
-      value.terminal === true)
+      value.terminal === true ||
+      value.browser != null)
   ) {
     return null;
+  }
+  if ("browser" in value) {
+    const source = value.browser;
+    if (!source || typeof source !== "object") return null;
+    const browser = source as Record<string, unknown>;
+    if (
+      typeof browser.url !== "string" ||
+      !isHttpUrl(browser.url) ||
+      browser.url.length > 8192 ||
+      [
+        "plan",
+        "releaseNotes",
+        "commit",
+        "sessionChanges",
+        "terminal",
+        "review",
+        "changes",
+        "delivery",
+      ].some((key) => value[key] != null && value[key] !== false)
+    )
+      return null;
+    return {
+      id: value.id,
+      path: value.path,
+      cwd: value.cwd,
+      browser: {
+        url: browser.url,
+        ...(typeof browser.title === "string" && browser.title.trim()
+          ? { title: browser.title.trim().slice(0, 200) }
+          : {}),
+        ...(browser.expanded === true ? { expanded: true } : {}),
+      },
+    };
   }
   const command =
     value.terminal === true ? sanitizeTerminalCommand(value.command) : undefined;

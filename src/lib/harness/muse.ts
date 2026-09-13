@@ -48,6 +48,12 @@ import {
   type MuseItemState,
   type MuseUserInput,
 } from "./museProtocol";
+import {
+  MuseSubagentTrails,
+  museSubagentMeta,
+  type FollowedMuseChild,
+  type MuseSubagentMeta,
+} from "./museSubagents";
 import { acquireSharedStart } from "./liveStart";
 import { markTurn } from "../turnTiming";
 import type {
@@ -107,6 +113,8 @@ type Live = {
   stopping: boolean;
   onEvent: (event: HarnessEvent) => void;
   items: Map<string, MuseItemState>;
+  /** Followed `subagent` child sessions rendered as agent.step trails. */
+  subagents: MuseSubagentTrails;
   approvals: Map<number, PendingApproval>;
   approvalUiById: Map<string, number>;
   questions: Map<number, PendingQuestion>;
@@ -225,6 +233,47 @@ export async function steerMuseTurn(input: SteerTurnInput): Promise<void> {
   const effort = museReasoningEffort(input.modelSettings);
   if (effort) params.reasoningEffort = effort;
   await live.rpc.request("turn/steer", params, CONTROL_TIMEOUT_MS);
+}
+
+/**
+ * Apply a UI access-mode change to a running host: push the wire-selected
+ * approval mode and settle parked asks the new mode auto-decides. The sandbox
+ * posture (`--disable-sandbox`) is a spawn flag the stale postureKey turns
+ * into a respawn on the next turn.
+ */
+export function setMuseRuntimeMode(
+  sessionId: string,
+  runtimeMode: RuntimeMode,
+): void {
+  const live = liveByThread.get(sessionId);
+  if (!live) return;
+  const changed = live.runtimeMode !== runtimeMode;
+  live.runtimeMode = runtimeMode;
+  const mode = museApprovalMode(runtimeMode, live.planning);
+  if (mode !== live.appliedMode) {
+    void live.rpc
+      .request(
+        "session/setApprovalMode",
+        { commandId: newCommandId(), mode, sessionId: live.museSessionId },
+        CONTROL_TIMEOUT_MS,
+      )
+      .then(() => {
+        live.appliedMode = mode;
+      })
+      .catch((error: unknown) => {
+        try {
+          ignoreUnsupportedControl("session/setApprovalMode", error);
+        } catch {
+          // A wedged transport is recycled by the next turn's ensureLive.
+        }
+      });
+  }
+  if (!changed) return;
+  for (const [uiId, pending] of live.approvals) {
+    if (pending.decidedLocally) continue;
+    const auto = museAutoDecision(runtimeMode, live.planning, pending.kind);
+    if (auto) respondMuseApproval(sessionId, uiId, auto);
+  }
 }
 
 export function respondMuseApproval(
@@ -669,6 +718,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       stopping: false,
       onEvent: input.onEvent,
       items: new Map(),
+      subagents: new MuseSubagentTrails(),
       approvals: new Map(),
       approvalUiById: new Map(),
       questions: new Map(),
@@ -1084,20 +1134,218 @@ function noteDrainEvidence(
   }
 }
 
+// ---- Subagent child-session trails ----
+
+const CHILD_PAGE_LIMIT = 200;
+/** History walk on subscribe; beyond this the live tail keeps going. */
+const CHILD_PAGE_MAX = 8;
+/** Gap fills and post-completion drains stay short — deltas are ephemeral. */
+const CHILD_DRAIN_PAGE_MAX = 4;
+
+/**
+ * A main-session `subagent` item owns a child session. Follow it on every
+ * phase — `childSessionId` can appear late — and close the follow on the
+ * item's terminal revision with a final drain.
+ */
+function noteSubagentItem(
+  live: Live,
+  item: unknown,
+  phase: "started" | "updated" | "completed",
+): void {
+  const rec = asRecord(item);
+  if (!rec || stringField(rec, "kind") !== "subagent") return;
+  const itemId = stringField(rec, "itemId");
+  const childSessionId = stringField(rec, "childSessionId");
+  if (childSessionId && itemId) {
+    followChildSession(live, childSessionId, itemId, museSubagentMeta(rec));
+  }
+  if (phase === "completed" && childSessionId) {
+    void endChildSession(live, childSessionId);
+  }
+}
+
+/** Notifications carrying a followed child session id land here. */
+function handleChildNotification(
+  live: Live,
+  sessionId: string,
+  method: string,
+  params: unknown,
+): void {
+  const child = live.subagents.get(sessionId);
+  if (!child) return;
+  if (method === "view/gap") {
+    void fillChildGap(live, sessionId, params);
+    return;
+  }
+  const routed = live.subagents.route(sessionId, method, params);
+  emit(live, routed.events);
+  for (const next of routed.follow) {
+    followChildSession(live, next.sessionId, next.callId, next.meta);
+  }
+}
+
+function followChildSession(
+  live: Live,
+  childSessionId: string,
+  callId: string,
+  meta?: MuseSubagentMeta,
+): void {
+  if (!childSessionId || childSessionId === live.museSessionId) return;
+  const child = live.subagents.register(childSessionId, callId, meta);
+  if (!child) return;
+  void backfillChild(live, childSessionId, child);
+}
+
+/**
+ * Page the child's durable history first, then subscribe at the last seen
+ * cursor: the server replays `(after, head]` before any live event, so the
+ * sequence is gapless and needs no buffering (tdd SS4.7.1). Per-item state
+ * folds replayed revisions to their unseen remainder.
+ */
+async function backfillChild(
+  live: Live,
+  childSessionId: string,
+  child: FollowedMuseChild,
+): Promise<void> {
+  await pageChild(live, childSessionId, child, { maxPages: CHILD_PAGE_MAX });
+  if (child.ended) return;
+  try {
+    const result = asRecord(
+      await live.rpc.request(
+        "view/subscribe",
+        {
+          sessionId: childSessionId,
+          ...(child.cursor ? { after: child.cursor } : {}),
+        },
+        CONTROL_TIMEOUT_MS,
+      ),
+    );
+    const head = stringField(result, "viewCursor");
+    if (head) child.cursor = head;
+  } catch (error) {
+    console.debug("[monocode] muse view/subscribe failed", error);
+  }
+}
+
+/**
+ * Forward `view/page` walk. `until` stops the walk at a named cursor (gap
+ * fill); without it the walk runs to the view head (`nextCursor: null`).
+ */
+async function pageChild(
+  live: Live,
+  childSessionId: string,
+  child: FollowedMuseChild,
+  opts: { cursor?: string; until?: string; maxPages: number },
+): Promise<void> {
+  let cursor = opts.cursor ?? child.cursor;
+  try {
+    for (let page = 0; page < opts.maxPages; page += 1) {
+      const result = asRecord(
+        await live.rpc.request(
+          "view/page",
+          {
+            sessionId: childSessionId,
+            direction: "forward",
+            limit: CHILD_PAGE_LIMIT,
+            ...(cursor ? { cursor } : {}),
+          },
+          CONTROL_TIMEOUT_MS,
+        ),
+      );
+      const events = Array.isArray(result?.events) ? result.events : [];
+      let reached = false;
+      for (const entry of events) {
+        const notification = asRecord(entry);
+        if (!notification) continue;
+        const routed = live.subagents.route(
+          childSessionId,
+          stringField(notification, "method") ?? "",
+          notification.params,
+        );
+        emit(live, routed.events);
+        for (const next of routed.follow) {
+          followChildSession(live, next.sessionId, next.callId, next.meta);
+        }
+        if (
+          opts.until &&
+          stringField(asRecord(notification.params), "viewCursor") ===
+            opts.until
+        ) {
+          reached = true;
+          break;
+        }
+      }
+      const next = result?.nextCursor;
+      if (typeof next === "string" && next) child.cursor = next;
+      if (reached || typeof next !== "string" || !next) break;
+      cursor = next;
+    }
+  } catch (error) {
+    console.debug("[monocode] muse view/page failed", error);
+  }
+}
+
+/** `view/gap` names the hole exactly; page (after, next] forward. */
+async function fillChildGap(
+  live: Live,
+  sessionId: string,
+  params: unknown,
+): Promise<void> {
+  const child = live.subagents.get(sessionId);
+  const rec = asRecord(params);
+  const after = stringField(rec, "after");
+  const until = stringField(rec, "next");
+  if (!child || !after) return;
+  await pageChild(live, sessionId, child, {
+    cursor: after,
+    until,
+    maxPages: CHILD_DRAIN_PAGE_MAX,
+  });
+}
+
+/** The parent item is terminal: drain what remains, then stop following. */
+async function endChildSession(
+  live: Live,
+  childSessionId: string,
+): Promise<void> {
+  const child = live.subagents.get(childSessionId);
+  if (!child || child.ended) return;
+  child.ended = true;
+  try {
+    await pageChild(live, childSessionId, child, {
+      maxPages: CHILD_DRAIN_PAGE_MAX,
+    });
+  } finally {
+    live.subagents.unregister(childSessionId);
+    await live.rpc
+      .request(
+        "view/unsubscribe",
+        { sessionId: childSessionId },
+        CONTROL_TIMEOUT_MS,
+      )
+      .catch(() => undefined);
+  }
+}
+
 function handleNotification(live: Live, method: string, params: unknown): void {
   const rec = asRecord(params);
   const sessionId = stringField(rec, "sessionId");
-  if (sessionId && sessionId !== live.museSessionId) return;
+  if (sessionId && sessionId !== live.museSessionId) {
+    handleChildNotification(live, sessionId, method, params);
+    return;
+  }
 
   switch (method) {
     case "item/started":
       emit(live, museItemEvent(rec?.item, "started", live.items));
       noteDrainEvidence(live, rec?.item, "started");
+      noteSubagentItem(live, rec?.item, "started");
       settleOnDrain(live);
       return;
     case "item/updated":
       emit(live, museItemEvent(rec?.item, "updated", live.items));
       noteDrainEvidence(live, rec?.item, "updated");
+      noteSubagentItem(live, rec?.item, "updated");
       settleOnDrain(live);
       return;
     case "item/completed": {
@@ -1130,6 +1378,7 @@ function handleNotification(live: Live, method: string, params: unknown): void {
       }
       emit(live, events);
       noteDrainEvidence(live, item, "completed");
+      noteSubagentItem(live, item, "completed");
       settleOnDrain(live);
       return;
     }

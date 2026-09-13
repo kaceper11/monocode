@@ -46,6 +46,39 @@ import { InboxConnectMenu } from "../chrome/InboxConnectMenu";
 import { InboxProviderMark } from "../chrome/InboxProviderMark";
 import { ContextCheckbox, InboxContextPicker, useInboxContext } from "../chrome/InboxContextPicker";
 import { InboxRelated } from "../chrome/InboxRelated";
+import {
+  InboxMyWorkSection,
+  MyWorkBadges,
+  myWorkBadges,
+} from "../chrome/InboxMyWorkSection";
+import {
+  inboxMyWorkForItems,
+  type InboxMyWork,
+} from "../lib/inboxMyWork";
+import type { AttentionItem } from "../lib/attention";
+import {
+  listTaskPrDrafts,
+  subscribeTaskPrs,
+  taskPrsSnapshot,
+} from "../lib/taskPrs";
+import {
+  loadProjects,
+  projectsSnapshot,
+  subscribeProjects,
+} from "../lib/projects";
+import { deliveryStores } from "../lib/taskDelivery";
+import { AZURE_PR_ASSOCIATIONS_CHANGED } from "../lib/azureRepos";
+import { AZURE_CI_SOURCES_CHANGED } from "../lib/azurePipelines";
+import {
+  diffStatsVersion,
+  peekProjectDiffStats,
+  subscribeDiffStatsVersion,
+} from "../hooks/useProjectDiffStats";
+import {
+  branchPrVersion,
+  cachedBranchPr,
+  subscribeBranchPrVersion,
+} from "../hooks/useBranchPr";
 import type { InboxComposerCard } from "../lib/githubTasks";
 import { ProjectLogoIcon } from "../chrome/ProjectLogoIcon";
 import { ProjectMascot } from "../chrome/ProjectMascot";
@@ -63,17 +96,20 @@ import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import { useTabGroupLogos } from "../hooks/useTabGroupLogos";
 import {
   githubStatus,
+  githubPrDiff,
   githubReviewDecisionLabel,
   githubWorkItem,
   githubWorkItemComment,
   githubWorkItemDetails,
   githubWorkItemThread,
+  gitlabAttentionLabel,
   inboxItemKey,
   inboxItemRef,
   inboxItemStatus,
   inboxListIsFresh,
   inboxProjectsForRail,
   listInboxItems,
+  peekGithubPrDiff,
   peekGithubWorkItemDetails,
   peekGithubWorkItemThread,
   peekInboxList,
@@ -145,11 +181,9 @@ import {
 import {
   GITLAB_CHANGE_EVENT,
   gitlabConnected,
-  gitlabMrDiff,
   gitlabWorkItemComment,
   gitlabWorkItemDetails,
   gitlabWorkItemThread,
-  peekGitlabMrDiff,
   peekGitlabWorkItemDetails,
   peekGitlabWorkItemThread,
   type GitlabWorkItemThread,
@@ -172,6 +206,7 @@ import {
 } from "./InboxComments";
 import { InboxPrDiff } from "./InboxPrDiff";
 import { GithubPrReview } from "../chrome/GithubPrReview";
+import { GitlabMrReview } from "../chrome/GitlabMrReview";
 import {
   InboxDiscussionPanel,
   type InboxSessionPortal,
@@ -347,7 +382,13 @@ type Props = {
   onStartTask?: (item: InboxItem, taskId: string | null) => void;
   sessions?: readonly SessionSummary[];
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure", prUrl?: string) => Promise<void>;
+  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
+  /** Live session state for "my work" badges — mid-turn and input-blocked. */
+  busySessionIds?: ReadonlySet<string>;
+  needsInputSessionIds?: ReadonlySet<string>;
+  /** Visible attention queue rows — "waiting on you" joins per ticket. */
+  attentionItems?: readonly AttentionItem[];
+  onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
   /** Session-card destination to reveal after the Inbox list loads. */
   target?: LinkedWorkItem | null;
   visible?: boolean;
@@ -375,6 +416,10 @@ export function InboxView({
   sessions = [],
   onOpenSession,
   onOpenDelivery,
+  busySessionIds,
+  needsInputSessionIds,
+  attentionItems,
+  onAttentionAction,
   target = null,
   visible = true,
   conversationId,
@@ -832,6 +877,63 @@ export function InboxView({
   ]);
 
   const relatedSessionCounts = useMemo(() => inboxRelatedSessionCounts(visibleItems, sessions), [visibleItems, sessions]);
+
+  // "My work" inputs are all already-cached snapshots — the version ticks
+  // re-derive the join when a store publish lands; nothing here fetches.
+  const tasksRaw = useSyncExternalStore(
+    subscribeTaskWorkspaces,
+    taskWorkspacesSnapshot,
+  );
+  const projectsRaw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
+  const prDraftsRaw = useSyncExternalStore(subscribeTaskPrs, taskPrsSnapshot);
+  const statsVersion = useSyncExternalStore(
+    subscribeDiffStatsVersion,
+    diffStatsVersion,
+  );
+  const branchPrV = useSyncExternalStore(
+    subscribeBranchPrVersion,
+    branchPrVersion,
+  );
+  const [deliveryTick, setDeliveryTick] = useState(0);
+  useEffect(() => {
+    const bump = () => setDeliveryTick((value) => value + 1);
+    window.addEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, bump);
+    window.addEventListener(AZURE_CI_SOURCES_CHANGED, bump);
+    return () => {
+      window.removeEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, bump);
+      window.removeEventListener(AZURE_CI_SOURCES_CHANGED, bump);
+    };
+  }, []);
+  const myWorkByItem = useMemo(
+    () =>
+      inboxMyWorkForItems(visibleItems, {
+        sessions,
+        busySessionIds,
+        needsInputSessionIds,
+        tasks: loadTaskWorkspaces(),
+        projects: loadProjects(),
+        prDrafts: listTaskPrDrafts(),
+        stores: deliveryStores(),
+        attention: attentionItems,
+        branchForCwd: (cwd) => peekProjectDiffStats(cwd)?.branch,
+        githubPrFor: cachedBranchPr,
+      }),
+    // Snapshot strings above are the real inputs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      visibleItems,
+      sessions,
+      busySessionIds,
+      needsInputSessionIds,
+      attentionItems,
+      tasksRaw,
+      projectsRaw,
+      prDraftsRaw,
+      deliveryTick,
+      statsVersion,
+      branchPrV,
+    ],
+  );
   const selectTicketPreview = useCallback((item: InboxItem) => {
     const key = inboxItemKey(item);
     markInboxItemSeen({ key, updatedAt: item.updatedAt });
@@ -1127,7 +1229,9 @@ export function InboxView({
                 : source === "linear"
                   ? "No Linear issues match these filters"
                   : source === "gitlab"
-                    ? "No GitLab items match these filters"
+                    ? activeFilters.assignedToMe
+                      ? "Nothing needs your attention"
+                      : "No GitLab items match these filters"
                     : "No issues or pull requests match these filters"
               : source === "linear"
                 ? "No Linear issues"
@@ -1159,6 +1263,7 @@ export function InboxView({
                       projectName(item.projectPath),
                     )}
                     relatedSessionCount={relatedSessionCounts.get(item) ?? 0}
+                    myWork={myWorkByItem.get(item)}
                     onSelect={selectTicketPreview}
                   /></div>
                 </li>
@@ -1270,6 +1375,8 @@ export function InboxView({
               onStartTask={onStartTask}
               onOpenDelivery={onOpenDelivery}
               onOpenSession={id => { setPreviewingTicket(false); return onOpenSession?.(id); }}
+              myWork={selected ? myWorkByItem.get(selected) : undefined}
+              onAttentionAction={onAttentionAction}
             />
           </div>
           {(conversationId && !previewingTicket) || (discussionOpen && selected) ? (
@@ -1301,6 +1408,8 @@ function InboxDetailBody({
   onStartTask,
   onOpenSession,
   onOpenDelivery,
+  myWork,
+  onAttentionAction,
 }: {
   item: InboxItem | null;
   cwd: string;
@@ -1310,7 +1419,9 @@ function InboxDetailBody({
   onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
   onStartTask?: (item: InboxItem, taskId: string | null) => void;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure", prUrl?: string) => Promise<void>;
+  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
+  myWork?: InboxMyWork;
+  onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
 }) {
   if (!item) {
     return (
@@ -1333,6 +1444,8 @@ function InboxDetailBody({
       onStartTask={onStartTask}
       onOpenSession={onOpenSession}
       onOpenDelivery={onOpenDelivery}
+      myWork={myWork}
+      onAttentionAction={onAttentionAction}
     />
   );
 }
@@ -1379,6 +1492,7 @@ const InboxCard = memo(function InboxCard({
   mascotName,
   mascotColor,
   relatedSessionCount,
+  myWork,
   onSelect,
 }: {
   item: InboxItem;
@@ -1387,6 +1501,7 @@ const InboxCard = memo(function InboxCard({
   mascotName: string | null;
   mascotColor: string;
   relatedSessionCount: number;
+  myWork?: InboxMyWork;
   onSelect: (item: InboxItem) => void;
 }) {
   useInboxSeenTick();
@@ -1403,10 +1518,15 @@ const InboxCard = memo(function InboxCard({
   const jira = item.provider === "jira";
   const azure = item.provider === "azure";
   const source = azure ? `${item.site?.split("/").pop()} / ${item.projectName}` : jira ? item.projectName : linear ? item.teamName || item.repo : item.repo || name;
+  const attentionLabel =
+    item.provider === "gitlab"
+      ? gitlabAttentionLabel(item.attentionReason ?? "")
+      : "";
   const unseen = isInboxEntryUnseen({
     key: inboxItemKey(item),
     updatedAt: item.updatedAt,
   });
+  const work = myWorkBadges(myWork);
 
   return (
     <button
@@ -1415,7 +1535,7 @@ const InboxCard = memo(function InboxCard({
       aria-current={active ? "true" : undefined}
       aria-label={`${jira || azure ? item.state : status.label} ${kindLabel.toLowerCase()} ${inboxItemRef(
         item,
-      )}: ${item.title}${unseen ? ", new" : ""}${relatedSessionCount > 0 ? `, ${relatedSessionCount} related ${relatedSessionCount === 1 ? "thread" : "threads"}` : ""}`}
+      )}: ${item.title}${attentionLabel ? `, ${attentionLabel}` : ""}${unseen ? ", new" : ""}${relatedSessionCount > 0 ? `, ${relatedSessionCount} related ${relatedSessionCount === 1 ? "thread" : "threads"}` : ""}${work?.aria ? `, ${work.aria}` : ""}`}
       onClick={() => onSelect(item)}
       className={`flex w-full flex-col rounded-md border px-2.5 py-2 text-left ${
         active
@@ -1435,6 +1555,7 @@ const InboxCard = memo(function InboxCard({
           />
           <span className="min-w-0 truncate text-[11px] text-content/50">
             {jira || (azure && !item.delivery) ? "" : `${kindLabel} · `}{inboxItemRef(item)}
+            {attentionLabel ? ` · ${attentionLabel}` : ""}
           </span>
         </span>
         {relatedSessionCount > 0 || time || unseen ? (
@@ -1464,7 +1585,7 @@ const InboxCard = memo(function InboxCard({
       </span>
       <span className="mt-1 flex min-w-0 items-center gap-2">
         <span className="flex min-w-0 flex-1 items-center gap-1.5 text-[11px] text-content/45">
-          {linear || jira || azure ? null : logoPath ? (
+          {linear || jira || azure || !item.projectPath ? null : logoPath ? (
             <ProjectLogoIcon
               path={logoPath}
               className="size-3.5 shrink-0 rounded-sm"
@@ -1481,6 +1602,7 @@ const InboxCard = memo(function InboxCard({
           {jira || azure ? <span className="max-w-[55%] truncate" title={item.state}>{item.state} ·</span> : null}
           <span className="min-w-0 truncate">{source}</span>
         </span>
+        <MyWorkBadges work={myWork} />
         {!azure && item.labels.length > 0 ? (
           <span className="flex min-w-0 shrink-0 items-center gap-1">
             {item.labels.slice(0, 2).map((label) => (
@@ -1503,6 +1625,8 @@ export function InboxDetail({
   onStartTask,
   onOpenSession,
   onOpenDelivery,
+  myWork,
+  onAttentionAction,
 }: {
   item: InboxItem;
   cwd: string;
@@ -1512,21 +1636,25 @@ export function InboxDetail({
   onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
   onStartTask?: (item: InboxItem, taskId: string | null) => void;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure", prUrl?: string) => Promise<void>;
+  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
+  myWork?: InboxMyWork;
+  onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
 }) {
   const detailLock = useLockOverscroll<HTMLDivElement>();
-  const [deliveryProviders, setDeliveryProviders] = useState<Record<string, "github" | "azure">>(() => {
-    try { const saved = JSON.parse(localStorage.getItem("monocode.inboxDeliveryProviders.v1") || "{}"); return saved && typeof saved === "object" && !Array.isArray(saved) ? Object.fromEntries(Object.entries(saved).filter(([, value]) => value === "github" || value === "azure").slice(-100)) as Record<string, "github" | "azure"> : {}; }
+  const [deliveryProviders, setDeliveryProviders] = useState<Record<string, "github" | "azure" | "gitlab">>(() => {
+    try { const saved = JSON.parse(localStorage.getItem("monocode.inboxDeliveryProviders.v1") || "{}"); return saved && typeof saved === "object" && !Array.isArray(saved) ? Object.fromEntries(Object.entries(saved).filter(([, value]) => value === "github" || value === "azure" || value === "gitlab").slice(-100)) as Record<string, "github" | "azure" | "gitlab"> : {}; }
     catch { return {}; }
   });
   const [choosingProviders, setChoosingProviders] = useState<string | null>(null);
   const providerKey = (sessionId: string, kind: "pr" | "ci") => JSON.stringify([contextTicketKey(item), sessionId, kind]);
   const deliveryProvider = (sessionId: string, kind: "pr" | "ci") => {
     const saved = deliveryProviders[providerKey(sessionId, kind)];
-    return saved === "github" || saved === "azure" ? saved : item.provider === "github" || item.provider === "azure" ? item.provider : undefined;
+    const provider = saved === "github" || saved === "azure" || saved === "gitlab" ? saved : item.provider === "github" || item.provider === "azure" || item.provider === "gitlab" ? item.provider : undefined;
+    // GitLab pipelines ride the MR surface — never a standalone CI delivery.
+    return provider === "gitlab" && kind === "ci" ? undefined : provider;
   };
   const saveProvider = (sessionId: string, kind: "pr" | "ci", provider: string) => {
-    if (provider !== "" && provider !== "github" && provider !== "azure") return;
+    if (provider !== "" && provider !== "github" && provider !== "azure" && provider !== "gitlab") return;
     const key = providerKey(sessionId, kind);
     const next = Object.fromEntries([...Object.entries(deliveryProviders).filter(([entry]) => entry !== key), ...(provider ? [[key, provider]] : [])].slice(-100));
     try { localStorage.setItem("monocode.inboxDeliveryProviders.v1", JSON.stringify(next)); setDeliveryProviders(next); }
@@ -1546,7 +1674,7 @@ export function InboxDetail({
     deliveryPending.current = true;
     setDeliveryBusy(true);
     setDeliveryError("");
-    try { await onOpenDelivery(sessionId, kind, () => deliveryMounted.current, provider, item.provider === "github" && item.kind === "pr" ? item.url : undefined); }
+    try { await onOpenDelivery(sessionId, kind, () => deliveryMounted.current, provider, item.provider === "github" && item.kind === "pr" ? item.url : undefined, item.provider === "gitlab" && item.kind === "pr" ? { repo: item.repo, number: item.number } : undefined); }
     catch (error) { if (deliveryMounted.current) setDeliveryError(error instanceof Error ? error.message : String(error)); }
     finally { deliveryPending.current = false; if (deliveryMounted.current) setDeliveryBusy(false); }
   };
@@ -1565,17 +1693,20 @@ export function InboxDetail({
   const cached = azure ? peekAzureDetails(item) : jira ? peekJiraDetails(item) : linear
     ? peekLinearIssueDetails(item.id ?? "")
     : gitlabKind
-      ? peekGitlabWorkItemDetails(item.projectPath, gitlabKind, item.number)
+      ? peekGitlabWorkItemDetails(item.repo, gitlabKind, item.number)
       : githubKind
         ? peekGithubWorkItemDetails(item.projectPath, githubKind, item.number)
         : null;
-  const cachedDiff = isPr && gitlab
-    ? peekGitlabMrDiff(item.projectPath, item.number)
-    : null;
+  // GitHub and GitLab PRs render dedicated review surfaces that load their
+  // own diffs — the inbox-level diff only remains for other providers.
+  const cachedDiff =
+    isPr && !gitlab && item.provider !== "github"
+      ? peekGithubPrDiff(item.projectPath, item.number)
+      : null;
   const cachedThread = azure ? peekAzureThread(item) : jira ? peekJiraThread(item) : linear
     ? peekLinearIssueThread(item.id ?? "")
     : gitlabKind
-      ? peekGitlabWorkItemThread(item.projectPath, gitlabKind, item.number)
+      ? peekGitlabWorkItemThread(item.repo, gitlabKind, item.number)
       : githubKind
         ? peekGithubWorkItemThread(item.projectPath, githubKind, item.number)
         : null;
@@ -1606,6 +1737,7 @@ export function InboxDetail({
   const context = useInboxContext(item);
   const [sendError, setSendError] = useState("");
   const [retry, setRetry] = useState(0);
+  const chooseStartProject = ticket || (gitlab && !item.projectPath);
   const status = ticket
     ? item.state || inboxItemStatus(item)
     : inboxItemStatus(item);
@@ -1614,7 +1746,12 @@ export function InboxDetail({
   const source = azure ? `${item.site?.split("/").pop()} / ${item.projectName}` : jira ? item.projectName : linear
     ? item.teamName || item.repo
     : item.repo || projectName(item.projectPath);
-  const markdownCwd = ticket ? startProject || cwd : item.projectPath || cwd;
+  const attentionLabel = gitlab
+    ? gitlabAttentionLabel(item.attentionReason ?? "")
+    : "";
+  const markdownCwd = chooseStartProject
+    ? startProject || cwd
+    : item.projectPath || cwd;
   const authorName = details?.author?.trim() ?? "";
   const extraAssignees = item.assignees.filter(
     (person) =>
@@ -1642,7 +1779,7 @@ export function InboxDetail({
     const cachedDetails = azure ? peekAzureDetails(item) : jira ? peekJiraDetails(item) : linear
       ? peekLinearIssueDetails(item.id ?? "")
       : gitlabKind
-        ? peekGitlabWorkItemDetails(item.projectPath, gitlabKind, item.number)
+        ? peekGitlabWorkItemDetails(item.repo, gitlabKind, item.number)
         : githubKind
           ? peekGithubWorkItemDetails(item.projectPath, githubKind, item.number)
           : null;
@@ -1660,7 +1797,7 @@ export function InboxDetail({
         ? linearIssueDetails(item.id)
         : Promise.reject(new Error("Missing Linear issue"))
       : gitlabKind
-        ? gitlabWorkItemDetails(item.projectPath, gitlabKind, item.number)
+        ? gitlabWorkItemDetails(item.repo, gitlabKind, item.number)
         : githubKind
           ? githubWorkItemDetails(item.projectPath, githubKind, item.number)
           : Promise.reject(new Error("Unknown inbox item"));
@@ -1687,6 +1824,7 @@ export function InboxDetail({
     item.id,
     item.number,
     item.projectPath,
+    item.repo,
     linear,
     revision,
     jira,
@@ -1727,7 +1865,7 @@ export function InboxDetail({
     }
     if (gitlabKind) {
       const cachedThread = peekGitlabWorkItemThread(
-        item.projectPath,
+        item.repo,
         gitlabKind,
         item.number,
       );
@@ -1740,7 +1878,7 @@ export function InboxDetail({
         setThreadError(null);
         setThread(null);
       }
-      void gitlabWorkItemThread(item.projectPath, gitlabKind, item.number)
+      void gitlabWorkItemThread(item.repo, gitlabKind, item.number)
         .then((next) => {
           if (cancelled) return;
           setThread(next);
@@ -1796,6 +1934,7 @@ export function InboxDetail({
     item.id,
     item.number,
     item.projectPath,
+    item.repo,
     linear,
     revision,
     jira,
@@ -1803,10 +1942,11 @@ export function InboxDetail({
   ]);
 
   useEffect(() => {
-    // GitHub PRs render the dedicated review surface, which loads its own diff.
-    if (!gitlab || !isPr || tab !== "code") return;
+    // GitHub and GitLab PRs render dedicated review surfaces, which load
+    // their own diffs.
+    if (item.provider === "github" || gitlab || !isPr || tab !== "code") return;
     let cancelled = false;
-    const cachedDiff = peekGitlabMrDiff(item.projectPath, item.number);
+    const cachedDiff = peekGithubPrDiff(item.projectPath, item.number);
     if (cachedDiff) {
       setPrDiff(cachedDiff);
       setDiffLoading(false);
@@ -1816,7 +1956,7 @@ export function InboxDetail({
       setDiffError(null);
       setPrDiff(null);
     }
-    const pending = gitlabMrDiff(item.projectPath, item.number);
+    const pending = githubPrDiff(item.projectPath, item.number);
     void pending
       .then((next) => {
         if (cancelled) return;
@@ -1834,7 +1974,7 @@ export function InboxDetail({
     return () => {
       cancelled = true;
     };
-  }, [gitlab, isPr, item.number, item.projectPath, revision, tab]);
+  }, [gitlab, isPr, item.number, item.projectPath, item.repo, revision, tab]);
 
   const postComment = async (body: string) => {
     setPosting(true);
@@ -1852,21 +1992,13 @@ export function InboxDetail({
         return;
       }
       if (gitlabKind) {
-        await gitlabWorkItemComment(
-          item.projectPath,
-          gitlabKind,
-          item.number,
-          body,
-        );
+        await gitlabWorkItemComment(item.repo, gitlabKind, item.number, body);
         setReplyTo(null);
         try {
           setThread(
-            await gitlabWorkItemThread(
-              item.projectPath,
-              gitlabKind,
-              item.number,
-              { force: true },
-            ),
+            await gitlabWorkItemThread(item.repo, gitlabKind, item.number, {
+              force: true,
+            }),
           );
         } catch (err: unknown) {
           setPostError(err instanceof Error ? err.message : String(err));
@@ -1923,6 +2055,9 @@ export function InboxDetail({
             <statusMark.Icon className="size-3.5" strokeWidth={1.75} />
             {status}
           </span>
+          {attentionLabel ? (
+            <span className="shrink-0 text-accent">{attentionLabel}</span>
+          ) : null}
           {source ? <span className="truncate">{source}</span> : null}
         </div>
         <h1 title={item.title}
@@ -2011,11 +2146,11 @@ export function InboxDetail({
                 </button>                  {onOpenDelivery && session.cwd ? ([['pr', 'PRs'], ['ci', 'CI']] as const).map(([kind, label]) => (
                     <button key={kind} type="button" aria-label={`${label} for ${title}`} title={`${label} · ${session.cwd}`} disabled={deliveryBusy}
                       className="h-6 rounded-md px-1.5 text-[11px] text-content/50 hover:bg-content/5 hover:text-content focus-visible:outline-accent disabled:opacity-40"
-                      onClick={() => void openDelivery(session.id, kind)}>{deliveryProvider(session.id, kind) === "github" ? `GitHub ${label} ↗` : deliveryProvider(session.id, kind) === "azure" ? `Azure ${label}` : `Choose ${label}`}</button>
+                      onClick={() => void openDelivery(session.id, kind)}>{deliveryProvider(session.id, kind) === "github" ? `GitHub ${label} ↗` : deliveryProvider(session.id, kind) === "azure" ? `Azure ${label}` : deliveryProvider(session.id, kind) === "gitlab" ? `GitLab ${label}` : `Choose ${label}`}</button>
                   )) : null}
                   {onOpenDelivery && session.cwd ? <button type="button" aria-label={`Delivery providers for ${title}`} className="h-6 rounded-md px-1.5 text-[11px] text-content/40 hover:bg-content/5" onClick={() => setChoosingProviders(choosingProviders === session.id ? null : session.id)}>Providers</button> : null}
                   {choosingProviders === session.id ? <span className="flex flex-wrap items-center gap-2 rounded-md border border-content/10 p-2">
-                    {([['pr', 'PR provider'], ['ci', 'CI provider']] as const).map(([kind, label]) => <span key={kind} className="text-[11px] text-content/60">{label}<Select label={`${label} for ${title}`} value={deliveryProvider(session.id, kind) ?? ""} options={[{value:"", label:item.provider === "github" || item.provider === "azure" ? "Use ticket provider" : "Choose provider"}, {value:"github",label:kind === "pr" ? "GitHub" : "GitHub checks"}, {value:"azure",label:kind === "pr" ? "Azure Repos" : "Azure Pipelines"}]} onChange={value => saveProvider(session.id, kind, value)} /></span>)}
+                    {([['pr', 'PR provider'], ['ci', 'CI provider']] as const).map(([kind, label]) => <span key={kind} className="text-[11px] text-content/60">{label}<Select label={`${label} for ${title}`} value={deliveryProvider(session.id, kind) ?? ""} options={[{value:"", label:item.provider === "github" || item.provider === "azure" || item.provider === "gitlab" ? "Use ticket provider" : "Choose provider"}, {value:"github",label:kind === "pr" ? "GitHub" : "GitHub checks"}, {value:"azure",label:kind === "pr" ? "Azure Repos" : "Azure Pipelines"}, ...(kind === "pr" ? [{value:"gitlab",label:"GitLab"}] : [])]} onChange={value => saveProvider(session.id, kind, value)} /></span>)}
                     <button type="button" className="px-2 py-1 text-[11px]" onClick={() => setChoosingProviders(null)}>Done</button>
                   </span> : null}
                 </span>
@@ -2035,7 +2170,7 @@ export function InboxDetail({
                 }
                 onClick={() => {
                   setSendError("");
-                  void Promise.resolve(onStartTask(ticket ? { ...item, projectPath: startProject } : item, null)).catch(reason => setSendError(String(reason)));
+                  void Promise.resolve(onStartTask(chooseStartProject ? { ...item, projectPath: startProject } : item, null)).catch(reason => setSendError(String(reason)));
                 }}
                 className={`${ACTION_FILLED} disabled:cursor-default disabled:opacity-40`}
               >
@@ -2053,13 +2188,13 @@ export function InboxDetail({
               >
                 <ChevronDown className="size-3.5" strokeWidth={1.75} />
               </button>
-              {ticket ? <InboxProjectPicker projects={projects} value={startProject} onChange={setStartProject} /> : null}
+              {chooseStartProject ? <InboxProjectPicker projects={projects} value={startProject} onChange={setStartProject} /> : null}
               {sendMenu ? (
                 <SendTargetMenu
                   anchor={sendAnchor}
                   onPick={(taskId) => {
                     setSendMenu(false);
-                    onStartTask?.(ticket ? { ...item, projectPath: startProject } : item, taskId);
+                    onStartTask?.(chooseStartProject ? { ...item, projectPath: startProject } : item, taskId);
                   }}
                   onClose={() => setSendMenu(false)}
                 />
@@ -2116,7 +2251,7 @@ export function InboxDetail({
         </div>
         {sendError ? <p role="alert" className="text-[12px] text-red-400">{sendError}</p> : null}
         <InboxContextPicker context={context}
-          destination={ticket ? <InboxProjectPicker projects={projects} value={startProject} onChange={setStartProject} /> : <span className="truncate" title={item.projectPath}>{projectName(item.projectPath)}</span>}
+          destination={chooseStartProject ? <InboxProjectPicker projects={projects} value={startProject} onChange={setStartProject} /> : <span className="truncate" title={item.projectPath}>{projectName(item.projectPath)}</span>}
           onConfirm={async (card) => {
             await onDiscuss?.(card);
           }} />
@@ -2166,6 +2301,16 @@ export function InboxDetail({
             enabled
             onClose={() => undefined}
           />
+        ) : gitlab ? (
+          <GitlabMrReview
+            key={`${item.projectPath}:${item.repo}:${item.number}:${revision}`}
+            embedded
+            cwd={item.projectPath}
+            repo={item.repo}
+            number={item.number}
+            enabled
+            onClose={() => undefined}
+          />
         ) : diffLoading ? (
           <div className="flex justify-center py-10 text-content/40">
             <LoaderCircle className="size-4 animate-spin" strokeWidth={1.75} />
@@ -2198,6 +2343,14 @@ export function InboxDetail({
             <p className="text-[13px] text-content/45">No description</p>
           )}
           {(jira || azure) && galleryAttachments.length ? <TicketImages key={`${item.site}:${item.id}:${revision}`} item={item} attachments={galleryAttachments} /> : null}
+          {myWork?.hasWork ? (
+            <InboxMyWorkSection
+              work={myWork}
+              onOpenSession={onOpenSession}
+              onOpenDelivery={onOpenDelivery}
+              onOpenAttention={onAttentionAction}
+            />
+          ) : null}
           <InboxRelated key={`related:${inboxItemKey(item)}:${revision}`} item={item} />
           <InboxComments
             thread={thread}

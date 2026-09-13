@@ -87,6 +87,16 @@ export type GitDiffIndex = {
   ahead: number;
   behind: number;
   aheadOfDefault: number;
+  /** A merge, rebase, patch apply (`git am`), cherry-pick or revert is in progress. */
+  opInProgress: boolean;
+  /** "merge" | "rebase" | "am" | "cherry-pick" | "revert" — "" when none. */
+  op: string;
+  /** Unmerged paths while an operation is in progress (bounded). */
+  conflicts: string[];
+  /** Short SHA of MERGE_HEAD (or the rebased head) when known. */
+  mergeHead: string | null;
+  /** HEAD is detached — `branch` then holds a short SHA, not a branch. */
+  detached: boolean;
 };
 
 export function gitDiffIndex(cwd: string): Promise<GitDiffIndex> {
@@ -250,13 +260,69 @@ export function gitUpdateFromDefault(
   cwd: string,
   mode: "merge" | "rebase",
   base?: string,
+  expectedBranch?: string,
 ): Promise<GitUpdateResult> {
-  return invoke<GitUpdateResult>("git_update_from_default", { cwd, mode, base });
+  return invoke<GitUpdateResult>("git_update_from_default", {
+    cwd,
+    mode,
+    base,
+    expectedBranch,
+  });
 }
 
-/** Abort an in-progress merge or rebase, leaving the checkout clean. */
+/** Abort an in-progress merge, rebase, `git am`, cherry-pick or revert, leaving the checkout clean. */
 export function gitMergeAbort(cwd: string): Promise<void> {
   return invoke<void>("git_merge_abort", { cwd });
+}
+
+export type GitSyncResult = {
+  /** "merged" | "up-to-date" | "conflicted" | "refused" */
+  outcome: string;
+  branch: string;
+  /** The remote ref merged, e.g. "origin/main". */
+  syncedWith: string;
+  /** Subjects of the incoming commits the merge brought in (bounded). */
+  commits: string[];
+  /** Total incoming commits — `commits` may be truncated. */
+  commitCount: number;
+  /** Conflicted paths when the merge stopped; left in progress. */
+  conflicts: string[];
+  /** Why a refused sync did not run. */
+  reason: string;
+};
+
+/**
+ * Fetch the remote default branch and merge `remote/<default>` into this
+ * exact working copy on its own host. Merge only; never pushes. A dirty
+ * tree, an operation already in progress, a branch that moved since
+ * `expectedBranch` was confirmed, or a second concurrent sync is refused
+ * as data — nothing is stashed or queued.
+ */
+export function gitSyncBranch(
+  cwd: string,
+  expectedBranch?: string,
+): Promise<GitSyncResult> {
+  return invoke<GitSyncResult>("git_sync_branch", { cwd, expectedBranch });
+}
+
+export type GitMergeContext = {
+  /** A merge, rebase, patch apply (`git am`), cherry-pick or revert is in progress. */
+  merging: boolean;
+  /** "merge" | "rebase" | "am" | "cherry-pick" | "revert" — "" when none. */
+  op: string;
+  /** Unmerged paths (bounded). */
+  conflicts: string[];
+  /** Short SHA of the head being applied (MERGE_HEAD…) when known. */
+  mergeHead: string | null;
+  /** Remote-tracking ref verified to name MERGE_HEAD, e.g. "origin/main". */
+  incomingRef: string | null;
+  /** Bounded combined diff of the conflicted paths — both sides. */
+  diff: string;
+};
+
+/** Live merge state — honest after restart, unlike a remembered result. */
+export function gitMergeContext(cwd: string): Promise<GitMergeContext> {
+  return invoke<GitMergeContext>("git_merge_context", { cwd });
 }
 
 export type GitRangeContext = {

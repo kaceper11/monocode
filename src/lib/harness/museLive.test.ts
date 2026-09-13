@@ -32,6 +32,7 @@ const {
   compactMuseContext,
   respondMuseApproval,
   respondMuseQuestion,
+  setMuseRuntimeMode,
   stopMuseSession,
   bindMuseSession,
   __museTestReset,
@@ -302,6 +303,70 @@ describe("muse live turn sequence", () => {
     });
     await turn;
     await stopMuseSession("t3");
+  });
+
+  it("pushes allowAll and auto-decides a parked approval on a mid-conversation change", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "run tests", "t3b");
+    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
+
+    serverRequest(78, "approval/request", {
+      approvalId: "a2",
+      sessionId: "MS1",
+      turnId: "T1",
+      itemId: "i3",
+      toolCallId: "call_3",
+      toolName: "bash",
+      rawArgs: JSON.stringify({ command: "npm test" }),
+      currentRequirementId: { approvalId: "a2", sourceIndex: 0 },
+      availableChoices: [
+        { choiceId: "ch-allow", label: "Allow once", decision: "approved", scope: "once" },
+        { choiceId: "ch-deny", label: "Deny", decision: "denied", scope: "once" },
+      ],
+      subject: { kind: "shell", command: "npm test" },
+    });
+    await waitFor(
+      () => events.some((e) => e.type === "approval.requested"),
+      "approval.requested",
+    );
+
+    setMuseRuntimeMode("t3b", "full-access");
+    await waitFor(
+      () => byMethod("session/setApprovalMode").length > 0,
+      "session/setApprovalMode",
+    );
+    const setMode = lastByMethod("session/setApprovalMode")!;
+    expect(setMode.params.mode).toBe("allowAll");
+    reply(setMode.id, {});
+
+    await waitFor(
+      () => byMethod("approval/decide").length > 0,
+      "approval/decide",
+    );
+    const decide = lastByMethod("approval/decide")!;
+    expect(decide.params).toMatchObject({
+      approvalId: "a2",
+      choiceId: "ch-allow",
+    });
+    reply(decide.id, {
+      approvalId: "a2",
+      commandId: decide.params.commandId,
+      status: "accepted",
+      terminal: true,
+    });
+    expect(
+      events.some(
+        (e) => e.type === "approval.resolved" && e.decision === "allow",
+      ),
+    ).toBe(true);
+
+    notify("turn/completed", {
+      sessionId: "MS1",
+      turnId: "T1",
+      terminal: "completed",
+    });
+    await turn;
+    await stopMuseSession("t3b");
   });
 
   it("re-asks when Muse reports a stale approval requirement", async () => {
@@ -1265,5 +1330,187 @@ describe("muse live turn sequence", () => {
     expect(byMethod("turn/unqueue")).toHaveLength(0);
     await turn;
     await stopMuseSession("t14");
+  });
+
+  it("folds a subagent child session into agent steps on its row", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "explore auth", "ts1");
+    const childPages = () =>
+      byMethod("view/page").filter((m) => m.params.sessionId === "CHILD1");
+
+    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
+    notify("item/started", {
+      sessionId: "MS1",
+      item: {
+        itemId: "sa1",
+        kind: "subagent",
+        childSessionId: "CHILD1",
+        objective: "Map the auth flow",
+        agentPath: "/agents/explorer.md",
+        role: "research",
+        status: "inProgress",
+        revision: 1,
+      },
+    });
+
+    // The child session is paged first, then tailed at the last seen cursor.
+    await waitFor(() => childPages().length > 0, "child view/page");
+    reply(childPages()[0].id, {
+      events: [
+        {
+          method: "item/started",
+          params: {
+            sessionId: "CHILD1",
+            viewCursor: "k1",
+            item: {
+              itemId: "cm1",
+              kind: "agentMessage",
+              status: "inProgress",
+              revision: 1,
+            },
+          },
+        },
+        {
+          method: "item/started",
+          params: {
+            sessionId: "CHILD1",
+            viewCursor: "k2",
+            item: {
+              itemId: "ct1",
+              kind: "toolCall",
+              tool: "read",
+              args: JSON.stringify({ path: "auth.ts" }),
+              status: "inProgress",
+              revision: 1,
+            },
+          },
+        },
+      ],
+      nextCursor: "k2",
+    });
+    await waitFor(() => childPages().length > 1, "second child page");
+    reply(childPages()[1].id, { events: [], nextCursor: null });
+    await waitFor(
+      () =>
+        byMethod("view/subscribe").some(
+          (m) => m.params.sessionId === "CHILD1",
+        ),
+      "child view/subscribe",
+    );
+    const sub = byMethod("view/subscribe").find(
+      (m) => m.params.sessionId === "CHILD1",
+    )!;
+    expect(sub.params.after).toBe("k2");
+    reply(sub.id, { viewCursor: "k3" });
+
+    // Live child events land as steps on the sa1 row, not as transcript items.
+    notify("item/delta", {
+      sessionId: "CHILD1",
+      viewCursor: "k4",
+      itemId: "cm1",
+      field: "text",
+      delta: "Reading auth.ts",
+    });
+    notify("item/completed", {
+      sessionId: "CHILD1",
+      viewCursor: "k5",
+      item: {
+        itemId: "ct1",
+        kind: "toolCall",
+        tool: "read",
+        args: JSON.stringify({ path: "auth.ts" }),
+        status: "completed",
+        revision: 2,
+      },
+    });
+
+    // The parent's own message stream is untouched by child prose.
+    notify("item/started", {
+      sessionId: "MS1",
+      item: { itemId: "m1", kind: "agentMessage", status: "inProgress" },
+    });
+    notify("item/delta", {
+      sessionId: "MS1",
+      itemId: "m1",
+      field: "text",
+      delta: "Parent answer",
+    });
+    notify("item/completed", {
+      sessionId: "MS1",
+      item: {
+        itemId: "m1",
+        kind: "agentMessage",
+        status: "completed",
+        text: "Parent answer",
+      },
+    });
+
+    // The terminal revision drains the tail, then unsubscribes the child.
+    notify("item/completed", {
+      sessionId: "MS1",
+      item: {
+        itemId: "sa1",
+        kind: "subagent",
+        childSessionId: "CHILD1",
+        status: "completed",
+        result: {
+          summary: "auth flow mapped",
+          artifactRefs: [],
+          evidenceRefs: [],
+        },
+        revision: 2,
+      },
+    });
+    await waitFor(() => childPages().length > 2, "child drain page");
+    reply(childPages()[2].id, { events: [], nextCursor: null });
+    await waitFor(
+      () =>
+        byMethod("view/unsubscribe").some(
+          (m) => m.params.sessionId === "CHILD1",
+        ),
+      "child view/unsubscribe",
+    );
+
+    notify("turn/completed", {
+      sessionId: "MS1",
+      turnId: "T1",
+      terminal: "completed",
+    });
+    await turn;
+
+    const steps = events.filter((e) => e.type === "agent.step");
+    expect(steps.some((s) => s.callId === "sa1" && s.kind === "tool" &&
+      s.status === "completed")).toBe(true);
+    expect(
+      steps.some(
+        (s) =>
+          s.callId === "sa1" &&
+          s.kind === "message" &&
+          s.text === "Reading auth.ts",
+      ),
+    ).toBe(true);
+    expect(
+      steps.every(
+        (s) => s.agentName === "Explorer" && s.agentType === "research",
+      ),
+    ).toBe(true);
+    // Child items never become top-level blocks; the parent row carries the
+    // terminal summary and the assistant text stays the parent's own.
+    expect(
+      events.some((e) => e.type === "tool.started" && e.callId === "ct1"),
+    ).toBe(false);
+    expect(
+      events.some(
+        (e) =>
+          e.type === "tool.updated" &&
+          e.callId === "sa1" &&
+          e.detail === "auth flow mapped",
+      ),
+    ).toBe(true);
+    const deltas = events
+      .filter((e) => e.type === "message.delta")
+      .map((e) => (e as { text: string }).text);
+    expect(deltas).toEqual(["Parent answer"]);
+    await stopMuseSession("ts1");
   });
 });

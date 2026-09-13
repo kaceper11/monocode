@@ -1,4 +1,5 @@
 import { nativeModelId } from "../models";
+import { AcpSubagents } from "./acpSubagents";
 import type { RuntimeMode } from "../session";
 import { AcpClient, type AcpHandlers } from "./acp";
 import type { JsonRpcId } from "./jsonRpc";
@@ -36,6 +37,7 @@ type SessionSetupResult = {
 };
 
 type Live = {
+  subagents: AcpSubagents;
   acp: AcpClient;
   acpSessionId: string;
   cwd: string;
@@ -45,6 +47,8 @@ type Live = {
   cancelled: boolean;
   runtimeMode: RuntimeMode;
   planning: boolean;
+  /** Last modeId the provider confirmed, so repeats skip the wire call. */
+  appliedModeId?: string;
   onEvent: (event: HarnessEvent) => void;
   turns: Promise<void>;
 };
@@ -105,11 +109,13 @@ export async function sendFxTurn(input: SendTurnInput): Promise<void> {
   if (cancelledThreads.delete(input.sessionId)) return;
 
   live.onEvent = input.onEvent;
-  live.runtimeMode = input.runtimeMode;
-  live.planning = input.intent === "plan";
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      // Posture applies when the queued turn actually runs — applying it at
+      // enqueue time would flip the running turn's permission handling.
+      live.runtimeMode = input.runtimeMode;
+      live.planning = input.intent === "plan";
       live.cancelled = false;
       live.muteUpdates = false;
       try {
@@ -150,6 +156,19 @@ export function respondFxApproval(
   _requestId: number,
   _decision: ApprovalDecision,
 ) {}
+
+/** Push a UI access-mode change to the provider now rather than next turn. */
+export function setFxRuntimeMode(
+  sessionId: string,
+  runtimeMode: RuntimeMode,
+): void {
+  const live = liveByThread.get(sessionId);
+  if (!live) return;
+  live.runtimeMode = runtimeMode;
+  void applyRuntimeMode(live, runtimeMode, live.planning).catch(
+    () => undefined,
+  );
+}
 
 export async function cancelFxTurn(sessionId: string): Promise<void> {
   const live = liveByThread.get(sessionId);
@@ -194,7 +213,6 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
   const existing = liveByThread.get(input.sessionId);
   if (existing && existing.cwd === input.cwd) {
     existing.onEvent = input.onEvent;
-    existing.runtimeMode = input.runtimeMode;
     return existing;
   }
   if (existing) {
@@ -325,6 +343,7 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
 
     const configOptions = readConfigOptions(setup?.configOptions);
     const live: Live = {
+      subagents: new AcpSubagents(),
       acp,
       acpSessionId,
       cwd: input.cwd,
@@ -391,15 +410,20 @@ async function applyRuntimeMode(
   // Unsupported mode control is non-fatal because handlePermission remains a
   // backstop. Transport failures and timeouts are rethrown so the wedged child
   // is recycled rather than leaving this turn pending forever.
+  const modeId = planning ? "ask" : fxModeId(runtimeMode);
+  if (modeId === live.appliedModeId) return;
   await live.acp
     .request(
       "session/set_mode",
       {
         sessionId: live.acpSessionId,
-        modeId: planning ? "ask" : fxModeId(runtimeMode),
+        modeId,
       },
       CONTROL_TIMEOUT_MS,
     )
+    .then(() => {
+      live.appliedModeId = modeId;
+    })
     .catch((error: unknown) => {
       ignoreUnsupportedControl("set_mode", error);
     });
@@ -470,7 +494,7 @@ function ignoreUnsupportedControl(method: string, error: unknown): void {
 
 function handleNotification(live: Live, method: string, params: unknown) {
   if (method !== "session/update") return;
-  for (const event of eventsFromAcpUpdate(params)) {
+  for (const event of live.subagents.route(params, eventsFromAcpUpdate(params))) {
     live.onEvent(event);
   }
 }

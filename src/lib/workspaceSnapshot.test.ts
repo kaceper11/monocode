@@ -717,8 +717,85 @@ it("restores delivery scope without treating it as an editable file", () => {
       ],
     };
     expect(
-      parseWorkspaceSnapshot(JSON.stringify(invalid))?.tabs[0]?.editorPanes?.[0]
-        ?.files?.[0],
+      parseWorkspaceSnapshot(invalid)?.tabs[0]?.editorPanes?.[0]?.files?.[0],
+    ).toBeUndefined();
+  }
+});
+
+it("keeps only delivery tabs whose provider identity can render", () => {
+  const file = {
+    id: "gl-1",
+    path: "Pull requests",
+    cwd: "/repo",
+    delivery: {
+      kind: "pr" as const,
+      branch: "feature",
+      provider: "gitlab" as const,
+      repo: "acme/web",
+      number: 7,
+    },
+  };
+  const tab = {
+    ...newTab("owner"),
+    id: "t1",
+    editorPanes: [{ id: "e1", files: [file], activeFileId: file.id }],
+  };
+  const snapshot = collectWorkspaceSnapshot([tab], [], "t1", "/repo", new Map());
+  // A well-formed GitLab delivery tab round-trips.
+  expect(
+    parseWorkspaceSnapshot(snapshot)?.tabs[0]?.editorPanes?.[0]?.files?.[0]
+      ?.delivery,
+  ).toEqual(file.delivery);
+  // A GitHub delivery tab with its PR identity round-trips too.
+  const githubFile = {
+    ...file,
+    delivery: { ...file.delivery, provider: "github" as const },
+  };
+  const githubSnapshot = collectWorkspaceSnapshot(
+    [{ ...tab, editorPanes: [{ id: "e1", files: [githubFile], activeFileId: githubFile.id }] }],
+    [],
+    "t1",
+    "/repo",
+    new Map(),
+  );
+  expect(
+    parseWorkspaceSnapshot(githubSnapshot)?.tabs[0]?.editorPanes?.[0]
+      ?.files?.[0]?.delivery,
+  ).toEqual(githubFile.delivery);
+  for (const bad of [
+    // A GitLab tab missing its MR identity cannot render its MR.
+    {
+      ...file,
+      delivery: {
+        kind: "pr",
+        branch: "feature",
+        provider: "gitlab",
+        number: 7,
+      },
+    },
+    {
+      ...file,
+      delivery: {
+        kind: "pr",
+        branch: "feature",
+        provider: "gitlab",
+        repo: "acme/web",
+      },
+    },
+    { ...file, delivery: { ...file.delivery, repo: "  " } },
+    { ...file, delivery: { ...file.delivery, number: 0 } },
+  ]) {
+    const invalid = {
+      ...snapshot,
+      tabs: [
+        {
+          ...tab,
+          editorPanes: [{ id: "e1", files: [bad], activeFileId: bad.id }],
+        },
+      ],
+    };
+    expect(
+      parseWorkspaceSnapshot(invalid)?.tabs[0]?.editorPanes?.[0]?.files?.[0],
     ).toBeUndefined();
   }
 });

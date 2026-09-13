@@ -20,6 +20,7 @@ import {
   extractSkillName,
   extractToolPreview,
 } from "./preview";
+import { acpAgentInfo } from "./acpSubagents";
 
 export type AcpHandlers = {
   onNotification?: (method: string, params: unknown) => void;
@@ -383,6 +384,7 @@ export function acpEventsFromUpdate(params: unknown): HarnessEvent[] {
         status,
         detail: cap(toolDetail(update, tool) ?? "") || undefined,
         preview,
+        ...acpAgentInfo(update, tool, toolKind, title),
       },
     ];
   }

@@ -16,6 +16,7 @@ import {
   composeTaskSessionPrompt,
   createTask,
   isTaskChildLaunching,
+  linkTicketToTask,
   loadTaskWorkspaces,
   markTaskChildLaunching,
   PRIMARY_ATTEMPT_ID,
@@ -32,12 +33,26 @@ import {
   taskChildrenForWorkingCopy,
   taskForSession,
   taskHostConflict,
+  taskMatchesQuery,
   taskOwnsCheckout,
   tasksForProject,
   unmarkTaskChildLaunching,
   updateTask,
   updateTaskChild,
 } from "./taskWorkspaces";
+import {
+  ensureDeliveryWatcher,
+  loadWatchers,
+  saveWatcher,
+  updateWatcher,
+  watchGithubPrUrl,
+} from "./watchers";
+import {
+  allAzurePrAssociations,
+  saveAzurePrAssociation,
+  type AzurePrAssociation,
+} from "./azureRepos";
+import { saveTaskPrDraft } from "./taskPrs";
 
 function family(commonDir: string, checkout: string): RepositoryFamily {
   return {
@@ -1041,6 +1056,83 @@ describe("composeTaskPrompt", () => {
   });
 });
 
+describe("taskMatchesQuery", () => {
+  const build = () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "Checkout",
+      brief: "Rebuild the checkout flow.",
+      ticket: {
+        kind: "issue",
+        repo: "acme/shop",
+        number: 217,
+        url: "https://github.com/acme/shop/issues/217",
+        identifier: "BOOK-217",
+        title: "Checkout",
+      },
+      children: [
+        {
+          repositoryId: repo.id,
+          mode: "worktree",
+          baseRef: "refs/heads/main",
+          baseCommit: "abc1234567",
+          branch: "checkout",
+          path: "/tmp/app-checkout",
+          responsibility: "UI only",
+        },
+        later(lib.id),
+      ],
+    });
+    return { task, project };
+  };
+
+  it("matches name, brief, ticket and repository fields", () => {
+    const { task, project } = build();
+    for (const query of [
+      "checkout", // name, ticket title, branch
+      "BOOK-217", // ticket identifier
+      "issues/217", // ticket url
+      "rebuild the checkout", // brief
+      "lib", // repository display name
+      "app-checkout", // working copy path
+      "ui only", // responsibility
+    ]) {
+      expect(taskMatchesQuery(task, query, project), query).toBe(true);
+    }
+  });
+
+  it("matches additional ticket items and attempt labels", () => {
+    const { task, project } = build();
+    linkTicketToTask(task.id, {
+      kind: "issue",
+      repo: "acme/shop",
+      number: 88,
+      url: "https://github.com/acme/shop/issues/88",
+      identifier: "OPS-88",
+      title: "Ops follow-up",
+    });
+    const linked = loadTaskWorkspaces().find((row) => row.id === task.id)!;
+    expect(taskMatchesQuery(linked, "OPS-88", project)).toBe(true);
+    expect(taskMatchesQuery(linked, "ops follow", project)).toBe(true);
+  });
+
+  it("matches tokens across different fields", () => {
+    const { task, project } = build();
+    // "book-217" is the ticket identifier, "ui" only appears in the
+    // responsibility — the pair must still match.
+    expect(taskMatchesQuery(task, "book-217 ui", project)).toBe(true);
+    expect(taskMatchesQuery(task, "checkout nope", project)).toBe(false);
+  });
+
+  it("returns true for empty queries and false for misses", () => {
+    const { task, project } = build();
+    expect(taskMatchesQuery(task, "  ", project)).toBe(true);
+    expect(taskMatchesQuery(task, "unrelated", project)).toBe(false);
+  });
+});
+
 describe("suggestTaskBranch", () => {
   it("slugs the task name and stays unique against existing refs", () => {
     const refs = [
@@ -1053,5 +1145,414 @@ describe("suggestTaskBranch", () => {
     );
     expect(suggestTaskBranch("Fix — auth", refs)).toBe("fix-auth");
     expect(suggestTaskBranch("", [])).toBe("task");
+  });
+});
+
+describe("delivery watcher teardown", () => {
+  const autoGhPr = (cwd: string, number: number, sessionId?: string) =>
+    ensureDeliveryWatcher({
+      kind: "github-pr",
+      cwd,
+      repo: "acme/app",
+      number,
+      ...(sessionId ? { sessionId } : {}),
+    });
+  const autoCi = (cwd: string, sessionId?: string) =>
+    ensureDeliveryWatcher({
+      kind: "azure-ci",
+      target: {
+        site: "https://dev.azure.com/team",
+        accountId: "a",
+        project: "p",
+        definition: 5,
+        repositoryId: "r",
+        repositoryType: "TfsGit",
+        repositoryUrl: "u",
+      },
+      definitionName: "Tests",
+      remote: "u",
+      cwd,
+      branch: "feat",
+      ...(sessionId ? { sessionId } : {}),
+    });
+
+  const association = (
+    cwd: string,
+    session: string,
+  ): AzurePrAssociation => ({
+    target: {
+      site: "https://dev.azure.com/team",
+      accountId: "a",
+      project: "p",
+      repository: "r",
+      number: 7,
+    },
+    account: "Ada",
+    cwd,
+    branch: "feat",
+    sourceSessionId: session,
+    revision: "s:t",
+    projectName: "P",
+    repositoryName: "R",
+    pr: {
+      pullRequestId: 7,
+      title: "Review me",
+      status: "active",
+      sourceRefName: "refs/heads/feat",
+      targetRefName: "refs/heads/main",
+      reviewers: [],
+    },
+  });
+
+  it("lifts a task's auto watchers on archive and restores them on unarchive", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    const childId = task.children[0].id;
+    updateTaskChild(task.id, childId, { sessionIds: ["s1"] });
+    // Links saved through the real paths, bound to the child's copy+session —
+    // the association and the draft both register their watcher on write.
+    saveAzurePrAssociation(
+      association("/tmp/app-copy", "s1"),
+      "/tmp/app-copy",
+      "feat",
+      "s1",
+    );
+    saveTaskPrDraft(task.id, childId, {
+      target: "main",
+      title: "T",
+      body: "",
+      result: {
+        provider: "github",
+        url: "https://github.com/acme/app/pull/3",
+        title: "T",
+        number: 3,
+      },
+    });
+    watchGithubPrUrl("/tmp/app-copy", "https://github.com/acme/app/pull/3", "s1");
+    autoGhPr("/tmp/app-copy", 5, "s1"); // session-bound, nothing stored
+    autoGhPr("/elsewhere", 4, "s9"); // unrelated
+    expect(loadWatchers()).toHaveLength(4);
+    archiveTask(task.id);
+    expect(loadWatchers().map((watcher) => watcher.source)).toEqual([
+      expect.objectContaining({ cwd: "/elsewhere" }),
+    ]);
+    // Un-archiving re-registers watchers for links that stayed saved — the
+    // bare session-bound watcher without a stored link stays gone.
+    archiveTask(task.id, false);
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(3);
+    expect(watchers.map((watcher) => watcher.source.kind).sort()).toEqual([
+      "azure-pr",
+      "github-pr",
+      "github-pr",
+    ]);
+    expect(watchers.every((watcher) => watcher.auto)).toBe(true);
+  });
+
+  it("lifts a removed task's watchers and keeps hand-made ones", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    autoGhPr("/tmp/app-copy", 3);
+    saveWatcher({
+      name: "Manual",
+      source: { kind: "github-pr", cwd: "/tmp/app-copy", repo: "acme/app", number: 8 },
+      enabled: true,
+      mode: "notify",
+      intervalSec: 300,
+      cooldownSec: 900,
+    });
+    removeTask(task.id);
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].name).toBe("Manual");
+  });
+
+  it("lifts only the removed child's scope", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+        { repositoryId: lib.id, mode: "existing", workingCopy: "/tmp/lib-copy" },
+      ],
+    });
+    autoGhPr("/tmp/app-copy", 3);
+    autoGhPr("/tmp/lib-copy", 4);
+    removeTaskChild(task.id, task.children[0].id);
+    expect(loadWatchers().map((watcher) => watcher.source)).toEqual([
+      expect.objectContaining({ cwd: "/tmp/lib-copy" }),
+    ]);
+  });
+
+  it("lifts session-bound watchers when the session is pruned", () => {
+    autoGhPr("/tmp/app-copy", 3, "s1");
+    autoGhPr("/tmp/app-copy", 4, "s2");
+    pruneTaskSession("s1");
+    expect(loadWatchers().map((watcher) => watcher.source)).toEqual([
+      expect.objectContaining({ sessionId: "s2" }),
+    ]);
+  });
+
+  it("keeps a pruned session's watcher when another scope still links the delivery", () => {
+    const assoc = association("/tmp/app-copy", "s2");
+    // The watcher is bound to s1; the stored link lives under s2.
+    saveWatcher({
+      name: "Auto",
+      source: {
+        kind: "azure-pr",
+        target: assoc.target,
+        projectName: "P",
+        repositoryName: "R",
+        cwd: "/tmp/app-copy",
+        branch: "feat",
+        sessionId: "s1",
+      },
+      enabled: true,
+      mode: "notify",
+      auto: true,
+      intervalSec: 300,
+      cooldownSec: 900,
+    });
+    const watcher = loadWatchers()[0];
+    updateWatcher(watcher.id, (row) => ({ ...row, seen: ["k1"] }));
+    saveAzurePrAssociation(assoc, "/tmp/app-copy", "feat", "s2");
+    // ensureDeliveryWatcher dedupes — the s1-bound watcher already covers it.
+    expect(loadWatchers()).toHaveLength(1);
+    pruneTaskSession("s1");
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].id).toBe(watcher.id);
+    expect(watchers[0].source).toEqual(
+      expect.objectContaining({ sessionId: "s2" }),
+    );
+    expect(watchers[0].seen).toEqual(["k1"]);
+  });
+
+  it("keeps a pruned session's watcher session-less while its link stays", () => {
+    const assoc = association("/tmp/app-copy", "s1");
+    saveAzurePrAssociation(assoc, "/tmp/app-copy", "feat", "s1");
+    expect(loadWatchers()).toHaveLength(1);
+    pruneTaskSession("s1");
+    // The stored link survives with the dead owner stripped, so the watcher
+    // follows it — rebound to nobody rather than to a deleted session.
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).not.toHaveProperty("sessionId");
+    expect(allAzurePrAssociations()[0].sourceSessionId).toBeUndefined();
+  });
+
+  it("never rebinds a watcher to a deleted session", () => {
+    const assoc = association("/tmp/app-copy", "s1");
+    saveAzurePrAssociation(assoc, "/tmp/app-copy", "feat", "s1");
+    saveAzurePrAssociation(
+      { ...assoc, sourceSessionId: "s2" },
+      "/tmp/app-copy",
+      "feat",
+      "s2",
+    );
+    expect(loadWatchers()[0].source).toEqual(
+      expect.objectContaining({ sessionId: "s1" }),
+    );
+    pruneTaskSession("s1");
+    expect(loadWatchers()[0].source).toEqual(
+      expect.objectContaining({ sessionId: "s2" }),
+    );
+    pruneTaskSession("s2");
+    // s1's row was unbound when s1 was pruned — nothing points back at a
+    // dead session; the session-less twins collapse to one covering row.
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).not.toHaveProperty("sessionId");
+    expect(allAzurePrAssociations()).toHaveLength(1);
+  });
+
+  it("does not count an archived task's draft as coverage", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    const childId = task.children[0].id;
+    updateTaskChild(task.id, childId, { sessionIds: ["s9"] });
+    saveTaskPrDraft(task.id, childId, {
+      target: "main",
+      title: "T",
+      body: "",
+      result: {
+        provider: "github",
+        url: "https://github.com/acme/app/pull/9",
+        title: "T",
+        number: 9,
+      },
+    });
+    archiveTask(task.id);
+    // The parked task's draft must not keep another session's watcher alive.
+    watchGithubPrUrl("/tmp/app-copy", "https://github.com/acme/app/pull/9", "s1");
+    pruneTaskSession("s1");
+    expect(loadWatchers()).toHaveLength(0);
+  });
+
+  it("keeps a watcher covered by a live session at a torn checkout", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    updateTaskChild(task.id, task.children[0].id, { sessionIds: ["s1"] });
+    // s9 is a live session elsewhere — its stored link shares the checkout.
+    saveAzurePrAssociation(
+      association("/tmp/app-copy", "s9"),
+      "/tmp/app-copy",
+      "feat",
+      "s9",
+    );
+    removeTask(task.id);
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).toEqual(
+      expect.objectContaining({ sessionId: "s9" }),
+    );
+  });
+
+  it("keeps a github-pr watcher covered by a task's saved PR result", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    const childId = task.children[0].id;
+    updateTaskChild(task.id, childId, { sessionIds: ["s2"] });
+    saveTaskPrDraft(task.id, childId, {
+      target: "main",
+      title: "T",
+      body: "",
+      result: {
+        provider: "github",
+        url: "https://github.com/acme/app/pull/9",
+        title: "T",
+        number: 9,
+      },
+    });
+    // The watcher is bound to an ad-hoc session at the same checkout.
+    watchGithubPrUrl("/tmp/app-copy", "https://github.com/acme/app/pull/9", "s1");
+    pruneTaskSession("s1");
+    const watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).toEqual(
+      expect.objectContaining({ sessionId: "s2" }),
+    );
+    // Removing the task then lifts it — its coverage is task-scoped.
+    removeTask(task.id);
+    expect(loadWatchers()).toHaveLength(0);
+  });
+
+  it("keeps a foreign live session's watcher through archive/unarchive", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    saveAzurePrAssociation(
+      association("/tmp/app-copy", "foreign"),
+      "/tmp/app-copy",
+      "feat",
+      "foreign",
+    );
+    // The foreign session is live — its stored link still covers the
+    // delivery, so archiving this task doesn't lift the watcher.
+    archiveTask(task.id);
+    let watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source).toEqual(
+      expect.objectContaining({ sessionId: "foreign" }),
+    );
+    // Un-archiving must not stack a second watcher over the kept one.
+    archiveTask(task.id, false);
+    watchers = loadWatchers();
+    expect(watchers).toHaveLength(1);
+    expect(watchers[0].source.kind).toBe("azure-pr");
+  });
+
+  it("lifts watchers for children dropped by reviseTask", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+        { repositoryId: lib.id, mode: "existing", workingCopy: "/tmp/lib-copy" },
+      ],
+    });
+    autoGhPr("/tmp/app-copy", 3);
+    autoGhPr("/tmp/lib-copy", 4);
+    reviseTask(task.id, {
+      name: "X",
+      keepRepositoryIds: [repo.id],
+      responsibilities: new Map(),
+      additions: [],
+    });
+    expect(loadWatchers().map((watcher) => watcher.source)).toEqual([
+      expect.objectContaining({ cwd: "/tmp/app-copy" }),
+    ]);
+  });
+
+  it("lifts watchers for children of a removed attempt", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+      ],
+    });
+    const attempt = addTaskAttempt(task.id, "Second");
+    addTaskChildren(task.id, [
+      {
+        repositoryId: lib.id,
+        attemptId: attempt.id,
+        mode: "existing",
+        workingCopy: "/tmp/lib-copy",
+      },
+    ]);
+    autoGhPr("/tmp/app-copy", 3);
+    autoGhPr("/tmp/lib-copy", 4);
+    removeTaskAttempt(task.id, attempt.id);
+    expect(loadWatchers().map((watcher) => watcher.source)).toEqual([
+      expect.objectContaining({ cwd: "/tmp/app-copy" }),
+    ]);
   });
 });

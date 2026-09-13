@@ -5,6 +5,7 @@ import { githubRepo } from "./githubTasks";
 import { deliveryProvider, saveDeliveryProvider, repositoryProvider, resolvePrProviders, githubDeliveryTarget, parseGithubPrLocation } from "./deliveryProviders";
 vi.mock("./fs", () => ({gitPrStatus: vi.fn()}));
 vi.mock("./githubTasks", () => ({githubRepo: vi.fn()}));
+vi.mock("./gitlab", () => ({gitlabMrForBranch: vi.fn()}));
 beforeEach(() => { const rows = new Map<string, string>(); vi.stubGlobal("localStorage", {getItem:(key:string) => rows.get(key) ?? null, setItem:(key:string,value:string) => rows.set(key,value)}); });
 afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks(); });
 it("resolves known remotes without choosing between ambiguous providers", () => {
@@ -66,4 +67,15 @@ it("resolves the delivery target from a PR link or the branch's open PR", async 
   await expect(githubDeliveryTarget("/repo")).resolves.toEqual({ repo: "team/repo", number: 4 });
   vi.mocked(gitPrStatus).mockResolvedValue(null);
   await expect(githubDeliveryTarget("/repo")).rejects.toThrow("No GitHub PR found");
+});
+it("binds GitLab delivery to the project the backend resolved", async () => {
+  const { gitlabDeliveryTarget } = await import("./deliveryProviders");
+  const { gitlabMrForBranch } = await import("./gitlab");
+  vi.mocked(gitlabMrForBranch).mockResolvedValue({repo: "acme/web", number: 7} as never);
+  await expect(gitlabDeliveryTarget("/repo", "feature")).resolves.toEqual({repo: "acme/web", number: 7});
+  await expect(gitlabDeliveryTarget("/repo", " ")).rejects.toThrow("No branch");
+  vi.mocked(gitlabMrForBranch).mockRejectedValueOnce(new Error("No open merge request for this branch"));
+  await expect(gitlabDeliveryTarget("/repo", "feature")).rejects.toThrow("No open merge request");
+  vi.mocked(gitlabMrForBranch).mockResolvedValueOnce({repo: "", number: 7} as never);
+  await expect(gitlabDeliveryTarget("/repo", "feature")).rejects.toThrow("does not resolve");
 });

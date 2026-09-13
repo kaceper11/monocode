@@ -67,6 +67,7 @@ import {
   type TaskChild,
   type TaskWorkspace,
 } from "../lib/taskWorkspaces";
+import { watchGithubPrUrl } from "../lib/watchers";
 import { repositoryDisplayName } from "../lib/projects";
 import { useProjectBranchesState } from "../hooks/useProjectBranches";
 import { Modal } from "./Modal";
@@ -573,6 +574,11 @@ export function TaskPrSheet({
         const isDraft = draft?.draft === true;
         if (provider === "github") {
           const url = await gitPrCreate(cwd, title, body, target, branch, isDraft);
+          watchGithubPrUrl(
+            cwd,
+            url,
+            row.child.sessionIds[0] ?? task?.sessionIds?.[0],
+          );
           saveTaskPrDraft(taskId, id, {
             target,
             title,
@@ -606,12 +612,16 @@ export function TaskPrSheet({
             body,
             isDraft,
           );
-          // Link the PR to every session that shares this working copy.
+          // Link the PR to every session that shares this working copy. A
+          // task that never launched has none — save the link session-less
+          // so it is still tracked and watched like the GitHub path's.
           const sessionIds = [
             ...(task?.sessionIds ?? []),
             ...row.child.sessionIds,
           ].slice(0, 20);
-          for (const sessionId of sessionIds) {
+          for (const sessionId of sessionIds.length
+            ? sessionIds
+            : [undefined]) {
             saveAzurePrAssociation(
               {
                 target: created.target,
@@ -622,7 +632,7 @@ export function TaskPrSheet({
                 repositoryName: created.repositoryName,
                 cwd,
                 branch,
-                sourceSessionId: sessionId,
+                ...(sessionId ? { sourceSessionId: sessionId } : {}),
               },
               cwd,
               branch,

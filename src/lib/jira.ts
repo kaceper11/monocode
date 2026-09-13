@@ -337,6 +337,7 @@ export async function jiraThread(
         threadId: "",
         replies: [],
       })),
+    commits: [],
     truncated: response.total > response.comments.length,
     reviewDecision: "",
     baseRefName: "",

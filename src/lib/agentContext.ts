@@ -58,6 +58,9 @@ export type AgentContextRequest = {
    * summarized into its shared brief. */
   newTask?: boolean;
   requireDestinationSelection?: boolean;
+  /** When the chosen harness can't take attachments, deliver the text
+   * entries instead of failing — the entries carry the same context. */
+  attachmentsOptional?: boolean;
   onPrepared?: () => void;
   onRefreshEvidence?: (instruction: string) => void;
 };
@@ -178,12 +181,12 @@ export async function contextFromTicketDescriptions(
           const provider = await import("./gitlab");
           details =
             provider.peekGitlabWorkItemDetails(
-              item.projectPath,
+              item.repo,
               kind,
               item.number,
             ) ??
             (await provider.gitlabWorkItemDetails(
-              item.projectPath,
+              item.repo,
               kind,
               item.number,
             ));

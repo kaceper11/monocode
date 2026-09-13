@@ -141,6 +141,29 @@ export async function getPtyStatus(
   return invoke<{ foreground: string | null }>("pty_status", { id });
 }
 
+export type PtyResource = {
+  id: string;
+  /** `native` runs on the OS host; `wsl` is a Linux tree behind wsl.exe. */
+  host: "native" | "wsl";
+  distro: string | null;
+  cpuPct: number;
+  rssBytes: number;
+  processes: number;
+  /** Non-shell work exists — the kill-workload action is meaningful. */
+  workload: boolean;
+  /** Busiest non-shell process name. */
+  top: string | null;
+};
+
+export async function getPtyResources(): Promise<PtyResource[]> {
+  return invoke<PtyResource[]>("pty_resources");
+}
+
+/** Stop the terminal's workload; its shell stays alive. */
+export async function killPtyWorkload(id: string): Promise<void> {
+  await invoke("pty_kill_workload", { id });
+}
+
 export async function killPty(id: string): Promise<void> {
   dataHandlers.delete(id);
   exitHandlers.delete(id);

@@ -5,7 +5,16 @@ import {
   type AttentionItem,
 } from "./attention";
 import { composeToolTitle } from "./harness/preview";
-import { displayPath } from "./paths";
+import { displayPath, isEqualOrInside, pathKey, projectName } from "./paths";
+import type { ProjectRecord } from "./projects";
+import { collectRailProjects, type RecentProject } from "./recents";
+import {
+  lastWorkingCopyUse,
+  staleWorkingCopy,
+  workingCopyAge,
+  STALE_WORKING_COPY_AGE,
+  type RepositoryFamily,
+} from "./repositoryFamilies";
 import type { RepairRecord } from "./repair";
 import {
   HARNESS_TITLE,
@@ -151,6 +160,156 @@ function repairItems(record: RepairRecord, sessions: Session[]): AttentionItem[]
       action: { kind: "open-session", sessionId: session.id },
     },
   ];
+}
+
+/** A working copy counts as stale when Git marks it missing/prunable, or
+ * when its last recorded MonoCode use is older than this. Unknown activity
+ * is never stale — a fresh or externally-used copy has no recorded use. */
+export const STALE_WORKTREE_AGE = STALE_WORKING_COPY_AGE;
+
+/** Small stable hash for signatures — fingerprints the stale set without
+ * embedding whole paths. */
+function signatureHash(parts: readonly string[]): string {
+  let hash = 0x811c9dc5;
+  const text = parts.join(" ");
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(36);
+}
+
+/**
+ * Repository families reachable from the rail — recents, the open checkout,
+ * stored project anchors and their member repositories. The shared verified
+ * map also holds families probed incidentally (task worktree verification,
+ * sheet locates); those must not raise cleanup rows for repositories the
+ * user never added.
+ */
+export function railReachableFamilies(input: {
+  families: ReadonlyMap<string, RepositoryFamily>;
+  recents: RecentProject[];
+  currentCwd: string;
+  projects: readonly ProjectRecord[];
+}): Map<string, RepositoryFamily> {
+  const railPaths = [
+    ...collectRailProjects(input.recents, input.currentCwd).values(),
+  ].map((item) => item.path);
+  for (const project of input.projects) {
+    if (project.anchor) railPaths.push(project.anchor);
+    for (const repo of project.repositories) railPaths.push(repo.anchor);
+  }
+  const commonDirs = new Set<string>();
+  for (const path of railPaths) {
+    const family = input.families.get(pathKey(path));
+    if (family) commonDirs.add(pathKey(family.commonDir));
+  }
+  return new Map(
+    [...input.families].filter(([, family]) =>
+      commonDirs.has(pathKey(family.commonDir)),
+    ),
+  );
+}
+
+/**
+ * Stale working copies → one cleanup row per repository family. A copy is
+ * stale when Git marks it missing/prunable, or when its last recorded
+ * MonoCode use is older than {@link STALE_WORKTREE_AGE}. Hidden, main,
+ * locked and currently-open copies never nudge. The row is derived — using
+ * or removing the copies clears it; nothing is deleted automatically. Its
+ * action opens the worktree manager, which re-checks every entry before any
+ * removal.
+ */
+export function worktreeCleanupAttention(input: {
+  families: ReadonlyMap<string, RepositoryFamily>;
+  recents: RecentProject[];
+  /** Last observed session activity per checkout path — family inventory
+   * only carries `lastUsed` after the worktree panel has joined session
+   * evidence, so callers fold in the session summaries they already hold. */
+  sessionActivity?: ReadonlyMap<string, number>;
+  currentCwd?: string;
+  hidden?: readonly string[];
+  now?: number;
+}): AttentionItem[] {
+  const now = input.now ?? Date.now();
+  const hiddenKeys = new Set((input.hidden ?? []).map(pathKey));
+  const items: AttentionItem[] = [];
+  const seen = new Set<string>();
+  const lastUse = (entry: RepositoryFamily["worktrees"][number]) =>
+    Math.max(
+      lastWorkingCopyUse(entry, input.recents) ?? 0,
+      input.sessionActivity?.get(pathKey(entry.path)) ?? 0,
+    ) || null;
+  for (const family of input.families.values()) {
+    // Alias keys can map to a distinct probe result — dedupe on the
+    // canonical common dir, not object identity.
+    const familyKey = pathKey(family.commonDir);
+    if (seen.has(familyKey)) continue;
+    seen.add(familyKey);
+    const stale = family.worktrees.filter((entry) => {
+      if (entry.main) return false;
+      if (hiddenKeys.has(pathKey(entry.path))) return false;
+      if (input.currentCwd && isEqualOrInside(input.currentCwd, entry.path))
+        return false;
+      // Locked is an explicit "don't touch" — it wins over a stale or
+      // missing registration too.
+      if (entry.locked) return false;
+      if (entry.missing || entry.prunable) return true;
+      return staleWorkingCopy(entry, lastUse(entry), now);
+    });
+    if (!stale.length) continue;
+    const missing = stale.filter(
+      (entry) => entry.missing || entry.prunable,
+    ).length;
+    const uses = stale
+      .map(lastUse)
+      .filter((value): value is number => value !== null);
+    const name = projectName(family.checkout || stale[0].path);
+    // A surviving member path — `family.checkout` is not guaranteed to be a
+    // verified-family map key, and the manager seeds its list from it.
+    const member =
+      family.worktrees.find((entry) => !entry.missing && !entry.prunable)
+        ?.path ?? family.checkout;
+    items.push({
+      key: `worktree-stale:${pathKey(family.commonDir)}`,
+      kind: "worktree",
+      title: `${name} · ${stale.length} stale working ${
+        stale.length === 1 ? "copy" : "copies"
+      }`,
+      detail: [
+        missing ? `${missing} missing or stale on disk` : "",
+        uses.length
+          ? `oldest ${workingCopyAge(Math.min(...uses), now).toLowerCase()}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      urgency: ATTENTION_INFO,
+      // The newest stale copy's last use — stable across re-derivations, so
+      // the row keeps its queue position. With no recorded use at all the
+      // state-change time is unknown; 0 sorts it below dated rows.
+      at: uses.length ? Math.max(...uses) : 0,
+      signature: `stale:${signatureHash(
+        stale
+          .map(
+            (entry) =>
+              `${pathKey(entry.path)}:${
+                entry.missing ? "m" : entry.prunable ? "p" : "s"
+              }`,
+          )
+          .sort(),
+      )}`,
+      cwd: member,
+      action: {
+        kind: "open-worktrees",
+        cwd: member,
+        // The manager lands on the stale set pre-checked; missing/prunable
+        // registrations are never selectable and sort into review instead.
+        paths: stale.map((entry) => entry.path),
+      },
+    });
+  }
+  return items;
 }
 
 /**

@@ -6,6 +6,7 @@ import {
   respondGrokApproval,
   respondGrokQuestion,
   sendGrokTurn,
+  setGrokRuntimeMode,
   steerGrokTurn,
   stopGrokSession,
 } from "./grok";
@@ -28,6 +29,7 @@ export const grokAdapter: HarnessAdapter = {
   steerTurn: steerGrokTurn,
   cancelTurn: cancelGrokTurn,
   respondApproval: respondGrokApproval,
+  setRuntimeMode: setGrokRuntimeMode,
   respondQuestion: respondGrokQuestion,
   stopSession: stopGrokSession,
   forgetSession: forgetGrokSession,

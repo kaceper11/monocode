@@ -2,13 +2,16 @@ mod bounded_process;
 mod wsl;
 use tauri::Manager;
 
+mod agent_config;
 mod azure;
 mod azure_inbox;
 mod azure_pipelines;
 mod azure_repos;
+mod browser;
 mod chat_background;
 mod checkout;
 mod checkpoint;
+mod checks;
 mod confluence;
 mod cursor_store;
 pub mod dictation;
@@ -25,6 +28,7 @@ mod menu;
 mod notes;
 mod notifications;
 mod power;
+mod proc_stats;
 mod project_logo;
 mod pty;
 mod rate_limits;
@@ -183,9 +187,11 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(harness::HarnessHost::new())
         .manage(power::PowerHost::new())
+        .manage(browser::BrowserState::default())
         .manage(pty::PtyHost::new())
         .manage(window_transfer::WindowTransferState::new())
         .manage(dictation::DictationHost::new())
@@ -233,6 +239,18 @@ pub fn run() {
             reminders::reminder_take_open,
             reminders::reminder_register_window,
             reminders::reminder_open,
+            browser::browser_open,
+            browser::browser_close,
+            browser::browser_navigate,
+            browser::browser_reload,
+            browser::browser_go_back,
+            browser::browser_go_forward,
+            browser::browser_set_bounds,
+            browser::browser_set_visible,
+            browser::browser_set_background,
+            browser::browser_probe,
+            browser::browser_set_recording,
+            browser::browser_capture,
             fs::list_dir,
             fs::list_project_files,
             fs::git_diff_stats,
@@ -272,6 +290,9 @@ pub fn run() {
             fs::git_github_pr_diff,
             fs::github_pr_prepare_checkout,
             fs::git_update_from_default,
+            fs::git_sync_branch,
+            checks::run_check,
+            fs::git_merge_context,
             fs::git_merge_abort,
             inbox_media::fetch_inbox_media,
             inbox_context::inbox_context_document,
@@ -280,11 +301,17 @@ pub fn run() {
             gitlab::gitlab_set_config,
             gitlab::gitlab_repo,
             gitlab::gitlab_list_work_items,
+            gitlab::gitlab_list_todos,
             gitlab::gitlab_work_item_details,
             gitlab::gitlab_work_item_thread,
             gitlab::gitlab_work_item_comment,
             gitlab::gitlab_issue_relations,
             gitlab::gitlab_mr_diff,
+            gitlab::gitlab_mr_for_branch,
+            gitlab::gitlab_mr_state,
+            gitlab::gitlab_mr_discussions,
+            gitlab::gitlab_mr_discussion_reply,
+            gitlab::gitlab_mr_discussion_resolve,
             linear::linear_status,
             jira::jira_status,
             jira::jira_set_config,
@@ -351,8 +378,12 @@ pub fn run() {
             fs::read_text_file,
             fs::write_text_file,
             skills::list_skills,
+            agent_config::agent_config_inventory,
+            agent_config::agent_config_set_enabled,
+            agent_config::agent_config_remove,
             search::search_project,
             cursor_store::cursor_tool_calls,
+            cursor_store::cursor_subagent_runs,
             harness::harness_resolve_cursor,
             harness::harness_resolve_codex,
             harness::harness_resolve_opencode,
@@ -382,7 +413,9 @@ pub fn run() {
             pty::pty_write,
             pty::pty_resize,
             pty::pty_status,
+            pty::pty_resources,
             pty::pty_kill,
+            pty::pty_kill_workload,
             pty::pty_kill_all,
             session_store::session_upsert,
             session_store::session_list_by_project,
@@ -508,6 +541,7 @@ fn reap_harness_children(handle: &tauri::AppHandle) {
     if let Some(host) = handle.try_state::<dictation::DictationHost>() {
         host.shutdown();
     }
+    checks::reap_running();
 }
 
 #[cfg(all(debug_assertions, target_os = "macos"))]

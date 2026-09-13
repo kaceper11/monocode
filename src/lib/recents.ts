@@ -39,10 +39,17 @@ export function sameProjectPath(a: string, b: string): boolean {
   return pathKey(a) === pathKey(b);
 }
 
+/** Cache on the raw storage string like loadProjects — the rail and
+ * worktree panel call this on render paths and the parse is the same
+ * every call until something saves. */
+let recentsCacheRaw: string | null | undefined;
+let recentsCache: RecentProject[] = [];
+
 export function loadRecents(): RecentProject[] {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return [];
+    if (raw === recentsCacheRaw) return recentsCache;
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
     const out: RecentProject[] = [];
@@ -56,7 +63,9 @@ export function loadRecents(): RecentProject[] {
           : 0;
       out.push({ path: normalize(rec.path), openedAt });
     }
-    return out;
+    recentsCache = out;
+    recentsCacheRaw = raw;
+    return recentsCache;
   } catch {
     return [];
   }

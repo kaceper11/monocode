@@ -53,7 +53,16 @@ tab/pane layout (`WorkspaceTab`, `workspaceSnapshot`, `sessionWorkspaceLifecycle
   rejects mixed native/WSL working copies.
 - `taskOwnsCheckout(child)` (`branch`+`baseRef` recorded) marks checkouts the
   task created versus borrowed existing/main copies. Removal and cleanup
-  offers must use it, never path heuristics.
+  offers must use it, never path heuristics. The rail's **Delete task…**
+  opens a sheet (`TaskWorktreesSheet`) that lists exactly these owned copies
+  with per-row checkboxes — borrowed copies are never listed — and offers
+  **Delete task** (record only) or a reviewed batch removal through the same
+  `git_worktree_safety` preflight/`git_worktree_remove` pipeline as the
+  worktree manager (never force, never stopping processes). The task record
+  is deleted either way, even when copies are skipped or fail — leftovers
+  stay listed with a **Review** handoff into the manager's single-entry
+  flow. The copy containing the active context is disabled. Sessions,
+  conversations and branches always stay.
 - `attempts[0]` is pinned to `PRIMARY_ATTEMPT_ID` on load, so the primary
   attempt's protection holds even for hand-edited records. It cannot be
   removed; mark it `discarded` via `setTaskAttemptStatus` instead.
@@ -99,12 +108,39 @@ that touch disjoint repositories, keep today's output.
   the copy is created on disk and the final `updateTaskChild` no-ops. The
   copy stays discoverable through repository family inventory; nothing
   records it back onto the task.
+- Removing a task-owned working copy through the manager or the delete
+  sheet does not rewrite `child.workingCopy` — the binding dangles and
+  relaunch surfaces the failure (a retained branch blocks `worktree add
+  -b`). TaskDetails keeps the row visible with its launch error; record
+  rewriting on external removal is out of scope by policy.
 - Task records are frontend-localStorage today. Durable execution (#21) and
   schedules (#24) will need the backend to resolve task → checkout bindings;
   keep new fields flat and id-keyed so that move stays a row mapping.
 - Which attempt a task-level session works on is intentionally unsettled —
   the session is rooted at a host checkout and the prompt lists every child;
   per-attempt session UX is a later slice, not hidden in this model.
+
+## Discovery and details surfaces
+
+- `taskMatchesQuery` is the one rail/search filter — name, ticket fields
+  (identifier/title/url, including `additionalItems`), brief, repository
+  display names, working copies, branches, merge targets, responsibilities
+  and attempt labels, all from already-loaded records. The Tasks rail shows
+  every live and archived match while filtering (the rail cap is suspended);
+  the global ⌘K search exposes the same records as `task` hits under a Tasks
+  scope. Selecting a task row never retints unrelated repository rows.
+- **Task details** (`src/chrome/TaskDetails.tsx`, `OPEN_TASK_DETAILS` event)
+  is a read-only rollup opened from the task row's menu, the scope chip and
+  ⌘K results: deduped tickets (task ticket, `additionalItems` and
+  session-linked work items), per-repository working copies with launch
+  state and delivery badges, saved PR links (Azure associations, the cached
+  GitHub branch PR, `taskPrs` drafts/results) and CI sources, and the task's
+  conversations resolved against sidebar history. It renders saved/cached
+  state only — no Git or provider fetch — and external links are opened
+  after an http(s) check. Each prepared working-copy row carries a manage
+  chevron that closes the sheet and opens the shared worktree modal focused
+  on that copy (`OPEN_WORKTREE_MANAGER`); the same event backs the rail's
+  per-worktree menu and the attention queue's pre-checked cleanup.
 
 ## Verification
 

@@ -11,6 +11,7 @@ import AppWindowIcon from "@hugeicons/core-free-icons/AppWindowIcon";
 import Archive02Icon from "@hugeicons/core-free-icons/Archive02Icon";
 import ArrowDown01Icon from "@hugeicons/core-free-icons/ArrowDown01Icon";
 import ArrowExpand01Icon from "@hugeicons/core-free-icons/ArrowExpand01Icon";
+import ArrowShrink01Icon from "@hugeicons/core-free-icons/ArrowShrink01Icon";
 import ArrowLeft01Icon from "@hugeicons/core-free-icons/ArrowLeft01Icon";
 import ArrowRight01Icon from "@hugeicons/core-free-icons/ArrowRight01Icon";
 import ArrowTurnForwardIcon from "@hugeicons/core-free-icons/ArrowTurnForwardIcon";
@@ -18,6 +19,7 @@ import ArrowUp01Icon from "@hugeicons/core-free-icons/ArrowUp01Icon";
 import BotIcon from "@hugeicons/core-free-icons/BotIcon";
 import AiIdeaIcon from "@hugeicons/core-free-icons/AiIdeaIcon";
 import Cancel01Icon from "@hugeicons/core-free-icons/Cancel01Icon";
+import Camera01Icon from "@hugeicons/core-free-icons/Camera01Icon";
 import CaseSensitiveIcon from "@hugeicons/core-free-icons/CaseSensitiveIcon";
 import CircleArrowDown01Icon from "@hugeicons/core-free-icons/CircleArrowDown01Icon";
 import CancelCircleIcon from "@hugeicons/core-free-icons/CancelCircleIcon";
@@ -50,6 +52,7 @@ import GitMergeIcon from "@hugeicons/core-free-icons/GitMergeIcon";
 import GitPullRequestClosedIcon from "@hugeicons/core-free-icons/GitPullRequestClosedIcon";
 import GitPullRequestDraftIcon from "@hugeicons/core-free-icons/GitPullRequestDraftIcon";
 import GitPullRequestIcon from "@hugeicons/core-free-icons/GitPullRequestIcon";
+import GlobeIcon from "@hugeicons/core-free-icons/GlobeIcon";
 import ImageAdd01Icon from "@hugeicons/core-free-icons/ImageAdd01Icon";
 import InboxIcon from "@hugeicons/core-free-icons/InboxIcon";
 import KeyboardIcon from "@hugeicons/core-free-icons/KeyboardIcon";
@@ -93,6 +96,7 @@ import Tick02Icon from "@hugeicons/core-free-icons/Tick02Icon";
 import TickDouble02Icon from "@hugeicons/core-free-icons/TickDouble02Icon";
 import UndoIcon from "@hugeicons/core-free-icons/UndoIcon";
 import UngroupItemsIcon from "@hugeicons/core-free-icons/UngroupItemsIcon";
+import ViewIcon from "@hugeicons/core-free-icons/ViewIcon";
 import WholeWordIcon from "@hugeicons/core-free-icons/WholeWordIcon";
 import Wrench01Icon from "@hugeicons/core-free-icons/Wrench01Icon";
 import { forwardRef, type Ref } from "react";
@@ -147,6 +151,14 @@ const UnfoldVerticalIcon: IconSvgElement = [
   ["path", { d: "M7 17L12 22L17 17", ...stroke, key: "5" }],
 ];
 
+/** Filled stop square — reads as "stop", unlike the stroked Square checkbox look. */
+const StopIcon: IconSvgElement = [
+  [
+    "rect",
+    { x: "6", y: "6", width: "12", height: "12", rx: "2", fill: "currentColor", key: "0" },
+  ],
+];
+
 export const AlertCircle = wrap(AlertCircleIcon, "AlertCircle");
 export const AppWindow = wrap(AppWindowIcon, "AppWindow");
 export const Archive = wrap(Archive02Icon, "Archive");
@@ -155,6 +167,7 @@ export const ArrowLeft = wrap(ArrowLeft01Icon, "ArrowLeft");
 export const ArrowUp = wrap(ArrowUp01Icon, "ArrowUp");
 export const Bot = wrap(BotIcon, "Bot");
 export const AiIdea = wrap(AiIdeaIcon, "AiIdea");
+export const Camera = wrap(Camera01Icon, "Camera");
 export const CaseSensitive = wrap(CaseSensitiveIcon, "CaseSensitive");
 export const Check = wrap(Tick02Icon, "Check");
 export const CheckCheck = wrap(TickDouble02Icon, "CheckCheck");
@@ -179,6 +192,7 @@ export const FilePlusCorner = wrap(FilePlusCornerIcon, "FilePlusCorner");
 export const FoldVertical = wrap(FoldVerticalIcon, "FoldVertical");
 export const Folder = wrap(Folder01Icon, "Folder");
 export const FolderOpen = wrap(FolderOpenIcon, "FolderOpen");
+export const Eye = wrap(ViewIcon, "Eye");
 export const FolderPlus = wrap(FolderAddIcon, "FolderPlus");
 export const FolderTree = wrap(FolderTreeIcon, "FolderTree");
 export const Gauge = wrap(GaugeIcon, "Gauge");
@@ -195,6 +209,7 @@ export const GitPullRequestDraft = wrap(
   "GitPullRequestDraft",
 );
 export const GripVertical = wrap(DragDropVerticalIcon, "GripVertical");
+export const Globe = wrap(GlobeIcon, "Globe");
 export const ImagePlus = wrap(ImageAdd01Icon, "ImagePlus");
 export const Inbox = wrap(InboxIcon, "Inbox");
 export const Keyboard = wrap(KeyboardIcon, "Keyboard");
@@ -207,6 +222,7 @@ export const LoaderCircle = wrap(Loading03Icon, "LoaderCircle");
 export const Lock = wrap(SquareLock02Icon, "Lock");
 export const LockOpen = wrap(SquareUnlock01Icon, "LockOpen");
 export const Maximize2 = wrap(ArrowExpand01Icon, "Maximize2");
+export const Minimize2 = wrap(ArrowShrink01Icon, "Minimize2");
 export const MessageMultiple = wrap(MessageMultiple01Icon, "MessageMultiple");
 export const MessageSquare = wrap(Comment01Icon, "MessageSquare");
 export const MessageSquarePlus = wrap(CommentAdd01Icon, "MessageSquarePlus");
@@ -239,6 +255,7 @@ export const SlidersHorizontal = wrap(
 );
 export const Sparkles = wrap(SparklesIcon, "Sparkles");
 export const Square = wrap(SquareIcon, "Square");
+export const Stop = wrap(StopIcon, "Stop");
 export const SquarePlus = wrap(AddSquareIcon, "SquarePlus");
 export const Star = wrap(StarIcon, "Star");
 export const StickyNote = wrap(Note01Icon, "StickyNote");
