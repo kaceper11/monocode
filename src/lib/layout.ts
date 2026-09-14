@@ -84,8 +84,6 @@ export type BrowserTabSource = {
   title?: string;
   /** Leaf expands to cover the whole pane area; other leaves stay mounted. */
   expanded?: boolean;
-  /** Page zoom factor; absent means 1. */
-  zoom?: number;
   /** Keep cookies/site data across restarts — the default. `false` marks a
    * private tab on the throwaway data store. */
   persist?: boolean;
@@ -269,7 +267,6 @@ export type BrowserMetaPatch = {
   url?: string;
   title?: string;
   expanded?: boolean;
-  zoom?: number;
   persist?: boolean;
 };
 
@@ -288,18 +285,11 @@ export function updateBrowserTab(
       const title =
         patch.title !== undefined ? patch.title.trim() : file.browser.title;
       const expanded = patch.expanded ?? file.browser.expanded;
-      const zoom =
-        patch.zoom !== undefined
-          ? patch.zoom > 0 && patch.zoom !== 1
-            ? patch.zoom
-            : undefined
-          : file.browser.zoom;
       const persist = patch.persist ?? file.browser.persist;
       if (
         (!url || url === file.browser.url) &&
         title === file.browser.title &&
         expanded === file.browser.expanded &&
-        zoom === file.browser.zoom &&
         persist === file.browser.persist
       )
         return file;
@@ -308,7 +298,6 @@ export function updateBrowserTab(
         url: url || file.browser.url,
         ...(title ? { title } : {}),
         ...(expanded ? { expanded: true } : {}),
-        ...(zoom ? { zoom } : {}),
         ...(persist === false ? { persist: false } : {}),
       };
       return { ...file, ...(url ? { path: url } : {}), browser };

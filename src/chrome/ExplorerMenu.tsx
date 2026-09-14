@@ -32,9 +32,6 @@ type Props = {
   ariaLabel?: string;
   header?: ReactNode;
   width?: number;
-  /** Selector matching the trigger — pointerdowns on it don't dismiss the
-   * menu, so the trigger's own click can toggle it closed. */
-  ignore?: string;
   onPick: (id: string) => void;
   onClose: () => void;
 };
@@ -62,7 +59,6 @@ export function ExplorerMenu({
   ariaLabel = "File actions",
   header,
   width = MENU_WIDTH,
-  ignore,
   onPick,
   onClose,
 }: Props) {
@@ -267,7 +263,7 @@ export function ExplorerMenu({
           if (reason === "escape" && submenu) closeSubmenu();
           else onClose();
         }}
-        ignore={`[data-explorer-menu="${menuId}"]${ignore ? `, ${ignore}` : ""}`}
+        ignore={`[data-explorer-menu="${menuId}"]`}
         data-explorer-menu={menuId}
         role="menu"
         tabIndex={-1}

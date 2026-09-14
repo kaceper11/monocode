@@ -133,19 +133,12 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .build(app)?;
     let sidebar_opacity =
         MenuItemBuilder::with_id("sidebar_opacity", "Sidebar Appearance…").build(app)?;
-    // Menu key equivalents preempt keydown delivery, so no double-fire —
-    // and they're the only way zoom reaches us while a native browser
-    // webview owns focus. The frontend routes these to the page when a
-    // browser tab is focused, the app UI otherwise (same as keydown).
-    let zoom_in = MenuItemBuilder::with_id("zoom_in", "Zoom In")
-        .accelerator("CmdOrCtrl+=")
-        .build(app)?;
-    let zoom_out = MenuItemBuilder::with_id("zoom_out", "Zoom Out")
-        .accelerator("CmdOrCtrl+-")
-        .build(app)?;
-    let zoom_reset = MenuItemBuilder::with_id("zoom_reset", "Reset Zoom")
-        .accelerator("CmdOrCtrl+0")
-        .build(app)?;
+    // No accelerators here on purpose: the webview key handler owns
+    // CmdOrCtrl + - 0, and a menu accelerator would fire the same command
+    // a second time on top of it.
+    let zoom_in = MenuItemBuilder::with_id("zoom_in", "Zoom In").build(app)?;
+    let zoom_out = MenuItemBuilder::with_id("zoom_out", "Zoom Out").build(app)?;
+    let zoom_reset = MenuItemBuilder::with_id("zoom_reset", "Reset Zoom").build(app)?;
     let find = MenuItemBuilder::with_id("find", "Find")
         .accelerator("CmdOrCtrl+F")
         .build(app)?;

@@ -24,9 +24,6 @@ export type BrowserCommand =
   | "reload"
   | "focus-url"
   | "find"
-  | "zoom-in"
-  | "zoom-out"
-  | "zoom-reset"
   | "devtools";
 
 export function requestBrowserCommand(label: string, command: BrowserCommand) {
@@ -415,11 +412,6 @@ export function browserSetVisible(
   visible: boolean,
 ): Promise<void> {
   return invoke("browser_set_visible", { label, visible });
-}
-
-/** Page zoom factor — resolves the clamped value actually applied. */
-export function browserSetZoom(label: string, scale: number): Promise<number> {
-  return invoke("browser_set_zoom", { label, scale });
 }
 
 /** Toggle the page inspector; resolves whether it is open afterwards. */

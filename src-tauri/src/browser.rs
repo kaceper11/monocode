@@ -640,12 +640,6 @@ fn dedicated_store_supported() -> bool {
     os_major() >= 14
 }
 
-/// `WKWebView.pageZoom` (what wry's `set_zoom` calls) needs macOS 11.
-#[cfg(target_os = "macos")]
-fn page_zoom_supported() -> bool {
-    os_major() >= 11
-}
-
 /// Run an eval whose JSON return value is needed. Async like
 /// `browser_probe`: the completion callback arrives on the main thread, so
 /// blocking inside a synchronous command deadlocks on Windows.
@@ -777,9 +771,6 @@ pub async fn browser_open(
         // marked private stays on the throwaway store.
         .incognito(!persist)
         .devtools(true)
-        // WebView2-only: Ctrl+wheel/+- zoom inside the page — the app
-        // keydown handler can't see keys while the native view has focus.
-        .zoom_hotkeys_enabled(true)
         .focused(false)
         // The pane's own background — WKWebView paints it during the
         // process swap on every cross-site navigation, so matching the
@@ -1759,25 +1750,6 @@ const FIND_SCRIPT: &str = r#"(arg) => {
   }
   return { count: matches.length, index: state.index };
 }"#;
-
-#[tauri::command]
-pub fn browser_set_zoom(window: Window, label: String, scale: f64) -> Result<f64, String> {
-    // wry calls WKWebView.pageZoom ungated — it needs macOS 11, and an
-    // unrecognized selector aborts on the spot.
-    #[cfg(target_os = "macos")]
-    if !page_zoom_supported() {
-        return Err("Page zoom needs macOS 11 or later".into());
-    }
-    let zoom = if scale.is_finite() {
-        scale.clamp(0.25, 5.0)
-    } else {
-        1.0
-    };
-    find_webview(&window, &label)?
-        .set_zoom(zoom)
-        .map_err(|error| error.to_string())?;
-    Ok(zoom)
-}
 
 /// Toggle (or set) the page inspector. In release builds this needs the
 /// `devtools` cargo feature — enabled in Cargo.toml.

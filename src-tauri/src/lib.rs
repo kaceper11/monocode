@@ -252,7 +252,6 @@ pub fn run() {
             browser::browser_probe,
             browser::browser_set_recording,
             browser::browser_capture,
-            browser::browser_set_zoom,
             browser::browser_devtools,
             browser::browser_clear_data,
             browser::browser_copy_screenshot,

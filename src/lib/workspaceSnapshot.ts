@@ -581,14 +581,6 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       ].some((key) => value[key] != null && value[key] !== false)
     )
       return null;
-    const zoom =
-      typeof browser.zoom === "number" &&
-      Number.isFinite(browser.zoom) &&
-      browser.zoom >= 0.25 &&
-      browser.zoom <= 5 &&
-      browser.zoom !== 1
-        ? browser.zoom
-        : undefined;
     return {
       id: value.id,
       path: value.path,
@@ -599,7 +591,6 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
           ? { title: browser.title.trim().slice(0, 200) }
           : {}),
         ...(browser.expanded === true ? { expanded: true } : {}),
-        ...(zoom ? { zoom } : {}),
         ...(browser.persist === false ? { persist: false } : {}),
       },
     };

@@ -8087,12 +8087,6 @@ export default function App({
         if (zoom) {
           e.preventDefault();
           e.stopPropagation();
-          // A focused browser tab zooms its page, not the app UI.
-          const browserLabel = focusedBrowserLabel();
-          if (browserLabel) {
-            requestBrowserCommand(browserLabel, zoom);
-            return;
-          }
           if (zoom === "zoom-in") {
             const next = saveUiScale(zoomInUiScale(loadUiScale()));
             void applyUiScale(next);
@@ -8338,33 +8332,17 @@ export default function App({
         void getCurrentWindow().setFocus();
         actions.current.onOpenApprovalSession(sessionId);
       }),
-      // Page zoom while a browser tab is focused; app UI scale otherwise.
       listen("zoom_in", () => {
-        const label = focusedBrowserLabel();
-        if (label) {
-          requestBrowserCommand(label, "zoom-in");
-          return;
-        }
         const next = zoomInUiScale(loadUiScale());
         saveUiScale(next);
         void applyUiScale(next);
       }),
       listen("zoom_out", () => {
-        const label = focusedBrowserLabel();
-        if (label) {
-          requestBrowserCommand(label, "zoom-out");
-          return;
-        }
         const next = zoomOutUiScale(loadUiScale());
         saveUiScale(next);
         void applyUiScale(next);
       }),
       listen("zoom_reset", () => {
-        const label = focusedBrowserLabel();
-        if (label) {
-          requestBrowserCommand(label, "zoom-reset");
-          return;
-        }
         saveUiScale(UI_SCALE_DEFAULT);
         void applyUiScale(UI_SCALE_DEFAULT);
       }),

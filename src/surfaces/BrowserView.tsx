@@ -1,6 +1,13 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ask } from "@tauri-apps/plugin-dialog";
 import {
+  CheckMenuItem,
+  Menu,
+  MenuItem,
+  PredefinedMenuItem,
+} from "@tauri-apps/api/menu";
+import { LogicalPosition } from "@tauri-apps/api/dpi";
+import {
   readText as readClipboardText,
   writeText as writeClipboardText,
 } from "@tauri-apps/plugin-clipboard-manager";
@@ -16,8 +23,8 @@ import {
   type Ref,
 } from "react";
 import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, CircleDot, ExternalLink, EyeOff, Globe, KeyRound, ListBullet, Maximize2, Minimize2, MoreHorizontal, Pencil, RefreshCw, Search, Star, Trash2, X } from "../chrome/icons";
-import { ExplorerMenu, type ExplorerMenuItem } from "../chrome/ExplorerMenu";
-import { ALT, MOD } from "../lib/platform";
+
+import { MOD } from "../lib/platform";
 
 import {
   BROWSER_COMMAND_EVENT,
@@ -45,7 +52,6 @@ import {
   browserSetBounds,
   browserSetRecording,
   browserSetVisible,
-  browserSetZoom,
   browserTabLabel,
   isBrowserCommandRequest,
   isBrowserFavorite,
@@ -86,10 +92,6 @@ const WATCHDOG_RETRY_MS = 6_000;
 const WATCHDOG_MAX_ATTEMPTS = 3;
 /** Re-checks the host rect — pane position can shift without a resize. */
 const BOUNDS_POLL_MS = 800;
-/** Chrome-style zoom ladder — Cmd +/- steps through these. */
-const ZOOM_STEPS = [
-  0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5,
-];
 
 function urlOrigin(url: string): string {
   try {
@@ -211,7 +213,7 @@ export function BrowserView({
   } | null>(null);
   const [loginsOpen, setLoginsOpen] = useState(false);
   const [logins, setLogins] = useState<BrowserLoginMeta[]>([]);
-  const [menuAt, setMenuAt] = useState<{ x: number; y: number } | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
   const urlInputRef = useRef<HTMLInputElement>(null);
   const findInputRef = useRef<HTMLInputElement>(null);
   const findTimerRef = useRef<number | null>(null);
@@ -220,15 +222,7 @@ export function BrowserView({
   /** Storage mode the live webview was created with. */
   const persist = file.browser.persist !== false;
   const persistRef = useRef(persist);
-  /** Page zoom. `zoomRef` leads the prop so rapid zoom keys step from the
-   * in-flight target; the prop only overwrites it when it changes. */
-  const zoomProp = file.browser.zoom ?? 1;
-  const zoomRef = useRef(zoomProp);
-  const zoomPropRef = useRef(zoomProp);
-  if (zoomPropRef.current !== zoomProp) {
-    zoomPropRef.current = zoomProp;
-    zoomRef.current = zoomProp;
-  }
+
   const favorites = useSyncExternalStore(
     subscribeBrowserFavorites,
     browserFavorites,
@@ -346,44 +340,6 @@ export function BrowserView({
     void browserReload(label).catch(() => undefined);
   }, [label, armWatchdog]);
 
-  const applyZoom = useCallback(
-    (next: number) => {
-      // Optimistic: rapid presses step from the target; a failed apply
-      // rolls back to the last committed value.
-      zoomRef.current = next;
-      void browserSetZoom(label, next)
-        .then((applied) => {
-          zoomRef.current = applied;
-          onMetaChangeRef.current?.({ zoom: applied });
-        })
-        .catch(() => {
-          zoomRef.current = zoomPropRef.current;
-        });
-    },
-    [label],
-  );
-
-  const stepZoom = useCallback(
-    (dir: 1 | -1) => {
-      const current = zoomRef.current;
-      let next: number | undefined;
-      if (dir > 0) {
-        next = ZOOM_STEPS.find((step) => step > current + 0.001);
-      } else {
-        for (let i = ZOOM_STEPS.length - 1; i >= 0; i--) {
-          if (ZOOM_STEPS[i] < current - 0.001) {
-            next = ZOOM_STEPS[i];
-            break;
-          }
-        }
-      }
-      applyZoom(
-        next ?? (dir > 0 ? ZOOM_STEPS[ZOOM_STEPS.length - 1] : ZOOM_STEPS[0]),
-      );
-    },
-    [applyZoom],
-  );
-
   const runFind = useCallback(
     (query: string, forward = true) => {
       void browserFind(label, query, forward)
@@ -483,7 +439,6 @@ export function BrowserView({
 
   const onMenuPick = useCallback(
     (id: string) => {
-      setMenuAt(null);
       switch (id) {
         case "find":
           openFind();
@@ -498,15 +453,6 @@ export function BrowserView({
             .then(() => showNotice("Screenshot copied"))
             .catch(noticeError);
           break;
-        case "zoom-in":
-          stepZoom(1);
-          break;
-        case "zoom-out":
-          stepZoom(-1);
-          break;
-        case "zoom-reset":
-          applyZoom(1);
-          break;
         case "devtools":
           void browserDevtools(label).catch(noticeError);
           break;
@@ -519,7 +465,7 @@ export function BrowserView({
           break;
       }
     },
-    [label, persist, stepZoom, applyZoom, clearSiteData, openFind, showNotice, noticeError],
+    [label, persist, clearSiteData, openFind, showNotice, noticeError],
   );
 
   // Menu accelerators and the App key handler route browser commands here
@@ -539,15 +485,6 @@ export function BrowserView({
         case "find":
           openFind();
           break;
-        case "zoom-in":
-          stepZoom(1);
-          break;
-        case "zoom-out":
-          stepZoom(-1);
-          break;
-        case "zoom-reset":
-          applyZoom(1);
-          break;
         case "devtools":
           void browserDevtools(label).catch(() => undefined);
           break;
@@ -555,7 +492,7 @@ export function BrowserView({
     };
     window.addEventListener(BROWSER_COMMAND_EVENT, onCommand);
     return () => window.removeEventListener(BROWSER_COMMAND_EVENT, onCommand);
-  }, [label, reloadPage, stepZoom, applyZoom, openFind]);
+  }, [label, reloadPage, openFind]);
 
   // The recording chip's elapsed timer — only ticks while a session runs.
   useEffect(() => {
@@ -759,9 +696,6 @@ export function BrowserView({
           boundsRef.current = bounds;
           setOpened(true);
           setStatus("loading");
-          if (zoomRef.current !== 1) {
-            void browserSetZoom(label, zoomRef.current).catch(() => undefined);
-          }
           armWatchdog(url);
         } catch (error) {
           if (!alive) return;
@@ -978,55 +912,64 @@ export function BrowserView({
 
   const wsl = wslLocation(file.cwd);
   const showChrome = !!url;
-  const zoomPct = Math.round((file.browser.zoom ?? 1) * 100);
-  const menuItems: ExplorerMenuItem[] = [
-    { kind: "item", id: "find", label: "Find in Page", shortcut: `${MOD}F`, disabled: !opened },
-    { kind: "item", id: "copy-url", label: "Copy URL", disabled: !current },
-    {
-      kind: "item",
-      id: "copy-shot",
-      label: "Copy Screenshot",
-      disabled: !opened,
+  // The overflow menu is a native popup: a DOM menu would paint under the
+  // native webview and force the overlay watcher to blank the page while
+  // it's open — the native menu floats above it instead.
+  const openMenu = useCallback(
+    (anchor: { left: number; bottom: number }) => {
+      void (async () => {
+        const spec: (
+          | { sep: true }
+          | { id: string; text: string; enabled?: boolean; checked?: boolean; accel?: string }
+        )[] = [
+          { id: "find", text: "Find in Page", accel: "CmdOrCtrl+F", enabled: opened },
+          { id: "copy-url", text: "Copy URL", enabled: !!current },
+          { id: "copy-shot", text: "Copy Screenshot", enabled: opened },
+          { sep: true },
+          {
+            id: "devtools",
+            text: "Developer Tools",
+            accel: "CmdOrCtrl+Alt+I",
+            enabled: opened,
+          },
+          // Forget site data when this tab closes — the page reloads.
+          { id: "private", text: "Private Tab", checked: !persist },
+          { sep: true },
+          {
+            id: "clear-data",
+            text: "Clear Saved Site Data…",
+            enabled: persist,
+          },
+        ];
+        const items = await Promise.all(
+          spec.map((entry) => {
+            if ("sep" in entry)
+              return PredefinedMenuItem.new({ item: "Separator" });
+            const base = {
+              id: `browser-${entry.id}`,
+              text: entry.text,
+              enabled: entry.enabled !== false,
+              accelerator: entry.accel,
+              action: () => onMenuPick(entry.id),
+            };
+            return entry.checked === undefined
+              ? MenuItem.new(base)
+              : CheckMenuItem.new({ ...base, checked: entry.checked });
+          }),
+        );
+        const menu = await Menu.new({ items });
+        setMenuOpen(true);
+        try {
+          await menu.popup(
+            new LogicalPosition(anchor.left, anchor.bottom + 4),
+          );
+        } finally {
+          setMenuOpen(false);
+        }
+      })().catch(noticeError);
     },
-    { kind: "sep" },
-    {
-      kind: "item",
-      id: "zoom-in",
-      label: "Zoom In",
-      description: zoomPct === 100 ? undefined : `Currently ${zoomPct}%`,
-      disabled: !opened,
-    },
-    { kind: "item", id: "zoom-out", label: "Zoom Out", disabled: !opened },
-    {
-      kind: "item",
-      id: "zoom-reset",
-      label: "Reset Zoom",
-      disabled: !opened || zoomPct === 100,
-    },
-    { kind: "sep" },
-    {
-      kind: "item",
-      id: "devtools",
-      label: "Developer Tools",
-      shortcut: `${MOD}${ALT}I`,
-      disabled: !opened,
-    },
-    {
-      kind: "item",
-      id: "private",
-      label: "Private Tab",
-      checked: !persist,
-      description: "Forget site data when this tab closes — the page reloads",
-    },
-    { kind: "sep" },
-    {
-      kind: "item",
-      id: "clear-data",
-      label: "Clear Saved Site Data…",
-      danger: true,
-      disabled: !persist,
-    },
-  ];
+    [opened, current, persist, onMenuPick, noticeError],
+  );
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
@@ -1150,18 +1093,12 @@ export function BrowserView({
           </ToolbarButton>
           <ToolbarButton
             title="More actions"
-            pressed={menuAt != null}
+            pressed={menuOpen}
             aria-haspopup="menu"
-            aria-expanded={menuAt != null}
-            data-browser-menu-trigger
-            onClick={(event) => {
-              // The menu ignores pointerdowns on this button, so the click
-              // toggles rather than dismiss-then-reopen.
-              const rect = event.currentTarget.getBoundingClientRect();
-              setMenuAt((at) =>
-                at ? null : { x: rect.left, y: rect.bottom + 4 },
-              );
-            }}
+            aria-expanded={menuOpen}
+            onClick={(event) =>
+              openMenu(event.currentTarget.getBoundingClientRect())
+            }
           >
             <MoreHorizontal className="size-3.5" strokeWidth={1.75} />
           </ToolbarButton>
@@ -1334,17 +1271,7 @@ export function BrowserView({
           </div>
         ) : null}
       </div>
-      {menuAt ? (
-        <ExplorerMenu
-          x={menuAt.x}
-          y={menuAt.y}
-          items={menuItems}
-          ariaLabel="Browser actions"
-          ignore="[data-browser-menu-trigger]"
-          onPick={onMenuPick}
-          onClose={() => setMenuAt(null)}
-        />
-      ) : null}
+
     </div>
   );
 }

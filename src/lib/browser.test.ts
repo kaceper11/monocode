@@ -322,28 +322,17 @@ describe("browser tabs in the layout", () => {
     ).toBeUndefined();
   });
 
-  it("updateBrowserTab stores zoom and persist, and drops a reset zoom", () => {
+  it("updateBrowserTab stores the private flag and keeps it through later patches", () => {
     const browser = { ...newBrowserTab("/repo", "http://localhost:3000/"), id: "b1" };
     const tab = {
       ...newTab("s1"),
       editorPanes: [{ id: "p1", files: [browser], activeFileId: "b1" }],
     };
-    let next = updateBrowserTab(tab, "b1", { zoom: 1.25 });
+    let next = updateBrowserTab(tab, "b1", { persist: false });
     let entry = next.editorPanes[0].files[0];
-    expect(entry.browser?.zoom).toBe(1.25);
-
-    next = updateBrowserTab(next, "b1", { persist: false });
-    entry = next.editorPanes[0].files[0];
-    expect(entry.browser?.persist).toBe(false);
-    expect(entry.browser?.zoom).toBe(1.25);
-
-    // Zooming back to 1 returns the field to the absent default.
-    next = updateBrowserTab(next, "b1", { zoom: 1 });
-    entry = next.editorPanes[0].files[0];
-    expect(entry.browser?.zoom).toBeUndefined();
     expect(entry.browser?.persist).toBe(false);
 
-    // A title patch keeps both flags.
+    // A title patch keeps the flag.
     next = updateBrowserTab(next, "b1", { title: "App" });
     entry = next.editorPanes[0].files[0];
     expect(entry.browser?.persist).toBe(false);
@@ -390,12 +379,12 @@ describe("browser command requests", () => {
     };
     window.addEventListener("monocode:browser-command", onEvent);
     try {
-      requestBrowserCommand("browser-1", "zoom-in");
+      requestBrowserCommand("browser-1", "find");
       requestBrowserCommand("browser-2", "devtools");
     } finally {
       window.removeEventListener("monocode:browser-command", onEvent);
     }
-    expect(seen).toEqual(["browser-1:zoom-in", "browser-2:devtools"]);
+    expect(seen).toEqual(["browser-1:find", "browser-2:devtools"]);
   });
 
   it("rejects non-command events", () => {
@@ -468,7 +457,7 @@ describe("browser tabs in the workspace snapshot", () => {
     expect(files?.[1].browser?.expanded).toBeUndefined();
   });
 
-  it("round-trips zoom and the private flag, sanitizing bad values", () => {
+  it("round-trips the private flag, sanitizing bad values", () => {
     const parsed = parseWorkspaceSnapshot(
       snapshotWith([
         {
@@ -477,7 +466,6 @@ describe("browser tabs in the workspace snapshot", () => {
           cwd: "/repo",
           browser: {
             url: "http://localhost:3000/",
-            zoom: 1.5,
             persist: false,
           },
         },
@@ -485,24 +473,14 @@ describe("browser tabs in the workspace snapshot", () => {
           id: "b2",
           path: "http://localhost:4000/",
           cwd: "/repo",
-          browser: { url: "http://localhost:4000/", zoom: 99, persist: "no" },
-        },
-        {
-          id: "b3",
-          path: "http://localhost:5000/",
-          cwd: "/repo",
-          browser: { url: "http://localhost:5000/", zoom: 1 },
+          browser: { url: "http://localhost:4000/", persist: "no" },
         },
       ]),
     );
     const files = parsed?.tabs[0].editorPanes[0].files;
-    expect(files?.[0].browser?.zoom).toBe(1.5);
     expect(files?.[0].browser?.persist).toBe(false);
-    // Out-of-range zoom and a non-boolean persist fall back to defaults.
-    expect(files?.[1].browser?.zoom).toBeUndefined();
+    // A non-boolean persist falls back to the persistent default.
     expect(files?.[1].browser?.persist).toBeUndefined();
-    // Zoom of exactly 1 is the default — not stored.
-    expect(files?.[2].browser?.zoom).toBeUndefined();
   });
 
   it.each([
