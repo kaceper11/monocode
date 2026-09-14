@@ -620,19 +620,30 @@ fn app_origin<R: Runtime>(window: &Window<R>) -> Option<String> {
 #[cfg(target_os = "macos")]
 const BROWSER_STORE_ID: [u8; 16] = *b"monocode-browser";
 
+/// macOS major version, queried once — feature gates below.
+#[cfg(target_os = "macos")]
+fn os_major() -> isize {
+    use objc2_foundation::NSProcessInfo;
+    static VERSION: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| {
+        NSProcessInfo::processInfo()
+            .operatingSystemVersion()
+            .majorVersion
+    })
+}
+
 /// `data_store_identifier` needs macOS 14; below it a persisted tab falls
 /// back to the default (shared) data store, which still persists but must
 /// never be cleared from here — it holds the app's own storage too.
 #[cfg(target_os = "macos")]
 fn dedicated_store_supported() -> bool {
-    use objc2_foundation::NSProcessInfo;
-    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        NSProcessInfo::processInfo()
-            .operatingSystemVersion()
-            .majorVersion
-            >= 14
-    })
+    os_major() >= 14
+}
+
+/// `WKWebView.pageZoom` (what wry's `set_zoom` calls) needs macOS 11.
+#[cfg(target_os = "macos")]
+fn page_zoom_supported() -> bool {
+    os_major() >= 11
 }
 
 /// Run an eval whose JSON return value is needed. Async like
@@ -758,6 +769,8 @@ pub async fn browser_open(
     let download_window = window_label.clone();
     let download_label = label.clone();
 
+    // `mut` only where a data store gets configured — mobile never does.
+    #[allow(unused_mut)]
     let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed.clone()))
         // Persisted tabs keep cookies/site data in the browser profile so
         // dev logins survive webview recreation and app restarts; a tab
@@ -903,28 +916,37 @@ pub async fn browser_open(
 
     // A persisted tab needs its own data store, not the app shell's:
     // WebView2/WebKitGTK take a data directory; WKWebView takes a named
-    // store (macOS 14+). On older macOS the tab still persists — via the
-    // default store — but `browser_clear_data` stays unavailable because
-    // that store also holds the app's own localStorage.
-    #[cfg(not(target_os = "macos"))]
-    let dedicated = persist;
-    #[cfg(not(target_os = "macos"))]
-    if persist {
-        if let Ok(dir) = app
-            .path()
-            .app_local_data_dir()
-            .map(|dir| dir.join("browser"))
-        {
-            let _ = std::fs::create_dir_all(&dir);
-            builder = builder.data_directory(dir);
+    // store (macOS 14+). `dedicated` must only be set when that store was
+    // actually applied — `browser_clear_data` trusts the flag, and the
+    // fallback (default store/shared WebContext) also holds the app's own
+    // storage. (On old WebView2 runtimes wry silently ignores `incognito`,
+    // so a "private" tab may still persist — never promise otherwise.)
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+    let dedicated = {
+        let mut applied = false;
+        if persist {
+            if let Ok(dir) = app
+                .path()
+                .app_local_data_dir()
+                .map(|dir| dir.join("browser"))
+            {
+                let _ = std::fs::create_dir_all(&dir);
+                builder = builder.data_directory(dir);
+                applied = true;
+            }
         }
-    }
+        applied
+    };
     #[cfg(target_os = "macos")]
     let dedicated = persist && dedicated_store_supported();
     #[cfg(target_os = "macos")]
     if dedicated {
         builder = builder.data_store_identifier(BROWSER_STORE_ID);
     }
+    // Mobile: no dedicated store exists — `incognito` still applies, but
+    // there is nothing `browser_clear_data` may safely wipe.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    let dedicated = false;
     {
         let state = app.state::<BrowserState>();
         let mut dedicated_keys = state.dedicated.lock().unwrap();
@@ -1047,24 +1069,16 @@ pub async fn browser_set_recording(
     on: bool,
 ) -> Result<bool, String> {
     let view = find_webview(&window, &label)?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    view.eval_with_callback(
+    let raw = eval_json(
+        &view,
         format!(
             "!!(window.__monocodeSetRec && (window.__monocodeSetRec({}), true))",
             if on { "true" } else { "false" }
         ),
-        move |result| {
-            let _ = tx.send(result);
-        },
     )
-    .map_err(|error| error.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        rx.recv_timeout(PROBE_TIMEOUT)
-            .map_err(|_| "Recording toggle timed out".to_string())
-    })
     .await
-    .map_err(|error| error.to_string())?
-    .map(|result| result.trim() == "true")
+    .map_err(|_| "Recording toggle timed out".to_string())?;
+    Ok(raw.trim() == "true")
 }
 
 /// Read the live location so the tab can tell "never loaded" apart from a
@@ -1077,20 +1091,12 @@ pub async fn browser_set_recording(
 #[tauri::command]
 pub async fn browser_probe(window: Window, label: String) -> Result<String, String> {
     let view = find_webview(&window, &label)?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    view.eval_with_callback(
-        "({href:location.href,title:document.title,readyState:document.readyState})",
-        move |result| {
-            let _ = tx.send(result);
-        },
+    eval_json(
+        &view,
+        "({href:location.href,title:document.title,readyState:document.readyState})".to_string(),
     )
-    .map_err(|error| error.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        rx.recv_timeout(PROBE_TIMEOUT)
-            .map_err(|_| "Probe timed out".to_string())
-    })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|_| "Probe timed out".to_string())
 }
 
 #[derive(Serialize)]
@@ -1466,6 +1472,16 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
 // and reported but never filled — a one-time code is for the user to
 // type. Nothing is submitted unless the profile opts in.
 const LOGIN_FORM_SCRIPT: &str = r#"(arg) => {
+  // The real origin gate lives here: a navigation that committed after
+  // the command read the location must not receive stored credentials —
+  // this check runs in the same synchronous eval as the fill.
+  if (
+    arg &&
+    arg.expectedOrigin &&
+    location.origin !== arg.expectedOrigin
+  ) {
+    return { aborted: true };
+  }
   const CAP = 400;
   const fields = [];
   const buttons = [];
@@ -1473,6 +1489,16 @@ const LOGIN_FORM_SCRIPT: &str = r#"(arg) => {
   const REMEMBER_RE = /remember|stay|keep.?me|trust|signed/i;
   const OTP_RE = /otp|one.?time|2fa|mfa|totp|verif|passcode|security.?code/i;
   const NEXT_RE = /^(next|continue|sign ?in|log ?in|submit|proceed|verify|go)$/i;
+
+  // Lone surrogates are unpaired UTF-16 — they pass through JSON but kill
+  // the native JSON serializer on the way back (wry unwraps it).
+  const clean = (s) =>
+    Array.from(String(s))
+      .filter((c) => {
+        const n = c.codePointAt(0);
+        return n < 0xd800 || n > 0xdfff;
+      })
+      .join("");
 
   const visible = (el) => {
     try {
@@ -1495,7 +1521,7 @@ const LOGIN_FORM_SCRIPT: &str = r#"(arg) => {
         (tag === "input" && (type === "button" || type === "submit") ? el.value : "") ||
         (tag === "button" ? (el.innerText || "").trim() : "") ||
         el.id || "";
-      text = String(text).trim().replace(/\s+/g, " ").slice(0, 80);
+      text = clean(String(text).trim().replace(/\s+/g, " ").slice(0, 80));
       const name = tag === "input" && type && type !== "text" ? "input[" + type + "]" : tag;
       return text ? name + ' "' + text + '"' : name;
     } catch (e) {
@@ -1514,10 +1540,14 @@ const LOGIN_FORM_SCRIPT: &str = r#"(arg) => {
       el.getAttribute("aria-label") || "",
       ac,
     ].join(" ");
-    if (type === "password" || ac === "current-password" || ac === "new-password")
-      return "password";
-    if (ac === "one-time-code" || (type !== "password" && OTP_RE.test(hint)))
-      return "otp";
+    // OTP before password: type=password + autocomplete=one-time-code is
+    // a common 2FA shape — the account password must never land there.
+    // An explicit current/new-password hint outranks name guesses like
+    // "passcode"; a bare type=password with OTP-ish hints stays out.
+    if (ac === "one-time-code") return "otp";
+    if (ac === "current-password" || ac === "new-password") return "password";
+    if (type === "password") return OTP_RE.test(hint) ? "otp" : "password";
+    if (OTP_RE.test(hint)) return "otp";
     if (type === "checkbox") return REMEMBER_RE.test(hint) ? "remember" : null;
     if (ac === "username" || ac === "email") return "identity";
     if (type === "email" || type === "tel") return "identity";
@@ -1573,8 +1603,11 @@ const LOGIN_FORM_SCRIPT: &str = r#"(arg) => {
 
   if ((arg && arg.mode) === "capture") {
     return {
-      identity: identity ? String(identity.el.value || "") : "",
-      password: password ? String(password.el.value || "") : "",
+      // href read in the same eval as the values — the pair can't drift
+      // across a navigation.
+      href: location.href,
+      identity: identity ? clean(identity.el.value || "") : "",
+      password: password ? clean(password.el.value || "") : "",
       otp,
     };
   }
@@ -1582,27 +1615,26 @@ const LOGIN_FORM_SCRIPT: &str = r#"(arg) => {
   const result = { filled: [], missing: [], otpRequired: otp, submitted: false };
   const setVal = (el, v) => {
     try {
-      const proto =
-        el instanceof HTMLTextAreaElement
-          ? HTMLTextAreaElement.prototype
-          : el instanceof HTMLSelectElement
-            ? HTMLSelectElement.prototype
-            : HTMLInputElement.prototype;
-      const desc = Object.getOwnPropertyDescriptor(proto, "value");
+      // getPrototypeOf resolves the element's own realm — instanceof
+      // against the top realm fails inside same-origin iframes, and the
+      // wrong setter then throws a WebIDL receiver error.
+      const proto = Object.getPrototypeOf(el);
+      const desc = proto && Object.getOwnPropertyDescriptor(proto, "value");
       if (desc && desc.set) desc.set.call(el, v);
       else el.value = v;
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
-    } catch (e) {}
+      return el.value === v;
+    } catch (e) {
+      return false;
+    }
   };
   if (!identity) result.missing.push("username");
   if (!password) result.missing.push("password");
-  if (identity && arg.username) {
-    setVal(identity.el, arg.username);
+  if (identity && arg.username && setVal(identity.el, arg.username)) {
     result.filled.push(label(identity.el));
   }
-  if (password && arg.password) {
-    setVal(password.el, arg.password);
+  if (password && arg.password && setVal(password.el, arg.password)) {
     result.filled.push(label(password.el));
   }
   if (arg.rememberMe) {
@@ -1675,7 +1707,10 @@ const FIND_SCRIPT: &str = r#"(arg) => {
       NodeFilter.SHOW_TEXT,
     );
     let node;
-    while ((node = walker.nextNode())) {
+    // Matches are capped at 200; the walk itself needs a budget too —
+    // a huge DOM with few matches would otherwise blow the eval timeout.
+    let walked = 0;
+    while ((node = walker.nextNode()) && walked++ < 20000) {
       if (matches.length >= 200) break;
       const parent = node.parentElement;
       if (!parent || parent.closest("script,style,noscript,iframe")) continue;
@@ -1727,6 +1762,12 @@ const FIND_SCRIPT: &str = r#"(arg) => {
 
 #[tauri::command]
 pub fn browser_set_zoom(window: Window, label: String, scale: f64) -> Result<f64, String> {
+    // wry calls WKWebView.pageZoom ungated — it needs macOS 11, and an
+    // unrecognized selector aborts on the spot.
+    #[cfg(target_os = "macos")]
+    if !page_zoom_supported() {
+        return Err("Page zoom needs macOS 11 or later".into());
+    }
     let zoom = if scale.is_finite() {
         scale.clamp(0.25, 5.0)
     } else {
@@ -1752,7 +1793,10 @@ pub fn browser_devtools(window: Window, label: String, open: Option<bool>) -> Re
     } else {
         view.close_devtools();
     }
-    Ok(view.is_devtools_open())
+    // Report the requested state, not a re-query: WebView2's
+    // `is_devtools_open` is hardcoded false (close is a no-op too), and
+    // WKWebView's inspector visibility is async right after show.
+    Ok(next)
 }
 
 /// Clear the browser profile's site data (cookies, storage). Only a tab
@@ -1793,6 +1837,9 @@ pub async fn browser_copy_screenshot(
     .await
     .map_err(|error| error.to_string())?
     .ok_or_else(|| "Screenshot unavailable".to_string())?;
+    if png.len() > MAX_SCREENSHOT_BYTES {
+        return Err("Screenshot too large to copy".into());
+    }
     let image = tauri::image::Image::from_bytes(&png).map_err(|error| error.to_string())?;
     use tauri_plugin_clipboard_manager::ClipboardExt;
     app.clipboard()
@@ -1821,6 +1868,10 @@ pub async fn browser_find(
         "query": query.chars().take(200).collect::<String>(),
         "forward": forward.unwrap_or(true),
     });
+    let arg = serde_json::to_string(&arg)
+        .map_err(|error| error.to_string())?
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
     let raw = eval_json(&view, format!("({FIND_SCRIPT})({arg})")).await?;
     #[derive(Deserialize)]
     struct PageFind {
@@ -1831,9 +1882,11 @@ pub async fn browser_find(
         count: None,
         index: None,
     });
+    let count = parsed.count.unwrap_or(0).min(200);
     Ok(BrowserFindResult {
-        count: parsed.count.unwrap_or(0).min(200),
-        index: parsed.index.unwrap_or(-1),
+        count,
+        // Page-controlled value — clamp to the reported range.
+        index: parsed.index.unwrap_or(-1).clamp(-1, count as i32 - 1),
     })
 }
 
@@ -1866,6 +1919,11 @@ pub fn browser_login_delete(app: AppHandle, id: String) -> Result<(), String> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CapturedLogin {
+    /// `location.href` read in the same eval as the values — the pair
+    /// can't drift across a navigation. `view.url()` is avoided entirely:
+    /// wry unwraps WKWebView.URL, which is nil before the first commit
+    /// (a refused dev server would abort the process on the spot).
+    href: Option<String>,
     identity: Option<String>,
     password: Option<String>,
 }
@@ -1879,8 +1937,6 @@ pub async fn browser_capture_login(
     label: String,
 ) -> Result<browser_logins::LoginMeta, String> {
     let view = find_webview(&window, &label)?;
-    let url = view.url().map_err(|error| error.to_string())?;
-    let origin = browser_logins::normalize_origin(url.as_str())?;
     let raw = eval_json(
         &view,
         format!("({LOGIN_FORM_SCRIPT})({{\"mode\":\"capture\"}})"),
@@ -1888,6 +1944,7 @@ pub async fn browser_capture_login(
     .await?;
     let captured: CapturedLogin =
         serde_json::from_str(&raw).map_err(|_| "Couldn't read the login form".to_string())?;
+    let origin = browser_logins::normalize_origin(&captured.href.unwrap_or_default())?;
     browser_logins::upsert_credentials(
         &app,
         &origin,
@@ -1908,6 +1965,9 @@ pub struct BrowserFillResult {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PageFillResult {
+    /// In-script origin gate tripped — the page moved between the
+    /// location read and the fill eval.
+    aborted: Option<bool>,
     filled: Option<Vec<serde_json::Value>>,
     missing: Option<Vec<serde_json::Value>>,
     otp_required: Option<bool>,
@@ -1915,7 +1975,8 @@ struct PageFillResult {
 }
 
 /// Fill a saved login into the current page. The page's live origin must
-/// match the profile's — a redirect can never steer credentials into a
+/// match the profile's — checked here, then re-checked inside the fill
+/// eval itself so a navigation in the gap can't steer credentials into a
 /// different site. The password reaches only the eval script, never the
 /// frontend.
 #[tauri::command]
@@ -1926,8 +1987,11 @@ pub async fn browser_fill_login(
     profile_id: Option<String>,
 ) -> Result<BrowserFillResult, String> {
     let view = find_webview(&window, &label)?;
-    let url = view.url().map_err(|error| error.to_string())?;
-    let origin = browser_logins::normalize_origin(url.as_str())?;
+    // location.href via eval — view.url() aborts the process on WKWebView
+    // before the first commit (URL is nil there).
+    let raw = eval_json(&view, "location.href".to_string()).await?;
+    let href: String = serde_json::from_str(&raw).unwrap_or_default();
+    let origin = browser_logins::normalize_origin(&href)?;
     let profile = match profile_id {
         Some(id) => browser_logins::get(&app, &id)
             .ok_or_else(|| "That login no longer exists".to_string())?,
@@ -1942,6 +2006,7 @@ pub async fn browser_fill_login(
     }
     let arg = serde_json::json!({
         "mode": "fill",
+        "expectedOrigin": origin,
         "username": profile.username,
         "password": profile.password,
         "submit": profile.submit,
@@ -1956,6 +2021,9 @@ pub async fn browser_fill_login(
     let raw = eval_json(&view, format!("({LOGIN_FORM_SCRIPT})({arg})")).await?;
     let parsed: PageFillResult =
         serde_json::from_str(&raw).map_err(|_| "Fill didn't report".to_string())?;
+    if parsed.aborted.unwrap_or(false) {
+        return Err("The page navigated — try again".into());
+    }
     let strings = |values: Option<Vec<serde_json::Value>>| -> Vec<String> {
         values
             .unwrap_or_default()

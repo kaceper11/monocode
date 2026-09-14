@@ -284,6 +284,10 @@ mod tests {
         assert!(normalize_origin("file:///etc/passwd").is_err());
         assert!(normalize_origin("javascript:alert(1)").is_err());
         assert!(normalize_origin("https://user:pass@host/x").is_err());
+        // location.href on an unloaded or srcdoc page — capture must not
+        // mint a profile for it.
+        assert!(normalize_origin("about:blank").is_err());
+        assert!(normalize_origin("data:text/html,<p>x</p>").is_err());
     }
 
     #[test]

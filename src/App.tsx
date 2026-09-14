@@ -8075,7 +8075,7 @@ export default function App({
     );
     if (!tab || tab.diffFocused) return null;
     const file = focusedFileTab(tab);
-    return file?.browser ? `browser-${file.id}` : null;
+    return file?.browser?.url ? `browser-${file.id}` : null;
   };
 
   useEffect(() => {

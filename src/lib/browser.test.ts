@@ -350,6 +350,29 @@ describe("browser tabs in the layout", () => {
     expect(entry.browser?.title).toBe("App");
   });
 
+  it("updateBrowserTab keeps the url on an empty patch and normalizes persist:true", () => {
+    const browser = { ...newBrowserTab("/repo", "http://localhost:3000/"), id: "b1" };
+    const tab = {
+      ...newTab("s1"),
+      editorPanes: [{ id: "p1", files: [browser], activeFileId: "b1" }],
+    };
+    // An empty url must not blank the tab or its file path — transient
+    // page events can report one during a load handoff.
+    let next = updateBrowserTab(tab, "b1", { url: "", title: "Loading" });
+    let entry = next.editorPanes[0].files[0];
+    expect(entry.browser?.url).toBe("http://localhost:3000/");
+    expect(entry.path).toBe("http://localhost:3000/");
+    expect(entry.browser?.title).toBe("Loading");
+
+    // persist is the default — a true patch must not serialize it.
+    next = updateBrowserTab(next, "b1", { persist: false });
+    entry = next.editorPanes[0].files[0];
+    expect(entry.browser?.persist).toBe(false);
+    next = updateBrowserTab(next, "b1", { persist: true });
+    entry = next.editorPanes[0].files[0];
+    expect(entry.browser?.persist).toBeUndefined();
+  });
+
   it("newBrowserTab marks a private tab", () => {
     const file = newBrowserTab("/repo", "http://localhost:3000/", false);
     expect(file.browser?.persist).toBe(false);

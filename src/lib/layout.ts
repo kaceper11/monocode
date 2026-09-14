@@ -305,11 +305,11 @@ export function updateBrowserTab(
         return file;
       paneChanged = true;
       const browser: BrowserTabSource = {
-        url: url ?? file.browser.url,
+        url: url || file.browser.url,
         ...(title ? { title } : {}),
         ...(expanded ? { expanded: true } : {}),
         ...(zoom ? { zoom } : {}),
-        ...(persist !== undefined ? { persist } : {}),
+        ...(persist === false ? { persist: false } : {}),
       };
       return { ...file, ...(url ? { path: url } : {}), browser };
     });

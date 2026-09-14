@@ -10,10 +10,10 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  type ComponentPropsWithoutRef,
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
-  type MouseEvent as ReactMouseEvent,
-  type ReactNode,
+  type Ref,
 } from "react";
 import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, CircleDot, ExternalLink, EyeOff, Globe, KeyRound, ListBullet, Maximize2, Minimize2, MoreHorizontal, Pencil, RefreshCw, Search, Star, Trash2, X } from "../chrome/icons";
 import { ExplorerMenu, type ExplorerMenuItem } from "../chrome/ExplorerMenu";
@@ -213,15 +213,22 @@ export function BrowserView({
   const [logins, setLogins] = useState<BrowserLoginMeta[]>([]);
   const [menuAt, setMenuAt] = useState<{ x: number; y: number } | null>(null);
   const urlInputRef = useRef<HTMLInputElement>(null);
+  const findInputRef = useRef<HTMLInputElement>(null);
   const findTimerRef = useRef<number | null>(null);
   /** Latest find query for the page-event subscription. */
   const findQueryRef = useRef("");
   /** Storage mode the live webview was created with. */
   const persist = file.browser.persist !== false;
   const persistRef = useRef(persist);
-  /** Page zoom — mirrored so command handlers don't read stale props. */
-  const zoomRef = useRef(file.browser.zoom ?? 1);
-  zoomRef.current = file.browser.zoom ?? 1;
+  /** Page zoom. `zoomRef` leads the prop so rapid zoom keys step from the
+   * in-flight target; the prop only overwrites it when it changes. */
+  const zoomProp = file.browser.zoom ?? 1;
+  const zoomRef = useRef(zoomProp);
+  const zoomPropRef = useRef(zoomProp);
+  if (zoomPropRef.current !== zoomProp) {
+    zoomPropRef.current = zoomProp;
+    zoomRef.current = zoomProp;
+  }
   const favorites = useSyncExternalStore(
     subscribeBrowserFavorites,
     browserFavorites,
@@ -232,6 +239,20 @@ export function BrowserView({
     if (watchdogRef.current != null) window.clearTimeout(watchdogRef.current);
     watchdogRef.current = null;
   }, []);
+
+  /** One message row, newest status wins: a fresh notice replaces a
+   * blocked popup/download banner, and a new banner replaces the notice. */
+  const showNotice = useCallback((message: string) => {
+    setPopup(null);
+    setDownload(null);
+    setNotice(message);
+  }, []);
+
+  const noticeError = useCallback(
+    (error: unknown) =>
+      showNotice(error instanceof Error ? error.message : String(error)),
+    [showNotice],
+  );
 
   /**
    * WKWebView keeps a refused connection visually blank and emits no event —
@@ -262,18 +283,19 @@ export function BrowserView({
             }
             if (probe.href === target) {
               if (attempt >= WATCHDOG_MAX_ATTEMPTS) {
-                setNotice("Still loading…");
+                showNotice("Still loading…");
                 return;
               }
               armWatchdog(target, attempt + 1);
               return;
             }
             // The page never committed — whatever is still shown wins.
+            currentRef.current = probe.href;
             setCurrent(probe.href);
             setDraft(probe.href);
             if (openedRef.current) {
               setStatus("ready");
-              setNotice(`Couldn't load ${target}`);
+              showNotice(`Couldn't load ${target}`);
             } else {
               setStatus("failed");
               setFailure(`Couldn't load ${target}`);
@@ -283,7 +305,7 @@ export function BrowserView({
         attempt === 1 ? WATCHDOG_FIRST_MS : WATCHDOG_RETRY_MS,
       );
     },
-    [label],
+    [label, showNotice],
   );
 
   /** Stop the steps session; the page-side flag is the real gate, the
@@ -293,10 +315,10 @@ export function BrowserView({
       recordingRef.current = false;
       setRecording(false);
       setRecordStart(null);
-      if (message) setNotice(message);
+      if (message) showNotice(message);
       void browserSetRecording(label, false).catch(() => undefined);
     },
-    [label],
+    [label, showNotice],
   );
 
   const toggleRecording = useCallback(() => {
@@ -306,7 +328,7 @@ export function BrowserView({
         // No hook on this page (e.g. still on its first load) — starting
         // would show an indicator that records nothing.
         if (next && !applied) {
-          setNotice("Can't record steps on this page");
+          showNotice("Can't record steps on this page");
           return;
         }
         recordingRef.current = next;
@@ -315,10 +337,8 @@ export function BrowserView({
         setElapsed(0);
         if (next) setRecordedOnce(true);
       })
-      .catch((error) =>
-        setNotice(error instanceof Error ? error.message : String(error)),
-      );
-  }, [label]);
+      .catch(noticeError);
+  }, [label, showNotice, noticeError]);
 
   const reloadPage = useCallback(() => {
     setStatus("loading");
@@ -328,12 +348,17 @@ export function BrowserView({
 
   const applyZoom = useCallback(
     (next: number) => {
+      // Optimistic: rapid presses step from the target; a failed apply
+      // rolls back to the last committed value.
+      zoomRef.current = next;
       void browserSetZoom(label, next)
         .then((applied) => {
           zoomRef.current = applied;
           onMetaChangeRef.current?.({ zoom: applied });
         })
-        .catch(() => undefined);
+        .catch(() => {
+          zoomRef.current = zoomPropRef.current;
+        });
     },
     [label],
   );
@@ -341,13 +366,20 @@ export function BrowserView({
   const stepZoom = useCallback(
     (dir: 1 | -1) => {
       const current = zoomRef.current;
-      const next =
-        dir > 0
-          ? (ZOOM_STEPS.find((step) => step > current + 0.001) ??
-            ZOOM_STEPS[ZOOM_STEPS.length - 1])
-          : ([...ZOOM_STEPS].reverse().find((step) => step < current - 0.001) ??
-            ZOOM_STEPS[0]);
-      applyZoom(next);
+      let next: number | undefined;
+      if (dir > 0) {
+        next = ZOOM_STEPS.find((step) => step > current + 0.001);
+      } else {
+        for (let i = ZOOM_STEPS.length - 1; i >= 0; i--) {
+          if (ZOOM_STEPS[i] < current - 0.001) {
+            next = ZOOM_STEPS[i];
+            break;
+          }
+        }
+      }
+      applyZoom(
+        next ?? (dir > 0 ? ZOOM_STEPS[ZOOM_STEPS.length - 1] : ZOOM_STEPS[0]),
+      );
     },
     [applyZoom],
   );
@@ -361,9 +393,18 @@ export function BrowserView({
     [label],
   );
 
+  /** Opens the find bar (or refocuses it) — no-op on a URL-less tab. */
+  const openFind = useCallback(() => {
+    if (!currentRef.current) return;
+    setFindOpen(true);
+    findInputRef.current?.focus();
+  }, []);
+
   const closeFind = useCallback(() => {
     setFindOpen(false);
     setFindResult(null);
+    setFindQuery("");
+    findQueryRef.current = "";
     if (findTimerRef.current != null)
       window.clearTimeout(findTimerRef.current);
     findTimerRef.current = null;
@@ -382,23 +423,28 @@ export function BrowserView({
       .catch(() => setLogins([]));
   }, []);
 
+  // The bar tracks the page's origin — a cross-site navigation while it's
+  // open swaps the listed profiles, otherwise Fill would hit the backend's
+  // origin gate with stale entries.
+  useEffect(() => {
+    if (loginsOpen) refreshLogins();
+  }, [loginsOpen, current, refreshLogins]);
+
   const saveLogin = useCallback(() => {
     void browserCaptureLogin(label)
       .then((meta) => {
-        setNotice(`Saved ${meta.username} for ${meta.origin}`);
+        showNotice(`Saved ${meta.username} for ${meta.origin}`);
         refreshLogins();
       })
-      .catch((error) =>
-        setNotice(error instanceof Error ? error.message : String(error)),
-      );
-  }, [label, refreshLogins]);
+      .catch(noticeError);
+  }, [label, refreshLogins, showNotice, noticeError]);
 
   const fillLogin = useCallback(
     (profileId?: string) => {
       void browserFillLogin(label, profileId)
         .then((result) => {
           if (result.filled.length) {
-            setNotice(
+            showNotice(
               `Filled ${result.filled.join(" + ")}${
                 result.submitted
                   ? " — submitted"
@@ -408,16 +454,14 @@ export function BrowserView({
               }`,
             );
           } else if (result.missing.length) {
-            setNotice(`No ${result.missing.join(" or ")} field on this page`);
+            showNotice(`No ${result.missing.join(" or ")} field on this page`);
           } else {
-            setNotice("No matching fields on this page");
+            showNotice("No matching fields on this page");
           }
         })
-        .catch((error) =>
-          setNotice(error instanceof Error ? error.message : String(error)),
-        );
+        .catch(noticeError);
     },
-    [label],
+    [label, showNotice, noticeError],
   );
 
   const clearSiteData = useCallback(() => {
@@ -429,34 +473,30 @@ export function BrowserView({
       if (!ok) return;
       try {
         await browserClearData(label);
-        setNotice("Site data cleared");
+        showNotice("Site data cleared");
         reloadPage();
       } catch (error) {
-        setNotice(error instanceof Error ? error.message : String(error));
+        noticeError(error);
       }
     })();
-  }, [label, reloadPage]);
+  }, [label, reloadPage, showNotice, noticeError]);
 
   const onMenuPick = useCallback(
     (id: string) => {
       setMenuAt(null);
       switch (id) {
         case "find":
-          setFindOpen(true);
+          openFind();
           break;
         case "copy-url":
           void writeClipboardText(currentRef.current)
-            .then(() => setNotice("URL copied"))
-            .catch((error) =>
-              setNotice(error instanceof Error ? error.message : String(error)),
-            );
+            .then(() => showNotice("URL copied"))
+            .catch(noticeError);
           break;
         case "copy-shot":
           void browserCopyScreenshot(label)
-            .then(() => setNotice("Screenshot copied"))
-            .catch((error) =>
-              setNotice(error instanceof Error ? error.message : String(error)),
-            );
+            .then(() => showNotice("Screenshot copied"))
+            .catch(noticeError);
           break;
         case "zoom-in":
           stepZoom(1);
@@ -468,9 +508,7 @@ export function BrowserView({
           applyZoom(1);
           break;
         case "devtools":
-          void browserDevtools(label).catch((error) =>
-            setNotice(error instanceof Error ? error.message : String(error)),
-          );
+          void browserDevtools(label).catch(noticeError);
           break;
         case "private":
           // Recreates the webview on the other data store — the page reloads.
@@ -481,7 +519,7 @@ export function BrowserView({
           break;
       }
     },
-    [label, persist, stepZoom, applyZoom, clearSiteData],
+    [label, persist, stepZoom, applyZoom, clearSiteData, openFind, showNotice, noticeError],
   );
 
   // Menu accelerators and the App key handler route browser commands here
@@ -499,7 +537,7 @@ export function BrowserView({
           urlInputRef.current?.select();
           break;
         case "find":
-          setFindOpen(true);
+          openFind();
           break;
         case "zoom-in":
           stepZoom(1);
@@ -517,7 +555,7 @@ export function BrowserView({
     };
     window.addEventListener(BROWSER_COMMAND_EVENT, onCommand);
     return () => window.removeEventListener(BROWSER_COMMAND_EVENT, onCommand);
-  }, [label, reloadPage, stepZoom, applyZoom]);
+  }, [label, reloadPage, stepZoom, applyZoom, openFind]);
 
   // The recording chip's elapsed timer — only ticks while a session runs.
   useEffect(() => {
@@ -599,19 +637,30 @@ export function BrowserView({
           onMetaChangeRef.current?.({ title: event.title ?? "" });
           break;
         case "blocked":
-          setNotice(event.reason ?? "That link isn't allowed in Browser");
+          showNotice(event.reason ?? "That link isn't allowed in Browser");
           break;
         case "popup":
-          if (event.url) setPopup(event.url);
+          if (event.url) {
+            setNotice(null);
+            setDownload(null);
+            setPopup(event.url);
+          }
           break;
         case "download":
           // Denied by design — offer the system browser as the way out.
-          if (event.url && isHttpUrl(event.url)) setDownload(event.url);
-          else setNotice(event.reason ?? "Downloads are not allowed in Browser");
+          if (event.url && isHttpUrl(event.url)) {
+            setNotice(null);
+            setPopup(null);
+            setDownload(event.url);
+          } else {
+            showNotice(
+              event.reason ?? "Downloads are not allowed in Browser",
+            );
+          }
           break;
       }
     });
-  }, [label, armWatchdog, clearWatchdog, stopRecording, runFind]);
+  }, [label, armWatchdog, clearWatchdog, stopRecording, runFind, showNotice]);
 
   const wantShowRef = useRef(false);
   const bgRef = useRef<Rgba | undefined>(undefined);
@@ -699,7 +748,9 @@ export function BrowserView({
           bgRef.current = background;
           await browserOpen(label, url, bounds, background, persist);
           if (!alive) {
-            void browserClose(label).catch(() => undefined);
+            // Await the orphan close — a stale run must not drop a webview
+            // a fresh run is about to open under the same label.
+            await browserClose(label).catch(() => undefined);
             return;
           }
           persistRef.current = persist;
@@ -864,6 +915,7 @@ export function BrowserView({
       setDraft(normalized);
       setNotice(null);
       setPopup(null);
+      setDownload(null);
       if (!openedRef.current) {
         onMetaChangeRef.current?.({ url: normalized });
         return;
@@ -875,10 +927,10 @@ export function BrowserView({
         // overwrite this specific error with a generic one seconds later.
         clearWatchdog();
         setStatus("ready");
-        setNotice(error instanceof Error ? error.message : String(error));
+        noticeError(error);
       });
     },
-    [label, armWatchdog, clearWatchdog],
+    [label, armWatchdog, clearWatchdog, noticeError],
   );
 
   const onSubmitUrl = (event: FormEvent) => {
@@ -899,7 +951,7 @@ export function BrowserView({
         try {
           const capture = await browserCapture(label);
           if (includeSteps && !capture.steps.length) {
-            setNotice("No steps recorded — press the record button first");
+            showNotice("No steps recorded — press the record button first");
             return;
           }
           const context = browserAgentContext(
@@ -913,17 +965,15 @@ export function BrowserView({
             attachmentsOptional: true,
             requireDestinationSelection: true,
           });
-          if (capture.detail) setNotice(capture.detail);
+          if (capture.detail) showNotice(capture.detail);
         } catch (error) {
-          setNotice(
-            error instanceof Error ? error.message : String(error),
-          );
+          noticeError(error);
         } finally {
           setCapturing(false);
         }
       })();
     },
-    [capturing, label],
+    [capturing, label, showNotice, noticeError],
   );
 
   const wsl = wslLocation(file.cwd);
@@ -1067,11 +1117,7 @@ export function BrowserView({
           <ToolbarButton
             title="Open in system browser"
             disabled={!current}
-            onClick={() =>
-              void openUrl(current).catch((error) =>
-                setNotice(error instanceof Error ? error.message : String(error)),
-              )
-            }
+            onClick={() => void openUrl(current).catch(noticeError)}
           >
             <ExternalLink className="size-3.5" strokeWidth={1.75} />
           </ToolbarButton>
@@ -1098,21 +1144,23 @@ export function BrowserView({
             title="Logins — save or fill credentials for this site"
             pressed={loginsOpen}
             disabled={!opened && !current}
-            onClick={() => {
-              setLoginsOpen((open) => {
-                if (!open) refreshLogins();
-                return !open;
-              });
-            }}
+            onClick={() => setLoginsOpen((open) => !open)}
           >
             <KeyRound className="size-3.5" strokeWidth={1.75} />
           </ToolbarButton>
           <ToolbarButton
             title="More actions"
             pressed={menuAt != null}
+            aria-haspopup="menu"
+            aria-expanded={menuAt != null}
+            data-browser-menu-trigger
             onClick={(event) => {
+              // The menu ignores pointerdowns on this button, so the click
+              // toggles rather than dismiss-then-reopen.
               const rect = event.currentTarget.getBoundingClientRect();
-              setMenuAt({ x: rect.left, y: rect.bottom + 4 });
+              setMenuAt((at) =>
+                at ? null : { x: rect.left, y: rect.bottom + 4 },
+              );
             }}
           >
             <MoreHorizontal className="size-3.5" strokeWidth={1.75} />
@@ -1146,6 +1194,7 @@ export function BrowserView({
       ) : null}
       {showChrome && findOpen ? (
         <BrowserFindBar
+          ref={findInputRef}
           query={findQuery}
           result={findResult}
           onQuery={(query) => {
@@ -1171,20 +1220,12 @@ export function BrowserView({
           onPatch={(id, patch) => {
             void browserLoginUpdate(id, patch)
               .then(() => refreshLogins())
-              .catch((error) =>
-                setNotice(
-                  error instanceof Error ? error.message : String(error),
-                ),
-              );
+              .catch(noticeError);
           }}
           onDelete={(id) => {
             void browserLoginDelete(id)
               .then(() => refreshLogins())
-              .catch((error) =>
-                setNotice(
-                  error instanceof Error ? error.message : String(error),
-                ),
-              );
+              .catch(noticeError);
           }}
           onClose={() => setLoginsOpen(false)}
         />
@@ -1299,6 +1340,7 @@ export function BrowserView({
           y={menuAt.y}
           items={menuItems}
           ariaLabel="Browser actions"
+          ignore="[data-browser-menu-trigger]"
           onPick={onMenuPick}
           onClose={() => setMenuAt(null)}
         />
@@ -1309,16 +1351,15 @@ export function BrowserView({
 
 function ToolbarButton({
   title,
-  disabled,
   pressed,
-  onClick,
   children,
-}: {
+  ...rest
+}: Omit<
+  ComponentPropsWithoutRef<"button">,
+  "className" | "type" | "title"
+> & {
   title: string;
-  disabled?: boolean;
   pressed?: boolean;
-  onClick: (event: ReactMouseEvent<HTMLButtonElement>) => void;
-  children: ReactNode;
 }) {
   return (
     <button
@@ -1326,9 +1367,8 @@ function ToolbarButton({
       title={title}
       aria-label={title}
       aria-pressed={pressed}
-      disabled={disabled}
-      onClick={onClick}
       className="grid size-6 shrink-0 place-items-center rounded-md text-content/60 hover:bg-content/10 hover:text-content disabled:cursor-not-allowed disabled:opacity-35"
+      {...rest}
     >
       {children}
     </button>
@@ -1493,12 +1533,14 @@ function BrowserBookmarksBar({
  * steps forward, Shift+Enter back, Esc closes and clears highlights.
  */
 function BrowserFindBar({
+  ref,
   query,
   result,
   onQuery,
   onStep,
   onClose,
 }: {
+  ref?: Ref<HTMLInputElement>;
   query: string;
   result: { count: number; index: number } | null;
   onQuery: (query: string) => void;
@@ -1529,6 +1571,7 @@ function BrowserFindBar({
     >
       <Search className="size-3.5 shrink-0 text-content/40" strokeWidth={1.75} />
       <input
+        ref={ref}
         value={query}
         onChange={(event) => onQuery(event.currentTarget.value)}
         onKeyDown={onKey}
@@ -1604,6 +1647,7 @@ function BrowserLoginsBar({
 }) {
   return (
     <div
+      role="region"
       aria-label="Saved logins"
       className="shrink-0 border-b border-content/10 bg-content/2 px-2 py-1.5"
     >
