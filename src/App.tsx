@@ -8600,6 +8600,9 @@ export default function App({
       ) : null}
       {commandsSheet ? (
         <ProjectCommandsSheet
+          // A retarget while the sheet is open must not carry an edit draft
+          // from one project's form over another's data.
+          key={commandsSheet.projectId}
           projectId={commandsSheet.projectId}
           focus={commandsSheet.focus}
           onClose={() => setCommandsSheet(null)}

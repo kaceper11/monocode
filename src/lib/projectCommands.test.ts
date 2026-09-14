@@ -315,8 +315,11 @@ describe("openCommandsSheet", () => {
     const listener = (event: Event) =>
       seen.push((event as CustomEvent<CommandsSheetRequest>).detail);
     window.addEventListener(OPEN_COMMANDS_SHEET, listener);
-    openCommandsSheet({ projectId: "p1", focus: "checks" });
-    window.removeEventListener(OPEN_COMMANDS_SHEET, listener);
+    try {
+      openCommandsSheet({ projectId: "p1", focus: "checks" });
+    } finally {
+      window.removeEventListener(OPEN_COMMANDS_SHEET, listener);
+    }
     expect(seen).toEqual([{ projectId: "p1", focus: "checks" }]);
   });
 });

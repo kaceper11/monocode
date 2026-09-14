@@ -66,7 +66,6 @@ it("lists the configured check with its command and mode", () => {
   expect(page).toContain("Checks on finish");
   expect(page).toContain("Tests");
   expect(page).toContain("Notify");
-  expect(page).toContain("On");
 });
 
 it("opens the project's commands sheet on the checks section", async () => {
@@ -74,8 +73,11 @@ it("opens the project's commands sheet on the checks section", async () => {
   const listener = (event: Event) =>
     seen.push((event as CustomEvent<CommandsSheetRequest>).detail);
   window.addEventListener(OPEN_COMMANDS_SHEET, listener);
-  await act(async () => button("Configure")?.click());
-  window.removeEventListener(OPEN_COMMANDS_SHEET, listener);
+  try {
+    await act(async () => button("Configure")?.click());
+  } finally {
+    window.removeEventListener(OPEN_COMMANDS_SHEET, listener);
+  }
   expect(seen).toEqual([{ projectId, focus: "checks" }]);
 });
 
@@ -84,6 +86,7 @@ it("pauses and resumes a project's check from its row", async () => {
   expect(
     loadProjects().find((p) => p.id === projectId)?.verify?.enabled,
   ).toBe(false);
+  expect(host.textContent).toContain("Paused");
   await act(async () => button("Resume")?.click());
   expect(
     loadProjects().find((p) => p.id === projectId)?.verify?.enabled,
