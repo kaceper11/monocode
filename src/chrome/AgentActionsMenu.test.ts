@@ -27,6 +27,7 @@ const cleanIndex: GitDiffIndex = {
   conflicts: [],
   mergeHead: null,
   detached: false,
+  localOnly: [],
 };
 
 function render(props: Partial<Parameters<typeof AgentActionsMenu>[0]> = {}) {

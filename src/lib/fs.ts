@@ -97,6 +97,10 @@ export type GitDiffIndex = {
   mergeHead: string | null;
   /** HEAD is detached — `branch` then holds a short SHA, not a branch. */
   detached: boolean;
+  /** "Keep local" files — skip-worktree entries git hides from status and
+   * refuses to stage or commit. Tracked entries are local edits; untracked
+   * ones are parked intent-to-add files. */
+  localOnly: GitChangedFile[];
 };
 
 export function gitDiffIndex(cwd: string): Promise<GitDiffIndex> {
@@ -215,6 +219,16 @@ export function gitStageAll(cwd: string): Promise<void> {
 
 export function gitUnstageAll(cwd: string): Promise<void> {
   return invoke<void>("git_unstage_all", { cwd });
+}
+
+/** Hide a file's local state from staging and commits (skip-worktree). */
+export function gitKeepLocal(cwd: string, relative: string): Promise<void> {
+  return invoke<void>("git_keep_local", { cwd, relative });
+}
+
+/** Remove the keep-local flag so the file's real state shows again. */
+export function gitUnkeepLocal(cwd: string, relative: string): Promise<void> {
+  return invoke<void>("git_unkeep_local", { cwd, relative });
 }
 
 export function gitCommit(cwd: string, message: string): Promise<void> {
