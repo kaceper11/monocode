@@ -470,8 +470,9 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
         !["azure", "github", "gitlab"].includes(
           delivery.provider as string,
         )) ||
-      // A GitLab tab without repo+number identity cannot render its MR.
-      (delivery.provider === "gitlab" &&
+      // A GitHub/GitLab review tab without repo+number identity cannot
+      // render its PR/MR.
+      ((delivery.provider === "gitlab" || delivery.provider === "github") &&
         (typeof delivery.repo !== "string" ||
           !delivery.repo.trim() ||
           typeof delivery.number !== "number" ||

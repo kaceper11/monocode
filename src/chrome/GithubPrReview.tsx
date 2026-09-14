@@ -140,12 +140,15 @@ function GithubPrPanel({
   const mounted = useRef(true);
   const repairDraft = useRef<{ key: string; instruction: string } | null>(null);
   const reviewedHead = useRef("");
+  const preparation = useRef<AbortController | null>(null);
   const scope = githubPrScope(repo || boundRepo || cwd, number);
 
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
+      // A dismissed panel must not leave a checkout clone running.
+      preparation.current?.abort();
       generation.current++;
     };
   }, []);
@@ -221,13 +224,23 @@ function GithubPrPanel({
       : undefined;
 
   const sendEvidence = (
-      prepare: () => Promise<{
+      prepare: (
+        current: () => boolean,
+        signal: AbortSignal,
+      ) => Promise<{
         evidence: RepairEvidence;
         context: AgentContext;
       }>,
     ) =>
     run(async (current) => {
-      const draft = await prepare();
+      const controller = new AbortController();
+      preparation.current = controller;
+      const draft = await prepare(
+        () => current() && !controller.signal.aborted,
+        controller.signal,
+      ).finally(() => {
+        if (preparation.current === controller) preparation.current = null;
+      });
       if (!current()) return;
       requestAgentContext({
         context: {
@@ -244,10 +257,14 @@ function GithubPrPanel({
     });
 
   const sendComments = (comments: GithubWorkItemComment[]) =>
-    sendEvidence(() => githubCommentsRepair({ cwd, repo, number, comments }));
+    sendEvidence((current, signal) =>
+      githubCommentsRepair({ cwd, repo, number, comments }, current, signal),
+    );
 
   const sendChecks = () =>
-    sendEvidence(() => githubCiRepair({ cwd, repo, number }));
+    sendEvidence((current, signal) =>
+      githubCiRepair({ cwd, repo, number }, current, signal),
+    );
 
   const openWorktree = () =>
     run(async (current) => {
@@ -443,6 +460,14 @@ function GithubPrPanel({
                 </button>
               ) : null}
             </div>
+            {busy && preparation.current ? (
+              <button
+                className={button}
+                onClick={() => preparation.current?.abort()}
+              >
+                Cancel preparation
+              </button>
+            ) : null}
           </section>
         ) : null}
         {repoError ? <p role="alert">{repoError}</p> : null}
@@ -600,6 +625,12 @@ function GithubPrSections({
               ? ` · ${reviewComments.length} line comment${reviewComments.length === 1 ? "" : "s"}`
               : ""}
           </h4>
+          {reviewComments.length >= 50 ? (
+            <p className="text-[11px] text-content/45">
+              GitHub allows at most 50 comments per review — adding another
+              drops the oldest draft.
+            </p>
+          ) : null}
           {reviewComments.length ? (
             <ul className="space-y-1">
               {reviewComments.map((comment, index) => (
@@ -654,7 +685,8 @@ function GithubPrSections({
             </button>
             <button
               className={button}
-              disabled={busy}
+              disabled={busy || pr.isDraft}
+              title={pr.isDraft ? "Draft pull requests can't be approved" : undefined}
               onClick={() => void submitReview("APPROVE", reviewBody)}
             >
               Approve
@@ -682,7 +714,7 @@ function GithubPrSections({
         {diff ? (
           <InboxPrDiff
             diff={diff}
-            lineCommentComposer={open ? commentComposer : undefined}
+            lineCommentComposer={open && !busy ? commentComposer : undefined}
           />
         ) : (
           <p className="text-content/50">Diff unavailable. Refresh PR to retry.</p>
@@ -691,7 +723,7 @@ function GithubPrSections({
       <section aria-label="Review threads" className="space-y-1">
         <h4 className="text-content/60">
           Review threads ({threads.length}
-          {thread?.truncated ? " · first page" : ""})
+          {thread?.truncated ? " · earlier threads omitted" : ""})
         </h4>
         {threads.length === 0 ? <p>No review threads.</p> : null}
         {threads.map((comment) => (

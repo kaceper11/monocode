@@ -290,6 +290,7 @@ pub fn run() {
             fs::git_github_pr_diff,
             fs::git_github_submit_review,
             fs::github_pr_prepare_checkout,
+            fs::github_pr_cancel_checkout,
             fs::git_update_from_default,
             fs::git_sync_branch,
             checks::run_check,

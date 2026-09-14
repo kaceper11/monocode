@@ -422,11 +422,15 @@ const githubRepoSlug = (url: string) =>
  * the PR's repository. A repair never mutates the user's working copy — a
  * mismatch reuses a known checkout already at the head, or clones the head
  * into an isolated checkout like the Azure flow does. */
-async function githubRepairHead(input: {
-  cwd: string;
-  repo: string;
-  number: number;
-}): Promise<{ head: CiHead; state: GithubPrState }> {
+async function githubRepairHead(
+  input: {
+    cwd: string;
+    repo: string;
+    number: number;
+  },
+  current: () => boolean = () => true,
+  signal?: AbortSignal,
+): Promise<{ head: CiHead; state: GithubPrState }> {
   const state = await githubPrState(input.cwd, input.number);
   if (state.state.toUpperCase() !== "OPEN")
     throw new Error("The PR is no longer open. Refresh and retry.");
@@ -445,19 +449,31 @@ async function githubRepairHead(input: {
       ...loadRecents().map(project => project.path),
     ])].filter(path => path !== input.cwd && wslLocation(path)?.distribution === wslLocation(input.cwd)?.distribution).slice(0, 20);
     for (const path of paths) {
+      if (!current()) throw new Error("Checkout preparation cancelled.");
       const candidate = await ciContext(path).catch(() => null);
       if (candidate && matches(candidate)) { checkout = candidate; break; }
     }
     if (!matches(checkout)) {
+      if (!current()) throw new Error("Checkout preparation cancelled.");
       const requestId = crypto.randomUUID();
-      const path = await invoke<string>("github_pr_prepare_checkout", {
-        cwd: input.cwd,
-        repo: input.repo,
-        number: input.number,
-        expectedRevision: state.headRefOid,
-        requestId,
-      });
+      const cancel = () => { void invoke("github_pr_cancel_checkout", { requestId }).catch(() => undefined); };
+      signal?.throwIfAborted();
+      signal?.addEventListener("abort", cancel, { once: true });
+      let path: string;
+      try {
+        path = await invoke<string>("github_pr_prepare_checkout", {
+          cwd: input.cwd,
+          repo: input.repo,
+          number: input.number,
+          expectedRevision: state.headRefOid,
+          requestId,
+        });
+      } finally {
+        signal?.removeEventListener("abort", cancel);
+      }
+      signal?.throwIfAborted();
       notifyGitChanged(input.cwd);
+      if (!current()) throw new Error("Checkout preparation cancelled.");
       checkout = await ciContext(path);
       if (!matches(checkout))
         throw new Error(
@@ -480,15 +496,19 @@ async function githubRepairHead(input: {
 
 /** "Address comments" for a GitHub PR — bounded review evidence digested so a
  * changed thread blocks dispatch instead of replaying stale comments. */
-export async function githubCommentsRepair(input: {
-  cwd: string;
-  repo: string;
-  number: number;
-  comments: GithubWorkItemComment[];
-}) {
+export async function githubCommentsRepair(
+  input: {
+    cwd: string;
+    repo: string;
+    number: number;
+    comments: GithubWorkItemComment[];
+  },
+  current: () => boolean = () => true,
+  signal?: AbortSignal,
+) {
   const comments = input.comments.slice(0, 20);
   if (!comments.length) throw new Error("Select review comments first.");
-  const { head, state } = await githubRepairHead(input);
+  const { head, state } = await githubRepairHead(input, current, signal);
   const origin = `${state.url} · repository ${input.repo} · head ${state.headRefOid} · checkout ${head.cwd}`;
   const built = comments.map((comment) => {
     const where = comment.path
@@ -545,12 +565,16 @@ export async function githubCommentsRepair(input: {
 
 /** "Fix CI" for a GitHub PR — failing check runs on the PR head, bounded and
  * digested for freshness validation at dispatch. */
-export async function githubCiRepair(input: {
-  cwd: string;
-  repo: string;
-  number: number;
-}) {
-  const { head, state } = await githubRepairHead(input);
+export async function githubCiRepair(
+  input: {
+    cwd: string;
+    repo: string;
+    number: number;
+  },
+  current: () => boolean = () => true,
+  signal?: AbortSignal,
+) {
+  const { head, state } = await githubRepairHead(input, current, signal);
   const failing = state.checks
     .filter((check) => FAILING_CHECK_CONCLUSIONS.includes(check.conclusion))
     .slice(0, 20);

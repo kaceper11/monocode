@@ -2091,6 +2091,13 @@ pub async fn github_pr_prepare_checkout(
     .map_err(|e| e.to_string())?
 }
 
+/// Cancel an in-flight PR-checkout preparation — a dismissed review panel
+/// must not leave a clone running in the background.
+#[tauri::command]
+pub fn github_pr_cancel_checkout(request_id: String) {
+    crate::checkout::cancel_checkout(&request_id);
+}
+
 const MAX_PR_DIFF_BYTES: usize = 2 * 1024 * 1024;
 
 /// Unified diff and file stats for a pull request, via `gh`.
@@ -3635,29 +3642,18 @@ fn git_github_review_reply_for(root: &Path, thread_id: &str, body: &str) -> Resu
 const MAX_REVIEW_COMMENTS: usize = 50;
 const MAX_REVIEW_BODY_BYTES: usize = 64_000;
 
-fn git_github_submit_review_for(
-    root: &Path,
-    repo: &str,
-    number: i64,
+/// Validate and serialize the review request — pure, so every rejection
+/// lands before any Git or `gh` call runs.
+fn github_review_payload(
     commit_id: &str,
     event: &str,
     body: &str,
     comments: &[GitHubReviewCommentInput],
 ) -> Result<String, String> {
-    if number <= 0 {
-        return Err("Invalid GitHub PR number".into());
-    }
     let event = event.trim();
     if !matches!(event, "APPROVE" | "REQUEST_CHANGES" | "COMMENT") {
         return Err("Unknown review event".into());
     }
-    let repo = if repo.trim().is_empty() {
-        git_github_repo_for(root)?
-    } else {
-        repo.trim().to_string()
-    };
-    let (owner, name) = split_github_repo(&repo)?;
-    let endpoint = format!("repos/{owner}/{name}/pulls/{number}/reviews");
     let commit_id = commit_id.trim();
     if commit_id.len() > 64
         || commit_id.is_empty()
@@ -3695,16 +3691,40 @@ fn git_github_submit_review_for(
             "body": text,
         }));
     }
-    if payload_comments.is_empty() && body.trim().is_empty() {
+    // A bare approve or request-changes is a valid review; an empty COMMENT
+    // would carry nothing at all.
+    if event == "COMMENT" && payload_comments.is_empty() && body.trim().is_empty() {
         return Err("A review needs a body or at least one comment".into());
     }
-    let payload = json!({
+    Ok(json!({
         "commit_id": commit_id,
         "event": event,
         "body": body,
         "comments": payload_comments,
     })
-    .to_string();
+    .to_string())
+}
+
+fn git_github_submit_review_for(
+    root: &Path,
+    repo: &str,
+    number: i64,
+    commit_id: &str,
+    event: &str,
+    body: &str,
+    comments: &[GitHubReviewCommentInput],
+) -> Result<String, String> {
+    if number <= 0 {
+        return Err("Invalid GitHub PR number".into());
+    }
+    let payload = github_review_payload(commit_id, event, body, comments)?;
+    let repo = if repo.trim().is_empty() {
+        git_github_repo_for(root)?
+    } else {
+        repo.trim().to_string()
+    };
+    let (owner, name) = split_github_repo(&repo)?;
+    let endpoint = format!("repos/{owner}/{name}/pulls/{number}/reviews");
     with_temp_body(&payload, |path| {
         let json = gh_checked(root, &["api", &endpoint, "-X", "POST", "--input", path])?;
         parse_github_submit_review_url(&json)
@@ -7796,6 +7816,21 @@ mod tests {
             git_github_submit_review_for(root, "bad repo", 1, "abc123", "APPROVE", "", &[])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn github_review_payload_allows_bare_approve_and_serializes() {
+        // An empty approve or request-changes is a valid review — only an
+        // empty COMMENT carries nothing and is rejected.
+        let payload: serde_json::Value =
+            serde_json::from_str(&github_review_payload("abc123", "APPROVE", "", &[]).unwrap())
+                .unwrap();
+        assert_eq!(payload["commit_id"], "abc123");
+        assert_eq!(payload["event"], "APPROVE");
+        assert_eq!(payload["body"], "");
+        assert_eq!(payload["comments"].as_array().unwrap().len(), 0);
+        assert!(github_review_payload("abc123", "REQUEST_CHANGES", "", &[]).is_ok());
+        assert!(github_review_payload("abc123", "COMMENT", "", &[]).is_err());
     }
 
     #[test]

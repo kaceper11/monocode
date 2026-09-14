@@ -96,7 +96,6 @@ import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import { useTabGroupLogos } from "../hooks/useTabGroupLogos";
 import {
   githubStatus,
-  githubPrDiff,
   githubReviewDecisionLabel,
   githubWorkItem,
   githubWorkItemComment,
@@ -109,14 +108,12 @@ import {
   inboxListIsFresh,
   inboxProjectsForRail,
   listInboxItems,
-  peekGithubPrDiff,
   peekGithubWorkItemDetails,
   peekGithubWorkItemThread,
   peekInboxList,
   formatRelativeTime,
   inboxPersonAvatarUrl,
   type GithubLabel,
-  type GithubPrDiff,
   type GithubWorkItemDetails,
   type GithubWorkItemThread,
   type InboxItem,
@@ -204,7 +201,6 @@ import {
   InboxCommentForm,
   type InboxReplyTarget,
 } from "./InboxComments";
-import { InboxPrDiff } from "./InboxPrDiff";
 import { GithubPrReview } from "../chrome/GithubPrReview";
 import { GitlabMrReview } from "../chrome/GitlabMrReview";
 import {
@@ -1697,12 +1693,6 @@ export function InboxDetail({
       : githubKind
         ? peekGithubWorkItemDetails(item.projectPath, githubKind, item.number)
         : null;
-  // GitHub and GitLab PRs render dedicated review surfaces that load their
-  // own diffs — the inbox-level diff only remains for other providers.
-  const cachedDiff =
-    isPr && !gitlab && item.provider !== "github"
-      ? peekGithubPrDiff(item.projectPath, item.number)
-      : null;
   const cachedThread = azure ? peekAzureThread(item) : jira ? peekJiraThread(item) : linear
     ? peekLinearIssueThread(item.id ?? "")
     : gitlabKind
@@ -1714,9 +1704,6 @@ export function InboxDetail({
   const [loading, setLoading] = useState(cached == null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<"summary" | "code">("summary");
-  const [prDiff, setPrDiff] = useState<GithubPrDiff | null>(cachedDiff);
-  const [diffLoading, setDiffLoading] = useState(isPr && cachedDiff == null);
-  const [diffError, setDiffError] = useState<string | null>(null);
   const [thread, setThread] = useState<
     GithubWorkItemThread | LinearIssueThread | GitlabWorkItemThread | null
   >(cachedThread);
@@ -1940,41 +1927,6 @@ export function InboxDetail({
     jira,
     retry,
   ]);
-
-  useEffect(() => {
-    // GitHub and GitLab PRs render dedicated review surfaces, which load
-    // their own diffs.
-    if (item.provider === "github" || gitlab || !isPr || tab !== "code") return;
-    let cancelled = false;
-    const cachedDiff = peekGithubPrDiff(item.projectPath, item.number);
-    if (cachedDiff) {
-      setPrDiff(cachedDiff);
-      setDiffLoading(false);
-      setDiffError(null);
-    } else {
-      setDiffLoading(true);
-      setDiffError(null);
-      setPrDiff(null);
-    }
-    const pending = githubPrDiff(item.projectPath, item.number);
-    void pending
-      .then((next) => {
-        if (cancelled) return;
-        setPrDiff(next);
-        setDiffError(null);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        if (cachedDiff) return;
-        setDiffError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setDiffLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [gitlab, isPr, item.number, item.projectPath, item.repo, revision, tab]);
 
   const postComment = async (body: string) => {
     setPosting(true);
@@ -2211,7 +2163,7 @@ export function InboxDetail({
           >
             <MessageSquare className="size-3.5" strokeWidth={1.75} /> Ask agent
           </button>
-          {isPr ? <button type="button" className={ACTION_OUTLINE} onClick={() => setTab("code")}>Review PR</button> : null}
+          {isPr && (item.provider === "github" || gitlab) ? <button type="button" className={ACTION_OUTLINE} onClick={() => setTab("code")}>Review PR</button> : null}
           {item.provider === "github" && item.kind === "pr" && item.repo ? (
             <button
               type="button"
@@ -2257,7 +2209,7 @@ export function InboxDetail({
           }} />
         {(jira || azure) && error && details ? <p role="status" className="text-[12px] text-content/50">{error} <button type="button" className={ACTION_GHOST} onClick={() => setRetry(value => value + 1)}>Retry</button></p> : null}
       </header>
-      {isPr ? (
+      {isPr && (item.provider === "github" || gitlab) ? (
         <div
           role="tablist"
           aria-label={
@@ -2311,20 +2263,7 @@ export function InboxDetail({
             enabled
             onClose={() => undefined}
           />
-        ) : diffLoading ? (
-          <div className="flex justify-center py-10 text-content/40">
-            <LoaderCircle className="size-4 animate-spin" strokeWidth={1.75} />
-          </div>
-        ) : diffError ? (
-          <p className="text-[13px] text-content/50">{diffError}</p>
-        ) : prDiff ? (
-          <InboxPrDiff
-            key={`${item.projectPath}:${item.number}:${revision}`}
-            diff={prDiff}
-          />
-        ) : (
-          <p className="text-[13px] text-content/45">No file changes</p>
-        )
+        ) : null
       ) : loading ? (
         <div className="flex justify-center py-10 text-content/40">
           <LoaderCircle className="size-4 animate-spin" strokeWidth={1.75} />
