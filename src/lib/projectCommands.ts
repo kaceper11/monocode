@@ -318,3 +318,22 @@ export function resolveCommandGroup(input: {
   }
   return { runs, failures };
 }
+
+/** Fired on `window` to open a project's saved-commands sheet — surfaces
+ * emit, App hosts. */
+export const OPEN_COMMANDS_SHEET = "monocode:open-commands-sheet";
+
+export type CommandsSheetRequest = {
+  projectId: string;
+  /** Scroll a section into view — a check row's Configure lands on its
+   * controls instead of the top of the command list. */
+  focus?: "checks";
+};
+
+export function openCommandsSheet(request: CommandsSheetRequest) {
+  window.dispatchEvent(
+    new CustomEvent<CommandsSheetRequest>(OPEN_COMMANDS_SHEET, {
+      detail: request,
+    }),
+  );
+}

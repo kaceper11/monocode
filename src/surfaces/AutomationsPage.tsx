@@ -24,6 +24,7 @@ import {
   type Schedule,
 } from "../lib/schedules";
 import { runScheduleNow } from "../lib/scheduleEngine";
+import { openCommandsSheet } from "../lib/projectCommands";
 import {
   loadProjects,
   projectsSnapshot,
@@ -326,6 +327,18 @@ export function AutomationsPage() {
                       }
                     >
                       {verify.enabled === false ? "Resume" : "Pause"}
+                    </button>
+                    <button
+                      type="button"
+                      className={button}
+                      onClick={() =>
+                        openCommandsSheet({
+                          projectId: project.id,
+                          focus: "checks",
+                        })
+                      }
+                    >
+                      Configure
                     </button>
                   </div>
                 </li>

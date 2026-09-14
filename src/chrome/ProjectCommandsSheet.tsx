@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   MAX_COMMAND_STEPS,
   deleteProjectCommand,
@@ -66,9 +72,13 @@ type EditState =
  */
 export function ProjectCommandsSheet({
   projectId,
+  focus,
   onClose,
 }: {
   projectId: string;
+  /** Open scrolled to a section — the Automations check rows land on their
+   * controls instead of the top of the command list. */
+  focus?: "checks";
   onClose: () => void;
 }) {
   const raw = useSyncExternalStore(
@@ -86,10 +96,16 @@ export function ProjectCommandsSheet({
   );
   const [editing, setEditing] = useState<EditState | null>(null);
   const [error, setError] = useState("");
+  const checksRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!project) onClose();
   }, [project, onClose]);
+
+  useEffect(() => {
+    if (focus === "checks")
+      checksRef.current?.scrollIntoView({ block: "nearest" });
+  }, [focus]);
 
   const commands = project?.commands ?? [];
   const groups = project?.commandGroups ?? [];
@@ -609,7 +625,7 @@ export function ProjectCommandsSheet({
                 New project command
               </button>
             </div>
-            <div>
+            <div ref={checksRef}>
               <span className={labelClass}>Checks on finish</span>
               {commands.length === 0 ? (
                 <p className="py-1.5 text-[12px] text-content/45">
