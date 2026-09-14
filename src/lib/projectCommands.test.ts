@@ -1,13 +1,16 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  OPEN_COMMANDS_SHEET,
   deleteReusableCommand,
   joinRelativeCwd,
   loadReusableCommands,
   moveReusableCommand,
+  openCommandsSheet,
   resolveCommandGroup,
   resolveCommandTarget,
   saveReusableCommand,
+  type CommandsSheetRequest,
 } from "./projectCommands";
 import type { ProjectRecord } from "./projects";
 import type { TaskWorkspace } from "./taskWorkspaces";
@@ -303,5 +306,17 @@ describe("reusable commands", () => {
         steps: [{ command: " " }],
       }).error,
     ).toBeTruthy();
+  });
+});
+
+describe("openCommandsSheet", () => {
+  it("dispatches the open event with the request detail", () => {
+    const seen: CommandsSheetRequest[] = [];
+    const listener = (event: Event) =>
+      seen.push((event as CustomEvent<CommandsSheetRequest>).detail);
+    window.addEventListener(OPEN_COMMANDS_SHEET, listener);
+    openCommandsSheet({ projectId: "p1", focus: "checks" });
+    window.removeEventListener(OPEN_COMMANDS_SHEET, listener);
+    expect(seen).toEqual([{ projectId: "p1", focus: "checks" }]);
   });
 });

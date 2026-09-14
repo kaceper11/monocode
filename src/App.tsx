@@ -205,7 +205,11 @@ import {
   type ProjectTerminalDock as ProjectTerminal,
 } from "./lib/projectTerminal";
 import { writePty } from "./lib/pty";
-import { resolveCommandTarget } from "./lib/projectCommands";
+import {
+  OPEN_COMMANDS_SHEET,
+  resolveCommandTarget,
+  type CommandsSheetRequest,
+} from "./lib/projectCommands";
 import { ProjectCommandsMenu } from "./chrome/ProjectCommandsMenu";
 import { ProjectCommandsSheet } from "./chrome/ProjectCommandsSheet";
 import type { PopoverAnchor } from "./chrome/Popover";
@@ -899,8 +903,9 @@ export default function App({
     projectId?: string;
     taskId?: string;
   } | null>(null);
-  /** ProjectRecord.id of the project whose commands are being edited. */
-  const [commandsSheet, setCommandsSheet] = useState<string | null>(null);
+  /** The project whose commands are being edited — and where to land. */
+  const [commandsSheet, setCommandsSheet] =
+    useState<CommandsSheetRequest | null>(null);
   // The rail's own anchored overlays go stale when the visible folder
   // changes — close them rather than leaving a floating menu behind.
   useEffect(() => {
@@ -7624,6 +7629,15 @@ export default function App({
     return () => window.removeEventListener(OPEN_SCHEDULE_SHEET, onOpen);
   }, []);
 
+  useEffect(() => {
+    const onOpen = (event: Event) => {
+      const detail = (event as CustomEvent<CommandsSheetRequest>).detail;
+      if (detail?.projectId) setCommandsSheet(detail);
+    };
+    window.addEventListener(OPEN_COMMANDS_SHEET, onOpen);
+    return () => window.removeEventListener(OPEN_COMMANDS_SHEET, onOpen);
+  }, []);
+
   // The watcher engine owns polling/dedup; these hooks are its only bridge
   // into App dispatch. Hooks live on a ref so the engine never re-subscribes.
   const watcherHooksRef = useRef<WatcherEngineHooks>({});
@@ -8579,14 +8593,15 @@ export default function App({
                 (looksLikeProject(projectCwd)
                   ? ensureProjectForPath(projectCwd)
                   : undefined));
-            if (project) setCommandsSheet(project.id);
+            if (project) setCommandsSheet({ projectId: project.id });
           }}
           onClose={() => setCommandsMenu(null)}
         />
       ) : null}
       {commandsSheet ? (
         <ProjectCommandsSheet
-          projectId={commandsSheet}
+          projectId={commandsSheet.projectId}
+          focus={commandsSheet.focus}
           onClose={() => setCommandsSheet(null)}
         />
       ) : null}
