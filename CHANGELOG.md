@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- macOS builds now require macOS 10.15 or later; the bundled Whisper engine uses C++ `std::filesystem`.
 - Selecting files in Changes now opens a floating action card that sends the selection to a task rather than a session picker.
 - Creating a task prepares it and reveals the rail without starting agent sessions.
 - Includes all upstream 0.1.45 changes, which were merged after 0.2.1.
