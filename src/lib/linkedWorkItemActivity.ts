@@ -2,6 +2,7 @@ import {
   githubReviewStateLabel,
   type GithubWorkItemComment,
   type GithubWorkItemThread,
+  type InboxProvider,
 } from "./githubTasks";
 import type { LinkedSessionUpdate } from "./linkedSessionUpdates";
 
@@ -28,12 +29,16 @@ export type LinkedWorkItemTerminalState =
 
 /** In-memory, one-shot context shown when an updated linked session is opened. */
 export type LinkedWorkItemUpdateCard = {
+  provider: InboxProvider;
   kind: "issue" | "pr";
   repo: string;
   number: number;
+  identifier?: string;
   title: string;
   url: string;
   state: string;
+  stateType?: string;
+  project?: string;
   since: number;
   updatedAt: number;
   status: "loading" | "ready" | "error";
@@ -48,16 +53,55 @@ const EMPTY_COUNTS: LinkedWorkItemActivityCounts = {
   commits: 0,
 };
 
+export const LINKED_PROVIDER_NAMES: Record<InboxProvider, string> = {
+  github: "GitHub",
+  gitlab: "GitLab",
+  jira: "Jira",
+  azure: "Azure DevOps",
+  linear: "Linear",
+};
+
+export function linkedWorkItemProviderName(
+  provider: InboxProvider | undefined,
+): string {
+  return LINKED_PROVIDER_NAMES[provider ?? "github"];
+}
+
+/** Handle-style authors (logins/usernames) get "@"; display names do not. */
+export function linkedWorkItemAuthorLabel(
+  provider: InboxProvider | undefined,
+  author: string,
+): string {
+  return provider === "github" || provider === "gitlab" || !provider
+    ? `@${author}`
+    : author;
+}
+
+/** Provider-native noun for the linked item kind. */
+export function linkedWorkItemNoun(
+  provider: InboxProvider | undefined,
+  kind: "issue" | "pr",
+): string {
+  if (kind === "pr") {
+    return provider === "gitlab" ? "merge request" : "pull request";
+  }
+  return provider === "azure" ? "work item" : "issue";
+}
+
 export function pendingLinkedWorkItemUpdateCard(
   update: LinkedSessionUpdate,
 ): LinkedWorkItemUpdateCard {
   return {
-    kind: update.item.kind,
+    provider: update.item.provider ?? "github",
+    kind: update.item.kind === "pr" ? "pr" : "issue",
     repo: update.item.repo,
     number: update.item.number,
+    identifier: update.item.identifier,
     title: update.item.title,
     url: update.item.url,
     state: update.item.state,
+    stateType: update.item.stateType,
+    project: update.item.projectName,
     since: update.since,
     updatedAt: update.updatedAt,
     status: "loading",
@@ -90,6 +134,31 @@ function flattenComments(
   ]);
 }
 
+/**
+ * Provider comment kinds differ: GitHub keeps formal "review" and per-line
+ * "review_comment"; every other provider's thread read emits plain
+ * "comment" kinds only.
+ */
+function entryKind(comment: GithubWorkItemComment): LinkedWorkItemActivityKind {
+  if (comment.kind === "review") return "review";
+  if (comment.kind === "review_comment") return "review_comment";
+  return "comment";
+}
+
+function entryText(
+  provider: InboxProvider,
+  comment: GithubWorkItemComment,
+): string {
+  if (provider === "github" && comment.kind === "review") {
+    return concise(
+      [githubReviewStateLabel(comment.state), comment.body]
+        .filter(Boolean)
+        .join(": "),
+    );
+  }
+  return concise(comment.body);
+}
+
 export function completeLinkedWorkItemUpdateCard(
   card: LinkedWorkItemUpdateCard,
   thread: GithubWorkItemThread,
@@ -103,20 +172,9 @@ export function completeLinkedWorkItemUpdateCard(
   const entries: LinkedWorkItemActivityEntry[] = [
     ...comments.map((comment) => ({
       id: comment.id,
-      kind: (comment.kind === "review"
-        ? "review"
-        : comment.kind === "review_comment"
-          ? "review_comment"
-          : "comment") as LinkedWorkItemActivityKind,
+      kind: entryKind(comment),
       author: comment.author,
-      text:
-        comment.kind === "review"
-          ? concise(
-              [githubReviewStateLabel(comment.state), comment.body]
-                .filter(Boolean)
-                .join(": "),
-            )
-          : concise(comment.body),
+      text: entryText(card.provider, comment),
       createdAt: comment.createdAt,
       url: comment.url,
     })),
@@ -136,8 +194,11 @@ export function completeLinkedWorkItemUpdateCard(
     ...card,
     status: "ready",
     counts: {
-      comments: comments.filter((comment) => comment.kind !== "review").length,
-      reviews: comments.filter((comment) => comment.kind === "review").length,
+      comments: comments.filter(
+        (comment) => entryKind(comment) !== "review",
+      ).length,
+      reviews: comments.filter((comment) => entryKind(comment) === "review")
+        .length,
       commits: commits.length,
     },
     entries,
@@ -151,12 +212,36 @@ export function failLinkedWorkItemUpdateCard(
   return { ...card, status: "error" };
 }
 
-/** A linked work item state that usually means the session can be cleaned up. */
-export function linkedWorkItemTerminalState(
-  card: Pick<LinkedWorkItemUpdateCard, "kind" | "state">,
-): LinkedWorkItemTerminalState | undefined {
+/**
+ * A linked work item state that usually means the session can be cleaned up.
+ * GitHub/GitLab share open/closed/merged state strings; Azure PR snapshots
+ * map to the same vocabulary; Jira/Azure Boards/Linear report a state
+ * category instead.
+ */
+export function linkedWorkItemTerminalState(card: {
+  provider?: InboxProvider;
+  kind: "issue" | "pr";
+  state: string;
+  stateType?: string;
+}): LinkedWorkItemTerminalState | undefined {
+  const provider = card.provider ?? "github";
   const state = card.state.trim().toLowerCase();
+  const stateType = card.stateType?.trim().toLowerCase();
   if (card.kind === "issue") {
+    if (provider === "jira") {
+      return stateType === "done" ? "issue_closed" : undefined;
+    }
+    if (provider === "linear") {
+      return stateType === "completed" || stateType === "canceled"
+        ? "issue_closed"
+        : undefined;
+    }
+    if (provider === "azure") {
+      return stateType === "completed" || state === "closed" ||
+          state === "done" || state === "resolved" || state === "removed"
+        ? "issue_closed"
+        : undefined;
+    }
     return state === "closed" ? "issue_closed" : undefined;
   }
   if (state === "merged") return "pr_merged";
@@ -177,14 +262,17 @@ export function linkedWorkItemUpdateSummary(
   ].filter(Boolean);
   if (parts.length > 0) return parts.join(" · ");
   if (card.status === "loading") return "Loading change details…";
-  if (card.status === "error") return "Updated on GitHub · details unavailable";
+  if (card.status === "error") {
+    return `Updated on ${linkedWorkItemProviderName(card.provider)} · details unavailable`;
+  }
   return "Metadata or status changed";
 }
 
 export function linkedWorkItemActivityPrompt(
   card: LinkedWorkItemUpdateCard,
 ): string {
-  const kind = card.kind === "pr" ? "pull request" : "issue";
+  const noun = linkedWorkItemNoun(card.provider, card.kind);
+  const provider = linkedWorkItemProviderName(card.provider);
   const latest = card.entries[0];
   const instruction =
     latest?.kind === "commit"
@@ -193,7 +281,9 @@ export function linkedWorkItemActivityPrompt(
         ? "Address the new feedback and continue the work where needed."
         : "Review the latest update and continue the work where needed.";
   const details = card.entries.slice(0, 12).map((entry) => {
-    const actor = entry.author ? ` by @${entry.author}` : "";
+    const actor = entry.author
+      ? ` by ${linkedWorkItemAuthorLabel(card.provider, entry.author)}`
+      : "";
     const type =
       entry.kind === "review_comment" ? "review comment" : entry.kind;
     return `- ${type}${actor}: ${entry.text || "No message"}`;
@@ -206,9 +296,9 @@ export function linkedWorkItemActivityPrompt(
   const context = [
     instruction,
     "",
-    `The linked GitHub ${kind} has new activity:`,
+    `The linked ${provider} ${noun} has new activity:`,
     "",
-    `#${card.number} ${card.title}`,
+    `${card.identifier ?? `#${card.number}`} ${card.title}`,
     card.url,
     "",
     ...details,

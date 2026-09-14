@@ -401,9 +401,11 @@ export async function githubWorkItemThread(
   cwd: string,
   kind: GithubTaskKind,
   number: number,
-  options?: { force?: boolean },
+  options?: { force?: boolean; repo?: string },
 ): Promise<GithubWorkItemThread> {
-  const key = detailsCacheKey(cwd, kind, number);
+  const key = options?.repo
+    ? `${detailsCacheKey(cwd, kind, number)}:${options.repo.trim().toLowerCase()}`
+    : detailsCacheKey(cwd, kind, number);
   if (options?.force) {
     threadByKey.delete(key);
     threadInflight.delete(key);
@@ -412,6 +414,7 @@ export async function githubWorkItemThread(
   if (pending) return pending;
   const promise = invoke<GithubWorkItemThread>("git_github_work_item_thread", {
     cwd,
+    repo: options?.repo ?? "",
     kind,
     number,
   })
@@ -782,7 +785,7 @@ async function fetchLinearInboxItems(query: InboxQuery): Promise<InboxItem[]> {
     .map(linearIssueToInboxItem);
 }
 
-function linearIssueToInboxItem(issue: LinearIssue): InboxItem {
+export function linearIssueToInboxItem(issue: LinearIssue): InboxItem {
   return {
     account: issue.account,
     provider: "linear",
@@ -807,7 +810,7 @@ function linearIssueToInboxItem(issue: LinearIssue): InboxItem {
   };
 }
 
-function gitlabWorkItemToInboxItem(
+export function gitlabWorkItemToInboxItem(
   item: GitlabWorkItem,
   projectPath: string,
   repo: string,
@@ -1076,6 +1079,10 @@ export type InboxComposerCard = {
   provider: InboxProvider;
   kind: InboxKind;
   identifier: string;
+  /** Provider-side item id for direct refresh and threads. */
+  id?: string;
+  /** Provider site base URL (Jira/Azure/multi-instance GitLab). */
+  site?: string;
   title: string;
   url: string;
   source: string;
@@ -1093,6 +1100,8 @@ export function inboxComposerCard(
     ...(item.account ? { account: item.account } : {}),
     kind: item.kind,
     identifier: inboxItemRef(item),
+    ...(item.id ? { id: item.id } : {}),
+    ...(item.site ? { site: item.site } : {}),
     title: item.title.trim() || inboxItemRef(item),
     url: item.url.trim(),
     source:

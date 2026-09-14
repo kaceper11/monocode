@@ -266,6 +266,25 @@ pub async fn gitlab_work_item_details(
 }
 
 #[tauri::command]
+pub async fn gitlab_work_item(
+    app: AppHandle,
+    repo: String,
+    kind: String,
+    number: i64,
+) -> Result<GitlabWorkItem, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = require_config(&app)?;
+        let repo = validate_repo(&repo)?;
+        validate_item(&kind, number)?;
+        let response = gitlab_get(&config, &item_path(&repo, &kind, number))?;
+        parse_work_item(&response.value, &kind, &repo)
+            .ok_or_else(|| "GitLab did not return that item".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 pub async fn gitlab_work_item_thread(
     app: AppHandle,
     repo: String,

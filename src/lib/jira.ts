@@ -264,7 +264,7 @@ export async function listJiraIssues(
     throw new Error("Jira connection changed. Refresh and retry.");
   return result.issues.map((issue) => jiraIssue(result.site, issue));
 }
-function key(item: InboxItem) {
+function key(item: Pick<InboxItem, "site" | "id">) {
   return `${item.site}:${item.id}`;
 }
 function retain<T>(cache: Map<string, T>, id: string, value: T) {
@@ -272,6 +272,21 @@ function retain<T>(cache: Map<string, T>, id: string, value: T) {
   cache.set(id, value);
   if (cache.size > 40) cache.delete(cache.keys().next().value!);
 }
+/** Single-issue read used to refresh linked sessions outside the Inbox listing. */
+export async function jiraIssueSnapshot(
+  site: string,
+  id: string,
+): Promise<InboxItem> {
+  const before = generation;
+  const response = await invoke<IssueResponse>("jira_issue_snapshot", {
+    site,
+    id,
+  });
+  if (before !== generation)
+    throw new Error("Jira connection changed. Refresh and retry.");
+  return jiraIssue(site, response);
+}
+
 export function peekJiraDetails(item: InboxItem) {
   return details.get(key(item)) ?? null;
 }
@@ -305,7 +320,7 @@ export async function jiraDetails(
   return result;
 }
 export async function jiraThread(
-  item: InboxItem,
+  item: Pick<InboxItem, "site" | "id" | "url">,
 ): Promise<GithubWorkItemThread> {
   const before = generation;
   const response = await invoke<{

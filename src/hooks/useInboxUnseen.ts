@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  githubWorkItem,
   inboxItemKey,
   inboxProjectsForRail,
   listInboxItems,
-  type GithubWorkItem,
   type InboxItem,
   type InboxQuery,
 } from "../lib/githubTasks";
@@ -23,12 +21,16 @@ import {
 import {
   linkedSessionUpdates,
   linkedWorkItemTargets,
-  linkedWorkItemUpdateKey,
   type LinkedSessionUpdate,
   type LinkedWorkItemTarget,
 } from "../lib/linkedSessionUpdates";
+import { refreshLinkedWorkItem } from "../lib/linkedWorkItemRefresh";
 import {
-  linkedSessionSeenAt,
+  indexByWorkItem,
+  relatedFromIndex,
+} from "../lib/sessionWorkItem";
+import {
+  linkedSessionSeenAll,
   subscribeLinkedSessionSeen,
 } from "../lib/linkedSessionSeen";
 import { loadHiddenLinearTeamIds } from "../lib/linear";
@@ -48,10 +50,10 @@ function seenEntries(items: readonly InboxItem[]): InboxSeenEntry[] {
 }
 
 function mergeSnapshots(
-  current: ReadonlyMap<string, GithubWorkItem>,
-  snapshots: readonly (readonly [string, GithubWorkItem])[],
-): ReadonlyMap<string, GithubWorkItem> {
-  let next: Map<string, GithubWorkItem> | undefined;
+  current: ReadonlyMap<string, InboxItem>,
+  snapshots: readonly (readonly [string, InboxItem])[],
+): ReadonlyMap<string, InboxItem> {
+  let next: Map<string, InboxItem> | undefined;
   for (const [key, item] of snapshots) {
     if (current.get(key)?.updatedAt === item.updatedAt) continue;
     next ??= new Map(current);
@@ -60,29 +62,20 @@ function mergeSnapshots(
   return next ?? current;
 }
 
+/** Direct per-provider reads for linked items missing from the Inbox listing. */
 async function fetchFallbackUpdates(
   cwd: string,
   targets: readonly LinkedWorkItemTarget[],
-): Promise<Array<readonly [string, GithubWorkItem]>> {
-  const results: Array<readonly [string, GithubWorkItem]> = [];
+): Promise<Array<readonly [string, InboxItem]>> {
+  const results: Array<readonly [string, InboxItem]> = [];
   let cursor = 0;
   const worker = async () => {
     while (cursor < targets.length) {
       const target = targets[cursor++];
       if (!target) return;
-      try {
-        const item = await githubWorkItem(
-          cwd,
-          target.item.repo,
-          target.item.kind,
-          target.item.number,
-          { force: true },
-        );
-        if (Number.isFinite(Date.parse(item.updatedAt))) {
-          results.push([target.key, item]);
-        }
-      } catch {
-        // The next shared Inbox poll retries missing items.
+      const item = await refreshLinkedWorkItem(cwd, target.item);
+      if (item && Number.isFinite(Date.parse(item.updatedAt))) {
+        results.push([target.key, item]);
       }
     }
   };
@@ -109,16 +102,18 @@ export function useInboxActivity(
 ): InboxActivity {
   const [unseen, setUnseen] = useState(false);
   const [workItems, setWorkItems] = useState<
-    ReadonlyMap<string, GithubWorkItem>
+    ReadonlyMap<string, InboxItem>
   >(() => new Map());
   const [linkedSeenRevision, setLinkedSeenRevision] = useState(0);
   const entriesRef = useRef<InboxSeenEntry[]>([]);
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
   const fallbackFetchedAt = useRef(new Map<string, number>());
-  const targetKey = linkedWorkItemTargets(sessions)
-    .map((target) => target.key)
-    .join("\0");
+  const targets = useMemo(() => linkedWorkItemTargets(sessions), [sessions]);
+  const targetKey = useMemo(
+    () => targets.map((target) => target.key).join("\0"),
+    [targets],
+  );
 
   const applyUnseen = useCallback((next: boolean) => {
     noteInboxUnseen(next);
@@ -141,11 +136,6 @@ export function useInboxActivity(
 
   useEffect(() => {
     const projects = inboxProjectsForRail(recents, cwd);
-    if (projects.length === 0) {
-      entriesRef.current = [];
-      applyUnseen(false);
-      return;
-    }
 
     let cancelled = false;
     let pulling = false;
@@ -162,7 +152,10 @@ export function useInboxActivity(
         linearHiddenTeamIds: loadHiddenLinearTeamIds(),
       };
       try {
-        const listed = await listInboxItems(projects, query, { force });
+        // No rail projects still refreshes linked items via the fallback.
+        const listed = projects.length
+          ? await listInboxItems(projects, query, { force })
+          : { items: [], errors: {} };
         if (cancelled) return;
         const visible = applyInboxFilters(listed.items, filters, "");
         const entries = seenEntries(visible);
@@ -171,26 +164,24 @@ export function useInboxActivity(
         applyUnseen(inboxHasUnseenItems(entries));
 
         const targets = linkedWorkItemTargets(sessionsRef.current);
-        const targetKeys = new Set(targets.map((target) => target.key));
+        const liveKeys = new Set(targets.map((target) => target.key));
+        for (const key of fallbackFetchedAt.current.keys()) {
+          if (!liveKeys.has(key)) fallbackFetchedAt.current.delete(key);
+        }
+        const index = indexByWorkItem(targets, (target) => [target.item]);
         const listedKeys = new Set<string>();
-        const snapshots: Array<readonly [string, GithubWorkItem]> = [];
+        const snapshots: Array<readonly [string, InboxItem]> = [];
         for (const item of listed.items) {
-          const kind = item.kind;
-          if (
-            item.provider !== "github" ||
-            (kind !== "issue" && kind !== "pr")
-          ) {
-            continue;
-          }
-          const key = linkedWorkItemUpdateKey({
-            repo: item.repo,
-            kind,
-            number: item.number,
-          });
-          if (!targetKeys.has(key)) continue;
-          listedKeys.add(key);
-          if (Number.isFinite(Date.parse(item.updatedAt))) {
-            snapshots.push([key, { ...item, kind }]);
+          if (item.kind === "ci") continue;
+          for (const target of relatedFromIndex(item, index)) {
+            // Azure PR listing rows stamp only creation/close — comment
+            // activity needs the direct thread read in the fallback below.
+            if (target.item.provider === "azure" && target.item.kind === "pr")
+              continue;
+            listedKeys.add(target.key);
+            if (Number.isFinite(Date.parse(item.updatedAt))) {
+              snapshots.push([target.key, item]);
+            }
           }
         }
         if (snapshots.length > 0) {
@@ -234,18 +225,18 @@ export function useInboxActivity(
     };
   }, [applyUnseen, cwd, recents, targetKey]);
 
-  const updates = useMemo(
-    () => linkedSessionUpdates(sessions, workItems, linkedSessionSeenAt),
-    [sessions, workItems, linkedSeenRevision],
-  );
+  const updates = useMemo(() => {
+    const seen = linkedSessionSeenAll();
+    return linkedSessionUpdates(
+      sessions,
+      workItems,
+      (sessionId) => seen[sessionId] ?? 0,
+    );
+  }, [sessions, workItems, linkedSeenRevision]);
+  const updateIds = useMemo(() => new Set(updates.keys()), [updates]);
   return {
     unseen,
     linkedSessionUpdates: updates,
-    linkedSessionUpdateIds: new Set(updates.keys()),
+    linkedSessionUpdateIds: updateIds,
   };
-}
-
-/** Badge-only compatibility wrapper for consumers that do not render sessions. */
-export function useInboxUnseen(recents: RecentProject[], cwd: string): boolean {
-  return useInboxActivity(recents, cwd, []).unseen;
 }

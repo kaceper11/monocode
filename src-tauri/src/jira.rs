@@ -314,6 +314,22 @@ fn numeric_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 30 && id.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// The `issue/{ref}` endpoint also resolves project keys like `PROJ-123`.
+fn issue_ref(id: &str) -> bool {
+    if numeric_id(id) {
+        return true;
+    }
+    let Some((project, number)) = id.split_once('-') else {
+        return false;
+    };
+    !project.is_empty()
+        && project.len() <= 20
+        && project
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && numeric_id(number)
+}
+
 fn issue_query(project: &str, filter: &str, assigned: bool, state: &str) -> Result<String, String> {
     if (!project.is_empty() && !numeric_id(project)) || (!filter.is_empty() && !numeric_id(filter))
     {
@@ -454,7 +470,7 @@ pub async fn jira_issue_content(
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
-        if !numeric_id(&id) {
+        if !issue_ref(&id) {
             return Err("Invalid Jira issue identity".into());
         }
         if comments {
@@ -474,6 +490,31 @@ pub async fn jira_issue_content(
     })
     .await
     .map_err(|_| "Jira details task failed")?
+}
+
+#[tauri::command]
+pub async fn jira_issue_snapshot(
+    app: AppHandle,
+    site: String,
+    id: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = require_config(&app, &site)?;
+        if !issue_ref(&id) {
+            return Err("Invalid Jira issue identity".into());
+        }
+        request(
+            &config,
+            &format!("issue/{id}"),
+            &[(
+                "fields",
+                "summary,status,updated,project,labels,assignee".into(),
+            )],
+        )
+        .map_err(String::from)
+    })
+    .await
+    .map_err(|_| "Jira snapshot task failed")?
 }
 
 /// Directional link wording stays provider-native; the key only picks a group.
@@ -539,7 +580,7 @@ pub async fn jira_issue_relations(
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
-        if !numeric_id(&id) {
+        if !issue_ref(&id) {
             return Err("Invalid Jira issue identity".into());
         }
         let issue = request(
@@ -577,7 +618,7 @@ pub async fn jira_image(
 ) -> Result<tauri::ipc::Response, String> {
     let bytes = tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
-        if !numeric_id(&id) || !numeric_id(&attachment_id) {
+        if !issue_ref(&id) || !numeric_id(&attachment_id) {
             return Err("Invalid Jira image identity".into());
         }
         let issue = request(
@@ -663,6 +704,23 @@ mod tests {
         assert!(issue_query("12 OR 1=1", "", true, "all").is_err());
         assert!(issue_query("", "secret", true, "all").is_err());
         assert!(!numeric_id("../myself"));
+        for id in ["10042", "PROJ-123", "PROJ_2-1"] {
+            assert!(issue_ref(id), "expected {id} to be accepted");
+        }
+        for id in [
+            "",
+            "../myself",
+            "-1",
+            "PROJ-",
+            "PROJ-1-2",
+            "proj-1",
+            "PROJ 1-1",
+            "PROJ-12x",
+            "PROJ-1/x",
+            "PROJ-1?fields=x",
+        ] {
+            assert!(!issue_ref(id), "expected {id} to be rejected");
+        }
         assert!(http_error(401).contains("Reconnect"));
         assert!(http_error(403).contains("permissions"));
     }

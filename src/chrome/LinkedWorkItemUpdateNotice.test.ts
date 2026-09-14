@@ -13,6 +13,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl }));
 vi.mock("../lib/sounds", () => ({ playCue }));
 
 const baseCard: LinkedWorkItemUpdateCard = {
+  provider: "github",
   kind: "pr",
   repo: "acme/app",
   number: 42,
@@ -145,7 +146,7 @@ describe("linked work item update notice", () => {
     });
 
     const notice = document.body.querySelector<HTMLElement>(
-      'section[aria-label="New activity on Pull request 42"]',
+      'section[aria-label="New activity on Pull request #42"]',
     );
     expect(notice?.classList.contains("isolate")).toBe(true);
     expect(notice?.classList.contains("bg-content/10")).toBe(false);
@@ -154,7 +155,7 @@ describe("linked work item update notice", () => {
     expect(document.body.textContent).toContain("1 new comment");
     expect(
       button("Dismiss").nextElementSibling?.getAttribute("aria-label"),
-    ).toBe("Dismiss updates for Pull request 42");
+    ).toBe("Dismiss updates for Pull request #42");
     expect(button("Open discussion").classList.contains("truncate")).toBe(true);
     expect(button("Address with agent").classList).toContain(
       "whitespace-nowrap",

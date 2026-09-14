@@ -231,6 +231,22 @@ export function azureDescription(item: WorkItem) {
     .filter(Boolean)
     .join("\n\n");
 }
+/** Single work-item read used to refresh linked sessions outside the Inbox listing. */
+export async function azureItemSnapshot(
+  site: string,
+  id: string,
+): Promise<InboxItem> {
+  const before = generation;
+  const raw = await invoke<WorkItem>("azure_item_content", {
+    site,
+    id,
+    discussion: false,
+  });
+  if (before !== generation)
+    throw new Error("Azure connection changed. Refresh and retry.");
+  return azureItem(site, raw);
+}
+
 export async function azureDetails(
   item: InboxItem,
 ): Promise<GithubWorkItemDetails> {
@@ -253,7 +269,7 @@ export async function azureDetails(
   return result;
 }
 export async function azureThread(
-  item: InboxItem,
+  item: Pick<InboxItem, "site" | "id" | "url">,
 ): Promise<GithubWorkItemThread> {
   const before = generation;
   const raw = await invoke<{

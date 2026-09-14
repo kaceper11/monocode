@@ -245,6 +245,10 @@ export type LinkedWorkItem = {
   provider?: import("./githubTasks").InboxProvider;
   account?: string;
   identifier?: string;
+  /** Provider-side item id (Jira/Azure/Linear) for direct refresh and threads. */
+  id?: string;
+  /** Provider site base URL (Jira/Azure/multi-instance GitLab). */
+  site?: string;
   title?: string;
   /** Captured ticket context, retained after sending and reopening. */
   context?: string;

@@ -1739,14 +1739,16 @@ pub struct GitHubWorkItemThread {
 }
 
 /// Conversation for the inbox detail pane: comments, reviews, and review threads.
+/// `repo` pins the repository for cross-repo linked items; empty resolves from cwd.
 #[tauri::command]
 pub async fn git_github_work_item_thread(
     cwd: String,
+    repo: String,
     kind: String,
     number: i64,
 ) -> Result<GitHubWorkItemThread, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        git_github_work_item_thread_for(&expand_home(&cwd), &kind, number)
+        git_github_work_item_thread_for(&expand_home(&cwd), &repo, &kind, number)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3262,6 +3264,7 @@ mutation InboxReviewReply($threadId: ID!, $body: String!) {
 
 fn git_github_work_item_thread_for(
     root: &Path,
+    repo: &str,
     kind: &str,
     number: i64,
 ) -> Result<GitHubWorkItemThread, String> {
@@ -3272,7 +3275,11 @@ fn git_github_work_item_thread_for(
     if number <= 0 {
         return Err("Invalid GitHub item number".into());
     }
-    let repo = git_github_repo_for(root)?;
+    let repo = if repo.trim().is_empty() {
+        git_github_repo_for(root)?
+    } else {
+        repo.trim().to_string()
+    };
     let (owner, name) = split_github_repo(&repo)?;
     let query = if kind == "pr" {
         GITHUB_PR_THREAD_QUERY

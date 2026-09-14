@@ -127,6 +127,8 @@ export function linkedWorkItemFromInboxItem(
     url: item.url,
     identifier: item.identifier,
     title: item.title,
+    ...(item.id ? { id: item.id } : {}),
+    ...(item.site ? { site: item.site } : {}),
   };
 }
 
@@ -148,7 +150,7 @@ export function inboxItemMatchesLinkedWorkItem(
 
 /** Same key used by Inbox selection, without synthesizing a full Inbox item. */
 export function linkedWorkItemInboxKey(linked: LinkedWorkItem): string {
-  return `${linked.provider ?? "github"}:${inboxIdentityKey({ ...linked, id: linked.identifier })}`;
+  return `${linked.provider ?? "github"}:${inboxIdentityKey(linked)}`;
 }
 
 /** Find local sessions whose persisted GitHub identity matches an Inbox row. */
@@ -219,7 +221,7 @@ export function openInboxCard(card: InboxComposerCard) {
   const github = card.provider === "github" ? parseGithubWorkItemUrl(card.url) : null;
   const number = github?.number ?? Number(card.identifier.match(/\d+$/)?.[0]);
   if (!validNumber(number)) return;
-  const item: LinkedWorkItem = { provider: card.provider, account: card.account, kind: card.kind === "pr" ? "pr" : "issue", repo: github?.repo ?? card.source, number, url: card.url, identifier: card.identifier, title: card.title };
+  const item: LinkedWorkItem = { provider: card.provider, account: card.account, kind: card.kind === "pr" ? "pr" : "issue", repo: github?.repo ?? card.source, number, url: card.url, identifier: card.identifier, title: card.title, ...(card.id ? { id: card.id } : {}), ...(card.site ? { site: card.site } : {}) };
   window.dispatchEvent(new CustomEvent(OPEN_INBOX_WORK_ITEM, { detail: item }));
 }
 

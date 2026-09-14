@@ -150,7 +150,9 @@ pub async fn linear_list_issues(
         let filter = issue_filter(assigned_to_me, &state, &team_ids);
         let data = graphql_with_token(
             &token,
-            ISSUES_QUERY,
+            &issue_row_query(
+                "query InboxIssues($first: Int!, $filter: IssueFilter) {\n  viewer { id }\n  issues(first: $first, filter: $filter, orderBy: updatedAt) {\n    nodes { ...IssueRow }\n  }\n}",
+            ),
             json!({ "first": limit, "filter": filter }),
         )?;
         parse_linear_issues(&data)
@@ -172,6 +174,36 @@ pub async fn linear_issue_details(
         }
         let data = graphql_with_token(&token, ISSUE_QUERY, json!({ "id": id }))?;
         parse_linear_issue_details(&data)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn linear_issue_snapshot(app: AppHandle, id: String) -> Result<LinearIssue, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = require_token(&app)?;
+        let id = id.trim();
+        if !valid_linear_id(id) {
+            return Err("Missing Linear issue".into());
+        }
+        let data = graphql_with_token(
+            &token,
+            &issue_row_query(
+                "query InboxIssueSnapshot($id: String!) {\n  viewer { id }\n  issue(id: $id) { ...IssueRow }\n}",
+            ),
+            json!({ "id": id }),
+        )?;
+        let account = data
+            .pointer("/viewer/id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut item = data
+            .get("issue")
+            .and_then(parse_linear_issue)
+            .ok_or_else(|| "Linear did not return that issue".to_string())?;
+        item.account = account.to_owned();
+        Ok(item)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -269,7 +301,13 @@ pub async fn linear_issue_relations(app: AppHandle, id: String) -> Result<Value,
         if !valid_linear_id(id) {
             return Err("Missing Linear issue".into());
         }
-        let data = graphql_with_token(&token, RELATIONS_QUERY, json!({ "id": id }))?;
+        let data = graphql_with_token(
+            &token,
+            &issue_row_query(
+                "query InboxIssueRelations($id: String!) {\n  issue(id: $id) {\n    parent { ...IssueRow }\n    children(first: 50) {\n      pageInfo { hasNextPage }\n      nodes { ...IssueRow }\n    }\n    relations(first: 50) {\n      pageInfo { hasNextPage }\n      nodes { type relatedIssue { ...IssueRow } }\n    }\n    inverseRelations(first: 50) {\n      pageInfo { hasNextPage }\n      nodes { type issue { ...IssueRow } }\n    }\n  }\n}",
+            ),
+            json!({ "id": id }),
+        )?;
         parse_linear_relations(&data)
     })
     .await
@@ -322,26 +360,21 @@ query {
   }
 }
 "#;
-const ISSUES_QUERY: &str = r#"
-query InboxIssues($first: Int!, $filter: IssueFilter) {
-  viewer { id }
-  issues(first: $first, filter: $filter, orderBy: updatedAt) {
-    nodes {
-      id
-      identifier
-      number
-      title
-      url
-      updatedAt
-      state { name type }
-      team { id key name }
-      project { id name }
-      labels { nodes { name color } }
-      assignee { name displayName avatarUrl }
-    }
-  }
+/// Shared Inbox row shape — one fragment definition behind every query that
+/// maps results through `parse_linear_issue`.
+const ISSUE_ROW_FRAGMENT: &str = r#"fragment IssueRow on Issue {
+  id identifier number title url updatedAt
+  state { name type }
+  team { id key name }
+  project { id name }
+  labels { nodes { name color } }
+  assignee { name displayName avatarUrl }
+}"#;
+
+fn issue_row_query(body: &str) -> String {
+    format!("{ISSUE_ROW_FRAGMENT}\n{body}")
 }
-"#;
+
 const ISSUE_QUERY: &str = r#"
 query InboxIssue($id: String!) {
   issue(id: $id) {
@@ -364,33 +397,6 @@ query InboxIssueComments($id: String!) {
         user { name displayName avatarUrl }
         parent { id }
       }
-    }
-  }
-}
-"#;
-const RELATIONS_QUERY: &str = r#"
-fragment IssueRow on Issue {
-  id identifier number title url updatedAt
-  state { name type }
-  team { id key name }
-  project { id name }
-  labels { nodes { name color } }
-  assignee { name displayName avatarUrl }
-}
-query InboxIssueRelations($id: String!) {
-  issue(id: $id) {
-    parent { ...IssueRow }
-    children(first: 50) {
-      pageInfo { hasNextPage }
-      nodes { ...IssueRow }
-    }
-    relations(first: 50) {
-      pageInfo { hasNextPage }
-      nodes { type relatedIssue { ...IssueRow } }
-    }
-    inverseRelations(first: 50) {
-      pageInfo { hasNextPage }
-      nodes { type issue { ...IssueRow } }
     }
   }
 }

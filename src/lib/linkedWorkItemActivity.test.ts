@@ -14,6 +14,7 @@ const update: LinkedSessionUpdate = {
   since: Date.parse("2026-09-13T10:00:00Z"),
   updatedAt: Date.parse("2026-09-13T12:00:00Z"),
   item: {
+    provider: "github",
     kind: "pr",
     repo: "acme/app",
     number: 42,
@@ -24,6 +25,7 @@ const update: LinkedSessionUpdate = {
     labels: [],
     assignees: [],
     draft: false,
+    projectPath: "",
   },
 };
 
@@ -118,5 +120,140 @@ describe("linked work item activity card", () => {
     expect(linkedWorkItemTerminalState({ kind: "issue", state: "open" })).toBe(
       undefined,
     );
+  });
+});
+
+describe("provider-specific activity", () => {
+  const gitlabUpdate: LinkedSessionUpdate = {
+    ...update,
+    item: {
+      ...update.item,
+      provider: "gitlab",
+      url: "https://gitlab.example.com/acme/app/-/merge_requests/42",
+    },
+  };
+
+  it("labels GitLab notes as comments and uses merge-request wording", () => {
+    const card = completeLinkedWorkItemUpdateCard(
+      pendingLinkedWorkItemUpdateCard(gitlabUpdate),
+      {
+        comments: [
+          {
+            id: "discussion",
+            kind: "comment",
+            author: "maya",
+            body: "A blocking discussion",
+            createdAt: "2026-09-13T11:30:00Z",
+            url: "",
+            state: "",
+            path: "",
+            line: null,
+            resolved: false,
+            threadId: "d1",
+            replies: [],
+          },
+          {
+            id: "diff-note",
+            kind: "comment",
+            author: "nik",
+            body: "Rename this",
+            createdAt: "2026-09-13T11:40:00Z",
+            url: "",
+            state: "",
+            path: "",
+            line: null,
+            resolved: false,
+            threadId: "d2",
+            replies: [],
+          },
+        ],
+        commits: [],
+        truncated: false,
+        reviewDecision: "",
+        baseRefName: "",
+        headRefName: "",
+      },
+    );
+
+    expect(card.entries.map((entry) => entry.kind)).toEqual([
+      "comment",
+      "comment",
+    ]);
+    expect(card.counts).toEqual({ comments: 2, reviews: 0, commits: 0 });
+    expect(linkedWorkItemActivityPrompt(card)).toContain(
+      "The linked GitLab merge request has new activity",
+    );
+  });
+
+  it("recognizes Jira, Azure and Linear terminal states", () => {
+    expect(
+      linkedWorkItemTerminalState({
+        provider: "jira",
+        kind: "issue",
+        state: "Done",
+        stateType: "done",
+      }),
+    ).toBe("issue_closed");
+    expect(
+      linkedWorkItemTerminalState({
+        provider: "jira",
+        kind: "issue",
+        state: "In Progress",
+        stateType: "indeterminate",
+      }),
+    ).toBeUndefined();
+    expect(
+      linkedWorkItemTerminalState({
+        provider: "azure",
+        kind: "issue",
+        state: "Resolved",
+        stateType: "completed",
+      }),
+    ).toBe("issue_closed");
+    expect(
+      linkedWorkItemTerminalState({
+        provider: "linear",
+        kind: "issue",
+        state: "Canceled",
+        stateType: "canceled",
+      }),
+    ).toBe("issue_closed");
+    expect(
+      linkedWorkItemTerminalState({
+        provider: "azure",
+        kind: "pr",
+        state: "merged",
+        stateType: "completed",
+      }),
+    ).toBe("pr_merged");
+    expect(
+      linkedWorkItemTerminalState({
+        provider: "azure",
+        kind: "pr",
+        state: "closed",
+        stateType: "removed",
+      }),
+    ).toBe("pr_closed");
+  });
+
+  it("uses provider nouns and identifiers in the agent prompt", () => {
+    const jiraCard = completeLinkedWorkItemUpdateCard(
+      pendingLinkedWorkItemUpdateCard({
+        ...update,
+        item: {
+          ...update.item,
+          provider: "jira",
+          kind: "jira",
+          identifier: "PROJ-123",
+          url: "https://acme.atlassian.net/browse/PROJ-123",
+        },
+      }),
+      { ...thread, commits: [] },
+    );
+
+    const prompt = linkedWorkItemActivityPrompt(jiraCard);
+    expect(prompt).toContain("The linked Jira issue has new activity");
+    expect(prompt).toContain("PROJ-123");
+    expect(jiraCard.identifier).toBe("PROJ-123");
   });
 });

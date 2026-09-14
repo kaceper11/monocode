@@ -534,7 +534,11 @@ import {
   pendingLinkedWorkItemUpdateCard,
   type LinkedWorkItemUpdateCard,
 } from "./lib/linkedWorkItemActivity";
-import type { LinkedSessionUpdate } from "./lib/linkedSessionUpdates";
+import {
+  linkedWorkItemIdentityChanged,
+  type LinkedSessionUpdate,
+} from "./lib/linkedSessionUpdates";
+import { fetchLinkedWorkItemThread } from "./lib/linkedWorkItemRefresh";
 import { markLinkedSessionUpdateSeen } from "./lib/linkedSessionSeen";
 import { linearIssueDetails, peekLinearIssueDetails } from "./lib/linear";
 import { jiraDetails, peekJiraDetails } from "./lib/jira";
@@ -2144,7 +2148,10 @@ export default function App({
     const context = selected ? await contextFromTicketDescriptions([item]) : undefined;
     const current = sessionsRef.current.find(entry => entry.id === sessionId);
     if (!current) throw new Error("Conversation closed.");
-    const next = context ? linkTicketContext(current, context) : removeSessionWorkItem(current, link);
+    const base = context ? linkTicketContext(current, context) : removeSessionWorkItem(current, link);
+    const next = linkedWorkItemIdentityChanged(current.linkedWorkItem, base.linkedWorkItem)
+      ? { ...base, linkedWorkItemUpdateCard: undefined }
+      : base;
     if (!selected && next.contextDraft) {
       const entries = next.contextDraft.entries.filter(entry => entry.workItem?.url !== link.url || entry.workItem?.account !== link.account);
       next.contextDraft = entries.length || next.contextDraft.attachments.length ? { ...next.contextDraft, entries } : undefined;
@@ -3470,12 +3477,7 @@ export default function App({
           : undefined,
       );
 
-      void githubWorkItemThread(
-        session.cwd,
-        session.linkedWorkItem.kind,
-        session.linkedWorkItem.number,
-        { force: true },
-      ).then(
+      void fetchLinkedWorkItemThread(session.cwd, update.linked).then(
         (thread) => {
           if (
             linkedWorkItemActivityFetches.current.get(sessionId) !==
@@ -5717,6 +5719,11 @@ export default function App({
         lastActiveChildId: host.id,
       }));
       setActiveTabId(tab.id);
+      // Match every other session reveal: the spawn may land while an
+      // overlay or the project terminal holds focus.
+      dismissOverlays();
+      setProjectTerminalFocused(false);
+      setComposerFocused(true);
       // The brief lands as the session's first message; a failed send is
       // recorded by leaving briefSentFor unset so a later open resends it.
       const sent = await onSubmit(
@@ -5741,6 +5748,7 @@ export default function App({
     },
     [
       appendTab,
+      dismissOverlays,
       onSelectHistorySession,
       onSubmit,
       taskSessionAlive,
@@ -6024,11 +6032,16 @@ export default function App({
             ...(task?.children.flatMap((entry) => entry.sessionIds) ?? []),
           ];
           if (sessionIds.length) {
-            const next = sessionsRef.current.map((session) =>
-              sessionIds.includes(session.id)
-                ? addSessionWorkItems(session, [linked])
-                : session,
-            );
+            const next = sessionsRef.current.map((session) => {
+              if (!sessionIds.includes(session.id)) return session;
+              const updated = addSessionWorkItems(session, [linked]);
+              return linkedWorkItemIdentityChanged(
+                session.linkedWorkItem,
+                updated.linkedWorkItem,
+              )
+                ? { ...updated, linkedWorkItemUpdateCard: undefined }
+                : updated;
+            });
             sessionsRef.current = next;
             setSessions(next);
           }
@@ -6862,11 +6875,19 @@ export default function App({
       // Notification clicks and approval toasts can fire while an overlay is
       // open — always reveal the session.
       dismissOverlays();
-      if (!focusOpenSession(sessionId)) {
+      if (focusOpenSession(sessionId)) {
+        const linkedUpdate = linkedSessionUpdatesRef.current.get(sessionId);
+        if (linkedUpdate) revealLinkedSessionUpdate(sessionId, linkedUpdate);
+      } else {
         void onSelectHistorySession(sessionId);
       }
     },
-    [dismissOverlays, focusOpenSession, onSelectHistorySession],
+    [
+      dismissOverlays,
+      focusOpenSession,
+      onSelectHistorySession,
+      revealLinkedSessionUpdate,
+    ],
   );
 
   const nextTitleTabs: TitleTab[] = deckProjectTabs.map((tab) =>
@@ -8513,7 +8534,7 @@ export default function App({
           />
         </Modal>
       ) : null}
-      {wslPickerOpen && <WslProjectDialog cwd={projectCwd} onOpen={selectProject} onClose={() => setWslPickerOpen(false)} />}
+      {wslPickerOpen && <WslProjectDialog cwd={projectCwd} onOpen={(paths) => { if (paths[0]) selectProject(paths[0]); }} onClose={() => setWslPickerOpen(false)} />}
       {taskSheet && (
         <TaskCreateSheet
           projectId={taskSheet.projectId}
@@ -8523,7 +8544,7 @@ export default function App({
           initialBrief={taskSheet.initialBrief}
           initialChildren={taskSheet.initialChildren}
           onCreated={(taskId) => {
-            armTaskFocus(taskId);
+            onOpenTask(taskId);
             setProjectRailOpen((open) => {
               if (open) return open;
               saveProjectRailOpen(true);
@@ -8541,7 +8562,17 @@ export default function App({
             if (!ids.size) return;
             const next = sessionsRef.current.map((session) =>
               ids.has(session.id)
-                ? { ...session, title: task.name, linkedWorkItem: task.ticket }
+                ? {
+                    ...session,
+                    title: task.name,
+                    linkedWorkItem: task.ticket,
+                    ...(linkedWorkItemIdentityChanged(
+                      session.linkedWorkItem,
+                      task.ticket,
+                    )
+                      ? { linkedWorkItemUpdateCard: undefined }
+                      : {}),
+                  }
                 : session,
             );
             sessionsRef.current = next;

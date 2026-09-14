@@ -136,6 +136,46 @@ describe("sanitizeSessionForPersist", () => {
     });
   });
 
+  it("keeps provider identity fields needed for direct refresh", () => {
+    const session = newSession("codex", "/tmp/project");
+    session.blocks = [{ id: "u1", role: "user", text: "fix PROJ-123" }];
+    session.linkedWorkItem = {
+      provider: "jira",
+      kind: "issue",
+      repo: "",
+      number: 123,
+      url: "https://team.atlassian.net/browse/PROJ-123",
+      identifier: "PROJ-123",
+      id: "10042",
+      site: "https://team.atlassian.net",
+    };
+
+    expect(sanitizeSessionForPersist(session).linkedWorkItem).toMatchObject({
+      provider: "jira",
+      identifier: "PROJ-123",
+      id: "10042",
+      site: "https://team.atlassian.net",
+    });
+  });
+
+  it("drops a linked site that is not an https URL", () => {
+    const session = newSession("codex", "/tmp/project");
+    session.blocks = [{ id: "u1", role: "user", text: "fix PROJ-123" }];
+    session.linkedWorkItem = {
+      provider: "jira",
+      kind: "issue",
+      repo: "",
+      number: 123,
+      url: "https://team.atlassian.net/browse/PROJ-123",
+      identifier: "PROJ-123",
+      site: "http://team.atlassian.net",
+    };
+
+    expect(
+      sanitizeSessionForPersist(session).linkedWorkItem?.site,
+    ).toBeUndefined();
+  });
+
   it("omits a path-like provider session id so upsert can still snapshot git", () => {
     const session = newSession("pi", "/tmp/project");
     session.providerSessionId = "/Users/me/.pi/agent/sessions/abc.jsonl";

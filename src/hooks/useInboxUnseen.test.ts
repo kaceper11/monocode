@@ -7,14 +7,20 @@ import type { SessionSummary } from "../lib/sessionStore";
 import { markLinkedSessionUpdateSeen } from "../lib/linkedSessionSeen";
 import { useInboxActivity, type InboxActivity } from "./useInboxUnseen";
 
-const { githubWorkItem, listInboxItems } = vi.hoisted(() => ({
-  githubWorkItem: vi.fn(),
-  listInboxItems: vi.fn(),
-}));
+const { githubWorkItem, listInboxItems, refreshLinkedWorkItem } = vi.hoisted(
+  () => ({
+    githubWorkItem: vi.fn(),
+    listInboxItems: vi.fn(),
+    refreshLinkedWorkItem: vi.fn(),
+  }),
+);
 vi.mock("../lib/githubTasks", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../lib/githubTasks")>()),
   githubWorkItem,
   listInboxItems,
+}));
+vi.mock("../lib/linkedWorkItemRefresh", () => ({
+  refreshLinkedWorkItem,
 }));
 vi.mock("../lib/sounds", () => ({ noteInboxUnseen: vi.fn() }));
 
@@ -53,7 +59,7 @@ let root: Root;
 let container: HTMLDivElement;
 let activity: InboxActivity;
 const recents = [];
-const sessions = [session];
+let sessions = [session];
 
 function Harness() {
   activity = useInboxActivity(recents, "/tmp/app", sessions);
@@ -71,6 +77,11 @@ beforeEach(() => {
   localStorage.clear();
   listInboxItems.mockReset();
   githubWorkItem.mockReset();
+  refreshLinkedWorkItem.mockReset();
+  refreshLinkedWorkItem.mockImplementation(async (_cwd, linked) =>
+    githubWorkItem("/tmp/app", linked.repo, linked.kind, linked.number),
+  );
+  sessions = [session];
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -100,13 +111,110 @@ describe("Inbox activity polling", () => {
 
     expect(activity.linkedSessionUpdateIds.has(session.id)).toBe(true);
     expect(listInboxItems).toHaveBeenCalledTimes(1);
-    expect(githubWorkItem).toHaveBeenCalledExactlyOnceWith(
+    expect(refreshLinkedWorkItem).toHaveBeenCalledExactlyOnceWith(
       "/tmp/app",
-      "acme/app",
-      "pr",
-      42,
-      { force: true },
+      session.linkedWorkItem,
     );
+  });
+
+  it("matches linked GitLab items from the shared Inbox listing", async () => {
+    const gitlabItem: InboxItem = {
+      ...remote,
+      provider: "gitlab",
+      url: "https://gitlab.example.com/acme/app/-/merge_requests/42",
+    };
+    sessions = [
+      {
+        ...session,
+        id: "gitlab-session",
+        linkedWorkItem: {
+          provider: "gitlab",
+          kind: "pr",
+          repo: "acme/app",
+          number: 42,
+          url: gitlabItem.url,
+        },
+      },
+    ];
+    listInboxItems.mockResolvedValue({ items: [gitlabItem], errors: {} });
+    await mount();
+
+    expect(activity.linkedSessionUpdateIds.has("gitlab-session")).toBe(true);
+    expect(refreshLinkedWorkItem).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a provider refresh for linked items outside the listing", async () => {
+    const jiraLinked = {
+      provider: "jira" as const,
+      kind: "issue" as const,
+      repo: "",
+      number: 123,
+      url: "https://acme.atlassian.net/browse/PROJ-123",
+      identifier: "PROJ-123",
+      site: "https://acme.atlassian.net",
+      id: "10042",
+    };
+    sessions = [
+      { ...session, id: "jira-session", linkedWorkItem: jiraLinked },
+    ];
+    listInboxItems.mockResolvedValue({ items: [], errors: {} });
+    refreshLinkedWorkItem.mockResolvedValue({
+      ...remote,
+      provider: "jira",
+      kind: "jira",
+      url: jiraLinked.url,
+      identifier: "PROJ-123",
+      id: "10042",
+      site: jiraLinked.site,
+    });
+    await mount();
+
+    expect(refreshLinkedWorkItem).toHaveBeenCalledWith("/tmp/app", jiraLinked);
+    expect(activity.linkedSessionUpdateIds.has("jira-session")).toBe(true);
+  });
+
+  it("always refreshes Azure PRs directly — listing stamps miss comments", async () => {
+    const azureUrl =
+      "https://dev.azure.com/org/project-id/_git/repo-id/pullrequest/7";
+    const azureLinked = {
+      provider: "azure" as const,
+      kind: "pr" as const,
+      repo: "repo",
+      number: 7,
+      url: azureUrl,
+      site: "https://dev.azure.com/org",
+      id: "7",
+    };
+    sessions = [
+      { ...session, id: "azure-session", linkedWorkItem: azureLinked },
+    ];
+    // The delivery row lists the PR but stamps only creation/close dates.
+    listInboxItems.mockResolvedValue({
+      items: [
+        {
+          ...remote,
+          provider: "azure",
+          kind: "pr",
+          number: 7,
+          url: azureUrl,
+          site: azureLinked.site,
+          updatedAt: "2026-09-13T09:00:00Z",
+        },
+      ],
+      errors: {},
+    });
+    refreshLinkedWorkItem.mockResolvedValue({
+      ...remote,
+      provider: "azure",
+      kind: "pr",
+      number: 7,
+      url: azureUrl,
+      site: azureLinked.site,
+    });
+    await mount();
+
+    expect(refreshLinkedWorkItem).toHaveBeenCalledWith("/tmp/app", azureLinked);
+    expect(activity.linkedSessionUpdateIds.has("azure-session")).toBe(true);
   });
 
   it("clears a linked-session update as soon as its remote snapshot is read", async () => {

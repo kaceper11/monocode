@@ -39,6 +39,11 @@ export function linkedSessionSeenAt(sessionId: string): number {
   return loadSeenMap()[sessionId] ?? 0;
 }
 
+/** Whole map in one localStorage read — for callers scoring many sessions. */
+export function linkedSessionSeenAll(): Readonly<SeenMap> {
+  return loadSeenMap();
+}
+
 /** Remember the exact remote snapshot acknowledged for this session. */
 export function markLinkedSessionUpdateSeen(
   sessionId: string,

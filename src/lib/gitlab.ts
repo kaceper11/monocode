@@ -213,6 +213,14 @@ export async function gitlabWorkItemDetails(
   return details;
 }
 
+export async function gitlabWorkItem(
+  repo: string,
+  kind: GitlabKind,
+  number: number,
+): Promise<GitlabWorkItem> {
+  return invoke<GitlabWorkItem>("gitlab_work_item", { repo, kind, number });
+}
+
 export function peekGitlabWorkItemThread(
   repo: string,
   kind: GitlabKind,

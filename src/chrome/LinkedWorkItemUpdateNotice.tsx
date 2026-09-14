@@ -4,20 +4,22 @@ import { createPortal } from "react-dom";
 import { LAYER } from "../lib/layers";
 import {
   linkedWorkItemActivityPrompt,
+  linkedWorkItemAuthorLabel,
+  linkedWorkItemNoun,
+  linkedWorkItemProviderName,
   linkedWorkItemTerminalState,
   linkedWorkItemUpdateSummary,
   type LinkedWorkItemActivityEntry,
   type LinkedWorkItemUpdateCard,
 } from "../lib/linkedWorkItemActivity";
+import { InboxProviderMark } from "./InboxProviderMark";
 import { formatRelativeTime } from "../lib/githubTasks";
 import { playCue } from "../lib/sounds";
 import {
   Archive,
   Check,
-  CircleDot,
   GitBranch,
   GitMerge,
-  GitPullRequest,
   GitPullRequestClosed,
   Loader,
   MessageSquare,
@@ -90,15 +92,19 @@ export function LinkedWorkItemUpdateNotice({
   }, [card, onHeightChange]);
   useEffect(() => {
     if (!card || card.status !== "ready") return;
-    const key = `${card.kind}:${card.repo}:${card.number}:${card.updatedAt}`;
+    const key = `${card.provider}:${card.kind}:${card.repo}:${card.number}:${card.updatedAt}`;
     if (soundedCards.current.has(key)) return;
     soundedCards.current.add(key);
     playCue("linkedActivity");
   }, [card]);
   if (!card || card.status === "loading") return null;
 
-  const KindIcon = card.kind === "pr" ? GitPullRequest : CircleDot;
-  const kindLabel = card.kind === "pr" ? "Pull request" : "Issue";
+  const provider = card.provider ?? "github";
+  const providerName = linkedWorkItemProviderName(provider);
+  const kindLabel =
+    linkedWorkItemNoun(provider, card.kind).charAt(0).toUpperCase() +
+    linkedWorkItemNoun(provider, card.kind).slice(1);
+  const itemRef = card.identifier ?? `#${card.number}`;
   const latest = card.entries[0];
   const discussion =
     latest?.kind === "comment" ||
@@ -108,7 +114,7 @@ export function LinkedWorkItemUpdateNotice({
     ? "Open discussion"
     : latest?.kind === "commit"
       ? "Open commit"
-      : `Open ${card.kind === "pr" ? "pull request" : "issue"}`;
+      : `Open ${linkedWorkItemNoun(provider, card.kind)}`;
   const agentLabel = discussion
     ? "Address with agent"
     : latest?.kind === "commit"
@@ -117,11 +123,17 @@ export function LinkedWorkItemUpdateNotice({
   const terminalState = linkedWorkItemTerminalState(card);
   const terminalLabel =
     terminalState === "pr_merged"
-      ? "Pull request merged"
+      ? `${kindLabel} ${provider === "azure" ? "completed" : "merged"}`
       : terminalState === "pr_closed"
-        ? "Pull request closed"
+        ? `${kindLabel} ${provider === "azure" ? "abandoned" : "closed"}`
         : terminalState === "issue_closed"
-          ? "Issue closed"
+          ? `${kindLabel} ${
+              provider === "jira"
+                ? "done"
+                : provider === "linear"
+                  ? "completed"
+                  : "closed"
+            }`
           : "";
   const TerminalIcon =
     terminalState === "pr_merged"
@@ -158,7 +170,7 @@ export function LinkedWorkItemUpdateNotice({
   return createPortal(
     <section
       ref={panelRef}
-      aria-label={`New activity on ${kindLabel} ${card.number}`}
+      aria-label={`New activity on ${kindLabel} ${itemRef}`}
       aria-live="polite"
       style={{ zIndex: LAYER.popover - 1, top: topOffset }}
       className="linked-activity-notice fixed right-3 isolate w-[min(320px,calc(100vw-24px))] overflow-hidden rounded-xl border border-content/10 text-content shadow-xl"
@@ -170,9 +182,12 @@ export function LinkedWorkItemUpdateNotice({
       <div className="relative z-[1] flex items-center justify-between gap-0.5 border-b border-content/10 px-3 py-2">
         <div className="flex items-center gap-1.5">
           <span className="size-2 shrink-0 rounded-full bg-accent" />
-          <KindIcon className="size-3.5 text-content/55" strokeWidth={1.75} />
+          <InboxProviderMark
+            provider={provider}
+            className="size-3.5 shrink-0 text-content/55"
+          />
           <span className="min-w-0 flex-1 truncate text-[12px] font-semibold">
-            GitHub activity
+            {providerName} activity
           </span>
         </div>
         <div className="flex items-center gap-px">
@@ -186,7 +201,7 @@ export function LinkedWorkItemUpdateNotice({
           <button
             type="button"
             title="Dismiss"
-            aria-label={`Dismiss updates for ${kindLabel} ${card.number}`}
+            aria-label={`Dismiss updates for ${kindLabel} ${itemRef}`}
             onClick={dismiss}
             className="grid size-6 place-items-center rounded-md text-content/40 hover:bg-content/10 hover:text-content"
           >
@@ -205,7 +220,12 @@ export function LinkedWorkItemUpdateNotice({
           className="block w-full text-left"
         >
           <span className="block text-[11px] text-content/50">
-            {kindLabel} #{card.number} · {card.repo}
+            {card.identifier
+              ? itemRef
+              : `${kindLabel} ${itemRef}`}
+            {card.project || card.repo
+              ? ` · ${card.project || card.repo}`
+              : ""}
           </span>
           <span className="mt-0.5 block truncate text-[13px] font-medium hover:underline">
             {card.title}
@@ -241,7 +261,7 @@ export function LinkedWorkItemUpdateNotice({
                   </span>
                   {entry.author ? (
                     <span className="min-w-0 truncate text-content/45">
-                      @{entry.author}
+                      {linkedWorkItemAuthorLabel(provider, entry.author)}
                     </span>
                   ) : null}
                   <span className="ml-auto shrink-0 text-content/35">
@@ -254,6 +274,13 @@ export function LinkedWorkItemUpdateNotice({
               </span>
             </button>
           ))}
+          {card.entries.length > 3 || card.truncated ? (
+            <div className="px-3 py-1.5 text-[11px] text-content/40">
+              {card.truncated
+                ? `More on ${providerName} — open the ${linkedWorkItemNoun(provider, card.kind)}`
+                : `+${card.entries.length - 3} more`}
+            </div>
+          ) : null}
         </div>
       ) : null}
 

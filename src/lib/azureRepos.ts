@@ -22,6 +22,10 @@ export type AzurePr = {
   isDraft?: boolean;
   sourceRefName: string;
   targetRefName: string;
+  creationDate?: string;
+  closedDate?: string;
+  repositoryName?: string;
+  projectName?: string;
   lastMergeSourceCommit?: { commitId: string };
   lastMergeTargetCommit?: { commitId: string };
   /** Azure's merge verdict — "conflicts" among others; empty when unknown. */

@@ -144,6 +144,13 @@ export function sanitizeLinkedWorkItem(
   }
   if (typeof item.title === "string") linked.title = item.title.slice(0, 240);
   if (typeof item.identifier === "string") linked.identifier = item.identifier.slice(0, 100);
+  if (typeof item.id === "string") linked.id = item.id.slice(0, 128);
+  if (typeof item.site === "string") {
+    try {
+      const site = new URL(item.site);
+      if (site.protocol === "https:") linked.site = site.origin + site.pathname.replace(/\/+$/, "");
+    } catch { /* drop an invalid site — refresh falls back to the connection */ }
+  }
   if (typeof item.context === "string") linked.context = item.context.slice(0, 32_000);
   const additionalItems = Array.isArray(item.additionalItems) ? item.additionalItems.slice(0, 19).map(value => {
     if (!value || typeof value !== "object") return undefined;

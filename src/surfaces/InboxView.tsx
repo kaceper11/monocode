@@ -94,11 +94,11 @@ import { WindowControls } from "../chrome/WindowControls";
 import { useDragResize } from "../hooks/useDragResize";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import { useTabGroupLogos } from "../hooks/useTabGroupLogos";
+import { refreshLinkedWorkItem } from "../lib/linkedWorkItemRefresh";
 import {
   githubStatus,
   githubPrDiff,
   githubReviewDecisionLabel,
-  githubWorkItem,
   githubWorkItemComment,
   githubWorkItemDetails,
   githubWorkItemThread,
@@ -827,24 +827,18 @@ export function InboxView({
     if (!visible) return;
     if (
       !target ||
-      (target.provider && target.provider !== "github") ||
       items.some((item) => inboxItemMatchesLinkedWorkItem(item, target))
     ) {
       return;
     }
     let cancelled = false;
-    void githubWorkItem(cwd, target.repo, target.kind, target.number)
-      .then((item) => {
-        if (cancelled) return;
-        setTargetItem({
-          ...item,
-          projectPath: cwd,
-          provider: "github",
-        });
-      })
-      .catch(() => {
-        // The normal Inbox remains usable when an exact lookup is unavailable.
+    void refreshLinkedWorkItem(cwd, target).then((item) => {
+      if (cancelled || !item) return;
+      setTargetItem({
+        ...item,
+        projectPath: item.projectPath || cwd,
       });
+    });
     return () => {
       cancelled = true;
     };
