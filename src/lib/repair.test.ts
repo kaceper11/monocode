@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   ciRepair,
   commentsRepair,
+  githubCiRepair,
   validateRepair,
   assertRepairOwner,
   reserveRepair,
@@ -411,4 +412,30 @@ it("prepares comments in a verified PR checkout without retargeting the source c
   vi.mocked(invoke).mockClear();
   await expect(commentsRepair(association, threads, 0, () => !cancelled)).rejects.toThrow("cancelled");
   expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "azure_pr_prepare_checkout")).toBe(false);
+});
+
+it("prepares a verified checkout for a GitHub PR repair instead of rejecting a stale checkout", async () => {
+  localStorage.setItem("monocode.recentProjects", JSON.stringify([{path:"/work/repo",openedAt:1}]));
+  const remote = "https://github.com/acme/app";
+  let existing = true;
+  vi.mocked(invoke).mockImplementation(async (command, raw) => {
+    const args = raw as Record<string, string>;
+    if (command === "git_github_pr_state") return { number: 42, title: "Fix", url: `${remote}/pull/42`, state: "OPEN", headRefOid: "head42", headRefName: "feature", baseRefName: "main", mergeStateStatus: "CLEAN", reviewDecision: "", isDraft: false, checks: [{ name: "build", conclusion: "failure", url: "", outputTitle: "", outputText: "" }] };
+    if (command === "azure_ci_context") {
+      const at = args.cwd === "/work/app-pr-42" || (args.cwd === "/work/repo" && existing);
+      return { cwd: args.cwd, branch: at ? "feature" : "main", commit: at ? "head42" : "old", remotes: [{ name: "origin", url: remote }] };
+    }
+    if (command === "github_pr_prepare_checkout") return "/work/app-pr-42";
+    throw new Error(`Unexpected ${command}`);
+  });
+  // A known checkout already at the PR head is reused — no clone needed.
+  const reused = await githubCiRepair({ cwd: "/work/story", repo: "acme/app", number: 42 });
+  expect(reused.evidence.head.cwd).toBe("/work/repo");
+  expect(vi.mocked(invoke).mock.calls.some(([name]) => name === "github_pr_prepare_checkout")).toBe(false);
+  // With nothing matching, the head is cloned into an isolated checkout —
+  // the stale working copy is never checked out or reset.
+  existing = false;
+  const created = await githubCiRepair({ cwd: "/work/story", repo: "acme/app", number: 42 });
+  expect(created.evidence.head.cwd).toBe("/work/app-pr-42");
+  expect(invoke).toHaveBeenCalledWith("github_pr_prepare_checkout", { cwd: "/work/story", repo: "acme/app", number: 42, expectedRevision: "head42", requestId: expect.any(String) });
 });

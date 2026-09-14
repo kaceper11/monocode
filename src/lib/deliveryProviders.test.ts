@@ -1,10 +1,10 @@
 // @vitest-environment happy-dom
 import { beforeEach, afterEach, expect, it, vi } from "vitest";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { gitPrStatus } from "./fs";
-import { deliveryProvider, saveDeliveryProvider, repositoryProvider, resolvePrProviders, openGitHubDelivery } from "./deliveryProviders";
-vi.mock("@tauri-apps/plugin-opener", () => ({openUrl: vi.fn()}));
+import { githubRepo } from "./githubTasks";
+import { deliveryProvider, saveDeliveryProvider, repositoryProvider, resolvePrProviders, githubDeliveryTarget, parseGithubPrLocation } from "./deliveryProviders";
 vi.mock("./fs", () => ({gitPrStatus: vi.fn()}));
+vi.mock("./githubTasks", () => ({githubRepo: vi.fn()}));
 vi.mock("./gitlab", () => ({gitlabMrForBranch: vi.fn()}));
 beforeEach(() => { const rows = new Map<string, string>(); vi.stubGlobal("localStorage", {getItem:(key:string) => rows.get(key) ?? null, setItem:(key:string,value:string) => rows.set(key,value)}); });
 afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks(); });
@@ -47,6 +47,27 @@ it("keeps PR and CI choices scoped to checkout, branch and conversation", () => 
   saveDeliveryProvider("/repo", "feature", "owner", "ci", "");
   expect(deliveryProvider("/repo", "feature", "owner", "ci")).toBeUndefined();
 });
+it("parses a github.com PR link into an explicit repo + number identity", () => {
+  expect(parseGithubPrLocation("https://github.com/team/repo/pull/42?tab=files"))
+    .toEqual({ repo: "team/repo", number: 42 });
+  expect(parseGithubPrLocation("https://github.com/team/repo/pull/42/"))
+    .toEqual({ repo: "team/repo", number: 42 });
+  expect(() => parseGithubPrLocation("javascript:alert(1)")).toThrow("invalid PR link");
+  expect(() => parseGithubPrLocation("https://github.com.evil.test/a/b/pull/1")).toThrow("invalid PR link");
+  expect(() => parseGithubPrLocation("https://github.com/a/b/pull/")).toThrow("invalid PR link");
+});
+it("resolves the delivery target from a PR link or the branch's open PR", async () => {
+  await expect(githubDeliveryTarget("/repo", "https://github.com/team/repo/pull/7"))
+    .resolves.toEqual({ repo: "team/repo", number: 7 });
+  vi.mocked(gitPrStatus).mockResolvedValue({number:3,title:"Fix",state:"OPEN",url:"https://github.com/team/repo/pull/3"});
+  await expect(githubDeliveryTarget("/repo")).resolves.toEqual({ repo: "team/repo", number: 3 });
+  // A non-standard PR URL still binds to the checkout's own repository.
+  vi.mocked(gitPrStatus).mockResolvedValue({number:4,title:"Fix",state:"OPEN",url:"https://example.test/x"});
+  vi.mocked(githubRepo).mockResolvedValue("team/repo");
+  await expect(githubDeliveryTarget("/repo")).resolves.toEqual({ repo: "team/repo", number: 4 });
+  vi.mocked(gitPrStatus).mockResolvedValue(null);
+  await expect(githubDeliveryTarget("/repo")).rejects.toThrow("No GitHub PR found");
+});
 it("binds GitLab delivery to the project the backend resolved", async () => {
   const { gitlabDeliveryTarget } = await import("./deliveryProviders");
   const { gitlabMrForBranch } = await import("./gitlab");
@@ -57,13 +78,4 @@ it("binds GitLab delivery to the project the backend resolved", async () => {
   await expect(gitlabDeliveryTarget("/repo", "feature")).rejects.toThrow("No open merge request");
   vi.mocked(gitlabMrForBranch).mockResolvedValueOnce({repo: "", number: 7} as never);
   await expect(gitlabDeliveryTarget("/repo", "feature")).rejects.toThrow("does not resolve");
-});
-it("opens the selected GitHub PR/checks and discards stale navigation", async () => {
-  vi.mocked(gitPrStatus).mockResolvedValue({number:3,title:"Fix",state:"OPEN",url:"https://github.com/team/repo/pull/3?tab=files"});
-  await openGitHubDelivery("/repo", "ci", () => true);
-  expect(openUrl).toHaveBeenCalledWith("https://github.com/team/repo/pull/3/checks");
-  vi.mocked(openUrl).mockClear();
-  await openGitHubDelivery("/repo", "pr", () => false);
-  expect(openUrl).not.toHaveBeenCalled();
-  await expect(openGitHubDelivery("/repo", "pr", () => true, "javascript:alert(1)")).rejects.toThrow("invalid PR link");
 });

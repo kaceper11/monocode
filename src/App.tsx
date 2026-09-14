@@ -1,4 +1,4 @@
-import { openGitHubDelivery, gitlabDeliveryTarget, GITLAB_CI_ON_MR, saveDeliveryProvider } from "./lib/deliveryProviders";
+import { githubDeliveryTarget, gitlabDeliveryTarget, GITLAB_CI_ON_MR, saveDeliveryProvider } from "./lib/deliveryProviders";
 import {
   ciContext,
   ciLookup,
@@ -374,6 +374,7 @@ import {
   loadRecents,
   looksLikeProject,
   normalizeProjectPath,
+  OPEN_PROJECT_PATH,
   projectRailItems,
   rememberProject,
   sameProjectPath,
@@ -4259,6 +4260,14 @@ export default function App({
   }, [selectProject]);
 
   const [wslPickerOpen, setWslPickerOpen] = useState(false);
+  useEffect(() => {
+    const open = (event: Event) => {
+      const path = (event as CustomEvent<string>).detail;
+      if (typeof path === "string" && path) onSelectProject(path);
+    };
+    window.addEventListener(OPEN_PROJECT_PATH, open);
+    return () => window.removeEventListener(OPEN_PROJECT_PATH, open);
+  }, [onSelectProject]);
   const pickProject = useCallback(async () => {
     if (IS_WIN) { setWslPickerOpen(true); return; }
     const path = await pickFolder();
@@ -7053,18 +7062,18 @@ export default function App({
     // Reject before saving — a dead CI choice must not persist.
     if (provider === "gitlab" && kind === "ci") throw new Error(GITLAB_CI_ON_MR);
     saveDeliveryProvider(cwd, checkout.branch, sessionId, kind, provider);
-    if (provider === "github") {
-      await openGitHubDelivery(cwd, kind, () => current() && sessionWorkCwd(sessionsRef.current.find(value => value.id === sessionId) ?? session) === cwd, prUrl);
-      return;
-    }
     // GitLab delivery tabs bind to the inbox item's own MR identity when it
     // carries one; otherwise to the open MR for the checkout's branch.
-    const target = provider === "gitlab" ? (gitlabTarget ?? await gitlabDeliveryTarget(cwd, checkout.branch)) : undefined;
+    const target = provider === "github"
+      ? await githubDeliveryTarget(cwd, prUrl)
+      : provider === "gitlab"
+        ? (gitlabTarget ?? await gitlabDeliveryTarget(cwd, checkout.branch))
+        : undefined;
     if (!current() || sessionWorkCwd(sessionsRef.current.find(value => value.id === sessionId) ?? session) !== cwd)
       throw new Error("The conversation checkout changed. Open its review again.");
     const existing = tabsRef.current.find(tab => leafIds(tab.layout).includes(sessionId));
     const base = existing ?? newTab(sessionId);
-    const file = { id: crypto.randomUUID(), path: kind === "pr" ? "Pull requests" : "CI", cwd, delivery: { kind, branch: checkout.branch, sourceSessionId: sessionId, ...(provider === "gitlab" ? { provider: "gitlab" as const, repo: target!.repo, number: target!.number } : {}) } };
+    const file = { id: crypto.randomUUID(), path: kind === "pr" ? "Pull requests" : "CI", cwd, delivery: { kind, branch: checkout.branch, sourceSessionId: sessionId, ...(provider === "github" || provider === "gitlab" ? { provider, repo: target!.repo, number: target!.number } : {}) } };
     if (existing) {
       setTabs(previous => previous.map(tab => tab.id === existing.id ? openEditorTab(tab, file) : tab));
       activateTab(existing.id);

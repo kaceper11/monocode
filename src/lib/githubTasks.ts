@@ -24,6 +24,7 @@ import {
   sameProjectPath,
   type RecentProject,
 } from "./recents";
+import type { UnifiedLine } from "./unifiedDiff";
 
 export type GithubTaskKind = "issue" | "pr";
 export type InboxKind = GithubTaskKind | "ci" | "linear" | "jira" | "azure";
@@ -587,6 +588,61 @@ export async function githubPrDiff(
     });
   prDiffInflight.set(key, promise);
   return promise;
+}
+
+export type GithubReviewEvent = "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
+
+/** One pending inline comment — the anchor GitHub's review API expects. */
+export type GithubReviewCommentDraft = {
+  path: string;
+  line: number;
+  side: "LEFT" | "RIGHT";
+  body: string;
+};
+
+/** A rendered diff line's GitHub review anchor: deletions anchor on the old
+ *  side, additions and context lines on the new. Hunk headers can't anchor. */
+export function githubReviewAnchor(
+  line: UnifiedLine,
+): { line: number; side: "LEFT" | "RIGHT" } | null {
+  if (line.kind === "del") {
+    return line.oldNumber == null
+      ? null
+      : { line: line.oldNumber, side: "LEFT" };
+  }
+  return line.newNumber == null
+    ? null
+    : { line: line.newNumber, side: "RIGHT" };
+}
+
+/**
+ * Submit a formal pull-request review — the event plus all pending inline
+ * comments in one API call, pinned to the head revision the reviewer saw.
+ */
+export async function githubSubmitReview(
+  cwd: string,
+  repo: string,
+  number: number,
+  review: {
+    commitId: string;
+    event: GithubReviewEvent;
+    body: string;
+    comments: GithubReviewCommentDraft[];
+  },
+): Promise<string> {
+  const url = await invoke<string>("git_github_submit_review", {
+    cwd,
+    repo,
+    number,
+    commitId: review.commitId,
+    event: review.event,
+    body: review.body,
+    comments: review.comments,
+  });
+  const key = detailsCacheKey(cwd, "pr", number);
+  threadByKey.delete(key);
+  threadInflight.delete(key);
+  return url;
 }
 
 export async function listInboxItems(

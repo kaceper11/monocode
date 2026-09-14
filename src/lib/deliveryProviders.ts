@@ -1,5 +1,5 @@
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { gitPrStatus } from "./fs";
+import { githubRepo } from "./githubTasks";
 import { parseAzurePrLocation } from "./azureRepos";
 import { gitlabMrForBranch } from "./gitlab";
 
@@ -58,16 +58,48 @@ export function resolvePrProviders(input: {
   const detected = repositoryProvider(input.remotes, upstreamRemote);
   return { detected, effective: input.override ?? detected };
 }
-export async function openGitHubDelivery(cwd: string, kind: "pr" | "ci", current: () => boolean, prUrl?: string) {
-  const url = prUrl ?? (await gitPrStatus(cwd))?.url;
-  if (!current()) return;
-  if (!url) throw new Error("No GitHub PR found for this branch. Open the PR branch or choose another provider.");
-  const target = new URL(url);
-  if (target.protocol !== "https:" || target.username || target.password || !/^\/[^/]+\/[^/]+\/pull\/\d+\/?$/.test(target.pathname)) throw new Error("GitHub returned an invalid PR link.");
-  target.search = "";
-  target.hash = "";
-  target.pathname = target.pathname.replace(/\/$/, "") + (kind === "ci" ? "/checks" : "");
-  await openUrl(target.href);
+
+/** owner/repo + PR number from a `github.com/<owner>/<repo>/pull/<n>` link. */
+export function parseGithubPrLocation(url: string): { repo: string; number: number } {
+  let target: URL;
+  try {
+    target = new URL(url.trim());
+  } catch {
+    throw new Error("GitHub returned an invalid PR link.");
+  }
+  const match = target.pathname.match(/^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)\/?$/);
+  if (
+    target.protocol !== "https:" ||
+    target.hostname !== "github.com" ||
+    target.username ||
+    target.password ||
+    !match
+  )
+    throw new Error("GitHub returned an invalid PR link.");
+  return { repo: `${match[1]}/${match[2]}`, number: Number(match[3]) };
+}
+
+/**
+ * The exact GitHub PR a delivery tab is bound to — explicit `repo` +
+ * `number`, never guessed from the checkout alone. `prUrl` (an inbox item
+ * link) carries both; otherwise the branch's open PR and the checkout's
+ * repository resolve them.
+ */
+export async function githubDeliveryTarget(
+  cwd: string,
+  prUrl?: string,
+): Promise<{ repo: string; number: number }> {
+  if (prUrl) return parseGithubPrLocation(prUrl);
+  const pr = await gitPrStatus(cwd);
+  if (!pr) throw new Error("No GitHub PR found for this branch. Open the PR branch or choose another provider.");
+  if (pr.url) {
+    try {
+      return parseGithubPrLocation(pr.url);
+    } catch { /* Fall back to the checkout repo + reported number. */ }
+  }
+  const repo = (await githubRepo(cwd)).trim();
+  if (!repo) throw new Error("This checkout does not resolve to a GitHub repository.");
+  return { repo, number: pr.number };
 }
 /** GitLab has no standalone branch-CI review — pipeline state rides on the
  * merge request surface. */

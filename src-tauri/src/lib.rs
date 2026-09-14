@@ -9,6 +9,7 @@ mod azure_pipelines;
 mod azure_repos;
 mod browser;
 mod chat_background;
+mod checkout;
 mod checkpoint;
 mod checks;
 mod confluence;
@@ -287,6 +288,9 @@ pub fn run() {
             fs::git_github_work_item_comment,
             fs::git_github_pr_state,
             fs::git_github_pr_diff,
+            fs::git_github_submit_review,
+            fs::github_pr_prepare_checkout,
+            fs::github_pr_cancel_checkout,
             fs::git_update_from_default,
             fs::git_sync_branch,
             checks::run_check,

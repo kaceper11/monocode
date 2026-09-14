@@ -746,10 +746,23 @@ it("keeps only delivery tabs whose provider identity can render", () => {
     parseWorkspaceSnapshot(snapshot)?.tabs[0]?.editorPanes?.[0]?.files?.[0]
       ?.delivery,
   ).toEqual(file.delivery);
+  // A GitHub delivery tab with its PR identity round-trips too.
+  const githubFile = {
+    ...file,
+    delivery: { ...file.delivery, provider: "github" as const },
+  };
+  const githubSnapshot = collectWorkspaceSnapshot(
+    [{ ...tab, editorPanes: [{ id: "e1", files: [githubFile], activeFileId: githubFile.id }] }],
+    [],
+    "t1",
+    "/repo",
+    new Map(),
+  );
+  expect(
+    parseWorkspaceSnapshot(githubSnapshot)?.tabs[0]?.editorPanes?.[0]
+      ?.files?.[0]?.delivery,
+  ).toEqual(githubFile.delivery);
   for (const bad of [
-    // GitHub opens externally and never produces a delivery file — a
-    // persisted one would render the Azure surface.
-    { ...file, delivery: { ...file.delivery, provider: "github" } },
     // A GitLab tab missing its MR identity cannot render its MR.
     {
       ...file,

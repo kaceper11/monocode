@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::wsl;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tauri::Manager;
 
 use crate::dirs_home;
 
@@ -1965,6 +1966,140 @@ pub struct GitHubPrDiff {
     pub truncated: bool,
 }
 
+/// Prepare an isolated checkout at the GitHub PR head — repair evidence must
+/// bind to the exact head commit, and a repair never mutates the user's
+/// working copy. Fetches the head ref over https with the `gh` token; the
+/// clone stores no credentials. One preparation runs at a time, shared with
+/// Azure through the checkout module's request slot.
+#[tauri::command]
+pub async fn github_pr_prepare_checkout(
+    app: tauri::AppHandle,
+    cwd: String,
+    repo: String,
+    number: i64,
+    expected_revision: String,
+    request_id: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _preparation = crate::checkout::begin_checkout(&request_id)?;
+        if wsl::location(&cwd)?.is_some() {
+            return Err("Automatic cloning requires a local execution host. Open a matching checkout in this WSL distribution to keep the agent on its selected host.".into());
+        }
+        if number <= 0 {
+            return Err("Invalid GitHub PR number".into());
+        }
+        let (owner, name) = split_github_repo(&repo)?;
+        let repo = format!("{owner}/{name}");
+        // `--repo` pins the read — `gh` needs no checkout context, so run it
+        // from home and survive a deleted working copy.
+        let gh_root = dirs_home()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| expand_home(&cwd));
+        let number_arg = number.to_string();
+        let read_head = || -> Result<(String, String, String, bool), String> {
+            let json = gh_checked(
+                &gh_root,
+                &[
+                    "pr",
+                    "view",
+                    &number_arg,
+                    "--repo",
+                    &repo,
+                    "--json",
+                    "state,headRefOid,headRefName,isCrossRepository",
+                ],
+            )?;
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct View {
+                #[serde(default)]
+                state: String,
+                #[serde(default)]
+                head_ref_oid: String,
+                #[serde(default)]
+                head_ref_name: String,
+                #[serde(default)]
+                is_cross_repository: bool,
+            }
+            let view: View = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            Ok((
+                view.state,
+                view.head_ref_oid,
+                view.head_ref_name,
+                view.is_cross_repository,
+            ))
+        };
+        let verified_head = |expected: &str| -> Result<(String, String), String> {
+            let (state, head_oid, head_name, cross) = read_head()?;
+            if !state.eq_ignore_ascii_case("open") || head_oid != expected {
+                return Err(
+                    "PR changed or is no longer open. Refresh before preparing its checkout."
+                        .into(),
+                );
+            }
+            if head_name.is_empty() {
+                return Err("GitHub did not report the PR head. Refresh and retry.".into());
+            }
+            if cross {
+                return Err(
+                    "Fork PR checkouts require opening the source repository explicitly.".into(),
+                );
+            }
+            Ok((head_name, head_oid))
+        };
+        let (branch, commit) = verified_head(&expected_revision)?;
+        let remote = format!("https://github.com/{repo}");
+        let auth = crate::inbox_media::github_auth_token().map(|token| {
+            format!(
+                "Basic {}",
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    format!("x-access-token:{token}"),
+                )
+            )
+        });
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (&repo, number, &branch, &commit).hash(&mut hash);
+        let key = format!("pr-{number}-{:016x}", hash.finish());
+        let base = app
+            .path()
+            .app_data_dir()
+            .map_err(|_| "Cannot locate PR checkouts")?
+            .join("checkouts")
+            .join("github");
+        crate::checkout::prepare_checkout(
+            &base,
+            &key,
+            &remote,
+            &branch,
+            &commit,
+            auth.as_deref(),
+            || {
+                if crate::checkout::checkout_cancelled() {
+                    return Err("Checkout preparation cancelled.".into());
+                }
+                let (verified_branch, _) = verified_head(&expected_revision)?;
+                if verified_branch != branch {
+                    return Err(
+                        "PR changed during checkout preparation. Refresh and retry.".into(),
+                    );
+                }
+                Ok(())
+            },
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Cancel an in-flight PR-checkout preparation — a dismissed review panel
+/// must not leave a clone running in the background.
+#[tauri::command]
+pub fn github_pr_cancel_checkout(request_id: String) {
+    crate::checkout::cancel_checkout(&request_id);
+}
+
 const MAX_PR_DIFF_BYTES: usize = 2 * 1024 * 1024;
 
 /// Unified diff and file stats for a pull request, via `gh`.
@@ -1973,6 +2108,42 @@ pub async fn git_github_pr_diff(cwd: String, number: i64) -> Result<GitHubPrDiff
     tauri::async_runtime::spawn_blocking(move || git_github_pr_diff_for(&expand_home(&cwd), number))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubReviewCommentInput {
+    pub path: String,
+    pub line: i64,
+    pub side: String,
+    pub body: String,
+}
+
+/// Submit a formal pull-request review — approve, request changes, or comment —
+/// with optional inline comments, pinned to the head revision the reviewer saw.
+#[tauri::command]
+pub async fn git_github_submit_review(
+    cwd: String,
+    repo: String,
+    number: i64,
+    commit_id: String,
+    event: String,
+    body: String,
+    comments: Vec<GitHubReviewCommentInput>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_github_submit_review_for(
+            &expand_home(&cwd),
+            &repo,
+            number,
+            &commit_id,
+            &event,
+            &body,
+            &comments,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -3445,7 +3616,7 @@ fn git_github_work_item_comment_for(
         return git_github_review_reply_for(root, reply, body);
     }
     let number = number.to_string();
-    with_temp_markdown(body, |path| {
+    with_temp_body(body, |path| {
         let output = gh_checked(root, &[kind, "comment", &number, "--body-file", path])?;
         github_url_from_output(&output, "GitHub did not return a comment URL")
     })
@@ -3456,7 +3627,7 @@ fn git_github_review_reply_for(root: &Path, thread_id: &str, body: &str) -> Resu
         return Err("Invalid review thread".into());
     }
     let thread_field = format!("threadId={thread_id}");
-    with_temp_markdown(body, |path| {
+    with_temp_body(body, |path| {
         let body_field = format!("body=@{path}");
         let json = gh_checked(
             root,
@@ -3475,7 +3646,120 @@ fn git_github_review_reply_for(root: &Path, thread_id: &str, body: &str) -> Resu
     })
 }
 
-fn with_temp_markdown(
+const MAX_REVIEW_COMMENTS: usize = 50;
+const MAX_REVIEW_BODY_BYTES: usize = 64_000;
+
+/// Validate and serialize the review request — pure, so every rejection
+/// lands before any Git or `gh` call runs.
+fn github_review_payload(
+    commit_id: &str,
+    event: &str,
+    body: &str,
+    comments: &[GitHubReviewCommentInput],
+) -> Result<String, String> {
+    let event = event.trim();
+    if !matches!(event, "APPROVE" | "REQUEST_CHANGES" | "COMMENT") {
+        return Err("Unknown review event".into());
+    }
+    let commit_id = commit_id.trim();
+    if commit_id.len() > 64
+        || commit_id.is_empty()
+        || !commit_id.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return Err("Reviews must pin the pull-request head revision".into());
+    }
+    if body.len() > MAX_REVIEW_BODY_BYTES {
+        return Err("Review body exceeds 64 KB".into());
+    }
+    if comments.len() > MAX_REVIEW_COMMENTS {
+        return Err("A review accepts at most 50 comments".into());
+    }
+    let mut payload_comments = Vec::with_capacity(comments.len());
+    for comment in comments {
+        let path = comment.path.trim();
+        let side = comment.side.trim();
+        let text = comment.body.trim();
+        if path.is_empty() || path.len() > 1024 || path.starts_with('/') {
+            return Err("Review comment has an invalid path".into());
+        }
+        if comment.line <= 0 {
+            return Err("Review comment has an invalid line".into());
+        }
+        if !matches!(side, "LEFT" | "RIGHT") {
+            return Err("Review comment has an invalid side".into());
+        }
+        if text.is_empty() || text.len() > MAX_REVIEW_BODY_BYTES {
+            return Err("Review comment body is empty or exceeds 64 KB".into());
+        }
+        payload_comments.push(json!({
+            "path": path,
+            "line": comment.line,
+            "side": side,
+            "body": text,
+        }));
+    }
+    // A bare approve or request-changes is a valid review; an empty COMMENT
+    // would carry nothing at all.
+    if event == "COMMENT" && payload_comments.is_empty() && body.trim().is_empty() {
+        return Err("A review needs a body or at least one comment".into());
+    }
+    Ok(json!({
+        "commit_id": commit_id,
+        "event": event,
+        "body": body,
+        "comments": payload_comments,
+    })
+    .to_string())
+}
+
+fn git_github_submit_review_for(
+    root: &Path,
+    repo: &str,
+    number: i64,
+    commit_id: &str,
+    event: &str,
+    body: &str,
+    comments: &[GitHubReviewCommentInput],
+) -> Result<String, String> {
+    if number <= 0 {
+        return Err("Invalid GitHub PR number".into());
+    }
+    let payload = github_review_payload(commit_id, event, body, comments)?;
+    let repo = if repo.trim().is_empty() {
+        git_github_repo_for(root)?
+    } else {
+        repo.trim().to_string()
+    };
+    let (owner, name) = split_github_repo(&repo)?;
+    let endpoint = format!("repos/{owner}/{name}/pulls/{number}/reviews");
+    with_temp_body(&payload, |path| {
+        let json = gh_checked(root, &["api", &endpoint, "-X", "POST", "--input", path])?;
+        parse_github_submit_review_url(&json)
+    })
+}
+
+fn parse_github_submit_review_url(json: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    if let Some(message) = value
+        .get("message")
+        .and_then(|message| message.as_str())
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        return Err(message.to_string());
+    }
+    let url = value
+        .get("html_url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Ok(url.to_string());
+    }
+    Err("GitHub did not return a review URL".into())
+}
+
+fn with_temp_body(
     body: &str,
     run: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<String, String> {
@@ -4292,7 +4576,10 @@ fn gh_run(root: &Path, args: &[&str], allow_empty: bool) -> Result<String, Strin
         let mut linux_args: Vec<String> = args.iter().map(|arg| (*arg).into()).collect();
         // Existing comment/PR flows prepare a body file in the UI host's temp
         // directory. Send that explicit body on stdin, never its Windows path.
-        let source = if let Some(index) = args.iter().position(|arg| *arg == "--body-file") {
+        let source = if let Some(index) = args
+            .iter()
+            .position(|arg| *arg == "--body-file" || *arg == "--input")
+        {
             Some((
                 index + 1,
                 *args.get(index + 1).ok_or("Missing GitHub body file")?,
@@ -7449,6 +7736,119 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("Could not resolve to a node"));
+    }
+
+    #[test]
+    fn github_submit_review_validates_before_calling_gh() {
+        let root = Path::new("/nonexistent");
+        let comment = |path: &str, line: i64, side: &str, body: &str| GitHubReviewCommentInput {
+            path: path.into(),
+            line,
+            side: side.into(),
+            body: body.into(),
+        };
+        // Every rejection lands before `gh` runs — no checkout or auth needed.
+        assert!(
+            git_github_submit_review_for(root, "acme/app", 0, "abc123", "APPROVE", "", &[])
+                .is_err()
+        );
+        assert!(
+            git_github_submit_review_for(root, "acme/app", 1, "abc123", "LGTM", "", &[]).is_err()
+        );
+        assert!(
+            git_github_submit_review_for(root, "acme/app", 1, "not a sha", "APPROVE", "", &[])
+                .is_err()
+        );
+        assert!(git_github_submit_review_for(root, "acme/app", 1, "", "APPROVE", "", &[]).is_err());
+        assert!(
+            git_github_submit_review_for(root, "acme/app", 1, "abc123", "COMMENT", "", &[])
+                .is_err()
+        );
+        assert!(git_github_submit_review_for(
+            root,
+            "acme/app",
+            1,
+            "abc123",
+            "COMMENT",
+            "",
+            &[comment("", 1, "RIGHT", "hi"),]
+        )
+        .is_err());
+        assert!(git_github_submit_review_for(
+            root,
+            "acme/app",
+            1,
+            "abc123",
+            "COMMENT",
+            "",
+            &[comment("a.ts", 0, "RIGHT", "hi"),]
+        )
+        .is_err());
+        assert!(git_github_submit_review_for(
+            root,
+            "acme/app",
+            1,
+            "abc123",
+            "COMMENT",
+            "",
+            &[comment("a.ts", 1, "MIDDLE", "hi"),]
+        )
+        .is_err());
+        assert!(git_github_submit_review_for(
+            root,
+            "acme/app",
+            1,
+            "abc123",
+            "COMMENT",
+            "",
+            &[comment("a.ts", 1, "RIGHT", "  "),]
+        )
+        .is_err());
+        assert!(git_github_submit_review_for(
+            root,
+            "acme/app",
+            1,
+            "abc123",
+            "COMMENT",
+            "",
+            &[comment("/etc/passwd", 1, "RIGHT", "hi"),]
+        )
+        .is_err());
+        let many = vec![comment("a.ts", 1, "RIGHT", "hi"); 51];
+        assert!(
+            git_github_submit_review_for(root, "acme/app", 1, "abc123", "COMMENT", "", &many)
+                .is_err()
+        );
+        assert!(
+            git_github_submit_review_for(root, "bad repo", 1, "abc123", "APPROVE", "", &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn github_review_payload_allows_bare_approve_and_serializes() {
+        // An empty approve or request-changes is a valid review — only an
+        // empty COMMENT carries nothing and is rejected.
+        let payload: serde_json::Value =
+            serde_json::from_str(&github_review_payload("abc123", "APPROVE", "", &[]).unwrap())
+                .unwrap();
+        assert_eq!(payload["commit_id"], "abc123");
+        assert_eq!(payload["event"], "APPROVE");
+        assert_eq!(payload["body"], "");
+        assert_eq!(payload["comments"].as_array().unwrap().len(), 0);
+        assert!(github_review_payload("abc123", "REQUEST_CHANGES", "", &[]).is_ok());
+        assert!(github_review_payload("abc123", "COMMENT", "", &[]).is_err());
+    }
+
+    #[test]
+    fn parse_github_submit_review_url_reads_rest_response() {
+        let json = r#"{"id": 9, "html_url": "https://github.com/acme/app/pull/42#pullrequestreview-9", "state": "APPROVED"}"#;
+        assert_eq!(
+            parse_github_submit_review_url(json).unwrap(),
+            "https://github.com/acme/app/pull/42#pullrequestreview-9"
+        );
+        assert!(parse_github_submit_review_url(r#"{"message": "Validation Failed"}"#).is_err());
+        assert!(parse_github_submit_review_url(r#"{"id": 9}"#).is_err());
     }
 
     #[test]

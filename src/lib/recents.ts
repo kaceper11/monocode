@@ -226,6 +226,12 @@ export function lastProjectPath(): string | null {
   return null;
 }
 
+/** Ask the app shell to open a project at `path` (e.g. a prepared PR checkout). */
+export const OPEN_PROJECT_PATH = "monocode:open-project-path";
+export function openProjectPath(path: string) {
+  window.dispatchEvent(new CustomEvent(OPEN_PROJECT_PATH, { detail: path }));
+}
+
 export type ProjectRailSections = {
   pinned: RailProjectItem[];
   projects: RailProjectItem[];

@@ -296,7 +296,7 @@ it("updates PR and CI rows when their exact conversation associations change", a
     expect(prRow().textContent).toContain("#13 Fix login");
     expect(prRow().textContent).toContain("Needs attention · saved");
     await act(async () => prRow().click());
-    expect(open).toHaveBeenLastCalledWith("/repo", { kind: "pr", branch: "feature", sourceSessionId: "owner" });
+    expect(open).toHaveBeenLastCalledWith("/repo", { kind: "pr", branch: "feature", sourceSessionId: "owner", provider: "azure" });
     const target = { site: "https://dev.azure.com/team", accountId: "ada", project: "project", definition: 7, repositoryId: "team/repo", repositoryType: "GitHub", repositoryUrl: "https://github.com/team/repo" };
     await act(async () => saveCiSources([{ target, cwd: "/repo", branch: "feature", session: "owner", remote: target.repositoryUrl, definitionName: "Unit tests", projectName: "Project" }], "/repo", "feature", "owner"));
     expect(ciRow().textContent).toContain("Unit tests");
@@ -715,12 +715,11 @@ it("applies an in-flight mutation to the repo it ran on after a child switch", a
   }
 });
 
-it("routes GitHub rows externally and keeps an Azure CI override independent", async () => {
+it("routes GitHub rows to the review surface and keeps an Azure CI override independent", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const rows = new Map<string, string>();
   vi.stubGlobal("localStorage", { getItem: (key: string) => rows.get(key) ?? null, setItem: (key: string, value: string) => rows.set(key, value) });
   const { invoke } = await import("@tauri-apps/api/core");
-  const { openUrl } = await import("@tauri-apps/plugin-opener");
   const { saveDeliveryProvider } = await import("../lib/deliveryProviders");
   const original = vi.mocked(invoke).getMockImplementation()!;
   vi.mocked(invoke).mockImplementation(async (command, args) => {
@@ -736,13 +735,13 @@ it("routes GitHub rows externally and keeps an Azure CI override independent", a
     expect(row("Pull requests").textContent).toContain("GitHub");
     expect(row("CI").textContent).toContain("GitHub");
     await act(async () => row("CI").click());
-    expect(openUrl).toHaveBeenCalledWith("https://github.com/team/repo/pull/5/checks");
-    expect(open).not.toHaveBeenCalled();
+    expect(open).toHaveBeenCalledWith("/github", {kind:"ci",branch:"feature",sourceSessionId:"gh-owner",provider:"github",repo:"team/repo",number:5});
+    open.mockClear();
     await act(async () => saveDeliveryProvider("/github", "feature", "gh-owner", "ci", "azure"));
     expect(row("CI").textContent).toContain("Azure Pipelines");
     expect(row("Pull requests").textContent).toContain("GitHub");
     await act(async () => row("CI").click());
-    expect(open).toHaveBeenCalledWith("/github", {kind:"ci",branch:"feature",sourceSessionId:"gh-owner"});
+    expect(open).toHaveBeenCalledWith("/github", {kind:"ci",branch:"feature",sourceSessionId:"gh-owner",provider:"azure"});
   } finally { await act(async () => root.unmount()); host.remove(); vi.mocked(invoke).mockImplementation(original); vi.unstubAllGlobals(); }
 });
 

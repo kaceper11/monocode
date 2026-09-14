@@ -97,7 +97,6 @@ import { useTabGroupLogos } from "../hooks/useTabGroupLogos";
 import { refreshLinkedWorkItem } from "../lib/linkedWorkItemRefresh";
 import {
   githubStatus,
-  githubPrDiff,
   githubReviewDecisionLabel,
   githubWorkItemComment,
   githubWorkItemDetails,
@@ -109,14 +108,12 @@ import {
   inboxListIsFresh,
   inboxProjectsForRail,
   listInboxItems,
-  peekGithubPrDiff,
   peekGithubWorkItemDetails,
   peekGithubWorkItemThread,
   peekInboxList,
   formatRelativeTime,
   inboxPersonAvatarUrl,
   type GithubLabel,
-  type GithubPrDiff,
   type GithubWorkItemDetails,
   type GithubWorkItemThread,
   type InboxItem,
@@ -181,11 +178,9 @@ import {
 import {
   GITLAB_CHANGE_EVENT,
   gitlabConnected,
-  gitlabMrDiff,
   gitlabWorkItemComment,
   gitlabWorkItemDetails,
   gitlabWorkItemThread,
-  peekGitlabMrDiff,
   peekGitlabWorkItemDetails,
   peekGitlabWorkItemThread,
   type GitlabWorkItemThread,
@@ -206,7 +201,7 @@ import {
   InboxCommentForm,
   type InboxReplyTarget,
 } from "./InboxComments";
-import { InboxPrDiff } from "./InboxPrDiff";
+import { GithubPrReview } from "../chrome/GithubPrReview";
 import { GitlabMrReview } from "../chrome/GitlabMrReview";
 import {
   InboxDiscussionPanel,
@@ -1692,11 +1687,6 @@ export function InboxDetail({
       : githubKind
         ? peekGithubWorkItemDetails(item.projectPath, githubKind, item.number)
         : null;
-  const cachedDiff = isPr
-    ? gitlab
-      ? peekGitlabMrDiff(item.repo, item.number)
-      : peekGithubPrDiff(item.projectPath, item.number)
-    : null;
   const cachedThread = azure ? peekAzureThread(item) : jira ? peekJiraThread(item) : linear
     ? peekLinearIssueThread(item.id ?? "")
     : gitlabKind
@@ -1708,9 +1698,6 @@ export function InboxDetail({
   const [loading, setLoading] = useState(cached == null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<"summary" | "code">("summary");
-  const [prDiff, setPrDiff] = useState<GithubPrDiff | null>(cachedDiff);
-  const [diffLoading, setDiffLoading] = useState(isPr && cachedDiff == null);
-  const [diffError, setDiffError] = useState<string | null>(null);
   const [thread, setThread] = useState<
     GithubWorkItemThread | LinearIssueThread | GitlabWorkItemThread | null
   >(cachedThread);
@@ -1934,44 +1921,6 @@ export function InboxDetail({
     jira,
     retry,
   ]);
-
-  useEffect(() => {
-    // GitLab MRs render the dedicated review surface, which loads its own diff.
-    if (gitlab || !isPr || tab !== "code") return;
-    let cancelled = false;
-    const cachedDiff = gitlab
-      ? peekGitlabMrDiff(item.repo, item.number)
-      : peekGithubPrDiff(item.projectPath, item.number);
-    if (cachedDiff) {
-      setPrDiff(cachedDiff);
-      setDiffLoading(false);
-      setDiffError(null);
-    } else {
-      setDiffLoading(true);
-      setDiffError(null);
-      setPrDiff(null);
-    }
-    const pending = gitlab
-      ? gitlabMrDiff(item.repo, item.number)
-      : githubPrDiff(item.projectPath, item.number);
-    void pending
-      .then((next) => {
-        if (cancelled) return;
-        setPrDiff(next);
-        setDiffError(null);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        if (cachedDiff) return;
-        setDiffError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setDiffLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [gitlab, isPr, item.number, item.projectPath, item.repo, revision, tab]);
 
   const postComment = async (body: string) => {
     setPosting(true);
@@ -2208,7 +2157,7 @@ export function InboxDetail({
           >
             <MessageSquare className="size-3.5" strokeWidth={1.75} /> Ask agent
           </button>
-          {isPr ? <button type="button" className={ACTION_OUTLINE} onClick={() => setTab("code")}>Review PR</button> : null}
+          {isPr && (item.provider === "github" || gitlab) ? <button type="button" className={ACTION_OUTLINE} onClick={() => setTab("code")}>Review PR</button> : null}
           {item.provider === "github" && item.kind === "pr" && item.repo ? (
             <button
               type="button"
@@ -2254,7 +2203,7 @@ export function InboxDetail({
           }} />
         {(jira || azure) && error && details ? <p role="status" className="text-[12px] text-content/50">{error} <button type="button" className={ACTION_GHOST} onClick={() => setRetry(value => value + 1)}>Retry</button></p> : null}
       </header>
-      {isPr ? (
+      {isPr && (item.provider === "github" || gitlab) ? (
         <div
           role="tablist"
           aria-label={
@@ -2288,7 +2237,17 @@ export function InboxDetail({
           </div>
         ) : null}
       {isPr && tab === "code" ? (
-        gitlab ? (
+        item.provider === "github" ? (
+          <GithubPrReview
+            key={`${item.projectPath}:${item.repo}:${item.number}:${revision}`}
+            embedded
+            cwd={item.projectPath}
+            repo={item.repo}
+            number={item.number}
+            enabled
+            onClose={() => undefined}
+          />
+        ) : gitlab ? (
           <GitlabMrReview
             key={`${item.projectPath}:${item.repo}:${item.number}:${revision}`}
             embedded
@@ -2298,20 +2257,7 @@ export function InboxDetail({
             enabled
             onClose={() => undefined}
           />
-        ) : diffLoading ? (
-          <div className="flex justify-center py-10 text-content/40">
-            <LoaderCircle className="size-4 animate-spin" strokeWidth={1.75} />
-          </div>
-        ) : diffError ? (
-          <p className="text-[13px] text-content/50">{diffError}</p>
-        ) : prDiff ? (
-          <InboxPrDiff
-            key={`${item.projectPath}:${item.number}:${revision}`}
-            diff={prDiff}
-          />
-        ) : (
-          <p className="text-[13px] text-content/45">No file changes</p>
-        )
+        ) : null
       ) : loading ? (
         <div className="flex justify-center py-10 text-content/40">
           <LoaderCircle className="size-4 animate-spin" strokeWidth={1.75} />

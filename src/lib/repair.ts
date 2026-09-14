@@ -419,39 +419,76 @@ const githubRepoSlug = (url: string) =>
 
 /** Resolve and verify the GitHub PR-head binding for a repair: the checkout
  * must sit at the PR head commit on the PR branch with a remote pointing at
- * the PR's repository. Never silently checks anything out — a mismatch is a
- * visible error, not a fixup. */
-async function githubRepairHead(input: {
-  cwd: string;
-  repo: string;
-  number: number;
-}): Promise<{ head: CiHead; state: GithubPrState }> {
+ * the PR's repository. A repair never mutates the user's working copy — a
+ * mismatch reuses a known checkout already at the head, or clones the head
+ * into an isolated checkout like the Azure flow does. */
+async function githubRepairHead(
+  input: {
+    cwd: string;
+    repo: string;
+    number: number;
+  },
+  current: () => boolean = () => true,
+  signal?: AbortSignal,
+): Promise<{ head: CiHead; state: GithubPrState }> {
   const state = await githubPrState(input.cwd, input.number);
   if (state.state.toUpperCase() !== "OPEN")
     throw new Error("The PR is no longer open. Refresh and retry.");
   if (!state.headRefOid || !state.headRefName)
     throw new Error("GitHub did not report the PR head. Refresh and retry.");
-  const checkout = await ciContext(input.cwd);
-  const remote = checkout.remotes.find(
-    (row) => githubRepoSlug(row.url) === input.repo.toLowerCase(),
-  );
-  if (!remote)
-    throw new Error(
-      `This checkout has no remote for ${input.repo}. Open the PR's checkout.`,
+  const matches = (value: CiCheckout) =>
+    value.commit === state.headRefOid &&
+    value.branch === state.headRefName &&
+    value.remotes.some(
+      (row) => githubRepoSlug(row.url) === input.repo.toLowerCase(),
     );
-  if (
-    checkout.commit !== state.headRefOid ||
-    checkout.branch !== state.headRefName
-  )
-    throw new Error(
-      `Checkout is not at the PR head (${state.headRefName} · ${state.headRefOid.slice(0, 8)}). Update the checkout first.`,
-    );
+  let checkout = await ciContext(input.cwd);
+  if (!matches(checkout)) {
+    const paths = [...new Set([
+      ...[...getVerifiedFamilies().values()].flatMap(family => family.worktrees.filter(tree => !tree.missing && !tree.prunable && !tree.locked).map(tree => tree.path)),
+      ...loadRecents().map(project => project.path),
+    ])].filter(path => path !== input.cwd && wslLocation(path)?.distribution === wslLocation(input.cwd)?.distribution).slice(0, 20);
+    for (const path of paths) {
+      if (!current()) throw new Error("Checkout preparation cancelled.");
+      const candidate = await ciContext(path).catch(() => null);
+      if (candidate && matches(candidate)) { checkout = candidate; break; }
+    }
+    if (!matches(checkout)) {
+      if (!current()) throw new Error("Checkout preparation cancelled.");
+      const requestId = crypto.randomUUID();
+      const cancel = () => { void invoke("github_pr_cancel_checkout", { requestId }).catch(() => undefined); };
+      signal?.throwIfAborted();
+      signal?.addEventListener("abort", cancel, { once: true });
+      let path: string;
+      try {
+        path = await invoke<string>("github_pr_prepare_checkout", {
+          cwd: input.cwd,
+          repo: input.repo,
+          number: input.number,
+          expectedRevision: state.headRefOid,
+          requestId,
+        });
+      } finally {
+        signal?.removeEventListener("abort", cancel);
+      }
+      signal?.throwIfAborted();
+      notifyGitChanged(input.cwd);
+      if (!current()) throw new Error("Checkout preparation cancelled.");
+      checkout = await ciContext(path);
+      if (!matches(checkout))
+        throw new Error(
+          "Prepared checkout no longer matches the PR. Refresh and retry.",
+        );
+    }
+  }
   return {
     head: {
       cwd: checkout.cwd,
       branch: checkout.branch,
       commit: checkout.commit,
-      remote: remote.url,
+      remote: checkout.remotes.find(
+        (row) => githubRepoSlug(row.url) === input.repo.toLowerCase(),
+      )!.url,
     },
     state,
   };
@@ -459,15 +496,19 @@ async function githubRepairHead(input: {
 
 /** "Address comments" for a GitHub PR — bounded review evidence digested so a
  * changed thread blocks dispatch instead of replaying stale comments. */
-export async function githubCommentsRepair(input: {
-  cwd: string;
-  repo: string;
-  number: number;
-  comments: GithubWorkItemComment[];
-}) {
+export async function githubCommentsRepair(
+  input: {
+    cwd: string;
+    repo: string;
+    number: number;
+    comments: GithubWorkItemComment[];
+  },
+  current: () => boolean = () => true,
+  signal?: AbortSignal,
+) {
   const comments = input.comments.slice(0, 20);
   if (!comments.length) throw new Error("Select review comments first.");
-  const { head, state } = await githubRepairHead(input);
+  const { head, state } = await githubRepairHead(input, current, signal);
   const origin = `${state.url} · repository ${input.repo} · head ${state.headRefOid} · checkout ${head.cwd}`;
   const built = comments.map((comment) => {
     const where = comment.path
@@ -524,12 +565,16 @@ export async function githubCommentsRepair(input: {
 
 /** "Fix CI" for a GitHub PR — failing check runs on the PR head, bounded and
  * digested for freshness validation at dispatch. */
-export async function githubCiRepair(input: {
-  cwd: string;
-  repo: string;
-  number: number;
-}) {
-  const { head, state } = await githubRepairHead(input);
+export async function githubCiRepair(
+  input: {
+    cwd: string;
+    repo: string;
+    number: number;
+  },
+  current: () => boolean = () => true,
+  signal?: AbortSignal,
+) {
+  const { head, state } = await githubRepairHead(input, current, signal);
   const failing = state.checks
     .filter((check) => FAILING_CHECK_CONCLUSIONS.includes(check.conclusion))
     .slice(0, 20);
