@@ -198,11 +198,14 @@ AGENT_NAMES = {
 }
 # Linux tool folders that are not always exported to the login PATH.
 AGENT_FOLDERS = [
-    ".local/bin", ".npm-global/bin", ".cargo/bin", ".bun/bin", "n/bin",
+    ".local/bin", "bin", ".npm-global/bin", ".cargo/bin", ".bun/bin",
+    ".yarn/bin", ".deno/bin", ".local/share/pnpm", "n/bin",
     ".volta/bin", ".asdf/shims", ".local/share/mise/shims",
-    ".grok/bin", ".fx/bin", ".claude/local", ".local/share/claude",
-    ".local/share/devin/cli/_versions/current/bin",
+    ".linuxbrew/bin", ".grok/bin", ".fx/bin", ".claude/local",
+    ".local/share/claude", ".local/share/devin/cli/_versions/current/bin",
 ]
+# System prefixes a broken login profile can drop from PATH.
+AGENT_SYSTEM_FOLDERS = ["/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin", "/snap/bin"]
 # Credential evidence checked without spawning the provider or reading secrets:
 # only env names and file existence are inspected. strict providers report a
 # definitive "signed out" when nothing is found; others stay unknown.
@@ -259,8 +262,10 @@ def file_mentions(candidate, needles):
 
 
 def agent_help(candidate, home):
+    # Standalone agent binaries are ~100MB+ self-contained executables whose
+    # cold --help can outlive a 2s budget; keep the probe bounded but real.
     try:
-        code, out, err = run([str(candidate), "--help"], str(home), timeout=2)
+        code, out, err = run([str(candidate), "--help"], str(home), timeout=6)
         return code, (out + err).decode("utf-8", errors="replace").lower()
     except (OSError, ValueError, TimeoutError):
         return 1, ""
@@ -335,6 +340,7 @@ def find_agent(provider):
             names = names + ["muse-bin-" + version]
     folders = [home / suffix for suffix in AGENT_FOLDERS]
     folders = [Path(folder) for folder in os.environ.get("PATH", "").split(":") if folder.startswith("/") and not folder.startswith("/mnt/")] + folders
+    folders += [Path(folder) for folder in AGENT_SYSTEM_FOLDERS]
     for name in names:
         for folder in dict.fromkeys(folders):
             candidate = folder / name
@@ -709,8 +715,10 @@ def handle(request):
                 entries.append({"name": entry.name, "path": entry.path,
                                 "isDir": entry.is_dir(), "ignored": entry.name == ".git"})
         names = b"".join(os.fsencode(entry["name"]) + b"\0" for entry in entries)
-        code, out, _ = run(["git", "check-ignore", "--stdin", "-z"], str(path), names)
-        ignored = set(os.fsdecode(name) for name in out.split(b"\0")) if code in (0, 1) else set()
+        ignored = set()
+        if names:
+            code, out, _ = run(["git", "check-ignore", "--stdin", "-z"], str(path), names)
+            ignored = set(os.fsdecode(name) for name in out.split(b"\0")) if code in (0, 1) else set()
         for entry in entries:
             entry["ignored"] |= entry["name"] in ignored
         return sorted(entries, key=lambda entry: (not entry["isDir"], entry["name"].lower()))

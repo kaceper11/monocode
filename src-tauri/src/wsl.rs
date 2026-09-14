@@ -15,6 +15,7 @@ const PROCESS_SCRIPT: &str = include_str!("wsl_process.py");
 const MAX_MESSAGE: usize = 40 * 1024 * 1024;
 const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 static QUEUED_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static CONNECTING: AtomicUsize = AtomicUsize::new(0);
@@ -114,6 +115,16 @@ fn wsl_command() -> Result<Command, String> {
     command.env("WSLENV", "");
     crate::hide_window_console(&mut command);
     Ok(command)
+}
+
+/// Windows caps a spawn command line near 32 KiB (os error 206) and the bridge
+/// script is larger. This fixed-size `-c` bootstrap execs the program read from
+/// stdin; the same pipe then carries protocol frames.
+fn stdin_bootstrap(program: &str) -> String {
+    format!(
+        "import sys;exec(compile(sys.stdin.buffer.read({}),'bridge','exec'))",
+        program.len()
+    )
 }
 
 /// Env marker tagging a terminal's whole Linux tree — env is inherited by
@@ -526,16 +537,88 @@ struct Bridge {
     /// instead of round-tripping the whole environment on every spawn.
     agent_environment: Mutex<Option<(usize, Arc<Value>)>>,
 }
+struct Spawned {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    #[cfg(windows)]
+    job: std::os::windows::io::OwnedHandle,
+}
+
+impl Spawned {
+    /// Deliver the program on a helper thread with a deadline: a `wsl.exe`
+    /// that stalls before the guest reads must not wedge a connect slot.
+    /// Killing the child breaks the pipe and releases the writer.
+    fn finish_lane(mut self, program: &[u8]) -> Result<Bridge, String> {
+        let (send, receive) = mpsc::sync_channel(0);
+        let mut stdin = self.stdin;
+        let program = program.to_vec();
+        std::thread::spawn(move || {
+            let delivered = stdin
+                .write_all(&program)
+                .and_then(|()| stdin.flush())
+                .map(|()| stdin);
+            let _ = send.send(delivered);
+        });
+        let stdin = match receive.recv_timeout(LAUNCH_TIMEOUT) {
+            Ok(Ok(stdin)) => stdin,
+            Ok(Err(error)) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return Err(format!("Cannot start WSL: {error}"));
+            }
+            Err(_) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return Err("WSL did not load the bridge in time".into());
+            }
+        };
+        Ok(Bridge {
+            generation: AtomicUsize::new(NEXT_BRIDGE_GENERATION.fetch_add(1, Ordering::SeqCst)),
+            io: Mutex::new(Some(BridgeIo {
+                stdin,
+                stdout: self.stdout,
+            })),
+            available: Condvar::new(),
+            reads: None,
+            process: Arc::new(Mutex::new(Process {
+                child: self.child,
+                #[cfg(windows)]
+                _job: self.job,
+            })),
+            alive: Arc::new(AtomicBool::new(true)),
+            owner: None,
+            agent_environment: Mutex::new(None),
+        })
+    }
+
+    fn abort(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Bridge {
-    fn start(command: &mut Command) -> Result<Self, String> {
-        let mut bridge = Self::start_lane(command)?;
-        let mut reads = Self::start_lane(command)?;
+    fn start(command: &mut Command, program: &[u8]) -> Result<Self, String> {
+        // Spawn both lanes before either program is delivered so the two guest
+        // interpreters start together; each write then waits only on its own
+        // reader.
+        let first = Self::spawn_lane(command)?;
+        let second = match Self::spawn_lane(command) {
+            Ok(lane) => lane,
+            Err(error) => {
+                first.abort();
+                return Err(error);
+            }
+        };
+        let mut bridge = first.finish_lane(program)?;
+        let mut reads = second.finish_lane(program)?;
         reads.alive = bridge.alive.clone();
         bridge.reads = Some(Box::new(reads));
         Ok(bridge)
     }
 
-    fn start_lane(command: &mut Command) -> Result<Self, String> {
+    fn spawn_lane(command: &mut Command) -> Result<Spawned, String> {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -549,19 +632,12 @@ impl Bridge {
             .map_err(|e| format!("Cannot start Linux bridge: {e}"))?;
         let stdin = child.stdin.take().ok_or("Missing WSL input")?;
         let stdout = BufReader::new(child.stdout.take().ok_or("Missing WSL output")?);
-        Ok(Self {
-            generation: AtomicUsize::new(NEXT_BRIDGE_GENERATION.fetch_add(1, Ordering::SeqCst)),
-            io: Mutex::new(Some(BridgeIo { stdin, stdout })),
-            available: Condvar::new(),
-            reads: None,
-            process: Arc::new(Mutex::new(Process {
-                child,
-                #[cfg(windows)]
-                _job: job,
-            })),
-            alive: Arc::new(AtomicBool::new(true)),
-            owner: None,
-            agent_environment: Mutex::new(None),
+        Ok(Spawned {
+            child,
+            stdin,
+            stdout,
+            #[cfg(windows)]
+            job,
         })
     }
     fn request(&self, request: Value) -> Result<Value, String> {
@@ -851,7 +927,7 @@ pub fn wsl_connect(
         distribution,
         "/",
         "/usr/bin/python3",
-        &["-u".into(), "-c".into(), SCRIPT.into()],
+        &["-u".into(), "-c".into(), stdin_bootstrap(SCRIPT)],
     ));
     let connected = connect_bridge(
         HOSTS.get_or_init(Mutex::default),
@@ -878,18 +954,27 @@ fn connect_bridge(
     owner: Option<(tauri::AppHandle, String)>,
 ) -> Result<Location, String> {
     fn validate(bridge: &Bridge, location: &Location) -> Result<Location, String> {
-        let result = bridge.request(json!({"op":"connect", "path":location.path}))?;
-        if let Some(reads) = &bridge.reads {
-            let checked = reads.request(json!({"op":"connect", "path":location.path}))?;
-            if checked["path"] != result["path"] {
-                return Err("WSL read channel resolved a different checkout".into());
+        // Both lanes capture the login environment on connect — run the two
+        // guest probes together instead of serially.
+        std::thread::scope(|scope| {
+            let pending = bridge.reads.as_ref().map(|reads| {
+                scope.spawn(|| reads.request(json!({"op":"connect", "path":location.path})))
+            });
+            let result = bridge.request(json!({"op":"connect", "path":location.path}))?;
+            if let Some(pending) = pending {
+                let checked = pending
+                    .join()
+                    .map_err(|_| "WSL read validation panicked".to_string())??;
+                if checked["path"] != result["path"] {
+                    return Err("WSL read channel resolved a different checkout".into());
+                }
             }
-        }
-        location.with_path(
-            result["path"]
-                .as_str()
-                .ok_or("WSL did not return the selected Linux path")?,
-        )
+            location.with_path(
+                result["path"]
+                    .as_str()
+                    .ok_or("WSL did not return the selected Linux path")?,
+            )
+        })
     }
     let key = location.distribution.to_lowercase();
     {
@@ -905,7 +990,7 @@ fn connect_bridge(
     }
     // Validate privately: failed opens drop their process and consume no host
     // slot. Other repositories can keep using their bridges during validation.
-    let mut candidate = Bridge::start(command)?;
+    let mut candidate = Bridge::start(command, SCRIPT.as_bytes())?;
     if let Some(reads) = &mut candidate.reads {
         reads.owner = owner.clone();
     }
@@ -1158,8 +1243,8 @@ with tempfile.TemporaryDirectory(prefix='monocode-env-') as directory:
     fn metadata_remains_available_during_git_while_mutations_stay_ordered() {
         use super::*;
         let mut command = Command::new("python3");
-        command.args(["-u", "-c", SCRIPT]);
-        let bridge = Bridge::start(&mut command).unwrap();
+        command.args(["-u", "-c", &stdin_bootstrap(SCRIPT)]);
+        let bridge = Bridge::start(&mut command, SCRIPT.as_bytes()).unwrap();
         let root = std::env::temp_dir().join(format!("monocode-read-lane-{}", std::process::id()));
         std::fs::create_dir(&root).unwrap();
         Command::new("git")
@@ -1374,8 +1459,13 @@ def run(argv, cwd, input_bytes=None, timeout=25):
     return real_run(argv, cwd, input_bytes, timeout)
 "#
         );
-        let bridge =
-            Arc::new(Bridge::start(Command::new("python3").args(["-u", "-c", &script])).unwrap());
+        let bridge = Arc::new(
+            Bridge::start(
+                Command::new("python3").args(["-u", "-c", &stdin_bootstrap(&script)]),
+                script.as_bytes(),
+            )
+            .unwrap(),
+        );
         HOSTS
             .get_or_init(Mutex::default)
             .lock()
@@ -1836,7 +1926,7 @@ assert not any(call[0] == 'signal' for call in calls)
         let missing = format!("{path}/monocode-missing-{}", std::process::id());
         let connect = |name: &str, path: &str| {
             let mut command = Command::new("python3");
-            command.args(["-u", "-c", SCRIPT]);
+            command.args(["-u", "-c", &stdin_bootstrap(SCRIPT)]);
             connect_bridge(
                 &registry,
                 &Location::new(name, path).unwrap(),
@@ -1867,8 +1957,8 @@ assert not any(call[0] == 'signal' for call in calls)
     #[test]
     fn watchdog_expiry_overrides_a_complete_response_and_allows_reconnect() {
         let mut command = Command::new("python3");
-        command.args(["-u", "-c", SCRIPT]);
-        let bridge = Arc::new(Bridge::start(&mut command).unwrap());
+        command.args(["-u", "-c", &stdin_bootstrap(SCRIPT)]);
+        let bridge = Arc::new(Bridge::start(&mut command, SCRIPT.as_bytes()).unwrap());
         // Simulate the OS deadline firing after the read completed. Exercise
         // the production completion, process cleanup and reconnect paths.
         let error = bridge
@@ -1899,8 +1989,8 @@ assert not any(call[0] == 'signal' for call in calls)
     #[test]
     fn concurrent_bridge_requests_keep_responses_and_disconnects_scoped() {
         let mut command = Command::new("python3");
-        command.args(["-u", "-c", SCRIPT]);
-        let bridge = Arc::new(Bridge::start(&mut command).unwrap());
+        command.args(["-u", "-c", &stdin_bootstrap(SCRIPT)]);
+        let bridge = Arc::new(Bridge::start(&mut command, SCRIPT.as_bytes()).unwrap());
         let directory = std::env::temp_dir().join(format!(
             "monocode-queue-{}-{}",
             std::process::id(),
@@ -1963,8 +2053,8 @@ assert not any(call[0] == 'signal' for call in calls)
     #[test]
     fn real_bridge_reads_git_and_survives_request_errors() {
         let mut command = Command::new("python3");
-        command.args(["-u", "-c", SCRIPT]);
-        let bridge = Bridge::start(&mut command).unwrap();
+        command.args(["-u", "-c", &stdin_bootstrap(SCRIPT)]);
+        let bridge = Bridge::start(&mut command, SCRIPT.as_bytes()).unwrap();
         let path = std::env::temp_dir().to_string_lossy().into_owned();
         let connected = bridge
             .request(json!({"op":"connect", "path":path}))
@@ -2000,8 +2090,8 @@ assert not any(call[0] == 'signal' for call in calls)
     #[test]
     fn real_bridge_pty_ops_degrade_without_proc() {
         let mut command = Command::new("python3");
-        command.args(["-u", "-c", SCRIPT]);
-        let bridge = Bridge::start(&mut command).unwrap();
+        command.args(["-u", "-c", &stdin_bootstrap(SCRIPT)]);
+        let bridge = Bridge::start(&mut command, SCRIPT.as_bytes()).unwrap();
         let path = std::env::temp_dir().to_string_lossy().into_owned();
         assert_eq!(
             bridge
