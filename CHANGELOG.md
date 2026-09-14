@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-14
+
+### Added
+
+- In-app browser tabs: a contextual preview pane, a title-bar globe button and keyboard shortcut, an expand mode that zooms the page over the whole workspace while keeping the agent docked, a bookmarks bar, a new-tab button, and clipboard URL prefill. Send the current page to an agent as context, and record browser steps so agents can describe the viewport.
+- Multi-repository tasks: a task spans several repositories with one session per repository, per-attempt checkouts, task-scoped worktrees, branch suggestions, and its own rail section with activity and repository scope. Link issues and inbox items to a task, send a changes selection to a task, track delivery status across repositories, and create GitHub or Azure pull requests per task repository.
+- Attention queue and provider watchers: assigned inbox tickets show your in-flight work, and produced pull requests and CI runs are watched automatically and retired on completion.
+- Dedicated pull-request review surfaces: GitHub pull requests support submitting reviews and preparing isolated checkouts for repairs, and GitLab merge requests get a review surface with full discussion paging.
+- One-shot and recurring schedules for agent sessions.
+- Local dictation: Whisper-based capture with hold-to-talk, the Cmd+Shift+D shortcut, and a filterable picker covering the full Whisper language set.
+- New agent providers: Devin CLI over ACP, GitHub Copilot CLI, and Muse Code via its MSP session host.
+- Configurable agent actions and saved project commands that run as host-aware sequential steps, including recovering failed runs.
+- Keep the computer awake while agents work, with automatic retry and helper handoff.
+- Related work items and Confluence pages can be attached as agent context, and sessions surface linked work-item activity across providers.
+- Notes: tag notes and save transcript selections directly as notes.
+- Multi-worktree management: create and switch worktrees from repository rows, safely remove the active worktree, task-aware cleanup with attention scoped to reachable families, and a warning when live worktrees change the same files.
+- Durable projects: repository membership, saved repository sets, pure group projects without a folder anchor, a streamlined add flow with deferred creation and multi-select picking, and the option to save the import queue as a set.
+- Settings → Extensions page with a provider-aware inventory, collapsible groups, toggles, and entry removal.
+- Terminal resource manager in the usage footer.
+- Session defaults honor configured models and support both default and live access modes.
+- Post-turn verification can run project checks automatically when a turn finishes, with check configuration opened directly from Automations rows.
+- Session reminders shown in the session menu, and nested context menus in the explorer.
+- Subagent transcript trails for Muse, Devin, and Copilot sessions.
+- Title-bar terminal and browser toggle buttons.
+
+### Changed
+
+- Selecting files in Changes now opens a floating action card that sends the selection to a task rather than a session picker.
+- Creating a task prepares it and reveals the rail without starting agent sessions.
+- Includes all upstream 0.1.45 changes, which were merged after 0.2.1.
+
+### Fixed
+
+- Remount ghosts no longer kill live PTYs, and provider harness lifecycle and protocol handling are hardened.
+- GitLab merge-request review: pinned fetched SHAs, deadline-split WSL Git timeouts, fresh-state aborts, coverage-aware teardown, and correct identity binding.
+- The paste-URL action reads the pasteboard natively without a consent bubble, and only on an explicit click.
+- The worktree-removal batch stays staged across row review, and skip rows pass through the batch Review handoff.
+- Worktree panel flicker, close, and overflow issues; repositories sheet and import-queue polish.
+- Config mutations are hardened against third-party review findings.
+- Dictation start-phase leaks, window-teardown leaks, hold lifecycle, and insertion edge cases.
+
 ## [0.2.1] - 2026-09-11
 
 ### Fixed
