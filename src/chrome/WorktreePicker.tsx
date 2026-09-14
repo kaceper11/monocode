@@ -585,12 +585,12 @@ export function WorktreePanel({
   const reviewEntry = (skip: BulkSkip | { entry: Worktree }) => {
     const { entry } = skip;
     const safety = "safety" in skip ? skip.safety : undefined;
-    setBulk(null);
-    setSelecting(false);
-    setChecked(new Set());
+    // The batch stays staged underneath — backing out of the detail or the
+    // guarded confirmation returns to the remaining rows. The detail always
+    // mounts so a failed removal has somewhere to report.
+    setDetail(entry);
     if (safety && (safety.dirty || safety.processes.length))
       startRemove(entry);
-    else setDetail(entry);
   };
   const confirmBulkRemove = () =>
     void run(async () => {
@@ -659,7 +659,7 @@ export function WorktreePanel({
   return (
     <div className="flex min-h-0 flex-1 flex-col text-[12px]" aria-busy={busy}>
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-none">
-        {bulk ? (
+        {bulk && !confirmation && !detail ? (
           <WorktreeRemovalBatch
             phase={bulk.phase}
             removable={bulk.removable}
@@ -871,8 +871,35 @@ export function WorktreePanel({
                   );
                   setWorkingCopyHidden(entry.path, false);
                   notifyGitChanged(cwdRef.current);
-                  // Done — the action completed; don't drop back to the list.
-                  onClose();
+                  // A staged batch resumes minus the just-removed row —
+                  // with nothing left the whole flow is done. Outside a
+                  // batch, a completed removal closes the panel outright.
+                  if (bulk) {
+                    const removedPath = pathKey(entry.path);
+                    const notRemoved = (row: { entry: { path: string } }) =>
+                      pathKey(row.entry.path) !== removedPath;
+                    const remaining = {
+                      ...bulk,
+                      removable: bulk.removable.filter(notRemoved),
+                      skipped: bulk.skipped.filter(notRemoved),
+                      failures: bulk.failures.filter(notRemoved),
+                      removed: [...bulk.removed, entry.path],
+                    };
+                    const left =
+                      remaining.removable.length +
+                      remaining.skipped.length +
+                      remaining.failures.length;
+                    setBulk(left ? remaining : null);
+                    setChecked((current) => {
+                      const next = new Set(current);
+                      next.delete(removedPath);
+                      return next;
+                    });
+                    setConfirmation(null);
+                    if (!left) onClose();
+                  } else {
+                    onClose();
+                  }
                 });
               }}
             >
