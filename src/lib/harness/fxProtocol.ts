@@ -2,7 +2,7 @@ import type { PromptContentBlock } from "../attachments";
 import type { AgentModel, ModelSetting, ModelSettingChoice } from "../models";
 import type { RuntimeMode, ToolPreview } from "../session";
 import { normalizeTaskListStatus } from "../taskList";
-import type { ApprovalDecision, HarnessEvent } from "./types";
+import type { HarnessEvent } from "./types";
 import {
   composeToolTitle,
   extractSearchQuery,
@@ -12,6 +12,7 @@ import {
 } from "./preview";
 import { fxToolInfo, fxToolVerb } from "./fxTool";
 import { acpAgentInfo } from "./acpSubagents";
+import { acpPermissionOptionId, isAcpMcpToolCall } from "./acp";
 
 export type FxModeId = "ask" | "code";
 
@@ -58,51 +59,8 @@ export function fxModeId(_runtimeMode: RuntimeMode): FxModeId {
   return "code";
 }
 
-/**
- * Approve anything fx still asks about. `set_mode` can fail, and fx keeps a few
- * prompts even in code mode, so this is the backstop that guarantees a turn is
- * never blocked on an approval nobody can see.
- */
-export function autoPermissionOption(
-  _runtimeMode: RuntimeMode,
-  optionIds: string[],
-): string | null {
-  if (optionIds.length === 0) return null;
-  return pickOption(optionIds, [
-    "allow-always",
-    "allow_always",
-    "allow-once",
-    "allow_once",
-    "allow",
-  ]);
-}
-
-export function permissionOptionId(
-  decision: ApprovalDecision,
-  optionIds: string[],
-): string {
-  if (decision === "allow") {
-    return (
-      pickOption(optionIds, [
-        "allow-once",
-        "allow_once",
-        "allow-always",
-        "allow_always",
-        "allow",
-      ]) ?? "allow-once"
-    );
-  }
-  return (
-    pickOption(optionIds, [
-      "reject-once",
-      "reject_once",
-      "reject-always",
-      "reject_always",
-      "reject",
-      "deny",
-    ]) ?? "reject-once"
-  );
-}
+/** Shares the ACP option vocabulary; never invents an id the agent didn't offer. */
+export const permissionOptionId = acpPermissionOptionId;
 
 export function permissionRequestFromAcp(
   params: unknown,
@@ -117,7 +75,9 @@ export function permissionRequestFromAcp(
     rec ??
     {};
   const command = stringField(subject ?? {}, "command");
-  const kind = stringField(tool, "kind") ?? stringField(subject ?? {}, "kind");
+  const kind = isAcpMcpToolCall(tool, subject)
+    ? "mcp"
+    : (stringField(tool, "kind") ?? stringField(subject ?? {}, "kind"));
   const fx = fxToolInfo(tool, tool);
   const preview = fx.resolved
     ? fx.preview
@@ -200,8 +160,11 @@ export function eventsFromAcpUpdate(params: unknown): HarnessEvent[] {
     // nothing to work with. Mine the result blob instead, and only fall back to
     // the shared path if fx ever starts sending structured fields.
     const fx = fxToolInfo(update, tool);
-    const toolKind =
-      fx.kind ?? stringField(update, "kind") ?? stringField(tool, "kind");
+    const toolKind = isAcpMcpToolCall(tool, update)
+      ? "mcp"
+      : (fx.kind ??
+        stringField(update, "kind") ??
+        stringField(tool, "kind"));
     const preview = fx.resolved
       ? fx.preview
       : (fx.preview ?? extractToolPreview(update, tool));
@@ -599,13 +562,6 @@ function cap(value: string, max = 8_000): string {
   const text = value.trim();
   if (text.length <= max) return text;
   return `${text.slice(0, max)}\n…`;
-}
-
-function pickOption(optionIds: string[], preferred: string[]): string | null {
-  for (const id of preferred) {
-    if (optionIds.includes(id)) return id;
-  }
-  return null;
 }
 
 function humanField(

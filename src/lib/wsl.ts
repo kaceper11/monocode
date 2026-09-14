@@ -4,6 +4,54 @@ import { invalidateModelCatalogs } from "./models";
 import { wslLocation, wslPath } from "./paths";
 import { setWslStatus } from "./wslStatus";
 
+/** Long enough to keep the project dialog warm, short enough to notice a distro installed mid-session. */
+const DISTRIBUTIONS_TTL_MS = 30_000;
+
+let distributionsProbe: Promise<string[]> | null = null;
+let distributionsValue: { at: number; names: string[] } | null = null;
+
+/**
+ * Cached `wsl_distributions` probe. The resolved value expires after
+ * {@link DISTRIBUTIONS_TTL_MS} — a distro installed mid-session must still
+ * surface. A failed probe is not retained; the last good list stays visible
+ * via `wslDistributionsPeek`.
+ */
+export function wslDistributions(refresh = false): Promise<string[]> {
+  if (
+    !refresh &&
+    distributionsValue &&
+    Date.now() - distributionsValue.at < DISTRIBUTIONS_TTL_MS
+  ) {
+    return Promise.resolve(distributionsValue.names);
+  }
+  if (!refresh && distributionsProbe) return distributionsProbe;
+  const probe = invoke<string[]>("wsl_distributions");
+  distributionsProbe = probe;
+  probe
+    .then((names) => {
+      // A superseded probe must not overwrite a newer result.
+      if (distributionsProbe === probe) {
+        distributionsValue = { at: Date.now(), names };
+        distributionsProbe = null;
+      }
+    })
+    .catch(() => {
+      if (distributionsProbe === probe) distributionsProbe = null;
+    });
+  return probe;
+}
+
+/** Last resolved distribution list without triggering a probe; null if never resolved. */
+export function wslDistributionsPeek(): string[] | null {
+  return distributionsValue?.names ?? null;
+}
+
+/** @internal test-only: drop the cached probe and value. */
+export function __wslDistributionsReset() {
+  distributionsProbe = null;
+  distributionsValue = null;
+}
+
 const generations = new Map<string, number>();
 export function invalidateWslDiscovery(path: string) {
   invalidateHarnessAvailability(path);

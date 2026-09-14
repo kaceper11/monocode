@@ -19,6 +19,7 @@ import {
   extractShellCommand,
   extractSkillName,
   extractToolPreview,
+  isMcpToolName,
 } from "./preview";
 import { acpAgentInfo } from "./acpSubagents";
 
@@ -329,8 +330,9 @@ export function acpEventsFromUpdate(params: unknown): HarnessEvent[] {
         "",
     );
     if (!callId) return [];
-    const toolKind =
-      stringField(update, "kind") ?? stringField(tool, "kind");
+    const toolKind = isAcpMcpToolCall(tool, update)
+      ? "mcp"
+      : (stringField(update, "kind") ?? stringField(tool, "kind"));
     const status = stringField(update, "status") ?? stringField(tool, "status");
     const preview = extractToolPreview(update, tool);
     const meta = asRecord(update._meta) ?? asRecord(tool._meta);
@@ -403,6 +405,41 @@ export function acpEventsFromUpdate(params: unknown): HarnessEvent[] {
   return usage ? [usage] : [];
 }
 
+/**
+ * ACP has no MCP tool kind in the spec; agents mark calls loosely through the
+ * kind, a server field on the toolCall/_meta, or an `mcp`-prefixed name.
+ */
+export function isAcpMcpToolCall(
+  tool: Record<string, unknown>,
+  extra?: Record<string, unknown> | null,
+): boolean {
+  const records = [tool, extra ?? null];
+  for (const rec of records) {
+    if (!rec) continue;
+    if (stringField(rec, "kind")?.toLowerCase() === "mcp") return true;
+    const meta = asRecord(rec._meta) ?? asRecord(rec.meta);
+    if (meta?.mcp === true) return true;
+    for (const source of [rec, meta]) {
+      if (!source) continue;
+      if (
+        stringField(source, "serverName") ||
+        stringField(source, "server_name") ||
+        stringField(source, "mcpServer") ||
+        stringField(source, "mcp_server")
+      ) {
+        return true;
+      }
+    }
+    const name =
+      stringField(rec, "name") ??
+      stringField(rec, "toolName") ??
+      stringField(rec, "tool_name") ??
+      stringField(rec, "title");
+    if (isMcpToolName(name)) return true;
+  }
+  return false;
+}
+
 export function acpPermissionRequest(
   params: unknown,
 ): AcpPermissionRequest {
@@ -416,7 +453,9 @@ export function acpPermissionRequest(
     rec ??
     {};
   const command = stringField(subject ?? {}, "command");
-  const kind = stringField(tool, "kind") ?? stringField(subject ?? {}, "kind");
+  const kind = isAcpMcpToolCall(tool, subject)
+    ? "mcp"
+    : (stringField(tool, "kind") ?? stringField(subject ?? {}, "kind"));
   const preview = extractToolPreview(tool, tool);
   const title =
     composeToolTitle({
@@ -451,9 +490,10 @@ export function acpPermissionRequest(
 
 /**
  * Requests that still reach us are answered by runtime mode: supervised keeps
- * every prompt, auto-accept-edits keeps shell/fetch/other prompts, and the
- * auto/full-access modes answer immediately since the agent already applied
- * its own mode judgement before asking.
+ * every prompt, auto-accept-edits auto-answers only edit/read/search/think and
+ * keeps everything else (MCP included) on a prompt, and the auto/full-access
+ * modes answer immediately since the agent already applied its own mode
+ * judgement before asking.
  */
 export function acpAutoOption(
   runtimeMode: RuntimeMode,
@@ -463,11 +503,13 @@ export function acpAutoOption(
   if (optionIds.length === 0) return null;
   const tool = (kind ?? "").toLowerCase();
   if (runtimeMode === "supervised") return null;
-  if (
-    runtimeMode === "auto-accept-edits" &&
-    (tool === "execute" || tool === "other" || tool === "fetch")
-  ) {
-    return null;
+  if (runtimeMode === "auto-accept-edits") {
+    // AcceptEdits auto-answers only harmless kinds — edits and reads. MCP,
+    // commands, deletes, fetches and anything unrecognized still prompt the
+    // way the real CLIs do.
+    if (tool !== "edit" && tool !== "read" && tool !== "search" && tool !== "think") {
+      return null;
+    }
   }
   if (runtimeMode === "full-access") {
     return pickOption(optionIds, [

@@ -910,3 +910,93 @@ it("shows merge state with send-to-owning-agent and abort controls", async () =>
     vi.unstubAllGlobals();
   }
 });
+
+it("moves a file to the Local Only section and back", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const { invoke } = await import("@tauri-apps/api/core");
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  const kept = new Set<string>(["dev.local"]);
+  const calls: [string, string][] = [];
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "git_keep_local" || command === "git_unkeep_local") {
+      const { relative } = args as { relative: string };
+      calls.push([command, relative]);
+      if (command === "git_keep_local") kept.add(relative);
+      else kept.delete(relative);
+      return null;
+    }
+    if (command === "git_diff_index") {
+      const file = (relative: string, status: string) => ({
+        path: `/repo-keep/${relative}`,
+        relative,
+        status,
+        staged: false,
+        unstaged: !kept.has(relative),
+        additions: 1,
+        deletions: 0,
+      });
+      const files = ["a.ts", "dev.local"].filter((name) => !kept.has(name));
+      return {
+        branch: "feature",
+        ahead: 0,
+        behind: 0,
+        files: files.map((name) => file(name, "modified")),
+        localOnly: [...kept].map((name) => file(name, "modified")),
+      };
+    }
+    return original(command, args);
+  });
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const row = (relative: string) =>
+    host.querySelector(`button[title="${relative}"]`) as HTMLButtonElement | null;
+  const sectionOf = (relative: string) =>
+    [...host.querySelectorAll("span.uppercase")].find((title) =>
+      title.parentElement?.parentElement?.parentElement?.contains(
+        row(relative)!,
+      ),
+    )?.textContent;
+  try {
+    await act(async () =>
+      root.render(
+        createElement(GitChangesPanel, {
+          cwd: "/repo-keep",
+          sourceSessionId: "owner",
+          enabled: true,
+          onOpenFile: vi.fn(),
+          onOpenAllChanges: vi.fn(),
+          onOpenCommit: vi.fn(),
+        }),
+      ),
+    );
+    // The kept file renders in its own section with only the unkeep action.
+    expect(row("dev.local")).not.toBeNull();
+    expect(sectionOf("dev.local")).toBe("Local Only");
+    expect(
+      row("dev.local")!.parentElement!.querySelector(
+        'button[aria-label^="Stop keeping local"]',
+      ),
+    ).not.toBeNull();
+    // A normal row offers keep alongside stage/discard.
+    const keepButton = row("a.ts")!.parentElement!.querySelector(
+      'button[aria-label^="Keep local"]',
+    ) as HTMLButtonElement;
+    expect(keepButton).not.toBeNull();
+    await act(async () => keepButton.click());
+    expect(calls).toEqual([["git_keep_local", "a.ts"]]);
+    expect(sectionOf("a.ts")).toBe("Local Only");
+    // Unkeeping returns the row to the regular changes list.
+    const unkeepButton = row("a.ts")!.parentElement!.querySelector(
+      'button[aria-label^="Stop keeping local"]',
+    ) as HTMLButtonElement;
+    await act(async () => unkeepButton.click());
+    expect(calls.at(-1)).toEqual(["git_unkeep_local", "a.ts"]);
+    await vi.waitFor(() => expect(sectionOf("a.ts")).toBe("Changes"));
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    vi.mocked(invoke).mockImplementation(original);
+    vi.unstubAllGlobals();
+  }
+});

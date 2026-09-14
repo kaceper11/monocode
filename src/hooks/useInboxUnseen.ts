@@ -1,7 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import {
+  inboxFetchPaths,
   inboxItemKey,
+  inboxProjectIdentities,
   inboxProjectsForRail,
+  inboxRailKeyResolver,
   listInboxItems,
   type InboxItem,
   type InboxQuery,
@@ -34,6 +44,7 @@ import {
   subscribeLinkedSessionSeen,
 } from "../lib/linkedSessionSeen";
 import { loadHiddenLinearTeamIds } from "../lib/linear";
+import { projectsSnapshot, subscribeProjects } from "../lib/projects";
 import type { RecentProject } from "../lib/recents";
 import type { SessionSummary } from "../lib/sessionStore";
 import { noteInboxUnseen } from "../lib/sounds";
@@ -134,17 +145,23 @@ export function useInboxActivity(
     [],
   );
 
-  useEffect(() => {
-    const projects = inboxProjectsForRail(recents, cwd);
+  // Repulling on a project-store save is what lands a just-added project's
+  // items without waiting for the next interval or a remount.
+  const projectsRaw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
 
+  useEffect(() => {
     let cancelled = false;
     let pulling = false;
 
     const pull = async (force: boolean) => {
       if (pulling) return;
       pulling = true;
-      const projectPaths = projects.map((project) => project.path);
-      const filters = pruneInboxFilters(loadInboxFilters(), projectPaths);
+      // Recomputed per pass — membership edits between polls are picked up.
+      const projects = inboxProjectsForRail(recents, cwd);
+      const filters = pruneInboxFilters(
+        loadInboxFilters(),
+        inboxProjectIdentities(projects),
+      );
       const query: InboxQuery = {
         assignedToMe: filters.assignedToMe,
         state: inboxFetchState(filters),
@@ -154,10 +171,17 @@ export function useInboxActivity(
       try {
         // No rail projects still refreshes linked items via the fallback.
         const listed = projects.length
-          ? await listInboxItems(projects, query, { force })
+          ? await listInboxItems(inboxFetchPaths(projects), query, { force })
           : { items: [], errors: {} };
         if (cancelled) return;
-        const visible = applyInboxFilters(listed.items, filters, "");
+        const visible = applyInboxFilters(
+          listed.items,
+          filters,
+          "",
+          Date.now(),
+          undefined,
+          inboxRailKeyResolver(projects),
+        );
         const entries = seenEntries(visible);
         entriesRef.current = entries;
         seedInboxSeenIfNeeded(entries);
@@ -223,7 +247,7 @@ export function useInboxActivity(
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [applyUnseen, cwd, recents, targetKey]);
+  }, [applyUnseen, cwd, recents, targetKey, projectsRaw]);
 
   const updates = useMemo(() => {
     const seen = linkedSessionSeenAll();

@@ -22,7 +22,7 @@ vi.mock("./child", () => ({
   },
 }));
 
-const { sendFxTurn, stopFxSession } = await import("./fx");
+const { sendFxTurn, stopFxSession, respondFxApproval } = await import("./fx");
 import type { HarnessEvent } from "./types";
 
 function reply(id: number, result: unknown) {
@@ -161,24 +161,114 @@ describe("fx live turn sequence", () => {
       }),
     );
 
+    // Supervised parks the elevated ask on an approval card; the user's
+    // decision is what gets answered back to fx.
+    await waitFor(
+      () => events.some((e) => e.type === "approval.requested"),
+      "approval request",
+    );
+    const approval = events.find((e) => e.type === "approval.requested")!;
+    respondFxApproval("t1", approval.requestId, "allow");
     await waitFor(
       () => parse().some((m) => m.id === 1 && m.result),
-      "auto permission response",
+      "permission response",
     );
     const response = parse().find((m) => m.id === 1 && m.result);
-    console.log(
-      "auto-approved without any UI round trip:",
-      JSON.stringify(response),
-    );
-    expect(response.result.outcome.optionId).toBe("allow_always");
-    expect(
-      events.some((e) => e.type === "approval.requested"),
-      "fx must never park a turn on an approval",
-    ).toBe(false);
+    expect(response.result.outcome.optionId).toBe("allow_once");
 
     reply(promptId, { stopReason: "end_turn" });
     await turn2;
     await stopFxSession("t1");
+  });
+
+  it("parks MCP permission asks under auto-accept-edits", async () => {
+    const events: HarnessEvent[] = [];
+    const input = {
+      sessionId: "t3",
+      cwd: "/repo",
+      model: "fx:zai/glm-5.2",
+      modelSettings: {},
+      runtimeMode: "auto-accept-edits" as const,
+      text: "use the github tool",
+      attachments: [],
+      onEvent: (e: HarnessEvent) => events.push(e),
+    };
+
+    const turn = sendFxTurn(input as never);
+    await waitFor(
+      () => parse().some((m) => m.method === "initialize"),
+      "initialize",
+    );
+    reply(parse().find((m) => m.method === "initialize")!.id, {
+      protocolVersion: 1,
+    });
+    await waitFor(
+      () => parse().some((m) => m.method === "session/new"),
+      "session/new",
+    );
+    reply(parse().find((m) => m.method === "session/new")!.id, {
+      sessionId: "S1",
+      configOptions: [
+        { id: "provider", category: "model", currentValue: "gateway" },
+        { id: "model", category: "model", currentValue: "zai/glm-5.2" },
+        { id: "mode", category: "mode", currentValue: "ask" },
+      ],
+    });
+    await waitFor(
+      () => parse().some((m) => m.method === "session/set_mode"),
+      "set_mode",
+    );
+    reply(parse().find((m) => m.method === "session/set_mode")!.id, {});
+    await waitFor(
+      () => parse().some((m) => m.method === "session/prompt"),
+      "prompt",
+    );
+    const promptId = parse().find((m) => m.method === "session/prompt")!.id;
+
+    onLine!(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 7,
+        method: "session/request_permission",
+        params: {
+          sessionId: "S1",
+          toolCall: {
+            toolCallId: "call_mcp",
+            title: "mcp__github__create_issue",
+            kind: "other",
+            status: "pending",
+          },
+          options: [
+            { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+            { optionId: "reject_once", name: "Reject", kind: "reject_once" },
+          ],
+        },
+      }),
+    );
+
+    await waitFor(
+      () => events.some((e) => e.type === "approval.requested"),
+      "MCP approval.requested",
+    );
+    expect(parse().some((m) => m.id === 7)).toBe(false);
+    expect(events.find((e) => e.type === "approval.requested")?.kind).toBe(
+      "mcp",
+    );
+
+    respondFxApproval("t3", 7, "deny");
+    await waitFor(() => parse().some((m) => m.id === 7), "MCP response");
+    expect(parse().find((m) => m.id === 7)?.result?.outcome?.optionId).toBe(
+      "reject_once",
+    );
+    expect(events).toContainEqual({
+      type: "approval.resolved",
+      requestId: 7,
+      decision: "deny",
+    });
+
+    reply(promptId, { stopReason: "end_turn" });
+    await turn;
+    await stopFxSession("t3");
   });
 
   it("routes a late exit to the current turn's listener, not turn 1's", async () => {

@@ -738,6 +738,133 @@ describe("claude runtime mode changes", () => {
     await turn;
   });
 
+  it("parks MCP asks under auto-accept-edits and settles them under full-access", async () => {
+    const { events, turn } = await startTurn("s1", {
+      runtimeMode: "auto-accept-edits",
+    });
+    // acceptEdits still raises can_use_tool for MCP calls, the way the real
+    // CLI prompts for them; the ask parks for the user.
+    emit({
+      type: "control_request",
+      request_id: "mcp_1",
+      request: {
+        subtype: "can_use_tool",
+        tool_name: "mcp__github__create_issue",
+        input: { title: "Bug" },
+      },
+    });
+    await waitFor(
+      () => events.some((event) => event.type === "approval.requested"),
+      "MCP approval UI",
+    );
+    const requested = events.find((e) => e.type === "approval.requested")!;
+    expect(requested.kind).toBe("mcp");
+    expect(
+      parse().some(
+        (message) =>
+          (message.response as Record<string, unknown>)?.request_id ===
+          "mcp_1",
+      ),
+    ).toBe(false);
+
+    // Full-access admits everything — the parked MCP ask settles as allowed.
+    setClaudeRuntimeMode("s1", "full-access");
+    await waitFor(
+      () =>
+        parse().some(
+          (message) =>
+            (message.response as Record<string, unknown>)?.request_id ===
+            "mcp_1",
+        ),
+      "MCP settle response",
+    );
+    expect(
+      parse().find(
+        (message) =>
+          (message.response as Record<string, unknown>)?.request_id ===
+          "mcp_1",
+      ),
+    ).toMatchObject({ response: { response: { behavior: "allow" } } });
+    expect(
+      events.some(
+        (e) => e.type === "approval.resolved" && e.decision === "allow",
+      ),
+    ).toBe(true);
+
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await turn;
+  });
+
+  it("auto-answers a residual MCP ask under full-access", async () => {
+    const { events, turn } = await startTurn("s1", {
+      runtimeMode: "full-access",
+    });
+    // bypassPermissions means the CLI skips can_use_tool entirely, but a
+    // straggler that still arrives is allowed without parking.
+    emit({
+      type: "control_request",
+      request_id: "mcp_2",
+      request: {
+        subtype: "can_use_tool",
+        tool_name: "mcp__github__create_issue",
+        input: { title: "Bug" },
+      },
+    });
+    await waitFor(
+      () =>
+        parse().some(
+          (message) =>
+            (message.response as Record<string, unknown>)?.request_id ===
+            "mcp_2",
+        ),
+      "MCP auto response",
+    );
+    expect(events.some((e) => e.type === "approval.requested")).toBe(false);
+
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await turn;
+  });
+
+  it("settles a parked MCP approval when the child exits", async () => {
+    const { events, turn } = await startTurn("s1", {
+      runtimeMode: "auto-accept-edits",
+    });
+    emit({
+      type: "control_request",
+      request_id: "mcp_exit",
+      request: {
+        subtype: "can_use_tool",
+        tool_name: "mcp__github__create_issue",
+        input: { title: "Bug" },
+      },
+    });
+    await waitFor(
+      () => events.some((event) => event.type === "approval.requested"),
+      "MCP approval UI",
+    );
+
+    // Attach the catch before the exit so the turn's rejection is handled.
+    const settled = turn.catch(() => undefined);
+    onExit!(1);
+    await waitFor(
+      () => events.some((event) => event.type === "approval.resolved"),
+      "approval.resolved",
+    );
+    expect(events.find((e) => e.type === "approval.resolved")).toMatchObject({
+      decision: "cancelled",
+    });
+    expect(events.some((e) => e.type === "session.ended")).toBe(true);
+    // The dead child gets no control response — "cancelled" skips the write.
+    expect(
+      parse().some(
+        (message) =>
+          (message.response as Record<string, unknown>)?.request_id ===
+          "mcp_exit",
+      ),
+    ).toBe(false);
+    await settled;
+  });
+
   it("settles only the asks the new mode covers", async () => {
     const { events, turn } = await startTurn("s1");
     emit({

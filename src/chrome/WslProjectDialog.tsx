@@ -1,7 +1,6 @@
-import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 import { wslLocation, wslPath } from "../lib/paths";
-import { connectWslProject } from "../lib/wsl";
+import { connectWslProject, wslDistributions, wslDistributionsPeek } from "../lib/wsl";
 import { useWslStatus } from "../lib/wslStatus";
 import { pickFolder, pickFolders } from "../lib/fs";
 import { Select } from "./Select";
@@ -50,10 +49,14 @@ export function WslProjectDialog({
     };
   }, []);
   const current = wslLocation(cwd);
-  const [distributions, setDistributions] = useState<string[]>([]);
+  // A prefetched distribution list mounts the dialog in its final layout
+  // instead of flashing a loading frame that resizes under the user.
+  const [distributions, setDistributions] = useState<string[]>(
+    () => wslDistributionsPeek() ?? [],
+  );
   const [distribution, setDistribution] = useState(current?.distribution ?? "");
   const [path, setPath] = useState(current?.path ?? "");
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => wslDistributionsPeek() == null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const wslStatus = useWslStatus(distribution || undefined);
@@ -61,9 +64,10 @@ export function WslProjectDialog({
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
+    // A manual retry shows the spinner even when a stale list is cached.
+    if (wslDistributionsPeek() == null || attempt > 0) setLoading(true);
     setError("");
-    void invoke<string[]>("wsl_distributions")
+    void wslDistributions(attempt > 0)
       .then((names) => {
         if (cancelled) return;
         setDistributions(names);
@@ -208,7 +212,7 @@ export function WslProjectDialog({
           </p>
         )}
         <div className="flex justify-end gap-2 text-[12px]">
-          {!loading && !distributions.length && (
+          {!loading && (!!error || !distributions.length) && (
             <button
               type="button"
               className="rounded-md px-3 py-1.5 hover:bg-content/8"

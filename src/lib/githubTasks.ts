@@ -18,12 +18,28 @@ import {
   listGitlabWorkItems,
   type GitlabWorkItem,
 } from "./gitlab";
+import { pathKey, projectKey, projectName } from "./paths";
 import {
-  collectRailProjects,
+  isProjectRailKey,
+  loadProjects,
+  projectContainsPath,
+  projectForPath,
+  projectRailKey,
+  type ProjectRecord,
+} from "./projects";
+import {
+  loadPinnedProjects,
+  loadProjectRailOrder,
   normalizeProjectPath,
+  projectRailSections,
   sameProjectPath,
   type RecentProject,
 } from "./recents";
+import {
+  getVerifiedFamilies,
+  type RepositoryFamily,
+} from "./repositoryFamilies";
+import { loadTabGroupLabels, resolveTabGroupLabel } from "./tabGroups";
 import type { UnifiedLine } from "./unifiedDiff";
 
 export type GithubTaskKind = "issue" | "pr";
@@ -879,16 +895,129 @@ export function gitlabWorkItemToInboxItem(
   };
 }
 
+/** One row of the rail's project point of view — a stored project or an
+ * unclaimed folder — with the working copies the inbox fetches through. */
+export type InboxRailProject = {
+  /** Rail identity — `project:<id>` for pure groups. Keys filters and
+   * appearance; never assume it is a filesystem path. */
+  key: string;
+  /** Stored project name, saved rail label, or folder name. */
+  name: string;
+  /** Working copies this project fetches through: member repository anchors
+   * plus the folder anchor when the project keeps one. */
+  paths: string[];
+  /** A real folder for new-work defaults — never a `project:` sentinel. */
+  cwd: string;
+  project?: ProjectRecord;
+};
+
+/** The Inbox's project rows follow the rail, not the recents list: stored
+ * projects collapse their member folders into one row and keep appearing
+ * while they own repositories, even when nothing member-side is a recent. */
 export function inboxProjectsForRail(
   recents: RecentProject[],
   cwd: string,
-): RecentProject[] {
-  const map = collectRailProjects(recents, cwd);
-  const current = cwd ? map.get(normalizeProjectPath(cwd)) : undefined;
-  const rest = [...map.values()].filter(
-    (project) => !current || !sameProjectPath(project.path, current.path),
+  storedProjects: readonly ProjectRecord[] = loadProjects(),
+  families: ReadonlyMap<string, RepositoryFamily> = getVerifiedFamilies(),
+): InboxRailProject[] {
+  const sections = projectRailSections(
+    recents,
+    cwd,
+    loadProjectRailOrder(),
+    loadPinnedProjects(),
+    families,
+    storedProjects,
   );
-  return current ? [current, ...rest] : rest;
+  const labels = loadTabGroupLabels();
+  const out: InboxRailProject[] = [];
+  for (const item of [...sections.pinned, ...sections.projects]) {
+    const project = item.project;
+    const seen = new Set<string>();
+    const paths: string[] = [];
+    for (const path of project
+      ? [project.anchor, ...project.repositories.map((repo) => repo.anchor)]
+      : [item.path]) {
+      if (!path) continue;
+      const key = pathKey(path);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      paths.push(path);
+    }
+    const target = project
+      ? (project.anchor ??
+        project.lastPath ??
+        project.repositories[0]?.anchor ??
+        "")
+      : item.path;
+    // A pathless project with no repositories yet has nothing to fetch.
+    if (!paths.length || !target) continue;
+    out.push({
+      key: item.path,
+      name:
+        project?.name ??
+        resolveTabGroupLabel(
+          projectKey(item.path),
+          labels,
+          isProjectRailKey(item.path) ? "Project" : projectName(item.path),
+        ),
+      paths,
+      cwd: target,
+      ...(project ? { project } : {}),
+    });
+  }
+  const currentIndex = cwd
+    ? out.findIndex(
+        (entry) =>
+          sameProjectPath(entry.key, cwd) ||
+          entry.paths.some((path) => sameProjectPath(path, cwd)) ||
+          (entry.project
+            ? projectContainsPath(entry.project, cwd, families)
+            : false),
+      )
+    : -1;
+  if (currentIndex > 0) out.unshift(...out.splice(currentIndex, 1));
+  return out;
+}
+
+/** Fetch units for `listInboxItems` — every working copy across the rows. */
+export function inboxFetchPaths(
+  projects: readonly InboxRailProject[],
+): { path: string }[] {
+  return projects.flatMap((project) =>
+    project.paths.map((path) => ({ path })),
+  );
+}
+
+/** Every value a stored `hiddenProjects` entry can mean — rail keys now,
+ * member working-copy paths from older saves. */
+export function inboxProjectIdentities(
+  projects: readonly InboxRailProject[],
+): string[] {
+  return projects.flatMap((project) => [project.key, ...project.paths]);
+}
+
+/** Maps a working copy to its inbox project key — the rail row it was
+ * fetched under. Member worktrees inherit the project's identity; unknown
+ * paths keep their own normalized form. */
+export function inboxRailKeyResolver(
+  projects: readonly InboxRailProject[],
+): (path: string) => string {
+  const byPath = new Map<string, string>();
+  for (const project of projects) {
+    byPath.set(pathKey(project.key), project.key);
+    for (const path of project.paths) {
+      const key = pathKey(path);
+      if (!byPath.has(key)) byPath.set(key, project.key);
+    }
+  }
+  return (path: string) => {
+    const normalized = normalizeProjectPath(path);
+    if (!normalized || normalized === "/") return normalized;
+    const direct = byPath.get(pathKey(normalized));
+    if (direct) return direct;
+    const owner = projectForPath(normalized);
+    return owner ? (owner.anchor ?? projectRailKey(owner.id)) : normalized;
+  };
 }
 
 export function uniqueInboxProjects(

@@ -228,4 +228,31 @@ describe("Inbox activity polling", () => {
 
     expect(activity.linkedSessionUpdateIds.has(session.id)).toBe(false);
   });
+
+  it("re-pulls with the new project's repositories when the store changes", async () => {
+    const { addRepositoryToProject, createProjectGroup } = await import(
+      "../lib/projects"
+    );
+    listInboxItems.mockResolvedValue({ items: [], errors: {} });
+    await mount();
+    expect(listInboxItems).toHaveBeenLastCalledWith(
+      [{ path: "/tmp/app" }],
+      expect.anything(),
+      expect.anything(),
+    );
+
+    await act(async () => {
+      const group = createProjectGroup("Suite");
+      addRepositoryToProject(group.id, {
+        commonDir: "/tmp/api/.git",
+        anchor: "/tmp/api",
+      });
+    });
+
+    expect(listInboxItems).toHaveBeenLastCalledWith(
+      [{ path: "/tmp/app" }, { path: "/tmp/api" }],
+      expect.anything(),
+      expect.anything(),
+    );
+  });
 });

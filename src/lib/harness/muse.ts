@@ -1712,6 +1712,9 @@ function museAutoDecision(
   if (planning) {
     return kind === "read" || kind === "search" ? "allow" : "deny";
   }
+  // MCP calls aren't edits — acceptEdits prompts for them the way the real
+  // CLIs do. Full-access admits them outright; auto delegates to the server.
+  if (kind === "mcp" && runtimeMode === "auto-accept-edits") return null;
   if (runtimeMode === "full-access") return "allow";
   if (runtimeMode === "auto-accept-edits" && kind === "edit") return "allow";
   return null;

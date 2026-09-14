@@ -1,7 +1,7 @@
 import { nativeModelId } from "../models";
 import { AcpSubagents } from "./acpSubagents";
 import type { RuntimeMode } from "../session";
-import { AcpClient, type AcpHandlers } from "./acp";
+import { AcpClient, acpAutoOption, type AcpHandlers } from "./acp";
 import type { JsonRpcId } from "./jsonRpc";
 import {
   killChild,
@@ -11,7 +11,6 @@ import {
   watchChild,
 } from "./child";
 import {
-  autoPermissionOption,
   eventsFromAcpUpdate,
   extractModelConfigId,
   fxModeId,
@@ -36,6 +35,12 @@ type SessionSetupResult = {
   configOptions?: unknown;
 };
 
+type PendingApproval = {
+  kind?: string;
+  optionIds: string[];
+  resolve: (decision: ApprovalDecision) => void;
+};
+
 type Live = {
   subagents: AcpSubagents;
   acp: AcpClient;
@@ -49,6 +54,8 @@ type Live = {
   planning: boolean;
   /** Last modeId the provider confirmed, so repeats skip the wire call. */
   appliedModeId?: string;
+  approvals: Map<number, PendingApproval>;
+  nextRequestId: number;
   onEvent: (event: HarnessEvent) => void;
   turns: Promise<void>;
 };
@@ -150,12 +157,18 @@ export async function steerFxTurn(_input: SteerTurnInput): Promise<void> {
   throw new Error("fx does not support steering an in-flight turn");
 }
 
-/** fx auto-approves in `code` mode, so there is never a pending approval. */
+/** MCP asks park for the user where the mode still prompts; the rest are answered locally. */
 export function respondFxApproval(
-  _sessionId: string,
-  _requestId: number,
-  _decision: ApprovalDecision,
-) {}
+  sessionId: string,
+  requestId: number,
+  decision: ApprovalDecision,
+) {
+  const live = liveByThread.get(sessionId);
+  const pending = live?.approvals.get(requestId);
+  if (!pending) return;
+  live!.approvals.delete(requestId);
+  pending.resolve(decision);
+}
 
 /** Push a UI access-mode change to the provider now rather than next turn. */
 export function setFxRuntimeMode(
@@ -164,10 +177,19 @@ export function setFxRuntimeMode(
 ): void {
   const live = liveByThread.get(sessionId);
   if (!live) return;
+  const changed = live.runtimeMode !== runtimeMode;
   live.runtimeMode = runtimeMode;
   void applyRuntimeMode(live, runtimeMode, live.planning).catch(
     () => undefined,
   );
+  if (!changed) return;
+  // Settle parked asks the new mode would auto-answer; the rest stay parked.
+  for (const [requestId, pending] of live.approvals) {
+    if (acpAutoOption(runtimeMode, pending.kind, pending.optionIds)) {
+      live.approvals.delete(requestId);
+      pending.resolve("allow");
+    }
+  }
 }
 
 export async function cancelFxTurn(sessionId: string): Promise<void> {
@@ -178,6 +200,8 @@ export async function cancelFxTurn(sessionId: string): Promise<void> {
   }
   live.cancelled = true;
   live.muteUpdates = true;
+  for (const [, pending] of live.approvals) pending.resolve("deny");
+  live.approvals.clear();
   await live.acp
     .notify("session/cancel", { sessionId: live.acpSessionId })
     .catch(() => undefined);
@@ -188,7 +212,11 @@ export async function stopFxSession(sessionId: string): Promise<void> {
   cancelledThreads.delete(sessionId);
   const live = liveByThread.get(sessionId);
   liveByThread.delete(sessionId);
-  if (live) live.muteUpdates = true;
+  if (live) {
+    live.muteUpdates = true;
+    for (const [, pending] of live.approvals) pending.resolve("deny");
+    live.approvals.clear();
+  }
   live?.acp.close();
   unwatchChild(sessionId);
   await killChild(sessionId).catch(() => undefined);
@@ -249,7 +277,12 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
         .catch(() => undefined);
       return;
     }
-    void handleRequest(live, id, method, params);
+    void handleRequest(live, id, method, params).catch((error) => {
+      console.debug("[monocode] fx request handler failed", error);
+      void acp
+        .respondError(id, { code: -32603, message: "Internal error" })
+        .catch(() => undefined);
+    });
   };
 
   // ensureLive runs once per session, so these handlers outlive the turn that
@@ -267,6 +300,13 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     (code) => {
       acp.close(new Error("fx exited"));
       liveByThread.delete(input.sessionId);
+      const live = liveRef.current;
+      if (live) {
+        // Exit settles parked asks so the provider request and the UI card
+        // both close instead of lingering on a dead child.
+        for (const [, pending] of live.approvals) pending.resolve("deny");
+        live.approvals.clear();
+      }
       emit({ type: "session.ended", code });
     },
     (line) => {
@@ -353,6 +393,8 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
       cancelled: false,
       runtimeMode: input.runtimeMode,
       planning: input.intent === "plan",
+      approvals: new Map(),
+      nextRequestId: 1_000_000,
       onEvent: input.onEvent,
       turns: Promise.resolve(),
     };
@@ -518,12 +560,20 @@ async function handleRequest(
 }
 
 /**
- * fx polices its own permissions in `code` mode, so anything that still reaches
- * us is answered immediately. We never park a turn on an approval — that is
- * what left sessions stuck on "Working…" with an empty transcript.
+ * fx polices its own permissions in `code` mode, so only asks it considers
+ * elevated reach us. Supervised still parks them for the user; auto-accept-
+ * edits auto-allows edits; auto and full-access answer everything locally.
  */
 async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
   const request = permissionRequestFromAcp(params);
+  if (live.cancelled || live.muteUpdates) {
+    // A request landing after cancel/stop must still be answered — the
+    // server holds its turn open until it gets a response.
+    await live.acp
+      .respond(id, { outcome: { outcome: "cancelled" } })
+      .catch(() => undefined);
+    return;
+  }
   if (request.callId) {
     live.onEvent({
       type: "tool.updated",
@@ -533,14 +583,58 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
       preview: request.preview,
     });
   }
-  const optionId = live.planning
-    ? permissionOptionId(
-        request.kind === "read" || request.kind === "search" ? "allow" : "deny",
-        request.optionIds,
+  if (live.planning) {
+    const optionId = permissionOptionId(
+      request.kind === "read" || request.kind === "search" ? "allow" : "deny",
+      request.optionIds,
+    );
+    await live.acp
+      .respond(
+        id,
+        optionId
+          ? { outcome: { outcome: "selected", optionId } }
+          : { outcome: { outcome: "cancelled" } },
       )
-    : (autoPermissionOption(live.runtimeMode, request.optionIds) ??
-      permissionOptionId("allow", request.optionIds));
-  await live.acp.respond(id, {
-    outcome: { outcome: "selected", optionId },
+      .catch(() => undefined);
+    return;
+  }
+  const auto = acpAutoOption(
+    live.runtimeMode,
+    request.kind,
+    request.optionIds,
+  );
+  if (auto) {
+    await live.acp
+      .respond(id, { outcome: { outcome: "selected", optionId: auto } })
+      .catch(() => undefined);
+    return;
+  }
+
+  const requestId = typeof id === "number" ? id : (live.nextRequestId += 1);
+  live.onEvent({
+    type: "approval.requested",
+    requestId,
+    title: request.title,
+    kind: request.kind,
+    callId: request.callId,
+    preview: request.preview,
   });
+  const decision = await new Promise<ApprovalDecision>((resolve) => {
+    live.approvals.set(requestId, {
+      kind: request.kind,
+      optionIds: request.optionIds,
+      resolve,
+    });
+  });
+  live.approvals.delete(requestId);
+  live.onEvent({ type: "approval.resolved", requestId, decision });
+  const optionId = permissionOptionId(decision, request.optionIds);
+  await live.acp
+    .respond(
+      id,
+      optionId
+        ? { outcome: { outcome: "selected", optionId } }
+        : { outcome: { outcome: "cancelled" } },
+    )
+    .catch(() => undefined);
 }

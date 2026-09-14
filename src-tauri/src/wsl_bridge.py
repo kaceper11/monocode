@@ -39,6 +39,13 @@ def absolute(value):
     return Path(value)
 
 
+def portable(name):
+    # surrogateescape bytes in undecodable names serialize as lone surrogates
+    # that the host's JSON parser rejects — one bad name would void the whole
+    # response, so such entries stay inside the guest.
+    return all(not 0xD800 <= ord(char) <= 0xDFFF for char in name)
+
+
 def run(argv, cwd, input_bytes=None, timeout=25):
     """Bound both streams and kill the owned group before reaping on failure."""
     # Temporary input avoids blocking the bridge while a child ignores its stdin.
@@ -111,7 +118,10 @@ def prepare_environment():
     # A configured shell that cannot answer (missing, non-POSIX, broken rc) must
     # not hide every installed agent: fall back to common POSIX shells so login
     # profiles still load user-managed tool paths.
-    preferred = pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
+    try:
+        preferred = pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
+    except KeyError:
+        preferred = os.environ.get("SHELL") or "/bin/sh"
     environment = None
     for shell in dict.fromkeys([preferred, "/bin/bash", "/bin/sh"]):
         try:
@@ -198,11 +208,14 @@ AGENT_NAMES = {
 }
 # Linux tool folders that are not always exported to the login PATH.
 AGENT_FOLDERS = [
-    ".local/bin", ".npm-global/bin", ".cargo/bin", ".bun/bin", "n/bin",
+    ".local/bin", "bin", ".npm-global/bin", ".cargo/bin", ".bun/bin",
+    ".yarn/bin", ".deno/bin", ".local/share/pnpm", "n/bin",
     ".volta/bin", ".asdf/shims", ".local/share/mise/shims",
-    ".grok/bin", ".fx/bin", ".claude/local", ".local/share/claude",
-    ".local/share/devin/cli/_versions/current/bin",
+    ".linuxbrew/bin", ".grok/bin", ".fx/bin", ".claude/local",
+    ".local/share/claude", ".local/share/devin/cli/_versions/current/bin",
 ]
+# System prefixes a broken login profile can drop from PATH.
+AGENT_SYSTEM_FOLDERS = ["/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin", "/snap/bin"]
 # Credential evidence checked without spawning the provider or reading secrets:
 # only env names and file existence are inspected. strict providers report a
 # definitive "signed out" when nothing is found; others stay unknown.
@@ -259,8 +272,10 @@ def file_mentions(candidate, needles):
 
 
 def agent_help(candidate, home):
+    # Standalone agent binaries are ~100MB+ self-contained executables whose
+    # cold --help can outlive a 2s budget; keep the probe bounded but real.
     try:
-        code, out, err = run([str(candidate), "--help"], str(home), timeout=2)
+        code, out, err = run([str(candidate), "--help"], str(home), timeout=6)
         return code, (out + err).decode("utf-8", errors="replace").lower()
     except (OSError, ValueError, TimeoutError):
         return 1, ""
@@ -335,6 +350,7 @@ def find_agent(provider):
             names = names + ["muse-bin-" + version]
     folders = [home / suffix for suffix in AGENT_FOLDERS]
     folders = [Path(folder) for folder in os.environ.get("PATH", "").split(":") if folder.startswith("/") and not folder.startswith("/mnt/")] + folders
+    folders += [Path(folder) for folder in AGENT_SYSTEM_FOLDERS]
     for name in names:
         for folder in dict.fromkeys(folders):
             candidate = folder / name
@@ -623,7 +639,7 @@ def handle(request):
             for index, entry in enumerate(entries):
                 if index >= 2000 or len(result) >= 300:
                     break
-                if entry.name.startswith('.') or entry.name == 'skills-cursor' or not entry.is_dir():
+                if entry.name.startswith('.') or entry.name == 'skills-cursor' or not entry.is_dir() or not portable(entry.name):
                     continue
                 for name in ['SKILL.md', 'skill.md']:
                     target = Path(entry.path) / name
@@ -702,15 +718,17 @@ def handle(request):
         entries = []
         with os.scandir(path) as reader:
             for entry in reader:
-                if entry.name == ".DS_Store":
+                if entry.name == ".DS_Store" or not portable(entry.name):
                     continue
                 if len(entries) >= MAX_FILES:
                     raise ValueError("Directory exceeds 20,000 entries")
                 entries.append({"name": entry.name, "path": entry.path,
                                 "isDir": entry.is_dir(), "ignored": entry.name == ".git"})
         names = b"".join(os.fsencode(entry["name"]) + b"\0" for entry in entries)
-        code, out, _ = run(["git", "check-ignore", "--stdin", "-z"], str(path), names)
-        ignored = set(os.fsdecode(name) for name in out.split(b"\0")) if code in (0, 1) else set()
+        ignored = set()
+        if names:
+            code, out, _ = run(["git", "check-ignore", "--stdin", "-z"], str(path), names)
+            ignored = set(os.fsdecode(name) for name in out.split(b"\0")) if code in (0, 1) else set()
         for entry in entries:
             entry["ignored"] |= entry["name"] in ignored
         return sorted(entries, key=lambda entry: (not entry["isDir"], entry["name"].lower()))
@@ -718,12 +736,12 @@ def handle(request):
         code, out, _ = run(["git", "ls-files", "-co", "--exclude-standard", "-z"], str(path))
         if code == 0:
             names = [os.fsdecode(name) for name in out.split(b"\0") if name]
-            names = [name for name in names if not SKIP.intersection(Path(name).parts)][:MAX_FILES]
+            names = [name for name in names if portable(name) and not SKIP.intersection(Path(name).parts)][:MAX_FILES]
         else:
             names = []
             for count, (root, dirs, files) in enumerate(os.walk(path, followlinks=False)):
-                dirs[:] = [name for name in dirs if name not in SKIP]
-                names.extend(str((Path(root) / name).relative_to(path)) for name in files[:MAX_FILES - len(names)])
+                dirs[:] = [name for name in dirs if name not in SKIP and portable(name)]
+                names.extend(str((Path(root) / name).relative_to(path)) for name in files[:MAX_FILES - len(names)] if portable(name))
                 if count >= 3999 or len(names) >= MAX_FILES:
                     break
         return [{"name": Path(name).name, "path": str(path / name), "relative": name} for name in names]

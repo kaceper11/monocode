@@ -100,6 +100,8 @@ type Live = {
   messageRoleById: Map<string, "user" | "assistant" | "hidden">;
   cancelled: boolean;
   muteUpdates: boolean;
+  /** The server process exited — replies to parked asks have nowhere to go. */
+  serverDead: boolean;
   turns: Promise<void>;
   turnDone: (() => void) | null;
   turnFailed: ((error: Error) => void) | null;
@@ -391,7 +393,17 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       if (!live?.muteUpdates) {
         (live?.onEvent ?? input.onEvent)({ type: "session.ended", code });
       }
-      if (live) live.muteUpdates = true;
+      if (live) {
+        live.muteUpdates = true;
+        live.serverDead = true;
+        // Parked asks and questions must settle — their awaiters otherwise
+        // hang on a dead server and the UI cards never close.
+        for (const pending of live.approvals.values()) pending.resolve("deny");
+        live.approvals.clear();
+        for (const pending of live.questions.values())
+          pending.resolve({ kind: "skipped" });
+        live.questions.clear();
+      }
       live?.turnFailed?.(new Error("OpenCode server exited"));
       if (live) {
         live.turnDone = null;
@@ -448,6 +460,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       messageRoleById: new Map(),
       cancelled: false,
       muteUpdates: false,
+      serverDead: false,
       turns: Promise.resolve(),
       turnDone: null,
       turnFailed: null,
@@ -464,7 +477,12 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     await client.subscribeEvents(
       input.sessionId,
       (event) => {
-        if (live.muteUpdates) return;
+        if (live.muteUpdates) {
+          // A late ask arriving between cancel and abort still holds a
+          // server request open — decline it before dropping the event.
+          declineLateAsk(live, event);
+          return;
+        }
         const turn = live.turnDone;
         void handleEvent(live, event).catch((error: unknown) => {
           if (live.muteUpdates || live.turnDone !== turn) return;
@@ -609,6 +627,20 @@ async function runCompaction(
   // Keep this outside the normal turn latch: its eventual session.status=idle
   // must not become a pending completion for the next user turn.
   await live.client.summarizeSession(live.openCodeSessionId, model);
+}
+
+/** Best-effort rejection for asks that arrive after the live is muted. */
+function declineLateAsk(live: Live, event: Record<string, unknown>): void {
+  if (live.serverDead) return;
+  const properties = asRecord(event.properties);
+  const id =
+    stringField(properties, "id") ?? stringField(properties, "requestID");
+  if (!id) return;
+  if (event.type === "permission.asked") {
+    void live.client.replyPermission(id, "reject").catch(() => undefined);
+  } else if (event.type === "question.asked") {
+    void live.client.rejectQuestion(id).catch(() => undefined);
+  }
 }
 
 async function handleEvent(
@@ -1113,6 +1145,9 @@ async function waitApproval(
   });
   live.approvals.delete(uiId);
   live.onEvent({ type: "approval.resolved", requestId: uiId, decision });
+  // Cancel/stop still deliver the deny — the server is alive and holds the
+  // permission request open. Exit settles after the server is gone.
+  if (live.serverDead) return;
   await live.client.replyPermission(id, toOpenCodePermissionReply(decision));
 }
 
@@ -1131,6 +1166,7 @@ async function waitQuestion(
     requestId: uiId,
     decision: reply.kind,
   });
+  if (live.serverDead) return;
   showNextQuestion(live);
   if (reply.kind !== "answered") {
     await live.client.rejectQuestion(id);

@@ -1499,9 +1499,8 @@ fn resolve_cursor_agent() -> Option<PathBuf> {
     candidates.push(PathBuf::from("/usr/local/bin/cursor-agent"));
     candidates.push(PathBuf::from("/usr/bin/cursor-agent"));
     candidates.push(PathBuf::from("/snap/bin/cursor-agent"));
-    if let Some(from_shell) = which_via_login_shell("cursor-agent") {
-        candidates.push(from_shell);
-    }
+    candidates.extend(which_all_via_login_shell("cursor-agent"));
+    candidates.extend(which_all_via_login_shell("agent"));
 
     first_binary_matching(candidates, is_cursor_agent)
 }
@@ -1601,12 +1600,8 @@ fn resolve_pi() -> Option<PathBuf> {
         candidates.push(PathBuf::from("/usr/bin").join(name));
         candidates.push(PathBuf::from("/snap/bin").join(name));
     }
-    if let Some(from_shell) = which_via_login_shell("pi-coding-agent") {
-        candidates.push(from_shell);
-    }
-    if let Some(from_shell) = which_via_login_shell("pi") {
-        candidates.push(from_shell);
-    }
+    candidates.extend(which_all_via_login_shell("pi-coding-agent"));
+    candidates.extend(which_all_via_login_shell("pi"));
 
     first_binary_matching(candidates, is_pi_coding_agent)
 }
@@ -1628,9 +1623,7 @@ fn resolve_omp() -> Option<PathBuf> {
     candidates.push(PathBuf::from("/usr/local/bin/omp"));
     candidates.push(PathBuf::from("/usr/bin/omp"));
     candidates.push(PathBuf::from("/snap/bin/omp"));
-    if let Some(from_shell) = which_via_login_shell("omp") {
-        candidates.push(from_shell);
-    }
+    candidates.extend(which_all_via_login_shell("omp"));
 
     first_binary_matching(candidates, is_omp_agent)
 }
@@ -1665,9 +1658,7 @@ fn resolve_fx() -> Option<PathBuf> {
     candidates.push(PathBuf::from("/usr/local/bin/fx"));
     candidates.push(PathBuf::from("/usr/bin/fx"));
     candidates.push(PathBuf::from("/snap/bin/fx"));
-    if let Some(from_shell) = which_via_login_shell("fx") {
-        candidates.push(from_shell);
-    }
+    candidates.extend(which_all_via_login_shell("fx"));
 
     first_binary_matching(candidates, is_fx_agent)
 }
@@ -1688,9 +1679,7 @@ fn resolve_grok() -> Option<PathBuf> {
     candidates.push(PathBuf::from("/usr/local/bin/grok"));
     candidates.push(PathBuf::from("/usr/bin/grok"));
     candidates.push(PathBuf::from("/snap/bin/grok"));
-    if let Some(from_shell) = which_via_login_shell("grok") {
-        candidates.push(from_shell);
-    }
+    candidates.extend(which_all_via_login_shell("grok"));
 
     first_binary_matching(candidates, is_grok_agent)
 }
@@ -1713,9 +1702,7 @@ fn resolve_devin() -> Option<PathBuf> {
     candidates.push(PathBuf::from("/usr/local/bin/devin"));
     candidates.push(PathBuf::from("/usr/bin/devin"));
     candidates.push(PathBuf::from("/snap/bin/devin"));
-    if let Some(from_shell) = which_via_login_shell("devin") {
-        candidates.push(from_shell);
-    }
+    candidates.extend(which_all_via_login_shell("devin"));
 
     first_binary_matching(candidates, is_devin_agent)
 }
@@ -1728,9 +1715,22 @@ fn resolve_copilot() -> Option<PathBuf> {
     if let Some(home) = &home {
         candidates.push(home.join(".local/bin/copilot"));
         candidates.push(home.join(".npm-global/bin/copilot"));
+        // Windows: the npm prefix and the WinGet portable shim's Links folder.
+        candidates.push(home.join("AppData/Roaming/npm/copilot"));
+        candidates.push(home.join("AppData/Local/Microsoft/WinGet/Links/copilot"));
+        // npm's platform package carries the real native binary; resolving it
+        // still works when the bin shim is missing or broken.
+        candidates.push(
+            home.join("AppData/Roaming/npm/node_modules/@github/copilot-win32-x64/copilot.exe"),
+        );
+        candidates.push(
+            home.join("AppData/Roaming/npm/node_modules/@github/copilot-win32-arm64/copilot.exe"),
+        );
         candidates.push(home.join(".volta/bin/copilot"));
+        candidates.push(home.join("AppData/Local/Volta/bin/copilot"));
         candidates.push(home.join(".asdf/shims/copilot"));
         candidates.push(home.join(".local/share/mise/shims/copilot"));
+        candidates.push(home.join("AppData/Local/mise/shims/copilot"));
         candidates.push(home.join(".bun/bin/copilot"));
         candidates.push(home.join("n/bin/copilot"));
     }
@@ -1739,9 +1739,7 @@ fn resolve_copilot() -> Option<PathBuf> {
     candidates.push(PathBuf::from("/usr/local/bin/copilot"));
     candidates.push(PathBuf::from("/usr/bin/copilot"));
     candidates.push(PathBuf::from("/snap/bin/copilot"));
-    if let Some(from_shell) = which_via_login_shell("copilot") {
-        candidates.push(from_shell);
-    }
+    candidates.extend(which_all_via_login_shell("copilot"));
 
     first_binary_matching(candidates, is_copilot_agent)
 }
@@ -1774,12 +1772,20 @@ fn detect_copilot_agent(path: &Path) -> bool {
     if !binary_name_eq(path, "copilot") {
         return false;
     }
+    // npm's platform package carries the native binary at
+    // node_modules/@github/copilot-<os>-<arch>/copilot.exe; the @github scope
+    // directory is stronger evidence than any marker scan of the SEA blob.
+    if path_has_component(path, "@github") {
+        return true;
+    }
     file_mentions_copilot_agent(path) || copilot_help_mentions_acp(path)
 }
 
 fn file_mentions_copilot_agent(path: &Path) -> bool {
     // "github/copilot-cli" does not match AWS's "github.com/aws/copilot-cli";
     // the backslash needle covers Windows npm shims (node_modules\@github\…).
+    // The standalone copilot.exe is a ~144MB Node SEA whose embedded payload
+    // hides the JS markers; its own COPILOT_* environment names stay visible.
     file_contains_markers(
         path,
         &[
@@ -1788,46 +1794,58 @@ fn file_mentions_copilot_agent(path: &Path) -> bool {
             "github/copilot-cli",
             "GitHub Copilot CLI",
             "copilot --acp",
+            "COPILOT_CLI_BINARY_VERSION",
+            "COPILOT_PKG_CACHE_HOME",
         ],
     )
 }
 
 fn copilot_help_mentions_acp(path: &Path) -> bool {
+    help_probe_output(path).is_some_and(|text| {
+        // AWS's `copilot` CLI also exists, so a bare "acp" trigram is not
+        // enough; GitHub Copilot documents `--acp` verbatim.
+        text.contains("copilot")
+            && (text.contains("--acp")
+                || text.contains("agent client protocol")
+                || text.contains("github copilot"))
+    })
+}
+
+/// `--help` probe budget. On Windows a `.cmd` shim chains cmd.exe → node →
+/// the real CLI, and Copilot's binary is a 144MB Node SEA that cold-starts
+/// slowly under antivirus scanning; 2s killed valid probes before they
+/// answered. A wrong binary that hangs still terminates, once per path.
+const HELP_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Lowercased stdout+stderr of `<cli> --help`, or `None` on spawn
+/// failure/timeout. npm-installed harnesses are `#!/usr/bin/env node`
+/// scripts, so this probe fails outright without a PATH that has node on it.
+fn help_probe_output(path: &Path) -> Option<String> {
     let mut cmd = Command::new(path);
     cmd.arg("--help")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // npm-installed harnesses are `#!/usr/bin/env node` scripts, so this probe
-    // fails outright without a PATH that has node on it.
     apply_gui_env(&mut cmd);
     isolate_child(&mut cmd);
-    let Ok(child) = spawn_managed(&mut cmd) else {
-        return false;
-    };
+    let child = spawn_managed(&mut cmd).ok()?;
     let pid = child.id();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
-    match rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(Ok(output)) => {
-            let text = format!(
+    match rx.recv_timeout(HELP_PROBE_TIMEOUT) {
+        Ok(Ok(output)) => Some(
+            format!(
                 "{}{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             )
-            .to_ascii_lowercase();
-            // AWS's `copilot` CLI also exists, so a bare "acp" trigram is not
-            // enough; GitHub Copilot documents `--acp` verbatim.
-            text.contains("copilot")
-                && (text.contains("--acp")
-                    || text.contains("agent client protocol")
-                    || text.contains("github copilot"))
-        }
+            .to_ascii_lowercase(),
+        ),
         _ => {
             terminate(pid);
-            false
+            None
         }
     }
 }
@@ -1857,9 +1875,7 @@ fn resolve_muse() -> Option<PathBuf> {
     candidates.push(PathBuf::from("/usr/local/bin/muse"));
     candidates.push(PathBuf::from("/usr/bin/muse"));
     candidates.push(PathBuf::from("/snap/bin/muse"));
-    if let Some(from_shell) = which_via_login_shell("muse") {
-        candidates.push(from_shell);
-    }
+    candidates.extend(which_all_via_login_shell("muse"));
 
     first_binary_matching(candidates, is_muse_agent)
 }
@@ -1886,45 +1902,17 @@ fn file_mentions_pi_coding_agent(path: &Path) -> bool {
         return false;
     };
     let text = String::from_utf8_lossy(&buf[..n]);
+    // The backslash needles cover Windows .cmd shims (node_modules\@scope\…).
     text.contains("pi-coding-agent")
         || text.contains("@earendil-works/pi")
+        || text.contains("@earendil-works\\pi")
         || text.contains("@mariozechner/pi-coding-agent")
+        || text.contains("@mariozechner\\pi-coding-agent")
         || text.contains("PI_CODING_AGENT")
 }
 
 fn help_mentions_rpc_mode(path: &Path) -> bool {
-    let mut cmd = Command::new(path);
-    cmd.arg("--help")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // npm-installed harnesses are `#!/usr/bin/env node` scripts, so this probe
-    // fails outright without a PATH that has node on it.
-    apply_gui_env(&mut cmd);
-    isolate_child(&mut cmd);
-    let Ok(child) = spawn_managed(&mut cmd) else {
-        return false;
-    };
-    let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(Ok(output)) => {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .to_ascii_lowercase();
-            text.contains("--mode") && text.contains("rpc")
-        }
-        _ => {
-            terminate(pid);
-            false
-        }
-    }
+    help_probe_output(path).is_some_and(|text| text.contains("--mode") && text.contains("rpc"))
 }
 
 fn is_fx_agent(path: &Path) -> bool {
@@ -1991,45 +1979,23 @@ fn file_contains_markers(path: &Path, markers: &[&str]) -> bool {
 }
 
 fn file_mentions_fx_agent(path: &Path) -> bool {
+    // "vercel-labs\\fx" covers the package path inside a Windows .cmd shim.
     file_contains_markers(
         path,
-        &["vercel-labs/fx", "FX_MODEL", "createFxAgent", "fx acp"],
+        &[
+            "vercel-labs/fx",
+            "vercel-labs\\fx",
+            "FX_MODEL",
+            "createFxAgent",
+            "fx acp",
+        ],
     )
 }
 
 fn fx_help_mentions_acp(path: &Path) -> bool {
-    let mut cmd = Command::new(path);
-    cmd.arg("--help")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // npm-installed harnesses are `#!/usr/bin/env node` scripts, so this probe
-    // fails outright without a PATH that has node on it.
-    apply_gui_env(&mut cmd);
-    isolate_child(&mut cmd);
-    let Ok(child) = spawn_managed(&mut cmd) else {
-        return false;
-    };
-    let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(Ok(output)) => {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .to_ascii_lowercase();
-            text.contains("acp") && (text.contains("ask") || text.contains("gateway"))
-        }
-        _ => {
-            terminate(pid);
-            false
-        }
-    }
+    help_probe_output(path).is_some_and(|text| {
+        text.contains("acp") && (text.contains("ask") || text.contains("gateway"))
+    })
 }
 
 fn file_mentions_grok_agent(path: &Path) -> bool {
@@ -2070,37 +2036,9 @@ fn file_mentions_devin_agent(path: &Path) -> bool {
 }
 
 fn devin_help_mentions_acp(path: &Path) -> bool {
-    let mut cmd = Command::new(path);
-    cmd.arg("--help")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_gui_env(&mut cmd);
-    isolate_child(&mut cmd);
-    let Ok(child) = spawn_managed(&mut cmd) else {
-        return false;
-    };
-    let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(Ok(output)) => {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .to_ascii_lowercase();
-            text.contains("acp")
-                && (text.contains("devin") || text.contains("agent client protocol"))
-        }
-        _ => {
-            terminate(pid);
-            false
-        }
-    }
+    help_probe_output(path).is_some_and(|text| {
+        text.contains("acp") && (text.contains("devin") || text.contains("agent client protocol"))
+    })
 }
 
 fn is_muse_agent(path: &Path) -> bool {
@@ -2134,69 +2072,15 @@ fn file_mentions_muse_agent(path: &Path) -> bool {
 }
 
 fn muse_help_mentions_serve(path: &Path) -> bool {
-    let mut cmd = Command::new(path);
-    cmd.arg("--help")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_gui_env(&mut cmd);
-    isolate_child(&mut cmd);
-    let Ok(child) = spawn_managed(&mut cmd) else {
-        return false;
-    };
-    let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(Ok(output)) => {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .to_ascii_lowercase();
-            text.contains("serve") && (text.contains("msp") || text.contains("session host"))
-        }
-        _ => {
-            terminate(pid);
-            false
-        }
-    }
+    help_probe_output(path).is_some_and(|text| {
+        text.contains("serve") && (text.contains("msp") || text.contains("session host"))
+    })
 }
 
 fn grok_help_mentions_agent(path: &Path) -> bool {
-    let mut cmd = Command::new(path);
-    cmd.arg("--help")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_gui_env(&mut cmd);
-    isolate_child(&mut cmd);
-    let Ok(child) = spawn_managed(&mut cmd) else {
-        return false;
-    };
-    let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(Ok(output)) => {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .to_ascii_lowercase();
-            text.contains("grok build") || (text.contains("agent") && text.contains("stdio"))
-        }
-        _ => {
-            terminate(pid);
-            false
-        }
-    }
+    help_probe_output(path).is_some_and(|text| {
+        text.contains("grok build") || (text.contains("agent") && text.contains("stdio"))
+    })
 }
 
 fn is_cursor_agent(path: &Path) -> bool {
@@ -2224,6 +2108,16 @@ fn is_cursor_agent(path: &Path) -> bool {
                     .to_ascii_lowercase()
                     .contains("cursor-agent");
         }
+        // Windows shims are real files, not symlinks: an `agent.cmd` whose
+        // content references the cursor-agent package is the same evidence.
+        #[cfg(windows)]
+        {
+            return file_contains_markers(path, &["cursor-agent"]);
+        }
+        #[cfg(not(windows))]
+        {
+            return false;
+        }
     }
     false
 }
@@ -2245,6 +2139,20 @@ fn which_in_path(path: &str, name: &str) -> Option<PathBuf> {
     })
 }
 
+fn which_all_via_login_shell(name: &str) -> Vec<PathBuf> {
+    which_all_in_path(&gui_search_path(), name)
+}
+
+/// Every spawnable `name.*` in every dir, not just the first hit: an
+/// unrelated `copilot.exe` earlier in PATH must not hide the GitHub
+/// `copilot.cmd` installed later — verified resolvers test each match.
+fn which_all_in_path(path: &str, name: &str) -> Vec<PathBuf> {
+    std::env::split_paths(std::ffi::OsStr::new(path))
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .flat_map(|dir| existing_binaries(dir.join(name)))
+        .collect()
+}
+
 fn first_binary(candidates: Vec<PathBuf>) -> Option<PathBuf> {
     candidates.into_iter().find_map(existing_binary)
 }
@@ -2253,23 +2161,36 @@ fn first_binary_matching(
     candidates: Vec<PathBuf>,
     pred: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
-    candidates.into_iter().find_map(|path| {
-        let path = existing_binary(path)?;
-        pred(&path).then_some(path)
-    })
+    candidates
+        .into_iter()
+        .flat_map(existing_binaries)
+        .find(|path| pred(path))
 }
 
 fn existing_binary(path: PathBuf) -> Option<PathBuf> {
+    existing_binaries(path).into_iter().next()
+}
+
+/// `…/bin/copilot` names a file family on Windows (`copilot.exe`,
+/// `copilot.cmd`, …). A wrong `.exe` must not shadow the `.cmd` that carries
+/// the markers, so return every spawnable variant in preference order.
+fn existing_binaries(path: PathBuf) -> Vec<PathBuf> {
     #[cfg(windows)]
     if path.extension().is_none() {
-        for ext in ["exe", "cmd", "bat", "com"] {
-            let candidate = path.with_extension(ext);
-            if is_executable_file(&candidate) {
-                return Some(candidate);
-            }
+        let found: Vec<PathBuf> = ["exe", "cmd", "bat", "com"]
+            .into_iter()
+            .map(|ext| path.with_extension(ext))
+            .filter(|candidate| is_executable_file(candidate))
+            .collect();
+        if !found.is_empty() {
+            return found;
         }
     }
-    is_executable_file(&path).then_some(path)
+    if is_executable_file(&path) {
+        vec![path]
+    } else {
+        Vec::new()
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -2289,6 +2210,98 @@ mod windows_launcher_tests {
         assert_eq!(existing_binary(bare.clone()), None);
         std::fs::remove_file(bare).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn existing_binaries_returns_every_spawnable_variant() {
+        let dir = std::env::temp_dir().join(format!("monocode-variants-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bare = dir.join("copilot");
+        let exe = dir.join("copilot.exe");
+        let cmd = dir.join("copilot.cmd");
+        std::fs::write(&exe, b"MZ").unwrap();
+        std::fs::write(&cmd, b"@echo off\n").unwrap();
+        assert_eq!(existing_binaries(bare), vec![exe, cmd]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrong_exe_does_not_shadow_the_marked_cmd_shim() {
+        let dir = std::env::temp_dir().join(format!("monocode-shadow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bare = dir.join("copilot");
+        // AWS Copilot shares the binary name; the GitHub .cmd shim carries the
+        // scoped package path and must still be tried.
+        std::fs::write(
+            dir.join("copilot.exe"),
+            b"MZ github.com/aws/copilot-cli AWS Copilot CLI",
+        )
+        .unwrap();
+        let cmd = dir.join("copilot.cmd");
+        std::fs::write(
+            &cmd,
+            b"@echo off\nnode %~dp0\\node_modules\\@github\\copilot\\npm-loader.js %*\n",
+        )
+        .unwrap();
+        assert_eq!(
+            first_binary_matching(vec![bare], is_copilot_agent),
+            Some(cmd)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn which_all_in_path_tests_every_match_not_just_the_first() {
+        let root = std::env::temp_dir().join(format!("monocode-which-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(
+            first.join("copilot.exe"),
+            b"MZ github.com/aws/copilot-cli AWS Copilot CLI",
+        )
+        .unwrap();
+        let github = second.join("copilot.cmd");
+        std::fs::write(
+            &github,
+            b"@echo off\nnode %~dp0\\node_modules\\@github\\copilot\\npm-loader.js %*\n",
+        )
+        .unwrap();
+        let path = std::env::join_paths([&first, &second])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let hits = which_all_in_path(&path, "copilot");
+        assert_eq!(hits, vec![first.join("copilot.exe"), github.clone()]);
+        assert_eq!(first_binary_matching(hits, is_copilot_agent), Some(github));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_cmd_shim_referencing_cursor_package_counts_as_cursor() {
+        let dir = std::env::temp_dir().join(format!("monocode-agent-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Cursor's `agent` alias is a symlink on Unix; the Windows npm/cmd
+        // shim is a real file carrying the package path.
+        let shim = dir.join("agent.cmd");
+        std::fs::write(
+            &shim,
+            b"@echo off\nnode %~dp0\\node_modules\\cursor-agent\\cli.js %*\n",
+        )
+        .unwrap();
+        assert!(is_cursor_agent(&shim));
+
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let foreign = other.join("agent.cmd");
+        std::fs::write(&foreign, b"@echo off\necho not cursor\n").unwrap();
+        assert!(!is_cursor_agent(&foreign));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -2369,6 +2382,12 @@ fn gui_search_path_from(
         parts.push(format!("{home}/AppData/Roaming/npm").into());
         parts.push(format!("{home}/AppData/Local/Yarn/bin").into());
         parts.push(format!("{home}/scoop/shims").into());
+        // Windows version-manager and package-manager bin dirs. Harmless
+        // misses on Unix; without them these installs depend on PATH alone.
+        parts.push(format!("{home}/AppData/Local/pnpm").into());
+        parts.push(format!("{home}/AppData/Local/Volta/bin").into());
+        parts.push(format!("{home}/AppData/Local/mise/shims").into());
+        parts.push(format!("{home}/AppData/Local/Microsoft/WinGet/Links").into());
     }
     parts.push("/opt/homebrew/bin".into());
     parts.push("/usr/local/bin".into());
@@ -3166,6 +3185,67 @@ mod tests {
             b"#!/bin/sh\n# github.com/aws/copilot-cli\n# AWS Copilot CLI\n",
         )
         .unwrap();
+        assert!(!file_mentions_copilot_agent(&aws));
+        assert!(!is_copilot_agent(&aws));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A foreign `copilot` earlier in PATH must not hide the real CLI in a
+    /// later dir — the resolver tests every match, not just the first.
+    #[test]
+    fn copilot_wrong_binary_does_not_shadow_the_real_cli() {
+        let root = std::env::temp_dir().join(format!("monocode-whichall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let aws = first.join("copilot");
+        std::fs::write(&aws, b"#!/bin/sh\necho 'AWS Copilot CLI'\n").unwrap();
+        let github = second.join("copilot");
+        std::fs::write(&github, b"#!/bin/sh\n# @github/copilot shim\n").unwrap();
+        for file in [&aws, &github] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::join_paths([&first, &second])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let hits = which_all_in_path(&path, "copilot");
+        assert_eq!(hits, vec![aws, github.clone()]);
+        assert_eq!(first_binary_matching(hits, is_copilot_agent), Some(github));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copilot_accepts_native_binary_markers_and_package_layout() {
+        let dir = std::env::temp_dir().join(format!("monocode-copilot-exe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The standalone copilot.exe is a Node SEA: the JS markers are inside
+        // the embedded payload, but the CLI's own COPILOT_* env names are
+        // still readable strings.
+        let exe = dir.join("copilot.exe");
+        std::fs::write(&exe, b"MZ\0\0COPILOT_CLI_BINARY_VERSION\0").unwrap();
+        assert!(file_mentions_copilot_agent(&exe));
+        assert!(is_copilot_agent(&exe));
+
+        // npm's platform package binary is trusted through its @github scope
+        // directory without needing markers or a spawn.
+        let package = dir.join("node_modules/@github/copilot-win32-x64");
+        std::fs::create_dir_all(&package).unwrap();
+        let packaged = package.join("copilot.exe");
+        std::fs::write(&packaged, b"MZ\0\0").unwrap();
+        assert!(is_copilot_agent(&packaged));
+
+        // An unrelated binary that merely shares the name must not pass.
+        let foreign = dir.join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        let aws = foreign.join("copilot.exe");
+        std::fs::write(&aws, b"MZ\0\0github.com/aws/copilot-cli\0AWS Copilot CLI\0").unwrap();
         assert!(!file_mentions_copilot_agent(&aws));
         assert!(!is_copilot_agent(&aws));
 

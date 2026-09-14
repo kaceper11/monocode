@@ -2,6 +2,8 @@
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
+import { wslDistributions } from "../lib/wsl";
 import { WslProjectDialog } from "./WslProjectDialog";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -65,6 +67,40 @@ it("uses the themed listbox and returns keyboard focus without closing the dialo
     expect(document.querySelector('[role="listbox"]')).toBeNull();
     expect(close).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(trigger);
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+    vi.unstubAllGlobals();
+  }
+});
+
+it("mounts with prefetched distributions without re-probing or loading", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  // The boot/preflight probe has already resolved, so the dialog must open
+  // in its final layout — a fresh probe would flicker the loading frame.
+  await wslDistributions();
+  vi.mocked(invoke).mockClear();
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  try {
+    await act(async () =>
+      root.render(
+        createElement(WslProjectDialog, {
+          cwd: "//wsl.localhost/Ubuntu/home/me/repo",
+          onOpen: vi.fn(),
+          onClose: vi.fn(),
+        }),
+      ),
+    );
+    const trigger = document.querySelector<HTMLButtonElement>(
+      '[aria-haspopup="listbox"]',
+    )!;
+    expect(trigger.textContent).toContain("Ubuntu");
+    expect(
+      document.querySelector("form")!.textContent,
+    ).not.toContain("No WSL distributions found");
+    expect(invoke).not.toHaveBeenCalled();
   } finally {
     await act(async () => root.unmount());
     container.remove();

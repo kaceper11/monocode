@@ -124,6 +124,7 @@ export function isOpenCodeNotFound(cause: unknown): boolean {
   return false;
 }
 
+/** OpenCode permission names glob-match and the last matching rule wins. */
 export function buildOpenCodePermissionRules(
   runtimeMode: RuntimeMode,
 ): OpenCodePermissionRule[] {

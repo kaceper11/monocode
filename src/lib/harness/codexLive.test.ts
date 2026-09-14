@@ -367,7 +367,7 @@ describe("codex live turn sequence", () => {
     await turn;
   });
 
-  it("keeps parked MCP consent for the user under full-access", async () => {
+  it("settles parked MCP consent when the mode loosens to full-access", async () => {
     const { events, turn } = await startTurn("codex-live");
     onLine!(
       JSON.stringify({
@@ -389,18 +389,18 @@ describe("codex live turn sequence", () => {
       () => events.some((e) => e.type === "approval.requested"),
       "MCP approval UI",
     );
+    expect(parse().some((m) => m.id === 91)).toBe(false);
 
     setCodexRuntimeMode("codex-live", "full-access");
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(parse().some((m) => m.id === 91)).toBe(false);
-    expect(events.some((e) => e.type === "approval.resolved")).toBe(false);
-
-    const approval = events.find((e) => e.type === "approval.requested")!;
-    respondCodexApproval("codex-live", approval.requestId, "allow");
     await waitFor(() => parse().some((m) => m.id === 91), "MCP response");
     expect(parse().find((m) => m.id === 91)?.result).toMatchObject({
       action: "accept",
     });
+    expect(
+      events.some(
+        (e) => e.type === "approval.resolved" && e.decision === "allow",
+      ),
+    ).toBe(true);
 
     notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
     await turn;
@@ -930,14 +930,9 @@ describe("codex live turn sequence", () => {
     await turn;
   });
 
-  it.each([
-    { decision: "allow", boolean: false },
-    { decision: "deny", boolean: false },
-    { decision: "allow", boolean: true },
-    { decision: "deny", boolean: true },
-  ] as const)(
-    "shows other MCP confirmation in Full Access and sends $decision, boolean=$boolean",
-    async ({ decision, boolean }) => {
+  it.each([false, true] as const)(
+    "auto-accepts MCP elicitation in Full Access, boolean=%s",
+    async (boolean) => {
       const { events, turn } = await startTurn("codex-live", {
         runtimeMode: "full-access",
       });
@@ -959,18 +954,13 @@ describe("codex live turn sequence", () => {
           },
         }),
       );
-      await waitFor(
-        () => events.some((e) => e.type === "approval.requested"),
-        "MCP approval UI",
-      );
-      expect(parse().some((m) => m.id === 91)).toBe(false);
-      const approval = events.find((e) => e.type === "approval.requested")!;
-      respondCodexApproval("codex-live", approval.requestId, decision);
+      // Full access admits MCP consent the way the CLI's bypass mode does —
+      // accepted immediately, no approval UI.
       await waitFor(() => parse().some((m) => m.id === 91), "MCP response");
+      expect(events.some((e) => e.type === "approval.requested")).toBe(false);
       expect(parse().find((m) => m.id === 91)?.result).toEqual({
-        action: decision === "allow" ? "accept" : "decline",
-        content:
-          decision === "allow" ? (boolean ? { approved: true } : {}) : null,
+        action: "accept",
+        content: boolean ? { approved: true } : {},
         _meta: null,
       });
       notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
@@ -978,7 +968,7 @@ describe("codex live turn sequence", () => {
     },
   );
 
-  it("auto-approves computer-use app access in Full Access", async () => {
+  it("auto-accepts computer-use app access in Full Access", async () => {
     const { events, turn } = await startTurn("codex-live", {
       runtimeMode: "full-access",
     });
@@ -999,12 +989,12 @@ describe("codex live turn sequence", () => {
       }),
     );
     await waitFor(() => parse().some((m) => m.id === 91), "MCP response");
+    expect(events.some((e) => e.type === "approval.requested")).toBe(false);
     expect(parse().find((m) => m.id === 91)?.result).toEqual({
       action: "accept",
       content: {},
       _meta: null,
     });
-    expect(events.some((e) => e.type === "approval.requested")).toBe(false);
     notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
     await turn;
   });
@@ -1396,6 +1386,46 @@ describe("codex live turn sequence", () => {
     );
     expect(parse().find((message) => message.id === 91)?.result).toEqual({
       decision: "decline",
+    });
+
+    notify("turn/completed", {
+      turn: { id: "turn_1", status: "completed" },
+    });
+    await turn;
+  });
+
+  it("declines MCP elicitation during a plan turn without prompting", async () => {
+    const { events, turn } = await startTurn("codex-live", {
+      runtimeMode: "auto",
+      intent: "plan",
+    });
+    onLine!(
+      JSON.stringify({
+        id: 91,
+        method: "mcpServer/elicitation/request",
+        params: {
+          serverName: "example",
+          mode: "form",
+          message: "Read this source?",
+          requestedSchema: {
+            type: "object",
+            properties: { approved: { type: "boolean" } },
+            required: ["approved"],
+          },
+        },
+      }),
+    );
+    await waitFor(
+      () => parse().some((message) => message.id === 91),
+      "plan elicitation denial",
+    );
+    expect(events.some((event) => event.type === "approval.requested")).toBe(
+      false,
+    );
+    expect(parse().find((message) => message.id === 91)?.result).toEqual({
+      action: "decline",
+      content: null,
+      _meta: null,
     });
 
     notify("turn/completed", {

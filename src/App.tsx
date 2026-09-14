@@ -97,7 +97,7 @@ import {
 } from "./lib/appearance";
 import { HAS_NATIVE_GLASS, IS_MAC, IS_WIN } from "./lib/platform";
 import { WslProjectDialog } from "./chrome/WslProjectDialog";
-import { connectWslProject, invalidateWslDiscovery } from "./lib/wsl";
+import { connectWslProject, invalidateWslDiscovery, wslDistributions } from "./lib/wsl";
 import { setWslStatus, wslStatusFor } from "./lib/wslStatus";
 import {
   applyUiScale,
@@ -1268,6 +1268,9 @@ export default function App({
 
   useEffect(() => {
     void probeHarnessAvailability();
+    // Warm the distribution probe so Add-project can skip the execution
+    // location dialog without waiting on wsl.exe when no WSL exists.
+    if (IS_WIN) void wslDistributions().catch(() => undefined);
     // Only the harnesses already in this window. Probing every installed CLI
     // at boot left unused agents (especially Pi) running in the background.
     // Each WSL session probes inside its own distribution; a WSL session must
@@ -4275,7 +4278,15 @@ export default function App({
     return () => window.removeEventListener(OPEN_PROJECT_PATH, open);
   }, [onSelectProject]);
   const pickProject = useCallback(async () => {
-    if (IS_WIN) { setWslPickerOpen(true); return; }
+    if (IS_WIN) {
+      // Only a successful empty probe skips the dialog — a failure can't
+      // prove WSL is absent, so the dialog opens for its error and retry.
+      const distributions = await wslDistributions().catch(() => null);
+      if (distributions === null || distributions.length) {
+        setWslPickerOpen(true);
+        return;
+      }
+    }
     const path = await pickFolder();
     if (path) onSelectProject(path);
   }, [onSelectProject]);

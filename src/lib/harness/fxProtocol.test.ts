@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  autoPermissionOption,
   eventsFromAcpUpdate,
   extractModelConfigId,
   fxModeId,
@@ -38,24 +37,6 @@ describe("fx protocol", () => {
     expect(harnessSupportsAttachments("cursor")).toBe(true);
   });
 
-  it("auto-allows in every runtime mode so a turn never parks on approval", () => {
-    const options = ["allow-once", "reject-once"];
-    expect(autoPermissionOption("supervised", options)).toBe("allow-once");
-    expect(autoPermissionOption("auto", options)).toBe("allow-once");
-    expect(autoPermissionOption("full-access", options)).toBe("allow-once");
-    expect(autoPermissionOption("supervised", [])).toBeNull();
-  });
-
-  it("prefers allow_always so fx stops re-asking", () => {
-    expect(
-      autoPermissionOption("supervised", [
-        "allow_once",
-        "allow_always",
-        "reject_once",
-      ]),
-    ).toBe("allow_always");
-  });
-
   it("picks allow/reject option ids from ACP permission options", () => {
     expect(
       permissionOptionId("allow", ["allow_once", "reject_once"]),
@@ -63,6 +44,8 @@ describe("fx protocol", () => {
     expect(
       permissionOptionId("deny", ["allow-once", "reject-once"]),
     ).toBe("reject-once");
+    // Never invents an id the agent did not offer.
+    expect(permissionOptionId("deny", ["allow-once"])).toBeUndefined();
   });
 
   it("reads a permission prompt from an ACP request", () => {

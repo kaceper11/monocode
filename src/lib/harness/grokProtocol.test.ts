@@ -51,7 +51,6 @@ describe("grok protocol", () => {
       grokSpawnArgs({
         model: "grok:grok-4.6",
         effort: "high",
-        fullAccess: true,
       }),
     ).toEqual([
       "--no-auto-update",
@@ -61,7 +60,6 @@ describe("grok protocol", () => {
       "grok-4.6",
       "--reasoning-effort",
       "high",
-      "--always-approve",
       "stdio",
     ]);
     expect(grokTextSpawnArgs()[0]).toBe("--no-auto-update");
@@ -79,7 +77,7 @@ describe("grok protocol", () => {
     ]);
   });
 
-  it("sets yoloMode only for full access", () => {
+  it("sets yoloMode for full-access and autoMode only for auto", () => {
     expect(grokSessionNewParams("/repo", "supervised")).toEqual({
       cwd: "/repo",
       mcpServers: [],
@@ -126,6 +124,11 @@ describe("grok protocol", () => {
     expect(pickAutoOption("full-access", "execute", options)).toBe(
       "allow-once",
     );
+    // MCP calls park only where the real CLIs still prompt — auto-accept-edits.
+    // Auto delegates consent to the agent; full-access admits them outright.
+    expect(pickAutoOption("auto-accept-edits", "mcp", options)).toBeNull();
+    expect(pickAutoOption("full-access", "mcp", options)).toBe("allow-once");
+    expect(pickAutoOption("auto", "mcp", options)).toBe("allow-once");
   });
 
   it("picks allow/reject option ids from ACP permission options", () => {
@@ -150,6 +153,29 @@ describe("grok protocol", () => {
     expect(request.callId).toBe("call-1");
     expect(request.title).toContain("git status");
     expect(request.optionIds).toEqual(["allow-once", "reject-once"]);
+  });
+
+  it("marks MCP permission requests so they never auto-approve", () => {
+    const request = permissionRequestFromAcp({
+      toolCall: {
+        toolCallId: "call-9",
+        kind: "other",
+        title: "mcp__github__create_issue",
+      },
+      options: [{ optionId: "allow-once" }, { optionId: "reject-once" }],
+    });
+    expect(request.kind).toBe("mcp");
+    const nested = permissionRequestFromAcp({
+      subject: {
+        toolCall: {
+          toolCallId: "call-10",
+          kind: "mcp",
+          title: "github: search_repositories",
+        },
+      },
+      options: [{ optionId: "allow-once" }, { optionId: "reject-once" }],
+    });
+    expect(nested.kind).toBe("mcp");
   });
 
   it("maps agent message, thought, and grok tool updates", () => {

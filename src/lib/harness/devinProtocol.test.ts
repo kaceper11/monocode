@@ -73,7 +73,7 @@ describe("devinModeId", () => {
   });
 
   it("returns undefined when nothing suitable is advertised", () => {
-    expect(devinModeId("full-access", false, ["accept-edits"])).toBeUndefined();
+    expect(devinModeId("full-access", false, ["smart", "plan"])).toBeUndefined();
     expect(devinModeId("auto", false, ["accept-edits", "ask"])).toBeUndefined();
     expect(devinModeId("supervised", false, ["bypass"])).toBeUndefined();
     expect(devinModeId("auto", false, [])).toBeUndefined();

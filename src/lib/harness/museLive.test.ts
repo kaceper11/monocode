@@ -305,7 +305,7 @@ describe("muse live turn sequence", () => {
     await stopMuseSession("t3");
   });
 
-  it("pushes allowAll and auto-decides a parked approval on a mid-conversation change", async () => {
+  it("auto-decides a parked non-MCP approval on a mid-conversation change", async () => {
     const events: HarnessEvent[] = [];
     const { turn } = await startTurn(events, "run tests", "t3b");
     notify("turn/started", { sessionId: "MS1", turnId: "T1" });
@@ -331,14 +331,15 @@ describe("muse live turn sequence", () => {
     );
 
     setMuseRuntimeMode("t3b", "full-access");
+    // Full-access pushes allowAll to the provider and settles the parked ask.
     await waitFor(
       () => byMethod("session/setApprovalMode").length > 0,
-      "session/setApprovalMode",
+      "setApprovalMode",
     );
-    const setMode = lastByMethod("session/setApprovalMode")!;
-    expect(setMode.params.mode).toBe("allowAll");
-    reply(setMode.id, {});
-
+    expect(lastByMethod("session/setApprovalMode")!.params.mode).toBe(
+      "allowAll",
+    );
+    reply(lastByMethod("session/setApprovalMode")!.id, {});
     await waitFor(
       () => byMethod("approval/decide").length > 0,
       "approval/decide",
@@ -367,6 +368,66 @@ describe("muse live turn sequence", () => {
     });
     await turn;
     await stopMuseSession("t3b");
+  });
+
+  it("auto-decides an MCP approval under full-access", async () => {
+    const events: HarnessEvent[] = [];
+    const turn = sendMuseTurn({
+      ...baseInput(events, "create a ticket", "t3m"),
+      runtimeMode: "full-access",
+    } as never);
+    await waitFor(() => byMethod("initialize").length > 0, "initialize");
+    reply(byMethod("initialize")[0].id, INIT_RESULT);
+    await waitFor(() => byMethod("session/start").length > 0, "session/start");
+    // Full access wires allowAll — MCP consent is admitted like the real CLIs.
+    expect(lastByMethod("session/start")!.params.approvalMode).toBe("allowAll");
+    reply(lastByMethod("session/start")!.id, {
+      session: { sessionId: "MS1" },
+      viewCursor: "c0",
+    });
+    await flushControls();
+    reply(lastByMethod("turn/start")!.id, {
+      commandId: lastByMethod("turn/start")!.params.commandId,
+      disposition: "started",
+      startedNewTurn: true,
+      status: "accepted",
+      turnId: "T1",
+    });
+    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
+
+    serverRequest(78, "approval/request", {
+      approvalId: "aMcp",
+      sessionId: "MS1",
+      turnId: "T1",
+      itemId: "i9",
+      toolCallId: "call_mcp",
+      toolName: "mcp__jira__create_issue",
+      rawArgs: "{}",
+      currentRequirementId: { approvalId: "aMcp", sourceIndex: 0 },
+      availableChoices: [
+        { choiceId: "ch-allow", label: "Allow", decision: "approved", scope: "once" },
+        { choiceId: "ch-deny", label: "Deny", decision: "denied", scope: "once" },
+      ],
+      subject: { kind: "mcp" },
+    });
+    // A residual ask that still arrives gets auto-decided, never parked.
+    await waitFor(
+      () => byMethod("approval/decide").length > 0,
+      "approval/decide",
+    );
+    expect(events.some((e) => e.type === "approval.requested")).toBe(false);
+    expect(lastByMethod("approval/decide")!.params).toMatchObject({
+      approvalId: "aMcp",
+      choiceId: "ch-allow",
+    });
+
+    notify("turn/completed", {
+      sessionId: "MS1",
+      turnId: "T1",
+      terminal: "completed",
+    });
+    await turn;
+    await stopMuseSession("t3m");
   });
 
   it("re-asks when Muse reports a stale approval requirement", async () => {

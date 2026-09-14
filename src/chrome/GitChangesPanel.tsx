@@ -40,6 +40,8 @@ import {
   CircleDashed,
   SquarePlus,
   ChevronDown,
+  Eye,
+  EyeOff,
   Task,
   X,
   ChevronRight,
@@ -84,11 +86,13 @@ import {
   gitDiffIndex,
   gitDiscardAll,
   gitDiscardFile,
+  gitKeepLocal,
   gitPrCreate,
   gitPush,
   gitStageAll,
   gitStageFile,
   gitSync,
+  gitUnkeepLocal,
   gitUnstageAll,
   gitUnstageFile,
   notifyGitChanged,
@@ -129,6 +133,7 @@ function confirmNative(message: string, okLabel?: string): Promise<boolean> {
 
 let stagedOpen = true;
 let changesOpen = true;
+let localOnlyOpen = true;
 let graphOpen = true;
 let changesView: ChangesView = loadChangesView();
 /** Folders the user collapsed in tree view, keyed `<kind>:<dir>`. */
@@ -989,6 +994,7 @@ function ChangedFiles({
   const [menuOpen, setMenuOpen] = useState(false);
   const [stagedExpanded, setStagedExpanded] = useState(stagedOpen);
   const [changesExpanded, setChangesExpanded] = useState(changesOpen);
+  const [localOnlyExpanded, setLocalOnlyExpanded] = useState(localOnlyOpen);
   const [view, setView] = useState<ChangesView>(changesView);
   const { pr, reload: reloadPr } = useBranchPr(cwd, index?.branch);
   const staged = useMemo(() => files.filter((file) => file.staged), [files]);
@@ -996,6 +1002,7 @@ function ChangedFiles({
     () => files.filter((file) => file.unstaged),
     [files],
   );
+  const localOnly = index?.localOnly ?? EMPTY_FILES;
   const hasRemote = Boolean(index?.remote);
   const hasOpenPr = pr?.state === "open";
   const diverged = (index?.ahead ?? 0) > 0 && (index?.behind ?? 0) > 0;
@@ -1069,7 +1076,7 @@ function ChangedFiles({
   const run = useCallback(
     async (
       file: GitChangedFile,
-      action: "stage" | "unstage" | "discard",
+      action: "stage" | "unstage" | "discard" | "keep" | "unkeep",
     ) => {
       if (busyRef.current) return;
       setBusy(file.relative);
@@ -1087,6 +1094,8 @@ function ChangedFiles({
         }
         if (action === "stage") await gitStageFile(cwd, file.relative);
         else if (action === "unstage") await gitUnstageFile(cwd, file.relative);
+        else if (action === "keep") await gitKeepLocal(cwd, file.relative);
+        else if (action === "unkeep") await gitUnkeepLocal(cwd, file.relative);
         else await gitDiscardFile(cwd, file.relative);
         mutated(
           [file.path],
@@ -1455,7 +1464,9 @@ function ChangedFiles({
             {index
               ? index.ahead > 0 || index.behind > 0
                 ? syncStatusLabel(index)
-                : "No uncommitted changes"
+                : localOnly.length > 0
+                  ? "No committable changes"
+                  : "No uncommitted changes"
               : "Loading changes…"}
           </p>
         ) : (
@@ -1543,6 +1554,32 @@ function ChangedFiles({
             ) : null}
           </>
         )}
+        {localOnly.length > 0 ? (
+          <FileSection
+            title="Local Only"
+            count={localOnly.length}
+            open={localOnlyExpanded}
+            onToggle={() => {
+              localOnlyOpen = !localOnlyExpanded;
+              setLocalOnlyExpanded(localOnlyOpen);
+            }}
+            view={view}
+            onToggleView={toggleView}
+            headerActions={[]}
+          >
+            <ChangeList
+              files={localOnly}
+              view={view}
+              kind="unstaged"
+              localOnly
+              selected={selected}
+              selectedKind={selectedKind}
+              busy={busy}
+              onOpenFile={openFile}
+              onAction={run}
+            />
+          </FileSection>
+        ) : null}
       </div>
       {selectingContext ? (
         <div className="pointer-events-none absolute inset-x-2 bottom-2 z-10">
@@ -1971,19 +2008,19 @@ type ContextSelection = {
   selected: ReadonlySet<string>;
   toggle: (relative: string, kind: GitFileDiffKind) => void;
 };
+type ChangeFileAction = "stage" | "unstage" | "discard" | "keep" | "unkeep";
 type ChangeRowProps = {
   contextSelection?: ContextSelection;
   files: GitChangedFile[];
   view: ChangesView;
   kind: GitFileDiffKind;
+  /** Renders the "keep local" section rows — unkeep is the only action. */
+  localOnly?: boolean;
   selected?: string;
   selectedKind?: GitFileDiffKind;
   busy: string | null;
   onOpenFile: (path: string, kind: GitFileDiffKind) => void;
-  onAction: (
-    file: GitChangedFile,
-    action: "stage" | "unstage" | "discard",
-  ) => void;
+  onAction: (file: GitChangedFile, action: ChangeFileAction) => void;
 };
 
 const ChangeList = memo(function ChangeList({
@@ -2004,6 +2041,7 @@ const ChangeList = memo(function ChangeList({
           active={isActive(file, rest.selected, rest.selectedKind, rest.kind)}
           busy={rest.busy === file.relative}
           kind={rest.kind}
+          localOnly={rest.localOnly}
           onOpenFile={rest.onOpenFile}
           onAction={rest.onAction}
           contextChecked={
@@ -2024,6 +2062,7 @@ function ChangeDirChildren({
   dir,
   depth,
   kind,
+  localOnly,
   selected,
   selectedKind,
   busy,
@@ -2042,6 +2081,7 @@ function ChangeDirChildren({
           dir={child}
           depth={depth}
           kind={kind}
+          localOnly={localOnly}
           selected={selected}
           selectedKind={selectedKind}
           busy={busy}
@@ -2057,6 +2097,7 @@ function ChangeDirChildren({
           active={isActive(file, selected, selectedKind, kind)}
           busy={busy === file.relative}
           kind={kind}
+          localOnly={localOnly}
           depth={depth}
           onOpenFile={onOpenFile}
           onAction={onAction}
@@ -2083,7 +2124,7 @@ const ChangeDirRow = memo(function ChangeDirRow({
   dir: ChangeDir;
   depth: number;
 }) {
-  const key = `${kind}:${dir.path}`;
+  const key = `${rest.localOnly ? "local" : kind}:${dir.path}`;
   const [open, setOpen] = useState(() => !collapsedDirs.has(key));
   const toggle = () => {
     if (open) collapsedDirs.add(key);
@@ -2210,6 +2251,7 @@ const ChangeRow = memo(
     active,
     busy,
     kind,
+    localOnly,
     depth,
     onOpenFile,
     onAction,
@@ -2223,13 +2265,12 @@ const ChangeRow = memo(
     active: boolean;
     busy: boolean;
     kind: GitFileDiffKind;
+    /** Row belongs to the "Local only" section — unkeep is the only action. */
+    localOnly?: boolean;
     /** Set in tree view: nesting level, and the folder path moves to the tree. */
     depth?: number;
     onOpenFile: (path: string, kind: GitFileDiffKind) => void;
-    onAction: (
-      file: GitChangedFile,
-      action: "stage" | "unstage" | "discard",
-    ) => void;
+    onAction: (file: GitChangedFile, action: ChangeFileAction) => void;
   }) {
     const name = basename(file.relative);
     const tree = depth !== undefined;
@@ -2283,31 +2324,50 @@ const ChangeRow = memo(
             active ? "flex" : "hidden group-focus-within:flex group-hover:flex"
           }`}
         >
-          {kind === "unstaged" ? (
+          {localOnly ? (
             <IconAction
-              title="Discard Changes"
+              title="Stop keeping local — show this file's changes again"
               disabled={busy}
-              onClick={() => onAction(file, "discard")}
+              onClick={() => onAction(file, "unkeep")}
             >
-              <Undo2 className="size-3.5" strokeWidth={1.75} />
-            </IconAction>
-          ) : null}
-          {kind === "staged" ? (
-            <IconAction
-              title="Unstage Changes"
-              disabled={busy}
-              onClick={() => onAction(file, "unstage")}
-            >
-              <Minus className="size-3.5" strokeWidth={1.75} />
+              <Eye className="size-3.5" strokeWidth={1.75} />
             </IconAction>
           ) : (
-            <IconAction
-              title="Stage Changes"
-              disabled={busy}
-              onClick={() => onAction(file, "stage")}
-            >
-              <Plus className="size-3.5" strokeWidth={1.75} />
-            </IconAction>
+            <>
+              <IconAction
+                title="Keep local — hide local state from commits"
+                disabled={busy}
+                onClick={() => onAction(file, "keep")}
+              >
+                <EyeOff className="size-3.5" strokeWidth={1.75} />
+              </IconAction>
+              {kind === "unstaged" ? (
+                <IconAction
+                  title="Discard Changes"
+                  disabled={busy}
+                  onClick={() => onAction(file, "discard")}
+                >
+                  <Undo2 className="size-3.5" strokeWidth={1.75} />
+                </IconAction>
+              ) : null}
+              {kind === "staged" ? (
+                <IconAction
+                  title="Unstage Changes"
+                  disabled={busy}
+                  onClick={() => onAction(file, "unstage")}
+                >
+                  <Minus className="size-3.5" strokeWidth={1.75} />
+                </IconAction>
+              ) : (
+                <IconAction
+                  title="Stage Changes"
+                  disabled={busy}
+                  onClick={() => onAction(file, "stage")}
+                >
+                  <Plus className="size-3.5" strokeWidth={1.75} />
+                </IconAction>
+              )}
+            </>
           )}
         </div>
         )}
@@ -2324,6 +2384,7 @@ const ChangeRow = memo(
     prev.active === next.active &&
     prev.busy === next.busy &&
     prev.kind === next.kind &&
+    prev.localOnly === next.localOnly &&
     prev.depth === next.depth &&
     prev.contextChecked === next.contextChecked &&
     prev.onOpenFile === next.onOpenFile &&
@@ -2546,8 +2607,11 @@ function changedFilePaths(prev: GitDiffIndex, next: GitDiffIndex): string[] {
 function indexAfterFileAction(
   index: GitDiffIndex,
   relative: string,
-  action: "stage" | "unstage" | "discard",
+  action: "stage" | "unstage" | "discard" | "keep" | "unkeep",
 ): GitDiffIndex {
+  if (action === "keep" || action === "unkeep") {
+    return indexAfterKeepAction(index, relative, action);
+  }
   const files: GitChangedFile[] = [];
   for (const file of index.files) {
     if (file.relative !== relative) {
@@ -2575,6 +2639,53 @@ function indexAfterFileAction(
     }
   }
   return { ...index, files };
+}
+
+/** Byte-order path compare — matches the backend's `relative.cmp` sort. */
+function compareRelative(a: GitChangedFile, b: GitChangedFile): number {
+  return a.relative < b.relative ? -1 : a.relative > b.relative ? 1 : 0;
+}
+
+/** Moves a row between `files` and `localOnly` before the refresh lands. */
+function indexAfterKeepAction(
+  index: GitDiffIndex,
+  relative: string,
+  action: "keep" | "unkeep",
+): GitDiffIndex {
+  if (action === "keep") {
+    const file = index.files.find((entry) => entry.relative === relative);
+    if (!file) return index;
+    const localOnly = [
+      ...index.localOnly,
+      {
+        ...file,
+        status:
+          file.status === "added"
+            ? "untracked"
+            : file.status === "deleted"
+              ? "modified"
+              : file.status,
+        staged: false,
+        unstaged: false,
+      },
+    ].sort(compareRelative);
+    return {
+      ...index,
+      files: index.files.filter((entry) => entry.relative !== relative),
+      localOnly,
+    };
+  }
+  const file = index.localOnly.find((entry) => entry.relative === relative);
+  if (!file) return index;
+  const files = [
+    ...index.files,
+    { ...file, staged: false, unstaged: true },
+  ].sort(compareRelative);
+  return {
+    ...index,
+    files,
+    localOnly: index.localOnly.filter((entry) => entry.relative !== relative),
+  };
 }
 
 function indexAfterAllAction(
@@ -2641,6 +2752,18 @@ function sameIndex(prev: GitDiffIndex | null, next: GitDiffIndex): boolean {
     (prev.mergeHead ?? null) !== (next.mergeHead ?? null) ||
     (prev.conflicts ?? []).length !== (next.conflicts ?? []).length ||
     (prev.conflicts ?? []).some((path, i) => (next.conflicts ?? [])[i] !== path)
+  ) {
+    return false;
+  }
+  const prevLocal = prev.localOnly ?? [];
+  const nextLocal = next.localOnly ?? [];
+  if (
+    prevLocal.length !== nextLocal.length ||
+    prevLocal.some(
+      (file, i) =>
+        file.relative !== nextLocal[i]?.relative ||
+        file.status !== nextLocal[i]?.status,
+    )
   ) {
     return false;
   }

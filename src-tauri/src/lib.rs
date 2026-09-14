@@ -271,6 +271,8 @@ pub fn run() {
             fs::git_discard_all,
             fs::git_stage_all,
             fs::git_unstage_all,
+            fs::git_keep_local,
+            fs::git_unkeep_local,
             fs::git_commit,
             fs::git_staged_context,
             fs::git_push,
