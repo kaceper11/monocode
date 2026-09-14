@@ -150,6 +150,55 @@ export async function probeRepositoryFamily(
   }
 }
 
+/** Probing one directory child per request; scan in small batches so a big
+ * parent folder does not burst the backend. */
+export const REPOSITORY_SCAN_BATCH = 8;
+
+export type PickedRepositoryScan = {
+  /** Picked paths that are themselves repositories, in pick order. */
+  own: RepositoryFamily[];
+  /** Repositories found one level inside picked non-repository folders. */
+  children: RepositoryFamily[];
+};
+
+/** One picker pass over several folders: each picked repository is returned
+ * directly; every other pick is scanned one level down for child
+ * repositories. Probe/list are injected so the picker host supplies the
+ * right backend. Duplicate picks probe once. */
+export async function scanPickedRepositories(
+  picked: string[],
+  probe: (path: string) => Promise<RepositoryFamily | null>,
+  listChildren: (path: string) => Promise<string[]>,
+): Promise<PickedRepositoryScan> {
+  const targets = [
+    ...new Map(picked.map((path) => [pathKey(path), path])).values(),
+  ];
+  const own: RepositoryFamily[] = [];
+  const parents: string[] = [];
+  for (let i = 0; i < targets.length; i += REPOSITORY_SCAN_BATCH) {
+    const probed = await Promise.all(
+      targets.slice(i, i + REPOSITORY_SCAN_BATCH).map(probe),
+    );
+    probed.forEach((family, index) => {
+      if (family) own.push(family);
+      else parents.push(targets[i + index]);
+    });
+  }
+  const children: RepositoryFamily[] = [];
+  for (const parent of parents) {
+    const dirs = await listChildren(parent);
+    for (let i = 0; i < dirs.length; i += REPOSITORY_SCAN_BATCH) {
+      const probed = await Promise.all(
+        dirs.slice(i, i + REPOSITORY_SCAN_BATCH).map(probe),
+      );
+      children.push(
+        ...probed.filter((family): family is RepositoryFamily => !!family),
+      );
+    }
+  }
+  return { own, children };
+}
+
 export function useRepositoryFamilies(recents: RecentProject[], cwd: string) {
   const [families, setFamilies] = useState<Map<string, RepositoryFamily>>(
     () => new Map(getVerifiedFamilies()),

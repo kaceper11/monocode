@@ -506,6 +506,20 @@ export async function pickFolder(title = "Open project", defaultPath?: string): 
   return typeof selected === "string" && selected ? slash(selected) : null;
 }
 
+/** Multi-select variant of pickFolder — every chosen folder comes back. */
+export async function pickFolders(title = "Open project", defaultPath?: string): Promise<string[] | null> {
+  const selected = await open({
+    directory: true,
+    multiple: true,
+    title,
+    defaultPath,
+  });
+  const paths = (Array.isArray(selected) ? selected : selected ? [selected] : [])
+    .filter((path): path is string => Boolean(path))
+    .map(slash);
+  return paths.length ? paths : null;
+}
+
 export async function pickFiles(title = "Attach files"): Promise<string[] | null> {
   const selected = await open({
     multiple: true,

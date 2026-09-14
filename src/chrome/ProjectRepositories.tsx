@@ -5,8 +5,11 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { basename, listDir, pickFolder } from "../lib/fs";
-import { probeRepositoryFamily } from "../hooks/useRepositoryFamilies";
+import { basename, listDir, pickFolder, pickFolders } from "../lib/fs";
+import {
+  probeRepositoryFamily,
+  scanPickedRepositories,
+} from "../hooks/useRepositoryFamilies";
 import {
   addRepositoryToProject,
   createProjectGroup,
@@ -88,9 +91,7 @@ type PendingRepo = {
   owner?: string;
 };
 
-/** Probing one directory child per request; scan in small batches so a big
- * parent folder does not burst the backend. */
-const SCAN_BATCH = 8;
+/** A picked parent folder contributes at most this many children to probe. */
 const SCAN_LIMIT = 200;
 
 /** The project repositories sheet: membership and saved repository sets for
@@ -115,6 +116,9 @@ export function ProjectRepositories({
   const [error, setError] = useState("");
   const [missing, setMissing] = useState<Set<string>>(new Set());
   const [pickOpen, setPickOpen] = useState(false);
+  /** The shared picker is multi-select when adding repositories; locating a
+   * missing one still takes a single folder. */
+  const [pickMultiple, setPickMultiple] = useState(false);
   /** Repository id being relocated through the shared folder picker. */
   const locating = useRef<string | null>(null);
   const [pending, setPending] = useState<PendingRepo[]>([]);
@@ -350,40 +354,43 @@ export function ProjectRepositories({
       setError("That repository is already in this project or queued.");
   };
 
-  /** One pick for both intents: a repository folder adds right away; any
-   * other folder is scanned — each immediate child repository is queued for
-   * review before it joins. */
-  const addPicked = async (picked: string | null) => {
-    if (!picked) return;
+  /** One picker pass for both intents: a single repository folder adds right
+   * away; anything else — several picks, or non-repository parents — is
+   * staged so the queue reviews every repository before it joins. */
+  const addPicked = async (picked: string[]) => {
+    if (!picked.length) return;
     setError("");
     // The first picked folder proposes the group name; later picks just add
     // more repositories, so the name preview never moves again.
-    if (groupImport) setImportParent((prev) => prev ?? picked);
+    if (groupImport) setImportParent((prev) => prev ?? picked[0]);
     setScanning(true);
     try {
-      const own = await probeRepositoryFamily(picked);
-      if (own) {
-        addFamily(own, picked);
+      const scan = await scanPickedRepositories(
+        picked,
+        probeRepositoryFamily,
+        (parent) =>
+          listDir(parent).then((entries) =>
+            entries
+              .filter(
+                (entry) =>
+                  entry.isDir && !entry.ignored && !entry.name.startsWith("."),
+              )
+              .slice(0, SCAN_LIMIT)
+              .map((entry) => entry.path),
+          ),
+      );
+      if (picked.length === 1 && scan.own.length) {
+        addFamily(scan.own[0], picked[0]);
         return;
       }
-      const dirs = (await listDir(picked))
-        .filter(
-          (entry) => entry.isDir && !entry.ignored && !entry.name.startsWith("."),
-        )
-        .slice(0, SCAN_LIMIT);
-      const found: (RepositoryFamily | null)[] = [];
-      for (let i = 0; i < dirs.length; i += SCAN_BATCH)
-        found.push(
-          ...(await Promise.all(
-            dirs.slice(i, i + SCAN_BATCH).map((entry) =>
-              probeRepositoryFamily(entry.path),
-            ),
-          )),
-        );
-      const result = stageable(found);
+      const result = stageable([...scan.own, ...scan.children]);
       stage(result);
       if (!result.items.length && !result.covered)
-        setError("No Git repositories in that folder.");
+        setError(
+          picked.length === 1
+            ? "No Git repositories in that folder."
+            : "No Git repositories in those folders.",
+        );
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -407,11 +414,12 @@ export function ProjectRepositories({
   const pickAdd = () => {
     setError("");
     if (IS_WIN) {
+      setPickMultiple(true);
       setPickOpen(true);
       return;
     }
-    void pickFolder("Choose a repository or a folder of repositories")
-      .then(addPicked)
+    void pickFolders("Choose repositories or folders of repositories")
+      .then((picked) => addPicked(picked ?? []))
       .catch((reason) => setError(String(reason)));
   };
 
@@ -458,6 +466,7 @@ export function ProjectRepositories({
     setError("");
     if (IS_WIN) {
       locating.current = repo.id;
+      setPickMultiple(false);
       setPickOpen(true);
       return;
     }
@@ -585,8 +594,8 @@ export function ProjectRepositories({
 
           {members.length === 0 ? (
             <p className="rounded-lg border border-content/10 px-2.5 py-2 text-[12px] text-content/45">
-              No repositories yet. Add a repository folder, or scan a parent
-              folder to add several at once.
+              No repositories yet. Pick one or more repository folders, or a
+              parent folder to add several at once.
             </p>
           ) : (
             <ul className="flex flex-col gap-px">
@@ -687,19 +696,19 @@ export function ProjectRepositories({
             <button
               type="button"
               disabled={scanning}
-              title="Pick a repository folder to add it, or a parent folder to review its repositories"
+              title="Pick one or more repository folders, or parent folders to review their repositories"
               onClick={pickAdd}
               className="flex items-center gap-1.5 rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-[12px] text-content hover:bg-content/10 disabled:opacity-50"
             >
               <FolderPlus className="size-3.5" strokeWidth={1.75} />
-              {scanning ? "Scanning…" : "Add folder…"}
+              {scanning ? "Scanning…" : "Add folders…"}
             </button>
             <p className="mt-1.5 text-[11px] leading-tight text-content/45">
               {groupImport && !project
                 ? "Picked repositories are queued — the project is created when you submit."
                 : pending.length
                   ? "Queued repositories join the project when you submit."
-                  : "Pick a repository to add it now, or a parent folder to review its repositories first."}
+                  : "Pick a repository to add it now, or several folders to review their repositories first."}
             </p>
             {pending.length ? (
               <div className="mt-1.5 space-y-1">
@@ -996,6 +1005,7 @@ export function ProjectRepositories({
       {pickOpen ? (
         <WslProjectDialog
           cwd={importParent || path}
+          multiple={pickMultiple}
           onOpen={(picked) => {
             setPickOpen(false);
             const target = locating.current;
@@ -1004,7 +1014,7 @@ export function ProjectRepositories({
               const repo = project.repositories.find(
                 (entry) => entry.id === target,
               );
-              if (repo) void locateInto(repo, picked);
+              if (repo && picked[0]) void locateInto(repo, picked[0]);
             } else void addPicked(picked);
           }}
           onClose={() => {

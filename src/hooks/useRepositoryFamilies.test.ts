@@ -1,5 +1,8 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { discoverRepositoryFamilies } from "./useRepositoryFamilies";
+import {
+  discoverRepositoryFamilies,
+  scanPickedRepositories,
+} from "./useRepositoryFamilies";
 import {
   getVerifiedFamilies,
   publishRepositoryFamilies,
@@ -176,4 +179,54 @@ it("never drops a recent subfolder alias while refreshing a sibling checkout", a
   } finally {
     unsubscribe();
   }
+});
+
+it("returns picked repositories directly and scans non-repository picks one level down", async () => {
+  const repos = new Set([
+    "/a/repo1",
+    "/b/repo2",
+    "/parent/child1",
+    "/parent/child2",
+  ]);
+  const probe = vi.fn(async (path: string) =>
+    repos.has(path) ? family(path) : null,
+  );
+  const listChildren = vi.fn(async (path: string) =>
+    path === "/parent"
+      ? ["/parent/child1", "/parent/plain", "/parent/child2"]
+      : [],
+  );
+  const scan = await scanPickedRepositories(
+    ["/a/repo1", "/parent", "/b/repo2"],
+    probe,
+    listChildren,
+  );
+  expect(scan.own.map((entry) => entry.checkout)).toEqual([
+    "/a/repo1",
+    "/b/repo2",
+  ]);
+  expect(scan.children.map((entry) => entry.checkout)).toEqual([
+    "/parent/child1",
+    "/parent/child2",
+  ]);
+  expect(listChildren).toHaveBeenCalledTimes(1);
+  expect(listChildren).toHaveBeenCalledWith("/parent");
+});
+
+it("probes duplicate picks once and reports a folder without repositories", async () => {
+  const probe = vi.fn(async (path: string) => family(path));
+  const listChildren = vi.fn(async () => [] as string[]);
+  const scan = await scanPickedRepositories(
+    ["/a/repo", "/a/repo/", "/a/repo"],
+    probe,
+    listChildren,
+  );
+  expect(probe).toHaveBeenCalledTimes(1);
+  expect(scan.own.map((entry) => entry.checkout)).toEqual(["/a/repo"]);
+  expect(scan.children).toEqual([]);
+
+  probe.mockResolvedValue(null);
+  const empty = await scanPickedRepositories(["/plain"], probe, listChildren);
+  expect(empty).toEqual({ own: [], children: [] });
+  expect(listChildren).toHaveBeenCalledWith("/plain");
 });

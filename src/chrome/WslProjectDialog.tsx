@@ -3,17 +3,21 @@ import { useEffect, useRef, useState } from "react";
 import { wslLocation, wslPath } from "../lib/paths";
 import { connectWslProject } from "../lib/wsl";
 import { useWslStatus } from "../lib/wslStatus";
-import { pickFolder } from "../lib/fs";
+import { pickFolder, pickFolders } from "../lib/fs";
 import { Select } from "./Select";
 import { Modal } from "./Modal";
 
 export function WslProjectDialog({
   cwd,
+  multiple,
   onOpen,
   onClose,
 }: {
   cwd: string;
-  onOpen: (path: string) => void;
+  /** Lets the native folder picker return several folders at once. A typed
+   * WSL path always delivers a single entry. */
+  multiple?: boolean;
+  onOpen: (paths: string[]) => void;
   onClose: () => void;
 }) {
   const form = useRef<HTMLFormElement>(null);
@@ -109,19 +113,26 @@ export function WslProjectDialog({
           void Promise.resolve()
             .then(async () => {
               if (distribution)
-                return connectWslProject(
-                  wslPath(distribution, path),
-                  controller.signal,
-                );
-              const selected = await pickFolder();
-              if (selected && wslLocation(selected))
+                return [
+                  await connectWslProject(
+                    wslPath(distribution, path),
+                    controller.signal,
+                  ),
+                ];
+              const selected = await (multiple ? pickFolders() : pickFolder());
+              const paths = Array.isArray(selected)
+                ? selected
+                : selected
+                  ? [selected]
+                  : null;
+              if (paths?.some((picked) => wslLocation(picked)))
                 throw new Error(
                   "Choose that WSL distribution as the execution location, then enter its Linux path.",
                 );
-              return selected;
+              return paths;
             })
             .then((canonical) => {
-              if (canonical && !controller.signal.aborted) {
+              if (canonical?.length && !controller.signal.aborted) {
                 onOpen(canonical);
                 onClose();
               }
