@@ -254,6 +254,10 @@ pub struct GitDiffIndex {
     pub merge_head: Option<String>,
     /// HEAD is detached — `branch` then holds a short SHA, not a branch.
     pub detached: bool,
+    /// "Keep local" files — skip-worktree index entries git itself refuses
+    /// to stage or commit until the flag is removed. Tracked entries carry
+    /// local edits; untracked ones are parked intent-to-add entries.
+    pub local_only: Vec<GitChangedFile>,
 }
 
 /// Changed files in the opened folder, with per-file line counts and status.
@@ -392,6 +396,28 @@ pub async fn git_stage_contents(
             contents.as_bytes(),
             Some(&guard),
         )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Keep a file's local state out of commits: the index entry is marked
+/// skip-worktree so status, diff, `add -A` and commit ignore it until it is
+/// un-kept. Tracked files are unstaged first (the flag does not unstage),
+/// untracked files are parked as intent-to-add entries under the same flag.
+#[tauri::command]
+pub async fn git_keep_local(cwd: String, relative: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || git_keep_local_for(&expand_home(&cwd), &relative))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Remove the keep-local flag so the file's real state shows again —
+/// tracked files resurface their edits, parked entries return to untracked.
+#[tauri::command]
+pub async fn git_unkeep_local(cwd: String, relative: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_unkeep_local_for(&expand_home(&cwd), &relative)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2232,6 +2258,12 @@ fn git_diff_stats_for(root: &Path) -> GitDiffStats {
         }
     }
     add_untracked_map(root, &mut files);
+    // Parked keep-local entries leave `0 0` rows in `diff HEAD --numstat` —
+    // drop them so these counts agree with the Changes panel's file list.
+    let kept = local_only_paths(root);
+    if !kept.is_empty() {
+        files.retain(|relative, _| !kept.contains(relative));
+    }
     let mut additions = 0i64;
     let mut deletions = 0i64;
     for acc in files.values() {
@@ -2366,6 +2398,24 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
     } else {
         None
     };
+    // Kept-local paths leave traces in `diff HEAD` (intent-to-add entries) —
+    // strip them from the ordinary list unless they are staged: a staged
+    // entry stays committable under skip-worktree, so it belongs in the
+    // staged list where it can still be acted on, not in "Local only".
+    let kept = local_only_paths(root);
+    if !kept.is_empty() {
+        out.retain(|file| file.staged || !kept.contains(&file.relative));
+    }
+    let staged_paths: HashSet<&str> = out
+        .iter()
+        .filter(|file| file.staged)
+        .map(|file| file.relative.as_str())
+        .collect();
+    let local_only: Vec<GitChangedFile> = local_only_files(root, kept)
+        .into_iter()
+        .filter(|file| !staged_paths.contains(file.relative.as_str()))
+        .collect();
+
     GitDiffIndex {
         branch: head_branch.clone().or(head_sha.clone()),
         files: out,
@@ -2382,7 +2432,136 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
         conflicts: sync.conflicts,
         merge_head: sync.merge_head,
         detached: head_branch.is_none() && head_sha.is_some(),
+        local_only,
     }
+}
+
+/// Paths carrying the skip-worktree bit — "keep local" entries git itself
+/// hides from status/diff and refuses to stage until the flag is removed.
+fn local_only_paths(root: &Path) -> HashSet<String> {
+    local_only_paths_scoped(root, true)
+}
+
+/// Whole-index variant — a commit lands the full index regardless of the
+/// opened folder, so the commit guard must see kept paths outside `cwd`.
+fn local_only_paths_repo(root: &Path) -> HashSet<String> {
+    local_only_paths_scoped(root, false)
+}
+
+fn local_only_paths_scoped(root: &Path, cwd_only: bool) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut args = vec!["ls-files", "-v", "-z"];
+    if cwd_only {
+        args.extend(["--", "."]);
+    }
+    let Some(text) = git_run(root, &args) else {
+        return out;
+    };
+    for entry in text.split('\0') {
+        let Some((tag, path)) = entry.split_once(' ') else {
+            continue;
+        };
+        // `S` is skip-worktree; lowercase means assume-unchanged is also set.
+        if tag.eq_ignore_ascii_case("s") {
+            let relative = normalize_diff_path(path);
+            if !relative.is_empty() {
+                out.insert(relative);
+            }
+        }
+    }
+    out
+}
+
+/// Whether each `relatives` path is a regular file in the working tree,
+/// keyed by its JS-form absolute path (host stat or batched WSL inspect).
+fn worktree_files_exist(root: &Path, relatives: &[String]) -> HashSet<String> {
+    let keys: Vec<String> = relatives
+        .iter()
+        .map(|relative| path_to_js(&host_path(root, relative)))
+        .collect();
+    if wsl::path_location(root).ok().flatten().is_some() {
+        #[derive(Deserialize)]
+        struct Entry {
+            path: String,
+            #[serde(rename = "isDir")]
+            is_dir: bool,
+        }
+        // `inspect` omits entries that fail to stat — no entry, no file.
+        return wsl::file_batches::<Entry>(&keys, "inspect")
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.path)
+            .collect();
+    }
+    keys.into_iter()
+        .filter(|key| Path::new(key).is_file())
+        .collect()
+}
+
+/// Whether a sparse checkout is active — it marks every out-of-cone index
+/// entry skip-worktree, which must not crowd the "Local only" list.
+fn git_sparse_checkout(root: &Path) -> bool {
+    ["core.sparseCheckout", "core.sparseCheckoutCone"]
+        .iter()
+        .any(|key| {
+            git_stdout(root, &["config", "--bool", key]).is_some_and(|value| value.trim() == "true")
+        })
+}
+
+/// "Keep local" files for the index: tracked entries report "modified" (or
+/// "deleted" when the worktree copy is gone), parked intent-to-add entries
+/// report "untracked". Under sparse checkout, entries absent from disk are
+/// out-of-cone artifacts, not kept files — they are dropped from the list.
+fn local_only_files(root: &Path, kept: HashSet<String>) -> Vec<GitChangedFile> {
+    let mut paths: Vec<String> = kept.into_iter().collect();
+    paths.sort();
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let sparse = git_sparse_checkout(root);
+    let exists = worktree_files_exist(root, &paths);
+    let mut in_head: HashSet<String> = HashSet::new();
+    let mut args = vec!["ls-tree", "-z", "HEAD", "--"];
+    let specs: Vec<String> = paths
+        .iter()
+        .map(|path| format!(":(literal){path}"))
+        .collect();
+    args.extend(specs.iter().map(String::as_str));
+    if let Some(text) = git_run(root, &args) {
+        for entry in text.split('\0') {
+            let Some((meta, path)) = entry.split_once('\t') else {
+                continue;
+            };
+            // "<mode> <type> <sha>" — only blobs count as tracked files.
+            if meta.split(' ').nth(1) == Some("blob") {
+                in_head.insert(normalize_diff_path(path));
+            }
+        }
+    }
+    paths
+        .into_iter()
+        .filter(|relative| !sparse || exists.contains(&path_to_js(&host_path(root, relative))))
+        .map(|relative| {
+            let abs = host_path(root, &relative);
+            let status = if !in_head.contains(&relative) {
+                "untracked"
+            } else if !exists.contains(&path_to_js(&abs)) {
+                "deleted"
+            } else {
+                "modified"
+            };
+            GitChangedFile {
+                path: path_to_js(&abs),
+                relative,
+                status: status.to_string(),
+                additions: 0,
+                deletions: 0,
+                staged: false,
+                unstaged: false,
+            }
+        })
+        .collect()
 }
 
 fn add_numstat_map(text: &str, files: &mut HashMap<String, FileAcc>) {
@@ -2544,7 +2723,11 @@ fn git_file_diff_for(root: &Path, relative: &str, staged: bool) -> Result<GitFil
 
     let prefix = git_stdout(root, &["rev-parse", "--show-prefix"]).unwrap_or_default();
     let index_spec = format!(":{prefix}{relative}");
-    let (original, current, large) = if staged {
+    // Kept-local files have no staged/unstaged split — the useful diff is
+    // always local file against HEAD (a parked intent-to-add index blob
+    // would render a new local file as empty).
+    let kept = local_only_paths(root).contains(&relative);
+    let (original, current, large) = if staged && !kept {
         let head_spec = format!("HEAD:{prefix}{relative}");
         (
             git_blob(root, &head_spec),
@@ -2569,7 +2752,12 @@ fn git_file_diff_for(root: &Path, relative: &str, staged: bool) -> Result<GitFil
             };
             (current, false)
         };
-        (git_blob(root, &index_spec), current, large)
+        let base = if kept {
+            git_blob(root, &format!("HEAD:{prefix}{relative}"))
+        } else {
+            git_blob(root, &index_spec)
+        };
+        (base, current, large)
     };
     let had_original = original.is_some();
     let had_current = current.is_some();
@@ -2891,7 +3079,100 @@ fn git_commit_file_diff_for(root: &Path, sha: &str, relative: &str) -> Result<Gi
 
 fn git_stage_file_for(root: &Path, relative: &str) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
+    if local_only_paths(root).contains(&relative) {
+        return Err(format!(
+            "{relative} is kept local — stop keeping it local before staging"
+        ));
+    }
     git_checked(root, &["add", "--", &relative])
+}
+
+/// Whether the path exists on disk as a regular file (host or WSL guest).
+fn worktree_file_exists(root: &Path, relative: &str) -> Result<bool, String> {
+    let key = path_to_js(&host_path(root, relative));
+    Ok(worktree_files_exist(root, &[relative.to_string()]).contains(&key))
+}
+
+/// HEAD entry kind for a path — `Some("blob")` is a tracked file, `Some`
+/// with another type is a tree (directory) match, `None` is a parked
+/// intent-to-add, staged-never-committed, or untracked path.
+fn git_head_entry(root: &Path, relative: &str) -> Option<String> {
+    let spec = format!(":(literal){relative}");
+    let text = git_stdout(root, &["ls-tree", "-z", "HEAD", "--", &spec])?;
+    let (meta, _) = text.split('\0').next()?.split_once('\t')?;
+    meta.split(' ').nth(1).map(str::to_string)
+}
+
+/// Keep-local is best-effort: a mid-sequence failure (e.g. `add -N` works,
+/// `update-index` fails) leaves a git-consistent state — the file simply
+/// stays visible in the changes list, never silently committed.
+fn git_keep_local_for(root: &Path, relative: &str) -> Result<(), String> {
+    let relative = resolve_repo_path(root, relative)?;
+    // update-index takes literal paths; the pathspec commands need the
+    // explicit literal magic so glob metacharacters in a name stay literal.
+    let spec = format!(":(literal){relative}");
+    if local_only_paths(root).contains(&relative) {
+        // Already flagged — but a staged entry stays committable, so a
+        // re-keep still unstages it. `restore` drops the flag when it
+        // rewrites an entry, so the flag has to go off and back on.
+        if git_run(
+            root,
+            &["diff", "--cached", "--name-only", "-z", "--", &spec],
+        )
+        .is_some_and(|text| !text.trim().is_empty())
+        {
+            git_checked(
+                root,
+                &["update-index", "--no-skip-worktree", "--", &relative],
+            )?;
+            git_checked(root, &["restore", "--staged", "--", &spec])?;
+            git_checked(root, &["update-index", "--skip-worktree", "--", &relative])?;
+        }
+        return Ok(());
+    }
+    // A conflicted path carries stage-1/2/3 entries — unstaging it would
+    // silently resolve the conflict to HEAD.
+    if git_run(root, &["ls-files", "-u", "-z", "--", &spec])
+        .is_some_and(|text| !text.trim().is_empty())
+    {
+        return Err(format!("{relative} has unresolved merge conflicts"));
+    }
+    match git_head_entry(root, &relative).as_deref() {
+        Some("blob") => {
+            // The flag does not unstage — a staged entry stays committable.
+            git_checked(root, &["restore", "--staged", "--", &spec])?;
+            return git_checked(root, &["update-index", "--skip-worktree", "--", &relative]);
+        }
+        Some(_) => return Err(format!("{relative} is a directory, not a file")),
+        None => {}
+    }
+    if !worktree_file_exists(root, &relative)? {
+        return Err(format!("{relative} is not a file in the working tree"));
+    }
+    // An index-only entry (staged, never committed) drops back to untracked
+    // so `add -N` can park it under the same flag as a plain local file.
+    if git_checked(root, &["ls-files", "--error-unmatch", "--", &spec]).is_ok() {
+        git_checked(root, &["rm", "--cached", "-q", "--", &spec])?;
+    }
+    git_checked(root, &["add", "-N", "--", &spec])?;
+    git_checked(root, &["update-index", "--skip-worktree", "--", &relative])
+}
+
+fn git_unkeep_local_for(root: &Path, relative: &str) -> Result<(), String> {
+    let relative = resolve_repo_path(root, relative)?;
+    if !local_only_paths(root).contains(&relative) {
+        return Err(format!("{relative} is not kept local"));
+    }
+    git_checked(
+        root,
+        &["update-index", "--no-skip-worktree", "--", &relative],
+    )?;
+    if git_head_entry(root, &relative).is_none() {
+        // Drop the intent-to-add parking entry — plain untracked again.
+        let spec = format!(":(literal){relative}");
+        git_checked(root, &["rm", "--cached", "-q", "--", &spec])?;
+    }
+    Ok(())
 }
 
 fn git_stage_contents_for(
@@ -2901,6 +3182,11 @@ fn git_stage_contents_for(
     guard: Option<&GitDiffGuard>,
 ) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
+    if local_only_paths(root).contains(&relative) {
+        return Err(format!(
+            "{relative} is kept local — stop keeping it local before staging"
+        ));
+    }
     if contents.len() as u64 > MAX_TEXT_FILE_BYTES {
         return Err("File too large".into());
     }
@@ -3009,7 +3295,21 @@ fn git_unstage_file_for(root: &Path, relative: &str) -> Result<(), String> {
 }
 
 fn git_discard_file_for(root: &Path, relative: &str) -> Result<(), String> {
+    let kept = local_only_paths(root);
+    git_discard_file_guarded(root, relative, &kept)
+}
+
+fn git_discard_file_guarded(
+    root: &Path,
+    relative: &str,
+    kept: &HashSet<String>,
+) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
+    if kept.contains(&relative) {
+        return Err(format!(
+            "{relative} is kept local — stop keeping it local before discarding"
+        ));
+    }
     let abs = host_path(root, &relative);
     if git_checked(root, &["ls-files", "--error-unmatch", "--", &relative]).is_err() {
         if wsl::path_location(root)?.is_some() {
@@ -3032,8 +3332,10 @@ fn git_discard_all_for(root: &Path) -> Result<(), String> {
         .filter(|file| file.unstaged)
         .map(|file| file.relative)
         .collect();
+    // Hoist the kept-set lookup out of the per-file discard loop.
+    let kept = local_only_paths(root);
     for relative in files {
-        git_discard_file_for(root, &relative)?;
+        git_discard_file_guarded(root, &relative, &kept)?;
     }
     Ok(())
 }
@@ -3044,8 +3346,18 @@ fn git_staged_context_for(root: &Path) -> Result<GitStagedContext, String> {
         git_run(root, &["diff", "--cached", "--no-ext-diff", "--", "."]).unwrap_or_default();
 
     if summary.trim().is_empty() && patch.trim().is_empty() {
-        summary = git_run(root, &["diff", "HEAD", "--stat", "--", "."]).unwrap_or_default();
-        patch = git_run(root, &["diff", "HEAD", "--no-ext-diff", "--", "."]).unwrap_or_default();
+        // Parked keep-local entries surface as `new file` headers in the
+        // HEAD fallback — exclude them so local-only names stay out of
+        // generated context.
+        let kept = local_only_paths(root);
+        let mut specs: Vec<String> = vec![".".into()];
+        specs.extend(kept.iter().map(|path| format!(":(exclude,literal){path}")));
+        let mut stat_args = vec!["diff", "HEAD", "--stat", "--"];
+        stat_args.extend(specs.iter().map(String::as_str));
+        let mut patch_args = vec!["diff", "HEAD", "--no-ext-diff", "--"];
+        patch_args.extend(specs.iter().map(String::as_str));
+        summary = git_run(root, &stat_args).unwrap_or_default();
+        patch = git_run(root, &patch_args).unwrap_or_default();
         if let Some(untracked) = git_run(root, &["ls-files", "--others", "--exclude-standard"]) {
             let names = untracked.trim();
             if !names.is_empty() {
@@ -3073,6 +3385,25 @@ fn git_commit_for(root: &Path, message: &str) -> Result<(), String> {
     let message = message.trim();
     if message.is_empty() {
         return Err("Commit message cannot be empty".into());
+    }
+    let kept = local_only_paths_repo(root);
+    if !kept.is_empty() {
+        // A path flagged while staged (bare `update-index` in a shell) stays
+        // committable — keep-local must not ship in a commit. A commit lands
+        // the whole index, so the check is repo-wide, not scoped to `cwd`.
+        if let Some(staged) = git_run(root, &["diff", "--cached", "--name-only", "-z"]) {
+            let blocked: Vec<String> = staged
+                .split('\0')
+                .map(normalize_diff_path)
+                .filter(|path| kept.contains(path))
+                .collect();
+            if !blocked.is_empty() {
+                return Err(format!(
+                    "Kept-local files are staged: {}. Unstage or stop keeping them local first.",
+                    blocked.join(", ")
+                ));
+            }
+        }
     }
     let result = git_checked(root, &["commit", "--cleanup=strip", "-m", message]);
     // Committing during a merge concludes it — the poll cache would
@@ -7061,6 +7392,210 @@ mod tests {
             std::fs::read_to_string(dir.0.join("a.txt")).unwrap(),
             working
         );
+    }
+
+    #[test]
+    fn git_keep_local_hides_tracked_edits_and_blocks_staging() {
+        let dir = tmp("git-keep-tracked");
+        if !init_git_commit(&dir.0, &[("config.txt", "a\nb\n"), ("work.txt", "w\n")]) {
+            return;
+        }
+        std::fs::write(dir.0.join("config.txt"), "a\nlocal\n").unwrap();
+        assert!(git_diff_index_for(&dir.0)
+            .files
+            .iter()
+            .any(|file| file.relative == "config.txt"));
+
+        git_keep_local_for(&dir.0, "config.txt").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert!(index.files.iter().all(|file| file.relative != "config.txt"));
+        assert_eq!(index.local_only.len(), 1);
+        assert_eq!(index.local_only[0].relative, "config.txt");
+        assert_eq!(index.local_only[0].status, "modified");
+
+        // The diff still shows the local edit against HEAD.
+        let diff = git_file_diff_for(&dir.0, "config.txt", false).unwrap();
+        assert_eq!(diff.original, "a\nb\n");
+        assert_eq!(diff.current, "a\nlocal\n");
+        assert_eq!(diff.status, "modified");
+
+        // Staging paths refuse kept files, and `add -A` skips them.
+        assert!(git_stage_file_for(&dir.0, "config.txt").is_err());
+        assert!(git_stage_contents_for(&dir.0, "config.txt", b"x\n", None).is_err());
+        git_checked(&dir.0, &["add", "-A", "--", "."]).unwrap();
+        assert!(git_diff_index_for(&dir.0).files.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("config.txt")).unwrap(),
+            "a\nlocal\n"
+        );
+
+        // A commit lands without the kept file, and unkeep restores it.
+        std::fs::write(dir.0.join("work.txt"), "w2\n").unwrap();
+        git_stage_file_for(&dir.0, "work.txt").unwrap();
+        git_commit_for(&dir.0, "work").unwrap();
+        let diff = git_file_diff_for(&dir.0, "config.txt", false).unwrap();
+        assert_eq!(diff.original, "a\nb\n");
+        git_unkeep_local_for(&dir.0, "config.txt").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert!(index.local_only.is_empty());
+        let file = index
+            .files
+            .iter()
+            .find(|file| file.relative == "config.txt")
+            .unwrap();
+        assert!(file.unstaged);
+        assert!(!file.staged);
+    }
+
+    #[test]
+    fn git_keep_local_parks_untracked_files() {
+        let dir = tmp("git-keep-untracked");
+        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        std::fs::write(dir.0.join("dev.local"), "secret=1\n").unwrap();
+        assert!(git_diff_index_for(&dir.0)
+            .files
+            .iter()
+            .any(|file| file.relative == "dev.local" && file.status == "untracked"));
+
+        git_keep_local_for(&dir.0, "dev.local").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert!(index.files.is_empty());
+        assert_eq!(index.local_only.len(), 1);
+        assert_eq!(index.local_only[0].relative, "dev.local");
+        assert_eq!(index.local_only[0].status, "untracked");
+
+        // The parked file diffs as new content against nothing in HEAD.
+        let diff = git_file_diff_for(&dir.0, "dev.local", false).unwrap();
+        assert_eq!(diff.original, "");
+        assert_eq!(diff.current, "secret=1\n");
+        assert_eq!(diff.status, "untracked");
+
+        git_unkeep_local_for(&dir.0, "dev.local").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert!(index.local_only.is_empty());
+        assert!(index
+            .files
+            .iter()
+            .any(|file| file.relative == "dev.local" && file.status == "untracked"));
+        assert!(git_unkeep_local_for(&dir.0, "dev.local").is_err());
+    }
+
+    #[test]
+    fn git_keep_local_unstages_a_staged_file_first() {
+        let dir = tmp("git-keep-staged");
+        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        std::fs::write(dir.0.join("a.txt"), "beta\n").unwrap();
+        git_stage_file_for(&dir.0, "a.txt").unwrap();
+        assert!(git_diff_index_for(&dir.0).files[0].staged);
+
+        // Keeping a staged file must unstage it — the flag alone leaves it
+        // committable.
+        git_keep_local_for(&dir.0, "a.txt").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert!(index.files.is_empty());
+        assert_eq!(index.local_only[0].relative, "a.txt");
+        git_commit_for(&dir.0, "must not contain a.txt").unwrap_err();
+    }
+
+    #[test]
+    fn git_commit_refuses_a_staged_keep_local_entry() {
+        let dir = tmp("git-keep-commit-guard");
+        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n"), ("b.txt", "beta\n")]) {
+            return;
+        }
+        std::fs::write(dir.0.join("a.txt"), "local\n").unwrap();
+        // Simulates flagging a file while it is staged from a plain shell —
+        // the entry stays committable until something unstages it.
+        assert!(git(&dir.0, &["add", "a.txt"]));
+        assert!(git(&dir.0, &["update-index", "--skip-worktree", "a.txt"]));
+
+        let error = git_commit_for(&dir.0, "work").unwrap_err();
+        assert!(error.contains("a.txt"), "{error}");
+        assert!(error.contains("kept-local") || error.contains("Kept-local"));
+    }
+
+    #[test]
+    fn git_keep_local_parked_file_never_lands_in_a_commit() {
+        let dir = tmp("git-keep-commit-clean");
+        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        std::fs::write(dir.0.join("dev.local"), "secret=1\n").unwrap();
+        git_keep_local_for(&dir.0, "dev.local").unwrap();
+        std::fs::write(dir.0.join("a.txt"), "beta\n").unwrap();
+        git_stage_file_for(&dir.0, "a.txt").unwrap();
+
+        // The commit succeeds and HEAD gains only a.txt — the parked file
+        // stays out of the tree.
+        git_commit_for(&dir.0, "work").unwrap();
+        assert_eq!(git_head_entry(&dir.0, "dev.local"), None);
+        assert_eq!(git_head_entry(&dir.0, "a.txt").as_deref(), Some("blob"));
+        assert_eq!(git_diff_stats_for(&dir.0).files, 0);
+    }
+
+    #[test]
+    fn git_keep_local_refuses_conflicted_and_directory_paths() {
+        let dir = tmp("git-keep-conflict");
+        if !init_git_commit(&dir.0, &[("sub/f.txt", "f\n")]) {
+            return;
+        }
+        // A directory path must not unstage its subtree.
+        let error = git_keep_local_for(&dir.0, "sub").unwrap_err();
+        assert!(error.contains("directory"), "{error}");
+        assert_eq!(
+            git_diff_index_for(&dir.0).files.len(),
+            0,
+            "directory keep must not mutate the index"
+        );
+
+        // Diverge both sides of conf.txt and merge for a real conflict.
+        assert!(git(&dir.0, &["checkout", "-b", "side"]));
+        std::fs::write(dir.0.join("conf.txt"), "side\n").unwrap();
+        assert!(git(&dir.0, &["add", "conf.txt"]));
+        assert!(git(&dir.0, &["commit", "-m", "side"]));
+        assert!(git(&dir.0, &["checkout", "main"]));
+        std::fs::write(dir.0.join("conf.txt"), "main\n").unwrap();
+        assert!(git(&dir.0, &["add", "conf.txt"]));
+        assert!(git(&dir.0, &["commit", "-m", "main"]));
+        assert!(!git(&dir.0, &["merge", "side"]));
+
+        let error = git_keep_local_for(&dir.0, "conf.txt").unwrap_err();
+        assert!(error.contains("conflict"), "{error}");
+    }
+
+    #[test]
+    fn git_keep_local_reports_deleted_and_rekeep_unstages() {
+        let dir = tmp("git-keep-deleted");
+        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n"), ("b.txt", "beta\n")]) {
+            return;
+        }
+        git_keep_local_for(&dir.0, "a.txt").unwrap();
+        std::fs::remove_file(dir.0.join("a.txt")).unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert_eq!(index.local_only[0].relative, "a.txt");
+        assert_eq!(index.local_only[0].status, "deleted");
+
+        // A file flagged while staged (e.g. via bare update-index) stays
+        // committable — keeping it again must unstage it.
+        std::fs::write(dir.0.join("b.txt"), "local\n").unwrap();
+        assert!(git(&dir.0, &["add", "b.txt"]));
+        assert!(git(&dir.0, &["update-index", "--skip-worktree", "b.txt"]));
+        let index = git_diff_index_for(&dir.0);
+        let b = index
+            .files
+            .iter()
+            .find(|file| file.relative == "b.txt")
+            .unwrap();
+        assert!(b.staged);
+        git_keep_local_for(&dir.0, "b.txt").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert!(index.files.iter().all(|file| file.relative != "b.txt"));
+        assert!(index.local_only.iter().any(|file| file.relative == "b.txt"));
+        git_commit_for(&dir.0, "nothing staged now").unwrap_err();
     }
 
     #[test]

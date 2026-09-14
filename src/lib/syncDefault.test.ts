@@ -38,6 +38,7 @@ const cleanIndex: GitDiffIndex = {
   conflicts: [],
   mergeHead: null,
   detached: false,
+  localOnly: [],
 };
 
 function mockInvoke(handler: (command: string, args?: unknown) => unknown) {

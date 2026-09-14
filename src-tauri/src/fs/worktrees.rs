@@ -1,4 +1,6 @@
-use super::{expand_home, git_cmd};
+use super::{
+    expand_home, git_cmd, git_keep_local_for, host_path, local_only_files, local_only_paths,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::Read;
@@ -374,12 +376,74 @@ fn create(
             && e.head == commit
             && e.branch.as_deref() == Some(&format!("refs/heads/{branch}"))
     }) {
+        seed_local_only(root, Path::new(&target));
         return Ok(target);
     }
     result?;
     Err(format!(
         "Creation could not be confirmed. Refresh and inspect {target}; no data was removed."
     ))
+}
+
+/// Cap for a carried file — matches the WSL bridge's `restore_bytes` limit.
+const MAX_SEED_BYTES: usize = 8 * 1024 * 1024;
+
+/// Carry the source worktree's keep-local files into a freshly created one.
+/// Each worktree owns its index, so skip-worktree flags never propagate on
+/// their own — the file bytes are copied and re-flagged in the new checkout.
+/// Best-effort: a file that can't be carried is skipped and simply absent
+/// from the new worktree's "Local only" list. Symlinks and other non-regular
+/// files copy as the plain bytes they resolve to.
+fn seed_local_only(source: &Path, target: &Path) {
+    for file in local_only_files(source, local_only_paths(source)) {
+        // A kept file deleted on disk has nothing to carry.
+        if file.status == "deleted" {
+            continue;
+        }
+        if let Err(error) = seed_local_only_file(source, target, &file.relative) {
+            eprintln!(
+                "monocode: could not carry kept-local {} into {}: {error}",
+                file.relative,
+                path_to_js(target)
+            );
+        }
+    }
+}
+
+fn seed_local_only_file(source: &Path, target: &Path, relative: &str) -> Result<(), String> {
+    let src = host_path(source, relative);
+    let dst = host_path(target, relative);
+    let data = if let Some(location) = crate::wsl::path_location(&src)? {
+        use base64::Engine;
+        let text: String = crate::wsl::request(
+            &location,
+            "read",
+            serde_json::json!({"limit": MAX_SEED_BYTES}),
+        )?;
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .map_err(|e| e.to_string())?
+    } else {
+        let meta = std::fs::metadata(&src).map_err(|e| e.to_string())?;
+        if !meta.is_file() || meta.len() as usize > MAX_SEED_BYTES {
+            return Err("not a regular file or exceeds 8 MiB".into());
+        }
+        std::fs::read(&src).map_err(|e| e.to_string())?
+    };
+    if let Some(location) = crate::wsl::path_location(&dst)? {
+        use base64::Engine;
+        crate::wsl::request::<serde_json::Value>(
+            &location,
+            "restore_bytes",
+            serde_json::json!({"data": base64::engine::general_purpose::STANDARD.encode(&data)}),
+        )?;
+    } else {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&dst, &data).map_err(|e| e.to_string())?;
+    }
+    git_keep_local_for(target, relative)
 }
 
 #[tauri::command(async)]
@@ -964,6 +1028,59 @@ pub(crate) mod tests {
         )
         .is_err());
         assert!(create(&repo.0, "--bad", &base, "another", &repo.target("unused")).is_err());
+    }
+
+    #[test]
+    fn create_carries_keep_local_files_into_the_new_worktree() {
+        let repo = Repo::new();
+        std::fs::write(repo.0.join("tracked.txt"), "base\n").unwrap();
+        git(&repo.0, &["add", "tracked.txt"]).unwrap();
+        git(&repo.0, &["commit", "-m", "file"]).unwrap();
+        std::fs::write(repo.0.join("tracked.txt"), "base\nlocal\n").unwrap();
+        std::fs::write(repo.0.join("dev.local"), "secret=1\n").unwrap();
+        std::fs::create_dir_all(repo.0.join("conf.d")).unwrap();
+        std::fs::write(repo.0.join("conf.d/dev.yaml"), "x: 1\n").unwrap();
+        crate::fs::git_keep_local_for(&repo.0, "tracked.txt").unwrap();
+        crate::fs::git_keep_local_for(&repo.0, "dev.local").unwrap();
+        crate::fs::git_keep_local_for(&repo.0, "conf.d/dev.yaml").unwrap();
+
+        let child = repo.target("child-copy");
+        create(&repo.0, "refs/heads/main", &repo.head(), "child", &child).unwrap();
+
+        // Bytes carried over — including a file nested under a new directory.
+        let child_path = Path::new(&child);
+        assert_eq!(
+            std::fs::read_to_string(child_path.join("tracked.txt")).unwrap(),
+            "base\nlocal\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(child_path.join("dev.local")).unwrap(),
+            "secret=1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(child_path.join("conf.d/dev.yaml")).unwrap(),
+            "x: 1\n"
+        );
+        // And all of them are flagged in the child's own index, so they can
+        // never be committed or pushed from the new worktree either.
+        let index = crate::fs::git_diff_index_for(child_path);
+        assert!(index.files.is_empty());
+        let mut kept: Vec<&str> = index
+            .local_only
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["conf.d/dev.yaml", "dev.local", "tracked.txt"]);
+        // The source worktree's own keep-local state is untouched (the new
+        // worktree's directory inside the repo shows as a plain untracked
+        // `child-copy/` entry, not a kept file).
+        let source = crate::fs::git_diff_index_for(&repo.0);
+        assert_eq!(source.local_only.len(), 3);
+        assert!(source
+            .files
+            .iter()
+            .all(|file| file.relative.starts_with("child-copy")));
     }
 
     #[test]
