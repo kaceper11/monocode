@@ -443,57 +443,6 @@ export function browserFind(
   return invoke("browser_find", { label, query, forward });
 }
 
-// --- Saved dev logins — metadata only; passwords never reach the frontend ---
-
-export type BrowserLoginMeta = {
-  id: string;
-  /** `scheme://host[:port]` the credentials are bound to. */
-  origin: string;
-  username: string;
-  /** Click submit/next after filling — off unless the user enabled it. */
-  submit: boolean;
-  rememberMe: boolean;
-};
-
-export type BrowserFillResult = {
-  /** Labels of fields that were filled — never values. */
-  filled: string[];
-  missing: string[];
-  /** A one-time-code field exists on the page and was skipped. */
-  otpRequired: boolean;
-  submitted: boolean;
-};
-
-export function browserLoginsList(origin?: string): Promise<BrowserLoginMeta[]> {
-  return invoke("browser_logins_list", { origin });
-}
-
-export function browserLoginUpdate(
-  id: string,
-  patch: { username?: string; submit?: boolean; rememberMe?: boolean },
-): Promise<BrowserLoginMeta> {
-  return invoke("browser_login_update", { id, ...patch });
-}
-
-export function browserLoginDelete(id: string): Promise<void> {
-  return invoke("browser_login_delete", { id });
-}
-
-/** Read the credentials the user just typed into the page and store them
- * as a login profile for its origin. Values go page → Rust only. */
-export function browserCaptureLogin(label: string): Promise<BrowserLoginMeta> {
-  return invoke("browser_capture_login", { label });
-}
-
-/** Fill a stored login into the current page. With `profileId` omitted the
- * command fills only when exactly one profile matches the page origin. */
-export function browserFillLogin(
-  label: string,
-  profileId?: string,
-): Promise<BrowserFillResult> {
-  return invoke("browser_fill_login", { label, profileId });
-}
-
 /** Swap-flash color — the pane's painted background, so navigation
  * doesn't strobe white on a dark theme. */
 export function browserSetBackground(

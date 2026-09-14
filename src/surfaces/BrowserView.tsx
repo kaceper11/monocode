@@ -22,7 +22,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type Ref,
 } from "react";
-import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, CircleDot, ExternalLink, EyeOff, Globe, KeyRound, ListBullet, Maximize2, Minimize2, MoreHorizontal, Pencil, RefreshCw, Search, Star, Trash2, X } from "../chrome/icons";
+import { Camera, Check, ChevronDown, ChevronLeft, ChevronRight, CircleDot, ExternalLink, EyeOff, Globe, ListBullet, Maximize2, Minimize2, MoreHorizontal, Pencil, RefreshCw, Search, Star, Trash2, X } from "../chrome/icons";
 
 import { MOD } from "../lib/platform";
 
@@ -30,20 +30,15 @@ import {
   BROWSER_COMMAND_EVENT,
   browserAgentContext,
   browserCapture,
-  browserCaptureLogin,
   browserClearData,
   browserClipboardUrl,
   browserClose,
   browserCopyScreenshot,
   browserDevtools,
   browserFavorites,
-  browserFillLogin,
   browserFind,
   browserGoBack,
   browserGoForward,
-  browserLoginDelete,
-  browserLoginUpdate,
-  browserLoginsList,
   browserNavigate,
   browserOpen,
   browserProbe,
@@ -65,7 +60,6 @@ import {
   toggleBrowserFavorite,
   updateBrowserFavorite,
   type BrowserFavorite,
-  type BrowserLoginMeta,
 } from "../lib/browser";
 import { requestAgentContext } from "../lib/agentContext";
 import type {
@@ -211,8 +205,6 @@ export function BrowserView({
     count: number;
     index: number;
   } | null>(null);
-  const [loginsOpen, setLoginsOpen] = useState(false);
-  const [logins, setLogins] = useState<BrowserLoginMeta[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const urlInputRef = useRef<HTMLInputElement>(null);
   const findInputRef = useRef<HTMLInputElement>(null);
@@ -367,58 +359,6 @@ export function BrowserView({
     // Empty query clears page-side highlights and match state.
     void browserFind(label, "").catch(() => undefined);
   }, [label]);
-
-  const refreshLogins = useCallback(() => {
-    const origin = urlOrigin(currentRef.current);
-    if (!origin) {
-      setLogins([]);
-      return;
-    }
-    void browserLoginsList(origin)
-      .then(setLogins)
-      .catch(() => setLogins([]));
-  }, []);
-
-  // The bar tracks the page's origin — a cross-site navigation while it's
-  // open swaps the listed profiles, otherwise Fill would hit the backend's
-  // origin gate with stale entries.
-  useEffect(() => {
-    if (loginsOpen) refreshLogins();
-  }, [loginsOpen, current, refreshLogins]);
-
-  const saveLogin = useCallback(() => {
-    void browserCaptureLogin(label)
-      .then((meta) => {
-        showNotice(`Saved ${meta.username} for ${meta.origin}`);
-        refreshLogins();
-      })
-      .catch(noticeError);
-  }, [label, refreshLogins, showNotice, noticeError]);
-
-  const fillLogin = useCallback(
-    (profileId?: string) => {
-      void browserFillLogin(label, profileId)
-        .then((result) => {
-          if (result.filled.length) {
-            showNotice(
-              `Filled ${result.filled.join(" + ")}${
-                result.submitted
-                  ? " — submitted"
-                  : result.otpRequired
-                    ? " — type the one-time code yourself"
-                    : ""
-              }`,
-            );
-          } else if (result.missing.length) {
-            showNotice(`No ${result.missing.join(" or ")} field on this page`);
-          } else {
-            showNotice("No matching fields on this page");
-          }
-        })
-        .catch(noticeError);
-    },
-    [label, showNotice, noticeError],
-  );
 
   const clearSiteData = useCallback(() => {
     void (async () => {
@@ -1084,14 +1024,6 @@ export function BrowserView({
             <ChevronDown className="size-3.5" strokeWidth={1.75} />
           </ToolbarButton>
           <ToolbarButton
-            title="Logins — save or fill credentials for this site"
-            pressed={loginsOpen}
-            disabled={!opened && !current}
-            onClick={() => setLoginsOpen((open) => !open)}
-          >
-            <KeyRound className="size-3.5" strokeWidth={1.75} />
-          </ToolbarButton>
-          <ToolbarButton
             title="More actions"
             pressed={menuOpen}
             aria-haspopup="menu"
@@ -1146,25 +1078,6 @@ export function BrowserView({
           }}
           onStep={(forward) => runFind(findQueryRef.current, forward)}
           onClose={closeFind}
-        />
-      ) : null}
-      {showChrome && loginsOpen ? (
-        <BrowserLoginsBar
-          origin={urlOrigin(current)}
-          logins={logins}
-          onFill={fillLogin}
-          onSave={saveLogin}
-          onPatch={(id, patch) => {
-            void browserLoginUpdate(id, patch)
-              .then(() => refreshLogins())
-              .catch(noticeError);
-          }}
-          onDelete={(id) => {
-            void browserLoginDelete(id)
-              .then(() => refreshLogins())
-              .catch(noticeError);
-          }}
-          onClose={() => setLoginsOpen(false)}
         />
       ) : null}
       {notice || popup || draftError || download ? (
@@ -1542,125 +1455,6 @@ function BrowserFindBar({
       >
         <X className="size-3" strokeWidth={1.75} />
       </button>
-    </div>
-  );
-}
-
-/**
- * Saved logins for the page's origin — in-flow like the bookmarks bar.
- * Passwords never reach this list: "Save typed login" reads the page's
- * fields straight into the Rust-side secret file; Fill injects them back
- * without the frontend seeing the values.
- */
-function BrowserLoginsBar({
-  origin,
-  logins,
-  onFill,
-  onSave,
-  onPatch,
-  onDelete,
-  onClose,
-}: {
-  origin: string;
-  logins: BrowserLoginMeta[];
-  onFill: (id: string) => void;
-  onSave: () => void;
-  onPatch: (
-    id: string,
-    patch: { submit?: boolean; rememberMe?: boolean },
-  ) => void;
-  onDelete: (id: string) => void;
-  onClose: () => void;
-}) {
-  return (
-    <div
-      role="region"
-      aria-label="Saved logins"
-      className="shrink-0 border-b border-content/10 bg-content/2 px-2 py-1.5"
-    >
-      <div className="flex items-center gap-2">
-        <KeyRound className="size-3.5 shrink-0 text-content/40" strokeWidth={1.75} />
-        <span className="min-w-0 flex-1 truncate text-[11px] font-medium uppercase tracking-wide text-content/40">
-          Logins{origin ? ` · ${origin}` : ""}
-        </span>
-        <button
-          type="button"
-          className="shrink-0 rounded-md bg-content/10 px-2 py-0.5 text-[11.5px] leading-none text-content/75 hover:bg-content/15 hover:text-content"
-          title="Store the credentials you just typed on this page"
-          onClick={onSave}
-        >
-          Save typed login
-        </button>
-        <button
-          type="button"
-          aria-label="Close logins"
-          className="grid size-5 shrink-0 place-items-center rounded text-content/50 hover:bg-content/10 hover:text-content"
-          onClick={onClose}
-        >
-          <X className="size-3" strokeWidth={1.75} />
-        </button>
-      </div>
-      {logins.length ? (
-        <div className="mt-1 flex flex-col gap-0.5">
-          {logins.map((login) => (
-            <div key={login.id} className="flex items-center gap-1.5">
-              <span
-                className="min-w-0 flex-1 truncate text-[11.5px] text-content/75"
-                title={login.username}
-              >
-                {login.username}
-              </span>
-              <label
-                className="flex shrink-0 cursor-pointer items-center gap-1 text-[11px] text-content/55"
-                title="Click the form's submit/next control after filling"
-              >
-                <input
-                  type="checkbox"
-                  checked={login.submit}
-                  onChange={() => onPatch(login.id, { submit: !login.submit })}
-                  className="size-3 accent-current"
-                />
-                Submit
-              </label>
-              <label
-                className="flex shrink-0 cursor-pointer items-center gap-1 text-[11px] text-content/55"
-                title="Tick a “remember me” checkbox when the page has one"
-              >
-                <input
-                  type="checkbox"
-                  checked={login.rememberMe}
-                  onChange={() =>
-                    onPatch(login.id, { rememberMe: !login.rememberMe })
-                  }
-                  className="size-3 accent-current"
-                />
-                Remember
-              </label>
-              <button
-                type="button"
-                className="shrink-0 rounded-md bg-content/10 px-2 py-0.5 text-[11.5px] leading-none text-content/75 hover:bg-content/15 hover:text-content"
-                onClick={() => onFill(login.id)}
-              >
-                Fill
-              </button>
-              <button
-                type="button"
-                aria-label="Delete login"
-                title="Delete login"
-                className="grid size-5 shrink-0 place-items-center rounded text-content/40 hover:bg-content/10 hover:text-content"
-                onClick={() => onDelete(login.id)}
-              >
-                <Trash2 className="size-3" strokeWidth={1.75} />
-              </button>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <p className="mt-1 text-[11.5px] text-content/40">
-          No saved logins for this site — type them into the page, then “Save
-          typed login”.
-        </p>
-      )}
     </div>
   );
 }
