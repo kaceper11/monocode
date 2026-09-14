@@ -15,6 +15,34 @@ import type { Attachment } from "./session";
 export const OPEN_BROWSER_EVENT = "monocode:open-browser";
 export const LINK_CHOICE_EVENT = "monocode:link-choice";
 
+/** App-level routing → the BrowserView owning `label`. Menu accelerators
+ * reach the window even while the native webview holds focus, so commands
+ * travel over a DOM event that only the addressed tab acts on. */
+export const BROWSER_COMMAND_EVENT = "monocode:browser-command";
+
+export type BrowserCommand =
+  | "reload"
+  | "focus-url"
+  | "find"
+  | "zoom-in"
+  | "zoom-out"
+  | "zoom-reset"
+  | "devtools";
+
+export function requestBrowserCommand(label: string, command: BrowserCommand) {
+  window.dispatchEvent(
+    new CustomEvent(BROWSER_COMMAND_EVENT, { detail: { label, command } }),
+  );
+}
+
+export function isBrowserCommandRequest(
+  event: Event,
+): event is CustomEvent<{ label: string; command: BrowserCommand }> {
+  if (!(event instanceof CustomEvent)) return false;
+  const detail = event.detail as { label?: string; command?: string } | null;
+  return !!detail && typeof detail.label === "string" && !!detail.command;
+}
+
 const BROWSER_EVENT_NAME = "monocode:browser";
 const MAX_URL_LENGTH = 8192;
 const REMEMBERED_KEY = "monocode.browserUrls";
@@ -350,8 +378,9 @@ export function browserOpen(
   url: string,
   bounds: BrowserBounds,
   background?: [number, number, number, number],
+  persist?: boolean,
 ): Promise<void> {
-  return invoke("browser_open", { label, url, bounds, background });
+  return invoke("browser_open", { label, url, bounds, background, persist });
 }
 
 export function browserClose(label: string): Promise<void> {
@@ -386,6 +415,91 @@ export function browserSetVisible(
   visible: boolean,
 ): Promise<void> {
   return invoke("browser_set_visible", { label, visible });
+}
+
+/** Page zoom factor — resolves the clamped value actually applied. */
+export function browserSetZoom(label: string, scale: number): Promise<number> {
+  return invoke("browser_set_zoom", { label, scale });
+}
+
+/** Toggle the page inspector; resolves whether it is open afterwards. */
+export function browserDevtools(label: string, open?: boolean): Promise<boolean> {
+  return invoke("browser_devtools", { label, open });
+}
+
+/** Wipe the persistent browser profile's site data (cookies, storage). */
+export function browserClearData(label: string): Promise<void> {
+  return invoke("browser_clear_data", { label });
+}
+
+/** PNG screenshot of the visible page → system clipboard. */
+export function browserCopyScreenshot(label: string): Promise<void> {
+  return invoke("browser_copy_screenshot", { label });
+}
+
+export type BrowserFindResult = {
+  count: number;
+  /** 0-based current match, -1 when nothing matched. */
+  index: number;
+};
+
+export function browserFind(
+  label: string,
+  query: string,
+  forward?: boolean,
+): Promise<BrowserFindResult> {
+  return invoke("browser_find", { label, query, forward });
+}
+
+// --- Saved dev logins — metadata only; passwords never reach the frontend ---
+
+export type BrowserLoginMeta = {
+  id: string;
+  /** `scheme://host[:port]` the credentials are bound to. */
+  origin: string;
+  username: string;
+  /** Click submit/next after filling — off unless the user enabled it. */
+  submit: boolean;
+  rememberMe: boolean;
+};
+
+export type BrowserFillResult = {
+  /** Labels of fields that were filled — never values. */
+  filled: string[];
+  missing: string[];
+  /** A one-time-code field exists on the page and was skipped. */
+  otpRequired: boolean;
+  submitted: boolean;
+};
+
+export function browserLoginsList(origin?: string): Promise<BrowserLoginMeta[]> {
+  return invoke("browser_logins_list", { origin });
+}
+
+export function browserLoginUpdate(
+  id: string,
+  patch: { username?: string; submit?: boolean; rememberMe?: boolean },
+): Promise<BrowserLoginMeta> {
+  return invoke("browser_login_update", { id, ...patch });
+}
+
+export function browserLoginDelete(id: string): Promise<void> {
+  return invoke("browser_login_delete", { id });
+}
+
+/** Read the credentials the user just typed into the page and store them
+ * as a login profile for its origin. Values go page → Rust only. */
+export function browserCaptureLogin(label: string): Promise<BrowserLoginMeta> {
+  return invoke("browser_capture_login", { label });
+}
+
+/** Fill a stored login into the current page. With `profileId` omitted the
+ * command fills only when exactly one profile matches the page origin. */
+export function browserFillLogin(
+  label: string,
+  profileId?: string,
+): Promise<BrowserFillResult> {
+  return invoke("browser_fill_login", { label, profileId });
 }
 
 /** Swap-flash color — the pane's painted background, so navigation

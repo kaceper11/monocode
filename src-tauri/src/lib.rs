@@ -8,6 +8,7 @@ mod azure_inbox;
 mod azure_pipelines;
 mod azure_repos;
 mod browser;
+mod browser_logins;
 mod chat_background;
 mod checkout;
 mod checkpoint;
@@ -251,6 +252,16 @@ pub fn run() {
             browser::browser_probe,
             browser::browser_set_recording,
             browser::browser_capture,
+            browser::browser_set_zoom,
+            browser::browser_devtools,
+            browser::browser_clear_data,
+            browser::browser_copy_screenshot,
+            browser::browser_find,
+            browser::browser_logins_list,
+            browser::browser_login_update,
+            browser::browser_login_delete,
+            browser::browser_capture_login,
+            browser::browser_fill_login,
             fs::list_dir,
             fs::list_project_files,
             fs::git_diff_stats,

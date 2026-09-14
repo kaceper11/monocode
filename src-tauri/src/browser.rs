@@ -18,6 +18,8 @@ use tauri::{
     Window,
 };
 
+use crate::browser_logins;
+
 pub const EVENT: &str = "monocode:browser";
 const MAX_HISTORY: usize = 64;
 const MAX_URL_LEN: usize = 8192;
@@ -461,6 +463,9 @@ const SUMMARY_SCRIPT: &str = r#"(() => {
 pub struct BrowserState {
     history: Mutex<HashMap<String, History>>,
     hooked: Mutex<HashSet<String>>,
+    /// History keys whose webview owns a dedicated persistent data store —
+    /// only those may be cleared without touching the app shell's store.
+    dedicated: Mutex<HashSet<String>>,
 }
 
 struct History {
@@ -610,6 +615,43 @@ fn app_origin<R: Runtime>(window: &Window<R>) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+/// Identifies the dedicated WKWebsiteDataStore holding persisted browser
+/// tabs — exactly 16 bytes ("monocode-browser").
+#[cfg(target_os = "macos")]
+const BROWSER_STORE_ID: [u8; 16] = *b"monocode-browser";
+
+/// `data_store_identifier` needs macOS 14; below it a persisted tab falls
+/// back to the default (shared) data store, which still persists but must
+/// never be cleared from here — it holds the app's own storage too.
+#[cfg(target_os = "macos")]
+fn dedicated_store_supported() -> bool {
+    use objc2_foundation::NSProcessInfo;
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        NSProcessInfo::processInfo()
+            .operatingSystemVersion()
+            .majorVersion
+            >= 14
+    })
+}
+
+/// Run an eval whose JSON return value is needed. Async like
+/// `browser_probe`: the completion callback arrives on the main thread, so
+/// blocking inside a synchronous command deadlocks on Windows.
+async fn eval_json<R: Runtime>(view: &tauri::Webview<R>, script: String) -> Result<String, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    view.eval_with_callback(script, move |result| {
+        let _ = tx.send(result);
+    })
+    .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        rx.recv_timeout(PROBE_TIMEOUT)
+            .map_err(|_| "The page didn't answer".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn find_webview<R: Runtime>(window: &Window<R>, label: &str) -> Result<tauri::Webview<R>, String> {
     // The window's own shell webview shares this namespace — a bad label
     // must never resolve to it (browser_close would destroy the app UI).
@@ -645,6 +687,11 @@ fn hook_window_close<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
             .lock()
             .unwrap()
             .retain(|entry, _| !entry.starts_with(&prefix));
+        state
+            .dedicated
+            .lock()
+            .unwrap()
+            .retain(|entry| !entry.starts_with(&prefix));
         state.hooked.lock().unwrap().remove(&key);
     });
 }
@@ -669,6 +716,7 @@ pub async fn browser_open(
     url: String,
     bounds: BrowserBounds,
     background: Option<Color>,
+    persist: Option<bool>,
 ) -> Result<(), String> {
     if !valid_label(&label) {
         return Err("Invalid browser label".into());
@@ -679,6 +727,8 @@ pub async fn browser_open(
 
     let window_label = window.label().to_string();
     let key = history_key(&window_label, &label);
+    let persist = persist.unwrap_or(true);
+
     // Idempotent open: a stale webview under the same label is replaced.
     if let Ok(existing) = find_webview(&window, &label) {
         let _ = existing.close();
@@ -708,9 +758,15 @@ pub async fn browser_open(
     let download_window = window_label.clone();
     let download_label = label.clone();
 
-    let builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed.clone()))
-        .incognito(true)
-        .devtools(false)
+    let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed.clone()))
+        // Persisted tabs keep cookies/site data in the browser profile so
+        // dev logins survive webview recreation and app restarts; a tab
+        // marked private stays on the throwaway store.
+        .incognito(!persist)
+        .devtools(true)
+        // WebView2-only: Ctrl+wheel/+- zoom inside the page — the app
+        // keydown handler can't see keys while the native view has focus.
+        .zoom_hotkeys_enabled(true)
         .focused(false)
         // The pane's own background — WKWebView paints it during the
         // process swap on every cross-site navigation, so matching the
@@ -845,6 +901,40 @@ pub async fn browser_open(
             false
         });
 
+    // A persisted tab needs its own data store, not the app shell's:
+    // WebView2/WebKitGTK take a data directory; WKWebView takes a named
+    // store (macOS 14+). On older macOS the tab still persists — via the
+    // default store — but `browser_clear_data` stays unavailable because
+    // that store also holds the app's own localStorage.
+    #[cfg(not(target_os = "macos"))]
+    let dedicated = persist;
+    #[cfg(not(target_os = "macos"))]
+    if persist {
+        if let Ok(dir) = app
+            .path()
+            .app_local_data_dir()
+            .map(|dir| dir.join("browser"))
+        {
+            let _ = std::fs::create_dir_all(&dir);
+            builder = builder.data_directory(dir);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let dedicated = persist && dedicated_store_supported();
+    #[cfg(target_os = "macos")]
+    if dedicated {
+        builder = builder.data_store_identifier(BROWSER_STORE_ID);
+    }
+    {
+        let state = app.state::<BrowserState>();
+        let mut dedicated_keys = state.dedicated.lock().unwrap();
+        if dedicated {
+            dedicated_keys.insert(key.clone());
+        } else {
+            dedicated_keys.remove(&key);
+        }
+    }
+
     hook_window_close(&app, &window);
     window
         .add_child(
@@ -862,11 +952,9 @@ pub fn browser_close(window: Window, app: AppHandle, label: String) -> Result<()
         let _ = view.close();
     }
     let state = app.state::<BrowserState>();
-    state
-        .history
-        .lock()
-        .unwrap()
-        .remove(&history_key(window.label(), &label));
+    let key = history_key(window.label(), &label);
+    state.history.lock().unwrap().remove(&key);
+    state.dedicated.lock().unwrap().remove(&key);
     Ok(())
 }
 
@@ -1364,5 +1452,523 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
         headings,
         screenshot: screenshot_b64,
         detail,
+    })
+}
+
+// --- Login fill / capture (#browser-fill) ---
+//
+// One script does both jobs: `mode: "capture"` reads the page's login
+// fields back (the values travel only as far as the Rust command — never
+// the frontend); `mode: "fill"` writes a stored profile into them.
+// Discovery walks the document, open shadow roots and same-origin
+// iframes; values go in through the native setter + input/change events
+// so framework-controlled inputs register them. OTP fields are detected
+// and reported but never filled — a one-time code is for the user to
+// type. Nothing is submitted unless the profile opts in.
+const LOGIN_FORM_SCRIPT: &str = r#"(arg) => {
+  const CAP = 400;
+  const fields = [];
+  const buttons = [];
+  const ID_RE = /user|e.?mail|log.?in|account|identifier|handle|phone|sign.?in/i;
+  const REMEMBER_RE = /remember|stay|keep.?me|trust|signed/i;
+  const OTP_RE = /otp|one.?time|2fa|mfa|totp|verif|passcode|security.?code/i;
+  const NEXT_RE = /^(next|continue|sign ?in|log ?in|submit|proceed|verify|go)$/i;
+
+  const visible = (el) => {
+    try {
+      if (el.disabled || el.readOnly) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    } catch (e) {
+      return false;
+    }
+  };
+  const label = (el) => {
+    try {
+      const tag = (el.tagName || "").toLowerCase();
+      const type = ((el.getAttribute && el.getAttribute("type")) || "").toLowerCase();
+      let text =
+        el.getAttribute("aria-label") ||
+        el.getAttribute("placeholder") ||
+        el.getAttribute("name") ||
+        el.getAttribute("title") ||
+        (tag === "input" && (type === "button" || type === "submit") ? el.value : "") ||
+        (tag === "button" ? (el.innerText || "").trim() : "") ||
+        el.id || "";
+      text = String(text).trim().replace(/\s+/g, " ").slice(0, 80);
+      const name = tag === "input" && type && type !== "text" ? "input[" + type + "]" : tag;
+      return text ? name + ' "' + text + '"' : name;
+    } catch (e) {
+      return "field";
+    }
+  };
+  const classify = (el) => {
+    const tag = (el.tagName || "").toLowerCase();
+    if (tag !== "input" && tag !== "textarea") return null;
+    const type = (((el.getAttribute && el.getAttribute("type")) || el.type || "") + "").toLowerCase();
+    const ac = ((el.getAttribute("autocomplete") || "") + "").toLowerCase();
+    const hint = [
+      el.getAttribute("name") || "",
+      el.id || "",
+      el.getAttribute("placeholder") || "",
+      el.getAttribute("aria-label") || "",
+      ac,
+    ].join(" ");
+    if (type === "password" || ac === "current-password" || ac === "new-password")
+      return "password";
+    if (ac === "one-time-code" || (type !== "password" && OTP_RE.test(hint)))
+      return "otp";
+    if (type === "checkbox") return REMEMBER_RE.test(hint) ? "remember" : null;
+    if (ac === "username" || ac === "email") return "identity";
+    if (type === "email" || type === "tel") return "identity";
+    if ((type === "text" || type === "" || type === "username" || tag === "textarea") && ID_RE.test(hint))
+      return "identity";
+    return null;
+  };
+  const clickable = (el) => {
+    const tag = (el.tagName || "").toLowerCase();
+    const type = ((el.getAttribute("type") || "") + "").toLowerCase();
+    if (tag === "input") return type === "submit" || type === "button" || type === "image";
+    if (tag === "button") return true;
+    return (el.getAttribute("role") || "") === "button";
+  };
+  const btnText = (el) =>
+    String(
+      (el.innerText || el.value || el.getAttribute("aria-label") || "") + "",
+    ).trim().replace(/\s+/g, " ");
+
+  const walk = (root, depth) => {
+    if (depth > 5 || fields.length + buttons.length > CAP) return;
+    let els;
+    try {
+      els = root.querySelectorAll("input,textarea,select,button,[role='button'],iframe");
+    } catch (e) {
+      return;
+    }
+    for (const el of els) {
+      if (fields.length + buttons.length > CAP) break;
+      try {
+        if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+        if ((el.tagName || "").toLowerCase() === "iframe") {
+          try {
+            if (el.contentDocument) walk(el.contentDocument, depth + 1);
+          } catch (e) {}
+          continue;
+        }
+        if (!visible(el)) continue;
+        const kind = classify(el);
+        if (kind) {
+          fields.push({ el, kind });
+          continue;
+        }
+        if (clickable(el)) buttons.push(el);
+      } catch (e) {}
+    }
+  };
+  walk(document, 0);
+
+  const identity = fields.find((f) => f.kind === "identity");
+  const password = fields.find((f) => f.kind === "password");
+  const otp = fields.some((f) => f.kind === "otp");
+
+  if ((arg && arg.mode) === "capture") {
+    return {
+      identity: identity ? String(identity.el.value || "") : "",
+      password: password ? String(password.el.value || "") : "",
+      otp,
+    };
+  }
+
+  const result = { filled: [], missing: [], otpRequired: otp, submitted: false };
+  const setVal = (el, v) => {
+    try {
+      const proto =
+        el instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : el instanceof HTMLSelectElement
+            ? HTMLSelectElement.prototype
+            : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, "value");
+      if (desc && desc.set) desc.set.call(el, v);
+      else el.value = v;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (e) {}
+  };
+  if (!identity) result.missing.push("username");
+  if (!password) result.missing.push("password");
+  if (identity && arg.username) {
+    setVal(identity.el, arg.username);
+    result.filled.push(label(identity.el));
+  }
+  if (password && arg.password) {
+    setVal(password.el, arg.password);
+    result.filled.push(label(password.el));
+  }
+  if (arg.rememberMe) {
+    const remember = fields.find((f) => f.kind === "remember");
+    if (remember) {
+      try {
+        if (!remember.el.checked) remember.el.click();
+        result.filled.push(label(remember.el));
+      } catch (e) {}
+    }
+  }
+  // Auto-submit is opt-in per profile: a completed password field may
+  // submit the form; an identity-only fill clicks a "next"-style control
+  // so multi-step flows advance without trusting a guess.
+  if (arg.submit && result.filled.length) {
+    try {
+      const anchor = (password || identity).el;
+      const form = anchor && anchor.closest ? anchor.closest("form") : null;
+      let target = null;
+      if (form) {
+        const candidates = Array.from(
+          form.querySelectorAll("[type='submit'],button:not([type])"),
+        ).filter(visible);
+        target = candidates[0] || null;
+      }
+      if (!target && password && arg.password) {
+        target = buttons.find((b) => NEXT_RE.test(btnText(b))) || null;
+      }
+      if (!target && !password) {
+        target = buttons.find((b) => NEXT_RE.test(btnText(b))) || null;
+      }
+      if (target) {
+        target.click();
+        result.submitted = true;
+      }
+    } catch (e) {}
+  }
+  return result;
+}"#;
+
+/// Page-local find: text-node walk + CSS Custom Highlight painting +
+/// scroll-into-view. State lives on `window.__monocodeFind` so repeated
+/// calls step through matches; an empty query clears it.
+const FIND_SCRIPT: &str = r#"(arg) => {
+  const q = String((arg && arg.query) || "").slice(0, 200);
+  const NS = "monocode-find";
+  const state = (window.__monocodeFind = window.__monocodeFind || {
+    query: "",
+    index: -1,
+  });
+  const clear = () => {
+    try {
+      if (window.CSS && CSS.highlights) {
+        CSS.highlights.delete(NS);
+        CSS.highlights.delete(NS + "-current");
+      }
+    } catch (e) {}
+  };
+  if (!q) {
+    clear();
+    state.query = "";
+    state.index = -1;
+    return { count: 0, index: -1 };
+  }
+  const matches = [];
+  try {
+    const lower = q.toLowerCase();
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT,
+    );
+    let node;
+    while ((node = walker.nextNode())) {
+      if (matches.length >= 200) break;
+      const parent = node.parentElement;
+      if (!parent || parent.closest("script,style,noscript,iframe")) continue;
+      const text = node.nodeValue || "";
+      const hay = text.toLowerCase();
+      let i = hay.indexOf(lower);
+      while (i >= 0) {
+        const range = document.createRange();
+        range.setStart(node, i);
+        range.setEnd(node, i + q.length);
+        matches.push(range);
+        if (matches.length >= 200) break;
+        i = hay.indexOf(lower, i + q.length);
+      }
+    }
+  } catch (e) {}
+  if (window.CSS && CSS.highlights) {
+    try {
+      if (!document.getElementById("monocode-find-style")) {
+        const style = document.createElement("style");
+        style.id = "monocode-find-style";
+        style.textContent =
+          "::highlight(" + NS + ") { background-color: rgba(255,200,0,0.35); color: inherit; }" +
+          "::highlight(" + NS + "-current) { background-color: rgba(255,150,0,0.7); color: inherit; }";
+        (document.head || document.documentElement).appendChild(style);
+      }
+      CSS.highlights.set(NS, new Highlight(...matches));
+    } catch (e) {}
+  }
+  if (state.query !== q) {
+    state.query = q;
+    state.index = matches.length ? 0 : -1;
+  } else if (matches.length) {
+    const d = arg && arg.forward === false ? -1 : 1;
+    state.index = (state.index + d + matches.length) % matches.length;
+  } else {
+    state.index = -1;
+  }
+  if (state.index >= 0) {
+    try {
+      if (window.CSS && CSS.highlights)
+        CSS.highlights.set(NS + "-current", new Highlight(matches[state.index]));
+      const el = matches[state.index].startContainer.parentElement;
+      if (el) el.scrollIntoView({ block: "center" });
+    } catch (e) {}
+  }
+  return { count: matches.length, index: state.index };
+}"#;
+
+#[tauri::command]
+pub fn browser_set_zoom(window: Window, label: String, scale: f64) -> Result<f64, String> {
+    let zoom = if scale.is_finite() {
+        scale.clamp(0.25, 5.0)
+    } else {
+        1.0
+    };
+    find_webview(&window, &label)?
+        .set_zoom(zoom)
+        .map_err(|error| error.to_string())?;
+    Ok(zoom)
+}
+
+/// Toggle (or set) the page inspector. In release builds this needs the
+/// `devtools` cargo feature — enabled in Cargo.toml.
+#[tauri::command]
+pub fn browser_devtools(window: Window, label: String, open: Option<bool>) -> Result<bool, String> {
+    let view = find_webview(&window, &label)?;
+    let next = match open {
+        Some(open) => open,
+        None => !view.is_devtools_open(),
+    };
+    if next {
+        view.open_devtools();
+    } else {
+        view.close_devtools();
+    }
+    Ok(view.is_devtools_open())
+}
+
+/// Clear the browser profile's site data (cookies, storage). Only a tab
+/// backed by the dedicated store may clear it — on older macOS persistent
+/// tabs share the app shell's default data store, and clearing that would
+/// wipe app settings too.
+#[tauri::command]
+pub fn browser_clear_data(window: Window, app: AppHandle, label: String) -> Result<(), String> {
+    let key = history_key(window.label(), &label);
+    let dedicated = app
+        .state::<BrowserState>()
+        .dedicated
+        .lock()
+        .unwrap()
+        .contains(&key);
+    if !dedicated {
+        return Err("Only a persistent browser tab has its own data to clear".into());
+    }
+    find_webview(&window, &label)?
+        .clear_all_browsing_data()
+        .map_err(|error| error.to_string())
+}
+
+/// Copy a screenshot of the visible page to the system clipboard. Same
+/// platform capture as `browser_capture`, minus the DOM summary.
+#[tauri::command]
+pub async fn browser_copy_screenshot(
+    window: Window,
+    app: AppHandle,
+    label: String,
+) -> Result<(), String> {
+    let view = find_webview(&window, &label)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    start_screenshot(&view, tx)?;
+    let png = tauri::async_runtime::spawn_blocking(move || {
+        rx.recv_timeout(CAPTURE_TIMEOUT).ok().flatten()
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "Screenshot unavailable".to_string())?;
+    let image = tauri::image::Image::from_bytes(&png).map_err(|error| error.to_string())?;
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    app.clipboard()
+        .write_image(&image)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserFindResult {
+    count: usize,
+    index: i32,
+}
+
+/// Text search inside the page — highlight via the CSS Custom Highlight
+/// API when present, scroll-into-view always. `forward: false` steps back.
+#[tauri::command]
+pub async fn browser_find(
+    window: Window,
+    label: String,
+    query: String,
+    forward: Option<bool>,
+) -> Result<BrowserFindResult, String> {
+    let view = find_webview(&window, &label)?;
+    let arg = serde_json::json!({
+        "query": query.chars().take(200).collect::<String>(),
+        "forward": forward.unwrap_or(true),
+    });
+    let raw = eval_json(&view, format!("({FIND_SCRIPT})({arg})")).await?;
+    #[derive(Deserialize)]
+    struct PageFind {
+        count: Option<usize>,
+        index: Option<i32>,
+    }
+    let parsed: PageFind = serde_json::from_str(&raw).unwrap_or(PageFind {
+        count: None,
+        index: None,
+    });
+    Ok(BrowserFindResult {
+        count: parsed.count.unwrap_or(0).min(200),
+        index: parsed.index.unwrap_or(-1),
+    })
+}
+
+// --- Saved login profiles ---
+
+#[tauri::command]
+pub fn browser_logins_list(
+    app: AppHandle,
+    origin: Option<String>,
+) -> Result<Vec<browser_logins::LoginMeta>, String> {
+    Ok(browser_logins::list(&app, origin.as_deref()))
+}
+
+#[tauri::command]
+pub fn browser_login_update(
+    app: AppHandle,
+    id: String,
+    username: Option<String>,
+    submit: Option<bool>,
+    remember_me: Option<bool>,
+) -> Result<browser_logins::LoginMeta, String> {
+    browser_logins::update(&app, &id, username, submit, remember_me)
+}
+
+#[tauri::command]
+pub fn browser_login_delete(app: AppHandle, id: String) -> Result<(), String> {
+    browser_logins::delete(&app, &id)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CapturedLogin {
+    identity: Option<String>,
+    password: Option<String>,
+}
+
+/// Read the credentials the user just typed on this page and save them as
+/// a profile for the page's origin. The values cross page → Rust only.
+#[tauri::command]
+pub async fn browser_capture_login(
+    window: Window,
+    app: AppHandle,
+    label: String,
+) -> Result<browser_logins::LoginMeta, String> {
+    let view = find_webview(&window, &label)?;
+    let url = view.url().map_err(|error| error.to_string())?;
+    let origin = browser_logins::normalize_origin(url.as_str())?;
+    let raw = eval_json(
+        &view,
+        format!("({LOGIN_FORM_SCRIPT})({{\"mode\":\"capture\"}})"),
+    )
+    .await?;
+    let captured: CapturedLogin =
+        serde_json::from_str(&raw).map_err(|_| "Couldn't read the login form".to_string())?;
+    browser_logins::upsert_credentials(
+        &app,
+        &origin,
+        &captured.identity.unwrap_or_default(),
+        &captured.password.unwrap_or_default(),
+    )
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserFillResult {
+    filled: Vec<String>,
+    missing: Vec<String>,
+    otp_required: bool,
+    submitted: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageFillResult {
+    filled: Option<Vec<serde_json::Value>>,
+    missing: Option<Vec<serde_json::Value>>,
+    otp_required: Option<bool>,
+    submitted: Option<bool>,
+}
+
+/// Fill a saved login into the current page. The page's live origin must
+/// match the profile's — a redirect can never steer credentials into a
+/// different site. The password reaches only the eval script, never the
+/// frontend.
+#[tauri::command]
+pub async fn browser_fill_login(
+    window: Window,
+    app: AppHandle,
+    label: String,
+    profile_id: Option<String>,
+) -> Result<BrowserFillResult, String> {
+    let view = find_webview(&window, &label)?;
+    let url = view.url().map_err(|error| error.to_string())?;
+    let origin = browser_logins::normalize_origin(url.as_str())?;
+    let profile = match profile_id {
+        Some(id) => browser_logins::get(&app, &id)
+            .ok_or_else(|| "That login no longer exists".to_string())?,
+        None => match browser_logins::for_origin(&app, &origin).as_slice() {
+            [] => return Err("No saved login for this site".into()),
+            [only] => only.clone(),
+            _ => return Err("Pick a login to fill".into()),
+        },
+    };
+    if origin != profile.origin {
+        return Err("That login belongs to a different site".into());
+    }
+    let arg = serde_json::json!({
+        "mode": "fill",
+        "username": profile.username,
+        "password": profile.password,
+        "submit": profile.submit,
+        "rememberMe": profile.remember_me,
+    });
+    // serde_json output is a valid JS object literal; U+2028/2029 are the
+    // only JSON-legal characters that break older JS string parsing.
+    let arg = serde_json::to_string(&arg)
+        .map_err(|error| error.to_string())?
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
+    let raw = eval_json(&view, format!("({LOGIN_FORM_SCRIPT})({arg})")).await?;
+    let parsed: PageFillResult =
+        serde_json::from_str(&raw).map_err(|_| "Fill didn't report".to_string())?;
+    let strings = |values: Option<Vec<serde_json::Value>>| -> Vec<String> {
+        values
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .take(20)
+            .map(|value| clip_chars(&value, 120))
+            .collect()
+    };
+    Ok(BrowserFillResult {
+        filled: strings(parsed.filled),
+        missing: strings(parsed.missing),
+        otp_required: parsed.otp_required.unwrap_or(false),
+        submitted: parsed.submitted.unwrap_or(false),
     })
 }

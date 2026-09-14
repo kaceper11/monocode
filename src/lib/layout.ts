@@ -84,6 +84,11 @@ export type BrowserTabSource = {
   title?: string;
   /** Leaf expands to cover the whole pane area; other leaves stay mounted. */
   expanded?: boolean;
+  /** Page zoom factor; absent means 1. */
+  zoom?: number;
+  /** Keep cookies/site data across restarts — the default. `false` marks a
+   * private tab on the throwaway data store. */
+  persist?: boolean;
 };
 
 export type FilePaneTab = {
@@ -247,12 +252,16 @@ export function newTerminalFile(cwd: string, title?: string): FilePaneTab {
   };
 }
 
-export function newBrowserTab(cwd: string, url: string): FilePaneTab {
+export function newBrowserTab(
+  cwd: string,
+  url: string,
+  persist = true,
+): FilePaneTab {
   return {
     id: crypto.randomUUID(),
     path: url,
     cwd,
-    browser: { url },
+    browser: { url, ...(persist ? {} : { persist: false }) },
   };
 }
 
@@ -260,6 +269,8 @@ export type BrowserMetaPatch = {
   url?: string;
   title?: string;
   expanded?: boolean;
+  zoom?: number;
+  persist?: boolean;
 };
 
 /** Page-side state the webview reports back; keeps tab + snapshot current. */
@@ -277,10 +288,19 @@ export function updateBrowserTab(
       const title =
         patch.title !== undefined ? patch.title.trim() : file.browser.title;
       const expanded = patch.expanded ?? file.browser.expanded;
+      const zoom =
+        patch.zoom !== undefined
+          ? patch.zoom > 0 && patch.zoom !== 1
+            ? patch.zoom
+            : undefined
+          : file.browser.zoom;
+      const persist = patch.persist ?? file.browser.persist;
       if (
         (!url || url === file.browser.url) &&
         title === file.browser.title &&
-        expanded === file.browser.expanded
+        expanded === file.browser.expanded &&
+        zoom === file.browser.zoom &&
+        persist === file.browser.persist
       )
         return file;
       paneChanged = true;
@@ -288,6 +308,8 @@ export function updateBrowserTab(
         url: url ?? file.browser.url,
         ...(title ? { title } : {}),
         ...(expanded ? { expanded: true } : {}),
+        ...(zoom ? { zoom } : {}),
+        ...(persist !== undefined ? { persist } : {}),
       };
       return { ...file, ...(url ? { path: url } : {}), browser };
     });
