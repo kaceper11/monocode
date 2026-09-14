@@ -30,10 +30,7 @@ import {
   listCodexModels,
 } from "./codexCatalog";
 import { codexQuestions, codexQuestionResponse } from "./codexQuestions";
-import {
-  codexMcpConfirmation,
-  isCodexComputerUseAccessConfirmation,
-} from "./codexElicitation";
+import { codexMcpConfirmation } from "./codexElicitation";
 import { joinStreamText, snapshotRemainder } from "./streamText";
 import { acquireSharedStart } from "./liveStart";
 import { markTurn } from "../turnTiming";
@@ -52,8 +49,6 @@ type PendingApproval = {
   rpcId: JsonRpcId;
   threadId: string;
   kind: CodexApprovalKind;
-  /** Consent that must carry the user's decision even under full-access. */
-  mustPrompt?: boolean;
   resolve: (decision: ApprovalOutcome) => void;
 };
 
@@ -217,7 +212,6 @@ export function setCodexRuntimeMode(
   if (!live || live.runtimeMode === runtimeMode) return;
   live.runtimeMode = runtimeMode;
   for (const [uiId, pending] of live.approvals) {
-    if (pending.mustPrompt) continue;
     const decision = autoApproval(runtimeMode, pending.kind);
     if (!decision) continue;
     live.approvals.delete(uiId);
@@ -1062,11 +1056,18 @@ async function handleServerRequest(
       });
       return;
     }
-    if (
-      !live.planning &&
-      live.runtimeMode === "full-access" &&
-      isCodexComputerUseAccessConfirmation(params)
-    ) {
+    if (live.planning) {
+      // Plan turns surface no prompts — decline like the other approval paths.
+      await live.rpc.respond(id, {
+        action: "decline",
+        content: null,
+        _meta: null,
+      });
+      return;
+    }
+    if (live.runtimeMode === "full-access") {
+      // Full access covers MCP consent the same way the CLI's own bypass
+      // modes do — elicitation requests are accepted without a prompt.
       await live.rpc.respond(id, {
         action: "accept",
         content: confirmation.content,
@@ -1075,12 +1076,11 @@ async function handleServerRequest(
       return;
     }
     const uiId = live.nextApprovalUiId++;
-    const pending = waitApproval(live, uiId, id, "permissions", threadId, true);
-    // Other MCP consent must carry the user's decision, including in Full Access.
+    const pending = waitApproval(live, uiId, id, "permissions", threadId);
     live.onEvent({
       type: "approval.requested",
       requestId: uiId,
-      kind: "other",
+      kind: "mcp",
       title: confirmation.title,
     });
     const decision = await pending;
@@ -1194,10 +1194,9 @@ function waitApproval(
   rpcId: JsonRpcId,
   kind: CodexApprovalKind,
   threadId: string,
-  mustPrompt = false,
 ): Promise<ApprovalOutcome> {
   return new Promise<ApprovalOutcome>((resolve) => {
-    live.approvals.set(uiId, { rpcId, threadId, kind, mustPrompt, resolve });
+    live.approvals.set(uiId, { rpcId, threadId, kind, resolve });
   }).finally(() => {
     live.approvals.delete(uiId);
   });

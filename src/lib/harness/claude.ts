@@ -89,7 +89,6 @@ type ApprovalOutcome = ApprovalDecision | "cancelled";
 type PendingApproval = {
   requestId: string;
   kind: string;
-  input: Record<string, unknown>;
   resolve: (decision: ApprovalOutcome) => void;
 };
 
@@ -509,6 +508,17 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     (code) => {
       liveByThread.delete(input.sessionId);
       const current = liveRef.current;
+      if (current) {
+        // Exit settles parked asks so the provider request and the UI card
+        // both close. "cancelled" skips the control response — the child is
+        // dead and a write would only surface a spurious transport error.
+        for (const [, pending] of current.approvals)
+          pending.resolve("cancelled");
+        current.approvals.clear();
+        for (const [, pending] of current.questions)
+          pending.resolve("cancelled");
+        current.questions.clear();
+      }
       if (!current?.muteUpdates) {
         (current?.onEvent ?? input.onEvent)({ type: "session.ended", code });
       }
@@ -972,6 +982,9 @@ async function handleControlRequest(
     return;
   }
 
+  // Full access auto-allows anything that still reaches can_use_tool — under
+  // bypassPermissions the CLI skips it entirely, so this only matters when a
+  // mode change left a session in an ask-capable state.
   if (live.runtimeMode === "full-access") {
     await writeJson(
       sessionId,
@@ -988,7 +1001,6 @@ async function handleControlRequest(
     live,
     uiId,
     control.requestId,
-    input,
     toolKindFromName(toolName),
   );
   live.onEvent({
@@ -1037,11 +1049,10 @@ function waitApproval(
   live: Live,
   uiId: number,
   requestId: string,
-  input: Record<string, unknown>,
   kind: string,
 ): Promise<ApprovalOutcome> {
   return new Promise<ApprovalOutcome>((resolve) => {
-    live.approvals.set(uiId, { requestId, kind, input, resolve });
+    live.approvals.set(uiId, { requestId, kind, resolve });
   }).finally(() => {
     live.approvals.delete(uiId);
   });

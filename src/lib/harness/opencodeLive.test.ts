@@ -3,6 +3,7 @@ import { newSession } from "../session";
 import { applyHarnessEvent } from "./apply";
 
 let onStdout: ((line: string) => void) | undefined;
+let onExit: ((code: number | null) => void) | undefined;
 let onSseEvent: ((event: Record<string, unknown>) => void) | undefined;
 let onSseEnd: ((error?: string) => void) | undefined;
 const spawnChild = vi.fn(async () => {
@@ -39,8 +40,13 @@ vi.mock("./child", () => ({
   resolveOpenCodeBinary: async () => ({ path: "/fake/opencode" }),
   spawnChild,
   unwatchChild: () => undefined,
-  watchChild: (_id: string, stdout: (line: string) => void) => {
+  watchChild: (
+    _id: string,
+    stdout: (line: string) => void,
+    exit?: (code: number | null) => void,
+  ) => {
     onStdout = stdout;
+    onExit = exit;
   },
   watchSse: (
     _id: string,
@@ -125,6 +131,7 @@ function idle(sessionID = "session_1") {
 
 beforeEach(() => {
   onStdout = undefined;
+  onExit = undefined;
   onSseEvent = undefined;
   onSseEnd = undefined;
   spawnChild.mockClear();
@@ -250,6 +257,65 @@ describe("OpenCode event stream recovery", () => {
     });
     await second;
     expect(secondEvents).toContainEqual({ type: "message.completed" });
+  });
+
+  it("settles a parked approval and question when the server exits", async () => {
+    const events: HarnessEvent[] = [];
+    const { done } = await startTurn(events);
+    const outcome = done.then(
+      () => "resolved",
+      (error: unknown) => error,
+    );
+    askPermission("session_1", "permission_dead");
+    onSseEvent?.({
+      type: "question.asked",
+      properties: {
+        id: "question_dead",
+        sessionID: "session_1",
+        questions: [
+          { question: "Pick one?", options: [{ label: "A" }] },
+        ],
+      },
+    });
+    await waitFor(
+      () =>
+        events.some((event) => event.type === "approval.requested") &&
+        events.some((event) => event.type === "question.asked"),
+      "parked asks",
+    );
+    const approval = events.find(
+      (event) => event.type === "approval.requested",
+    )!;
+    const question = events.find(
+      (event) => event.type === "question.asked",
+    )!;
+
+    onExit?.(1);
+
+    await waitFor(
+      () =>
+        events.some((event) => event.type === "approval.resolved") &&
+        events.some((event) => event.type === "question.resolved"),
+      "settled asks",
+    );
+    expect(events).toContainEqual({ type: "session.ended", code: 1 });
+    expect(events).toContainEqual({
+      type: "approval.resolved",
+      requestId: approval.requestId,
+      decision: "deny",
+    });
+    expect(events).toContainEqual({
+      type: "question.resolved",
+      requestId: question.requestId,
+      decision: "skipped",
+    });
+    expect(await outcome).toBeInstanceOf(Error);
+    // Settled asks must not write replies to a dead server.
+    expect(
+      harnessHttp.mock.calls.some(([input]) =>
+        /permission|question/.test(input.url),
+      ),
+    ).toBe(false);
   });
 });
 
@@ -395,6 +461,101 @@ describe("OpenCode runtime mode changes", () => {
           "/permission/permission_edit_2/reply",
       ),
     ).toBe(false);
+
+    idle();
+    await done;
+  });
+
+  it("settles a parked MCP ask when the mode loosens to full-access", async () => {
+    const events: HarnessEvent[] = [];
+    const { done } = await startTurn(events);
+    onSseEvent?.({
+      type: "permission.asked",
+      properties: {
+        id: "permission_mcp",
+        sessionID: "session_1",
+        permission: "github_create_issue",
+        patterns: ["title=Bug"],
+        metadata: {},
+        tool: { messageID: "message_1", callID: "call_mcp" },
+      },
+    });
+    await waitFor(
+      () => events.some((event) => event.type === "approval.requested"),
+      "MCP approval",
+    );
+
+    setOpenCodeRuntimeMode("opencode-live", "full-access");
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.some(
+          ([input]) =>
+            input.method === "PATCH" &&
+            new URL(input.url).pathname === "/session/session_1",
+        ),
+      "permission rules update",
+    );
+    const patch = harnessHttp.mock.calls.find(
+      ([input]) =>
+        input.method === "PATCH" &&
+        new URL(input.url).pathname === "/session/session_1",
+    )![0];
+    // Full access is a plain wildcard allow — MCP calls included.
+    expect(JSON.parse(patch.body!).permission).toEqual([
+      { permission: "*", pattern: "*", action: "allow" },
+    ]);
+
+    // The wildcard covers the parked ask — it is replied without the user.
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.some(
+          ([input]) =>
+            new URL(input.url).pathname ===
+            "/permission/permission_mcp/reply",
+        ),
+      "MCP settle reply",
+    );
+    expect(events.some((event) => event.type === "approval.resolved")).toBe(
+      true,
+    );
+
+    idle();
+    await done;
+  });
+
+  it("settles an external_directory ask when the mode loosens to full-access", async () => {
+    const events: HarnessEvent[] = [];
+    const { done } = await startTurn(events);
+    onSseEvent?.({
+      type: "permission.asked",
+      properties: {
+        id: "permission_ext",
+        sessionID: "session_1",
+        permission: "external_directory",
+        patterns: ["/home/user/.gitconfig"],
+        metadata: {},
+        tool: { messageID: "message_1", callID: "call_ext" },
+      },
+    });
+    await waitFor(
+      () => events.some((event) => event.type === "approval.requested"),
+      "external dir approval",
+    );
+    // A builtin permission name that happens to contain "_" is not MCP.
+    expect(
+      events.find((event) => event.type === "approval.requested")?.kind,
+    ).not.toBe("mcp");
+
+    setOpenCodeRuntimeMode("opencode-live", "full-access");
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.some(
+          ([input]) =>
+            new URL(input.url).pathname ===
+            "/permission/permission_ext/reply",
+        ),
+      "external dir settled",
+    );
 
     idle();
     await done;

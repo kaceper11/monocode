@@ -34,6 +34,7 @@ import {
   type SavedRepositorySet,
 } from "../lib/projects";
 import { IS_WIN } from "../lib/platform";
+import { wslDistributions } from "../lib/wsl";
 import {
   pathKey,
   prettyCwd,
@@ -411,16 +412,30 @@ export function ProjectRepositories({
     if (groupImport && !project && !failed.size) onClose();
   };
 
-  const pickAdd = () => {
-    setError("");
-    if (IS_WIN) {
-      setPickMultiple(true);
-      setPickOpen(true);
+  /** On Windows, skip the host picker when the machine has no WSL distros. */
+  const pickOnWindows = (openDialog: () => void, pickNative: () => void) => {
+    if (!IS_WIN) {
+      pickNative();
       return;
     }
-    void pickFolders("Choose repositories or folders of repositories")
-      .then((picked) => addPicked(picked ?? []))
-      .catch((reason) => setError(String(reason)));
+    void wslDistributions()
+      .then((list) => (list.length ? openDialog() : pickNative()))
+      // A failed probe can't prove WSL is absent — offer the dialog.
+      .catch(() => openDialog());
+  };
+
+  const pickAdd = () => {
+    setError("");
+    pickOnWindows(
+      () => {
+        setPickMultiple(true);
+        setPickOpen(true);
+      },
+      () =>
+        void pickFolders("Choose repositories or folders of repositories")
+          .then((picked) => addPicked(picked ?? []))
+          .catch((reason) => setError(String(reason))),
+    );
   };
 
   const reconnect = (repo: ProjectRepository) => {
@@ -464,15 +479,17 @@ export function ProjectRepositories({
   const locate = (repo: ProjectRepository) => {
     if (!project) return;
     setError("");
-    if (IS_WIN) {
-      locating.current = repo.id;
-      setPickMultiple(false);
-      setPickOpen(true);
-      return;
-    }
-    void pickFolder("Locate repository")
-      .then((picked) => locateInto(repo, picked))
-      .catch((reason) => setError(String(reason)));
+    pickOnWindows(
+      () => {
+        locating.current = repo.id;
+        setPickMultiple(false);
+        setPickOpen(true);
+      },
+      () =>
+        void pickFolder("Locate repository")
+          .then((picked) => locateInto(repo, picked))
+          .catch((reason) => setError(String(reason))),
+    );
   };
 
   const commitSet = () => {

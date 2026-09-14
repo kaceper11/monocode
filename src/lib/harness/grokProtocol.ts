@@ -1,10 +1,14 @@
 import { promptBlocks, type PromptContentBlock } from "../attachments";
-import { acpAutoOption } from "./acp";
+import {
+  acpAutoOption,
+  acpPermissionOptionId,
+  isAcpMcpToolCall,
+} from "./acp";
 import type { AgentModel, ModelSetting, ModelSettingChoice } from "../models";
 import type { Attachment, RuntimeMode, ToolPreview } from "../session";
 import { normalizeTaskListStatus } from "../taskList";
 import { acpAgentInfo } from "./acpSubagents";
-import type { ApprovalDecision, HarnessEvent } from "./types";
+import type { HarnessEvent } from "./types";
 import type { UserQuestion, UserQuestionReply } from "../userQuestion";
 import { questionsFromUnknown, selectedAnswerLabels } from "../userQuestion";
 import {
@@ -181,32 +185,8 @@ export function grokAuthError(error: unknown): Error {
 /** Grok asks carry the same ACP option vocabulary as the other ACP adapters. */
 export const pickAutoOption = acpAutoOption;
 
-export function permissionOptionId(
-  decision: ApprovalDecision,
-  optionIds: string[],
-): string {
-  if (decision === "allow") {
-    return (
-      pickOption(optionIds, [
-        "allow-once",
-        "allow_once",
-        "allow-always",
-        "allow_always",
-        "allow",
-      ]) ?? "allow-once"
-    );
-  }
-  return (
-    pickOption(optionIds, [
-      "reject-once",
-      "reject_once",
-      "reject-always",
-      "reject_always",
-      "reject",
-      "deny",
-    ]) ?? "reject-once"
-  );
-}
+/** Shares the ACP option vocabulary; never invents an id the agent didn't offer. */
+export const permissionOptionId = acpPermissionOptionId;
 
 export function permissionRequestFromAcp(
   params: unknown,
@@ -221,10 +201,11 @@ export function permissionRequestFromAcp(
     rec ??
     {};
   const grok = grokToolFields(tool, tool);
-  const kind =
-    grok.kind ??
-    stringField(tool, "kind") ??
-    stringField(subject ?? {}, "kind");
+  const kind = isAcpMcpToolCall(tool, subject)
+    ? "mcp"
+    : (grok.kind ??
+      stringField(tool, "kind") ??
+      stringField(subject ?? {}, "kind"));
   const preview = extractToolPreview(tool, tool);
   const command = grok.command ?? extractShellCommand(tool);
   const title =
@@ -330,8 +311,11 @@ export function eventsFromAcpUpdate(params: unknown): HarnessEvent[] {
           "",
       );
     if (!callId) return [];
-    const toolKind =
-      grok.kind ?? stringField(update, "kind") ?? stringField(tool, "kind");
+    const toolKind = isAcpMcpToolCall(tool, update)
+      ? "mcp"
+      : (grok.kind ??
+        stringField(update, "kind") ??
+        stringField(tool, "kind"));
     const status = stringField(update, "status") ?? stringField(tool, "status");
     const preview = mergePreview(
       extractToolPreview(update, tool),
@@ -786,13 +770,6 @@ function cap(value: string, max = 8_000): string {
   const text = value.trim();
   if (text.length <= max) return text;
   return `${text.slice(0, max)}\n…`;
-}
-
-function pickOption(optionIds: string[], preferred: string[]): string | null {
-  for (const id of preferred) {
-    if (optionIds.includes(id)) return id;
-  }
-  return null;
 }
 
 function humanField(

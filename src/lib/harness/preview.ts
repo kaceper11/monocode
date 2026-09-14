@@ -259,6 +259,15 @@ export function isSkillTool(kind?: string, title?: string): boolean {
   return /^skill\b/i.test(title?.trim() ?? "");
 }
 
+/**
+ * MCP tool calls surface under provider-specific names rather than a shared
+ * kind: Claude namespaces them `mcp__server__tool`, while ACP agents mostly
+ * title them `mcp:…`, `mcp.…` or `mcp …`.
+ */
+export function isMcpToolName(name: string | undefined): boolean {
+  return !!name && /^mcp(?:__|[^a-z0-9_]|$)/i.test(name.trim());
+}
+
 /** Delegation tool names shared by the provider adapters. */
 export function isAgentToolName(name: string): boolean {
   const normalized = name.trim().toLowerCase();
@@ -450,6 +459,17 @@ export function composeToolTitle(opts: {
       title.replace(/^(?:find|search|grep|glob)(?:ing)?\b\s*/i, "").trim();
     if (q && !isWeakToolTitle(q)) return `Find ${q}`;
     return "Find";
+  }
+
+  // `mcp__server__tool` reads better unwrapped; other MCP titles
+  // ("mcp: …", "server: tool") already name the action.
+  if (kind === "mcp" && isMcpToolName(title)) {
+    const readable = title
+      .replace(/^mcp__/i, "")
+      .replace(/__/g, ": ")
+      .replace(/_/g, " ")
+      .trim();
+    if (readable) return `MCP ${readable}`;
   }
 
   return title;

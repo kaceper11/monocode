@@ -1,11 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, expect, it, vi } from "vitest";
-import { connectWslProject } from "./wsl";
+import {
+  __wslDistributionsReset,
+  connectWslProject,
+  wslDistributions,
+  wslDistributionsPeek,
+} from "./wsl";
 import { wslStatusFor } from "./wslStatus";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 beforeEach(() => {
   vi.mocked(invoke).mockReset();
+  __wslDistributionsReset();
 });
 
 it("opens only the selected distribution and preserves cancellation and errors", async () => {
@@ -67,4 +73,80 @@ it("opens only the selected distribution and preserves cancellation and errors",
     "WSL distribution",
   );
   expect(invoke).not.toHaveBeenCalled();
+});
+
+it("memoizes the distribution probe and exposes the resolved list", async () => {
+  vi.mocked(invoke).mockResolvedValue(["Ubuntu", "Debian"]);
+  expect(await wslDistributions()).toEqual(["Ubuntu", "Debian"]);
+  expect(await wslDistributions()).toEqual(["Ubuntu", "Debian"]);
+  expect(wslDistributionsPeek()).toEqual(["Ubuntu", "Debian"]);
+  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(invoke).toHaveBeenCalledWith("wsl_distributions");
+});
+
+it("refresh re-probes", async () => {
+  vi.mocked(invoke).mockResolvedValue(["Ubuntu"]);
+  await wslDistributions(true);
+  expect(wslDistributionsPeek()).toEqual(["Ubuntu"]);
+  expect(invoke).toHaveBeenCalledTimes(1);
+});
+
+it("a failed probe is not retained", async () => {
+  vi.mocked(invoke).mockResolvedValue(["Ubuntu"]);
+  await wslDistributions();
+  vi.mocked(invoke).mockRejectedValueOnce(new Error("wsl.exe unavailable"));
+  await expect(wslDistributions(true)).rejects.toThrow("wsl.exe unavailable");
+  // The last good value remains visible while the next call re-probes.
+  expect(wslDistributionsPeek()).toEqual(["Ubuntu"]);
+  vi.mocked(invoke).mockResolvedValue([]);
+  expect(await wslDistributions(true)).toEqual([]);
+  expect(invoke).toHaveBeenCalledTimes(3);
+});
+
+it("an expired value re-probes", async () => {
+  vi.mocked(invoke).mockResolvedValue(["Ubuntu"]);
+  await wslDistributions();
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(Date.now() + 60_000);
+    vi.mocked(invoke).mockResolvedValue(["Ubuntu", "Debian"]);
+    expect(await wslDistributions()).toEqual(["Ubuntu", "Debian"]);
+    expect(invoke).toHaveBeenCalledTimes(2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("dedupes concurrent in-flight probes", async () => {
+  let finish!: (value: string[]) => void;
+  vi.mocked(invoke).mockImplementation(
+    () =>
+      new Promise<string[]>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const first = wslDistributions();
+  const second = wslDistributions();
+  finish(["Ubuntu"]);
+  expect(await first).toEqual(["Ubuntu"]);
+  expect(await second).toEqual(["Ubuntu"]);
+  expect(invoke).toHaveBeenCalledTimes(1);
+});
+
+it("a superseded probe cannot overwrite a newer result", async () => {
+  const resolves: Array<(value: string[]) => void> = [];
+  vi.mocked(invoke).mockImplementation(
+    () =>
+      new Promise<string[]>((resolve) => {
+        resolves.push(resolve);
+      }),
+  );
+  const slow = wslDistributions();
+  const refresh = wslDistributions(true);
+  resolves[1](["Debian"]);
+  expect(await refresh).toEqual(["Debian"]);
+  resolves[0](["Ubuntu"]);
+  expect(await slow).toEqual(["Ubuntu"]);
+  // The stale result is discarded — peek keeps the refresh's answer.
+  expect(wslDistributionsPeek()).toEqual(["Debian"]);
 });

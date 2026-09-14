@@ -169,7 +169,7 @@ pub struct AgentConfigInventory {
 // Host/WSL IO helpers. Paths are JS identities: host paths are plain strings,
 // WSL paths are `//wsl.localhost/<distro>/<linux path>`.
 
-fn read_config_text(path: &Path) -> Option<String> {
+pub(crate) fn read_config_text(path: &Path) -> Option<String> {
     match wsl::path_location(path) {
         Ok(Some(location)) => {
             return wsl::request::<String>(&location, "read_text", json!({}))
@@ -211,7 +211,7 @@ struct InspectEntry {
 }
 
 /// Existence + size + isDir for many paths; WSL paths go in one bridge batch.
-fn inspect_all(paths: &[PathBuf]) -> HashMap<String, (u64, bool)> {
+pub(crate) fn inspect_all(paths: &[PathBuf]) -> HashMap<String, (u64, bool)> {
     let mut out = HashMap::new();
     let strings: Vec<String> = paths
         .iter()
@@ -242,15 +242,15 @@ fn inspect_all(paths: &[PathBuf]) -> HashMap<String, (u64, bool)> {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-struct DirListEntry {
-    name: String,
-    path: String,
+pub(crate) struct DirListEntry {
+    pub name: String,
+    pub path: String,
     #[serde(default)]
-    is_dir: bool,
+    pub is_dir: bool,
 }
 
 /// List one directory (names only used); missing/empty → empty vec.
-fn list_dir(path: &Path) -> Vec<DirListEntry> {
+pub(crate) fn list_dir(path: &Path) -> Vec<DirListEntry> {
     match wsl::path_location(path) {
         Ok(Some(location)) => {
             return wsl::files_request::<Vec<DirListEntry>>(&location, "list", json!({}))
@@ -275,14 +275,14 @@ fn list_dir(path: &Path) -> Vec<DirListEntry> {
         .collect()
 }
 
-fn home_for(project: &Path) -> Option<PathBuf> {
-    if let Ok(Some(location)) = wsl::path_location(project) {
-        if let Ok(home) = wsl::path_request(&location, "home", json!({})) {
-            return Some(PathBuf::from(home));
-        }
-        return None;
+fn home_for(project: &Path) -> Result<Option<PathBuf>, String> {
+    // A malformed WSL identity is an error, not a host project.
+    match wsl::path_location(project)? {
+        Some(location) => Ok(wsl::path_request(&location, "home", json!({}))
+            .ok()
+            .map(PathBuf::from)),
+        None => Ok(dirs_home().map(PathBuf::from)),
     }
-    dirs_home().map(PathBuf::from)
 }
 
 fn js(path: &Path) -> String {
@@ -1621,18 +1621,19 @@ fn toml_string_list(value: &str) -> Vec<String> {
 #[tauri::command(async)]
 pub fn agent_config_inventory(cwd: String) -> Result<AgentConfigInventory, String> {
     let project = expand_home(&cwd);
-    let home = home_for(&project);
+    let location = wsl::path_location(&project)?;
+    let home = home_for(&project)?;
 
-    let project_native = match wsl::path_location(&project) {
-        Ok(Some(location)) => location.path,
-        _ => crate::fs::path_to_js(&project),
+    let project_native = match &location {
+        Some(location) => location.path.clone(),
+        None => crate::fs::path_to_js(&project),
     };
     let mut inventory = AgentConfigInventory::default();
     let ctx = Ctx {
         project: project.clone(),
         home: home.clone(),
         project_native,
-        wsl_project: matches!(wsl::path_location(&project), Ok(Some(_))),
+        wsl_project: location.is_some(),
     };
 
     inventory.providers.push(claude_extensions(&ctx));
@@ -1912,8 +1913,11 @@ fn claude_extensions(ctx: &Ctx) -> ProviderExtensions {
 
     // Plugins: installed registry + enabledPlugins across settings files.
     // Read precedence runs user < project < project-local < managed so the
-    // last matching write below is the effective setting.
-    let managed = managed_settings_root()
+    // last matching write below is the effective setting. For a WSL project
+    // the managed root is inside the guest (/etc/claude-code), not the
+    // Windows host's ClaudeCode folder.
+    let location = crate::wsl::path_location(&ctx.project).ok().flatten();
+    let managed = claude_managed_root(location.as_ref())
         .map(|root| managed_plugin_settings(&root))
         .unwrap_or_default();
     let mut plugin_enabled_files: Vec<(PathBuf, HashMap<String, bool>)> = Vec::new();
@@ -2065,10 +2069,11 @@ fn managed_plugin_settings(root: &Path) -> HashMap<String, Option<bool>> {
     };
     apply(&root.join("managed-settings.json"));
     let dir = root.join("managed-settings.d");
+    // Same drop-in predicate as skills::managed_plugin_map.
     let mut files: Vec<PathBuf> = list_dir(&dir)
         .into_iter()
+        .filter(|e| !e.is_dir && e.name.ends_with(".json") && !e.name.starts_with('.'))
         .map(|e| PathBuf::from(e.path))
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
         .collect();
     files.sort();
     for file in files {
@@ -2092,6 +2097,18 @@ fn managed_settings_root() -> Option<PathBuf> {
     }
     #[allow(unreachable_code)]
     None
+}
+
+/// The Claude managed-policy root on the project's execution host —
+/// /etc/claude-code inside a WSL guest, the platform folder on the host.
+pub(crate) fn claude_managed_root(location: Option<&wsl::Location>) -> Option<PathBuf> {
+    match location {
+        Some(location) => location
+            .with_path("/etc/claude-code")
+            .ok()
+            .map(|root| PathBuf::from(root.identity())),
+        None => managed_settings_root(),
+    }
 }
 
 // ---- codex-family (codex, grok): config.toml with [mcp_servers.*] -----------
@@ -3648,10 +3665,20 @@ fn script_refs(command: &str, project: &Path, home: Option<&Path>) -> Vec<PathBu
             None
         } else if token.starts_with("//wsl.localhost/")
             || token.starts_with("//wsl$/")
-            || token.starts_with('/')
             || token.contains(":\\")
         {
             Some(PathBuf::from(token))
+        } else if token.starts_with('/') {
+            // A guest-absolute ref under a WSL hook must resolve inside the
+            // distribution — never as a host path.
+            match crate::wsl::location(&project.to_string_lossy()) {
+                Ok(Some(location)) => location
+                    .with_path(token)
+                    .ok()
+                    .map(|l| PathBuf::from(l.identity())),
+                Ok(None) => Some(PathBuf::from(token)),
+                Err(_) => None,
+            }
         } else if (token.starts_with("./") || token.starts_with("../"))
             && token.rsplit('/').next().is_some_and(|f| f.contains('.'))
             || token.contains('/')
@@ -4262,7 +4289,7 @@ pub fn agent_config_set_enabled(
         .lock()
         .map_err(|_| "Config mutation lock poisoned".to_string())?;
     let project = checked_project(&cwd)?;
-    let home = home_for(&project);
+    let home = home_for(&project)?;
     let path = expand_home(&toggle.file);
     toggle_allowed(&toggle, &path, &project, home.as_deref())?;
     let text = read_config_text(&path).ok_or("Config file could not be read")?;
@@ -4419,7 +4446,7 @@ pub fn agent_config_remove(cwd: String, remove: RemoveRef) -> Result<(), String>
         .lock()
         .map_err(|_| "Config mutation lock poisoned".to_string())?;
     let project = checked_project(&cwd)?;
-    let home = home_for(&project);
+    let home = home_for(&project)?;
     let path = expand_home(&remove.file);
     remove_allowed(&remove, &path, &project, home.as_deref())?;
     if remove.format == "file" {

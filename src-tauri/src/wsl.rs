@@ -1028,9 +1028,17 @@ pub fn files_request<T: DeserializeOwned>(
     fn qualify(value: &mut Value, location: &Location) -> Result<(), String> {
         match value {
             Value::Array(items) => {
-                for item in items {
-                    qualify(item, location)?;
+                // An entry whose guest path cannot form an identity (control
+                // chars, "..", a stray backslash) is dropped, not fatal — one
+                // exotic name must not void the whole listing.
+                let mut kept = Vec::with_capacity(items.len());
+                for item in std::mem::take(items) {
+                    let mut item = item;
+                    if qualify(&mut item, location).is_ok() {
+                        kept.push(item);
+                    }
                 }
+                *items = kept;
             }
             Value::Object(fields) => {
                 if let Some(Value::String(path)) = fields.get_mut("path") {

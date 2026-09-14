@@ -311,7 +311,12 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
         .catch(() => undefined);
       return;
     }
-    void handleRequest(live, id, method, params);
+    void handleRequest(live, id, method, params).catch((error) => {
+      console.debug("[monocode] grok request handler failed", error);
+      void acp
+        .respondError(id, { code: -32603, message: "Internal error" })
+        .catch(() => undefined);
+    });
   };
 
   const emit = (event: HarnessEvent) => {
@@ -323,7 +328,18 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     (line) => acp.pushLine(line),
     (code) => {
       acp.close(new Error("Grok Build exited"));
+      const live = liveByThread.get(input.sessionId);
       liveByThread.delete(input.sessionId);
+      if (live) {
+        // Exit settles parked asks so the provider request and the UI card
+        // both close instead of lingering on a dead child.
+        live.muteUpdates = true;
+        for (const [, pending] of live.approvals) pending.resolve("deny");
+        live.approvals.clear();
+        for (const [, resolve] of live.questions)
+          resolve({ kind: "skipped" });
+        live.questions.clear();
+      }
       emit({ type: "session.ended", code });
     },
     (line) => {
@@ -603,6 +619,14 @@ async function handleRequest(
 
 async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
   const request = permissionRequestFromAcp(params);
+  if (live.cancelled || live.muteUpdates) {
+    // A request landing after cancel/stop must still be answered — the
+    // server holds its turn open until it gets a response.
+    await live.acp
+      .respond(id, { outcome: { outcome: "cancelled" } })
+      .catch(() => undefined);
+    return;
+  }
   if (request.callId) {
     live.onEvent({
       type: "tool.updated",
@@ -619,9 +643,14 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
       readOnly ? "allow" : "deny",
       request.optionIds,
     );
-    await live.acp.respond(id, {
-      outcome: { outcome: "selected", optionId },
-    });
+    await live.acp
+      .respond(
+        id,
+        optionId
+          ? { outcome: { outcome: "selected", optionId } }
+          : { outcome: { outcome: "cancelled" } },
+      )
+      .catch(() => undefined);
     return;
   }
 
@@ -631,9 +660,9 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     request.optionIds,
   );
   if (auto) {
-    await live.acp.respond(id, {
-      outcome: { outcome: "selected", optionId: auto },
-    });
+    await live.acp
+      .respond(id, { outcome: { outcome: "selected", optionId: auto } })
+      .catch(() => undefined);
     return;
   }
 
@@ -659,15 +688,25 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
   live.approvals.delete(String(requestId));
   live.onEvent({ type: "approval.resolved", requestId, decision });
 
-  await live.acp.respond(id, {
-    outcome: {
-      outcome: "selected",
-      optionId: permissionOptionId(decision, request.optionIds),
-    },
-  });
+  const optionId = permissionOptionId(decision, request.optionIds);
+  await live.acp
+    .respond(
+      id,
+      optionId
+        ? { outcome: { outcome: "selected", optionId } }
+        : { outcome: { outcome: "cancelled" } },
+    )
+    .catch(() => undefined);
 }
 
 async function handleAskQuestion(live: Live, id: JsonRpcId, params: unknown) {
+  if (live.cancelled || live.muteUpdates) {
+    // ask_user_question's wire shape is flat — not the permission envelope.
+    await live.acp
+      .respond(id, { outcome: "skip_interview" })
+      .catch(() => undefined);
+    return;
+  }
   const questions = askQuestionsFromAcp(params);
   const requestId = typeof id === "number" ? id : (live.nextRequestId += 1);
   live.onEvent({

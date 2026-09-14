@@ -10,6 +10,7 @@ import type { UserQuestion, UserQuestionReply } from "../userQuestion";
 import {
   extractToolPreview,
   formatAgentType,
+  isMcpToolName,
   titleFromToolInput,
 } from "./preview";
 import { snapshotRemainder } from "./streamText";
@@ -642,7 +643,10 @@ export function museApprovalFromParams(params: unknown): MuseApproval | null {
   let kind = "other";
   let preview: ToolPreview | undefined;
   let title = toolName || "Approval";
-  if (subjectKind === "shell") {
+  if (subjectKind === "mcp" || isMcpToolName(toolName)) {
+    kind = "mcp";
+    title = toolName || title;
+  } else if (subjectKind === "shell") {
     kind = "execute";
     const command = stringField(subject, "command");
     preview = command ? { kind: "shell", title: command } : undefined;

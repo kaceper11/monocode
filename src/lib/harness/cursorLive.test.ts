@@ -141,6 +141,60 @@ afterEach(async () => {
   __cursorTestReset();
 });
 
+describe("cursor request lifecycle", () => {
+  it("answers a request that lands before the session binds", async () => {
+    const events: HarnessEvent[] = [];
+    const turn = sendCursorTurn({
+      sessionId: "cursor-live",
+      cwd: "/repo",
+      model: "cursor:composer-2.5",
+      modelSettings: {},
+      runtimeMode: "full-access",
+      text: "hey",
+      attachments: [],
+      onEvent: (event) => events.push(event),
+    });
+    await waitFor(() => !!outboundRequest("initialize"), "initialize");
+    reply(outboundRequest("initialize")!.id as number, {});
+    await waitFor(() => !!outboundRequest("authenticate"), "authenticate");
+    reply(outboundRequest("authenticate")!.id as number, {});
+    await waitFor(() => !!outboundRequest("session/new"), "session/new");
+
+    // A request landing before session/new resolves has no live record —
+    // it still needs an answer so the provider doesn't hold its turn open.
+    request(42, "session/request_permission", {
+      sessionId: "cursor_1",
+      toolCall: { toolCallId: "call_mcp", title: "mcp__x__y", kind: "mcp" },
+      options: [
+        { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+      ],
+    });
+    await waitFor(
+      () => parse().some((m) => m.id === 42 && "error" in m),
+      "pre-bind error response",
+    );
+    const response = parse().find((m) => m.id === 42 && "error" in m)!;
+    expect((response.error as { code: number }).code).toBe(-32601);
+    expect(events.some((e) => e.type === "approval.requested")).toBe(false);
+
+    reply(outboundRequest("session/new")!.id as number, {
+      sessionId: "cursor_1",
+      configOptions: [
+        {
+          id: "model",
+          category: "model",
+          currentValue: "composer-2.5",
+        },
+      ],
+    });
+    await waitFor(() => !!outboundRequest("session/prompt"), "prompt");
+    reply(outboundRequest("session/prompt")!.id as number, {
+      stopReason: "end_turn",
+    });
+    await turn;
+  });
+});
+
 describe("cursor background subagents", () => {
   it("recovers native child steps without parent-attributed ACP events and enriches foreground names", async () => {
     const run = {

@@ -53,10 +53,18 @@ async function discoverCodexModels(projectCwd?: string): Promise<AgentModel[]> {
     await killChild(PROBE_ID).catch(() => undefined);
   };
 
+  // The probe's stderr carries the real failure on WSL (e.g. "WSL process:
+  // ..." from the guest launcher); keep a short tail so thrown errors show
+  // the cause instead of a bare "probe exited"/timeout.
+  const stderrTail: string[] = [];
   watchChild(
     PROBE_ID,
     (line) => rpc.pushLine(line),
     () => rpc.close(new Error("Codex probe exited")),
+    (line) => {
+      stderrTail.push(line);
+      if (stderrTail.length > 8) stderrTail.shift();
+    },
   );
 
   try {
@@ -91,9 +99,26 @@ async function discoverCodexModels(projectCwd?: string): Promise<AgentModel[]> {
     }, () => {
       void stop();
     });
+  } catch (error) {
+    throw probeError(error, stderrTail);
   } finally {
     await stop();
   }
+}
+
+function probeError(error: unknown, stderrTail: string[]): unknown {
+  const message = error instanceof Error ? error.message : String(error);
+  // The sign-in message is already actionable; stderr noise would only
+  // clutter it.
+  if (message === CODEX_SIGN_IN_ERROR) return error;
+  const detail = stderrTail
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-3)
+    .join("; ")
+    .slice(0, 300);
+  if (!detail || message.includes(detail)) return error;
+  return new Error(`${message} — ${detail}`);
 }
 
 export const CODEX_SIGN_IN_ERROR =

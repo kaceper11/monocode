@@ -15,6 +15,7 @@ import {
 import {
   extractToolPreview,
   isAgentToolName,
+  isMcpToolName,
   titleFromToolInput,
 } from "./preview";
 import { streamTextDelta } from "./streamText";
@@ -266,9 +267,10 @@ export function buildClaudeSpawnArgs(input: {
   if (input.permissionMode) {
     args.push("--permission-mode", input.permissionMode);
   }
-  if (input.permissionMode === "bypassPermissions") {
-    args.push("--allow-dangerously-skip-permissions");
-  }
+  // The CLI refuses set_permission_mode→bypassPermissions from a session
+  // spawned without this flag, which would make a mid-session switch to
+  // full-access silently no-op. It enables bypass without activating it.
+  args.push("--allow-dangerously-skip-permissions");
   if (input.resume) args.push("--resume", input.resume);
   if (input.sessionId) args.push("--session-id", input.sessionId);
   if (input.maxTurns) args.push("--max-turns", String(input.maxTurns));
@@ -893,6 +895,7 @@ export function isTodoTool(toolName: string): boolean {
 export function toolKindFromName(toolName: string): string {
   const normalized = toolName.toLowerCase();
   if (isTodoTool(toolName)) return "tasks";
+  if (isMcpToolName(toolName)) return "mcp";
   if (
     normalized.includes("bash") ||
     normalized.includes("command") ||

@@ -3,7 +3,12 @@ import { AcpSubagents } from "./acpSubagents";
 import type { RuntimeMode } from "../session";
 import { promptBlocks } from "../attachments";
 import { isTaskListToolName, taskListFromToolInput } from "../taskList";
-import { AcpClient, type AcpHandlers } from "./acp";
+import {
+  AcpClient,
+  acpAutoOption,
+  isAcpMcpToolCall,
+  type AcpHandlers,
+} from "./acp";
 import type { JsonRpcId } from "./jsonRpc";
 import {
   killChild,
@@ -312,8 +317,24 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
   };
   handlers.onRequest = (id, method, params) => {
     const live = liveRef.current;
-    if (!live) return;
-    void handleRequest(live, id, method, params);
+    if (!live) {
+      // A request landing before the session binds (e.g. during a
+      // session/load replay) still needs a response — the provider holds
+      // its turn open until it gets one.
+      void acp
+        .respondError(id, {
+          code: -32601,
+          message: `Method not found: ${method}`,
+        })
+        .catch(() => undefined);
+      return;
+    }
+    void handleRequest(live, id, method, params).catch((error) => {
+      console.debug("[monocode] cursor request handler failed", error);
+      void acp
+        .respondError(id, { code: -32603, message: "Internal error" })
+        .catch(() => undefined);
+    });
   };
 
   watchChild(
@@ -326,6 +347,13 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
       if (live) {
         live.promptActive = false;
         retireCursorSubagentPolling(live);
+        // Exit settles parked asks so the provider request and the UI card
+        // both close instead of lingering on a dead child.
+        for (const [, pending] of live.approvals) pending.resolve("deny");
+        live.approvals.clear();
+        for (const [, resolve] of live.questions)
+          resolve({ kind: "skipped" });
+        live.questions.clear();
       }
       if (!live?.muteUpdates) {
         (live?.onEvent ?? input.onEvent)({ type: "session.ended", code });
@@ -622,6 +650,12 @@ function handleCursorTask(live: Live, params: unknown): void {
 }
 
 async function handleAskQuestion(live: Live, id: JsonRpcId, params: unknown) {
+  if (live.cancelled || live.muteUpdates) {
+    await live.acp
+      .respond(id, { outcome: { outcome: "cancelled" } })
+      .catch(() => undefined);
+    return;
+  }
   const rec = asRecord(params);
   const questions = questionsFromUnknown(params);
   const title =
@@ -680,6 +714,14 @@ function cursorAskQuestionResponse(
 }
 
 async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
+  if (live.cancelled || live.muteUpdates) {
+    // A request landing after cancel/stop must still be answered — the
+    // server holds its turn open until it gets a response.
+    await live.acp
+      .respond(id, { outcome: { outcome: "cancelled" } })
+      .catch(() => undefined);
+    return;
+  }
   const rec = asRecord(params);
   const subject = asRecord(rec?.subject);
   const tool =
@@ -689,7 +731,9 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     rec ??
     {};
   const command = stringField(subject ?? {}, "command");
-  const kind = stringField(tool, "kind") ?? stringField(subject ?? {}, "kind");
+  const kind = isAcpMcpToolCall(tool, subject)
+    ? "mcp"
+    : (stringField(tool, "kind") ?? stringField(subject ?? {}, "kind"));
   const preview = mergeToolPreview(
     extractToolPreview(tool, tool),
     subject ? extractToolPreview(subject, subject) : undefined,
@@ -750,20 +794,22 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     const optionId = readOnly
       ? pickOption(optionIds, ["allow-once", "allow_once", "allow"])
       : pickOption(optionIds, ["reject-once", "reject_once", "reject-always"]);
-    await live.acp.respond(id, {
-      outcome: {
-        outcome: "selected",
-        optionId: optionId ?? (readOnly ? "allow-once" : "reject-once"),
-      },
-    });
+    await live.acp
+      .respond(id, {
+        outcome: {
+          outcome: "selected",
+          optionId: optionId ?? (readOnly ? "allow-once" : "reject-once"),
+        },
+      })
+      .catch(() => undefined);
     return;
   }
 
   const auto = pickAutoOption(live.runtimeMode, kind, optionIds);
   if (auto) {
-    await live.acp.respond(id, {
-      outcome: { outcome: "selected", optionId: auto },
-    });
+    await live.acp
+      .respond(id, { outcome: { outcome: "selected", optionId: auto } })
+      .catch(() => undefined);
     return;
   }
 
@@ -793,13 +839,15 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
         ])
       : pickOption(optionIds, ["reject-once", "reject_once", "reject-always"]);
 
-  await live.acp.respond(id, {
-    outcome: {
-      outcome: "selected",
-      optionId:
-        optionId ?? (decision === "allow" ? "allow-once" : "reject-once"),
-    },
-  });
+  await live.acp
+    .respond(id, {
+      outcome: {
+        outcome: "selected",
+        optionId:
+          optionId ?? (decision === "allow" ? "allow-once" : "reject-once"),
+      },
+    })
+    .catch(() => undefined);
 }
 
 function handleSessionUpdate(live: Live, params: unknown) {
@@ -846,10 +894,11 @@ function handleSessionUpdate(live: Live, params: unknown) {
         "",
     );
     if (!callId) return;
-    const reportedKind =
-      coerceMaybeString(update, "kind") ?? coerceMaybeString(tool, "kind");
+    const reportedKind = isAcpMcpToolCall(tool, update)
+      ? "mcp"
+      : (stringField(update, "kind") ?? stringField(tool, "kind"));
     const status =
-      coerceMaybeString(update, "status") ?? coerceMaybeString(tool, "status");
+      stringField(update, "status") ?? stringField(tool, "status");
     const rawTitle = toolLabel(update, tool);
     const rawInput =
       update.rawInput ??
@@ -1262,29 +1311,7 @@ function pickAutoOption(
   kind: string | undefined,
   optionIds: string[],
 ): string | null {
-  if (optionIds.length === 0) return null;
-  const tool = (kind ?? "").toLowerCase();
-  if (runtimeMode === "supervised") return null;
-  if (
-    runtimeMode === "auto-accept-edits" &&
-    (tool === "execute" || tool === "other")
-  ) {
-    return null;
-  }
-  if (runtimeMode === "full-access") {
-    return pickOption(optionIds, [
-      "allow-always",
-      "allow_always",
-      "allow-once",
-      "allow_once",
-    ]);
-  }
-  return pickOption(optionIds, [
-    "allow-once",
-    "allow_once",
-    "allow-always",
-    "allow_always",
-  ]);
+  return acpAutoOption(runtimeMode, kind, optionIds);
 }
 
 function pickOption(optionIds: string[], preferred: string[]): string | null {
@@ -1591,13 +1618,6 @@ function shortPath(path: string): string {
   const parts = path.split(/[/\\]/).filter(Boolean);
   if (parts.length <= 2) return parts.join("/") || path;
   return parts.slice(-2).join("/");
-}
-
-function coerceMaybeString(
-  rec: Record<string, unknown>,
-  key: string,
-): string | undefined {
-  return stringField(rec, key);
 }
 
 function stringField(

@@ -253,7 +253,7 @@ describe("devin live turn sequence", () => {
     await stopDevinSession("t3");
   });
 
-  it("pushes the new mode and settles a parked approval on a mid-conversation change", async () => {
+  it("settles a parked approval on a mid-conversation change", async () => {
     const events: HarnessEvent[] = [];
     const turn = sendDevinTurn(baseInput(events, "run tests", "t12") as never);
 
@@ -297,14 +297,9 @@ describe("devin live turn sequence", () => {
     );
 
     setDevinRuntimeMode("t12", "full-access");
-    await waitFor(
-      () => byMethod("session/set_mode").length > 0,
-      "session/set_mode",
-    );
-    const setMode = lastByMethod("session/set_mode")!;
-    expect(setMode.params.modeId).toBe("bypass");
-    reply(setMode.id, {});
-
+    await waitFor(() => byMethod("session/set_mode").length > 0, "set_mode");
+    expect(byMethod("session/set_mode")[0].params.modeId).toBe("bypass");
+    reply(byMethod("session/set_mode")[0].id, {});
     await waitFor(
       () => parse().some((m) => m.id === 77 && m.result),
       "permission response",
@@ -320,6 +315,63 @@ describe("devin live turn sequence", () => {
     reply(promptId, { stopReason: "end_turn" });
     await turn;
     await stopDevinSession("t12");
+  });
+
+  it("auto-answers MCP permission asks under full-access", async () => {
+    const events: HarnessEvent[] = [];
+    const turn = sendDevinTurn({
+      ...baseInput(events, "file an issue", "t13"),
+      runtimeMode: "full-access",
+    } as never);
+    await waitFor(() => byMethod("initialize").length > 0, "initialize");
+    reply(byMethod("initialize")[0].id, {
+      protocolVersion: 1,
+      agentCapabilities: { loadSession: true },
+    });
+    await waitFor(() => byMethod("session/new").length > 0, "session/new");
+    reply(byMethod("session/new")[0].id, {
+      ...SETUP,
+      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+    });
+    // Full access switches the provider to bypass and auto-answers any ask
+    // that still arrives — MCP included, matching the real CLIs.
+    await waitFor(() => byMethod("session/set_mode").length > 0, "set_mode");
+    expect(byMethod("session/set_mode")[0].params.modeId).toBe("bypass");
+    reply(byMethod("session/set_mode")[0].id, {});
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
+    const promptId = lastByMethod("session/prompt").id;
+
+    onLine!(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 81,
+        method: "session/request_permission",
+        params: {
+          sessionId: "S1",
+          toolCall: {
+            toolCallId: "call_mcp",
+            title: "mcp__github__create_issue",
+            kind: "other",
+          },
+          options: [
+            { optionId: "allow_once", name: "Allow" },
+            { optionId: "reject_once", name: "Reject" },
+          ],
+        },
+      }),
+    );
+    await waitFor(
+      () => parse().some((m) => m.id === 81 && m.result),
+      "MCP auto response",
+    );
+    expect(events.some((e) => e.type === "approval.requested")).toBe(false);
+    expect(parse().find((m) => m.id === 81)?.result?.outcome?.optionId).toBe(
+      "allow_once",
+    );
+
+    reply(promptId, { stopReason: "end_turn" });
+    await turn;
+    await stopDevinSession("t13");
   });
 
   it("answers a permission request that carries a string JSON-RPC id", async () => {
@@ -782,11 +834,13 @@ describe("devin live turn sequence", () => {
     reply(promptId, { stopReason: "end_turn" });
     await turn;
 
-    // The queued send applies its own mode before prompting.
+    // The queued send applies its own mode before prompting — full-access
+    // switches the provider to bypass first.
     await waitFor(
       () => byMethod("session/set_mode").length > 0,
       "set_mode for queued turn",
     );
+    expect(lastByMethod("session/set_mode").params.modeId).toBe("bypass");
     reply(lastByMethod("session/set_mode").id, {});
     await waitFor(
       () => byMethod("session/prompt").length === 2,
