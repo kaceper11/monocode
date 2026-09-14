@@ -26,7 +26,8 @@ import { azureOptions, saveAzureFilter, type AzureFilter, type AzureOption } fro
 export const INBOX_FILTER_MENU_WIDTH = 228;
 
 type ProjectOption = {
-  path: string;
+  /** Rail identity — a normalized path or `project:<id>` for groups. */
+  key: string;
   name: string;
   logoPath: string | null;
 };
@@ -117,10 +118,10 @@ export function InboxFiltersMenu({
     onChange({ ...filters, hiddenKinds: [...next] });
   };
 
-  const toggleProject = (path: string) => {
+  const toggleProject = (key: string) => {
     const next = new Set(hiddenProjects);
-    if (next.has(path)) next.delete(path);
-    else next.add(path);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
     onChange({ ...filters, hiddenProjects: [...next] });
   };
 
@@ -343,9 +344,9 @@ export function InboxFiltersMenu({
           <SectionLabel>Projects</SectionLabel>
           {projects.map((project) => (
             <FilterItem
-              key={project.path}
+              key={project.key}
               label={project.name}
-              checked={!hiddenProjects.has(project.path)}
+              checked={!hiddenProjects.has(project.key)}
               icon={
                 project.logoPath ? (
                   <ProjectLogoIcon
@@ -355,7 +356,7 @@ export function InboxFiltersMenu({
                   />
                 ) : undefined
               }
-              onClick={() => toggleProject(project.path)}
+              onClick={() => toggleProject(project.key)}
             />
           ))}
         </>

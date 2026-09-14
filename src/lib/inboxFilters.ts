@@ -276,15 +276,20 @@ export function inboxFetchState(filters: InboxFilters): "open" | "all" {
 export function filterInboxByProject(
   items: readonly InboxItem[],
   hiddenProjects: Iterable<string>,
+  /** Resolves a working copy to its project identity — a hidden rail key or
+   * member path hides every item the project fetched. */
+  keyOf: (path: string) => string = normalizeProjectPath,
 ): InboxItem[] {
   const hidden = new Set(
     [...hiddenProjects].map((path) => normalizeProjectPath(path)),
   );
   if (hidden.size === 0) return [...items];
   return items.filter((item) => {
+    if (!item.projectPath.trim()) return true;
     const path = normalizeProjectPath(item.projectPath);
-    if (!path) return true;
-    return !hidden.has(path);
+    return (
+      !hidden.has(path) && !hidden.has(normalizeProjectPath(keyOf(path)))
+    );
   });
 }
 
@@ -378,6 +383,7 @@ export function applyInboxFilters(
   query: string,
   now = Date.now(),
   source?: InboxSource,
+  keyOf?: (path: string) => string,
 ): InboxItem[] {
   const scoped = source ? filterInboxByProvider(items, source) : [...items];
   const hiddenProjects =
@@ -393,7 +399,7 @@ export function applyInboxFilters(
       filterInboxByTime(
         filterInboxByKind(
           filterInboxByLinearProject(
-            filterInboxByProject(scoped, hiddenProjects),
+            filterInboxByProject(scoped, hiddenProjects, keyOf),
             filters.hiddenLinearProjects,
           ),
           hiddenKinds,

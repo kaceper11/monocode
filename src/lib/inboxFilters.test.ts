@@ -77,6 +77,49 @@ describe("filterInboxByProject", () => {
       filterInboxByProject(rows, ["/tmp/web"]).map((row) => row.number),
     ).toEqual([9]);
   });
+
+  it("hides items through the resolved project key", () => {
+    const rows = [
+      item({
+        number: 1,
+        updatedAt: "2026-08-27T10:00:00Z",
+        projectPath: "/tmp/api",
+      }),
+      item({
+        number: 2,
+        updatedAt: "2026-08-27T10:00:00Z",
+        projectPath: "/tmp/web",
+      }),
+    ];
+    const keyOf = (path: string) =>
+      path === "/tmp/api" ? "project:g1" : path;
+    expect(
+      filterInboxByProject(rows, ["project:g1"], keyOf).map(
+        (row) => row.number,
+      ),
+    ).toEqual([2]);
+  });
+
+  it("still hides by raw member path alongside the project key", () => {
+    const rows = [
+      item({
+        number: 1,
+        updatedAt: "2026-08-27T10:00:00Z",
+        projectPath: "/tmp/api",
+      }),
+      item({
+        number: 2,
+        updatedAt: "2026-08-27T10:00:00Z",
+        projectPath: "/tmp/web",
+      }),
+    ];
+    const keyOf = (path: string) =>
+      path === "/tmp/api" ? "project:g1" : path;
+    // Older saves stored the working-copy path, not the project key.
+    expect(
+      filterInboxByProject(rows, ["/tmp/api"], keyOf).map((row) => row.number),
+    ).toEqual([2]);
+  });
 });
 
 describe("linearProjectOptions", () => {

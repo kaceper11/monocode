@@ -102,11 +102,14 @@ import {
   githubWorkItemDetails,
   githubWorkItemThread,
   gitlabAttentionLabel,
+  inboxFetchPaths,
   inboxItemKey,
   inboxItemRef,
   inboxItemStatus,
   inboxListIsFresh,
+  inboxProjectIdentities,
   inboxProjectsForRail,
+  inboxRailKeyResolver,
   listInboxItems,
   peekGithubWorkItemDetails,
   peekGithubWorkItemThread,
@@ -119,6 +122,7 @@ import {
   type InboxItem,
   type InboxProviderErrors,
   type InboxQuery,
+  type InboxRailProject,
   clearInboxCache,
 } from "../lib/githubTasks";
 import {
@@ -146,6 +150,11 @@ import {
 import { projectKey, projectName } from "../lib/paths";
 import { IS_MAC } from "../lib/platform";
 import { sameProjectPath, type RecentProject } from "../lib/recents";
+import {
+  getVerifiedFamilies,
+  subscribeRepositoryFamilies,
+  type RepositoryFamily,
+} from "../lib/repositoryFamilies";
 import { sessionDisplayTitle, type LinkedWorkItem } from "../lib/session";
 import type { SessionSummary } from "../lib/sessionStore";
 import {
@@ -234,7 +243,12 @@ let rememberedWidth = DEFAULT_WIDTH;
 const rememberedSelections: Partial<Record<InboxSource, string>> = {};
 
 type InboxProjectOption = {
+  /** Rail identity — a normalized path or `project:<id>` for pure groups. */
+  key: string;
+  /** Real folder for new-work defaults — never a `project:` sentinel. */
   path: string;
+  /** Working copies this project fetches through. */
+  paths: string[];
   name: string;
   logoPath: string | null;
   mascotName: string | null;
@@ -242,7 +256,7 @@ type InboxProjectOption = {
 };
 
 function inboxProjectOptions(
-  projects: RecentProject[],
+  projects: InboxRailProject[],
   logos: ReturnType<typeof useTabGroupLogos>,
 ): InboxProjectOption[] {
   const mascots = loadTabGroupMascots();
@@ -250,14 +264,15 @@ function inboxProjectOptions(
   const custom = loadTabGroupCustomColors();
   return [...projects]
     .map((project) => {
-      const name = projectName(project.path);
-      const key = projectKey(project.path);
+      const key = projectKey(project.key);
       return {
-        path: project.path,
-        name,
+        key: project.key,
+        path: project.cwd,
+        paths: project.paths,
+        name: project.name,
         logoPath: resolveTabGroupLogo(key, logos),
         mascotName: resolveTabGroupMascot(key, mascots),
-        mascotColor: resolveTabGroupColor(key, colors, custom, name),
+        mascotColor: resolveTabGroupColor(key, colors, custom, project.name),
       };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -294,9 +309,9 @@ function peekInboxForRail(recents: RecentProject[], cwd: string) {
   const projects = inboxProjectsForRail(recents, cwd);
   const filters = pruneInboxFilters(
     loadInboxFilters(),
-    projects.map((project) => project.path),
+    inboxProjectIdentities(projects),
   );
-  return peekInboxList(projects, {
+  return peekInboxList(inboxFetchPaths(projects), {
     assignedToMe: filters.assignedToMe,
     state: inboxFetchState(filters),
     search: "",
@@ -513,9 +528,40 @@ export function InboxView({
   const [jiraOptionsError, setJiraOptionsError] = useState("");
   const prevRefresh = useRef(refresh);
 
+  // Project rows follow the durable project store and verified repository
+  // families — adding a project or moving a repository republishes both and
+  // lands here without waiting for a remount.
+  const projectsRaw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
+  const [families, setFamilies] = useState<ReadonlyMap<string, RepositoryFamily>>(
+    () => getVerifiedFamilies(),
+  );
+  // Discovery publishes once per probed path; coalesce the burst like the
+  // rail's useRepositoryFamilies instead of regrouping a step at a time.
+  useEffect(() => {
+    let timer = 0;
+    const unsubscribe = subscribeRepositoryFamilies(() => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(
+        () => setFamilies(getVerifiedFamilies()),
+        40,
+      );
+    });
+    return () => {
+      window.clearTimeout(timer);
+      unsubscribe();
+    };
+  }, []);
+  const storedProjects = useMemo(() => loadProjects(), [projectsRaw]);
   const projects = useMemo(
-    () => inboxProjectsForRail(recents, cwd),
-    [cwd, recents],
+    () => inboxProjectsForRail(recents, cwd, storedProjects, families),
+    [cwd, recents, storedProjects, families],
+  );
+  const fetchProjects = useMemo(() => inboxFetchPaths(projects), [projects]);
+  const railKeyOf = useMemo(() => inboxRailKeyResolver(projects), [projects]);
+  const projectByKey = useMemo(
+    () =>
+      new Map(projects.map((project) => [projectKey(project.key), project])),
+    [projects],
   );
   const projectOptions = useMemo(
     () => inboxProjectOptions(projects, logos),
@@ -524,10 +570,7 @@ export function InboxView({
   const linearProjects = useMemo(() => linearProjectOptions(items), [items]);
   const activeFilters = useMemo(
     () =>
-      pruneInboxFilters(
-        filters,
-        projects.map((project) => project.path),
-      ),
+      pruneInboxFilters(filters, inboxProjectIdentities(projects)),
     [filters, projects],
   );
   const filtersActive =
@@ -766,7 +809,7 @@ export function InboxView({
     if (!visible) return;
     const force = refresh !== prevRefresh.current;
     prevRefresh.current = refresh;
-    const cached = peekInboxList(projects, fetchQuery);
+    const cached = peekInboxList(fetchProjects, fetchQuery);
     if (cached) {
       setItems(previous => [...cached.items, ...previous.filter(item =>
         (item.provider === "jira" && cached.errors.jira && jiraSite === item.site) ||
@@ -775,7 +818,7 @@ export function InboxView({
       setProviderErrors(cached.errors);
       setLoading(false);
     }
-    if (!force && cached && inboxListIsFresh(projects, fetchQuery)) {
+    if (!force && cached && inboxListIsFresh(fetchProjects, fetchQuery)) {
       return;
     }
 
@@ -785,7 +828,7 @@ export function InboxView({
       setLoading(true);
       setProviderErrors({});
     }
-    void listInboxItems(projects, fetchQuery, { force })
+    void listInboxItems(fetchProjects, fetchQuery, { force })
       .then((next) => {
         if (cancelled) return;
         setItems(previous => [...next.items, ...previous.filter(item =>
@@ -816,7 +859,7 @@ export function InboxView({
     return () => {
       cancelled = true;
     };
-  }, [visible, fetchQuery, projects, refresh]);
+  }, [visible, fetchQuery, fetchProjects, refresh]);
 
   useEffect(() => {
     if (!visible) return;
@@ -847,6 +890,7 @@ export function InboxView({
       searchInput,
       Date.now(),
       source,
+      railKeyOf,
     );
     if (!target || source !== (target.provider ?? "github")) return visible;
     const targeted =
@@ -859,6 +903,7 @@ export function InboxView({
   }, [
     activeFilters,
     items,
+    railKeyOf,
     searchInput,
     source,
     sourceAvailable,
@@ -874,7 +919,6 @@ export function InboxView({
     subscribeTaskWorkspaces,
     taskWorkspacesSnapshot,
   );
-  const projectsRaw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
   const prDraftsRaw = useSyncExternalStore(subscribeTaskPrs, taskPrsSnapshot);
   const statsVersion = useSyncExternalStore(
     subscribeDiffStatsVersion,
@@ -1032,10 +1076,7 @@ export function InboxView({
   }, [selected, selectedKey, targetSelectionKey]);
 
   const onFiltersChange = (next: InboxFilters) => {
-    const pruned = pruneInboxFilters(
-      next,
-      projects.map((project) => project.path),
-    );
+    const pruned = pruneInboxFilters(next, inboxProjectIdentities(projects));
     setFilters(pruned);
     saveInboxFilters(pruned);
   };
@@ -1237,20 +1278,28 @@ export function InboxView({
           <ul className="flex flex-col gap-0.5 p-1.5">
             {visibleItems.map((item) => {
               const key = inboxItemKey(item);
-              const projectId = projectKey(item.projectPath);
+              // The row a working copy was fetched under — a stored project's
+              // key or its own path when nothing claims it.
+              const projectId = item.projectPath
+                ? projectKey(railKeyOf(item.projectPath))
+                : "";
+              const project = projectId
+                ? projectByKey.get(projectId)
+                : undefined;
               return (
                 <li key={key} className={selectingTickets ? "flex items-center gap-1" : undefined}>
                   {selectingTickets ? <ContextCheckbox label={`Select ${item.provider} ${item.identifier || item.number} ${item.title}`} checked={ticketSelected(item)} disabled={!!item.delivery || pendingTickets.has(contextTicketKey(item))} onChange={() => toggleTicket(item)} /> : null}
                   <div className="min-w-0 flex-1"><InboxCard
                     item={item}
                     active={selected != null && key === inboxItemKey(selected)}
+                    projectLabel={project?.name}
                     logoPath={resolveTabGroupLogo(projectId, logos)}
                     mascotName={resolveTabGroupMascot(projectId, groupMascots)}
                     mascotColor={resolveTabGroupColor(
                       projectId,
                       groupColors,
                       groupCustomColors,
-                      projectName(item.projectPath),
+                      project?.name ?? projectName(item.projectPath),
                     )}
                     relatedSessionCount={relatedSessionCounts.get(item) ?? 0}
                     myWork={myWorkByItem.get(item)}
@@ -1478,6 +1527,7 @@ function inboxStatusMark(item: InboxItem): InboxStatusMark {
 const InboxCard = memo(function InboxCard({
   item,
   active,
+  projectLabel,
   logoPath,
   mascotName,
   mascotColor,
@@ -1487,6 +1537,8 @@ const InboxCard = memo(function InboxCard({
 }: {
   item: InboxItem;
   active: boolean;
+  /** Owning project's display name — falls back to the folder name. */
+  projectLabel?: string;
   logoPath: string | null;
   mascotName: string | null;
   mascotColor: string;
@@ -1503,7 +1555,7 @@ const InboxCard = memo(function InboxCard({
         : "Pull request"
       : "Issue";
   const time = formatRelativeTime(item.updatedAt);
-  const name = projectName(item.projectPath);
+  const name = projectLabel?.trim() || projectName(item.projectPath);
   const linear = item.provider === "linear";
   const jira = item.provider === "jira";
   const azure = item.provider === "azure";
@@ -1711,7 +1763,11 @@ export function InboxDetail({
   const [posting, setPosting] = useState(false);
   const [postError, setPostError] = useState<string | null>(null);
   const defaultProject =
-    projects.find((project) => sameProjectPath(project.path, cwd))?.path ??
+    projects.find(
+      (project) =>
+        sameProjectPath(project.path, cwd) ||
+        project.paths.some((path) => sameProjectPath(path, cwd)),
+    )?.path ??
     projects[0]?.path ??
     cwd;
   const [startProject, setStartProject] = useState(defaultProject);
@@ -2376,9 +2432,11 @@ function InboxProjectPicker({
   const button = useRef<HTMLButtonElement>(null);
   const menu = useRef<HTMLDivElement>(null);
   const selected =
-    projects.find((project) => sameProjectPath(project.path, value)) ??
-    projects[0] ??
-    null;
+    projects.find(
+      (project) =>
+        sameProjectPath(project.path, value) ||
+        project.paths.some((path) => sameProjectPath(path, value)),
+    ) ?? projects[0] ?? null;
 
   useEffect(() => {
     if (!open) return;
@@ -2428,11 +2486,11 @@ function InboxProjectPicker({
         >
           {projects.map((project) => {
             const active = selected
-              ? sameProjectPath(project.path, selected.path)
+              ? project.key === selected.key
               : false;
             return (
               <button
-                key={project.path}
+                key={project.key}
                 type="button"
                 role="option"
                 aria-selected={active}
