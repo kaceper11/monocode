@@ -208,4 +208,14 @@ describe("MuseSubagentTrails", () => {
     expect(trails.get("child-15")).toBeDefined();
     expect(trails.get("child-19")).toBeUndefined();
   });
+  it("bounds retained prose while a child remains followed", () => {
+    const trails = new MuseSubagentTrails();
+    trails.register("child", "root");
+    for (let i = 0; i < 300; i++) {
+      trails.route("child", "item/completed", { item: { itemId: `message-${i}`, kind: "agentMessage", text: "x".repeat(9000), status: "completed" } });
+    }
+    expect(trails.get("child")!.prose.size).toBe(128);
+    expect(trails.get("child")!.prose.get("message-299")!.text).toHaveLength(8000);
+  });
+
 });

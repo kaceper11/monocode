@@ -13,8 +13,8 @@ use tauri::{AppHandle, Manager, State};
 #[cfg(test)]
 use crate::fs::GitDiffStats;
 use crate::fs::{
-    expand_home, git_checked, git_diff_files_for, host_path, path_to_js, resolve_repo_path,
-    GitChangedFile, GitDiffIndex, MAX_TEXT_FILE_BYTES,
+    expand_home, git_checked, git_checkpoint_paths, git_command_output, git_diff_files_for,
+    host_path, path_to_js, resolve_repo_path, GitChangedFile, GitDiffIndex, MAX_TEXT_FILE_BYTES,
 };
 
 const MAX_SNAPSHOT_FILES: usize = 500;
@@ -85,16 +85,39 @@ impl CheckpointStore {
         }
         std::fs::create_dir_all(dir.join("files")).map_err(|e| e.to_string())?;
 
+        let paths: Vec<_> = git_checkpoint_paths(&root)
+            .into_iter()
+            .filter_map(|path| resolve_repo_path(&root, &path).ok())
+            .take(MAX_SNAPSHOT_FILES)
+            .collect();
+        // One HEAD lookup instead of a Git/WSL round trip per dirty file.
+        let head = if paths.is_empty() {
+            None
+        } else {
+            git_command_output(
+                &root,
+                &["ls-tree", "-r", "--name-only", "-z", "HEAD", "--", "."],
+            )
+            .ok()
+            .filter(|output| output.status.success())
+        };
+        let candidates: HashSet<_> = paths.iter().map(|path| path.as_bytes()).collect();
+        let head_paths: HashSet<_> = head
+            .as_ref()
+            .map(|output| {
+                output
+                    .stdout
+                    .split(|byte| *byte == 0)
+                    .filter(|path| candidates.contains(path))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut files = BTreeMap::new();
         let mut tracked = BTreeSet::new();
-        for file in git_diff_files_for(&root).files {
-            if files.len() >= MAX_SNAPSHOT_FILES {
-                break;
-            }
-            let Ok(relative) = resolve_repo_path(&root, &file.relative) else {
-                continue;
-            };
-            if in_head(&root, &relative) {
+        for relative in paths {
+            if head_paths.contains(relative.as_bytes())
+                || (head.is_none() && in_head(&root, &relative))
+            {
                 tracked.insert(relative.clone());
             }
             files.insert(relative.clone(), snapshot_file(&dir, &root, &relative)?);
@@ -1933,5 +1956,128 @@ pub(crate) mod tests {
     fn rejects_invalid_session_id() {
         let err = validate_id("../x", "session").unwrap_err();
         assert!(err.contains("Invalid"));
+    }
+
+    #[test]
+    fn fast_checkpoint_preserves_dirty_paths_and_head_ownership() {
+        let repo = tmp("fast-paths");
+        assert!(init_git_commit(
+            &repo.0,
+            &[
+                ("dirty.txt", "head\n"),
+                ("deleted.txt", "head\n"),
+                ("rename.txt", "head\n"),
+                ("parked.txt", "head\n"),
+                ("nested/spaced ü.txt", "head\n")
+            ]
+        ));
+        std::fs::write(repo.0.join("dirty.txt"), "user dirty\n").unwrap();
+        std::fs::remove_file(repo.0.join("deleted.txt")).unwrap();
+        assert!(git(&repo.0, &["mv", "rename.txt", "renamed.txt"]));
+        std::fs::write(repo.0.join("new.txt"), "user untracked\n").unwrap();
+        std::fs::write(repo.0.join("staged.txt"), "user staged\n").unwrap();
+        assert!(git(&repo.0, &["add", "staged.txt"]));
+        assert!(git(
+            &repo.0,
+            &["update-index", "--skip-worktree", "parked.txt"]
+        ));
+        std::fs::write(repo.0.join("parked.txt"), "kept local\n").unwrap();
+        std::fs::write(repo.0.join("nested/spaced ü.txt"), "nested dirty\n").unwrap();
+        let expected: Vec<_> = git_diff_files_for(&repo.0)
+            .files
+            .into_iter()
+            .map(|file| file.relative)
+            .collect();
+        assert_eq!(git_checkpoint_paths(&repo.0), expected);
+        let (_dir, store) = store();
+        let cwd = repo.0.to_string_lossy();
+        store.ensure("s", &cwd).unwrap();
+        let manifest = read_manifest(&store.session_dir("s")).unwrap().unwrap();
+        assert_eq!(manifest.files.keys().cloned().collect::<Vec<_>>(), expected);
+        assert_eq!(
+            manifest.tracked,
+            BTreeSet::from([
+                "deleted.txt".into(),
+                "dirty.txt".into(),
+                "nested/spaced ü.txt".into(),
+                "rename.txt".into()
+            ])
+        );
+        store
+            .ensure("nested", &repo.0.join("nested").to_string_lossy())
+            .unwrap();
+        let nested = read_manifest(&store.session_dir("nested"))
+            .unwrap()
+            .unwrap();
+        assert!(nested.tracked.contains("spaced ü.txt"));
+        record(&store, "s", &cwd, &["dirty.txt", "new.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("parked.txt")).unwrap(),
+            "kept local\n"
+        );
+    }
+
+    #[test]
+    fn fast_checkpoint_handles_unborn_head() {
+        let repo = tmp("unborn-fast");
+        assert!(git(&repo.0, &["init"]));
+        std::fs::write(repo.0.join("new.txt"), "before\n").unwrap();
+        assert_eq!(git_checkpoint_paths(&repo.0), vec!["new.txt"]);
+        let (_dir, store) = store();
+        store.ensure("s", &repo.0.to_string_lossy()).unwrap();
+        let manifest = read_manifest(&store.session_dir("s")).unwrap().unwrap();
+        assert!(manifest.tracked.is_empty());
+        assert_eq!(manifest.files.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "release-mode filesystem benchmark; writes disposable repositories"]
+    fn checkpoint_send_latency_benchmark() {
+        let mut samples = Vec::new();
+        for (name, count, untracked) in [
+            ("clean", 0, false),
+            ("50-dirty", 50, false),
+            ("250-dirty", 250, false),
+            ("250-untracked", 250, true),
+        ] {
+            let repo = tmp(name);
+            let original = "original content line\n".repeat(2048);
+            let names: Vec<_> = (0..count).map(|i| format!("file-{i:04}.txt")).collect();
+            let files: Vec<_> = names
+                .iter()
+                .map(|name| (name.as_str(), original.as_str()))
+                .collect();
+            assert!(init_git_commit(
+                &repo.0,
+                if untracked || count == 0 {
+                    &[("seed.txt", "seed\n")]
+                } else {
+                    &files
+                }
+            ));
+            for name in &names {
+                std::fs::write(repo.0.join(name), format!("changed\n{original}")).unwrap();
+            }
+            let cwd = repo.0.to_string_lossy().into_owned();
+            for run in 0..10 {
+                let (_dir, store) = store();
+                let start = std::time::Instant::now();
+                store
+                    .exclusive("bench", &cwd, |store| store.ensure("bench", &cwd))
+                    .unwrap();
+                let initial_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let start = std::time::Instant::now();
+                store
+                    .exclusive("bench", &cwd, |store| store.ensure("bench", &cwd))
+                    .unwrap();
+                let warm_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let manifest = read_manifest(&store.session_dir("bench")).unwrap().unwrap();
+                assert_eq!(manifest.files.len(), count);
+                samples.push(serde_json::json!({"case":name,"run":run,"initialMs":initial_ms,"warmMs":warm_ms}));
+            }
+        }
+        let path =
+            std::env::var("MONOCODE_CHECKPOINT_BENCH_JSON").expect("set measurement output path");
+        std::fs::write(path, serde_json::to_vec_pretty(&samples).unwrap()).unwrap();
     }
 }

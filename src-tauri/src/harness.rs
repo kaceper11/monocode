@@ -6,9 +6,7 @@ use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, LazyLock, Mutex};
 use std::thread;
-use std::time::Duration;
-#[cfg(not(windows))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -27,6 +25,7 @@ const SSE_END_EVENT: &str = "harness-sse-end";
 #[serde(rename_all = "camelCase")]
 struct HarnessLine {
     session_id: String,
+    generation: u64,
     line: String,
 }
 
@@ -34,6 +33,7 @@ struct HarnessLine {
 #[serde(rename_all = "camelCase")]
 struct HarnessExit {
     session_id: String,
+    generation: u64,
     code: Option<i32>,
     pid: u32,
 }
@@ -42,6 +42,7 @@ struct HarnessExit {
 #[serde(rename_all = "camelCase")]
 struct HarnessSse {
     session_id: String,
+    generation: u64,
     data: String,
 }
 
@@ -49,6 +50,7 @@ struct HarnessSse {
 #[serde(rename_all = "camelCase")]
 struct HarnessSseEnd {
     session_id: String,
+    generation: u64,
     error: Option<String>,
 }
 
@@ -66,6 +68,7 @@ pub struct CursorBinary {
 }
 
 struct LiveChild {
+    generation: u64,
     stdin: Mutex<ChildStdin>,
     pid: u32,
     linux: Option<crate::wsl::LinuxProcess>,
@@ -83,13 +86,35 @@ impl LiveChild {
     }
 }
 
+#[derive(Default)]
 struct LiveSse {
-    stop: Arc<AtomicBool>,
+    stop: AtomicBool,
+    task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+impl LiveSse {
+    fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(task) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            task.abort();
+        }
+    }
+
+    fn install_task(&self, task: tauri::async_runtime::JoinHandle<()>) {
+        let mut slot = self.task.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stop.load(Ordering::SeqCst) {
+            task.abort();
+        } else {
+            *slot = Some(task);
+        }
+    }
 }
 
 struct HarnessInner {
     children: HashMap<String, Arc<LiveChild>>,
     epochs: HashMap<String, u64>,
+    client_generations: HashMap<String, u64>,
+    sse_generations: HashMap<String, u64>,
 }
 
 pub struct HarnessHost {
@@ -97,6 +122,7 @@ pub struct HarnessHost {
     sse: Mutex<HashMap<String, Arc<LiveSse>>>,
     /// Bumped by `kill_all` so a spawn that started before quit cannot reinsert.
     kill_all_gen: AtomicU64,
+    client_floor: AtomicU64,
 }
 
 impl HarnessHost {
@@ -105,9 +131,12 @@ impl HarnessHost {
             inner: Mutex::new(HarnessInner {
                 children: HashMap::new(),
                 epochs: HashMap::new(),
+                client_generations: HashMap::new(),
+                sse_generations: HashMap::new(),
             }),
             sse: Mutex::new(HashMap::new()),
             kill_all_gen: AtomicU64::new(0),
+            client_floor: AtomicU64::new(0),
         }
     }
 
@@ -120,14 +149,31 @@ impl HarnessHost {
     }
 
     /// Stamp this spawn and drop any child already registered under the id.
-    fn begin_spawn(&self, session_id: &str) -> (u64, u64, Option<Arc<LiveChild>>) {
+    fn begin_spawn(
+        &self,
+        session_id: &str,
+        generation: Option<u64>,
+    ) -> Result<(u64, u64, Option<Arc<LiveChild>>), String> {
         let mut inner = self.lock_inner();
+        if let Some(generation) = generation {
+            if generation <= self.client_floor.load(Ordering::SeqCst) {
+                return Err(SPAWN_CANCELLED.into());
+            }
+            let current = inner
+                .client_generations
+                .entry(session_id.to_string())
+                .or_default();
+            if generation <= *current {
+                return Err(SPAWN_CANCELLED.into());
+            }
+            *current = generation;
+        }
         let kill_all = self.kill_all_gen.load(Ordering::SeqCst);
         let epoch = inner.epochs.entry(session_id.to_string()).or_insert(0);
         *epoch += 1;
         let epoch = *epoch;
         let prev = inner.children.remove(session_id);
-        (epoch, kill_all, prev)
+        Ok((epoch, kill_all, prev))
     }
 
     #[cfg(all(test, unix))]
@@ -185,8 +231,15 @@ impl HarnessHost {
     /// reviewed worktree. Returns the stopped child's pid so callers can wait
     /// out the TERM→KILL escalation and report survivors.
     pub(crate) fn kill_id(&self, session_id: &str) -> Result<Option<u32>, String> {
-        self.stop_sse(session_id);
-        if let Some(live) = self.kill_session(session_id) {
+        self.kill_client(session_id, None)
+    }
+
+    fn kill_client(
+        &self,
+        session_id: &str,
+        generation: Option<u64>,
+    ) -> Result<Option<u32>, String> {
+        if let Some(live) = self.kill_session(session_id, generation) {
             live.terminate()?;
             self.remove_if_pid(session_id, live.pid);
             return Ok(Some(live.pid));
@@ -194,8 +247,28 @@ impl HarnessHost {
         Ok(None)
     }
 
-    fn kill_session(&self, session_id: &str) -> Option<Arc<LiveChild>> {
+    fn kill_session(&self, session_id: &str, generation: Option<u64>) -> Option<Arc<LiveChild>> {
         let mut inner = self.lock_inner();
+        let mut stop_stream = true;
+        if let Some(generation) = generation {
+            let current = inner
+                .client_generations
+                .entry(session_id.to_string())
+                .or_default();
+            if generation <= *current {
+                return None;
+            }
+            *current = generation;
+            let stream = inner
+                .sse_generations
+                .entry(session_id.to_string())
+                .or_default();
+            stop_stream = generation >= *stream;
+            *stream = (*stream).max(generation);
+        }
+        if stop_stream {
+            self.stop_sse(session_id);
+        }
         *inner.epochs.entry(session_id.to_string()).or_insert(0) += 1;
         // Keep failed cancellations addressable; remove only this PID after cleanup.
         inner.children.get(session_id).cloned()
@@ -207,6 +280,17 @@ impl HarnessHost {
             return None;
         }
         inner.children.remove(session_id)
+    }
+
+    fn remove_exited_child(&self, session_id: &str, pid: u32) {
+        let mut inner = self.lock_inner();
+        if inner.children.get(session_id).map(|live| live.pid) != Some(pid) {
+            return;
+        }
+        inner.children.remove(session_id);
+        // Keep child removal and its stream close atomic with replacement.
+        // All operations that take both locks use inner -> sse ordering.
+        self.stop_sse(session_id);
     }
 
     pub(crate) fn kill_all(&self) {
@@ -236,6 +320,28 @@ impl HarnessHost {
         terminate_all(&pids);
     }
 
+    fn replace_client_sse(
+        &self,
+        session_id: String,
+        generation: u64,
+        next: Option<Arc<LiveSse>>,
+    ) -> Result<(), String> {
+        let mut inner = self.lock_inner();
+        if generation <= self.client_floor.load(Ordering::SeqCst) {
+            return Err("Event stream operation cancelled".into());
+        }
+        let current = inner.sse_generations.entry(session_id.clone()).or_default();
+        if generation <= *current {
+            return Err("Event stream operation cancelled".into());
+        }
+        *current = generation;
+        self.stop_sse(&session_id);
+        if let Some(next) = next {
+            self.insert_sse(session_id, next);
+        }
+        Ok(())
+    }
+
     fn insert_sse(&self, session_id: String, live: Arc<LiveSse>) -> Option<Arc<LiveSse>> {
         self.sse
             .lock()
@@ -250,7 +356,7 @@ impl HarnessHost {
             .unwrap_or_else(|e| e.into_inner())
             .remove(session_id)
         {
-            live.stop.store(true, Ordering::SeqCst);
+            live.stop();
         }
     }
 
@@ -260,7 +366,7 @@ impl HarnessHost {
             map.drain().map(|(_, live)| live).collect()
         };
         for live in streams {
-            live.stop.store(true, Ordering::SeqCst);
+            live.stop();
         }
     }
 
@@ -280,6 +386,7 @@ impl HarnessHost {
         self.lock_inner().children.insert(
             session_id.into(),
             Arc::new(LiveChild {
+                generation: 0,
                 stdin: Mutex::new(stdin),
                 pid,
                 linux: None,
@@ -293,12 +400,7 @@ impl HarnessHost {
     /// session attribution.
     #[cfg(all(test, unix))]
     pub(crate) fn add_test_sse(&self, session_id: &str) {
-        self.insert_sse(
-            session_id.into(),
-            Arc::new(LiveSse {
-                stop: Arc::new(AtomicBool::new(false)),
-            }),
-        );
+        self.insert_sse(session_id.into(), Arc::new(LiveSse::default()));
     }
 }
 
@@ -463,12 +565,13 @@ pub fn harness_spawn(
     command: String,
     args: Vec<String>,
     cwd: String,
+    generation: u64,
 ) -> Result<u32, String> {
     let location = crate::wsl::location(&cwd)?;
     let _worktree_guard = crate::fs::worktrees::LIFECYCLE
         .try_read()
         .map_err(|_| "Worktree operation in progress; retry startup after it completes")?;
-    let (epoch, kill_all, prev) = host.begin_spawn(&session_id);
+    let (epoch, kill_all, prev) = host.begin_spawn(&session_id, Some(generation))?;
     if let Some(prev) = prev {
         if let Err(error) = prev.terminate() {
             host.install_spawn(session_id, epoch, kill_all, prev);
@@ -530,6 +633,7 @@ pub fn harness_spawn(
     };
 
     let live = Arc::new(LiveChild {
+        generation,
         stdin: Mutex::new(stdin),
         pid,
         linux,
@@ -563,11 +667,25 @@ pub fn harness_spawn(
         }
     }
 
+    // Readers own the terminal tail. Exit must follow their final emissions.
+    let output_open = Arc::new(Mutex::new(true));
+    let (output_done, output_drained) = mpsc::channel();
+    let stdout_open = output_open.clone();
+    let stderr_open = output_open.clone();
+    let stdout_done = output_done.clone();
     let stdout_app = app.clone();
     let stdout_id = session_id.clone();
     let stdout_live = Arc::clone(&live);
     thread::spawn(move || {
-        stream_lines(stdout, &stdout_app, &stdout_id, STDOUT_EVENT, &stdout_live);
+        stream_lines(
+            stdout,
+            &stdout_app,
+            &stdout_id,
+            STDOUT_EVENT,
+            &stdout_live,
+            &stdout_open,
+        );
+        let _ = stdout_done.send(());
     });
 
     let stderr_app = app.clone();
@@ -579,7 +697,9 @@ pub fn harness_spawn(
             &stderr_id,
             STDERR_EVENT,
             &live,
+            &stderr_open,
         );
+        let _ = output_done.send(());
     });
 
     let wait_app = app.clone();
@@ -587,15 +707,17 @@ pub fn harness_spawn(
     let wait_pid = pid;
     thread::spawn(move || {
         let code = child.wait().ok().and_then(|status| status.code());
+        // Descendants can retain inherited pipes after the CLI exits. Bound
+        // draining, then close the emission gate before delivering exit.
+        drain_output(output_drained, &output_open, Duration::from_secs(1));
         if let Some(host) = wait_app.try_state::<HarnessHost>() {
-            if host.remove_if_pid(&wait_id, wait_pid).is_some() {
-                host.stop_sse(&wait_id);
-            }
+            host.remove_exited_child(&wait_id, wait_pid);
         }
         let _ = wait_app.emit(
             EXIT_EVENT,
             HarnessExit {
                 session_id: wait_id,
+                generation,
                 code,
                 pid: wait_pid,
             },
@@ -605,19 +727,76 @@ pub fn harness_spawn(
     Ok(pid)
 }
 
-#[tauri::command]
+fn drain_output(done: mpsc::Receiver<()>, output_open: &Mutex<bool>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    for _ in 0..2 {
+        if done
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_err()
+        {
+            break;
+        }
+    }
+    *output_open.lock().unwrap_or_else(|e| e.into_inner()) = false;
+}
+
+// Process startup expands home aliases; protocol workspace fields must match.
+// Only execution-path fields are translated, never prompts or nested tool data.
+fn native_agent_cwd(line: String) -> Result<String, String> {
+    // Cheap fast-path: only a JSON request can carry a `~` field value worth
+    // expanding, and one always starts with '{' and shows `~` as `"~`.
+    // Anything else (including multi-MiB attachment payloads) skips the parse.
+    if !(line.starts_with('{') && line.contains("\"~")) {
+        return Ok(line);
+    }
+    let Ok(mut message) = serde_json::from_str::<serde_json::Value>(&line) else {
+        return Ok(line);
+    };
+    if message
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        return Ok(line);
+    }
+    let mut changed = false;
+    for field in ["cwd", "workspaceRoot"] {
+        let Some(cwd) = message["params"][field].as_str() else {
+            continue;
+        };
+        let expanded = expand_home(cwd);
+        if expanded == std::path::Path::new(cwd) {
+            continue;
+        }
+        if !expanded.is_absolute() {
+            return Err("Could not resolve the agent home directory".into());
+        }
+        message["params"][field] = crate::fs::path_to_js(&expanded).into();
+        changed = true;
+    }
+    Ok(if changed { message.to_string() } else { line })
+}
+
+#[tauri::command(async)]
 pub fn harness_write(
     host: State<HarnessHost>,
     session_id: String,
     line: String,
+    generation: u64,
 ) -> Result<(), String> {
+    if line.len() > 64 * 1024 * 1024 {
+        return Err("Harness input exceeds 64 MiB".into());
+    }
     let live = host
         .get(&session_id)
         .ok_or_else(|| "Harness process is not running".to_string())?;
+    if live.generation != generation {
+        return Err("Harness write cancelled".into());
+    }
     let line = if let Some(linux) = &live.linux {
         linux.protocol_line(line)?
     } else {
-        line
+        native_agent_cwd(line)?
     };
     let mut stdin = live.stdin.lock().unwrap_or_else(|e| e.into_inner());
     stdin
@@ -628,8 +807,12 @@ pub fn harness_write(
 }
 
 #[tauri::command(async)]
-pub fn harness_kill(host: State<HarnessHost>, session_id: String) -> Result<(), String> {
-    host.kill_id(&session_id).map(|_| ())
+pub fn harness_kill(
+    host: State<HarnessHost>,
+    session_id: String,
+    generation: u64,
+) -> Result<(), String> {
+    host.kill_client(&session_id, Some(generation)).map(|_| ())
 }
 
 const MAX_HARNESS_LINE_BYTES: u64 = 32 * 1024 * 1024;
@@ -644,7 +827,7 @@ fn bounded_line(reader: &mut impl BufRead, limit: u64) -> Result<Option<String>,
         return Ok(None);
     }
     if count as u64 > limit {
-        return Err("Agent output line exceeds 32 MiB; the process was stopped".into());
+        return Err("Agent output line exceeds 32 MiB".into());
     }
     if line.ends_with('\n') {
         line.pop();
@@ -661,20 +844,30 @@ fn stream_lines(
     session_id: &str,
     event: &str,
     live: &LiveChild,
+    output_open: &Mutex<bool>,
 ) {
     loop {
         match bounded_line(&mut reader, MAX_HARNESS_LINE_BYTES) {
             Ok(Some(line)) => {
+                let open = output_open.lock().unwrap_or_else(|e| e.into_inner());
+                if !*open {
+                    break;
+                }
                 let _ = app.emit(
                     event,
                     HarnessLine {
                         session_id: session_id.into(),
+                        generation: live.generation,
                         line,
                     },
                 );
             }
             Ok(None) => break,
             Err(error) => {
+                let open = output_open.lock().unwrap_or_else(|e| e.into_inner());
+                if !*open {
+                    break;
+                }
                 let cleanup = live
                     .terminate()
                     .err()
@@ -684,6 +877,7 @@ fn stream_lines(
                     STDERR_EVENT,
                     HarnessLine {
                         session_id: session_id.into(),
+                        generation: live.generation,
                         line: format!("{error}{cleanup}"),
                     },
                 );
@@ -696,7 +890,8 @@ fn stream_lines(
 /// Off the main thread: `kill_all` waits for the children to die before it
 /// returns, and a window close calls this while the app keeps running.
 #[tauri::command(async)]
-pub fn harness_kill_all(host: State<'_, HarnessHost>) -> Result<(), String> {
+pub fn harness_kill_all(host: State<'_, HarnessHost>, generation: u64) -> Result<(), String> {
+    host.client_floor.fetch_max(generation, Ordering::SeqCst);
     host.kill_all();
     Ok(())
 }
@@ -743,6 +938,7 @@ pub fn harness_sse_open(
     session_id: String,
     url: String,
     headers: Option<HashMap<String, String>>,
+    generation: u64,
 ) -> Result<(), String> {
     assert_loopback(&url)?;
     // A stream-only session is removal-binding evidence; registration must
@@ -750,55 +946,41 @@ pub fn harness_sse_open(
     let _worktree_guard = crate::fs::worktrees::LIFECYCLE
         .try_read()
         .map_err(|_| "Worktree operation in progress; retry startup after it completes")?;
-    host.stop_sse(&session_id);
-    let stop = Arc::new(AtomicBool::new(false));
-    host.insert_sse(
-        session_id.clone(),
-        Arc::new(LiveSse {
-            stop: Arc::clone(&stop),
-        }),
-    );
+    let live = Arc::new(LiveSse::default());
+    host.replace_client_sse(session_id.clone(), generation, Some(live.clone()))?;
 
-    thread::spawn(move || {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(60 * 60 * 6))
-            .timeout_write(Duration::from_secs(30))
-            .build();
-        let mut request = agent.get(&url).set("Accept", "text/event-stream");
-        if let Some(headers) = &headers {
-            for (key, value) in headers {
-                request = request.set(key, value);
-            }
-        }
-        let result = request.call();
-        if stop.load(Ordering::SeqCst) {
-            emit_sse_end(&app, &session_id, None);
-            return;
-        }
-        match result {
-            Ok(response) => {
-                let reader = BufReader::new(response.into_reader());
-                read_sse(reader, &app, &session_id, &stop);
-                emit_sse_end(&app, &session_id, None);
-            }
-            Err(error) => {
-                emit_sse_end(
-                    &app,
-                    &session_id,
-                    Some(format!("OpenCode event stream failed: {error}")),
+    let stream = live.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        let result = receive_sse(&url, headers.as_ref(), |data| {
+            if !stream.stop.load(Ordering::SeqCst) {
+                let _ = app.emit(
+                    SSE_EVENT,
+                    HarnessSse {
+                        session_id: session_id.clone(),
+                        generation,
+                        data,
+                    },
                 );
             }
+        })
+        .await;
+        if !stream.stop.load(Ordering::SeqCst) {
+            emit_sse_end(&app, &session_id, generation, result.err());
         }
     });
+    // Close/replacement may have won while the task was being created.
+    live.install_task(task);
 
     Ok(())
 }
 
 #[tauri::command]
-pub fn harness_sse_close(host: State<HarnessHost>, session_id: String) -> Result<(), String> {
-    host.stop_sse(&session_id);
-    Ok(())
+pub fn harness_sse_close(
+    host: State<HarnessHost>,
+    session_id: String,
+    generation: u64,
+) -> Result<(), String> {
+    host.replace_client_sse(session_id, generation, None)
 }
 
 fn read_http_response(response: ureq::Response) -> Result<HarnessHttpResponse, String> {
@@ -809,58 +991,118 @@ fn read_http_response(response: ureq::Response) -> Result<HarnessHttpResponse, S
     Ok(HarnessHttpResponse { status, body })
 }
 
-fn read_sse<R: BufRead>(reader: R, app: &AppHandle, session_id: &str, stop: &AtomicBool) {
-    let mut data = String::new();
-    for line in reader.lines() {
-        if stop.load(Ordering::SeqCst) {
-            break;
+async fn receive_sse(
+    url: &str,
+    headers: Option<&HashMap<String, String>>,
+    mut emit: impl FnMut(String),
+) -> Result<(), String> {
+    assert_loopback(url)?;
+    // Reuse the installed ring backend without changing the global TLS default.
+    // SSE is HTTP loopback-only, so this client needs no TLS trust roots.
+    let tls = ureq::rustls::ClientConfig::builder_with_provider(Arc::new(
+        ureq::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| e.to_string())?
+    .with_root_certificates(ureq::rustls::RootCertStore::empty())
+    .with_no_client_auth();
+    let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .connect_timeout(Duration::from_secs(10))
+        // Agent streams are local. Never follow redirects or inherit a proxy.
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut request = client.get(url).header("Accept", "text/event-stream");
+    if let Some(headers) = headers {
+        for (key, value) in headers {
+            request = request.header(key, value);
         }
-        let Ok(line) = line else { break };
-        if line.starts_with(':') {
-            continue;
-        }
-        if line.is_empty() {
-            if data.is_empty() {
+    }
+    let mut response = request.send().await.map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "OpenCode event stream failed: HTTP {}",
+            response.status()
+        ));
+    }
+    let mut parser = SseParser::default();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        parser.push(&chunk, &mut emit)?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct SseParser {
+    line: Vec<u8>,
+    data: String,
+}
+
+impl SseParser {
+    fn push(&mut self, chunk: &[u8], emit: &mut impl FnMut(String)) -> Result<(), String> {
+        // Split before appending: a body chunk can contain many bounded events.
+        for part in chunk.split_inclusive(|byte| *byte == b'\n') {
+            if self.line.len().saturating_add(part.len()) > MAX_HARNESS_LINE_BYTES as usize {
+                return Err("Agent output line exceeds 32 MiB".into());
+            }
+            self.line.extend_from_slice(part);
+            if !part.ends_with(b"\n") {
                 continue;
             }
-            let payload = std::mem::take(&mut data);
-            let _ = app.emit(
-                SSE_EVENT,
-                HarnessSse {
-                    session_id: session_id.to_string(),
-                    data: payload,
-                },
-            );
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("data:") {
-            let piece = rest.strip_prefix(' ').unwrap_or(rest);
-            if !data.is_empty() {
-                data.push('\n');
+            self.line.pop();
+            if self.line.last() == Some(&b'\r') {
+                self.line.pop();
             }
-            data.push_str(piece);
+            let line = std::str::from_utf8(&self.line).map_err(|e| e.to_string())?;
+            if line.is_empty() {
+                if !self.data.is_empty() {
+                    emit(std::mem::take(&mut self.data));
+                }
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                let piece = rest.strip_prefix(' ').unwrap_or(rest);
+                let separator = usize::from(!self.data.is_empty());
+                if self
+                    .data
+                    .len()
+                    .saturating_add(separator)
+                    .saturating_add(piece.len())
+                    > MAX_HARNESS_LINE_BYTES as usize
+                {
+                    return Err("Agent event exceeds 32 MiB".into());
+                }
+                if separator != 0 {
+                    self.data.push('\n');
+                }
+                self.data.push_str(piece);
+            }
+            self.line.clear();
         }
+        Ok(())
     }
 }
 
-fn emit_sse_end(app: &AppHandle, session_id: &str, error: Option<String>) {
+fn emit_sse_end(app: &AppHandle, session_id: &str, generation: u64, error: Option<String>) {
     let _ = app.emit(
         SSE_END_EVENT,
         HarnessSseEnd {
             session_id: session_id.to_string(),
+            generation,
             error,
         },
     );
 }
 
 fn assert_loopback(url: &str) -> Result<(), String> {
-    let lower = url.to_ascii_lowercase();
-    if lower.starts_with("http://127.0.0.1:")
-        || lower.starts_with("http://127.0.0.1/")
-        || lower.starts_with("http://localhost:")
-        || lower.starts_with("http://localhost/")
-    {
-        return Ok(());
+    if let Ok(url) = reqwest::Url::parse(url) {
+        if url.scheme() == "http"
+            && matches!(url.host_str(), Some("127.0.0.1" | "localhost"))
+            && url.username().is_empty()
+            && url.password().is_none()
+        {
+            return Ok(());
+        }
     }
     Err("OpenCode HTTP is limited to localhost".into())
 }
@@ -2683,6 +2925,7 @@ mod tests {
         let stdin = child.stdin.take().expect("test child stdin");
         (
             Arc::new(LiveChild {
+                generation: 0,
                 linux: None,
                 stdin: Mutex::new(stdin),
                 pid,
@@ -2695,6 +2938,350 @@ mod tests {
     fn reap(mut child: std::process::Child) {
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn client_kill_fences_a_spawn_that_has_not_started_and_cannot_kill_a_newer_child() {
+        let host = HarnessHost::new();
+        host.kill_client("same", Some(20)).unwrap();
+        assert!(host.begin_spawn("same", Some(19)).is_err());
+        assert!(host.replace_client_sse("same".into(), 19, None).is_err());
+        let (epoch, all, _) = host.begin_spawn("same", Some(21)).unwrap();
+        let (live, child) = live_child();
+        let pid = live.pid;
+        assert!(host
+            .install_spawn("same".into(), epoch, all, live)
+            .is_none());
+        assert!(host.kill_client("same", Some(20)).unwrap().is_none());
+        assert_eq!(host.get("same").unwrap().pid, pid);
+        host.kill_id("same").unwrap();
+        reap(child);
+    }
+
+    #[test]
+    fn client_shutdown_fences_commands_queued_before_native_admission() {
+        let host = HarnessHost::new();
+        host.client_floor.store(20, Ordering::SeqCst);
+        host.kill_all();
+        assert!(host.begin_spawn("late", Some(19)).is_err());
+        assert!(host.replace_client_sse("late".into(), 19, None).is_err());
+        assert!(host.begin_spawn("new", Some(21)).is_ok());
+    }
+
+    #[test]
+    fn loopback_urls_validate_the_parsed_destination() {
+        for url in ["http://127.0.0.1:123/event", "http://localhost/event"] {
+            assert!(assert_loopback(url).is_ok());
+        }
+        for url in [
+            "http://localhost:80@evil.example/event",
+            "http://127.0.0.1:80@evil.example/event",
+            "https://localhost/event",
+            "http://example.com/event",
+        ] {
+            assert!(assert_loopback(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn sse_parser_preserves_split_utf8_crlf_and_multiline_events() {
+        let mut parser = SseParser::default();
+        let mut events = Vec::new();
+        let bytes = ": heartbeat\r\ndata: żółw\r\ndata: second\r\n\r\ndata: next\n\n".as_bytes();
+        for byte in bytes {
+            parser
+                .push(&[*byte], &mut |data| events.push(data))
+                .unwrap();
+        }
+        assert_eq!(events, ["żółw\nsecond", "next"]);
+    }
+
+    #[test]
+    fn sse_parser_bounds_partial_lines_and_multiline_events() {
+        let mut parser = SseParser::default();
+        parser.line.resize(MAX_HARNESS_LINE_BYTES as usize, b'x');
+        assert!(parser.push(b"x", &mut |_| {}).is_err());
+        parser.line.clear();
+        parser.data = "x".repeat(MAX_HARNESS_LINE_BYTES as usize);
+        assert!(parser.push(b"data: x\n", &mut |_| {}).is_err());
+    }
+
+    #[test]
+    fn closing_idle_sse_drops_the_socket_without_waiting_for_peer_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/event", listener.local_addr().unwrap());
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = BufReader::new(socket.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                request.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nD\r\ndata: ready\n\n\r\n").unwrap();
+            let result = socket.read(&mut [0u8]);
+            closed_tx.send(matches!(result, Ok(0))).unwrap();
+        });
+        let live = LiveSse::default();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        live.install_task(tauri::async_runtime::spawn(async move {
+            let _ = receive_sse(&url, None, |data| {
+                ready_tx.send(data).unwrap();
+            })
+            .await;
+        }));
+        assert_eq!(
+            ready_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            "ready"
+        );
+        live.stop();
+        assert!(closed_rx.recv_timeout(Duration::from_secs(3)).unwrap());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sse_close_before_task_install_cancels_the_late_task() {
+        struct OnDrop(mpsc::Sender<()>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let live = LiveSse::default();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (drop_tx, drop_rx) = mpsc::channel();
+        let task = tauri::async_runtime::spawn(async move {
+            let _on_drop = OnDrop(drop_tx);
+            ready_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        live.stop();
+        live.install_task(task);
+        assert!(live.task.lock().unwrap().is_none());
+        drop_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    }
+
+    #[test]
+    fn terminal_output_drain_is_bounded_when_descendants_hold_pipes() {
+        let (_done, drained) = mpsc::channel();
+        let open = Mutex::new(true);
+        drain_output(drained, &open, Duration::from_millis(10));
+        assert!(!*open.lock().unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_output_is_drained_even_when_child_exit_wins_the_race() {
+        let mut child = Command::new("sh")
+            .args(["-c", "printf 'terminal response\\n'"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        assert!(child.wait().unwrap().success());
+        let open = Arc::new(Mutex::new(true));
+        let reader_open = open.clone();
+        let tail = Arc::new(Mutex::new(Vec::new()));
+        let reader_tail = tail.clone();
+        let (done, drained) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            while let Some(line) = bounded_line(&mut reader, MAX_HARNESS_LINE_BYTES).unwrap() {
+                let open = reader_open.lock().unwrap();
+                assert!(*open, "exit must not close output before the terminal tail");
+                reader_tail.lock().unwrap().push(line);
+            }
+            done.send(()).unwrap();
+            done.send(()).unwrap();
+        });
+        drain_output(drained, &open, Duration::from_secs(1));
+        reader.join().unwrap();
+        assert_eq!(*tail.lock().unwrap(), ["terminal response"]);
+        assert!(!*open.lock().unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exited_child_cleanup_never_stops_a_replacement_stream() {
+        for replacement_first in [true, false] {
+            let host = HarnessHost::new();
+            let mut old = host.add_test_child("same", "/tmp");
+            let old_stream = Arc::new(LiveSse::default());
+            host.replace_client_sse("same".into(), 1, Some(old_stream.clone()))
+                .unwrap();
+            if !replacement_first {
+                host.remove_exited_child("same", old.id());
+                assert!(old_stream.stop.load(Ordering::SeqCst));
+            }
+            let mut replacement = host.add_test_child("same", "/tmp");
+            let current = Arc::new(LiveSse::default());
+            host.replace_client_sse("same".into(), 2, Some(current.clone()))
+                .unwrap();
+            if replacement_first {
+                host.remove_exited_child("same", old.id());
+            }
+            assert_eq!(host.get("same").unwrap().pid, replacement.id());
+            assert!(!current.stop.load(Ordering::SeqCst));
+            old.kill().unwrap();
+            old.wait().unwrap();
+            replacement.kill().unwrap();
+            replacement.wait().unwrap();
+        }
+    }
+
+    #[test]
+    fn delayed_client_kill_preserves_a_newer_event_stream() {
+        let host = HarnessHost::new();
+        let current = Arc::new(LiveSse::default());
+        host.replace_client_sse("same".into(), 21, Some(current.clone()))
+            .unwrap();
+        host.kill_client("same", Some(20)).unwrap();
+        assert!(!current.stop.load(Ordering::SeqCst));
+        host.kill_client("same", Some(22)).unwrap();
+        assert!(current.stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stale_stream_open_and_close_cannot_replace_current_stream() {
+        let host = HarnessHost::new();
+        host.replace_client_sse("same".into(), 20, None).unwrap();
+        let current = Arc::new(LiveSse::default());
+        assert!(host
+            .replace_client_sse("same".into(), 19, Some(current.clone()))
+            .is_err());
+        host.replace_client_sse("same".into(), 21, Some(current.clone()))
+            .unwrap();
+        assert!(host.replace_client_sse("same".into(), 20, None).is_err());
+        assert!(!current.stop.load(Ordering::SeqCst));
+        host.replace_client_sse("same".into(), 22, None).unwrap();
+        assert!(current.stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    #[ignore = "requires installed and authenticated Muse; starts a real session without a turn"]
+    fn native_muse_home_session_start() {
+        let binary = resolve_muse().expect("Muse must be installed");
+        let mut command = Command::new(binary);
+        command
+            .arg("serve")
+            .current_dir(expand_home("~"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        isolate_child(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        let stdout = child.stdout.take().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if tx.send(message).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let result = (|| -> Result<(), String> {
+            let request = |stdin: &mut std::process::ChildStdin,
+                           id: u64,
+                           line: String|
+             -> Result<serde_json::Value, String> {
+                writeln!(stdin, "{line}").map_err(|e| e.to_string())?;
+                stdin.flush().map_err(|e| e.to_string())?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                loop {
+                    let message = rx
+                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                        .map_err(|e| e.to_string())?;
+                    if message["id"].as_u64() == Some(id) {
+                        return Ok(message);
+                    }
+                }
+            };
+            let init = request(&mut stdin, 1, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "clientInfo":{"name":"monocode","title":"MonoCode path check","version":"0.1.0"},
+                "capabilities":{"userInputDialogs":true}
+            }}).to_string())?;
+            if !init["error"].is_null() {
+                return Err(init["error"].to_string());
+            }
+            writeln!(
+                stdin,
+                "{}",
+                serde_json::json!({"jsonrpc":"2.0","method":"initialized"})
+            )
+            .map_err(|e| e.to_string())?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let mut start = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"session/start","params":{
+                "commandId":format!("{:08x}-{:04x}-7000-8000-{:012x}",now >> 16,now & 65535,pid),
+                "workspaceRoot":"~", "approvalMode":"promptUnmatched"
+            }});
+            let before = request(&mut stdin, 2, start.to_string())?;
+            if !before["error"].to_string().contains("absolute path") {
+                return Err(format!(
+                    "Expected the reported home-alias error, got {before}"
+                ));
+            }
+            start["id"] = 3.into();
+            start["params"]["commandId"] = format!(
+                "{:08x}-{:04x}-7001-8000-{:012x}",
+                now >> 16,
+                now & 65535,
+                pid
+            )
+            .into();
+            let after = request(&mut stdin, 3, native_agent_cwd(start.to_string())?)?;
+            if !after["error"].is_null() || after["result"].is_null() {
+                return Err(format!("Resolved home session failed: {after}"));
+            }
+            Ok(())
+        })();
+        terminate(pid);
+        let _ = child.wait();
+        let _ = reader.join();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn native_agent_protocol_expands_only_workspace_home_aliases() {
+        let home = expand_home("~");
+        assert!(home.is_absolute());
+        for field in ["cwd", "workspaceRoot"] {
+            for cwd in ["~", "~/project with spaces"] {
+                let mut request = serde_json::json!({
+                    "id": 1, "method": "session/start",
+                    "params": { "prompt": "keep ~/literal", "tool": {"cwd": "~"} }
+                });
+                request["params"][field] = cwd.into();
+                let result: serde_json::Value =
+                    serde_json::from_str(&native_agent_cwd(request.to_string()).unwrap()).unwrap();
+                request["params"][field] = crate::fs::path_to_js(&expand_home(cwd)).into();
+                assert_eq!(result, request);
+            }
+        }
+        for line in [
+            "plain ~ text",
+            r#"{"id":1,"result":{"cwd":"~"}}"#,
+            r#"{"method":"turn/start","params":{"cwd":"/repo","text":"~"}}"#,
+            r#"{"method":"turn/start","params":{"cwd":"//wsl.localhost/Ubuntu/home/dev","text":"~"}}"#,
+        ] {
+            assert_eq!(native_agent_cwd(line.into()).unwrap(), line);
+        }
     }
 
     #[test]
@@ -2719,7 +3306,7 @@ mod tests {
     #[test]
     fn install_spawn_keeps_a_child_nothing_cancelled() {
         let host = HarnessHost::new();
-        let (epoch, kill_all, _) = host.begin_spawn("s1");
+        let (epoch, kill_all, _) = host.begin_spawn("s1", None).unwrap();
         let (live, child) = live_child();
         let pid = live.pid;
         assert!(host
@@ -2732,8 +3319,8 @@ mod tests {
     #[test]
     fn install_spawn_rejects_a_child_killed_mid_spawn() {
         let host = HarnessHost::new();
-        let (epoch, kill_all, _) = host.begin_spawn("s1");
-        host.kill_session("s1");
+        let (epoch, kill_all, _) = host.begin_spawn("s1", None).unwrap();
+        host.kill_session("s1", None);
         let (live, child) = live_child();
         assert!(host
             .install_spawn("s1".into(), epoch, kill_all, live)
@@ -2745,7 +3332,7 @@ mod tests {
     #[test]
     fn install_spawn_rejects_a_child_after_kill_all() {
         let host = HarnessHost::new();
-        let (epoch, kill_all, _) = host.begin_spawn("s1");
+        let (epoch, kill_all, _) = host.begin_spawn("s1", None).unwrap();
         host.kill_all();
         let (live, child) = live_child();
         assert!(host
@@ -2758,22 +3345,22 @@ mod tests {
     #[test]
     fn kill_during_spawn_invalidates_the_stamp() {
         let host = HarnessHost::new();
-        let (epoch, kill_all, prev) = host.begin_spawn("s1");
+        let (epoch, kill_all, prev) = host.begin_spawn("s1", None).unwrap();
         assert!(prev.is_none());
         assert!(host.spawn_stamp_current("s1", epoch, kill_all));
-        host.kill_session("s1");
+        host.kill_session("s1", None);
         assert!(!host.spawn_stamp_current("s1", epoch, kill_all));
     }
 
     #[test]
     fn delayed_cancellation_never_removes_a_replacement_process() {
         let host = HarnessHost::new();
-        let (epoch, all, _) = host.begin_spawn("same");
+        let (epoch, all, _) = host.begin_spawn("same", None).unwrap();
         let (old, old_child) = live_child();
         host.install_spawn("same".into(), epoch, all, old.clone());
-        let cancelled = host.kill_session("same").unwrap();
+        let cancelled = host.kill_session("same", None).unwrap();
         assert_eq!(host.get("same").unwrap().pid, old.pid);
-        let (epoch, all, _) = host.begin_spawn("same");
+        let (epoch, all, _) = host.begin_spawn("same", None).unwrap();
         let (new, new_child) = live_child();
         host.install_spawn("same".into(), epoch, all, new.clone());
         assert!(host.remove_if_pid("same", cancelled.pid).is_none());
@@ -2785,8 +3372,8 @@ mod tests {
     #[test]
     fn overlapping_spawn_invalidates_the_earlier_one() {
         let host = HarnessHost::new();
-        let first = host.begin_spawn("s1");
-        let second = host.begin_spawn("s1");
+        let first = host.begin_spawn("s1", None).unwrap();
+        let second = host.begin_spawn("s1", None).unwrap();
         assert!(!host.spawn_stamp_current("s1", first.0, first.1));
         assert!(host.spawn_stamp_current("s1", second.0, second.1));
     }
@@ -2794,7 +3381,7 @@ mod tests {
     #[test]
     fn kill_all_rejects_an_in_flight_spawn() {
         let host = HarnessHost::new();
-        let (epoch, kill_all, _) = host.begin_spawn("s1");
+        let (epoch, kill_all, _) = host.begin_spawn("s1", None).unwrap();
         host.kill_all();
         assert!(!host.spawn_stamp_current("s1", epoch, kill_all));
     }
@@ -2850,6 +3437,7 @@ mod tests {
         let stdin = child.stdin.take().expect("grouped child stdin");
         (
             Arc::new(LiveChild {
+                generation: 0,
                 linux: None,
                 stdin: Mutex::new(stdin),
                 pid,
@@ -2862,7 +3450,7 @@ mod tests {
     #[test]
     fn kill_all_reaps_term_ignoring_children_before_return() {
         let host = HarnessHost::new();
-        let (epoch, kill_all, _) = host.begin_spawn("s1");
+        let (epoch, kill_all, _) = host.begin_spawn("s1", None).unwrap();
         let (live, child) = live_group("trap '' TERM; while true; do sleep 1; done");
         let pid = live.pid;
         // `harness_spawn` always leaves a thread owning the `Child`. Without one

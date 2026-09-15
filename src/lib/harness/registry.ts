@@ -28,6 +28,8 @@ export type HarnessAdapter = {
   live: boolean;
   /** False when the harness cannot accept a follow-up while a turn is running. Default: same as live. */
   canSteer?: boolean;
+  /** Live readiness, distinct from provider support. Missing means queue. */
+  canSteerSession?(sessionId: string): boolean;
   commands?: NativeCommandProvider;
   sendTurn(input: SendTurnInput): Promise<void>;
   /**
@@ -91,9 +93,9 @@ const adapters = new Map<HarnessId, HarnessAdapter>();
  */
 export const HARNESS_IDLE_PARK_MS = 5 * 60_000;
 const idleParkTimers = new Map<string, ReturnType<typeof setTimeout>>();
-// Sends in flight — a prewarm can arm a park timer while a turn is still
-// running, so the timer must re-arm instead of parking a busy session.
-const inFlightSends = new Map<string, number>();
+// Warmup, compaction and steering also keep the child busy. A concurrent
+// operation may finish first and arm a timer; never park the remaining work.
+const inFlightOperations = new Map<string, number>();
 
 function cancelIdlePark(sessionId: string): void {
   const timer = idleParkTimers.get(sessionId);
@@ -107,7 +109,7 @@ function scheduleIdlePark(harness: HarnessId, sessionId: string): void {
     sessionId,
     setTimeout(() => {
       idleParkTimers.delete(sessionId);
-      if (inFlightSends.get(sessionId)) {
+      if (inFlightOperations.get(sessionId)) {
         scheduleIdlePark(harness, sessionId);
         return;
       }
@@ -120,7 +122,7 @@ function scheduleIdlePark(harness: HarnessId, sessionId: string): void {
 export function resetHarnessIdlePark(): void {
   for (const timer of idleParkTimers.values()) clearTimeout(timer);
   idleParkTimers.clear();
-  inFlightSends.clear();
+  inFlightOperations.clear();
 }
 
 export function registerHarness(adapter: HarnessAdapter): void {
@@ -147,6 +149,26 @@ export function listHarnesses(): HarnessAdapter[] {
   return [...adapters.values()];
 }
 
+async function runHarnessOperation(
+  harness: HarnessId,
+  sessionId: string,
+  run: () => Promise<void>,
+): Promise<void> {
+  cancelIdlePark(sessionId);
+  inFlightOperations.set(
+    sessionId,
+    (inFlightOperations.get(sessionId) ?? 0) + 1,
+  );
+  try {
+    await run();
+  } finally {
+    const count = (inFlightOperations.get(sessionId) ?? 1) - 1;
+    if (count <= 0) inFlightOperations.delete(sessionId);
+    else inFlightOperations.set(sessionId, count);
+    scheduleIdlePark(harness, sessionId);
+  }
+}
+
 export async function sendHarnessTurn(
   input: SendTurnInput & { harness: HarnessId },
 ) {
@@ -154,19 +176,7 @@ export async function sendHarnessTurn(
   if (!adapter.live) {
     throw new Error(`${input.harness} is not connected yet`);
   }
-  cancelIdlePark(input.sessionId);
-  inFlightSends.set(
-    input.sessionId,
-    (inFlightSends.get(input.sessionId) ?? 0) + 1,
-  );
-  try {
-    await adapter.sendTurn(input);
-  } finally {
-    const count = (inFlightSends.get(input.sessionId) ?? 1) - 1;
-    if (count <= 0) inFlightSends.delete(input.sessionId);
-    else inFlightSends.set(input.sessionId, count);
-    scheduleIdlePark(input.harness, input.sessionId);
-  }
+  await runHarnessOperation(input.harness, input.sessionId, () => adapter.sendTurn(input));
 }
 
 /**
@@ -180,12 +190,8 @@ export async function prewarmHarness(
 ): Promise<void> {
   const adapter = getHarness(input.harness);
   if (!adapter?.live || !adapter.prewarm) return;
-  cancelIdlePark(input.sessionId);
-  try {
-    await adapter.prewarm(input);
-  } finally {
-    scheduleIdlePark(input.harness, input.sessionId);
-  }
+  const run = adapter.prewarm.bind(adapter);
+  await runHarnessOperation(input.harness, input.sessionId, () => run(input));
 }
 
 export function canCompactHarnessContext(id: HarnessId): boolean {
@@ -203,18 +209,18 @@ export async function compactHarnessContext(
   if (!adapter.compactContext) {
     throw new Error(`${input.harness} does not support manual compaction`);
   }
-  cancelIdlePark(input.sessionId);
-  try {
-    await adapter.compactContext(input);
-  } finally {
-    scheduleIdlePark(input.harness, input.sessionId);
-  }
+  const run = adapter.compactContext.bind(adapter);
+  await runHarnessOperation(input.harness, input.sessionId, () => run(input));
 }
 
 export function canSteerHarness(id: HarnessId): boolean {
   const adapter = adapters.get(id);
   if (!adapter?.live) return false;
   return adapter.canSteer !== false;
+}
+
+export function canSteerHarnessSession(id: HarnessId, sessionId: string): boolean {
+  return canSteerHarness(id) && (adapters.get(id)?.canSteerSession?.(sessionId) ?? false);
 }
 
 export async function steerHarnessTurn(
@@ -224,13 +230,7 @@ export async function steerHarnessTurn(
   if (!adapter.live) {
     throw new Error(`${input.harness} is not connected yet`);
   }
-  cancelIdlePark(input.sessionId);
-  try {
-    await adapter.steerTurn(input);
-  } finally {
-    // Re-arm even mid-turn — the in-flight guard just postpones the park.
-    scheduleIdlePark(input.harness, input.sessionId);
-  }
+  await runHarnessOperation(input.harness, input.sessionId, () => adapter.steerTurn(input));
 }
 
 export async function cancelHarnessTurn(

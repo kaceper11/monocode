@@ -49,7 +49,7 @@ describe("runtimeModeToCodexConfig", () => {
 });
 
 describe("buildThreadStartParams / buildTurnStartParams", () => {
-  it("includes model and omits default service tier", () => {
+  it("includes model and explicitly resets the Standard service tier", () => {
     const thread = buildThreadStartParams({
       cwd: "/tmp/proj",
       runtimeMode: "supervised",
@@ -61,7 +61,18 @@ describe("buildThreadStartParams / buildTurnStartParams", () => {
       model: "gpt-5.4",
       approvalPolicy: "untrusted",
     });
-    expect(thread.serviceTier).toBeUndefined();
+    expect(thread.serviceTier).toBeNull();
+  });
+
+  it("distinguishes an explicit tier reset from an unspecified tier on warm turns and resume", () => {
+    const turn = (serviceTier?: string) => buildTurnStartParams({ threadId: "same-thread", runtimeMode: "supervised", prompt: "next", serviceTier });
+    const resume = (serviceTier?: string) => buildThreadStartParams({ cwd: "/repo", runtimeMode: "supervised", serviceTier });
+    for (const params of [turn, resume]) {
+      expect(params("fast").serviceTier).toBe("fast");
+      expect(params("default")).toHaveProperty("serviceTier", null);
+      expect(params("fast").serviceTier).toBe("fast");
+      expect(params()).not.toHaveProperty("serviceTier");
+    }
   });
 
   it("builds turn input with text and image attachments", () => {

@@ -2931,10 +2931,8 @@ fn devin_extensions(ctx: &Ctx) -> ProviderExtensions {
     let mut ancestor_files: Vec<(PathBuf, &str)> = Vec::new();
     let mut ancestor_dirs: Vec<PathBuf> = Vec::new();
     for ancestor in ctx.project.ancestors().take(8) {
-        if let Some(home) = &ctx.home {
-            if ancestor == home.as_path() {
-                break;
-            }
+        if ctx.home.as_deref() == Some(ancestor) && ancestor != ctx.project {
+            break;
         }
         ancestor_dirs.push(ancestor.join(".devin"));
         for name in [
@@ -2949,6 +2947,11 @@ fn devin_extensions(ctx: &Ctx) -> ProviderExtensions {
                 "project"
             };
             ancestor_files.push((ancestor.join(format!(".devin/{name}")), scope));
+        }
+        // Home is a valid workspace too; include its local overrides before
+        // stopping the walk, otherwise the Extensions page hides them.
+        if ctx.home.as_deref() == Some(ancestor) {
+            break;
         }
     }
     let mcp_files: Vec<(PathBuf, &str)> = mcp_files
@@ -4484,6 +4487,43 @@ pub fn agent_config_remove(cwd: String, remove: RemoveRef) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devin_home_workspace_includes_local_mcp_override() {
+        let home = std::env::temp_dir().join(format!(
+            "monocode-devin-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join(".devin")).unwrap();
+        let file = home.join(".devin/mcp_config.local.json");
+        std::fs::write(
+            &file,
+            r#"{"mcpServers":{"example":{"command":"example-server","disabled":true}}}"#,
+        )
+        .unwrap();
+        let mut ctx = Ctx {
+            project: home.clone(),
+            home: Some(home.clone()),
+            project_native: js(&home),
+            wsl_project: false,
+        };
+        let inventory = devin_extensions(&ctx);
+        assert_eq!(inventory.mcp_servers.len(), 1);
+        let entry = &inventory.mcp_servers[0];
+        assert_eq!(entry.enabled, Some(false));
+        assert_eq!(entry.scope, "local");
+        assert_eq!(entry.file, js(&file));
+        assert!(entry.toggle.is_some());
+        // A home workspace's local override is not a global registration.
+        ctx.project = home.join("repo");
+        ctx.project_native = js(&ctx.project);
+        assert!(devin_extensions(&ctx).mcp_servers.is_empty());
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn json_bool_replaces_existing() {

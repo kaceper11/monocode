@@ -2260,7 +2260,7 @@ fn git_diff_stats_for(root: &Path) -> GitDiffStats {
             add_numstat_map(&text, &mut files);
         }
     }
-    add_untracked_map(root, &mut files);
+    add_untracked_map(root, &mut files, true);
     // Parked keep-local entries leave `0 0` rows in `diff HEAD --numstat` —
     // drop them so these counts agree with the Changes panel's file list.
     let kept = local_only_paths(root);
@@ -2297,6 +2297,39 @@ pub(crate) fn git_diff_index_for(root: &Path) -> GitDiffIndex {
 /// File list + counts only. Skips ahead/behind/remote lookups used by Git chrome.
 pub(crate) fn git_diff_files_for(root: &Path) -> GitDiffIndex {
     git_diff_index_with(root, false)
+}
+
+/// The checkpoint needs paths, not diff statistics or branch metadata.
+pub(crate) fn git_checkpoint_paths(root: &Path) -> Vec<String> {
+    let mut files: HashMap<String, FileAcc> = HashMap::new();
+    for staged in [false, true] {
+        let mut args = vec![
+            "diff",
+            "--no-ext-diff",
+            "--name-only",
+            "--no-renames",
+            "--relative",
+            "-z",
+        ];
+        if staged {
+            args.push("--cached");
+        }
+        args.extend(["--", "."]);
+        if let Some(names) = git_run(root, &args) {
+            for path in names.split('\0').filter(|path| !path.is_empty()) {
+                files.entry(path_to_js(Path::new(path))).or_default().staged |= staged;
+            }
+        }
+    }
+    add_untracked_map(root, &mut files, false);
+    let kept = local_only_paths(root);
+    let mut paths: Vec<_> = files
+        .into_iter()
+        .filter(|(path, file)| file.staged || !kept.contains(path))
+        .map(|(path, _)| path)
+        .collect();
+    paths.sort();
+    paths
 }
 
 fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
@@ -2360,7 +2393,7 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
             add_name_status(&names, &mut statuses);
         }
     }
-    add_untracked_map(root, &mut files);
+    add_untracked_map(root, &mut files, true);
     mark_cached_and_unstaged(root, &mut files);
 
     let mut out = Vec::with_capacity(files.len());
@@ -2621,15 +2654,18 @@ fn normalize_diff_path(path: &str) -> String {
 
 const MAX_UNTRACKED_BYTES: u64 = 1024 * 1024;
 
-fn add_untracked_map(root: &Path, files: &mut HashMap<String, FileAcc>) {
+fn add_untracked_map(root: &Path, files: &mut HashMap<String, FileAcc>, count_lines: bool) {
     let Some(stdout) = git_run(
         root,
         &["ls-files", "-o", "--exclude-standard", "-z", "--", "."],
     ) else {
         return;
     };
-    let remote_counts: Option<HashMap<String, i64>> =
-        wsl::path_location(root).ok().flatten().map(|_| {
+    let remote_counts: Option<HashMap<String, i64>> = wsl::path_location(root)
+        .ok()
+        .flatten()
+        .filter(|_| count_lines)
+        .map(|_| {
             let paths: Vec<_> = stdout
                 .split('\0')
                 .filter(|rel| !rel.is_empty())
@@ -2653,7 +2689,7 @@ fn add_untracked_map(root: &Path, files: &mut HashMap<String, FileAcc>) {
         let relative = path_to_js(Path::new(rel));
         let entry = files.entry(relative.clone()).or_default();
         entry.untracked = true;
-        if entry.additions == 0 {
+        if count_lines && entry.additions == 0 {
             entry.additions = match &remote_counts {
                 Some(counts) => *counts.get(&path_to_js(&host_path(root, rel))).unwrap_or(&0),
                 None => text_line_count(&host_path(root, rel)),

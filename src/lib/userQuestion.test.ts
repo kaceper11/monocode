@@ -91,6 +91,12 @@ describe("questionsFromUnknown", () => {
 });
 
 describe("question answers", () => {
+  it("treats an Other label as a normal provider option when custom input is disabled", () => {
+    const question = questionsFromUnknown({ questions: [{ id: "q", prompt: "Pick", allowCustom: false, options: [{ id: "other-id", label: "Other" }] }] })[0];
+    const reply = buildQuestionReply([question], { q: ["other-id"] }, { q: "stale custom text" });
+    expect(reply).toEqual({ kind: "answered", answers: { q: ["other-id"] } });
+    expect(selectedAnswerLabels(question, { kind: "answered", answers: { q: ["other-id"] } })).toEqual(["Other"]);
+  });
   const questions = questionsFromUnknown({
     questions: [
       {

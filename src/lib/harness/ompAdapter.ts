@@ -12,7 +12,7 @@ import { refreshOmpCatalog } from "./piCatalog";
 import { generateOmpSessionTitle } from "./piTitle";
 import { warmupOmpText } from "./piText";
 import { registerHarness, type HarnessAdapter } from "./registry";
-import { ompCommandProvider, respondQuestion } from "./piFamily";
+import { canSteerSession, ompCommandProvider, respondQuestion } from "./piFamily";
 import { OMP_FLAVOR } from "./piFlavor";
 
 export const ompAdapter: HarnessAdapter = {
@@ -24,6 +24,7 @@ export const ompAdapter: HarnessAdapter = {
   sendTurn: sendOmpTurn,
   compactContext: compactOmpContext,
   steerTurn: steerOmpTurn,
+  canSteerSession: (id) => canSteerSession(OMP_FLAVOR, id),
   cancelTurn: cancelOmpTurn,
   respondApproval: respondOmpApproval,
   stopSession: stopOmpSession,

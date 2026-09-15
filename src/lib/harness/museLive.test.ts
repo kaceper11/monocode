@@ -1,14 +1,17 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
 const sent: string[] = [];
+const resolveMuseBinary = vi.fn(async () => ({ path: "/fake/muse" }));
+const spawnChild = vi.fn(async () => undefined);
+const killChild = vi.fn(async () => undefined);
 let onLine: ((line: string) => void) | undefined;
 let onExit: ((code: number | null) => void) | undefined;
 let onStderr: ((line: string) => void) | undefined;
 
 vi.mock("./child", () => ({
-  resolveMuseBinary: async () => ({ path: "/fake/muse" }),
-  spawnChild: async () => undefined,
-  killChild: async () => undefined,
+  resolveMuseBinary,
+  spawnChild,
+  killChild,
   unwatchChild: () => undefined,
   watchChild: (
     _id: string,
@@ -27,6 +30,7 @@ vi.mock("./child", () => ({
 
 const {
   sendMuseTurn,
+  canSteerMuseSession,
   steerMuseTurn,
   cancelMuseTurn,
   compactMuseContext,
@@ -38,6 +42,8 @@ const {
   __museTestReset,
 } = await import("./muse");
 import type { HarnessEvent } from "./types";
+import { newSession } from "../session";
+import { applyHarnessEvent } from "./apply";
 
 const INIT_RESULT = {
   schema: { version: 1, fingerprint: "sha256:test" },
@@ -101,9 +107,18 @@ async function flushControls() {
   throw new Error("timed out waiting for turn/start");
 }
 
+/** Successful Stop waits for the provider's control acknowledgement. */
+async function cancelAndAcknowledge(sessionId: string) {
+  const count = byMethod("turn/interrupt").length;
+  const cancel = cancelMuseTurn(sessionId);
+  await waitFor(() => byMethod("turn/interrupt").length > count, "interrupt");
+  reply(lastByMethod("turn/interrupt")!.id, {});
+  await cancel;
+}
+
 /** Drive a session through initialize + session/start + turn/start ack. */
-async function startTurn(events: HarnessEvent[], text: string, id: string) {
-  const turn = sendMuseTurn(baseInput(events, text, id) as never);
+async function startTurn(events: HarnessEvent[], text: string, id: string, beforeAck?: () => Promise<void>, runtimeMode: "auto" | "supervised" = "supervised") {
+  const turn = sendMuseTurn({ ...baseInput(events, text, id), runtimeMode });
   await waitFor(() => byMethod("initialize").length > 0, "initialize");
   expect(byMethod("initialize")[0].params.capabilities.userInputDialogs).toBe(
     true,
@@ -115,6 +130,7 @@ async function startTurn(events: HarnessEvent[], text: string, id: string) {
   reply(startMsg.id, { session: { sessionId: "MS1" }, viewCursor: "c0" });
   await flushControls();
   const turnMsg = lastByMethod("turn/start")!;
+  await beforeAck?.();
   reply(turnMsg.id, {
     commandId: turnMsg.params.commandId,
     disposition: "started",
@@ -128,6 +144,9 @@ async function startTurn(events: HarnessEvent[], text: string, id: string) {
 describe("muse live turn sequence", () => {
   beforeEach(() => {
     sent.length = 0;
+    resolveMuseBinary.mockReset().mockResolvedValue({ path: "/fake/muse" });
+    spawnChild.mockClear();
+    killChild.mockClear();
     replied.clear();
     onStderr = undefined;
     __museTestReset();
@@ -290,11 +309,7 @@ describe("muse live turn sequence", () => {
       status: "accepted",
       terminal: true,
     });
-    expect(
-      events.some(
-        (e) => e.type === "approval.resolved" && e.decision === "allow",
-      ),
-    ).toBe(true);
+    await waitFor(() => events.some(e => e.type === "approval.resolved" && e.decision === "allow"), "approval accepted");
 
     notify("turn/completed", {
       sessionId: "MS1",
@@ -355,11 +370,7 @@ describe("muse live turn sequence", () => {
       status: "accepted",
       terminal: true,
     });
-    expect(
-      events.some(
-        (e) => e.type === "approval.resolved" && e.decision === "allow",
-      ),
-    ).toBe(true);
+    await waitFor(() => events.some(e => e.type === "approval.resolved" && e.decision === "allow"), "approval accepted");
 
     notify("turn/completed", {
       sessionId: "MS1",
@@ -528,11 +539,9 @@ describe("muse live turn sequence", () => {
       userInputId: "u1",
       answers: [{ questionId: "q1", selectedLabel: "Alpha" }],
     });
-    expect(
-      events.some(
-        (e) => e.type === "question.resolved" && e.decision === "answered",
-      ),
-    ).toBe(true);
+    expect(events.some(e => e.type === "question.resolved")).toBe(false);
+    reply(lastByMethod("userInput/answer")!.id, {});
+    await waitFor(() => events.some(e => e.type === "question.resolved" && e.decision === "answered"), "answer accepted");
 
     notify("turn/completed", {
       sessionId: "MS1",
@@ -608,7 +617,7 @@ describe("muse live turn sequence", () => {
       "approval.requested",
     );
 
-    await cancelMuseTurn("t6");
+    await cancelAndAcknowledge("t6");
     await turn;
     await waitFor(
       () =>
@@ -984,8 +993,9 @@ describe("muse live turn sequence", () => {
       "session/compact",
     );
     reply(lastByMethod("session/compact")!.id, { status: "accepted" });
-    await cancelMuseTurn("tcc");
-    await expect(compact).rejects.toThrow();
+    const rejected = expect(compact).rejects.toThrow();
+    await cancelAndAcknowledge("tcc");
+    await rejected;
     await stopMuseSession("tcc");
   });
 
@@ -1034,7 +1044,7 @@ describe("muse live turn sequence", () => {
     await stopMuseSession("t11");
   });
 
-  it("renders reminder children as a status line, never a tool row", async () => {
+  it("keeps turn-start reminder bookkeeping silent and out of transcript rows", async () => {
     const events: HarnessEvent[] = [];
     const { turn } = await startTurn(events, "hey", "tr1");
     notify("turn/started", { sessionId: "MS1", turnId: "T1" });
@@ -1051,18 +1061,10 @@ describe("muse live turn sequence", () => {
       sessionId: "MS1",
       item: { itemId: "rc1", kind: "reminderChild", status: "completed" },
     });
-    await waitFor(
-      () => events.some((e) => e.type === "status"),
-      "reminder status",
-    );
-    expect(
-      events.some(
-        (e) =>
-          e.type === "status" && e.text === "Reminder child session",
-      ),
-    ).toBe(true);
+    expect(events.some((e) => e.type === "session.activity")).toBe(false);
     expect(events.some((e) => e.type === "tool.started")).toBe(false);
     expect(events.some((e) => e.type === "tool.updated")).toBe(false);
+    expect(events.some((e) => e.type === "status")).toBe(false);
 
     notify("turn/completed", {
       sessionId: "MS1",
@@ -1073,7 +1075,7 @@ describe("muse live turn sequence", () => {
     await stopMuseSession("tr1");
   });
 
-  it("settles the send when the end-of-turn drain begins", async () => {
+  it("settles the send at drain detection while the host finishes bookkeeping", async () => {
     const events: HarnessEvent[] = [];
     const { turn } = await startTurn(events, "hey", "td1");
     let settled = false;
@@ -1085,24 +1087,22 @@ describe("muse live turn sequence", () => {
       sessionId: "MS1",
       item: { itemId: "m1", kind: "agentMessage", status: "inProgress" },
     });
+    expect(canSteerMuseSession("td1")).toBe(true);
     notify("item/completed", {
       sessionId: "MS1",
       item: { itemId: "m1", kind: "agentMessage", status: "completed" },
     });
-    // The drain's reminder child opens after the answer: the send must
-    // resolve without waiting out turn/completed.
+    // The drain's reminder child opens after the answer: the UI turn settles
+    // here instead of waiting out the host's bookkeeping gate.
     notify("item/started", {
       sessionId: "MS1",
       item: { itemId: "rc1", kind: "reminderChild", status: "inProgress" },
     });
     await waitFor(() => settled, "drain settle");
-    expect(
-      events.some(
-        (e) =>
-          e.type === "status" &&
-          e.text.includes("memory/reminder bookkeeping"),
-      ),
-    ).toBe(true);
+    // Still draining with no real item open — steer is refused at the
+    // boundary and a follow-up Send queues host-side instead.
+    expect(canSteerMuseSession("td1")).toBe(false);
+    expect(events.some(e => e.type === "session.activity" && e.text?.includes("finishing"))).toBe(true);
 
     // The trailing turn/completed still lands; nothing double-settles.
     notify("turn/completed", {
@@ -1114,7 +1114,7 @@ describe("muse live turn sequence", () => {
     await stopMuseSession("td1");
   });
 
-  it("settles on single-shot reminder children observed during the drain", async () => {
+  it("settles the send on a single-shot reminder child during the drain", async () => {
     const events: HarnessEvent[] = [];
     const { turn } = await startTurn(events, "hey", "td2");
     let settled = false;
@@ -1137,6 +1137,8 @@ describe("muse live turn sequence", () => {
       item: { itemId: "rc1", kind: "reminderChild", status: "completed" },
     });
     await waitFor(() => settled, "single-shot drain settle");
+    expect(events.some(e => e.type === "session.activity" && e.text?.includes("finishing"))).toBe(true);
+    await turn;
     await stopMuseSession("td2");
   });
 
@@ -1174,6 +1176,8 @@ describe("muse live turn sequence", () => {
       item: { itemId: "rc1", kind: "reminderChild", status: "inProgress" },
     });
     await waitFor(() => settled, "drain settle after answer");
+    expect(events.some(e => e.type === "session.activity" && e.text?.includes("finishing"))).toBe(true);
+    await turn;
     await stopMuseSession("td3");
   });
 
@@ -1220,6 +1224,8 @@ describe("muse live turn sequence", () => {
       },
     });
     await waitFor(() => settled, "settle once real work closes");
+    expect(events.some(e => e.type === "session.activity" && e.text?.includes("finishing"))).toBe(true);
+    await turn;
     await stopMuseSession("td4");
   });
 
@@ -1255,7 +1261,7 @@ describe("muse live turn sequence", () => {
     expect(settled).toBe(false);
 
     // The retry produces real work; once it closes with the reminder child
-    // still open, the drain is real and the send settles.
+    // still open, the drain is real and the UI turn settles.
     notify("item/started", {
       sessionId: "MS1",
       item: { itemId: "m2", kind: "agentMessage", status: "inProgress" },
@@ -1265,6 +1271,8 @@ describe("muse live turn sequence", () => {
       item: { itemId: "m2", kind: "agentMessage", status: "completed" },
     });
     await waitFor(() => settled, "settle after retried work closes");
+    expect(events.some(e => e.type === "session.activity" && e.text?.includes("finishing"))).toBe(true);
+    await turn;
     await stopMuseSession("td5");
   });
 
@@ -1308,9 +1316,12 @@ describe("muse live turn sequence", () => {
       sessionId: "MS1",
       item: { itemId: "rc1", kind: "reminderChild", status: "inProgress" },
     });
-    // The send resolves on the drain, but the turn still runs host-side:
-    // steer/interrupt must keep addressing T1 until turn/completed lands.
-    await turn;
+    // The UI turn settles on the drain, but the host turn still owns T1:
+    // an in-flight steer/interrupt must keep addressing it until the real
+    // turn/completed lands.
+    let settled = false;
+    void turn.then(() => { settled = true; });
+    await waitFor(() => settled, "drain settle");
     const steer = steerMuseTurn({
       sessionId: "td7",
       cwd: "/repo",
@@ -1323,6 +1334,93 @@ describe("muse live turn sequence", () => {
     reply(steerMsg.id, { commandId: steerMsg.params.commandId, disposition: "queued" });
     await steer;
     await stopMuseSession("td7");
+    await turn;
+  });
+
+  it("queues a follow-up on the host while the drain finishes", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "hey", "td8");
+    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
+    notify("item/started", {
+      sessionId: "MS1",
+      item: { itemId: "m1", kind: "agentMessage", status: "inProgress" },
+    });
+    notify("item/completed", {
+      sessionId: "MS1",
+      item: { itemId: "m1", kind: "agentMessage", status: "completed" },
+    });
+    notify("item/started", {
+      sessionId: "MS1",
+      item: { itemId: "rc1", kind: "reminderChild", status: "inProgress" },
+    });
+    // The UI turn settled at drain detection; the host still owns T1.
+    await turn;
+
+    // A follow-up sent during the drain goes through turn/start with
+    // ifBusy:"queue" — the host admits it now and runs it after bookkeeping.
+    const next = sendMuseTurn(baseInput(events, "follow up", "td8"));
+    await waitFor(() => byMethod("turn/start").length === 2, "follow-up turn/start");
+    const queuedStart = lastByMethod("turn/start")!;
+    expect(queuedStart.params.ifBusy).toBe("queue");
+    let nextSettled = false;
+    void next.then(() => { nextSettled = true; });
+    reply(queuedStart.id, {
+      commandId: queuedStart.params.commandId,
+      disposition: "queued",
+      turnId: "T2",
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(nextSettled).toBe(false);
+
+    // The drained turn's terminal event must not settle the queued send.
+    notify("turn/completed", {
+      sessionId: "MS1",
+      turnId: "T1",
+      terminal: "completed",
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(nextSettled).toBe(false);
+
+    notify("turn/started", { sessionId: "MS1", turnId: "T2" });
+    notify("item/completed", {
+      sessionId: "MS1",
+      item: {
+        itemId: "m2",
+        kind: "agentMessage",
+        status: "completed",
+        text: "again",
+      },
+    });
+    notify("turn/completed", {
+      sessionId: "MS1",
+      turnId: "T2",
+      terminal: "completed",
+    });
+    await next;
+    await stopMuseSession("td8");
+  });
+
+  it("does not let a late completed turn seal the next response", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "first", "late");
+    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
+    await turn;
+    events.length = 0;
+    const next = sendMuseTurn(baseInput(events, "second", "late"));
+    await waitFor(() => byMethod("turn/start").length === 2, "second turn");
+    const request = lastByMethod("turn/start")!;
+    reply(request.id, { turnId: "T2", disposition: "started" });
+    notify("turn/started", { sessionId: "MS1", turnId: "T2" });
+    let settled = false;
+    void next.then(() => { settled = true; });
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
+    await new Promise(r => setTimeout(r, 0));
+    expect(settled).toBe(false);
+    expect(events.some(e => e.type === "message.completed")).toBe(false);
+    notify("turn/completed", { sessionId: "MS1", turnId: "T2", terminal: "completed" });
+    await next;
+    await stopMuseSession("late");
   });
 
   it("ignores routine stderr lines that merely contain auth-like words", async () => {
@@ -1384,7 +1482,7 @@ describe("muse live turn sequence", () => {
     notify("turn/started", { sessionId: "MS1", turnId: "TQ" });
     await new Promise((r) => setTimeout(r, 10));
 
-    await cancelMuseTurn("t14");
+    await cancelAndAcknowledge("t14");
     expect(
       byMethod("turn/interrupt").some((m) => m.params.turnId === "TQ"),
     ).toBe(true);
@@ -1573,5 +1671,442 @@ describe("muse live turn sequence", () => {
       .map((e) => (e as { text: string }).text);
     expect(deltas).toEqual(["Parent answer"]);
     await stopMuseSession("ts1");
+  });
+  it.each(["cancel", "remove"])("fences %s before binary resolution without spawning", async action => {
+    let resolve!: (result: { path: string }) => void;
+    resolveMuseBinary.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    const events: HarnessEvent[] = [];
+    const turn = sendMuseTurn(baseInput(events, "never run", "startup"));
+    await waitFor(() => !!resolve, "binary resolution");
+    if (action === "cancel") await cancelMuseTurn("startup");
+    else await stopMuseSession("startup");
+    resolve({ path: "/fake/muse" });
+    await turn;
+    expect(spawnChild).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+  });
+
+  it("recycles the owned host when Stop races the turn/start acknowledgement", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "never run", "admission", () => cancelMuseTurn("admission"));
+    await turn;
+    expect(killChild).toHaveBeenCalledOnce();
+    expect(canSteerMuseSession("admission")).toBe(false);
+    notify("item/started", { sessionId: "MS1", item: { itemId: "late", kind: "agentMessage", text: "hidden" } });
+    expect(events.some(e => e.type === "message.delta")).toBe(false);
+  });
+
+  it.each(["model", "mode"])("does not send when a required %s selection is rejected", async setting => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "first", "settings", undefined, setting === "mode" ? "auto" : "supervised");
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
+    await turn;
+    const input = { ...baseInput(events, "must not send", "settings"), model: setting === "model" ? "muse:unavailable" : "muse:default", runtimeMode: "supervised" as const };
+    const next = sendMuseTurn(input);
+    const rejected = expect(next).rejects.toThrow("selection rejected");
+    const method = setting === "model" ? "session/setModel" : "session/setApprovalMode";
+    await waitFor(() => byMethod(method).length > 0, method);
+    fail(lastByMethod(method)!.id, { code: -32602, message: "selection rejected" });
+    await rejected;
+    expect(byMethod("turn/start")).toHaveLength(1);
+    await stopMuseSession("settings");
+  });
+
+  it("stops the host if a live access-mode change is rejected", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "first", "mode-error");
+    setMuseRuntimeMode("mode-error", "auto");
+    await waitFor(() => byMethod("session/setApprovalMode").length > 0, "mode request");
+    fail(lastByMethod("session/setApprovalMode")!.id, { code: -32602, message: "mode rejected" });
+    await turn;
+    expect(killChild).toHaveBeenCalled();
+    expect(events.some(e => e.type === "session.error" && e.message.includes("mode rejected"))).toBe(true);
+  });
+
+  it("keeps rejected approval decisions actionable until accepted", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "first", "decision-retry");
+    notify("approval/requested", {
+      approvalId: "retry-a", sessionId: "MS1", itemId: "cmd", toolName: "bash", title: "Run command",
+      currentRequirementId: { approvalId: "retry-a", sourceIndex: 0 },
+      availableChoices: [{ choiceId: "allow", decision: "approved", scope: "once" }, { choiceId: "deny", decision: "denied", scope: "once" }],
+    });
+    const asked = events.find(e => e.type === "approval.requested");
+    expect(asked?.type).toBe("approval.requested");
+    if (asked?.type !== "approval.requested") throw new Error("approval missing");
+    respondMuseApproval("decision-retry", asked.requestId, "allow");
+    await waitFor(() => byMethod("approval/decide").length === 1, "first decision");
+    fail(lastByMethod("approval/decide")!.id, { code: -32602, message: "try another choice" });
+    await waitFor(() => events.some(e => e.type === "status" && e.text.includes("try another choice")), "decision rejection");
+    expect(events.some(e => e.type === "approval.resolved")).toBe(false);
+    respondMuseApproval("decision-retry", asked.requestId, "deny");
+    await waitFor(() => byMethod("approval/decide").length === 2, "retry decision");
+    reply(lastByMethod("approval/decide")!.id, {});
+    await waitFor(() => events.some(e => e.type === "approval.resolved" && e.decision === "deny"), "confirmed decision");
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
+    await turn;
+    await stopMuseSession("decision-retry");
+  });
+
+  it("keeps rejected question answers actionable until accepted", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "first", "answer-retry");
+    notify("userInput/requested", { sessionId: "MS1", userInputId: "retry-q", questions: [{ id: "q", question: "Which?", options: [{ label: "One" }] }] });
+    const asked = events.find(e => e.type === "question.asked");
+    if (asked?.type !== "question.asked") throw new Error("question missing");
+    const answer = { kind: "answered" as const, answers: { q: ["One"] } };
+    respondMuseQuestion("answer-retry", asked.requestId, answer);
+    await waitFor(() => byMethod("userInput/answer").length === 1, "first answer");
+    fail(lastByMethod("userInput/answer")!.id, { code: -32602, message: "answer rejected" });
+    await waitFor(() => events.some(e => e.type === "status" && e.text.includes("answer rejected")), "answer rejection");
+    expect(events.some(e => e.type === "question.resolved")).toBe(false);
+    respondMuseQuestion("answer-retry", asked.requestId, answer);
+    await waitFor(() => byMethod("userInput/answer").length === 2, "retry answer");
+    reply(lastByMethod("userInput/answer")!.id, {});
+    await waitFor(() => events.some(e => e.type === "question.resolved"), "answer accepted");
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
+    await turn;
+    await stopMuseSession("answer-retry");
+  });
+
+  it("retains an approval if the selected decision has no offered choice", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "first", "missing-choice");
+    notify("approval/requested", { approvalId: "no-allow", sessionId: "MS1", itemId: "cmd", toolName: "bash", currentRequirementId: { approvalId: "no-allow", sourceIndex: 0 }, availableChoices: [{ choiceId: "deny", decision: "denied", scope: "once" }] });
+    const asked = events.find(e => e.type === "approval.requested");
+    if (asked?.type !== "approval.requested") throw new Error("approval missing");
+    respondMuseApproval("missing-choice", asked.requestId, "allow");
+    expect(byMethod("approval/decide")).toHaveLength(0);
+    expect(events.some(e => e.type === "approval.resolved")).toBe(false);
+    respondMuseApproval("missing-choice", asked.requestId, "deny");
+    await waitFor(() => byMethod("approval/decide").length === 1, "offered denial");
+    reply(lastByMethod("approval/decide")!.id, {});
+    await waitFor(() => events.some(e => e.type === "approval.resolved" && e.decision === "deny"), "accepted denial");
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
+    await turn;
+    await stopMuseSession("missing-choice");
+  });
+
+  it("releases nested subscriptions so later children remain visible", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "delegate", "nested");
+    const answerPage = async (child: string, count: number) => {
+      await waitFor(() => byMethod("view/page").filter(m => m.params.sessionId === child).length >= count, "child page");
+      reply(byMethod("view/page").filter(m => m.params.sessionId === child)[count - 1].id, { events: [], nextCursor: null });
+    };
+    const subscribe = async (child: string) => {
+      await answerPage(child, 1);
+      await waitFor(() => byMethod("view/subscribe").some(m => m.params.sessionId === child), "child subscribe");
+      reply(byMethod("view/subscribe").find(m => m.params.sessionId === child)!.id, {});
+    };
+    notify("item/started", { sessionId: "MS1", item: { itemId: "root", kind: "subagent", childSessionId: "ROOT", status: "inProgress" } });
+    await subscribe("ROOT");
+    for (let i = 0; i < 20; i++) {
+      const child = `NESTED-${i}`;
+      const item = { itemId: `nested-${i}`, kind: "subagent", childSessionId: child, status: "inProgress" };
+      notify("item/started", { sessionId: "ROOT", item });
+      await subscribe(child);
+      notify("item/started", { sessionId: child, item: { itemId: "answer", kind: "agentMessage", text: `work-${i}`, status: "inProgress" } });
+      notify("item/completed", { sessionId: "ROOT", item: { ...item, status: "completed" } });
+      await answerPage(child, 2);
+      await waitFor(() => byMethod("view/unsubscribe").some(m => m.params.sessionId === child), "nested unsubscribe");
+      reply(byMethod("view/unsubscribe").find(m => m.params.sessionId === child)!.id, {});
+    }
+    expect(events.some(e => e.type === "agent.step" && e.callId === "root" && e.text === "work-19")).toBe(true);
+    notify("item/completed", { sessionId: "MS1", item: { itemId: "root", kind: "subagent", childSessionId: "ROOT", status: "completed" } });
+    await answerPage("ROOT", 2);
+    await waitFor(() => byMethod("view/unsubscribe").some(m => m.params.sessionId === "ROOT"), "root unsubscribe");
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
+    await turn;
+    await stopMuseSession("nested");
+  });
+
+  it("does not dispatch an already queued send after cancellation", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "first", "cancel-queue");
+    const queued = sendMuseTurn(baseInput(events, "queued", "cancel-queue"));
+    await cancelMuseTurn("cancel-queue");
+    await Promise.all([turn, queued]);
+    expect(byMethod("turn/start")).toHaveLength(1);
+    await stopMuseSession("cancel-queue");
+  });
+
+  it("still reports a real startup error after cleanup", async () => {
+    const turn = sendMuseTurn(baseInput([], "test", "start-error"));
+    const rejected = expect(turn).rejects.toThrow("initialize denied");
+    await waitFor(() => byMethod("initialize").length > 0, "initialize");
+    fail(lastByMethod("initialize")!.id, { code: -32602, message: "initialize denied" });
+    await rejected;
+    expect(killChild).toHaveBeenCalled();
+    expect(byMethod("turn/start")).toHaveLength(0);
+  });
+
+  it("cannot bind a session after removal during the handshake", async () => {
+    const events: HarnessEvent[] = [];
+    const turn = sendMuseTurn(baseInput(events, "never run", "removed"));
+    await waitFor(() => byMethod("initialize").length > 0, "initialize");
+    reply(lastByMethod("initialize")!.id, INIT_RESULT);
+    await waitFor(() => byMethod("session/start").length > 0, "session start");
+    const start = lastByMethod("session/start")!;
+    await stopMuseSession("removed");
+    reply(start.id, { session: { sessionId: "REMOVED" } });
+    await turn;
+    expect(events.some(e => e.type === "session.providerBound")).toBe(false);
+    expect(byMethod("turn/start")).toHaveLength(0);
+  });
+
+  it("stops instead of replaying an answer whose delivery timed out", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "first", "uncertain-answer");
+    notify("userInput/requested", { sessionId: "MS1", userInputId: "uncertain", questions: [{ id: "q", question: "Which?", options: [{ label: "One" }] }] });
+    const asked = events.find(e => e.type === "question.asked");
+    if (asked?.type !== "question.asked") throw new Error("question missing");
+    vi.useFakeTimers();
+    try {
+      respondMuseQuestion("uncertain-answer", asked.requestId, { kind: "answered", answers: { q: ["One"] } });
+      await vi.advanceTimersByTimeAsync(60_000);
+      await turn;
+      expect(killChild).toHaveBeenCalled();
+      expect(byMethod("userInput/answer")).toHaveLength(1);
+      expect(events.some(e => e.type === "session.error" && e.message.includes("did not confirm"))).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("allows a new send while a cancelled binary resolution is still pending", async () => {
+    let resolve!: (result: { path: string }) => void;
+    resolveMuseBinary.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    const original = sendMuseTurn(baseInput([], "old", "new-after-stop"));
+    await waitFor(() => !!resolve, "old resolution");
+    await cancelMuseTurn("new-after-stop");
+    const next = await startTurn([], "new", "new-after-stop");
+    resolve({ path: "/fake/muse" });
+    await original;
+    expect(spawnChild).toHaveBeenCalledOnce();
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
+    await next.turn;
+    await stopMuseSession("new-after-stop");
+  });
+
+
+  it("reconciles a rapid Auto to Supervised change before applying another turn", async () => {
+    const { turn } = await startTurn([], "hold", "race-mode");
+    setMuseRuntimeMode("race-mode", "auto");
+    await waitFor(() => byMethod("session/setApprovalMode").length === 1, "auto request");
+    const auto = lastByMethod("session/setApprovalMode")!;
+    setMuseRuntimeMode("race-mode", "supervised");
+    expect(byMethod("session/setApprovalMode")).toHaveLength(1);
+    reply(auto.id, { effectiveMode: { mode: "onRequest" } });
+    await waitFor(() => byMethod("session/setApprovalMode").length === 2, "restore supervised");
+    expect(lastByMethod("session/setApprovalMode")!.params.mode).toBe("promptUnmatched");
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
+    await turn;
+    const next = sendMuseTurn(baseInput([], "next", "race-mode"));
+    await new Promise(r => setTimeout(r, 10));
+    expect(byMethod("turn/start")).toHaveLength(1);
+    reply(lastByMethod("session/setApprovalMode")!.id, { effectiveMode: { mode: "promptUnmatched" } });
+    await waitFor(() => byMethod("turn/start").length === 2, "next turn");
+    reply(lastByMethod("turn/start")!.id, { disposition: "started", turnId: "T2" });
+    notify("turn/completed", { sessionId: "MS1", turnId: "T2", terminal: "completed" });
+    await next;
+    await stopMuseSession("race-mode");
+  });
+
+  it("retains the original resume identity after a transient failure", async () => {
+    bindMuseSession("resume-fail", "MS-original", "/repo");
+    const first = sendMuseTurn(baseInput([], "retry", "resume-fail"));
+    const rejected = expect(first).rejects.toThrow("temporarily unavailable");
+    await waitFor(() => byMethod("initialize").length > 0, "initialize");
+    reply(lastByMethod("initialize")!.id, INIT_RESULT);
+    await waitFor(() => byMethod("session/resume").length > 0, "resume");
+    fail(lastByMethod("session/resume")!.id, { code: -32603, message: "temporarily unavailable" });
+    await rejected;
+    sent.length = 0;
+    const retry = sendMuseTurn(baseInput([], "retry", "resume-fail"));
+    await waitFor(() => byMethod("initialize").length > 0, "retry initialize");
+    reply(lastByMethod("initialize")!.id, INIT_RESULT);
+    await waitFor(() => byMethod("session/resume").length > 0, "retry resume");
+    expect(lastByMethod("session/resume")!.params.sessionId).toBe("MS-original");
+    expect(byMethod("session/start")).toHaveLength(0);
+    reply(lastByMethod("session/resume")!.id, { session: { sessionId: "MS-original" } });
+    await flushControls();
+    reply(lastByMethod("turn/start")!.id, { disposition: "started", turnId: "T-retry" });
+    notify("turn/completed", { sessionId: "MS-original", turnId: "T-retry", terminal: "completed" });
+    await retry;
+    await stopMuseSession("resume-fail");
+  });
+
+  it.each(["rejected", "unanswered"])("retires the host for an %s interruption and preserves resume", async outcome => {
+    const { turn } = await startTurn([], "hold", "stop-failure");
+    await new Promise(r => setTimeout(r, 0));
+    vi.useFakeTimers();
+    try {
+      const cancel = cancelMuseTurn("stop-failure");
+      if (outcome === "rejected") {
+        fail(lastByMethod("turn/interrupt")!.id, { code: -32603, message: "interrupt failed" });
+      } else {
+        await vi.advanceTimersByTimeAsync(15_001);
+      }
+      await cancel;
+      await turn;
+      expect(killChild).toHaveBeenCalledOnce();
+      expect(canSteerMuseSession("stop-failure")).toBe(false);
+    } finally { vi.useRealTimers(); }
+    sent.length = 0;
+    const retry = sendMuseTurn(baseInput([], "retry", "stop-failure"));
+    await waitFor(() => byMethod("initialize").length > 0, "retry initialize");
+    reply(lastByMethod("initialize")!.id, INIT_RESULT);
+    await waitFor(() => byMethod("session/resume").length > 0, "retry resume");
+    expect(lastByMethod("session/resume")!.params.sessionId).toBe("MS1");
+    await stopMuseSession("stop-failure");
+    await retry;
+  });
+
+  it("does not dispatch a new send before Stop is acknowledged", async () => {
+    const { turn } = await startTurn([], "hold", "stop-wait");
+    await new Promise(r => setTimeout(r, 0));
+    const cancel = cancelMuseTurn("stop-wait");
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "cancelled" });
+    const next = sendMuseTurn(baseInput([], "next", "stop-wait"));
+    await new Promise(r => setTimeout(r, 10));
+    expect(byMethod("turn/start")).toHaveLength(1);
+    reply(lastByMethod("turn/interrupt")!.id, {});
+    await cancel;
+    await turn;
+    await waitFor(() => byMethod("turn/start").length === 2, "next turn");
+    reply(lastByMethod("turn/start")!.id, { disposition: "started", turnId: "T2" });
+    notify("turn/completed", { sessionId: "MS1", turnId: "T2", terminal: "completed" });
+    await next;
+    await stopMuseSession("stop-wait");
+  });
+
+  it.each(["rejected", "unanswered"])("retires the host when queued work is not reclaimed (%s)", async outcome => {
+    const turn = sendMuseTurn(baseInput([], "queued on host", "unqueue-failure"));
+    await waitFor(() => byMethod("initialize").length > 0, "initialize");
+    reply(lastByMethod("initialize")!.id, INIT_RESULT);
+    await waitFor(() => byMethod("session/start").length > 0, "session start");
+    reply(lastByMethod("session/start")!.id, { session: { sessionId: "MS1" } });
+    await flushControls();
+    notify("turn/started", { sessionId: "MS1", turnId: "T-existing" });
+    reply(lastByMethod("turn/start")!.id, { disposition: "queued", turnId: "T-queued" });
+    await new Promise(r => setTimeout(r, 0));
+    vi.useFakeTimers();
+    try {
+      const cancel = cancelMuseTurn("unqueue-failure");
+      expect(lastByMethod("turn/interrupt")!.params.turnId).toBe("T-existing");
+      expect(lastByMethod("turn/unqueue")!.params.turnId).toBe("T-queued");
+      reply(lastByMethod("turn/interrupt")!.id, {});
+      if (outcome === "rejected") {
+        fail(lastByMethod("turn/unqueue")!.id, { code: -32603, message: "unqueue failed" });
+      } else {
+        await vi.advanceTimersByTimeAsync(15_001);
+      }
+      await cancel;
+      await turn;
+      expect(killChild).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("does not let a late Stop response retire a replacement host", async () => {
+    const old = await startTurn([], "old", "stop-replaced");
+    await new Promise(r => setTimeout(r, 0));
+    const cancel = cancelMuseTurn("stop-replaced");
+    const oldLine = onLine!;
+    const request = lastByMethod("turn/interrupt")!;
+    await stopMuseSession("stop-replaced");
+    await Promise.all([cancel, old.turn]);
+    sent.length = 0;
+    const next = sendMuseTurn(baseInput([], "new", "stop-replaced"));
+    await waitFor(() => byMethod("initialize").length > 0, "new initialize");
+    reply(lastByMethod("initialize")!.id, INIT_RESULT);
+    await waitFor(() => byMethod("session/resume").length > 0, "new resume");
+    reply(lastByMethod("session/resume")!.id, { session: { sessionId: "MS1" } });
+    await flushControls();
+    reply(lastByMethod("turn/start")!.id, { disposition: "started", turnId: "T-new" });
+    oldLine(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32603, message: "late interrupt failure" } }));
+    await new Promise(r => setTimeout(r, 0));
+    expect(killChild).toHaveBeenCalledOnce();
+    notify("turn/completed", { sessionId: "MS1", turnId: "T-new", terminal: "completed" });
+    await next;
+    await stopMuseSession("stop-replaced");
+  });
+
+  it("shares one resumed host for sends waiting on a failed Stop", async () => {
+    const old = await startTurn([], "old", "cancel-shared");
+    await new Promise(r => setTimeout(r, 0));
+    const cancel = cancelMuseTurn("cancel-shared");
+    const first = sendMuseTurn(baseInput([], "one", "cancel-shared"));
+    const second = sendMuseTurn(baseInput([], "two", "cancel-shared"));
+    fail(lastByMethod("turn/interrupt")!.id, { code: -32603, message: "interrupt failed" });
+    await Promise.all([cancel, old.turn]);
+    await waitFor(() => byMethod("initialize").length === 2, "one new initialize");
+    reply(lastByMethod("initialize")!.id, INIT_RESULT);
+    await waitFor(() => byMethod("session/resume").length === 1, "resume");
+    reply(lastByMethod("session/resume")!.id, { session: { sessionId: "MS1" } });
+    await waitFor(() => byMethod("session/setApprovalMode").length > 0, "mode");
+    reply(lastByMethod("session/setApprovalMode")!.id, {});
+    for (const count of [2, 3]) {
+      await waitFor(() => byMethod("turn/start").length === count, "serialized send");
+      const turnId = `T${count}`;
+      reply(lastByMethod("turn/start")!.id, { disposition: "started", turnId });
+      notify("turn/completed", { sessionId: "MS1", turnId, terminal: "completed" });
+    }
+    await Promise.all([first, second]);
+    expect(spawnChild).toHaveBeenCalledTimes(2);
+    await stopMuseSession("cancel-shared");
+  });
+
+  it.each(["live", "resume"])("serializes simultaneous questions from %s and preserves queued deadlines", async source => {
+    const events: HarnessEvent[] = [];
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const request = (id: string) => ({ sessionId: "MS1", userInputId: id, turnId: "T1", autoResolutionMs: 60_000, questions: [{ id, question: `${id}?`, options: [{ label: "Yes" }], selection: { mode: "single" } }] });
+    let turn: Promise<void> | undefined;
+    const state = () => events.reduce(applyHarnessEvent, newSession("muse:default"));
+    try {
+      if (source === "resume") {
+        bindMuseSession("question-queue", "MS1", "/repo");
+        turn = sendMuseTurn(baseInput(events, "resume questions", "question-queue"));
+        await waitFor(() => byMethod("initialize").length > 0, "initialize");
+        reply(lastByMethod("initialize")!.id, INIT_RESULT);
+        await waitFor(() => byMethod("session/resume").length > 0, "resume");
+        for (const [index, id] of ["first", "second", "expired", "last"].entries()) serverRequest(800 + index, "userInput/request", request(id));
+        reply(lastByMethod("session/resume")!.id, { session: { sessionId: "MS1" } });
+        await flushControls();
+        reply(lastByMethod("turn/start")!.id, { disposition: "started", turnId: "T1" });
+      } else {
+        ({ turn } = await startTurn(events, "ask questions", "question-queue"));
+        for (const id of ["first", "second", "expired", "last"]) notify("userInput/requested", request(id));
+      }
+      expect(events.filter(e => e.type === "question.asked")).toHaveLength(1);
+      expect(state().pendingQuestion?.questions[0].id).toBe("first");
+      const deadline = now + 60_000;
+      now += 10_000;
+      // A queued prompt may settle at the provider before becoming visible.
+      notify("userInput/settled", { sessionId: "MS1", userInputId: "expired", outcome: "cancelled" });
+      expect(state().pendingQuestion?.questions[0].id).toBe("first");
+      respondMuseQuestion("question-queue", state().pendingQuestion!.requestId, { kind: "skipped" });
+      fail(lastByMethod("userInput/cancel")!.id, { code: -32602, message: "retry question" });
+      await waitFor(() => events.some(e => e.type === "status" && e.text.includes("retry question")), "rejected decision");
+      expect(state().pendingQuestion?.questions[0].id).toBe("first");
+      respondMuseQuestion("question-queue", state().pendingQuestion!.requestId, { kind: "skipped" });
+      reply(lastByMethod("userInput/cancel")!.id, {});
+      await waitFor(() => state().pendingQuestion?.questions[0].id === "second", "second question");
+      expect(state().pendingQuestion?.autoResolveAt).toBe(deadline);
+      // Duplicate server settlement must not advance twice.
+      notify("userInput/settled", { sessionId: "MS1", userInputId: "first", outcome: "cancelled" });
+      expect(state().pendingQuestion?.questions[0].id).toBe("second");
+      notify("userInput/settled", { sessionId: "MS1", userInputId: "second", outcome: "answered" });
+      expect(state().pendingQuestion?.questions[0].id).toBe("last");
+      notify("userInput/requested", request("must-not-show-on-stop"));
+      const askedBeforeStop = events.filter(e => e.type === "question.asked").length;
+      await stopMuseSession("question-queue");
+      expect(state().pendingQuestion).toBeUndefined();
+      expect(events.filter(e => e.type === "question.asked")).toHaveLength(askedBeforeStop);
+      await turn;
+    } finally {
+      clock.mockRestore();
+      await stopMuseSession("question-queue");
+      await turn;
+    }
   });
 });

@@ -60,6 +60,10 @@ vi.mock("./child", () => ({
 
 const {
   __openCodeTestReset,
+  __openCodeRetainedState,
+  canSteerOpenCodeSession,
+  forgetOpenCodeSession,
+  setOpenCodeBinaryResolver,
   cancelOpenCodeTurn,
   respondOpenCodeApproval,
   respondOpenCodeQuestion,
@@ -137,6 +141,7 @@ beforeEach(() => {
   spawnChild.mockClear();
   killChild.mockClear();
   harnessHttp.mockClear();
+  setOpenCodeBinaryResolver(async () => ({ path: "/fake/opencode" }));
   __openCodeTestReset();
 });
 
@@ -1009,4 +1014,326 @@ describe("OpenCode child permission routing", () => {
     idle();
     await queued;
   });
+});
+
+
+describe("OpenCode startup and permission ownership", () => {
+  it.each(["resolve", "spawn"])(
+    "does not resurrect after forget during %s",
+    async (stage) => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      if (stage === "resolve")
+        setOpenCodeBinaryResolver(async () => {
+          await gate;
+          return { path: "/fake/opencode" };
+        });
+      else
+        spawnChild.mockImplementationOnce(async () => {
+          await gate;
+        });
+      const events: HarnessEvent[] = [];
+      const pending = turn(events);
+      const outcome = pending.catch((error: unknown) => error);
+      if (stage === "spawn")
+        await waitFor(() => spawnChild.mock.calls.length > 0, "spawn begins");
+      expect(canSteerOpenCodeSession("opencode-live")).toBe(false);
+      const stopping = forgetOpenCodeSession("opencode-live");
+      release();
+      expect(await outcome).toMatchObject({ name: "AbortError" });
+      await stopping;
+      expect(
+        harnessHttp.mock.calls.some(([input]) =>
+          input.url.includes("/prompt_async"),
+        ),
+      ).toBe(false);
+      expect(
+        events.some((event) => event.type === "session.providerBound"),
+      ).toBe(false);
+      if (stage === "resolve") expect(spawnChild).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([false, true])(
+    "waits for stricter permissions before sending (reject=%s)",
+    async (rejectUpdate) => {
+      const args = {
+        sessionId: "opencode-live",
+        cwd: "/repo",
+        model: "opencode:p/m",
+        runtimeMode: "full-access" as const,
+        text: "first",
+        onEvent: () => undefined,
+      };
+      const first = sendOpenCodeTurn(args);
+      await waitFor(
+        () =>
+          harnessHttp.mock.calls.some(([input]) =>
+            input.url.includes("/prompt_async"),
+          ),
+        "first prompt",
+      );
+      expect(canSteerOpenCodeSession(args.sessionId)).toBe(true);
+      idle();
+      await first;
+      expect(canSteerOpenCodeSession(args.sessionId)).toBe(false);
+      let release!: (value: { status: number; body: string }) => void;
+      const gate = new Promise<{ status: number; body: string }>((resolve) => {
+        release = resolve;
+      });
+      harnessHttp.mockClear();
+      harnessHttp.mockImplementationOnce(() => gate);
+      const second = sendOpenCodeTurn({
+        ...args,
+        runtimeMode: "supervised",
+        intent: "plan",
+      });
+      const outcome = second.catch((error: unknown) => error);
+      await waitFor(
+        () =>
+          harnessHttp.mock.calls.some(([input]) => input.method === "PATCH"),
+        "permission patch",
+      );
+      expect(
+        harnessHttp.mock.calls.some(([input]) =>
+          input.url.includes("/prompt_async"),
+        ),
+      ).toBe(false);
+      release(
+        rejectUpdate
+          ? { status: 503, body: "permission update failed" }
+          : { status: 204, body: "" },
+      );
+      if (rejectUpdate) {
+        expect(await outcome).toMatchObject({
+          message: "permission update failed",
+        });
+        expect(
+          harnessHttp.mock.calls.some(([input]) =>
+            input.url.includes("/prompt_async"),
+          ),
+        ).toBe(false);
+      } else {
+        await waitFor(
+          () =>
+            harnessHttp.mock.calls.some(([input]) =>
+              input.url.includes("/prompt_async"),
+            ),
+          "second prompt",
+        );
+        idle();
+        await second;
+      }
+    },
+  );
+
+  it("serializes permission updates in user order", async () => {
+    const { done } = await startTurn([]);
+    let release!: (value: { status: number; body: string }) => void;
+    const gate = new Promise<{ status: number; body: string }>((resolve) => {
+      release = resolve;
+    });
+    harnessHttp.mockClear();
+    harnessHttp.mockImplementationOnce(() => gate);
+    setOpenCodeRuntimeMode("opencode-live", "full-access");
+    setOpenCodeRuntimeMode("opencode-live", "supervised");
+    await waitFor(() => harnessHttp.mock.calls.length > 0, "first update");
+    expect(
+      harnessHttp.mock.calls.filter(([input]) => input.method === "PATCH"),
+    ).toHaveLength(1);
+    release({ status: 204, body: "" });
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.filter(([input]) => input.method === "PATCH")
+          .length === 2,
+      "second update",
+    );
+    const patch = harnessHttp.mock.calls
+      .filter(([input]) => input.method === "PATCH")
+      .at(-1)![0];
+    expect(JSON.parse(patch.body!).permission).toContainEqual({
+      permission: "*",
+      pattern: "*",
+      action: "ask",
+    });
+    idle();
+    await done;
+  });
+});
+
+describe("OpenCode retained streaming state", () => {
+  it("bounds finalized parts while keeping an active stream and ignoring late replay", async () => {
+    const events: HarnessEvent[] = [];
+    const { done } = await startTurn(events);
+    const message = (id: string) =>
+      onSseEvent?.({
+        type: "message.updated",
+        properties: { info: { sessionID: "session_1", id, role: "assistant" } },
+      });
+    const part = (id: string, messageID: string, text: string, end?: number) =>
+      onSseEvent?.({
+        type: "message.part.updated",
+        properties: {
+          part: {
+            sessionID: "session_1",
+            id,
+            messageID,
+            type: "text",
+            text,
+            time: end ? { end } : {},
+          },
+        },
+      });
+    message("active-msg");
+    part("active", "active-msg", "live ");
+    for (let i = 0; i < 600; i++) {
+      message(`m${i}`);
+      part(`p${i}`, `m${i}`, `completed ${i}`, 1);
+    }
+    expect(__openCodeRetainedState("opencode-live")?.parts).toBeLessThanOrEqual(
+      257,
+    );
+    expect(
+      __openCodeRetainedState("opencode-live")?.emitted,
+    ).toBeLessThanOrEqual(257);
+    const count = events.length;
+    message("m0");
+    part("p0", "m0", "completed 0", 1);
+    expect(
+      events.slice(count).some((event) => event.type === "message.delta"),
+    ).toBe(false);
+    onSseEvent?.({
+      type: "message.part.delta",
+      properties: {
+        sessionID: "session_1",
+        partID: "active",
+        delta: "continues",
+      },
+    });
+    expect(events.at(-1)).toMatchObject({
+      type: "message.delta",
+      text: "continues",
+    });
+    message("big");
+    part("large", "big", "x".repeat(600_000), 1);
+    expect(__openCodeRetainedState("opencode-live")?.bytes).toBeLessThanOrEqual(
+      1_000_000,
+    );
+    idle();
+    await done;
+  });
+
+  it("removes provider-deleted parts from every retained index", async () => {
+    const { done } = await startTurn([]);
+    onSseEvent?.({
+      type: "message.updated",
+      properties: {
+        info: { sessionID: "session_1", id: "m", role: "assistant" },
+      },
+    });
+    onSseEvent?.({
+      type: "message.part.updated",
+      properties: {
+        part: {
+          sessionID: "session_1",
+          id: "p",
+          messageID: "m",
+          type: "text",
+          text: "hello",
+        },
+      },
+    });
+    onSseEvent?.({
+      type: "message.removed",
+      properties: { sessionID: "session_1", messageID: "m" },
+    });
+    expect(__openCodeRetainedState("opencode-live")).toMatchObject({
+      parts: 0,
+      emitted: 0,
+      messages: 0,
+    });
+    idle();
+    await done;
+  });
+});
+
+it("OpenCode cancels queued work and allows a later explicit turn", async () => {
+  const first = await startTurn([]);
+  const queued = turn([]);
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  await cancelOpenCodeTurn("opencode-live");
+  await Promise.all([first.done, queued]);
+  expect(
+    harnessHttp.mock.calls.filter(([input]) =>
+      input.url.includes("/prompt_async"),
+    ),
+  ).toHaveLength(1);
+  const next = turn([]);
+  await waitFor(
+    () =>
+      harnessHttp.mock.calls.filter(([input]) =>
+        input.url.includes("/prompt_async"),
+      ).length === 2,
+    "next prompt",
+  );
+  idle();
+  await next;
+});
+
+it("OpenCode keeps a finalized part until its late role metadata arrives", async () => {
+  const events: HarnessEvent[] = [];
+  const { done } = await startTurn(events);
+  onSseEvent?.({
+    type: "message.part.updated",
+    properties: {
+      part: {
+        sessionID: "session_1",
+        id: "late-part",
+        messageID: "late-message",
+        type: "text",
+        text: "x".repeat(600_000),
+        time: { end: 1 },
+      },
+    },
+  });
+  expect(events.some((event) => event.type === "message.delta")).toBe(false);
+  onSseEvent?.({
+    type: "message.updated",
+    properties: {
+      info: { sessionID: "session_1", id: "late-message", role: "assistant" },
+    },
+  });
+  expect(
+    events.find((event) => event.type === "message.delta")?.text,
+  ).toHaveLength(600_000);
+  expect(__openCodeRetainedState("opencode-live")?.bytes).toBeLessThanOrEqual(
+    1_000_000,
+  );
+  idle();
+  await done;
+});
+
+it.each(["http", "timeout"])("retires OpenCode after a failed abort (%s) and resumes on the next explicit send", async (failure) => {
+  const original = harnessHttp.getMockImplementation()!;
+  harnessHttp.mockImplementation(async (input) => {
+    if (!input.url.includes("/abort")) return original(input);
+    if (failure === "timeout") throw new Error("abort rejected: timeout");
+    return { status: 500, body: "abort rejected" };
+  });
+  try {
+    const events: HarnessEvent[] = [];
+    const first = await startTurn(events);
+    await cancelOpenCodeTurn("opencode-live");
+    await first.done;
+    expect(killChild).toHaveBeenCalledWith("opencode-live");
+    expect(events).toContainEqual(expect.objectContaining({ type: "session.error", message: expect.stringContaining("abort rejected") }));
+    harnessHttp.mockClear();
+    const second = await startTurn(events);
+    expect(spawnChild).toHaveBeenCalledTimes(2);
+    expect(harnessHttp.mock.calls.some(([input]) => input.method === "GET" && new URL(input.url).pathname === "/session/session_1")).toBe(true);
+    idle();
+    await second.done;
+  } finally { harnessHttp.mockImplementation(original); }
 });

@@ -10,6 +10,7 @@ import {
   sendMuseTurn,
   setMuseRuntimeMode,
   steerMuseTurn,
+  canSteerMuseSession,
   stopMuseSession,
 } from "./muse";
 import { refreshMuseCatalog } from "./museCatalog";
@@ -23,6 +24,7 @@ export const museAdapter: HarnessAdapter = {
   prewarm: prewarmMuseSession,
   compactContext: compactMuseContext,
   steerTurn: steerMuseTurn,
+  canSteerSession: canSteerMuseSession,
   cancelTurn: cancelMuseTurn,
   respondApproval: respondMuseApproval,
   setRuntimeMode: setMuseRuntimeMode,

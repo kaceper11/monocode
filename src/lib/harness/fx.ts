@@ -1,7 +1,16 @@
+import {
+  acpStopReasonMessage,
+  acpUnsupportedControl,
+  acpAssertConfigApplied,
+  type AcpPermissionOption,
+  AcpClient,
+  acpAutoOption,
+  type AcpHandlers,
+} from "./acp";
+import { acquireSharedStart } from "./liveStart";
 import { nativeModelId } from "../models";
 import { AcpSubagents } from "./acpSubagents";
 import type { RuntimeMode } from "../session";
-import { AcpClient, acpAutoOption, type AcpHandlers } from "./acp";
 import type { JsonRpcId } from "./jsonRpc";
 import {
   killChild,
@@ -38,6 +47,7 @@ type SessionSetupResult = {
 type PendingApproval = {
   kind?: string;
   optionIds: string[];
+  options?: AcpPermissionOption[];
   resolve: (decision: ApprovalDecision) => void;
 };
 
@@ -57,6 +67,7 @@ type Live = {
   approvals: Map<number, PendingApproval>;
   nextRequestId: number;
   onEvent: (event: HarnessEvent) => void;
+  turnGeneration: number;
   turns: Promise<void>;
 };
 
@@ -100,6 +111,7 @@ const CLIENT_CAPABILITIES = {
 const liveByThread = new Map<string, Live>();
 const resumeByThread = new Map<string, Resume>();
 const cancelledThreads = new Set<string>();
+const startingClients = new Map<string, AcpClient>();
 
 /**
  * Live fx adapter. Spawns `fx acp` and talks Agent Client Protocol.
@@ -108,17 +120,19 @@ const cancelledThreads = new Set<string>();
 export async function sendFxTurn(input: SendTurnInput): Promise<void> {
   let live: Live;
   try {
-    live = await ensureLive(input);
+    live = await acquireLive(input);
   } catch (error) {
     cancelledThreads.delete(input.sessionId);
     throw error;
   }
   if (cancelledThreads.delete(input.sessionId)) return;
 
-  live.onEvent = input.onEvent;
+  const generation = live.turnGeneration;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (liveByThread.get(input.sessionId) !== live || live.turnGeneration !== generation) return;
+      live.onEvent = input.onEvent;
       // Posture applies when the queued turn actually runs — applying it at
       // enqueue time would flip the running turn's permission handling.
       live.runtimeMode = input.runtimeMode;
@@ -147,7 +161,7 @@ export async function sendFxTurn(input: SendTurnInput): Promise<void> {
     // its provider session id, but recycle the child so the next turn can
     // resume instead of inheriting a permanently wedged transport.
     if (liveByThread.get(input.sessionId) === live) {
-      await stopFxSession(input.sessionId);
+      await stopFxSession(input.sessionId, true);
     }
     throw error;
   }
@@ -179,13 +193,13 @@ export function setFxRuntimeMode(
   if (!live) return;
   const changed = live.runtimeMode !== runtimeMode;
   live.runtimeMode = runtimeMode;
-  void applyRuntimeMode(live, runtimeMode, live.planning).catch(
-    () => undefined,
-  );
+  void applyRuntimeMode(live, runtimeMode, live.planning).catch((error: unknown) => {
+    live.onEvent({ type: "session.error", message: error instanceof Error ? error.message : String(error) });
+  });
   if (!changed) return;
   // Settle parked asks the new mode would auto-answer; the rest stay parked.
   for (const [requestId, pending] of live.approvals) {
-    if (acpAutoOption(runtimeMode, pending.kind, pending.optionIds)) {
+    if (acpAutoOption(runtimeMode, pending.kind, pending.optionIds, pending.options)) {
       live.approvals.delete(requestId);
       pending.resolve("allow");
     }
@@ -196,30 +210,43 @@ export async function cancelFxTurn(sessionId: string): Promise<void> {
   const live = liveByThread.get(sessionId);
   if (!live) {
     cancelledThreads.add(sessionId);
+    const starting = startingClients.get(sessionId);
+    if (starting) {
+      starting.close(new Error("cancelled"));
+      unwatchChild(sessionId);
+      await killChild(sessionId).catch(() => undefined);
+    }
     return;
   }
+  live.turnGeneration += 1;
   live.cancelled = true;
   live.muteUpdates = true;
   for (const [, pending] of live.approvals) pending.resolve("deny");
   live.approvals.clear();
+  live.acp.rejectPending(new Error("cancelled"));
   await live.acp
     .notify("session/cancel", { sessionId: live.acpSessionId })
     .catch(() => undefined);
-  live.acp.rejectPending(new Error("cancelled"));
 }
 
-export async function stopFxSession(sessionId: string): Promise<void> {
-  cancelledThreads.delete(sessionId);
+export async function stopFxSession(sessionId: string, internal = false): Promise<void> {
+  if (!internal && startingByThread.has(sessionId)) cancelledThreads.add(sessionId);
+  else cancelledThreads.delete(sessionId);
+  const starting = startingClients.get(sessionId);
+  starting?.close(new Error("cancelled"));
   const live = liveByThread.get(sessionId);
   liveByThread.delete(sessionId);
   if (live) {
+    live.cancelled = true;
     live.muteUpdates = true;
     for (const [, pending] of live.approvals) pending.resolve("deny");
     live.approvals.clear();
   }
   live?.acp.close();
-  unwatchChild(sessionId);
-  await killChild(sessionId).catch(() => undefined);
+  if (live || starting) {
+    unwatchChild(sessionId);
+    await killChild(sessionId).catch(() => undefined);
+  }
 }
 
 export async function forgetFxSession(sessionId: string): Promise<void> {
@@ -237,15 +264,20 @@ export function bindFxSession(
   resumeByThread.set(threadId, { acpSessionId: sessionId, cwd });
 }
 
+const startingByThread = new Map<string, Promise<Live>>();
+
+function acquireLive(input: Parameters<typeof ensureLive>[0]): Promise<Live> {
+  return acquireSharedStart(input.sessionId, liveByThread, startingByThread, () => ensureLive(input));
+}
+
 async function ensureLive(input: SendTurnInput): Promise<Live> {
   const existing = liveByThread.get(input.sessionId);
   if (existing && existing.cwd === input.cwd) {
-    existing.onEvent = input.onEvent;
     return existing;
   }
   if (existing) {
     resumeByThread.delete(input.sessionId);
-    await stopFxSession(input.sessionId);
+    await stopFxSession(input.sessionId, true);
   }
 
   const resume = resumeByThread.get(input.sessionId);
@@ -254,9 +286,12 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     resumeByThread.delete(input.sessionId);
   }
 
+  if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
   const { path } = await resolveFxBinary(input.cwd);
+  if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(input.sessionId, handlers);
+  startingClients.set(input.sessionId, acp);
   const liveRef: { current: Live | null } = { current: null };
   const muteGate = { current: false };
 
@@ -279,6 +314,7 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     }
     void handleRequest(live, id, method, params).catch((error) => {
       console.debug("[monocode] fx request handler failed", error);
+      (liveRef.current?.onEvent ?? input.onEvent)({ type: "session.error", message: error instanceof Error ? error.message : String(error) });
       void acp
         .respondError(id, { code: -32603, message: "Internal error" })
         .catch(() => undefined);
@@ -317,9 +353,10 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     },
   );
 
-  await spawnChild(input.sessionId, path, fxSpawnArgs(input.model, input.cwd), input.cwd);
-
   try {
+    await spawnChild(input.sessionId, path, fxSpawnArgs(input.model, input.cwd), input.cwd);
+
+    if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
     try {
       await acp.request(
         "initialize",
@@ -347,7 +384,8 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
         );
         acpSessionId = sessionIdFromResult(setup) ?? resume.acpSessionId;
         didLoad = true;
-      } catch {
+      } catch (error) {
+        if (!acpUnsupportedControl(error)) throw new Error(`Could not resume the saved conversation; its binding was preserved. ${error instanceof Error ? error.message : String(error)}`);
         muteGate.current = true;
         try {
           setup = await acp.request<SessionSetupResult>(
@@ -361,10 +399,8 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
           );
           acpSessionId = sessionIdFromResult(setup) ?? resume.acpSessionId;
           didLoad = true;
-        } catch {
-          setup = undefined;
-          acpSessionId = undefined;
-          didLoad = false;
+        } catch (error) {
+          throw new Error(`Could not load the saved conversation; its binding was preserved. ${error instanceof Error ? error.message : String(error)}`);
         } finally {
           muteGate.current = false;
         }
@@ -396,8 +432,11 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
       approvals: new Map(),
       nextRequestId: 1_000_000,
       onEvent: input.onEvent,
+      turnGeneration: 0,
       turns: Promise.resolve(),
     };
+    if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
+    startingClients.delete(input.sessionId);
     liveRef.current = live;
     liveByThread.set(input.sessionId, live);
     resumeByThread.set(input.sessionId, {
@@ -412,7 +451,8 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     return live;
   } catch (error) {
     acp.close(error instanceof Error ? error : new Error(String(error)));
-    await stopFxSession(input.sessionId);
+    await stopFxSession(input.sessionId, true);
+    if (startingClients.get(input.sessionId) === acp) startingClients.delete(input.sessionId);
     throw error;
   }
 }
@@ -426,21 +466,12 @@ async function applyModelSelection(
   const modelConfigId =
     live.modelConfigId === "provider" ? "model" : live.modelConfigId;
 
-  await setConfigOption(live, modelConfigId, base).catch((error: unknown) => {
-    ignoreUnsupportedControl("set_config_option", error);
-  });
-  if (modelConfigId !== "model") {
-    await setConfigOption(live, "model", base).catch((error: unknown) => {
-      ignoreUnsupportedControl("set_config_option", error);
-    });
-  }
+  await setConfigOption(live, modelConfigId, base);
 
   for (const [settingId, value] of Object.entries(settings)) {
     const configId = resolveSettingConfigId(live.configOptions, settingId);
-    if (!configId || configId === "provider") continue;
-    await setConfigOption(live, configId, value).catch((error: unknown) => {
-      ignoreUnsupportedControl("set_config_option", error);
-    });
+    if (!configId || configId === "provider") throw new Error(`fx does not support the selected ${settingId} setting.`);
+    await setConfigOption(live, configId, value);
   }
 }
 
@@ -491,6 +522,7 @@ async function setConfigOption(
   );
   if (result?.configOptions) {
     live.configOptions = readConfigOptions(result.configOptions);
+    acpAssertConfigApplied(live.configOptions, configId, value);
     live.modelConfigId = extractModelConfigId(live.configOptions);
   }
 }
@@ -504,7 +536,7 @@ async function prompt(live: Live, input: SendTurnInput): Promise<void> {
   try {
     const blocks = fxPromptBlocks(input.text);
     if (blocks.length === 0) return;
-    await live.acp.request(
+    const result = await live.acp.request<{ stopReason?: string }>(
       "session/prompt",
       {
         sessionId: live.acpSessionId,
@@ -513,6 +545,8 @@ async function prompt(live: Live, input: SendTurnInput): Promise<void> {
       PROMPT_TIMEOUT_MS,
     );
     if (live.cancelled) return;
+    const stopMessage = acpStopReasonMessage("Fx", result?.stopReason ?? "");
+    if (stopMessage) live.onEvent({ type: "session.error", message: stopMessage });
     live.onEvent({ type: "message.completed" });
     live.onEvent({ type: "reasoning.completed" });
   } catch (error) {
@@ -530,8 +564,7 @@ async function prompt(live: Live, input: SendTurnInput): Promise<void> {
 
 function ignoreUnsupportedControl(method: string, error: unknown): void {
   console.debug(`[monocode] fx ${method} failed`, error);
-  const detail = error instanceof Error ? error.message : String(error);
-  if (/timed out|not running|exited|closed|pipe/i.test(detail)) throw error;
+  if (!acpUnsupportedControl(error)) throw error;
 }
 
 function handleNotification(live: Live, method: string, params: unknown) {
@@ -587,6 +620,7 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     const optionId = permissionOptionId(
       request.kind === "read" || request.kind === "search" ? "allow" : "deny",
       request.optionIds,
+      request.options,
     );
     await live.acp
       .respond(
@@ -602,6 +636,7 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     live.runtimeMode,
     request.kind,
     request.optionIds,
+    request.options,
   );
   if (auto) {
     await live.acp
@@ -623,12 +658,13 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     live.approvals.set(requestId, {
       kind: request.kind,
       optionIds: request.optionIds,
+      options: request.options,
       resolve,
     });
   });
   live.approvals.delete(requestId);
   live.onEvent({ type: "approval.resolved", requestId, decision });
-  const optionId = permissionOptionId(decision, request.optionIds);
+  const optionId = live.cancelled || live.muteUpdates ? undefined : permissionOptionId(decision, request.optionIds, request.options);
   await live.acp
     .respond(
       id,

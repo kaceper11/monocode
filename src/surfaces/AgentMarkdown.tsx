@@ -442,6 +442,16 @@ const MARKDOWN_COMPONENTS = {
 
 const TEXT_ONLY_COMPONENTS = { ...MARKDOWN_COMPONENTS, img: () => <span className="text-content/45">[Image — select separately under Images & files]</span> } satisfies Components;
 
+/** User prompts often contain unfenced generics/XML; display those literally. */
+function remarkLiteralHtml() {
+  type Node = { type: string; children?: Node[] };
+  function visit(node: Node) {
+    if (node.type === "html") node.type = "text";
+    for (const child of node.children ?? []) visit(child);
+  }
+  return visit;
+}
+
 export const AgentMarkdown = memo(function AgentMarkdown({
   text,
   streaming,
@@ -475,9 +485,10 @@ export const AgentMarkdown = memo(function AgentMarkdown({
   const remarkPlugins = useMemo<PluggableList>(
     () => [
       ...Object.values(defaultRemarkPlugins),
+      ...(textOnly ? [remarkLiteralHtml] : []),
       [remarkWorkspaceFileLinks, { cwd }],
     ],
-    [cwd],
+    [cwd, textOnly],
   );
   const remoteMedia = !!allowRemoteMedia;
 

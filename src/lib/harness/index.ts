@@ -1,6 +1,7 @@
 export { startHarnessBridge, killAllChildren } from "./child";
 export {
   applyHarnessEvent,
+  applyHarnessEvents,
   appendUser,
   appendSteerUser,
   promoteLastAssistantToPlan,

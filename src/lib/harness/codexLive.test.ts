@@ -1,15 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const sent: string[] = [];
+const resolveCodexBinary = vi.fn(async () => ({ path: "/fake/codex" }));
+const spawnChild = vi.fn(async () => undefined);
+const killChild = vi.fn(async () => undefined);
 let onLine: ((line: string) => void) | undefined;
 const writeChild = vi.fn(async (_id: string, line: string) => {
   sent.push(line);
 });
 
 vi.mock("./child", () => ({
-  resolveCodexBinary: async () => ({ path: "/fake/codex" }),
-  spawnChild: async () => undefined,
-  killChild: async () => undefined,
+  resolveCodexBinary,
+  spawnChild,
+  killChild,
   unwatchChild: () => undefined,
   watchChild: (_id: string, line: (l: string) => void) => {
     onLine = line;
@@ -25,9 +28,12 @@ const {
   respondCodexApproval,
   respondCodexQuestion,
   sendCodexTurn,
+  prewarmCodexSession,
+  canSteerCodexSession,
   setCodexRuntimeMode,
   stopCodexSession,
   __codexTestReset,
+  __codexTestRetained,
 } = await import("./codex");
 import type { HarnessEvent } from "./types";
 import { newSession, type RuntimeMode, type TurnIntent } from "../session";
@@ -64,6 +70,7 @@ async function startTurn(
     intent?: TurnIntent;
     resume?: boolean;
     beforeThreadReply?: () => Promise<void>;
+    beforeTurnReply?: () => Promise<void>;
   } = {},
 ) {
   const events: HarnessEvent[] = [];
@@ -99,6 +106,7 @@ async function startTurn(
     () => parse().some((m) => m.method === "turn/start"),
     "turn/start",
   );
+  await options.beforeTurnReply?.();
   reply(parse().find((m) => m.method === "turn/start")!.id as number, {
     turn: { id: "turn_1", status: "inProgress" },
   });
@@ -109,6 +117,9 @@ async function startTurn(
 describe("codex live turn sequence", () => {
   beforeEach(() => {
     sent.length = 0;
+    resolveCodexBinary.mockReset().mockResolvedValue({ path: "/fake/codex" });
+    spawnChild.mockClear();
+    killChild.mockClear();
     onLine = undefined;
     writeChild.mockClear();
   });
@@ -1529,6 +1540,27 @@ describe("codex live turn sequence", () => {
     await turn;
   });
 
+  it("ignores an old terminal event after a follow-up starts", async () => {
+    const { turn } = await startTurn("codex-late");
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
+    const events: HarnessEvent[] = [];
+    const next = sendCodexTurn({ sessionId: "codex-late", cwd: "/repo", model: "codex:gpt-5.4", runtimeMode: "supervised", text: "next", onEvent: e => events.push(e) });
+    await waitFor(() => parse().filter(m => m.method === "turn/start").length === 2, "second turn");
+    const request = parse().filter(m => m.method === "turn/start").at(-1)!;
+    reply(request.id as number, { turn: { id: "turn_2" } });
+    notify("turn/started", { turn: { id: "turn_2" } });
+    let settled = false;
+    void next.then(() => { settled = true; });
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await new Promise(r => setTimeout(r, 0));
+    expect(settled).toBe(false);
+    expect(canSteerCodexSession("codex-late")).toBe(true);
+    expect(events.some(e => e.type === "message.completed")).toBe(false);
+    notify("turn/completed", { turn: { id: "turn_2", status: "completed" } });
+    await next;
+  });
+
   it("falls back to the thread's model for the Default picker entry", async () => {
     const events: HarnessEvent[] = [];
     const turn = sendCodexTurn({
@@ -1982,5 +2014,253 @@ describe("codex subagents", () => {
           event.text.includes("Child talking."),
       ),
     ).toBe(false);
+  });
+  it.each(["cancel", "remove"])("fences %s before binary resolution without spawning", async action => {
+    let resolve!: (result: { path: string }) => void;
+    resolveCodexBinary.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    const events: HarnessEvent[] = [];
+    const turn = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:default", runtimeMode: "supervised", text: "never run", onEvent: e => events.push(e) });
+    await waitFor(() => !!resolve, "binary resolution");
+    if (action === "cancel") await cancelCodexTurn("codex-live");
+    else await stopCodexSession("codex-live");
+    resolve({ path: "/fake/codex" });
+    await turn;
+    expect(spawnChild).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+  });
+
+  it("cancels a home-session warmup before it can spawn or dispatch a turn", async () => {
+    let resolve!: (result: { path: string }) => void;
+    resolveCodexBinary.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    const events: HarnessEvent[] = [];
+    const warmup = prewarmCodexSession({ sessionId: "codex-live", cwd: "~",
+      model: "codex:gpt-6-astra", modelSettings: { reasoningEffort: "medium" },
+      runtimeMode: "supervised", onEvent: e => events.push(e) });
+    await waitFor(() => !!resolve, "warmup binary resolution");
+    await cancelCodexTurn("codex-live");
+    resolve({ path: "/fake/codex" });
+    await warmup;
+    expect(spawnChild).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+    expect(parse().some(m => m.method === "turn/start")).toBe(false);
+  });
+
+  it("recycles the owned host when Stop races the turn/start acknowledgement", async () => {
+    const { events, turn } = await startTurn("codex-live", { beforeTurnReply: () => cancelCodexTurn("codex-live") });
+    await turn;
+    expect(killChild).toHaveBeenCalledOnce();
+    expect(canSteerCodexSession("codex-live")).toBe(false);
+    notify("item/agentMessage/delta", { itemId: "late", delta: "must stay hidden" });
+    expect(events.some(e => e.type === "message.delta")).toBe(false);
+    sent.length = 0;
+    const next = await startTurn("codex-live", { resume: true });
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await next.turn;
+  });
+
+  it.each(["assistant", "reasoning"])("deduplicates separate streamed %s items within one turn", async role => {
+    const { events, turn } = await startTurn("codex-live");
+    const deltaMethod = role === "assistant" ? "item/agentMessage/delta" : "item/reasoning/summaryTextDelta";
+    for (const [id, text] of [["first", "I will inspect the code."], ["second", "The bug is fixed."]]) {
+      notify(deltaMethod, { threadId: "thr_1", itemId: id, delta: text });
+      notify("item/completed", { threadId: "thr_1", item: { id, type: role === "assistant" ? "agentMessage" : "reasoning", text, summary: [text] } });
+    }
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
+    const type = role === "assistant" ? "message.delta" : "reasoning.delta";
+    expect(events.filter(e => e.type === type).map(e => "text" in e ? e.text : "")).toEqual(["I will inspect the code.", "The bug is fixed."]);
+  });
+
+  it("bounds child mappings and unmatched payloads across turns", async () => {
+    const { events, turn } = await startTurn("codex-live");
+    for (let i = 0; i < 300; i++) {
+      notify("item/started", { threadId: `unknown-${i}`, item: { id: "cmd", type: "commandExecution", command: "x".repeat(16000) } });
+      notify("item/completed", { threadId: "thr_1", item: { id: `spawn-${i}`, type: "subAgentActivity", kind: "started", agentThreadId: `child-${i}` } });
+    }
+    expect(__codexTestRetained("codex-live")).toMatchObject({ children: 128 });
+    expect(__codexTestRetained("codex-live").pending).toBeLessThanOrEqual(64);
+    expect(__codexTestRetained("codex-live").bytes).toBeLessThanOrEqual(1024 * 1024);
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
+    expect(__codexTestRetained("codex-live")).toMatchObject({ pending: 0, bytes: 0 });
+    notify("item/completed", { threadId: "thr_1", item: { id: "fresh-spawn", type: "subAgentActivity", kind: "started", agentThreadId: "fresh-child" } });
+    notify("item/completed", { threadId: "fresh-child", item: { id: "fresh-answer", type: "agentMessage", text: "latest child" } });
+    expect(events.some(e => e.type === "agent.step" && e.callId === "fresh-spawn" && e.text === "latest child")).toBe(true);
+    expect(__codexTestRetained("codex-live").children).toBe(128);
+  });
+
+  it("does not dispatch an already queued send after cancellation", async () => {
+    const { turn } = await startTurn("codex-live");
+    const queued = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:default", runtimeMode: "supervised", text: "queued", onEvent: () => undefined });
+    const cancel = cancelCodexTurn("codex-live");
+    await waitFor(() => parse().some(m => m.method === "turn/interrupt"), "interrupt");
+    reply(parse().find(m => m.method === "turn/interrupt")!.id as number, {});
+    await Promise.all([turn, queued, cancel]);
+    expect(parse().filter(m => m.method === "turn/start")).toHaveLength(1);
+  });
+
+  it("still reports a real startup error after cleanup", async () => {
+    const turn = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:default", runtimeMode: "supervised", text: "test", onEvent: () => undefined });
+    const rejected = expect(turn).rejects.toThrow("initialize denied");
+    await waitFor(() => parse().some(m => m.method === "initialize"), "initialize");
+    onLine!(JSON.stringify({ id: parse().find(m => m.method === "initialize")!.id, error: { code: -32602, message: "initialize denied" } }));
+    await rejected;
+    expect(killChild).toHaveBeenCalled();
+    expect(parse().some(m => m.method === "turn/start")).toBe(false);
+  });
+
+  it("cannot bind a session after removal during the handshake", async () => {
+    const events: HarnessEvent[] = [];
+    const turn = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:default", runtimeMode: "supervised", text: "never run", onEvent: e => events.push(e) });
+    await waitFor(() => parse().some(m => m.method === "initialize"), "initialize");
+    reply(parse().find(m => m.method === "initialize")!.id as number, {});
+    await waitFor(() => parse().some(m => m.method === "thread/start"), "thread start");
+    const start = parse().find(m => m.method === "thread/start")!;
+    await stopCodexSession("codex-live");
+    reply(start.id as number, { thread: { id: "removed" } });
+    await turn;
+    expect(events.some(e => e.type === "session.providerBound")).toBe(false);
+    expect(parse().some(m => m.method === "turn/start")).toBe(false);
+  });
+
+  it("allows a new send while a cancelled binary resolution is still pending", async () => {
+    let resolve!: (result: { path: string }) => void;
+    resolveCodexBinary.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    const original = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:default", runtimeMode: "supervised", text: "old", onEvent: () => undefined });
+    await waitFor(() => !!resolve, "old resolution");
+    await cancelCodexTurn("codex-live");
+    const next = await startTurn("codex-live");
+    resolve({ path: "/fake/codex" });
+    await original;
+    expect(spawnChild).toHaveBeenCalledOnce();
+    expect(canSteerCodexSession("codex-live")).toBe(true);
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await next.turn;
+  });
+
+
+  it.each(["rejected", "unanswered"])("retires the host after an %s interrupt and preserves resume", async outcome => {
+    const { turn } = await startTurn("codex-live");
+    vi.useFakeTimers();
+    try {
+      const cancel = cancelCodexTurn("codex-live");
+      if (outcome === "rejected") {
+        const request = parse().find(m => m.method === "turn/interrupt")!;
+        onLine!(JSON.stringify({ id: request.id, error: { code: -32603, message: "interrupt failed" } }));
+      } else {
+        await vi.advanceTimersByTimeAsync(15_001);
+      }
+      await cancel;
+      await turn;
+      expect(killChild).toHaveBeenCalledOnce();
+      expect(canSteerCodexSession("codex-live")).toBe(false);
+    } finally { vi.useRealTimers(); }
+    sent.length = 0;
+    const retry = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:gpt-5.4", runtimeMode: "supervised", text: "retry", onEvent: () => undefined });
+    await waitFor(() => parse().some(m => m.method === "initialize"), "initialize");
+    reply(parse().find(m => m.method === "initialize")!.id as number, {});
+    await waitFor(() => parse().some(m => m.method === "thread/resume"), "resume");
+    expect(parse().find(m => m.method === "thread/resume")!.params).toMatchObject({ threadId: "thr_1" });
+    await stopCodexSession("codex-live");
+    await retry;
+  });
+
+  it("does not let a late interrupt response stop a replacement host", async () => {
+    const old = await startTurn("codex-live");
+    const cancel = cancelCodexTurn("codex-live");
+    const request = parse().find(m => m.method === "turn/interrupt")!;
+    const oldLine = onLine!;
+    await stopCodexSession("codex-live");
+    await Promise.all([cancel, old.turn]);
+    sent.length = 0;
+    const next = await startTurn("codex-live", { resume: true });
+    oldLine(JSON.stringify({ id: request.id, error: { code: -32603, message: "late interrupt failure" } }));
+    await new Promise(r => setTimeout(r, 0));
+    expect(killChild).toHaveBeenCalledOnce();
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await next.turn;
+  });
+
+  it("shares one resumed host for sends waiting on a failed interruption", async () => {
+    const old = await startTurn("codex-live");
+    const cancel = cancelCodexTurn("codex-live");
+    const input = { sessionId: "codex-live", cwd: "/repo", model: "codex:gpt-5.4", runtimeMode: "supervised" as const, text: "next", onEvent: () => undefined };
+    const first = sendCodexTurn(input);
+    const second = sendCodexTurn(input);
+    const request = parse().find(m => m.method === "turn/interrupt")!;
+    onLine!(JSON.stringify({ id: request.id, error: { code: -32603, message: "interrupt failed" } }));
+    await Promise.all([cancel, old.turn]);
+    await waitFor(() => parse().filter(m => m.method === "initialize").length === 2, "one new initialize");
+    reply(parse().filter(m => m.method === "initialize").at(-1)!.id as number, {});
+    await waitFor(() => parse().some(m => m.method === "thread/resume"), "resume");
+    reply(parse().find(m => m.method === "thread/resume")!.id as number, { thread: { id: "thr_1", model: "gpt-5.4" } });
+    for (const count of [2, 3]) {
+      await waitFor(() => parse().filter(m => m.method === "turn/start").length === count, "serialized send");
+      const turnId = `turn_${count}`;
+      reply(parse().filter(m => m.method === "turn/start").at(-1)!.id as number, { turn: { id: turnId } });
+      notify("turn/completed", { turn: { id: turnId, status: "completed" } });
+    }
+    await Promise.all([first, second]);
+    expect(spawnChild).toHaveBeenCalledTimes(2);
+  });
+  it("delayed stopped terminal cannot complete next admission", async () => {
+    const old = await startTurn("codex-live");
+    const cancel = cancelCodexTurn("codex-live");
+    reply(parse().find(m => m.method === "turn/interrupt")!.id as number, {});
+    await Promise.all([cancel, old.turn]);
+    const events: HarnessEvent[] = [];
+    const next = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:gpt-5.4", runtimeMode: "supervised", text: "new task", onEvent: e => events.push(e) });
+    const settled = vi.fn(); void next.then(settled);
+    await waitFor(() => parse().filter(m => m.method === "turn/start").length === 2, "new admission");
+    notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "interrupted" } });
+    reply(parse().filter(m => m.method === "turn/start").at(-1)!.id as number, { turn: { id: "turn_2" } });
+    await new Promise(r => setTimeout(r, 10));
+    expect(settled).not.toHaveBeenCalled();
+    notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_2", status: "completed" } });
+    await next;
+  });
+
+
+  it("ignores duplicate terminal events from several successfully stopped turns", async () => {
+    const first = await startTurn("codex-live");
+    const stopFirst = cancelCodexTurn("codex-live");
+    reply(parse().filter(m => m.method === "turn/interrupt").at(-1)!.id as number, {});
+    await Promise.all([stopFirst, first.turn]);
+    const input = { sessionId: "codex-live", cwd: "/repo", model: "codex:gpt-5.4", runtimeMode: "supervised" as const, text: "next", onEvent: () => undefined };
+    const second = sendCodexTurn(input);
+    await waitFor(() => parse().filter(m => m.method === "turn/start").length === 2, "second admission");
+    reply(parse().filter(m => m.method === "turn/start").at(-1)!.id as number, { turn: { id: "turn_2" } });
+    await new Promise(r => setTimeout(r, 0));
+    const stopSecond = cancelCodexTurn("codex-live");
+    reply(parse().filter(m => m.method === "turn/interrupt").at(-1)!.id as number, {});
+    await Promise.all([stopSecond, second]);
+    const third = sendCodexTurn(input);
+    const settled = vi.fn();
+    void third.then(settled);
+    await waitFor(() => parse().filter(m => m.method === "turn/start").length === 3, "third admission");
+    for (const id of ["turn_1", "turn_2", "turn_1"]) {
+      notify("turn/completed", { threadId: "thr_1", turn: { id, status: "interrupted" } });
+    }
+    reply(parse().filter(m => m.method === "turn/start").at(-1)!.id as number, { turn: { id: "turn_3" } });
+    await new Promise(r => setTimeout(r, 10));
+    expect(settled).not.toHaveBeenCalled();
+    expect(canSteerCodexSession("codex-live")).toBe(true);
+    notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_3", status: "completed" } });
+    await third;
+  });
+
+  it("bounds terminal identity retention during a long conversation", async () => {
+    const first = await startTurn("codex-live");
+    notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
+    await first.turn;
+    for (let index = 2; index <= 66; index++) {
+      const turn = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:gpt-5.4", runtimeMode: "supervised", text: "next", onEvent: () => undefined });
+      await waitFor(() => parse().filter(m => m.method === "turn/start").length === index, "turn admission");
+      const id = `turn_${index}`;
+      reply(parse().filter(m => m.method === "turn/start").at(-1)!.id as number, { turn: { id } });
+      notify("turn/completed", { threadId: "thr_1", turn: { id, status: "completed" } });
+      await turn;
+    }
+    expect(__codexTestRetained("codex-live").completedTurns).toBe(64);
   });
 });

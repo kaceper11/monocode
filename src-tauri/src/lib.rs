@@ -47,7 +47,12 @@ mod windows;
 /// Project directory for new sessions — prefer cwd, else home.
 #[tauri::command]
 fn default_cwd() -> String {
-    if let Ok(cwd) = std::env::current_dir() {
+    default_cwd_from(std::env::current_dir().ok())
+}
+
+fn default_cwd_from(cwd: Option<std::path::PathBuf>) -> String {
+    // Finder launches app bundles at the filesystem root, not a project.
+    if let Some(cwd) = cwd.filter(|path| path.parent().is_some()) {
         return fs::path_to_js(&cwd);
     }
     dirs_home()
@@ -558,4 +563,22 @@ fn reap_harness_children(handle: &tauri::AppHandle) {
 #[cfg(all(debug_assertions, target_os = "macos"))]
 pub fn ensure_macos_dev_bundle() {
     macos::ensure_dev_bundle();
+}
+
+#[cfg(test)]
+mod default_cwd_tests {
+    #[test]
+    fn root_launch_uses_home_but_project_launch_keeps_its_directory() {
+        let project = std::env::temp_dir().join("monocode-default-project");
+        assert_eq!(
+            super::default_cwd_from(Some(project.clone())),
+            crate::fs::path_to_js(&project)
+        );
+        let root = project.ancestors().last().unwrap().to_path_buf();
+        let home = super::dirs_home().unwrap();
+        assert_eq!(
+            super::default_cwd_from(Some(root)),
+            crate::fs::path_to_js(std::path::Path::new(&home))
+        );
+    }
 }

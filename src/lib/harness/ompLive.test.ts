@@ -10,8 +10,12 @@ const transport = vi.hoisted(() => ({
     ((sessionId: string, command: Record<string, unknown>) => void) | undefined,
   fast: undefined as
     ((sessionId: string, command: Record<string, unknown>) => void) | undefined,
+  state: undefined as ((sessionId: string, command: Record<string, unknown>) => void) | undefined,
+  thinking: undefined as ((sessionId: string, command: Record<string, unknown>) => void) | undefined,
   writeChild: vi.fn(),
   spawnChild: vi.fn(),
+  killChild: vi.fn(),
+  abort: undefined as ((sessionId: string, command: Record<string, unknown>) => void) | undefined,
 }));
 
 vi.mock("./child", () => ({
@@ -19,7 +23,7 @@ vi.mock("./child", () => ({
   resolvePiBinary: async () => ({ path: "/fake/pi" }),
   acquireHarnessBridge: async () => () => undefined,
   spawnChild: transport.spawnChild,
-  killChild: async () => undefined,
+  killChild: transport.killChild,
   unwatchChild: (id: string) => transport.watchers.delete(id),
   watchChild: (id: string, onLine: (line: string) => void) =>
     transport.watchers.set(id, onLine),
@@ -33,8 +37,8 @@ import {
   forgetOmpSession,
 } from "./omp";
 import { sendPiTurn, steerPiTurn, forgetPiSession } from "./pi";
-import { ompCommandProvider, respondQuestion } from "./piFamily";
-import { OMP_FLAVOR } from "./piFlavor";
+import { canSteerSession, ompCommandProvider, respondQuestion, cancelTurn, setPiBinaryResolver as setFlavorBinaryResolver, stopSession } from "./piFamily";
+import { OMP_FLAVOR, PI_FLAVOR } from "./piFlavor";
 import type { HarnessEvent, SendTurnInput } from "./types";
 import { applyHarnessEvent } from "./apply";
 import { newSession } from "../session";
@@ -72,18 +76,28 @@ beforeEach(() => {
   transport.requests.length = 0;
   transport.spawnChild.mockReset();
   transport.spawnChild.mockResolvedValue(undefined);
+  transport.killChild.mockReset();
+  transport.killChild.mockResolvedValue(undefined);
+  transport.abort = undefined;
   transport.prompt = (id, command) => response(id, command);
   transport.fast = undefined;
+  transport.state = undefined;
+  transport.thinking = undefined;
+  setFlavorBinaryResolver(PI_FLAVOR, async () => ({ path: "/fake/pi" }));
+  setFlavorBinaryResolver(OMP_FLAVOR, async () => ({ path: "/fake/omp" }));
   transport.writeChild.mockReset();
   transport.writeChild.mockImplementation(
     async (sessionId: string, line: string) => {
       const command = JSON.parse(line);
       transport.requests.push({ sessionId, command });
       if (command.type === "extension_ui_response") return;
+      if (command.type === "abort" && transport.abort) return transport.abort(sessionId, command);
       if (command.type === "prompt")
         return transport.prompt?.(sessionId, command);
       if (command.type === "set_fast_mode" && transport.fast)
         return transport.fast(sessionId, command);
+      if (command.type === "get_state" && transport.state) return transport.state(sessionId, command);
+      if (command.type === "set_thinking_level" && transport.thinking) return transport.thinking(sessionId, command);
       response(
         sessionId,
         command,
@@ -593,4 +607,278 @@ describe("OMP workflow dialogs", () => {
     });
     expect(events.some((e) => e.type === "question.resolved")).toBe(true);
   });
+});
+
+
+describe.each([
+  [PI_FLAVOR, sendPiTurn, forgetPiSession],
+  [OMP_FLAVOR, sendOmpTurn, forgetOmpSession],
+] as const)("%s reliability", (flavor, send, forget) => {
+  const turnInput = () => ({
+    ...input(`${flavor.id}-reliability`, "Review"),
+    model: `${flavor.id}:default`,
+  });
+
+  it.each(["resolve", "spawn"])(
+    "does not resurrect after forget during %s",
+    async (stage) => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      if (stage === "resolve")
+        setFlavorBinaryResolver(flavor, async () => {
+          await gate;
+          return { path: "/fake/agent" };
+        });
+      else transport.spawnChild.mockImplementationOnce(() => gate);
+      const args = turnInput();
+      const pending = send(args);
+      const outcome = pending.catch((error: unknown) => error);
+      if (stage === "spawn")
+        await vi.waitFor(() => expect(transport.spawnChild).toHaveBeenCalled());
+      expect(canSteerSession(flavor, args.sessionId)).toBe(false);
+      const stopping = forget(args.sessionId);
+      release();
+      expect(await outcome).toMatchObject({ name: "AbortError" });
+      await stopping;
+      expect(transport.requests).toEqual([]);
+      expect(
+        events.some((event) => event.type === "session.providerBound"),
+      ).toBe(false);
+      if (stage === "resolve")
+        expect(transport.spawnChild).not.toHaveBeenCalled();
+    },
+  );
+
+  it("applies the requested reasoning before the first prompt", async () => {
+    transport.state = (id, command) =>
+      response(id, command, { sessionId: "saved", thinkingLevel: "low" });
+    const args = { ...turnInput(), modelSettings: { thinking: "high" } };
+    const pending = send(args);
+    await vi.waitFor(() =>
+      expect(transport.requests.some((r) => r.command.type === "prompt")).toBe(
+        true,
+      ),
+    );
+    const kinds = transport.requests.map((r) => r.command.type);
+    expect(kinds.indexOf("set_thinking_level")).toBeLessThan(
+      kinds.indexOf("prompt"),
+    );
+    expect(
+      transport.requests.find((r) => r.command.type === "set_thinking_level")
+        ?.command.level,
+    ).toBe("high");
+    expect(canSteerSession(flavor, args.sessionId)).toBe(true);
+    frame(args.sessionId, { type: "agent_end" });
+    await pending;
+    expect(canSteerSession(flavor, args.sessionId)).toBe(false);
+  });
+
+  it("does not cache rejected reasoning or send a prompt after failure", async () => {
+    const args = turnInput();
+    const first = send(args);
+    await vi.waitFor(() =>
+      expect(transport.requests.some((r) => r.command.type === "prompt")).toBe(
+        true,
+      ),
+    );
+    frame(args.sessionId, { type: "agent_end" });
+    await first;
+    transport.requests.length = 0;
+    transport.thinking = (id, command) =>
+      frame(id, {
+        type: "response",
+        id: command.id,
+        command: command.type,
+        success: false,
+        error: "Unsupported reasoning",
+      });
+    const changed = { ...args, modelSettings: { thinking: "high" } };
+    await expect(send(changed)).rejects.toThrow("Unsupported reasoning");
+    expect(transport.requests.some((r) => r.command.type === "prompt")).toBe(
+      false,
+    );
+    transport.thinking = undefined;
+    const retry = send(changed);
+    await vi.waitFor(() =>
+      expect(
+        transport.requests.filter(
+          (r) => r.command.type === "set_thinking_level",
+        ),
+      ).toHaveLength(2),
+    );
+    await vi.waitFor(() =>
+      expect(transport.requests.some((r) => r.command.type === "prompt")).toBe(
+        true,
+      ),
+    );
+    frame(args.sessionId, { type: "agent_end" });
+    await retry;
+  });
+
+  it("cancels queued work without cancelling the next explicit send", async () => {
+    const args = turnInput();
+    const first = send(args);
+    await vi.waitFor(() =>
+      expect(transport.requests.some((r) => r.command.type === "prompt")).toBe(
+        true,
+      ),
+    );
+    const queued = send({ ...args, text: "cancelled queued prompt" });
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    await cancelTurn(flavor, args.sessionId);
+    await Promise.all([first, queued]);
+    expect(
+      transport.requests.filter((r) => r.command.type === "prompt"),
+    ).toHaveLength(1);
+    const next = send({ ...args, text: "explicit new prompt" });
+    await vi.waitFor(() =>
+      expect(
+        transport.requests.filter((r) => r.command.type === "prompt"),
+      ).toHaveLength(2),
+    );
+    expect(
+      transport.requests.filter((r) => r.command.type === "prompt").at(-1)
+        ?.command.message,
+    ).toBe("explicit new prompt");
+    frame(args.sessionId, { type: "agent_end" });
+    await next;
+  });
+
+  it("preserves resume identity when initialization fails", async () => {
+    const args = turnInput();
+    const first = send(args);
+    await vi.waitFor(() =>
+      expect(transport.requests.some((r) => r.command.type === "prompt")).toBe(
+        true,
+      ),
+    );
+    frame(args.sessionId, { type: "agent_end" });
+    await first;
+    await stopSession(flavor, args.sessionId);
+    transport.spawnChild.mockClear();
+    transport.state = (id, command) =>
+      frame(id, {
+        type: "response",
+        id: command.id,
+        command: command.type,
+        success: false,
+        error: "Temporary initialization failure",
+      });
+    await expect(send(args)).rejects.toThrow(
+      "Temporary initialization failure",
+    );
+    expect(transport.spawnChild).toHaveBeenCalledTimes(1);
+    expect(transport.spawnChild.mock.calls[0]?.[2]).toEqual(
+      expect.arrayContaining([flavor.resumeFlag, "provider-session"]),
+    );
+    transport.state = undefined;
+    transport.requests.length = 0;
+    const retry = send(args);
+    await vi.waitFor(() =>
+      expect(transport.requests.some((r) => r.command.type === "prompt")).toBe(
+        true,
+      ),
+    );
+    expect(transport.spawnChild.mock.calls[1]?.[2]).toEqual(
+      expect.arrayContaining([flavor.resumeFlag, "provider-session"]),
+    );
+    frame(args.sessionId, { type: "agent_end" });
+    await retry;
+  });
+
+  it.each(["select", "input", "editor"])(
+    "returns actual %s answers and queues overlapping dialogs",
+    async (method) => {
+      const args = turnInput();
+      const pending = send(args);
+      await vi.waitFor(() =>
+        expect(
+          transport.requests.some((r) => r.command.type === "prompt"),
+        ).toBe(true),
+      );
+      for (const id of ["one", "two"])
+        frame(args.sessionId, {
+          type: "extension_ui_request",
+          id,
+          method,
+          title: id,
+          options: ["first", "second"],
+        });
+      let asked = events.filter((e) => e.type === "question.asked");
+      expect(asked).toHaveLength(1);
+      expect(asked[0].questions[0].id).toBe("one");
+      respondQuestion(flavor, args.sessionId, asked[0].requestId, {
+        kind: "answered",
+        answers: { one: ["1"] },
+        custom: { one: "typed answer" },
+      });
+      await vi.waitFor(() =>
+        expect(events.filter((e) => e.type === "question.asked")).toHaveLength(
+          2,
+        ),
+      );
+      asked = events.filter((e) => e.type === "question.asked");
+      expect(transport.requests.map((r) => r.command)).toContainEqual({
+        type: "extension_ui_response",
+        id: "one",
+        value: method === "select" ? "second" : "typed answer",
+      });
+      frame(args.sessionId, {
+        type: "extension_ui_request",
+        id: "two",
+        method: "cancel",
+      });
+      await vi.waitFor(() =>
+        expect(
+          events.filter((e) => e.type === "question.resolved"),
+        ).toHaveLength(2),
+      );
+      frame(args.sessionId, { type: "agent_end" });
+      await pending;
+    },
+  );
+});
+
+it("rejects a failed omp Fast disable and retries the requested setting", async () => {
+  transport.state = (id, command) => response(id, command, { sessionId: "provider-session", fastModeEnabled: true });
+  transport.fast = (id, command) => frame(id, { type: "response", id: command.id, command: command.type, success: false, error: "disable rejected" });
+  const args = { ...input(), modelSettings: { fast: "false" } };
+  await expect(sendOmpTurn(args)).rejects.toThrow("disable rejected");
+  await expect(sendOmpTurn(args)).rejects.toThrow("disable rejected");
+  expect(transport.requests.filter((request) => request.command.type === "prompt")).toHaveLength(0);
+  expect(transport.requests.filter((request) => request.command.type === "set_fast_mode")).toHaveLength(2);
+  expect(events).toContainEqual({ type: "session.configChanged", modelSettings: { fast: "true" } });
+  transport.fast = (id, command) => response(id, command, { enabled: false });
+  const retry = await started(args);
+  frame(args.sessionId, { type: "agent_end" });
+  await retry.turn;
+});
+
+it("reflects omp's confirmed Fast state when it differs from the selection", async () => {
+  transport.fast = (id, command) => response(id, command, { enabled: false });
+  const running = await started({ ...input(), modelSettings: { fast: "true" } });
+  expect(events).toContainEqual({ type: "session.configChanged", modelSettings: { fast: "false" } });
+  frame("omp-test", { type: "agent_end" });
+  await running.turn;
+});
+
+it.each([[PI_FLAVOR, sendPiTurn], [OMP_FLAVOR, sendOmpTurn]] as const)("retires %s after rejected cancellation and preserves resume", async (flavor, send) => {
+  const args = { ...input(`${flavor.id}-abort-failure`, "hello"), model: `${flavor.id}:default` };
+  const first = send(args);
+  await vi.waitFor(() => expect(transport.requests.some((request) => request.command.type === "prompt")).toBe(true));
+  transport.abort = (id, command) => frame(id, { type: "response", command: command.type, id: command.id, success: false, error: "abort rejected" });
+  await cancelTurn(flavor, args.sessionId);
+  await first;
+  expect(transport.killChild).toHaveBeenCalledWith(args.sessionId);
+  expect(events).toContainEqual(expect.objectContaining({ type: "session.error", message: expect.stringContaining("abort rejected") }));
+  transport.requests.length = 0;
+  transport.abort = undefined;
+  const second = send(args);
+  await vi.waitFor(() => expect(transport.requests.some((request) => request.command.type === "prompt")).toBe(true));
+  expect(transport.spawnChild).toHaveBeenCalledTimes(2);
+  expect(transport.spawnChild.mock.calls.at(-1)?.[2]).toEqual(expect.arrayContaining([flavor.resumeFlag, "provider-session"]));
+  frame(args.sessionId, { type: "agent_end" });
+  await second;
 });

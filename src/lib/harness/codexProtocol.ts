@@ -79,8 +79,8 @@ export function buildThreadStartParams(input: {
     sandbox: config.sandbox,
     approvalsReviewer: config.approvalsReviewer,
     ...(input.model ? { model: input.model } : {}),
-    ...(input.serviceTier && input.serviceTier !== "default"
-      ? { serviceTier: input.serviceTier }
+    ...(input.serviceTier
+      ? { serviceTier: input.serviceTier === "default" ? null : input.serviceTier }
       : {}),
   };
 }
@@ -134,8 +134,8 @@ export function buildTurnStartParams(input: {
     },
     ...(input.model ? { model: input.model } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
-    ...(input.serviceTier && input.serviceTier !== "default"
-      ? { serviceTier: input.serviceTier }
+    ...(input.serviceTier
+      ? { serviceTier: input.serviceTier === "default" ? null : input.serviceTier }
       : {}),
   };
 }

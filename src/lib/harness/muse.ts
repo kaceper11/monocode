@@ -89,7 +89,9 @@ type PendingQuestion = {
   userInputId: string;
   sessionId: string;
   questions: UserQuestion[];
+  event: Extract<HarnessEvent, { type: "question.asked" }>;
   raw: MuseUserInput["raw"];
+  answering?: boolean;
 };
 
 type TurnWait = {
@@ -118,6 +120,7 @@ type Live = {
   approvals: Map<number, PendingApproval>;
   approvalUiById: Map<string, number>;
   questions: Map<number, PendingQuestion>;
+  visibleQuestionId: number | null;
   questionUiById: Map<string, number>;
   nextUiId: number;
   turnWaits: Map<string, TurnWait>;
@@ -127,7 +130,10 @@ type Live = {
   queuedTurnIds: Set<string>;
   appliedModelId: string;
   appliedMode: string;
+  modeUpdate: Promise<void> | null;
+  cancellation: Promise<void> | null;
   cancelled: boolean;
+  cancelGeneration: number;
   muteUpdates: boolean;
   turns: Promise<void>;
   gapNotified: boolean;
@@ -141,8 +147,8 @@ type Live = {
   reminderIdleSeen: boolean;
   /** A model retry is scheduled; its real item has not started yet. */
   retryPending: boolean;
-  /** The turn whose wait already resolved on drain detection. */
-  drainSettledFor: string | null;
+  /** The turn whose bookkeeping status was already shown. */
+  drainReportedFor: string | null;
 };
 
 type Resume = {
@@ -153,16 +159,27 @@ type Resume = {
 const liveByThread = new Map<string, Live>();
 const resumeByThread = new Map<string, Resume>();
 const cancelledThreads = new Set<string>();
+const START_CANCELLED = new Error("Muse session stopped during startup");
+const startupByThread = new Map<string, { cancelled: boolean; rpc?: JsonRpcClient }>();
 /** In-flight cold starts: a prewarm and a send share one spawn. */
 const startingByThread = new Map<string, Promise<Live>>();
 
 export async function sendMuseTurn(input: SendTurnInput): Promise<void> {
-  const live = await acquireLive(input);
+  const previous = liveByThread.get(input.sessionId);
+  const previousGeneration = previous?.cancelGeneration;
+  let live: Live;
+  try { live = await acquireLive(input); } catch (error) {
+    if (error === START_CANCELLED) return;
+    throw error;
+  }
   if (cancelledThreads.delete(input.sessionId)) return;
-  live.onEvent = input.onEvent;
+  if (previous === live && previous.cancelGeneration !== previousGeneration) return;
+  const generation = live.cancelGeneration;
   const turn = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (liveByThread.get(input.sessionId) !== live || live.cancelGeneration !== generation) return;
+      live.onEvent = input.onEvent;
       live.runtimeMode = input.runtimeMode;
       live.planning = input.intent === "plan";
       live.cancelled = false;
@@ -184,18 +201,23 @@ export async function sendMuseTurn(input: SendTurnInput): Promise<void> {
 export async function compactMuseContext(
   input: CompactContextInput,
 ): Promise<void> {
+  const previous = liveByThread.get(input.sessionId);
+  const previousGeneration = previous?.cancelGeneration;
   // A compact carries no intent; reuse the running host even when its spawn
   // posture came from a plan turn, rather than recycling mid-session.
   const existing = liveByThread.get(input.sessionId);
   const live =
-    existing && existing.cwd === input.cwd
+    existing && existing.cwd === input.cwd && !existing.cancellation
       ? existing
       : await acquireLive(input);
   if (cancelledThreads.delete(input.sessionId)) return;
-  live.onEvent = input.onEvent;
+  if (previous === live && previous.cancelGeneration !== previousGeneration) return;
+  const generation = live.cancelGeneration;
   const work = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (liveByThread.get(input.sessionId) !== live || live.cancelGeneration !== generation) return;
+      live.onEvent = input.onEvent;
       live.cancelled = false;
       live.muteUpdates = false;
       try {
@@ -212,6 +234,13 @@ export async function compactMuseContext(
     () => undefined,
   );
   await work;
+}
+
+export function canSteerMuseSession(sessionId: string): boolean {
+  const live = liveByThread.get(sessionId);
+  // The host can acknowledge a steer after its final answer without making
+  // another model call. Queue at that boundary until the next foreground turn.
+  return !!live?.activeTurnId && !live.cancelled && !live.muteUpdates && openWorkCounts(live).real > 0;
 }
 
 export async function steerMuseTurn(input: SteerTurnInput): Promise<void> {
@@ -249,31 +278,49 @@ export function setMuseRuntimeMode(
   if (!live) return;
   const changed = live.runtimeMode !== runtimeMode;
   live.runtimeMode = runtimeMode;
-  const mode = museApprovalMode(runtimeMode, live.planning);
-  if (mode !== live.appliedMode) {
-    void live.rpc
-      .request(
-        "session/setApprovalMode",
-        { commandId: newCommandId(), mode, sessionId: live.museSessionId },
-        CONTROL_TIMEOUT_MS,
-      )
-      .then(() => {
-        live.appliedMode = mode;
-      })
-      .catch((error: unknown) => {
-        try {
-          ignoreUnsupportedControl("session/setApprovalMode", error);
-        } catch {
-          // A wedged transport is recycled by the next turn's ensureLive.
-        }
-      });
-  }
+  void applyApprovalMode(live).catch(async (error: unknown) => {
+    if (liveByThread.get(sessionId) !== live || live.muteUpdates) return;
+    live.onEvent({ type: "session.error", message: `Muse could not apply the access mode: ${error instanceof Error ? error.message : String(error)}. The host was stopped; retry to resume safely.` });
+    await stopMuseSession(sessionId);
+  });
   if (!changed) return;
   for (const [uiId, pending] of live.approvals) {
     if (pending.decidedLocally) continue;
     const auto = museAutoDecision(runtimeMode, live.planning, pending.kind);
     if (auto) respondMuseApproval(sessionId, uiId, auto);
   }
+}
+
+/** Reconcile the latest selection; an in-flight write is never a confirmed cache hit. */
+function applyApprovalMode(live: Live): Promise<void> {
+  if (live.modeUpdate) return live.modeUpdate;
+  const work = (async () => {
+    while (liveByThread.get(live.sessionId) === live && !live.cancelled) {
+      const mode = museApprovalMode(live.runtimeMode, live.planning);
+      if (mode === live.appliedMode) return;
+      let result: unknown;
+      try {
+        result = await live.rpc.request(
+          "session/setApprovalMode",
+          { commandId: newCommandId(), mode, sessionId: live.museSessionId },
+          CONTROL_TIMEOUT_MS,
+        );
+      } catch (error) {
+        // A host without this control keeps its session/start mode; mark the
+        // selection applied so the same doomed write is not retried per turn.
+        if (isMuseUnsupportedControl(error)) {
+          live.appliedMode = mode;
+          return;
+        }
+        throw error;
+      }
+      const effective = stringField(asRecord(asRecord(result)?.effectiveMode), "mode");
+      if (effective && effective !== mode) throw new Error(`Muse retained access mode ${effective}`);
+      live.appliedMode = mode;
+    }
+  })().finally(() => { live.modeUpdate = null; });
+  live.modeUpdate = work;
+  return work;
 }
 
 export function respondMuseApproval(
@@ -286,15 +333,13 @@ export function respondMuseApproval(
   if (!live || !pending) return;
   if (pending.decidedLocally) return;
   pending.decidedLocally = decision;
-  live.onEvent({ type: "approval.resolved", requestId, decision });
   const choice = museChoiceFor(decision, pending.choices);
   if (!choice) {
     live.onEvent({
       type: "status",
       text: `Muse offered no ${decision === "allow" ? "approval" : "denial"} choice for this request.`,
     });
-    live.approvals.delete(requestId);
-    live.approvalUiById.delete(pending.approvalId);
+    pending.decidedLocally = undefined;
     return;
   }
   void live.rpc
@@ -310,16 +355,19 @@ export function respondMuseApproval(
       CONTROL_TIMEOUT_MS,
     )
     .then(() => {
-      // Accepted; a later approval/resolved (if any) is already deduped.
+      if (!live.approvals.has(requestId)) return;
+      live.onEvent({ type: "approval.resolved", requestId, decision });
       live.approvals.delete(requestId);
       live.approvalUiById.delete(pending.approvalId);
     })
     .catch((error: unknown) => {
+      if (!live.approvals.has(requestId)) return;
       const kind = museErrorKind(error);
       if (
         kind === "approvalAlreadyResolved" ||
         kind === "approvalNotFound"
       ) {
+        live.onEvent({ type: "approval.resolved", requestId, decision: "cancelled" });
         live.approvals.delete(requestId);
         live.approvalUiById.delete(pending.approvalId);
         return;
@@ -333,6 +381,7 @@ export function respondMuseApproval(
         });
         pending.decidedLocally = undefined;
         const freshId = live.nextUiId++;
+        live.onEvent({ type: "approval.resolved", requestId, decision: "cancelled" });
         live.approvals.delete(requestId);
         live.approvals.set(freshId, pending);
         live.approvalUiById.set(pending.approvalId, freshId);
@@ -346,6 +395,12 @@ export function respondMuseApproval(
         });
         return;
       }
+      if (typeof (error as { code?: unknown })?.code !== "number") {
+        live.onEvent({ type: "session.error", message: "Muse did not confirm the decision. The host was stopped; resume to reconcile the pending approval." });
+        void stopMuseSession(sessionId);
+        return;
+      }
+      pending.decidedLocally = undefined;
       live.onEvent({
         type: "status",
         text: `Muse rejected the decision: ${
@@ -362,14 +417,11 @@ export function respondMuseQuestion(
 ): void {
   const live = liveByThread.get(sessionId);
   const pending = live?.questions.get(requestId);
-  if (!live || !pending) return;
-  live.questions.delete(requestId);
-  live.questionUiById.delete(pending.userInputId);
-  live.onEvent({
-    type: "question.resolved",
-    requestId,
-    decision: reply.kind === "answered" ? "answered" : "skipped",
-  });
+  if (!live || !pending || pending.answering) return;
+  pending.answering = true;
+  const settle = (decision: "answered" | "skipped" | "cancelled") => {
+    settleQuestion(live, requestId, decision);
+  };
   const answers = museAnswerParts(reply, pending.questions, pending.raw);
   const request = answers
     ? live.rpc.request(
@@ -392,9 +444,17 @@ export function respondMuseQuestion(
         },
         CONTROL_TIMEOUT_MS,
       );
-  void request.catch((error: unknown) => {
+  void request.then(() => settle(reply.kind === "answered" ? "answered" : "skipped")).catch((error: unknown) => {
+    if (!live.questions.has(requestId)) return;
+    pending.answering = false;
     const kind = museErrorKind(error);
     if (kind === "userInputAlreadySettled" || kind === "userInputNotFound") {
+      settle("cancelled");
+      return;
+    }
+    if (typeof (error as { code?: unknown })?.code !== "number") {
+      live.onEvent({ type: "session.error", message: "Muse did not confirm the answer. The host was stopped; resume to reconcile the pending question." });
+      void stopMuseSession(sessionId);
       return;
     }
     live.onEvent({
@@ -421,49 +481,65 @@ export async function cancelMuseTurn(sessionId: string): Promise<void> {
   const live = liveByThread.get(sessionId);
   if (!live) {
     cancelledThreads.add(sessionId);
+    if (startupByThread.has(sessionId)) await stopMuseSession(sessionId);
     return;
   }
+  if (live.cancellation) return live.cancellation;
+  live.onEvent({ type: "session.activity" });
+  live.cancelGeneration += 1;
   live.cancelled = true;
   live.muteUpdates = true;
+  // Admission has no interruptible ID yet; close the owned host so the
+  // acknowledged request cannot execute after Stop. Resume stays available.
+  if (!live.activeTurnId) {
+    await stopMuseSession(sessionId);
+    return;
+  }
   clearPending(live);
   live.compactionWait?.reject(new Error("Muse turn cancelled"));
   live.compactionWait = null;
   const active = live.activeTurnId;
   const queued = [...live.queuedTurnIds];
+  // Turn waiters settle at Stop press — the wire round-trip below only tells
+  // the host and must not hold the visible turn (or its queue) open.
   settleAllTurns(live, undefined);
-  if (active) {
-    void live.rpc
-      .request(
-        "turn/interrupt",
-        {
-          commandId: newCommandId(),
-          sessionId: live.museSessionId,
-          turnId: active,
-        },
-        CONTROL_TIMEOUT_MS,
-      )
-      .catch(() => undefined);
-  }
-  for (const turnId of queued) {
-    void live.rpc
-      .request(
-        "turn/unqueue",
-        {
-          commandId: newCommandId(),
-          sessionId: live.museSessionId,
-          turnId,
-        },
-        CONTROL_TIMEOUT_MS,
-      )
-      .catch(() => undefined);
-  }
+  const work = (async () => {
+    try {
+      await Promise.all([
+        live.rpc.request("turn/interrupt", {
+          commandId: newCommandId(), sessionId: live.museSessionId, turnId: active,
+        }, CONTROL_TIMEOUT_MS),
+        ...queued.map(turnId => live.rpc.request("turn/unqueue", {
+          commandId: newCommandId(), sessionId: live.museSessionId, turnId,
+        }, CONTROL_TIMEOUT_MS)),
+      ]);
+    } catch {
+      // Retire only this host: a delayed failure cannot stop its replacement.
+      if (liveByThread.get(sessionId) === live) await stopMuseSession(sessionId);
+    }
+  })();
+  live.cancellation = work;
+  // The detached chain still reports through `live.cancellation` for callers
+  // that await it; the finally must not surface a second unhandled rejection.
+  void work
+    .finally(() => {
+      if (live.cancellation === work) live.cancellation = null;
+    })
+    .catch(() => undefined);
 }
 
 export async function stopMuseSession(sessionId: string): Promise<void> {
+  const startup = startupByThread.get(sessionId);
+  if (startup) {
+    startup.cancelled = true;
+    startup.rpc?.close(START_CANCELLED);
+    startingByThread.delete(sessionId);
+  }
   cancelledThreads.delete(sessionId);
   const live = liveByThread.get(sessionId);
   liveByThread.delete(sessionId);
   if (live) {
+    live.cancelGeneration += 1;
     live.stopping = true;
     live.cancelled = true;
     live.muteUpdates = true;
@@ -475,7 +551,7 @@ export async function stopMuseSession(sessionId: string): Promise<void> {
   }
   // Only kill a child this adapter owns — after a harness switch another
   // adapter may hold a live child under the same session id.
-  if (live || startingByThread.has(sessionId)) {
+  if (live || startup || startingByThread.has(sessionId)) {
     unwatchChild(sessionId);
     await killChild(sessionId).catch(() => undefined);
   }
@@ -501,6 +577,8 @@ async function acquireLive(
   input: HarnessSessionInput,
   keepExisting = false,
 ): Promise<Live> {
+  const cancellation = liveByThread.get(input.sessionId)?.cancellation;
+  if (cancellation) await cancellation;
   try {
     return await acquireSharedStart(
       input.sessionId,
@@ -524,7 +602,9 @@ export async function prewarmMuseSession(
   input: HarnessSessionInput,
 ): Promise<void> {
   if (liveByThread.has(input.sessionId)) return;
-  await acquireLive(input, true);
+  try { await acquireLive(input, true); } catch (error) {
+    if (error !== START_CANCELLED) throw error;
+  }
 }
 
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
@@ -532,7 +612,6 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   const posture = musePostureKey(input.runtimeMode, planning);
   const existing = liveByThread.get(input.sessionId);
   if (existing && existing.cwd === input.cwd && existing.postureKey === posture) {
-    existing.onEvent = input.onEvent;
     return existing;
   }
   // A different cwd or sandbox posture cannot be applied to a running host:
@@ -549,6 +628,27 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     await stopMuseSession(input.sessionId);
   }
 
+  const startup: { cancelled: boolean; rpc?: JsonRpcClient } = { cancelled: false };
+  startupByThread.set(input.sessionId, startup);
+  try {
+    return await startLive(input, startup);
+  } catch (error) {
+    if (startup.cancelled) throw START_CANCELLED;
+    throw error;
+  } finally {
+    if (startupByThread.get(input.sessionId) === startup) startupByThread.delete(input.sessionId);
+  }
+}
+
+async function startLive(
+  input: HarnessSessionInput,
+  startup: { cancelled: boolean; rpc?: JsonRpcClient },
+): Promise<Live> {
+  const planning = input.intent === "plan";
+  const posture = musePostureKey(input.runtimeMode, planning);
+  const assertStarting = () => {
+    if (startup.cancelled) throw START_CANCELLED;
+  };
   const resume = resumeByThread.get(input.sessionId);
   const canResume = resume != null && resume.cwd === input.cwd;
   if (resume && resume.cwd !== input.cwd) {
@@ -556,6 +656,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   }
 
   const { path } = await resolveMuseBinary(input.cwd);
+  assertStarting();
   markTurn(input.sessionId, "muse binary resolved");
   const liveRef: { current: Live | null } = { current: null };
   // session/resume re-issues pending approvals/questions as server requests
@@ -593,6 +694,9 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     },
     { includeJsonrpc: true, label: "muse" },
   );
+
+  startup.rpc = rpc;
+  assertStarting();
 
   watchChild(
     input.sessionId,
@@ -633,6 +737,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       }),
       input.cwd,
     );
+    assertStarting();
     markTurn(input.sessionId, "muse spawned");
 
     try {
@@ -675,9 +780,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
         resumed = museSessionId != null;
       } catch (error) {
         if (!isMuseSessionMissing(error)) {
-          // A resume that fails for another reason would retry the same
-          // doomed session on every turn; drop it before surfacing.
-          resumeByThread.delete(input.sessionId);
+          // Keep the durable identity so Retry resumes the same conversation.
           throw error;
         }
         museSessionId = undefined;
@@ -722,6 +825,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       approvals: new Map(),
       approvalUiById: new Map(),
       questions: new Map(),
+      visibleQuestionId: null,
       questionUiById: new Map(),
       nextUiId: 1,
       turnWaits: new Map(),
@@ -732,7 +836,10 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       // the first turn to push the user's current selections over the wire.
       appliedModelId: resumed ? "" : (wantedModel ?? ""),
       appliedMode: resumed ? "" : mode,
+      modeUpdate: null,
+      cancellation: null,
       cancelled: false,
+      cancelGeneration: 0,
       muteUpdates: false,
       turns: Promise.resolve(),
       gapNotified: false,
@@ -742,8 +849,9 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       hasCompletedReal: false,
       reminderIdleSeen: false,
       retryPending: false,
-      drainSettledFor: null,
+      drainReportedFor: null,
     };
+    assertStarting();
     liveRef.current = live;
     liveByThread.set(input.sessionId, live);
     resumeByThread.set(input.sessionId, {
@@ -764,10 +872,14 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   } catch (error) {
     rpc.close(error instanceof Error ? error : new Error(String(error)));
     liveRef.current = null;
-    await stopMuseSession(input.sessionId);
+    if (!startup.cancelled) {
+      if (startupByThread.get(input.sessionId) === startup) startupByThread.delete(input.sessionId);
+      await stopMuseSession(input.sessionId);
+    }
     throw error;
   }
 }
+
 
 /** The session's own host already answers model/list; warm the picker from it. */
 async function populateCatalog(live: Live): Promise<void> {
@@ -800,8 +912,7 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
   // Model and approval mode are independent session settings; issue them
   // together so a resumed turn pays one round trip, not two.
   const native = museNativeModel(input.model, input.cwd);
-  const mode = museApprovalMode(live.runtimeMode, live.planning);
-  const controls: Promise<void>[] = [];
+  const controls: Promise<void>[] = [applyApprovalMode(live)];
   if (native && native !== live.appliedModelId) {
     controls.push(
       live.rpc
@@ -817,31 +928,21 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
         .then(() => {
           live.appliedModelId = native;
         })
-        .catch((error: unknown) =>
-          ignoreUnsupportedControl("session/setModel", error),
-        ),
+        .catch((error: unknown) => {
+          // A host without this control keeps its session/start model; mark
+          // it applied so the doomed write is not retried every turn.
+          if (isMuseUnsupportedControl(error)) {
+            live.appliedModelId = native;
+            return;
+          }
+          throw error;
+        }),
     );
   }
-  if (mode !== live.appliedMode) {
-    controls.push(
-      live.rpc
-        .request(
-          "session/setApprovalMode",
-          { commandId: newCommandId(), mode, sessionId: live.museSessionId },
-          CONTROL_TIMEOUT_MS,
-        )
-        .then(() => {
-          live.appliedMode = mode;
-        })
-        .catch((error: unknown) =>
-          ignoreUnsupportedControl("session/setApprovalMode", error),
-        ),
-    );
-  }
-  if (controls.length) {
-    await Promise.all(controls);
-    markTurn(live.sessionId, "muse controls applied");
-  }
+  await Promise.all(controls);
+  markTurn(live.sessionId, "muse controls applied");
+  // A live selection may have changed while the model control was pending.
+  await applyApprovalMode(live);
   // The parallel controls widened the cancel window — check again before
   // launching a turn the user already stopped.
   if (live.cancelled) return;
@@ -885,11 +986,27 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
   await waitTurn(live, turnId, disposition);
 }
 
-/** A host may lack a control; only transport failures should fail the turn. */
-function ignoreUnsupportedControl(method: string, error: unknown): void {
-  console.debug(`[muse] ${method} failed`, error);
+/**
+ * A host may lack a session control entirely; only transport failures should
+ * fail the turn. Unsupported methods are cached as "applied" so a doomed
+ * write is not retried every turn.
+ */
+function isMuseUnsupportedControl(error: unknown): boolean {
+  const kind = museErrorKind(error);
+  if (
+    kind === "methodNotFound" ||
+    kind === "unknownMethod" ||
+    kind === "unsupportedMethod"
+  ) {
+    return true;
+  }
+  if ((error as { code?: unknown } | null | undefined)?.code === -32601) {
+    return true;
+  }
   const detail = error instanceof Error ? error.message : String(error);
-  if (/timed out|not running|exited|closed|pipe/i.test(detail)) throw error;
+  return /unknown method|method not found|not implemented|unsupported/i.test(
+    detail,
+  );
 }
 
 async function runCompaction(live: Live): Promise<void> {
@@ -1031,14 +1148,8 @@ function settleAllTurns(live: Live, outcome: Error | undefined): void {
 
 /** Pending prompts must leave the UI settled, not just forgotten. */
 function clearPending(live: Live): void {
-  for (const [requestId, pending] of live.approvals) {
-    if (!pending.decidedLocally) {
-      live.onEvent({
-        type: "approval.resolved",
-        requestId,
-        decision: "cancelled",
-      });
-    }
+  for (const requestId of live.approvals.keys()) {
+    live.onEvent({ type: "approval.resolved", requestId, decision: "cancelled" });
   }
   for (const requestId of live.questions.keys()) {
     live.onEvent({
@@ -1051,6 +1162,25 @@ function clearPending(live: Live): void {
   live.approvalUiById.clear();
   live.questions.clear();
   live.questionUiById.clear();
+  live.visibleQuestionId = null;
+}
+
+function showNextQuestion(live: Live): void {
+  if (live.cancelled || live.muteUpdates) return;
+  if (live.visibleQuestionId !== null && live.questions.has(live.visibleQuestionId)) return;
+  const next = live.questions.entries().next().value;
+  live.visibleQuestionId = next?.[0] ?? null;
+  // Muse owns the absolute deadline; time spent queued does not reset it.
+  if (next) live.onEvent(next[1].event);
+}
+
+function settleQuestion(live: Live, requestId: number, decision: "answered" | "skipped" | "cancelled"): void {
+  const pending = live.questions.get(requestId);
+  if (!pending) return;
+  live.questions.delete(requestId);
+  live.questionUiById.delete(pending.userInputId);
+  live.onEvent({ type: "question.resolved", requestId, decision });
+  showNextQuestion(live);
 }
 
 function emit(live: Live, events: HarnessEvent[]): void {
@@ -1086,10 +1216,17 @@ function openWorkCounts(live: Live): { real: number; reminders: number } {
  * scheduled model retry holds it off until the retry's real item starts.
  * `turn/completed` stays the backstop for drains that emit no reminder items;
  * a late `terminal: "failed"` still surfaces through its own session.error.
+ *
+ * The UI turn settles at drain detection — the user is not made to wait out
+ * the provider's bookkeeping. `activeTurnId` stays set until the real
+ * turn/completed so steer/interrupt keep their host-side target, and a
+ * follow-up sent at this boundary goes through `turn/start` with
+ * `ifBusy: "queue"` (see `runTurn`): the host admits it now and runs it when
+ * the bookkeeping finishes — no client-side wait is needed.
  */
-function settleOnDrain(live: Live): void {
+function reportDrain(live: Live): void {
   const turnId = live.activeTurnId;
-  if (!turnId || live.retryPending || live.drainSettledFor === turnId) return;
+  if (!turnId || live.retryPending || live.drainReportedFor === turnId) return;
   const { real, reminders } = openWorkCounts(live);
   if (
     real > 0 ||
@@ -1098,13 +1235,13 @@ function settleOnDrain(live: Live): void {
   ) {
     return;
   }
-  live.drainSettledFor = turnId;
+  live.drainReportedFor = turnId;
   if (!live.muteUpdates) {
     live.onEvent({ type: "message.completed" });
     live.onEvent({ type: "reasoning.completed" });
     live.onEvent({
-      type: "status",
-      text: "Muse is finishing up — memory/reminder bookkeeping.",
+      type: "session.activity",
+      text: "Muse is finishing up…",
     });
   }
   resolveTurnWait(live, turnId, undefined);
@@ -1160,7 +1297,7 @@ function noteSubagentItem(
     followChildSession(live, childSessionId, itemId, museSubagentMeta(rec));
   }
   if (phase === "completed" && childSessionId) {
-    void endChildSession(live, childSessionId);
+    void endChildSession(live, childSessionId, true);
   }
 }
 
@@ -1182,6 +1319,7 @@ function handleChildNotification(
   for (const next of routed.follow) {
     followChildSession(live, next.sessionId, next.callId, next.meta);
   }
+  for (const ended of routed.end) void endChildSession(live, ended);
 }
 
 function followChildSession(
@@ -1252,6 +1390,7 @@ async function pageChild(
           CONTROL_TIMEOUT_MS,
         ),
       );
+      if (live.subagents.get(childSessionId) !== child) return;
       const events = Array.isArray(result?.events) ? result.events : [];
       let reached = false;
       for (const entry of events) {
@@ -1266,6 +1405,7 @@ async function pageChild(
         for (const next of routed.follow) {
           followChildSession(live, next.sessionId, next.callId, next.meta);
         }
+        for (const ended of routed.end) void endChildSession(live, ended);
         if (
           opts.until &&
           stringField(asRecord(notification.params), "viewCursor") ===
@@ -1307,10 +1447,17 @@ async function fillChildGap(
 async function endChildSession(
   live: Live,
   childSessionId: string,
+  rootCompleted = false,
 ): Promise<void> {
   const child = live.subagents.get(childSessionId);
   if (!child || child.ended) return;
   child.ended = true;
+  if (rootCompleted) {
+    live.subagents.closeCall(child.callId);
+    for (const descendant of live.subagents.sessionsForCall(child.callId)) {
+      if (descendant !== childSessionId) void endChildSession(live, descendant);
+    }
+  }
   try {
     await pageChild(live, childSessionId, child, {
       maxPages: CHILD_DRAIN_PAGE_MAX,
@@ -1340,13 +1487,13 @@ function handleNotification(live: Live, method: string, params: unknown): void {
       emit(live, museItemEvent(rec?.item, "started", live.items));
       noteDrainEvidence(live, rec?.item, "started");
       noteSubagentItem(live, rec?.item, "started");
-      settleOnDrain(live);
+      reportDrain(live);
       return;
     case "item/updated":
       emit(live, museItemEvent(rec?.item, "updated", live.items));
       noteDrainEvidence(live, rec?.item, "updated");
       noteSubagentItem(live, rec?.item, "updated");
-      settleOnDrain(live);
+      reportDrain(live);
       return;
     case "item/completed": {
       const item = asRecord(rec?.item);
@@ -1379,7 +1526,7 @@ function handleNotification(live: Live, method: string, params: unknown): void {
       emit(live, events);
       noteDrainEvidence(live, item, "completed");
       noteSubagentItem(live, item, "completed");
-      settleOnDrain(live);
+      reportDrain(live);
       return;
     }
     case "item/delta":
@@ -1393,7 +1540,7 @@ function handleNotification(live: Live, method: string, params: unknown): void {
         live.hasCompletedReal = false;
         live.reminderIdleSeen = false;
         live.retryPending = false;
-        live.drainSettledFor = null;
+        live.drainReportedFor = null;
       }
       return;
     }
@@ -1401,21 +1548,43 @@ function handleNotification(live: Live, method: string, params: unknown): void {
       const turnId = stringField(rec, "turnId");
       if (!turnId) return;
       const terminal = stringField(rec, "terminal") ?? "completed";
+      // A delayed/duplicate terminal event must not close a newer response.
+      if (turnId !== live.activeTurnId) {
+        const error =
+          terminal === "failed"
+            ? museTurnError(rec) ?? new Error("Muse turn failed")
+            : undefined;
+        // A turn whose UI wait already settled at drain detection can still
+        // fail late host-side — surface that instead of dropping it.
+        if (error && !live.muteUpdates) {
+          live.onEvent({ type: "session.error", message: error.message });
+        }
+        settleTurn(live, turnId, error);
+        return;
+      }
       // Prompts the host forgot to settle must not outlive the turn.
+      emit(live, [{ type: "session.activity" }]);
       clearPending(live);
+      // The drain report already sealed this turn's streams; a real
+      // turn/completed must not re-emit the completions.
+      const drained = live.drainReportedFor === turnId;
       if (terminal === "failed") {
         const error = museTurnError(rec) ?? new Error("Muse turn failed");
         if (!live.muteUpdates) {
-          live.onEvent({ type: "message.completed" });
-          live.onEvent({ type: "reasoning.completed" });
+          if (!drained) {
+            live.onEvent({ type: "message.completed" });
+            live.onEvent({ type: "reasoning.completed" });
+          }
           live.onEvent({ type: "session.error", message: error.message });
         }
         settleTurn(live, turnId, error);
         return;
       }
       if (!live.muteUpdates) {
-        live.onEvent({ type: "message.completed" });
-        live.onEvent({ type: "reasoning.completed" });
+        if (!drained) {
+          live.onEvent({ type: "message.completed" });
+          live.onEvent({ type: "reasoning.completed" });
+        }
         if (terminal === "cancelled") {
           live.onEvent({
             type: "status",
@@ -1487,7 +1656,7 @@ function handleNotification(live: Live, method: string, params: unknown): void {
       if (!refresh) return;
       const uiId = live.approvalUiById.get(refresh.approvalId);
       const pending = uiId != null ? live.approvals.get(uiId) : undefined;
-      if (pending && !pending.decidedLocally) {
+      if (pending) {
         pending.requirementId = refresh.requirementId;
         if (refresh.choices.length > 0) pending.choices = refresh.choices;
       }
@@ -1499,10 +1668,8 @@ function handleNotification(live: Live, method: string, params: unknown): void {
         ? live.approvalUiById.get(approvalId)
         : undefined;
       if (uiId == null) return;
-      const pending = live.approvals.get(uiId);
       live.approvals.delete(uiId);
       if (approvalId) live.approvalUiById.delete(approvalId);
-      if (pending?.decidedLocally) return;
       live.onEvent({
         type: "approval.resolved",
         requestId: uiId,
@@ -1519,16 +1686,9 @@ function handleNotification(live: Live, method: string, params: unknown): void {
         ? live.questionUiById.get(userInputId)
         : undefined;
       if (uiId == null) return;
-      live.questions.delete(uiId);
-      if (userInputId) live.questionUiById.delete(userInputId);
-      live.onEvent({
-        type: "question.resolved",
-        requestId: uiId,
-        decision:
-          rec?.outcome === "answered" || rec?.outcome === "clarified"
-            ? "answered"
-            : "cancelled",
-      });
+      settleQuestion(live, uiId,
+        rec?.outcome === "answered" || rec?.outcome === "clarified" ? "answered" : "cancelled",
+      );
       return;
     }
     case "session/todoListChanged": {
@@ -1656,7 +1816,7 @@ function handleApprovalRequested(live: Live, params: unknown): void {
   const knownId = live.approvalUiById.get(approval.approvalId);
   if (knownId != null) {
     const known = live.approvals.get(knownId);
-    if (known && !known.decidedLocally) {
+    if (known) {
       known.requirementId = approval.requirementId;
       if (approval.choices.length > 0) known.choices = approval.choices;
     }
@@ -1750,32 +1910,33 @@ function handleUserInputRequested(live: Live, params: unknown): void {
     return;
   }
   if (live.cancelled || live.muteUpdates) return;
-  // Same approval dedupe: a re-issued request updates, never duplicates.
   const knownId = live.questionUiById.get(prompt.userInputId);
-  if (knownId != null) {
-    const known = live.questions.get(knownId);
-    if (known) {
-      known.questions = prompt.questions;
-      known.raw = prompt.raw;
-    }
-    return;
-  }
-  const uiId = live.nextUiId++;
-  live.questions.set(uiId, {
-    userInputId: prompt.userInputId,
-    sessionId: prompt.sessionId,
-    questions: prompt.questions,
-    raw: prompt.raw,
-  });
-  live.questionUiById.set(prompt.userInputId, uiId);
-  live.onEvent({
+  const uiId = knownId ?? live.nextUiId++;
+  const event: Extract<HarnessEvent, { type: "question.asked" }> = {
     type: "question.asked",
     requestId: uiId,
     title: questionPromptTitle(prompt.questions),
     questions: prompt.questions,
     ...(prompt.itemId ? { callId: prompt.itemId } : {}),
     ...(prompt.autoResolveAt ? { autoResolveAt: prompt.autoResolveAt } : {}),
+  };
+  // Reissued requests update their queued data without duplicating visible UI.
+  const known = live.questions.get(uiId);
+  if (known) {
+    known.questions = prompt.questions;
+    known.raw = prompt.raw;
+    known.event = event;
+    return;
+  }
+  live.questions.set(uiId, {
+    userInputId: prompt.userInputId,
+    sessionId: prompt.sessionId,
+    questions: prompt.questions,
+    raw: prompt.raw,
+    event,
   });
+  live.questionUiById.set(prompt.userInputId, uiId);
+  showNextQuestion(live);
 }
 
 /** Exported for tests. */
@@ -1783,4 +1944,5 @@ export function __museTestReset(): void {
   liveByThread.clear();
   resumeByThread.clear();
   cancelledThreads.clear();
+  startupByThread.clear();
 }

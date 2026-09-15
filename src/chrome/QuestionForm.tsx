@@ -4,6 +4,7 @@ import {
   CUSTOM_OPTION_ID,
   buildQuestionReply,
   isOtherOption,
+  isCustomSelection,
   questionIsComplete,
   type UserQuestion,
   type UserQuestionPrompt,
@@ -122,6 +123,9 @@ export function QuestionForm({ prompt, onReply, onInteraction }: Props) {
             Skip
           </button>
         </div>
+        {prompt.error ? (
+          <p role="alert" className="mt-2 text-[12px] text-amber-600 dark:text-amber-400">{prompt.error}</p>
+        ) : null}
         <div className="mt-2">
           <QuestionFields
             key={question.id}
@@ -160,6 +164,15 @@ export function QuestionForm({ prompt, onReply, onInteraction }: Props) {
           />
         </div>
         <div className="mt-2.5 flex items-center justify-end gap-2">
+          {index > 0 ? (
+            <button
+              type="button"
+              onClick={() => setStep(index - 1)}
+              className="h-6 rounded-md px-2.5 text-[11px] text-content/60 hover:bg-content/10 hover:text-content"
+            >
+              Back
+            </button>
+          ) : null}
           {prompt.autoResolveAt != null ? (
             <span
               className="mr-auto text-[11px] text-content/40"
@@ -218,8 +231,7 @@ function QuestionFields({
       ) : (
         <div className="mt-1.5 flex max-h-52 flex-col gap-1 overflow-y-auto" role="group">
           {options.map((option) => {
-            const isCustom =
-              isOtherOption(option) || option.id === CUSTOM_OPTION_ID;
+            const isCustom = isCustomSelection(question, option.id);
             const active = selected.includes(option.id);
             return (
               <div key={option.id}>
@@ -292,7 +304,7 @@ function customOptionId(question: UserQuestion): string {
 }
 
 function isCustomId(question: UserQuestion, optionId: string): boolean {
-  return optionId === CUSTOM_OPTION_ID || optionId === customOptionId(question);
+  return isCustomSelection(question, optionId);
 }
 
 function nextSelection(

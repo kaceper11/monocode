@@ -4,6 +4,7 @@ import { parseJsonLine, parseRpcResponse, stringField } from "./piProtocol";
 type Pending = {
   resolve: (value: Record<string, unknown>) => void;
   reject: (error: Error) => void;
+  abort: () => void;
 };
 
 /**
@@ -22,6 +23,7 @@ export class PiRpc {
   ) {}
 
   pushLine(line: string) {
+    if (this.closed) return;
     const rec = parseJsonLine(line);
     if (!rec) return;
     const response = parseRpcResponse(rec);
@@ -49,13 +51,16 @@ export class PiRpc {
     const id = stringField(command, "id") ?? `mc_${this.nextId++}`;
     if (this.pending.has(id)) throw new Error(`Duplicate RPC request id: ${id}`);
     const payload = { ...command, id };
+    const controller = new AbortController();
     const pending = new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        controller.abort();
         const type = stringField(command, "type") ?? "command";
         reject(new Error(`${this.label} ${type} timed out`));
       }, timeoutMs);
       this.pending.set(id, {
+        abort: () => controller.abort(),
         resolve: (value) => {
           clearTimeout(timer);
           resolve(value);
@@ -66,7 +71,7 @@ export class PiRpc {
         },
       });
     });
-    void writeChild(this.sessionId, JSON.stringify(payload)).catch((error) => {
+    void writeChild(this.sessionId, JSON.stringify(payload), controller.signal).catch((error) => {
       const message =
         error instanceof Error ? error : new Error(String(error));
       const request = this.pending.get(id);
@@ -80,13 +85,17 @@ export class PiRpc {
     if (this.closed) return;
     this.closed = true;
     const err = error ?? new Error(`${this.label} process exited`);
-    for (const pending of this.pending.values()) pending.reject(err);
+    for (const pending of this.pending.values()) {
+      pending.abort();
+      pending.reject(err);
+    }
     this.pending.clear();
   }
 
   cancelRequest(id: string): void {
     const pending = this.pending.get(id);
     this.pending.delete(id);
+    pending?.abort();
     pending?.reject(new Error(`${this.label} request cancelled`));
   }
 }

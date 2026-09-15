@@ -132,6 +132,7 @@ type Props = {
   latestTurnAccessory?: ReactNode;
   /** False while another tab is in front; local transcript state is retained. */
   visible?: boolean;
+  activity?: string;
 };
 
 function AgentTranscriptComponent({
@@ -157,6 +158,7 @@ function AgentTranscriptComponent({
   onRevealReady,
   latestTurnAccessory,
   visible = true,
+  activity,
 }: Props) {
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const scroller = useRef<HTMLDivElement>(null);
@@ -428,6 +430,10 @@ function AgentTranscriptComponent({
               paused={waitingForApproval}
               waitingLabel={pendingQuestion ? "Waiting for answers" : undefined}
               modelName={turnModelName}
+              activity={activity}
+              waitingForResponse={!turn.some((block) =>
+                block.role !== "user" && (block.text.trim() || block.tool),
+              )}
             />
           ) : durationMs != null ? (
             formatWorkingDuration(durationMs, turnModelName, true)
@@ -655,16 +661,22 @@ function LiveFoldTitle({
   paused,
   waitingLabel,
   modelName,
+  activity,
+  waitingForResponse,
 }: {
   startedAt?: number;
   paused: boolean;
   waitingLabel?: string;
   modelName?: string;
+  activity?: string;
+  waitingForResponse: boolean;
 }) {
   const elapsedMs = useElapsedFrom(startedAt, paused);
   const text = paused
     ? (waitingLabel ?? "Waiting for approval")
-    : formatWorkingDuration(elapsedMs, modelName);
+    : activity || (waitingForResponse
+      ? `Waiting for ${modelName?.trim() || "agent"} response${elapsedMs == null ? "…" : ` · ${formatElapsed(elapsedMs)}`}`
+      : formatWorkingDuration(elapsedMs, modelName));
   return (
     <Shimmer className="min-w-0 truncate font-sans text-sm" duration={1}>
       {text}
@@ -1002,7 +1014,6 @@ function UserMessageBlock({
   const note = block.noteCard;
   const action = block.action;
   const text = card && card.kind !== "handoff" ? "" : block.text;
-  const formatted = /(?:^|\n)`{3,}/.test(text) || text.startsWith("> Selected reference material.");
   const chat = layout === "chat";
   const textOnly =
     Boolean(text) && !block.attachments?.length && !card && !note && !action;
@@ -1100,9 +1111,9 @@ function UserMessageBlock({
         {text ? (
           <div
             ref={textRef}
-            className={`min-w-0 break-words font-sans text-sm ${formatted ? expanded ? "" : "max-h-64 overflow-hidden" : `whitespace-pre-wrap ${expanded ? "" : "line-clamp-4"}`}`}
+            className={`min-w-0 break-words font-sans text-sm leading-6 ${expanded ? "" : "max-h-64 overflow-hidden"}`}
           >
-            {formatted ? <AgentMarkdown text={text} textOnly /> : text}
+            <AgentMarkdown text={text} textOnly className="[&_p]:whitespace-pre-wrap" />
           </div>
         ) : null}
       </div>

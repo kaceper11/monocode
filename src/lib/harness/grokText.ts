@@ -1,4 +1,8 @@
-import { AcpClient } from "./acp";
+import {
+  acpPermissionRequest,
+  acpPermissionOptionId,
+  AcpClient,
+} from "./acp";
 import type { JsonRpcId } from "./jsonRpc";
 import {
   killChild,
@@ -224,13 +228,11 @@ async function handleTextRequest(
   params: unknown,
 ) {
   if (method === "session/request_permission") {
-    const optionIds = permissionOptionIds(params);
-    const optionId =
-      optionIds.find((value) => /reject|deny|cancel/i.test(value)) ??
-      "reject-once";
-    await acp
-      .respond(id, { outcome: { outcome: "selected", optionId } })
-      .catch(() => undefined);
+    const request = acpPermissionRequest(params);
+    const optionId = acpPermissionOptionId("deny", request.optionIds, request.options);
+    await acp.respond(id, optionId
+      ? { outcome: { outcome: "selected", optionId } }
+      : { outcome: { outcome: "cancelled" } }).catch(() => undefined);
     return;
   }
   if (
@@ -245,20 +247,6 @@ async function handleTextRequest(
   await acp.respond(id, {}).catch(() => undefined);
 }
 
-function permissionOptionIds(params: unknown): string[] {
-  const rec =
-    params && typeof params === "object" && !Array.isArray(params)
-      ? (params as Record<string, unknown>)
-      : null;
-  const options = Array.isArray(rec?.options) ? rec.options : [];
-  return options.flatMap((item) => {
-    const id =
-      item && typeof item === "object" && !Array.isArray(item)
-        ? (item as Record<string, unknown>).optionId
-        : undefined;
-    return typeof id === "string" ? [id] : [];
-  });
-}
 
 function textFromUpdate(params: unknown): string {
   const rec =

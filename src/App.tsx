@@ -1,3 +1,8 @@
+import { canSteerHarnessSession } from "./lib/harness/registry";
+import { matchesActiveTurnModel, startSessionActivity } from "./lib/harness/apply";
+import { queuedMessageOptions, retainQueuedFollowUp } from "./lib/messageQueue";
+import { sessionDecisionHarness } from "./lib/session";
+import { useSessionState } from "./hooks/useSessionState";
 import { githubDeliveryTarget, gitlabDeliveryTarget, GITLAB_CI_ON_MR, saveDeliveryProvider } from "./lib/deliveryProviders";
 import {
   ciContext,
@@ -239,12 +244,12 @@ import {
 import { footerTerminals } from "./lib/terminalResources";
 import {
   applyHarnessEvent,
+  applyHarnessEvents,
   appendUser,
   appendSteerUser,
   bindHarnessSession,
   cancelHarnessTurn,
   canCompactHarnessContext,
-  canSteerHarness,
   compactHarnessContext,
   forgetHarnessSession,
   generateHarnessTitle,
@@ -490,6 +495,7 @@ import {
   beginTurnTiming,
   endTurnTiming,
   markFirstTurnEvent,
+  markTurnContentApplied,
   markTurn,
 } from "./lib/turnTiming";
 import { warmNativeSkills, isNativeCommandPrompt } from "./lib/skills";
@@ -868,7 +874,7 @@ export default function App({
     const tab = newTab(session.id);
     return { session, tab };
   });
-  const [sessions, setSessions] = useState<Session[]>(
+  const [sessions, setSessions, sessionsRef] = useSessionState(
     () => windowTransfer?.sessions ?? resumed?.sessions ?? [seed.session],
   );
   const [tabs, setTabs] = useState<WorkspaceTab[]>(
@@ -1027,14 +1033,13 @@ export default function App({
   /** Project whose listing failed, so the error cannot leak to another one. */
   const [historyErrorCwd, setHistoryErrorCwd] = useState<string | null>(null);
 
-  const sessionsRef = useRef(sessions);
-  sessionsRef.current = sessions;
   const repairCheckingRef = useRef(new Set<string>());
   const linkedSessionUpdatesRef = useRef<
     ReadonlyMap<string, LinkedSessionUpdate>
   >(new Map());
   const linkedWorkItemActivityFetches = useRef(new Map<string, number>());
   const queueDispatchingRef = useRef(new Set<string>());
+  const pendingSteersRef = useRef(new Map<string, Set<Promise<void>>>());
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
   const dirtyFilesRef = useRef(dirtyFiles);
@@ -1163,10 +1168,11 @@ export default function App({
     const prev = sessionsRef.current;
     const next = prev.map((session) => {
       const events = batches.get(session.id);
-      return events ? events.reduce(applyHarnessEvent, session) : session;
+      return events ? applyHarnessEvents(session, events) : session;
     });
     if (!next.some((session, index) => session !== prev[index])) return;
     sessionsRef.current = next;
+    for (const sessionId of batches.keys()) markTurnContentApplied(sessionId);
     syncDockBadge(next);
     setSessions(next);
   }, []);
@@ -1202,7 +1208,7 @@ export default function App({
       const prev = sessionsRef.current;
       const next = prev.map((session) =>
         session.id === sessionId
-          ? events.reduce(applyHarnessEvent, session)
+          ? applyHarnessEvents(session, events)
           : session,
       );
       if (!next.some((session, index) => session !== prev[index])) return;
@@ -1952,6 +1958,7 @@ export default function App({
       if (
         !session ||
         session.busy ||
+        session.pendingSwitch ||
         // Only bound (resumable) sessions warm: spawning a fresh provider
         // session on a mere pane focus creates phantom provider threads.
         !session.providerSessionId ||
@@ -1961,7 +1968,7 @@ export default function App({
         return;
       }
       const cwd = sessionWorkCwd(session);
-      if (!cwd || cwd === "~") return;
+      if (!cwd) return;
       void prewarmHarness({
         harness: session.harness,
         sessionId,
@@ -4770,13 +4777,14 @@ export default function App({
         buildTarget?: PlanBuildTarget;
         action?: ActionRunRef;
       },
-    ) => {
-      if (removingSessionIds.current.has(sessionId)) return;
+    ): Promise<boolean> => {
+      const submittedAt = performance.now();
+      if (removingSessionIds.current.has(sessionId)) return false;
       let storedCurrent = sessionsRef.current.find((s) => s.id === sessionId);
       const queuedRow = storedCurrent?.queuedMessages?.find(row => row.id === options?.queuedMessageId);
       const repair = options?.repair ?? queuedRow?.repair;
       const action = options?.action ?? queuedRow?.action;
-      if (!storedCurrent) return;
+      if (!storedCurrent) return false;
       if (repair) {
         if (repairCheckingRef.current.has(sessionId)) return false;
         repairCheckingRef.current.add(sessionId);
@@ -4798,12 +4806,7 @@ export default function App({
         } finally { repairCheckingRef.current.delete(sessionId); }
       }
       if (!storedCurrent) return false;
-      const setSubmissionSessions = (update: (prev: Session[]) => Session[]) => {
-        if (!repair) { setSessions(update); return; }
-        const next = update(sessionsRef.current);
-        sessionsRef.current = next;
-        setSessions(next);
-      };
+      const setSubmissionSessions = setSessions;
       const current = options?.buildTarget
         ? withPlanBuildTarget(storedCurrent, options.buildTarget)
         : storedCurrent;
@@ -4814,12 +4817,12 @@ export default function App({
               block.id === options.planBlockId && block.role === "plan",
           )
         : undefined;
-      if (intent === "build" && !approvedPlan?.text.trim()) return;
+      if (intent === "build" && !approvedPlan?.text.trim()) return false;
       if (options?.queuedMessageId) {
         const mode =
           options.followUpBehavior === "steer" ? "steer" : "dispatch";
         if (!queuedMessageForSubmit(current, options.queuedMessageId, mode)) {
-          return;
+          return false;
         }
       }
       const noteCard =
@@ -4834,17 +4837,18 @@ export default function App({
         !noteCard &&
         !handoffCard
       ) {
-        return;
+        return false;
       }
       if (isPreparingHandoff(current)) {
-        // A provider switch is resolving — drop nothing an action submitted;
-        // the queue dispatches once the session is ready again.
-        if (!action) return;
+        // Preserve submissions while the provider switch resolves.
+        if (options?.queuedMessageId) return false;
         setSubmissionSessions((prev) =>
           prev.map((s) =>
             s.id === sessionId
               ? {
                   ...s,
+                  noteCard: undefined,
+                  handoffCard: undefined,
                   queuedMessages: [
                     ...(s.queuedMessages ?? []),
                     {
@@ -4864,7 +4868,7 @@ export default function App({
               : s,
           ),
         );
-        return;
+        return true;
       }
       saveRecentModelChoice(current.harness, current.model);
       const workCwd = sessionWorkCwd(current);
@@ -4884,7 +4888,8 @@ export default function App({
           intent === "plan"
             ? "queue"
             : (options?.followUpBehavior ?? loadFollowUpBehavior());
-        if (followUpBehavior === "queue") {
+        if (followUpBehavior === "queue" || !matchesActiveTurnModel(current) || !canSteerHarnessSession(current.harness, sessionId)) {
+          if (options?.queuedMessageId) return false;
           setSubmissionSessions((prev) =>
             prev.map((s) =>
               s.id === sessionId
@@ -4916,22 +4921,10 @@ export default function App({
           if (repair) updateRepair(repair.id, "queued", "Queued for this agent; evidence will be checked again before delivery. App must remain open.");
           return true;
         }
-        if (
-          !isLiveHarness(current.harness) ||
-          !canSteerHarness(current.harness)
-        ) {
-          // Harnesses that cannot steer (fx) used to drop the message on the
-          // floor here, so a follow-up sent mid-turn just vanished. Say so.
-          enqueueHarnessEvent(sessionId, {
-            type: "status",
-            text: `${current.harness} cannot take a follow-up mid-turn — wait for this turn to finish, or stop it first.`,
-          });
-          flushHarnessEvents();
-          return;
-        }
         const visible = displayAttachments(attachments);
         const cards = userTurnCards(noteCard, undefined, action);
-        setSessions((prev) =>
+        let optimisticBlockId: string | undefined;
+        setSubmissionSessions((prev) =>
           prev.map((s) => {
             if (s.id !== sessionId) return s;
             let next: Session = {
@@ -4944,46 +4937,63 @@ export default function App({
             if (options?.queuedMessageId) {
               next = dequeueQueuedMessage(next, options.queuedMessageId);
             }
-            return appendSteerUser(next, submittedText, visible, cards);
+            const appended = appendSteerUser(next, submittedText, visible, cards);
+            optimisticBlockId = appended.blocks[appended.blocks.length - 1]?.id;
+            return appended;
           }),
         );
-        void (async () => {
+        const gen = turnGen.current.get(sessionId);
+        const activityKey = `${sessionId}:${gen}`;
+        const pending = pendingSteersRef.current.get(activityKey) ?? new Set<Promise<void>>();
+        pendingSteersRef.current.set(activityKey, pending);
+        const stillOwned = () => turnGen.current.get(sessionId) === gen && !removingSessionIds.current.has(sessionId);
+        const followUp = (async () => {
           try {
-            const prepared = await prepareAttachments(attachments, workCwd);
-            const prompt = await preparePrompt(harnessText, {
-              harness: current.harness,
-              sessionId,
-              cwd: workCwd,
-            });
-            await steerHarnessTurn({
+            const [prepared, prompt] = await Promise.all([
+              prepareAttachments(attachments, workCwd),
+              preparePrompt(harnessText, { harness: current.harness, sessionId, cwd: workCwd }),
+            ]);
+            if (!stillOwned()) return;
+            const input = {
               harness: current.harness,
               sessionId,
               cwd: workCwd,
               model: current.model,
               modelSettings: current.modelSettings,
-              text: inboxAskPrompt(
-                rawCommand ? undefined : current.inboxAsk,
-                prompt,
-              ),
+              text: inboxAskPrompt(rawCommand ? undefined : current.inboxAsk, prompt),
               attachments: prepared,
-            });
+            };
+            if (canSteerHarnessSession(current.harness, sessionId)) {
+              await steerHarnessTurn(input);
+            } else {
+              // No write happened. Let normal queue dispatch own the next turn.
+              setSessions((prev) => prev.map((s) => s.id === sessionId
+                ? retainQueuedFollowUp(s, {
+                    id: options?.queuedMessageId ?? crypto.randomUUID(), text, attachments,
+                    noteCard, handoffCard, intent, action,
+                  }, optimisticBlockId)
+                : s));
+            }
           } catch (error: unknown) {
-            const message =
-              error instanceof Error
-                ? error.message
-                : `${current.harness} could not steer the active turn`;
-            enqueueHarnessEvent(sessionId, {
-              type: "session.error",
-              message,
-            });
-            flushHarnessEvents();
+            if (!stillOwned()) return;
+            const message = error instanceof Error ? error.message : `${current.harness} could not deliver the follow-up`;
+            // A rejected/uncertain steer is not proof the original turn stopped.
+            // Keep its transcript evidence and require review before any replay.
+            setSessions((prev) => prev.map((s) => s.id === sessionId
+              ? retainQueuedFollowUp(s, {
+                  id: options?.queuedMessageId ?? crypto.randomUUID(), text, attachments,
+                  noteCard, handoffCard, intent, action, deliveryError: message,
+                })
+              : s));
           }
         })();
-        return;
+        pending.add(followUp);
+        return true;
       }
 
       const gen = (turnGen.current.get(sessionId) ?? 0) + 1;
       turnGen.current.set(sessionId, gen);
+      const turnClock = beginTurnTiming(sessionId, current.harness, String(gen), submittedAt);
       const isFirstTurn = current.blocks.length === 0;
       const placeholderTitle = canReplaceSessionTitle(
         current.title,
@@ -5139,7 +5149,8 @@ export default function App({
         if (pendingSwitch) {
           void forgetHarnessSession(pendingSwitch.from, sessionId);
         }
-        return;
+        endTurnTiming(sessionId, "provider unavailable", turnClock);
+        return true;
       }
 
       void (async () => {
@@ -5192,7 +5203,6 @@ export default function App({
         const planEventKey = `turn:${gen}`;
         let nativePlanSeen = false;
         let providerFailureSeen = false;
-        const turnClock = beginTurnTiming(sessionId, current.harness);
         const routePlanEvent = (event: HarnessEvent): HarnessEvent | null => {
           if (event.type === "session.error") providerFailureSeen = true;
           if (intent !== "plan") return event;
@@ -5204,6 +5214,21 @@ export default function App({
             };
           }
           return event;
+        };
+        const onEvent = (event: HarnessEvent) => {
+          if (turnGen.current.get(sessionId) !== gen) return;
+          markFirstTurnEvent(sessionId, event);
+          if (
+            wrap &&
+            (event.type === "session.started" ||
+              event.type === "session.providerBound")
+          ) {
+            revealHandoff(wrap.text);
+          }
+          nudgeOpenEditors(event, workCwd);
+          trackSessionEdits(sessionId, workCwd, event);
+          const routed = routePlanEvent(event);
+          if (routed) enqueueHarnessEvent(sessionId, routed);
         };
 
         // The checkpoint only has to be durable before the turn can edit
@@ -5230,8 +5255,21 @@ export default function App({
                   sessionId,
                   cwd: workCwd,
                 }),
+            // The user has submitted and the outgoing host is retired. Warm
+            // the replacement while preparing the prompt/checkpoint; it may
+            // initialize tools, but cannot edit files before sendTurn below.
+            prewarmHarness({
+              harness: current.harness,
+              sessionId,
+              cwd: workCwd,
+              model: current.model,
+              modelSettings: current.modelSettings,
+              runtimeMode: current.runtimeMode,
+              onEvent,
+            }),
           ]);
           await checkpoint;
+          if (turnGen.current.get(sessionId) !== gen || removingSessionIds.current.has(sessionId)) return;
           markTurn(sessionId, "checkpoint + prompt ready");
           const turnPrompt =
             intent === "plan" && !rawCommand ? planTurnPrompt(prompt) : prompt;
@@ -5265,21 +5303,7 @@ export default function App({
                 : turnPrompt,
             ),
             attachments: prepared,
-            onEvent: (event) => {
-              if (turnGen.current.get(sessionId) !== gen) return;
-              markFirstTurnEvent(sessionId);
-              if (
-                wrap &&
-                (event.type === "session.started" ||
-                  event.type === "session.providerBound")
-              ) {
-                revealHandoff(wrap.text);
-              }
-              nudgeOpenEditors(event, workCwd);
-              trackSessionEdits(sessionId, workCwd, event);
-              const routed = routePlanEvent(event);
-              if (routed) enqueueHarnessEvent(sessionId, routed);
-            },
+            onEvent,
           });
           if (turnGen.current.get(sessionId) !== gen) return;
           if (wrap) {
@@ -5311,24 +5335,25 @@ export default function App({
           }
           providerFailureSeen = true;
         } finally {
-          endTurnTiming(
-            sessionId,
-            providerFailureSeen ? "turn failed" : "turn done",
-            turnClock,
-          );
+          const activityKey = `${sessionId}:${gen}`;
+          const pending = pendingSteersRef.current.get(activityKey);
+          while (pending?.size) {
+            const batch = [...pending];
+            await Promise.all(batch);
+            for (const work of batch) pending.delete(work);
+          }
+          pendingSteersRef.current.delete(activityKey);
           if (repair && turnGen.current.get(sessionId) !== gen) updateRepair(repair.id, "uncertain", "Turn interrupted. Inspect the conversation before allowing another request.");
-          if (turnGen.current.get(sessionId) !== gen) return;
+          if (turnGen.current.get(sessionId) !== gen) {
+            endTurnTiming(sessionId, "turn replaced", turnClock);
+            return;
+          }
           if (repair && buildSucceeded) updateRepair(repair.id, providerFailureSeen ? "uncertain" : "completed", providerFailureSeen ? "Provider reported a failure; inspect the conversation before retry." : "Agent turn completed. Verify the changes and provider results separately.");
           flushHarnessEvents();
-          // A failed provider can leave its process alive with a dead event
-          // stream or poisoned turn state. Park it now; the next prompt will
-          // reconnect and resume through a fresh transport.
-          if (providerFailureSeen) {
-            await stopHarnessSession(current.harness, sessionId).catch(
-              () => undefined,
-            );
-          }
-          await flushSessionCheckpoint(sessionId);
+          // The busy→idle edge only needs the applied event batch. Checkpoint
+          // durability is a pre-edit requirement, not a pre-idle one — later
+          // consumers serialize through the same queue, so settling here
+          // cannot reorder snapshot writes.
           setSessions((prev) =>
             prev.map((s) => {
               if (s.id !== sessionId) return s;
@@ -5349,6 +5374,22 @@ export default function App({
                 : finalized;
             }),
           );
+          scheduleHarnessFlush(() => {
+            endTurnTiming(sessionId, providerFailureSeen ? "turn failed" : "turn done", turnClock);
+          });
+          // A failed provider can leave its process alive with a dead event
+          // stream or poisoned turn state. Park it now; the next prompt will
+          // reconnect and resume through a fresh transport.
+          if (providerFailureSeen) {
+            await stopHarnessSession(current.harness, sessionId).catch(
+              () => undefined,
+            );
+          }
+          await flushSessionCheckpoint(sessionId);
+          if (turnGen.current.get(sessionId) !== gen || removingSessionIds.current.has(sessionId)) {
+            endTurnTiming(sessionId, "turn replaced", turnClock);
+            return;
+          }
           // Next tick: the flush above has rendered by then, so the banner
           // quotes the reply's final text rather than the previous batch.
           window.setTimeout(() => {
@@ -6232,13 +6273,7 @@ export default function App({
           ) {
             return;
           }
-          onSubmit(session.id, head.text, head.attachments, {
-            queuedMessageId: head.id,
-            noteCard: head.noteCard,
-            handoffCard: head.handoffCard,
-            intent: head.intent,
-            action: head.action,
-          });
+          onSubmit(session.id, head.text, head.attachments, queuedMessageOptions(head));
         }, 0),
       );
     }
@@ -6311,11 +6346,8 @@ export default function App({
         : undefined;
       if (!session || !message) return;
       onSubmit(sessionId, message.text, message.attachments, {
+        ...queuedMessageOptions(message),
         followUpBehavior: "steer",
-        queuedMessageId: message.id,
-        noteCard: message.noteCard,
-        handoffCard: message.handoffCard,
-        action: message.action,
       });
     },
     [onSubmit],
@@ -6737,7 +6769,7 @@ export default function App({
       const started = sessionsRef.current.map((session) =>
         session.id === sessionId
           ? applyHarnessEvent(
-              { ...session, busy: true },
+              startSessionActivity(session),
               { type: "status", text: "Compacting context…" },
             )
           : session,
@@ -6778,7 +6810,7 @@ export default function App({
           if (turnGen.current.get(sessionId) !== gen) return;
           flushHarnessEvents();
           const finished = sessionsRef.current.map((session) =>
-            session.id === sessionId ? { ...session, busy: false } : session,
+            session.id === sessionId ? stopStreaming(session) : session,
           );
           sessionsRef.current = finished;
           syncDockBadge(finished);
@@ -6876,7 +6908,7 @@ export default function App({
     (sessionId: string, requestId: number, decision: ApprovalDecision) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
       if (!session) return;
-      respondHarnessApproval(session.harness, sessionId, requestId, decision);
+      respondHarnessApproval(sessionDecisionHarness(session), sessionId, requestId, decision);
     },
     [],
   );
@@ -6885,7 +6917,7 @@ export default function App({
     (sessionId: string, requestId: number, reply: UserQuestionReply) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
       if (!session) return;
-      respondHarnessQuestion(session.harness, sessionId, requestId, reply);
+      respondHarnessQuestion(sessionDecisionHarness(session), sessionId, requestId, reply);
     },
     [],
   );
@@ -6893,7 +6925,7 @@ export default function App({
   const onQuestionInteraction = useCallback(
     (sessionId: string, requestId: number) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
-      if (session) keepHarnessQuestionOpen(session.harness, sessionId, requestId);
+      if (session) keepHarnessQuestionOpen(sessionDecisionHarness(session), sessionId, requestId);
     },
     [],
   );

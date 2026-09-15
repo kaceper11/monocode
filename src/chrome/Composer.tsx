@@ -178,6 +178,8 @@ type Props = {
   busy?: boolean;
   queuedMessages?: QueuedMessage[];
   queueStatus?: MessageQueueStatus;
+  modelChangePending?: boolean;
+  canSteer?: boolean;
   hotkeys?: boolean;
   onFocus: () => void;
   onCwdChange: (cwd: string, fresh?: boolean) => void;
@@ -200,7 +202,7 @@ type Props = {
       action?: import("../lib/agentActions").ActionRunRef;
       followUpBehavior?: import("../lib/settings").FollowUpBehavior;
     },
-  ) => void;
+  ) => boolean | Promise<boolean>;
   onStop?: () => void;
   onCompactContext?: () => boolean;
   onPlaceInFolder?: (target: SessionFolderTarget) => void;
@@ -251,6 +253,8 @@ function ToolButton({
 function MessageQueue({
   messages,
   status,
+  busy,
+  canSteer,
   onDelete,
   onEdit,
   onEditingChange,
@@ -259,6 +263,8 @@ function MessageQueue({
 }: {
   messages: QueuedMessage[];
   status?: MessageQueueStatus;
+  busy: boolean;
+  canSteer: boolean;
   onDelete?: (messageId: string) => void;
   onEdit?: (messageId: string, text: string) => void;
   onEditingChange?: (messageId?: string) => void;
@@ -306,7 +312,7 @@ function MessageQueue({
           <div className="flex h-7 items-center gap-2 border-b border-content/10 text-[12px]">
             <Pause className="size-3.5" />
             <span className="min-w-0 flex-1 truncate">
-              Queue paused because you interrupted
+              Queue paused — review before resuming
             </span>
             <button
               type="button"
@@ -380,18 +386,23 @@ function MessageQueue({
                 </>
               ) : (
                 <>
-                  <span className="min-w-0 flex-1 truncate text-content/80">
-                    {label}
-                  </span>
+                  <div className="min-w-0 flex-1 text-content/80">
+                    <div className="truncate">{label}</div>
+                    {message.deliveryError ? (
+                      <p className="py-1 text-[11px] text-amber-600 dark:text-amber-400" role="alert">
+                        Delivery unconfirmed: {message.deliveryError}. Inspect the conversation before retrying.
+                      </p>
+                    ) : null}
+                  </div>
                   <button
                     type="button"
-                    disabled={!!message.repair}
-                    title={message.repair ? "Tracked repairs run as a separate queued turn" : undefined}
+                    disabled={!!message.repair || (busy && (!canSteer || message.intent === "plan"))}
+                    title={message.repair ? "Tracked repairs run as a separate queued turn" : busy && message.intent === "plan" ? "Plans start as a separate turn after the running turn finishes" : busy && !canSteer ? "This follow-up will start after the running turn finishes" : undefined}
                     onClick={() => onSteer?.(message.id)}
                     className="flex h-6 shrink-0 items-center gap-1.5 rounded-md px-1.5 hover:bg-content/10 hover:text-content"
                   >
                     <CornerDownRight className="size-3.5" />
-                    Steer
+                    {busy ? "Steer" : "Send now"}
                   </button>
                   <button
                     type="button"
@@ -453,6 +464,8 @@ export function Composer({
   busy = false,
   queuedMessages = [],
   queueStatus,
+  modelChangePending = false,
+  canSteer = false,
   onFocus,
   onCwdChange,
   onBranchChange,
@@ -481,6 +494,9 @@ export function Composer({
   children,
 }: Props) {
   const ref = useRef<HTMLTextAreaElement>(null);
+  const submitting = useRef(false);
+  const submissionOwner = useRef(sessionId);
+  submissionOwner.current = sessionId;
   const boxRef = useRef<HTMLDivElement>(null);
   const plusRef = useRef<HTMLDivElement>(null);
   const highlightRef = useRef<HTMLDivElement>(null);
@@ -925,7 +941,7 @@ export function Composer({
   );
 
   useEffect(() => {
-    if (!focused) return;
+    if (!enabled || !focused) return;
     if (
       document.querySelector(
         "[data-model-picker], [data-access-picker], [data-model-settings], [data-file-picker], [data-branch-picker], [data-skill-picker], [data-session-folder-picker], [data-mention-picker], [data-attach-picker], [data-composer-plus], [data-dictation-menu]",
@@ -933,7 +949,7 @@ export function Composer({
     )
       return;
     ref.current?.focus();
-  }, [focused]);
+  }, [enabled, focused, shell]);
 
   useEffect(() => {
     if (!enabled) {
@@ -1035,7 +1051,8 @@ export function Composer({
     };
   }, [addAttachments, attachmentsSupported, enabled]);
 
-  const submit = (value: string) => {
+  const submit = async (value: string) => {
+    if (submitting.current) return;
     const folderCommand = consumeSessionFolderCommand(value);
     if (folderCommand.matched && onPlaceInFolder && !sessionFolderSelected) {
       openSessionFolderPicker();
@@ -1087,25 +1104,45 @@ export function Composer({
     }
     setAttachmentError("");
     if (!text && files.length === 0 && !noteCard && !handoffCard) return;
-    onSubmit(text, files, {
-      intent: planSelected || command.planning ? "plan" : "default",
-    });
-    if (!ref.current) return;
-    ref.current.value = "";
-    ref.current.style.height = "auto";
-    setDraft("");
-    onDraftChange?.("");
-    setAttachments([]);
-    setPlanSelected(false);
-    setSessionFolderSelected(false);
-    setSessionFolderOpen(false);
-    setPlusOpen(false);
-    setSlash(null);
-    setMention(null);
-    setAttachOpen(false);
-    setCreatingSkill(false);
-    setCreateError(null);
-    syncHasValue("", []);
+    const editor = ref.current;
+    const owner = sessionId;
+    const submittedFiles = new Set(attachments.map((file) => file.id));
+    submitting.current = true;
+    try {
+      const accepted = await onSubmit(text, files, {
+        intent: planSelected || command.planning ? "plan" : "default",
+      });
+      if (ref.current !== editor || submissionOwner.current !== owner) return;
+      if (!accepted) {
+        setAttachmentError("Message was not accepted. Your draft is saved; resolve the blocker and try again.");
+        return;
+      }
+      // An asynchronous preflight must not erase the next message or new files.
+      const remaining = attachmentsRef.current.filter((file) => !submittedFiles.has(file.id));
+      setAttachments(remaining);
+      if (editor && editor.value === value) {
+        editor.value = "";
+        editor.style.height = "auto";
+        setDraft("");
+        onDraftChange?.("");
+        setPlanSelected(false);
+        setSessionFolderSelected(false);
+        setSessionFolderOpen(false);
+        setPlusOpen(false);
+        setSlash(null);
+        setMention(null);
+        setAttachOpen(false);
+        setCreatingSkill(false);
+        setCreateError(null);
+      }
+      syncHasValue(editor?.value ?? "", remaining);
+    } catch (error) {
+      if (ref.current === editor && submissionOwner.current === owner) {
+        setAttachmentError(error instanceof Error ? error.message : "Message could not be submitted. Your draft is saved.");
+      }
+    } finally {
+      submitting.current = false;
+    }
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1322,6 +1359,8 @@ export function Composer({
       <MessageQueue
         messages={queuedMessages}
         status={queueStatus}
+        busy={busy}
+        canSteer={canSteer}
         onDelete={onDeleteQueuedMessage}
         onEdit={onEditQueuedMessage}
         onEditingChange={onQueuedMessageEditingChange}
@@ -1767,6 +1806,11 @@ export function Composer({
                     }
                     onClose={() => ref.current?.focus()}
                   />
+                ) : null}
+                {modelChangePending ? (
+                  <span className="px-1 text-[10px] text-content/45" title="The selected model and effort apply to the next turn. Follow-ups will queue until the running turn finishes.">
+                    Next turn
+                  </span>
                 ) : null}
                 {harness !== "fx" && harness !== "pi" && harness !== "omp" ? (
                   <AccessPicker

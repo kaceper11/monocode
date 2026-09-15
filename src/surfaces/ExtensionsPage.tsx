@@ -436,6 +436,8 @@ function InventoryTab({
         )}
 
         <p className="pt-3 text-[12px] text-content/40">
+          These entries show what is configured, not whether a server is connected.
+          Reconnect or start a new provider session to load configuration changes.{" "}
           Nothing here runs hooks or starts servers. Toggles write a single
           flag in the provider's own config; removal cuts the entry or renames
           the file — every change keeps a{" "}

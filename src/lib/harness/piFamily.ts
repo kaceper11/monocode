@@ -91,14 +91,16 @@ type Live = {
   approvals: Map<number, PendingApproval>;
   questions: Map<
     number,
-    { id: string; resolve: (reply: UserQuestionReply) => void }
+    { id: string; event: Extract<HarnessEvent, { type: "question.asked" }>; resolve: (reply: UserQuestionReply) => void }
   >;
+  visibleQuestionId: number | null;
   availableCommands?: NativeCommand[];
   promptId: string | null;
   nextApprovalUiId: number;
   toolsByIndex: Map<number, InFlightTool>;
   toolsById: Map<string, InFlightTool>;
   cancelled: boolean;
+  cancelVersion: number;
   muteUpdates: boolean;
   compacting: boolean;
   retrying: boolean;
@@ -130,6 +132,7 @@ type FlavorState = {
   cancelledThreads: Set<string>;
   resolveBinary: (cwd?: string) => Promise<{ path: string }>;
   commandListeners: Map<string, Set<(commands: NativeCommand[]) => void>>;
+  starting: Map<string, { controller: AbortController; promise: Promise<Live> }>;
 };
 
 /**
@@ -147,6 +150,7 @@ function stateFor(flavor: PiFlavor): FlavorState {
       cancelledThreads: new Set(),
       resolveBinary: flavor.resolveBinary,
       commandListeners: new Map(),
+      starting: new Map(),
     };
     stateByFlavor.set(flavor.id, state);
   }
@@ -216,6 +220,8 @@ export async function sendTurn(
   input: SendTurnInput,
 ): Promise<void> {
   const { cancelledThreads } = stateFor(flavor);
+  const beforeStart = stateFor(flavor).liveByThread.get(input.sessionId);
+  const beforeVersion = beforeStart?.cancelVersion;
   let live: Live;
   try {
     live = await ensureLive(flavor, input);
@@ -225,10 +231,17 @@ export async function sendTurn(
   }
   if (cancelledThreads.delete(input.sessionId)) return;
 
+  if (beforeStart && beforeStart.cancelVersion !== beforeVersion) return;
+  const cancelVersion = live.cancelVersion;
   live.onEvent = input.onEvent;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (
+        stateFor(flavor).liveByThread.get(input.sessionId) !== live ||
+        live.cancelVersion !== cancelVersion
+      )
+        return;
       live.cancelled = false;
       live.muteUpdates = false;
       try {
@@ -251,16 +264,23 @@ export async function compactContext(
     live = await ensureLive(flavor, input);
   } else {
     live.onEvent = input.onEvent;
-    await applyModel(flavor, live, input);
   }
   if (state.cancelledThreads.delete(input.sessionId)) return;
 
+  const cancelVersion = live.cancelVersion;
   live.onEvent = input.onEvent;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (
+        state.liveByThread.get(input.sessionId) !== live ||
+        live.cancelVersion !== cancelVersion
+      )
+        return;
       live.cancelled = false;
       live.muteUpdates = false;
+      await applyModel(flavor, live, input);
+      if (live.cancelled || live.muteUpdates) return;
       const response = await live.rpc.request(
         { type: "compact" },
         COMPACT_TIMEOUT_MS,
@@ -322,16 +342,24 @@ export function respondQuestion(
     ?.resolve(reply);
 }
 
+export function canSteerSession(flavor: PiFlavor, sessionId: string): boolean {
+  const live = stateFor(flavor).liveByThread.get(sessionId);
+  return !!live?.activeTurn && !live.cancelled && !live.muteUpdates;
+}
+
 export async function cancelTurn(
   flavor: PiFlavor,
   sessionId: string,
 ): Promise<void> {
-  const { liveByThread, cancelledThreads } = stateFor(flavor);
+  const state = stateFor(flavor);
+  state.starting.get(sessionId)?.controller.abort();
+  const { liveByThread, cancelledThreads } = state;
   const live = liveByThread.get(sessionId);
   if (!live) {
     cancelledThreads.add(sessionId);
     return;
   }
+  live.cancelVersion += 1;
   live.cancelled = true;
   live.muteUpdates = true;
   live.settleToken += 1;
@@ -340,7 +368,15 @@ export async function cancelTurn(
   for (const question of live.questions.values())
     question.resolve({ kind: "skipped" });
   live.questions.clear();
-  await live.rpc.request({ type: "abort" }, 5_000).catch(() => undefined);
+  try {
+    await live.rpc.request({ type: "abort" }, 5_000);
+  } catch (error) {
+    if (state.liveByThread.get(sessionId) === live) {
+      live.onEvent({ type: "session.error", message: `Could not confirm ${flavor.label} stopped: ${error instanceof Error ? error.message : String(error)}` });
+      await disposeSession(flavor, sessionId);
+    }
+    return;
+  }
   finishActiveTurn(live, [
     { type: "message.completed" },
     { type: "reasoning.completed" },
@@ -348,6 +384,19 @@ export async function cancelTurn(
 }
 
 export async function stopSession(
+  flavor: PiFlavor,
+  sessionId: string,
+): Promise<void> {
+  const state = stateFor(flavor);
+  const starting = state.starting.get(sessionId);
+  starting?.controller.abort();
+  const live = state.liveByThread.get(sessionId);
+  if (live) live.cancelVersion += 1;
+  await disposeSession(flavor, sessionId);
+  await starting?.promise.catch(() => undefined);
+}
+
+async function disposeSession(
   flavor: PiFlavor,
   sessionId: string,
 ): Promise<void> {
@@ -369,8 +418,10 @@ export async function stopSession(
     live.turnFailed = null;
     live.rpc.close();
   }
-  unwatchChild(sessionId);
-  await killChild(sessionId).catch(() => undefined);
+  if (live) {
+    unwatchChild(sessionId);
+    await killChild(sessionId).catch(() => undefined);
+  }
 }
 
 export async function forgetSession(
@@ -396,6 +447,33 @@ async function ensureLive(
   flavor: PiFlavor,
   input: HarnessSessionInput,
 ): Promise<Live> {
+  const state = stateFor(flavor);
+  const pending = state.starting.get(input.sessionId);
+  if (pending) {
+    const alreadyStopped = pending.controller.signal.aborted;
+    try {
+      await pending.promise;
+    } catch (error) {
+      if (!alreadyStopped) throw error;
+    }
+    return ensureLive(flavor, input);
+  }
+  const controller = new AbortController();
+  const promise = prepareLive(flavor, input, controller.signal);
+  state.starting.set(input.sessionId, { controller, promise });
+  try {
+    return await promise;
+  } finally {
+    if (state.starting.get(input.sessionId)?.promise === promise)
+      state.starting.delete(input.sessionId);
+  }
+}
+
+async function prepareLive(
+  flavor: PiFlavor,
+  input: HarnessSessionInput,
+  signal: AbortSignal,
+): Promise<Live> {
   const { liveByThread, resumeByThread } = stateFor(flavor);
   const existing = liveByThread.get(input.sessionId);
   const wantPlanning = input.intent === "plan";
@@ -405,12 +483,11 @@ async function ensureLive(
     existing.planning === wantPlanning
   ) {
     existing.onEvent = input.onEvent;
-    await applyModel(flavor, existing, input);
     return existing;
   }
   if (existing) {
     if (existing.cwd !== input.cwd) resumeByThread.delete(input.sessionId);
-    await stopSession(flavor, input.sessionId);
+    await disposeSession(flavor, input.sessionId);
   }
 
   const resume = resumeByThread.get(input.sessionId);
@@ -419,28 +496,25 @@ async function ensureLive(
     resumeByThread.delete(input.sessionId);
   }
 
-  try {
-    return await startLive(
-      flavor,
-      input,
-      canResume ? resume?.sessionId : undefined,
-    );
-  } catch (error) {
-    if (!canResume) throw error;
-    resumeByThread.delete(input.sessionId);
-    await stopSession(flavor, input.sessionId);
-    return startLive(flavor, input, undefined);
-  }
+  signal.throwIfAborted();
+  return startLive(
+    flavor,
+    input,
+    canResume ? resume?.sessionId : undefined,
+    signal,
+  );
 }
 
 async function startLive(
   flavor: PiFlavor,
   input: HarnessSessionInput,
   resume: string | undefined,
+  signal: AbortSignal,
 ): Promise<Live> {
   const state = stateFor(flavor);
   const { liveByThread } = state;
   const { path } = await state.resolveBinary(input.cwd);
+  signal.throwIfAborted();
   const native = nativeModelId(input.model, input.cwd);
   const modelRef = parsePiModelRef(native);
   const liveRef: { current: Live | null } = { current: null };
@@ -460,18 +534,20 @@ async function startLive(
     cwd: input.cwd,
     providerSessionId: resume ?? "",
     nativeModel: native,
-    thinking: input.modelSettings?.thinking ?? "",
+    thinking: "",
     fastModeEnabled: undefined,
     fastModeRequested: undefined,
     planning: input.intent === "plan",
     onEvent: input.onEvent,
     approvals: new Map(),
     questions: new Map(),
+    visibleQuestionId: null,
     promptId: null,
     nextApprovalUiId: 1,
     toolsByIndex: new Map(),
     toolsById: new Map(),
     cancelled: false,
+    cancelVersion: 0,
     muteUpdates: false,
     compacting: false,
     retrying: false,
@@ -493,7 +569,8 @@ async function startLive(
     (line) => rpc.pushLine(line),
     (code) => {
       rpc.close(new Error(`${flavor.label} exited`));
-      liveByThread.delete(input.sessionId);
+      if (liveByThread.get(input.sessionId) === live)
+        liveByThread.delete(input.sessionId);
       const current = liveRef.current;
       if (!current?.muteUpdates) {
         (current?.onEvent ?? input.onEvent)({ type: "session.ended", code });
@@ -515,26 +592,27 @@ async function startLive(
     },
   );
 
-  await spawnChild(
-    input.sessionId,
-    path,
-    buildPiSpawnArgs(flavor, {
-      resume,
-      model: modelRef ? native : undefined,
-      plan: input.intent === "plan",
-    }),
-    input.cwd,
-  );
-
-  liveByThread.set(input.sessionId, live);
-
   try {
+    await spawnChild(
+      input.sessionId,
+      path,
+      buildPiSpawnArgs(flavor, {
+        resume,
+        model: modelRef ? native : undefined,
+        plan: input.intent === "plan",
+      }),
+      input.cwd,
+    );
+
+    signal.throwIfAborted();
+    liveByThread.set(input.sessionId, live);
     const stateFrame = await rpc.request(
       { type: "get_state" },
       INIT_TIMEOUT_MS,
     );
+    signal.throwIfAborted();
     bindState(flavor, input.sessionId, live, stateFrame.data);
-    await applyModel(flavor, live, input);
+    signal.throwIfAborted();
     if (live.providerSessionId) {
       live.onEvent({
         type: "session.providerBound",
@@ -544,7 +622,12 @@ async function startLive(
     live.onEvent({ type: "session.started" });
     return live;
   } catch (error) {
-    await stopSession(flavor, input.sessionId);
+    live.muteUpdates = true;
+    rpc.close();
+    if (liveByThread.get(input.sessionId) === live)
+      liveByThread.delete(input.sessionId);
+    unwatchChild(input.sessionId);
+    await killChild(input.sessionId).catch(() => undefined);
     throw error;
   }
 }
@@ -555,6 +638,12 @@ async function runTurn(
   input: SendTurnInput,
 ): Promise<void> {
   await applyModel(flavor, live, input);
+  if (
+    live.cancelled ||
+    live.muteUpdates ||
+    stateFor(flavor).liveByThread.get(input.sessionId) !== live
+  )
+    return;
   live.emittedAssistant = "";
   live.emittedReasoning = "";
   live.turnError = null;
@@ -634,7 +723,6 @@ function handleFrame(
     return;
   }
   if (
-    flavor.id === "omp" &&
     rec.type === "extension_ui_request" &&
     rec.method === "cancel"
   ) {
@@ -645,7 +733,7 @@ function handleFrame(
   }
   const ui = parseExtensionUiRequest(rec);
   if (ui) {
-    void handleExtensionUi(flavor, sessionId, live, ui);
+    void handleExtensionUi(sessionId, live, ui);
     return;
   }
   if (live.muteUpdates) return;
@@ -887,7 +975,6 @@ async function settleTurn(live: Live): Promise<void> {
 }
 
 async function handleExtensionUi(
-  flavor: PiFlavor,
   sessionId: string,
   live: Live,
   request: PiExtensionUiRequest,
@@ -907,16 +994,12 @@ async function handleExtensionUi(
   }
 
   if (
-    flavor.id === "omp" &&
-    (request.method === "select" ||
-      request.method === "input" ||
-      request.method === "editor")
+    request.method === "select" ||
+    request.method === "input" ||
+    request.method === "editor"
   ) {
     const uiId = live.nextApprovalUiId++;
-    const replyPromise = new Promise<UserQuestionReply>((resolve) => {
-      live.questions.set(uiId, { id: request.id, resolve });
-    });
-    live.onEvent({
+    const event: Extract<HarnessEvent, { type: "question.asked" }> = {
       type: "question.asked",
       requestId: uiId,
       title: extensionUiTitle(request),
@@ -939,7 +1022,11 @@ async function handleExtensionUi(
               : [],
         },
       ],
+    };
+    const replyPromise = new Promise<UserQuestionReply>((resolve) => {
+      live.questions.set(uiId, { id: request.id, event, resolve });
     });
+    showNextQuestion(live);
     const reply = await replyPromise;
     live.questions.delete(uiId);
     let value: string | undefined;
@@ -957,6 +1044,7 @@ async function handleExtensionUi(
       requestId: uiId,
       decision: value === undefined ? "skipped" : "answered",
     });
+    showNextQuestion(live);
     await writeChild(
       sessionId,
       JSON.stringify({
@@ -986,6 +1074,18 @@ async function handleExtensionUi(
   ).catch(() => undefined);
 }
 
+function showNextQuestion(live: Live): void {
+  if (live.cancelled || live.muteUpdates) return;
+  if (
+    live.visibleQuestionId !== null &&
+    live.questions.has(live.visibleQuestionId)
+  )
+    return;
+  const next = live.questions.entries().next().value;
+  live.visibleQuestionId = next?.[0] ?? null;
+  if (next) live.onEvent(next[1].event);
+}
+
 async function applyModel(
   flavor: PiFlavor,
   live: Live,
@@ -1012,10 +1112,19 @@ async function applyModel(
 
   const thinking = input.modelSettings?.thinking;
   if (isPiThinkingLevel(thinking) && thinking !== live.thinking) {
-    await live.rpc
-      .request({ type: "set_thinking_level", level: thinking })
-      .catch(() => undefined);
-    live.thinking = thinking;
+    const response = await live.rpc.request({
+      type: "set_thinking_level",
+      level: thinking,
+    });
+    const data = asRecord(response.data);
+    const confirmed =
+      stringField(data, "level") ?? stringField(data, "thinkingLevel");
+    live.thinking = isPiThinkingLevel(confirmed) ? confirmed : thinking;
+    if (live.thinking !== thinking)
+      live.onEvent({
+        type: "session.configChanged",
+        modelSettings: { thinking: live.thinking },
+      });
   }
 
   const fast = input.modelSettings?.fast;
@@ -1025,7 +1134,6 @@ async function applyModel(
     (fast === "true") !== live.fastModeRequested
   ) {
     const enabled = fast === "true";
-    live.fastModeRequested = enabled;
     try {
       const response = await live.rpc.request({
         type: "set_fast_mode",
@@ -1034,7 +1142,15 @@ async function applyModel(
       const data = asRecord(response.data);
       live.fastModeEnabled =
         typeof data?.enabled === "boolean" ? data.enabled : enabled;
+      live.fastModeRequested = live.fastModeEnabled;
+      if (live.fastModeEnabled !== enabled)
+        live.onEvent({ type: "session.configChanged", modelSettings: { fast: String(live.fastModeEnabled) } });
     } catch (error) {
+      if (!enabled) {
+        if (live.fastModeEnabled != null)
+          live.onEvent({ type: "session.configChanged", modelSettings: { fast: String(live.fastModeEnabled) } });
+        throw error;
+      }
       if (enabled) {
         live.fastModeEnabled = false;
         live.onEvent({
@@ -1075,6 +1191,8 @@ function bindState(
   if (provider && modelId && !live.nativeModel) {
     live.nativeModel = piNativeId(provider, modelId);
   }
+  const thinking = stringField(asRecord(data), "thinkingLevel");
+  if (isPiThinkingLevel(thinking)) live.thinking = thinking;
   const fastModeEnabled = asRecord(data)?.fastModeEnabled;
   if (flavor.id === "omp" && typeof fastModeEnabled === "boolean") {
     live.fastModeEnabled = fastModeEnabled;
