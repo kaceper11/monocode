@@ -77,6 +77,9 @@ export type GitChangedFile = {
 };
 
 export type GitDiffIndex = {
+  /** The cwd sits inside a Git work tree — a plain folder produces the same
+   * empty index as a clean repo without this flag. */
+  isRepo: boolean;
   branch: string | null;
   files: GitChangedFile[];
   additions: number;

@@ -15,9 +15,11 @@ import { joinRelativeCwd, resolveCommandTarget } from "./projectCommands";
 import {
   findProjectByCommonDir,
   loadProjects,
+  QUALITY_COMMAND_ID,
   type ProjectCommand,
   type ProjectRecord,
 } from "./projects";
+import { qualityCheckSteps, QUALITY_COMMAND_NAME } from "./quality";
 import { sameProjectPath } from "./recents";
 import {
   getVerifiedFamilies,
@@ -40,11 +42,7 @@ import { projectForTask, taskForSession } from "./taskWorkspaces";
  */
 
 export type CheckRunStatus =
-  | "passed"
-  | "failed"
-  | "timeout"
-  | "error"
-  | "skipped";
+  "passed" | "failed" | "timeout" | "error" | "skipped";
 
 export type CheckRunRecord = {
   id: string;
@@ -79,6 +77,8 @@ export type VerifyHooks = {
     text: string,
     action: ActionRunRef,
   ) => Promise<boolean>;
+  /** Settle-window length — tests shrink it so runs stay instant. */
+  settleMs?: number;
 };
 
 const KEY = "monocode.verify.v1";
@@ -86,6 +86,10 @@ const VERIFY_CHANGED = "monocode:verify-changed";
 const MAX_RUNS = 40;
 const MAX_CLAIMS = 300;
 const MAX_TAIL = 4_000;
+/** `busy` flaps during harness bookkeeping pauses, so a busy→idle edge can be
+ * mid-turn — before spending a check, the session must stay quiet this long. */
+const SETTLE_MS = 2_000;
+const SETTLE_WINDOWS = 15;
 /** Consecutive sends into one failure chain before the row goes manual-only. */
 export const MAX_FIX_SENDS = 3;
 
@@ -137,12 +141,9 @@ function sanitizeRun(value: unknown): CheckRunRecord | null {
     cwd: clean(value.cwd, 2000) ?? "",
     turnKey,
     at:
-      typeof value.at === "number" && Number.isFinite(value.at)
-        ? value.at
-        : 0,
+      typeof value.at === "number" && Number.isFinite(value.at) ? value.at : 0,
     durationMs:
-      typeof value.durationMs === "number" &&
-      Number.isFinite(value.durationMs)
+      typeof value.durationMs === "number" && Number.isFinite(value.durationMs)
         ? value.durationMs
         : 0,
     status,
@@ -196,7 +197,8 @@ let writeFailed = false;
 
 function readStore(): VerifyStore {
   try {
-    const raw = writeFailed && memoryRaw ? memoryRaw : localStorage.getItem(KEY);
+    const raw =
+      writeFailed && memoryRaw ? memoryRaw : localStorage.getItem(KEY);
     return raw ? sanitizeStore(JSON.parse(raw)) : { claims: {}, projects: {} };
   } catch {
     return { claims: {}, projects: {} };
@@ -423,7 +425,12 @@ function resolveTarget(
   const verify = project.verify;
   if (!verify || verify.enabled === false)
     return { skip: "Checks on finish are off." };
-  const command = project.commands.find((item) => item.id === verify.commandId);
+  // The quality sentinel owns no saved command — its steps are probed from
+  // the checkout's own tooling when the run dispatches.
+  const command: ProjectCommand | undefined =
+    verify.commandId === QUALITY_COMMAND_ID
+      ? { id: QUALITY_COMMAND_ID, name: QUALITY_COMMAND_NAME, command: "" }
+      : project.commands.find((item) => item.id === verify.commandId);
   if (!command) return { error: "The check command was deleted.", project };
   if (owner) {
     const target = resolveCommandTarget({
@@ -440,11 +447,11 @@ function resolveTarget(
   // Standalone session: the run lands where the agent actually worked. A
   // repository-bound command additionally requires the session's copy to be
   // that repository — never redirect into a different checkout.
+  const family = familyForCwd(cwd);
   if (command.repositoryId) {
     const repo = project.repositories.find(
       (entry) => entry.id === command.repositoryId,
     );
-    const family = familyForCwd(cwd);
     if (
       !repo ||
       !family ||
@@ -457,6 +464,19 @@ function resolveTarget(
   }
   const joined = joinRelativeCwd(cwd, command.relativeCwd);
   if ("error" in joined) return { error: joined.error, project };
+  // Quality baselines and tool configs live at the worktree root — a session
+  // sitting in a subdirectory still checks the whole checkout.
+  if (command.id === QUALITY_COMMAND_ID && family) {
+    const key = pathKey(joined.cwd);
+    const worktree = family.worktrees
+      .filter(
+        (entry) =>
+          key === pathKey(entry.path) ||
+          key.startsWith(`${pathKey(entry.path)}/`),
+      )
+      .sort((a, b) => b.path.length - a.path.length)[0];
+    if (worktree) return { project, command, cwd: worktree.path };
+  }
   return { project, command, cwd: joined.cwd };
 }
 
@@ -507,6 +527,31 @@ function releaseClaim(turnKey: string) {
   writeStore(store);
 }
 
+// Check CLIs colorize unconditionally (jscpd paints a full table); the tail
+// is shown in the UI and handed to the agent, so escape codes and pure
+// box-drawing border lines must go. Table rows with data stay.
+// eslint-disable-next-line no-control-regex
+const ANSI_RE =
+  /\x1b(?:\[[0-9;?]*[A-Za-z~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()][0-9A-B]|[=>MEH78c])/g;
+const BORDER_LINE = /^[─━│┃┄-╬\s]+$/;
+
+function cleanCheckOutput(text: string) {
+  return text
+    .replace(ANSI_RE, "")
+    .split("\n")
+    .filter((line) => line.trim() === "" || !BORDER_LINE.test(line))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** New or growing blocks mean the harness is still mid-turn — the idle edge
+ * that claimed it was a bookkeeping flap. */
+function blockFingerprint(session: Session) {
+  const last = session.blocks[session.blocks.length - 1];
+  return `${session.blocks.length}:${last?.id ?? ""}:${last?.text?.length ?? 0}`;
+}
+
 async function run(
   sessionId: string,
   turnKey: string,
@@ -514,6 +559,27 @@ async function run(
 ) {
   const session = hooks.getSession?.(sessionId);
   if (!session) return;
+
+  // Settle first: `busy` flaps while a harness does bookkeeping between phases,
+  // so a claimed edge can sit inside the turn it means to verify. Churn or a
+  // busy flip releases the claim — the real turn end re-fires on its own edge.
+  const settleMs = hooks.settleMs ?? SETTLE_MS;
+  let fingerprint = blockFingerprint(session);
+  for (let window = 0; ; window += 1) {
+    await new Promise((resolve) => setTimeout(resolve, settleMs));
+    const current = hooks.getSession?.(sessionId);
+    if (!current || current.busy || sessionNeedsInput(current)) {
+      releaseClaim(turnKey);
+      return;
+    }
+    const next = blockFingerprint(current);
+    if (next === fingerprint) break;
+    fingerprint = next;
+    if (window + 1 >= SETTLE_WINDOWS) {
+      releaseClaim(turnKey);
+      return;
+    }
+  }
 
   const base = {
     projectId: resolved.project?.id ?? "",
@@ -563,10 +629,14 @@ async function run(
   try {
     // Clean-tree guard: a turn that changed nothing and is not ahead of its
     // upstream has nothing new to verify. Git failure is not proof of clean —
-    // the check still runs.
+    // the check still runs — and neither is a plain folder: `isRepo` false
+    // means "not a work tree", not "unchanged".
+    let isGit = false;
     try {
       const index = await gitDiffIndex(resolved.cwd);
+      isGit = index.isRepo !== false;
       if (
+        index.isRepo !== false &&
         index.files.length === 0 &&
         index.ahead === 0 &&
         index.aheadOfDefault === 0 &&
@@ -574,22 +644,33 @@ async function run(
       )
         return skipRun(base, "Working copy is unchanged.");
     } catch {
-      /* not a Git checkout — run anyway */
+      /* probe failed — run anyway */
     }
 
-    // The probe was async — re-read before the long-running invoke. A session
-    // deleted mid-probe gets nothing; one busy again skips rather than run a
-    // check against a mutating tree. A deleted/switched-off project is
-    // terminal: running anyway would emit state nothing can clean up.
+    const steps =
+      resolved.command.id === QUALITY_COMMAND_ID
+        ? await qualityCheckSteps(resolved.cwd, isGit)
+        : commandSteps(resolved.command);
+
+    // Everything above was async — re-read before the long-running invoke. A
+    // session deleted mid-probe gets nothing; one busy again skips rather
+    // than run a check against a mutating tree. A deleted/switched-off
+    // project is terminal: recording or emitting now would resurrect state
+    // nothing can clean up.
     const current = hooks.getSession?.(sessionId);
     if (!current || !liveVerify(resolved.project.id)) return;
     if (current.busy) return skipRun(base, "Session is busy again.");
+    if (steps.length === 0)
+      return skipRun(
+        base,
+        "No quality tools detected — add .jscpd.json or .pre-commit-config.yaml, or install jscpd/pre-commit.",
+      );
 
     let result: CheckRunResult;
     try {
       result = await invoke<CheckRunResult>("run_check", {
         cwd: resolved.cwd,
-        steps: commandSteps(resolved.command),
+        steps,
       });
     } catch (error) {
       if (!liveVerify(resolved.project.id)) return;
@@ -608,7 +689,16 @@ async function run(
       : result.code === 0
         ? "passed"
         : "failed";
-    const tail = result.output.slice(-MAX_TAIL);
+    const output = cleanCheckOutput(result.output);
+    const tail = output.slice(-MAX_TAIL);
+    // Quality runs name their tools so a "passed" row shows what actually
+    // checked — an empty list can't happen here (steps were non-empty).
+    const tools =
+      resolved.command.id === QUALITY_COMMAND_ID
+        ? steps
+            .map((step) => step.exec.replace(/^npx --yes /, "").split(" ")[0])
+            .join(" + ")
+        : "";
     // A project deleted or switched off while the check ran stays dead —
     // recording or emitting now would resurrect state nothing can resolve.
     const verify = liveVerify(resolved.project.id);
@@ -626,11 +716,10 @@ async function run(
                   ? "Killed."
                   : `Exit ${result.code}.`,
             outputTail: tail,
-            truncated:
-              result.truncated || result.output.length > MAX_TAIL,
+            truncated: result.truncated || output.length > MAX_TAIL,
           }
         : {
-            detail: `${Math.max(1, Math.round(result.durationMs / 1000))}s`,
+            detail: `${tools ? `${tools} · ` : ""}${Math.max(1, Math.round(result.durationMs / 1000))}s`,
           }),
     });
     // The run is history regardless; the row only lands when the session is
@@ -769,7 +858,8 @@ function outcomeItem(
     kind: "check",
     title,
     detail,
-    urgency: failed || run.status === "error" ? ATTENTION_ACTION : ATTENTION_INFO,
+    urgency:
+      failed || run.status === "error" ? ATTENTION_ACTION : ATTENTION_INFO,
     at: run.at,
     signature: `${run.status}:${run.id}:${overrideDetail ?? ""}`,
     sessionId,

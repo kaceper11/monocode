@@ -28,9 +28,11 @@ import { openCommandsSheet } from "../lib/projectCommands";
 import {
   loadProjects,
   projectsSnapshot,
+  QUALITY_COMMAND_ID,
   setProjectVerify,
   subscribeProjects,
 } from "../lib/projects";
+import { QUALITY_COMMAND_NAME } from "../lib/quality";
 import {
   subscribeVerify,
   verifyRunsFor,
@@ -240,9 +242,12 @@ export function AutomationsPage() {
             {checkedProjects.map(({ project, runs }) => {
               const verify = project.verify;
               if (!verify) return null;
-              const command = project.commands.find(
-                (item) => item.id === verify.commandId,
-              );
+              const commandName =
+                verify.commandId === QUALITY_COMMAND_ID
+                  ? QUALITY_COMMAND_NAME
+                  : project.commands.find(
+                      (item) => item.id === verify.commandId,
+                    )?.name;
               const last = runs[runs.length - 1];
               return (
                 <li
@@ -264,7 +269,8 @@ export function AutomationsPage() {
                     </span>
                   </div>
                   <p className="mt-0.5 truncate text-[12px] text-content/50">
-                    {command?.name ?? "Deleted command — reconfigure in saved commands"}
+                    {commandName ??
+                      "Deleted command — reconfigure in saved commands"}
                   </p>
                   {last ? (
                     <p

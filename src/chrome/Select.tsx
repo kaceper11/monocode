@@ -19,7 +19,7 @@ export function Select({
   disabled?: boolean;
   label: string;
   value: string;
-  options: { value: string; label: string }[];
+  options: { value: string; label: string; detail?: string }[];
   onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -153,7 +153,14 @@ export function Select({
                     : "text-content hover:bg-content/5"
                 }`}
               >
-                <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate">{option.label}</span>
+                  {option.detail ? (
+                    <span className="block truncate text-[11px] text-content/40">
+                      {option.detail}
+                    </span>
+                  ) : null}
+                </span>
                 {isSelected ? (
                   <Check className="size-3.5 shrink-0" strokeWidth={2.25} />
                 ) : null}

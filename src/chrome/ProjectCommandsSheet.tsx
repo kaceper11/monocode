@@ -7,6 +7,7 @@ import {
 } from "react";
 import {
   MAX_COMMAND_STEPS,
+  QUALITY_COMMAND_ID,
   deleteProjectCommand,
   deleteProjectCommandGroup,
   loadProjects,
@@ -33,15 +34,10 @@ import {
 import { ContextCheckbox } from "./InboxContextPicker";
 import { Modal } from "./Modal";
 import { Select } from "./Select";
+import { gitDiffIndex } from "../lib/fs";
+import { probeQuality, qualitySteps, type QualityStep } from "../lib/quality";
 import { MAX_FIX_SENDS, resolveVerifyForProject } from "../lib/verify";
-import {
-  Check,
-  ChevronDown,
-  ChevronUp,
-  Pencil,
-  Plus,
-  Trash2,
-} from "./icons";
+import { Check, ChevronDown, ChevronUp, Pencil, Plus, Trash2 } from "./icons";
 
 const inputClass =
   "w-full rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-[13px] text-content outline-none ring-accent/40 focus:ring-1";
@@ -97,6 +93,37 @@ export function ProjectCommandsSheet({
   const [editing, setEditing] = useState<EditState | null>(null);
   const [error, setError] = useState("");
   const checksRef = useRef<HTMLDivElement>(null);
+  const isQuality = project?.verify?.commandId === QUALITY_COMMAND_ID;
+  const [detectedSteps, setDetectedSteps] = useState<QualityStep[] | null>(
+    null,
+  );
+
+  // "Auto-detected" should show what it detected — probe the project folder
+  // once when the quality check is selected (the probe itself is cached).
+  useEffect(() => {
+    if (!isQuality || !project?.anchor) {
+      setDetectedSteps(null);
+      return;
+    }
+    let live = true;
+    const cwd = project.anchor;
+    setDetectedSteps(null);
+    Promise.all([
+      probeQuality(cwd),
+      gitDiffIndex(cwd)
+        .then((index) => index.isRepo !== false)
+        .catch(() => false),
+    ])
+      .then(([probe, isGit]) => {
+        if (live) setDetectedSteps(qualitySteps(probe, isGit));
+      })
+      .catch(() => {
+        if (live) setDetectedSteps([]);
+      });
+    return () => {
+      live = false;
+    };
+  }, [isQuality, project?.anchor]);
 
   useEffect(() => {
     if (!project) onClose();
@@ -627,74 +654,124 @@ export function ProjectCommandsSheet({
             </div>
             <div ref={checksRef}>
               <span className={labelClass}>Checks on finish</span>
-              {commands.length === 0 ? (
-                <p className="py-1.5 text-[12px] text-content/45">
-                  Save a project command first.
-                </p>
-              ) : (
-                <div className="flex items-center gap-2 py-1">
-                  <div className="min-w-0 flex-1">
-                    <Select
-                      label="Finish check command"
-                      value={project.verify?.commandId ?? ""}
-                      options={[
-                        { value: "", label: "Off" },
-                        ...commands.map((command) => ({
-                          value: command.id,
-                          label: command.name,
-                        })),
-                        // A deleted command stays listed so the stale
-                        // binding is visible instead of silently clearing.
-                        ...(project.verify &&
-                        !commands.some(
-                          (item) => item.id === project.verify?.commandId,
-                        )
-                          ? [
-                              {
-                                value: project.verify.commandId,
-                                label: "Deleted command",
-                              },
-                            ]
-                          : []),
-                      ]}
-                      onChange={(value) => {
-                        if (!value) {
-                          // "Off" clears the config; its live rows go too.
-                          resolveVerifyForProject(project.id);
-                          setProjectVerify(project.id, null);
-                          return;
-                        }
-                        setProjectVerify(project.id, {
-                          commandId: value,
-                          mode: project.verify?.mode ?? "notify",
-                        });
-                      }}
-                    />
-                  </div>
-                  {project.verify ? (
-                    <div className="w-44 shrink-0">
-                      <Select
-                        label="On failure"
-                        value={project.verify.mode}
-                        options={[
-                          { value: "notify", label: "Notify me" },
+              <div className="py-1">
+                <Select
+                  label="Finish check command"
+                  value={project.verify?.commandId ?? ""}
+                  options={[
+                    { value: "", label: "Off" },
+                    {
+                      value: QUALITY_COMMAND_ID,
+                      label: "Quality checks",
+                      detail: "Auto-detected in the checkout",
+                    },
+                    ...commands.map((command) => ({
+                      value: command.id,
+                      label: command.name,
+                      detail: command.steps?.length
+                        ? `${command.steps.length} steps`
+                        : command.command,
+                    })),
+                    // A deleted command stays listed so the stale
+                    // binding is visible instead of silently clearing.
+                    ...(project.verify &&
+                    project.verify.commandId !== QUALITY_COMMAND_ID &&
+                    !commands.some(
+                      (item) => item.id === project.verify?.commandId,
+                    )
+                      ? [
                           {
-                            value: "fix",
-                            label: `Send to agent (≤${MAX_FIX_SENDS})`,
+                            value: project.verify.commandId,
+                            label: "Deleted command",
                           },
-                        ]}
-                        onChange={(value) =>
+                        ]
+                      : []),
+                  ]}
+                  onChange={(value) => {
+                    if (!value) {
+                      // "Off" clears the config; its live rows go too.
+                      resolveVerifyForProject(project.id);
+                      setProjectVerify(project.id, null);
+                      return;
+                    }
+                    setProjectVerify(project.id, {
+                      commandId: value,
+                      mode: project.verify?.mode ?? "notify",
+                    });
+                  }}
+                />
+              </div>
+              {project.verify ? (
+                <div className="flex items-center gap-2 pb-1">
+                  <span className="shrink-0 text-[11px] text-content/45">
+                    On failure
+                  </span>
+                  <div
+                    role="radiogroup"
+                    aria-label="On failure"
+                    className="grid auto-cols-fr grid-flow-col gap-0.5 rounded-md border border-content/10 p-0.5 text-[11px]"
+                  >
+                    {(
+                      [
+                        ["notify", "Notify me"],
+                        ["fix", `Send to agent (≤${MAX_FIX_SENDS})`],
+                      ] as const
+                    ).map(([mode, label]) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        role="radio"
+                        aria-checked={project.verify?.mode === mode}
+                        onClick={() =>
                           setProjectVerify(project.id, {
                             commandId: project.verify?.commandId ?? "",
-                            mode: value === "fix" ? "fix" : "notify",
+                            mode,
                           })
                         }
-                      />
-                    </div>
-                  ) : null}
+                        className={`rounded-[5px] px-1 py-1 ${
+                          project.verify?.mode === mode
+                            ? "bg-content/10 text-content"
+                            : "text-content/50 hover:text-content"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              )}
-              {project.verify ? (
+              ) : null}
+              {isQuality ? (
+                <>
+                  {project.anchor ? (
+                    detectedSteps == null ? (
+                      <p className="text-[11px] text-content/40">
+                        Detecting tools in the project folder…
+                      </p>
+                    ) : detectedSteps.length ? (
+                      <div className="rounded-lg border border-content/8 bg-content/3 px-2.5 py-1.5">
+                        {detectedSteps.map((step) => (
+                          <p
+                            key={step.exec}
+                            className="truncate font-mono text-[11px] leading-5 text-content/55"
+                          >
+                            {step.exec}
+                          </p>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-[11px] text-content/40">
+                        No supported tools detected — install jscpd or add
+                        .pre-commit-config.yaml.
+                      </p>
+                    )
+                  ) : null}
+                  <p className="mt-1 text-[11px] text-content/40">
+                    Runs when an agent turn ends — only while MonoCode is open.
+                    A failure offers to hand the findings back to the same
+                    agent.
+                  </p>
+                </>
+              ) : project.verify ? (
                 <p className="text-[11px] text-content/40">
                   {commands.some(
                     (item) => item.id === project.verify?.commandId,

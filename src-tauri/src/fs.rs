@@ -232,6 +232,9 @@ pub struct GitChangedFile {
 #[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitDiffIndex {
+    /// The cwd sits inside a Git work tree — distinguishes a clean repo from
+    /// a plain folder, which otherwise produces the same empty index.
+    pub is_repo: bool,
     pub branch: Option<String>,
     pub files: Vec<GitChangedFile>,
     pub additions: i64,
@@ -2417,6 +2420,9 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
         .collect();
 
     GitDiffIndex {
+        // Any resolvable HEAD — a branch (symbolic-ref answers even on an
+        // unborn one) or a detached SHA — means a work tree.
+        is_repo: head_branch.is_some() || head_sha.is_some(),
         branch: head_branch.clone().or(head_sha.clone()),
         files: out,
         additions,

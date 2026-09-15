@@ -47,6 +47,11 @@ export type ProjectCommandGroup = {
   commandIds: string[];
 };
 
+/** Sentinel `commandId` on `ProjectVerify`: run the checkout's detected
+ * quality tools instead of a saved command. Never stored in
+ * `project.commands` — the run synthesizes its step list at dispatch. */
+export const QUALITY_COMMAND_ID = "builtin:quality";
+
 /** Checks-on-finish (#92): run one saved command when an agent turn ends in
  * this project. `commandId` can outlive the command it names — a stale id is
  * surfaced as a configuration error rather than silently cleared, so deleting
@@ -770,8 +775,10 @@ export function setProjectVerify(
     const current = loadProjects().find((entry) => entry.id === projectId);
     if (!current) return { error: "Project not found." };
     // Updates to the existing (possibly deleted) command id stay allowed —
-    // pausing a stale config must work even though its command is gone.
+    // pausing a stale config must work even though its command is gone. The
+    // quality sentinel owns no command row, so it's always a valid target.
     if (
+      verify.commandId !== QUALITY_COMMAND_ID &&
       !current.commands.some((item) => item.id === verify.commandId) &&
       current.verify?.commandId !== verify.commandId
     )

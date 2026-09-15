@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { emittedAttention } from "./attention";
 import { INTERRUPT_MESSAGE } from "./inFlight";
 import {
+  QUALITY_COMMAND_ID,
   deleteProject,
   ensureProjectForPath,
   loadProjects,
@@ -11,6 +12,7 @@ import {
   setProjectVerify,
   type ProjectRecord,
 } from "./projects";
+import { resetQualityProbeCache } from "./quality";
 import { publishRepositoryFamilies } from "./repositoryFamilies";
 import { newSession, type Session } from "./session";
 import {
@@ -35,6 +37,7 @@ const family = {
 };
 
 const dirtyIndex = {
+  isRepo: true,
   branch: "main",
   files: [
     {
@@ -124,12 +127,14 @@ async function settle() {
 beforeEach(() => {
   localStorage.clear();
   vi.mocked(invoke).mockClear();
+  resetQualityProbeCache();
   publishRepositoryFamilies(new Map([[CWD, family]]));
   sendToSession.mockClear().mockResolvedValue(true);
   session = { ...newSession("claude", CWD), title: "claude · work" };
   setVerifyHooks({
     getSession: () => session,
     sendToSession,
+    settleMs: 0,
   });
   vi.mocked(invoke).mockImplementation((command) => {
     if (command === "git_diff_index") return Promise.resolve(dirtyIndex);
@@ -179,9 +184,7 @@ it("does nothing without a user turn or outside a stored project", async () => {
   session = {
     ...session,
     cwd: "/nowhere",
-    blocks: [
-      { id: "t1", role: "user", text: "x", startedAt: Date.now() },
-    ],
+    blocks: [{ id: "t1", role: "user", text: "x", startedAt: Date.now() }],
   };
   verifyTurnFinished(session);
   await new Promise((resolve) => setTimeout(resolve, 20));
@@ -387,9 +390,14 @@ it("auto-fix never dispatches into a busy session", async () => {
   session = { ...session, busy: true };
   session = turnSession("t2");
   verifyTurnFinished(session);
-  await vi.waitFor(() => expect(verifyRunsFor(project.id)).toHaveLength(2));
-  await Promise.resolve();
+  // Busy at settle: the claim is released rather than recorded — nothing
+  // runs and nothing sends until the real idle edge arrives.
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(verifyRunsFor(project.id)).toHaveLength(1);
   expect(sendToSession).toHaveBeenCalledTimes(1);
+  session = { ...session, busy: false };
+  verifyTurnFinished(session);
+  await vi.waitFor(() => expect(verifyRunsFor(project.id)).toHaveLength(2));
 });
 
 it("a paused config never runs — and records nothing", async () => {
@@ -431,10 +439,7 @@ it("stepped commands run as steps and preserve native-host steps", async () => {
   await settle();
   expect(vi.mocked(invoke)).toHaveBeenCalledWith("run_check", {
     cwd: CWD,
-    steps: [
-      { exec: "npm run lint" },
-      { exec: "npm run build", native: true },
-    ],
+    steps: [{ exec: "npm run lint" }, { exec: "npm run build", native: true }],
   });
 });
 
@@ -479,6 +484,7 @@ it("a turn finishing behind a same-copy check retries after it", async () => {
   setVerifyHooks({
     getSession: (id: string) => sessions.get(id),
     sendToSession,
+    settleMs: 0,
   });
   let checks = 0;
   let resolveCheck!: (value: unknown) => void;
@@ -507,9 +513,7 @@ it("a turn finishing behind a same-copy check retries after it", async () => {
   await Promise.resolve();
   expect(checks).toBe(1);
   resolveCheck(checkResult(0));
-  await vi.waitFor(() =>
-    expect(verifyRunsFor(project.id)).toHaveLength(2),
-  );
+  await vi.waitFor(() => expect(verifyRunsFor(project.id)).toHaveLength(2));
   expect(checks).toBe(2);
   expect(verifyRunsFor(project.id).at(-1)!.status).toBe("passed");
 });
@@ -545,6 +549,7 @@ it("a session deleted mid-run records history but emits no row", async () => {
   setVerifyHooks({
     getSession: () => (alive ? session : undefined),
     sendToSession,
+    settleMs: 0,
   });
   vi.mocked(invoke).mockImplementation((command) => {
     if (command === "git_diff_index") return Promise.resolve(dirtyIndex);
@@ -577,4 +582,303 @@ it("setProjectVerify rejects unknown commands but updates a stale binding", asyn
   ).toBeUndefined();
   const saved = loadProjects().find((p) => p.id === project.id)!;
   expect(saved.verify?.enabled).toBe(false);
+});
+
+it("runs detected quality tools under the quality sentinel", async () => {
+  project = ensureProjectForPath(CWD, family);
+  const result = setProjectVerify(project.id, {
+    commandId: QUALITY_COMMAND_ID,
+    mode: "notify",
+  });
+  expect(result.error).toBeUndefined();
+  vi.mocked(invoke).mockImplementation((command, args) => {
+    if (command === "git_diff_index") return Promise.resolve(dirtyIndex);
+    if (command === "stat_files")
+      return Promise.resolve([
+        { path: `${CWD}/.jscpd-baseline.json`, mtimeMs: null },
+        { path: `${CWD}/.jscpd.json`, mtimeMs: null },
+        { path: `${CWD}/.pre-commit-config.yaml`, mtimeMs: null },
+      ]);
+    if (command === "run_check") {
+      const exec = (args as { steps: { exec: string }[] }).steps[0].exec;
+      if (exec.endsWith("--help"))
+        return Promise.resolve({
+          code: 0,
+          output: "--baseline-from-ref --fail-on-new-clones --exitCode",
+        });
+      return Promise.resolve(checkResult(1, "2 new clones found"));
+    }
+    return Promise.reject(new Error(`unexpected invoke: ${command}`));
+  });
+  session = turnSession();
+  verifyTurnFinished(session);
+  await settle();
+  const calls = vi
+    .mocked(invoke)
+    .mock.calls.filter(([cmd]) => cmd === "run_check");
+  expect(calls.at(-1)?.[1]).toEqual({
+    cwd: CWD,
+    steps: [{ exec: "jscpd . --baseline-from-ref HEAD --fail-on-new-clones" }],
+  });
+  const run = verifyRunsFor(project.id).at(-1)!;
+  expect(run.commandId).toBe(QUALITY_COMMAND_ID);
+  expect(run.commandName).toBe("Quality checks");
+  expect(run.status).toBe("failed");
+  expect(run.outputTail).toContain("2 new clones");
+});
+
+it("skips the quality sentinel when no tools are detected", async () => {
+  project = ensureProjectForPath(CWD, family);
+  setProjectVerify(project.id, {
+    commandId: QUALITY_COMMAND_ID,
+    mode: "notify",
+  });
+  vi.mocked(invoke).mockImplementation((command) => {
+    if (command === "git_diff_index") return Promise.resolve(dirtyIndex);
+    if (command === "stat_files")
+      return Promise.resolve([
+        { path: `${CWD}/.jscpd-baseline.json`, mtimeMs: null },
+        { path: `${CWD}/.jscpd.json`, mtimeMs: null },
+        { path: `${CWD}/.pre-commit-config.yaml`, mtimeMs: null },
+      ]);
+    if (command === "run_check")
+      return Promise.resolve({ code: 1, output: "" });
+    return Promise.reject(new Error(`unexpected invoke: ${command}`));
+  });
+  session = turnSession();
+  verifyTurnFinished(session);
+  await settle();
+  const run = verifyRunsFor(project.id).at(-1)!;
+  expect(run.status).toBe("skipped");
+  expect(run.detail).toContain("No quality tools detected");
+});
+
+it("auto-fix sends quality findings back to the owning agent", async () => {
+  project = ensureProjectForPath(CWD, family);
+  setProjectVerify(project.id, {
+    commandId: QUALITY_COMMAND_ID,
+    mode: "fix",
+  });
+  vi.mocked(invoke).mockImplementation((command, args) => {
+    if (command === "git_diff_index") return Promise.resolve(dirtyIndex);
+    if (command === "stat_files")
+      return Promise.resolve([
+        { path: `${CWD}/.jscpd-baseline.json`, mtimeMs: null },
+        { path: `${CWD}/.jscpd.json`, mtimeMs: null },
+        { path: `${CWD}/.pre-commit-config.yaml`, mtimeMs: null },
+      ]);
+    if (command === "run_check") {
+      const exec = (args as { steps: { exec: string }[] }).steps[0].exec;
+      if (exec.endsWith("--help"))
+        return Promise.resolve({
+          code: 0,
+          output: "--baseline-from-ref --fail-on-new-clones",
+        });
+      return Promise.resolve(checkResult(1, "clone in src/a.ts:12-58"));
+    }
+    return Promise.reject(new Error(`unexpected invoke: ${command}`));
+  });
+  session = turnSession();
+  verifyTurnFinished(session);
+  await settle();
+  await Promise.resolve();
+  expect(sendToSession).toHaveBeenCalledTimes(1);
+  const [sentSession, text] = sendToSession.mock.calls[0];
+  expect(sentSession).toBe(session.id);
+  expect(text).toContain("clone in src/a.ts:12-58");
+});
+
+it("still checks a folder-only checkout — isRepo false is not 'clean'", async () => {
+  project = ensureProjectForPath(CWD, family);
+  setProjectVerify(project.id, {
+    commandId: QUALITY_COMMAND_ID,
+    mode: "notify",
+  });
+  vi.mocked(invoke).mockImplementation((command, args) => {
+    if (command === "git_diff_index")
+      return Promise.resolve({ ...cleanIndex, isRepo: false });
+    if (command === "stat_files")
+      return Promise.resolve([
+        { path: `${CWD}/.jscpd-baseline.json`, mtimeMs: null },
+        { path: `${CWD}/.jscpd.json`, mtimeMs: null },
+        { path: `${CWD}/.pre-commit-config.yaml`, mtimeMs: null },
+      ]);
+    if (command === "run_check") {
+      const exec = (args as { steps: { exec: string }[] }).steps[0].exec;
+      if (exec.endsWith("--help"))
+        return Promise.resolve({
+          code: 0,
+          output: "--baseline-from-ref --fail-on-new-clones --exitCode",
+        });
+      return Promise.resolve(checkResult(0, "no clones"));
+    }
+    return Promise.reject(new Error(`unexpected invoke: ${command}`));
+  });
+  session = turnSession();
+  verifyTurnFinished(session);
+  await settle();
+  const calls = vi
+    .mocked(invoke)
+    .mock.calls.filter(([cmd]) => cmd === "run_check");
+  expect(calls.at(-1)?.[1]).toEqual({
+    cwd: CWD,
+    steps: [{ exec: "jscpd . --exitCode 1" }],
+  });
+  expect(verifyRunsFor(project.id).at(-1)!.status).toBe("passed");
+});
+
+it("skips a clean tree without probing tools", async () => {
+  project = ensureProjectForPath(CWD, family);
+  setProjectVerify(project.id, {
+    commandId: QUALITY_COMMAND_ID,
+    mode: "notify",
+  });
+  vi.mocked(invoke).mockImplementation((command) => {
+    if (command === "git_diff_index") return Promise.resolve(cleanIndex);
+    return Promise.reject(new Error(`unexpected invoke: ${command}`));
+  });
+  session = turnSession();
+  verifyTurnFinished(session);
+  await settle();
+  const run = verifyRunsFor(project.id).at(-1)!;
+  expect(run.status).toBe("skipped");
+  expect(run.detail).toContain("unchanged");
+  const probed = vi
+    .mocked(invoke)
+    .mock.calls.filter(([cmd]) => cmd === "stat_files" || cmd === "run_check");
+  expect(probed).toHaveLength(0);
+});
+
+it("skips when the session went busy again during the probe", async () => {
+  project = ensureProjectForPath(CWD, family);
+  setProjectVerify(project.id, {
+    commandId: QUALITY_COMMAND_ID,
+    mode: "notify",
+  });
+  vi.mocked(invoke).mockImplementation((command, args) => {
+    if (command === "git_diff_index") return Promise.resolve(dirtyIndex);
+    if (command === "stat_files") {
+      // The agent started a new turn while the probe was in flight.
+      session = { ...session, busy: true };
+      return Promise.resolve([
+        { path: `${CWD}/.jscpd-baseline.json`, mtimeMs: null },
+        { path: `${CWD}/.jscpd.json`, mtimeMs: null },
+        { path: `${CWD}/.pre-commit-config.yaml`, mtimeMs: null },
+      ]);
+    }
+    if (command === "run_check") {
+      const exec = (args as { steps: { exec: string }[] }).steps[0].exec;
+      if (exec.endsWith("--help"))
+        return Promise.resolve({
+          code: 0,
+          output: "--baseline-from-ref --fail-on-new-clones",
+        });
+      return Promise.resolve(checkResult(0));
+    }
+    return Promise.reject(new Error(`unexpected invoke: ${command}`));
+  });
+  session = turnSession();
+  verifyTurnFinished(session);
+  await settle();
+  const run = verifyRunsFor(project.id).at(-1)!;
+  expect(run.status).toBe("skipped");
+  expect(run.detail).toContain("busy");
+  const runs = vi
+    .mocked(invoke)
+    .mock.calls.filter(
+      ([cmd, args]) =>
+        cmd === "run_check" &&
+        !(args as { steps: { exec: string }[] }).steps[0].exec.endsWith(
+          "--help",
+        ),
+    );
+  expect(runs).toHaveLength(0);
+});
+
+it("releases the claim while blocks keep landing — a mid-turn idle flap", async () => {
+  makeProject();
+  setVerifyHooks({
+    getSession: () => session,
+    sendToSession,
+    settleMs: 10,
+  });
+  session = turnSession();
+  // Sustained churn past the settle cap means the edge was a bookkeeping
+  // flap mid-turn: release the claim, record nothing, let the real end
+  // re-fire on its own edge.
+  const churn = setInterval(() => {
+    session = {
+      ...session,
+      blocks: [
+        ...session.blocks,
+        { id: crypto.randomUUID(), role: "tool", text: "still working" },
+      ],
+    };
+  }, 5);
+  verifyTurnFinished(session);
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  clearInterval(churn);
+  expect(verifyRunsFor(project.id)).toHaveLength(0);
+  expect(
+    vi.mocked(invoke).mock.calls.some(([cmd]) => cmd === "run_check"),
+  ).toBe(false);
+  // Real end edge: quiet now — the check claims and runs normally.
+  verifyTurnFinished(session);
+  await settle();
+  expect(verifyRunsFor(project.id).at(-1)!.status).toBe("passed");
+});
+
+it("a single late block still verifies once the turn goes quiet", async () => {
+  makeProject();
+  session = turnSession();
+  verifyTurnFinished(session);
+  // One bookkeeping block lands inside the settle window, then the session
+  // is still — a genuine turn end, so the run proceeds.
+  session = {
+    ...session,
+    blocks: [
+      ...session.blocks,
+      { id: crypto.randomUUID(), role: "system", text: "bookkeeping" },
+    ],
+  };
+  await settle();
+  expect(verifyRunsFor(project.id).at(-1)!.status).toBe("passed");
+});
+
+it("strips ANSI escapes and border lines from the failure tail", async () => {
+  makeProject("fix");
+  vi.mocked(invoke).mockImplementation((command) => {
+    if (command === "git_diff_index") return Promise.resolve(dirtyIndex);
+    if (command === "run_check")
+      return Promise.resolve(
+        checkResult(
+          1,
+          "\x1b[31mClone found\x1b[39m\n├────┼────┤\n a.ts [1:0 - 9:5]\n\n\n\nERROR: 1 new clones\n",
+        ),
+      );
+    return Promise.reject(new Error(`unexpected invoke: ${command}`));
+  });
+  session = turnSession();
+  verifyTurnFinished(session);
+  await vi.waitFor(() =>
+    expect(verifyRunsFor(project.id).at(-1)?.status).toBe("failed"),
+  );
+  const tail = verifyRunsFor(project.id).at(-1)!.outputTail!;
+  expect(tail).not.toContain("\x1b");
+  expect(tail).not.toContain("├");
+  expect(tail).toContain("Clone found");
+  expect(tail).toContain("ERROR: 1 new clones");
+});
+
+it("releases the claim when the session is busy again during settle", async () => {
+  makeProject();
+  session = turnSession();
+  verifyTurnFinished(session);
+  session = { ...session, busy: true };
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(verifyRunsFor(project.id)).toHaveLength(0);
+  session = { ...session, busy: false };
+  verifyTurnFinished(session);
+  await settle();
+  expect(verifyRunsFor(project.id).at(-1)!.status).toBe("passed");
 });
