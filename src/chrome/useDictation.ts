@@ -497,6 +497,11 @@ export function useDictation({
       setError(
         "Microphone access is off — allow it in System Settings to dictate.",
       );
+    } else if (isSessionBusyError(failure)) {
+      // Cancel + retry still found the host finishing — the previous
+      // session is winding down, not stuck; say so instead of echoing the
+      // raw busy string.
+      setError("Dictation is still stopping — try again in a moment.");
     } else if (errorMessage(failure) !== "cancelled") {
       // "cancelled" means a takeover aborted our in-flight start — nothing
       // to show.
@@ -547,12 +552,17 @@ export function useDictation({
     if (!session) {
       // Still starting (no session yet) — flag it so begin() cancels the
       // session the moment dictation_start resolves, same as a hold release.
-      if (phaseRef.current === "starting") releaseRequestedRef.current = true;
+      // The chip can't wait for that: a hung capture-open can take the full
+      // start timeout, so clear the UI now.
+      if (phaseRef.current === "starting") {
+        releaseRequestedRef.current = true;
+        clearSession();
+      }
       return;
     }
     eraseDictated();
     void dictationCancel(session.id).catch(() => undefined);
-  }, [eraseDictated]);
+  }, [eraseDictated, clearSession]);
 
   const toggle = useCallback(() => {
     if (phaseRef.current === "idle") void start();

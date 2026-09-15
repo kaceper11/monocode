@@ -423,17 +423,15 @@ export function DictationControl({
               </span>
             </>
           )}
-          {dictation.sessionActive ? (
-            <button
-              type="button"
-              title="Cancel dictation"
-              aria-label="Cancel dictation"
-              onClick={dictation.cancel}
-              className="grid size-5.5 shrink-0 place-items-center rounded hover:bg-red-400/20"
-            >
-              <X className="size-3" />
-            </button>
-          ) : null}
+          <button
+            type="button"
+            title="Cancel dictation"
+            aria-label="Cancel dictation"
+            onClick={dictation.cancel}
+            className="grid size-5.5 shrink-0 place-items-center rounded hover:bg-red-400/20"
+          >
+            <X className="size-3" />
+          </button>
         </div>
       )}
       <button

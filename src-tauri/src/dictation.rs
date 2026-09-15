@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use capture::{AudioBuffer, MicPermission};
+use capture::{AudioBuffer, BufferSnapshot, MicPermission};
 use catalog::ModelSpec;
 use engine::{join_segments, Engine, TranscribeOptions};
 use resample::WHISPER_RATE;
@@ -38,6 +38,15 @@ const TICK: std::time::Duration = std::time::Duration::from_millis(60);
 /// How long dictation_start waits for the capture thread to report — a hung
 /// device stack must not wedge the host state machine.
 const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long dictation_stop waits for the worker's final pass before
+/// escalating to cancel — a pass that will not finish must not hold
+/// `finishing` (and block every later session) forever.
+const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Grace after the cancel escalation, dictation_cancel's own join budget,
+/// and how long a take-over cancel waits for `finishing` to clear.
+const CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Poll cadence for the bounded joins — JoinHandle has no timed wait.
+const JOIN_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 const PARTIAL_WINDOW: usize = PARTIAL_WINDOW_S * WHISPER_RATE as usize;
 /// ~1.5 s of new audio between partial passes.
@@ -155,6 +164,10 @@ struct HostState {
     /// The session's id and cancel flag while stop/cancel joins the worker —
     /// keeps the final pass abortable and blocks an overlapping start.
     finishing: Option<(u64, Arc<AtomicBool>)>,
+    /// Workers that outlived their stop/cancel timeout — detached but still
+    /// tracked so shutdown can reach their cancel flag and a later reap can
+    /// collect them once they actually exit.
+    orphans: Vec<OrphanedSession>,
 }
 
 struct Download {
@@ -162,12 +175,18 @@ struct Download {
     join: std::thread::JoinHandle<()>,
 }
 
+struct OrphanedSession {
+    id: u64,
+    cancel: Arc<AtomicBool>,
+    join: WorkerJoin,
+}
+
 struct Session {
     id: u64,
     model_id: String,
     stop: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
-    join: std::thread::JoinHandle<Result<DictationResult, String>>,
+    join: WorkerJoin,
 }
 
 impl DictationHost {
@@ -196,6 +215,9 @@ impl DictationHost {
         }
         for (_, download) in state.downloads.drain() {
             download.cancel.store(true, Ordering::Relaxed);
+        }
+        for orphan in &state.orphans {
+            orphan.cancel.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -353,19 +375,83 @@ pub fn dictation_model_cancel_download(
 
 /// Reap a session whose worker already exited (stream error, panic) so a
 /// stale entry cannot block later operations. Emits the session event the
-/// worker itself could not send if it panicked.
+/// worker itself could not send if it panicked. Also collects orphaned
+/// workers that have since exited.
 fn reap_finished_session(state: &mut HostState, app: &AppHandle) {
-    let stale = match state.session.as_ref() {
-        Some(s) if s.join.is_finished() => state.session.take().unwrap(),
-        _ => return,
-    };
-    if stale.join.join().is_err() {
-        emit_session(
-            app,
-            stale.id,
-            "error",
-            Some("Dictation worker panicked".into()),
-        );
+    if let Some(s) = state.session.as_ref() {
+        if s.join.is_finished() {
+            let stale = state.session.take().unwrap();
+            if stale.join.join().is_err() {
+                emit_panic(app, stale.id);
+            }
+        }
+    }
+    let mut i = 0;
+    while i < state.orphans.len() {
+        if state.orphans[i].join.is_finished() {
+            let orphan = state.orphans.remove(i);
+            // An orphan was already reported — joining just frees the
+            // thread; a panic is still worth surfacing to any listener.
+            if orphan.join.join().is_err() {
+                emit_panic(app, orphan.id);
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// A session worker's join handle, and its output once collected.
+type WorkerJoin = std::thread::JoinHandle<Result<DictationResult, String>>;
+type WorkerOutcome = std::thread::Result<Result<DictationResult, String>>;
+
+/// `JoinHandle` has no timed wait — poll `is_finished` until the deadline.
+/// `Err(join)` hands the handle back so the caller can escalate to cancel
+/// or park it in `orphans` rather than blocking on a stuck worker forever.
+fn join_with_timeout(
+    join: WorkerJoin,
+    timeout: std::time::Duration,
+) -> Result<WorkerOutcome, WorkerJoin> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if join.is_finished() {
+            return Ok(join.join());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(join);
+        }
+        std::thread::sleep(JOIN_POLL);
+    }
+}
+
+/// The worker died before it could report — surface it on the session
+/// event channel like any other failure.
+fn emit_panic(app: &AppHandle, id: u64) {
+    emit_session(app, id, "error", Some("Dictation worker panicked".into()));
+}
+
+/// Clear `starting` only while it still belongs to this attempt — a
+/// takeover cancel takes the flag and a retried start may already have
+/// installed a newer one, which must not be wiped.
+fn clear_starting(state: &mut HostState, cancel: &Arc<AtomicBool>) {
+    if state
+        .starting
+        .as_ref()
+        .is_some_and(|flag| Arc::ptr_eq(flag, cancel))
+    {
+        state.starting = None;
+    }
+}
+
+/// Clear `finishing` only while it still names this session — after a
+/// takeover force-clear a newer session may already own the entry.
+fn clear_finishing(state: &mut HostState, id: u64) {
+    if state
+        .finishing
+        .as_ref()
+        .is_some_and(|(owner, _)| *owner == id)
+    {
+        state.finishing = None;
     }
 }
 
@@ -517,7 +603,7 @@ pub fn dictation_start(
             })) {
                 Ok(result) => result,
                 Err(_) => {
-                    emit_session(&app, id, "error", Some("Dictation worker panicked".into()));
+                    emit_panic(&app, id);
                     Err("Dictation worker panicked".into())
                 }
             }
@@ -526,7 +612,7 @@ pub fn dictation_start(
     let join = match spawn {
         Ok(join) => join,
         Err(_) => {
-            host.inner.lock().unwrap().starting = None;
+            clear_starting(&mut host.inner.lock().unwrap(), &cancel);
             return Err("Cannot start the dictation worker".into());
         }
     };
@@ -535,7 +621,7 @@ pub fn dictation_start(
     // every start "already running", cancel and shutdown unable to reach it.
     let outcome = rx.recv_timeout(START_TIMEOUT);
     let mut state = host.inner.lock().unwrap();
-    state.starting = None;
+    clear_starting(&mut state, &cancel);
     match outcome {
         Ok(Ok(device_name)) if !cancel.load(Ordering::Relaxed) => {
             state.session = Some(Session {
@@ -562,11 +648,11 @@ pub fn dictation_start(
             Err(error)
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // The worker never reported in: stop it from registering later
-            // and detach — if capture::start is truly hung nothing can join
-            // it anyway.
+            // The worker never reported in: stop it from registering later.
+            // Detached but tracked — shutdown can still reach its cancel
+            // flag and a later reap collects it if it ever exits.
             cancel.store(true, Ordering::Relaxed);
-            drop(join);
+            state.orphans.push(OrphanedSession { id, cancel, join });
             Err("Microphone did not respond — check the input device".into())
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -602,12 +688,38 @@ pub fn dictation_stop(
         session
     };
     let id = session.id;
-    let outcome = session.join.join();
-    host.inner.lock().unwrap().finishing = None;
+    let cancel = Arc::clone(&session.cancel);
+    // Bound the wait: the final pass is unbounded CPU work, and a worker
+    // that will not exit must not hold `finishing` — and therefore block
+    // every later session — forever.
+    let outcome = match join_with_timeout(session.join, STOP_TIMEOUT) {
+        Ok(outcome) => outcome,
+        Err(join) => {
+            // Escalate to cancel — the final pass checks the flag at each
+            // decoding step, so a healthy worker exits inside the grace.
+            cancel.store(true, Ordering::Relaxed);
+            match join_with_timeout(join, CANCEL_TIMEOUT) {
+                Ok(outcome) => outcome,
+                Err(join) => {
+                    // Truly stuck — park it so `finishing` can't wedge every
+                    // later session; reaped when (if) it ever exits.
+                    {
+                        let mut state = host.inner.lock().unwrap();
+                        clear_finishing(&mut state, id);
+                        state.orphans.push(OrphanedSession { id, cancel, join });
+                    }
+                    let message = "Dictation took too long to stop — the session was abandoned";
+                    emit_session(&app, id, "error", Some(message.into()));
+                    return Err(message.into());
+                }
+            }
+        }
+    };
+    clear_finishing(&mut host.inner.lock().unwrap(), id);
     match outcome {
         Ok(result) => result,
         Err(_) => {
-            emit_session(&app, id, "error", Some("Dictation worker panicked".into()));
+            emit_panic(&app, id);
             Err("Dictation worker panicked".into())
         }
     }
@@ -619,7 +731,15 @@ pub fn dictation_cancel(
     host: State<'_, DictationHost>,
     session_id: Option<u64>,
 ) -> Result<(), String> {
-    let session = {
+    enum Pending {
+        /// The session was this call's to take — join its worker below.
+        Join(Session),
+        /// Stop/cancel already took it — the flag was set; wait for the
+        /// owner to clear `finishing` so a take-over retry can't hit a
+        /// stale "already running". Carries the watched session id.
+        WaitClear(u64),
+    }
+    let pending = {
         let mut state = host.inner.lock().unwrap();
         match state.session.as_ref() {
             Some(session) if session_id.is_some_and(|id| id != session.id) => {
@@ -631,40 +751,84 @@ pub fn dictation_cancel(
             Some(session) => {
                 session.cancel.store(true, Ordering::Relaxed);
                 state.finishing = Some((session.id, Arc::clone(&session.cancel)));
-                session
+                Pending::Join(session)
             }
-            None => {
+            None => match state.finishing.as_ref() {
                 // Stop already took the session — abort its final pass.
-                return match state.finishing.as_ref() {
-                    Some((id, cancel)) if session_id.is_none_or(|wanted| wanted == *id) => {
+                Some((id, cancel)) if session_id.is_none_or(|wanted| wanted == *id) => {
+                    cancel.store(true, Ordering::Relaxed);
+                    Pending::WaitClear(*id)
+                }
+                Some(_) => return Err("No dictation in progress".into()),
+                // An id-less cancel is an explicit takeover — a session
+                // still starting has no id yet, so only None can abort it.
+                None => match state.starting.take() {
+                    Some(cancel) if session_id.is_none() => {
                         cancel.store(true, Ordering::Relaxed);
-                        Ok(())
+                        return Ok(());
                     }
-                    Some(_) => Err("No dictation in progress".into()),
-                    // An id-less cancel is an explicit takeover — a session
-                    // still starting has no id yet, so only None can abort it.
-                    None => match state.starting.take() {
-                        Some(cancel) if session_id.is_none() => {
-                            cancel.store(true, Ordering::Relaxed);
-                            Ok(())
-                        }
-                        Some(cancel) => {
-                            state.starting = Some(cancel);
-                            Err("No dictation in progress".into())
-                        }
-                        None => Err("No dictation in progress".into()),
-                    },
-                };
-            }
+                    Some(cancel) => {
+                        state.starting = Some(cancel);
+                        return Err("No dictation in progress".into());
+                    }
+                    None => return Err("No dictation in progress".into()),
+                },
+            },
         }
     };
-    let id = session.id;
-    let outcome = session.join.join();
-    host.inner.lock().unwrap().finishing = None;
-    if outcome.is_err() {
-        emit_session(&app, id, "error", Some("Dictation worker panicked".into()));
+    match pending {
+        Pending::WaitClear(watched) => {
+            // The command that owns the join clears `finishing` when the
+            // worker exits — wait for it so a retried start sees a clean
+            // host. If it never clears, take the flag: the worker's cancel
+            // is already set, so the stale entry is dead weight either way.
+            let deadline = std::time::Instant::now() + CANCEL_TIMEOUT;
+            loop {
+                {
+                    let mut state = host.inner.lock().unwrap();
+                    // Done once the watched entry is gone — cleared by its
+                    // owner, or replaced by a newer session's.
+                    let still_watched = state
+                        .finishing
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == watched);
+                    if !still_watched {
+                        return Ok(());
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        state.finishing = None;
+                        return Ok(());
+                    }
+                }
+                std::thread::sleep(JOIN_POLL);
+            }
+        }
+        Pending::Join(session) => {
+            let id = session.id;
+            let cancel = Arc::clone(&session.cancel);
+            match join_with_timeout(session.join, CANCEL_TIMEOUT) {
+                Ok(outcome) => {
+                    clear_finishing(&mut host.inner.lock().unwrap(), id);
+                    if outcome.is_err() {
+                        emit_panic(&app, id);
+                    }
+                }
+                Err(join) => {
+                    // Cancel was already set — park the stuck worker rather
+                    // than blocking on it forever; reaped once it exits.
+                    {
+                        let mut state = host.inner.lock().unwrap();
+                        clear_finishing(&mut state, id);
+                        state.orphans.push(OrphanedSession { id, cancel, join });
+                    }
+                    // The owning composer is still showing this session —
+                    // nothing else will clear its UI now.
+                    emit_session(&app, id, "cancelled", None);
+                }
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 // ── Session worker ──────────────────────────────────────────────────────────
@@ -675,6 +839,30 @@ struct SessionIo<'a> {
     buffer: &'a Arc<Mutex<AudioBuffer>>,
     stop: &'a Arc<AtomicBool>,
     cancel: &'a Arc<AtomicBool>,
+}
+
+/// The trailing audio no partial pass committed — the only part the final
+/// transcription needs to decode. `committed_end_ms` is on the snapshot's
+/// absolute timeline; commits may cover silence decoded to empty text, so
+/// the boundary alone decides — not whether any words came out of it.
+fn uncommitted_tail(snapshot: &BufferSnapshot, committed_end_ms: i64) -> &[f32] {
+    if committed_end_ms <= 0 {
+        return &snapshot.samples;
+    }
+    let committed_end = committed_end_ms as u64 * WHISPER_RATE as u64 / 1000;
+    let start = committed_end
+        .saturating_sub(snapshot.base)
+        .min(snapshot.samples.len() as u64) as usize;
+    &snapshot.samples[start..]
+}
+
+/// `true` when a non-trivial session captured only exact zeros (or nothing
+/// at all — `all` holds on an empty slice) — a real mic always produces
+/// noise, so this means the OS tap delivered nothing: dead device, or mic
+/// privacy serving silence to desktop apps on Windows. `duration_ms` is
+/// the longer of the audio length and the session's wall-clock time.
+fn captured_only_silence(samples: &[f32], duration_ms: u64) -> bool {
+    duration_ms > 1_500 && samples.iter().all(|s| *s == 0.0)
 }
 
 fn run_session(
@@ -691,6 +879,13 @@ fn run_session(
         stop,
         cancel,
     } = *io;
+    // A takeover or the start timeout may have cancelled while the stream
+    // was still opening — don't spend seconds loading a model for a dead
+    // session.
+    if cancel.load(Ordering::Relaxed) {
+        emit_session(app, session_id, "cancelled", None);
+        return Err("cancelled".into());
+    }
     let (engine, load_ms) = match Engine::load(model_path) {
         Ok(ok) => ok,
         Err(error) => {
@@ -699,6 +894,7 @@ fn run_session(
         }
     };
     emit_session(app, session_id, "recording", None);
+    let recording_since = std::time::Instant::now();
 
     let opts = TranscribeOptions {
         language: language.clone(),
@@ -743,6 +939,7 @@ fn run_session(
                     let window_start_ms = (snapshot.base * 1000 / WHISPER_RATE as u64) as i64;
                     let now_ms = (end_abs * 1000 / WHISPER_RATE as u64) as i64;
                     let mut partial = Vec::new();
+                    let mut deferred = false;
                     for seg in &transcript.segments {
                         let seg_start = window_start_ms + seg.start_ms;
                         let seg_end = window_start_ms + seg.end_ms;
@@ -751,9 +948,13 @@ fn run_session(
                             continue;
                         }
                         // Commit only whole segments that start after the last
-                        // commit — overlapping boundaries get re-decoded by a
-                        // later window instead of duplicated.
-                        if seg_end <= now_ms - COMMIT_MARGIN_MS && seg_start >= committed_end_ms {
+                        // commit — and stop committing once one is deferred,
+                        // so the commit point never jumps over audio the
+                        // tail pass would then skip below `committed_end_ms`.
+                        if !deferred
+                            && seg_end <= now_ms - COMMIT_MARGIN_MS
+                            && seg_start >= committed_end_ms
+                        {
                             let text = seg.text.trim();
                             if !text.is_empty() {
                                 if !committed.is_empty() {
@@ -763,6 +964,7 @@ fn run_session(
                             }
                             committed_end_ms = seg_end;
                         } else {
+                            deferred = true;
                             partial.push(seg.clone());
                         }
                     }
@@ -798,11 +1000,38 @@ fn run_session(
     // the lock isn't held while the copy contends with the RT callback.
     drop(capture);
 
-    // Final pass over everything still buffered — replaces all partials.
+    // Final pass over the still-uncommitted tail — everything before
+    // `committed_end_ms` was already decoded by the partial passes, and
+    // re-transcribing a whole session on a CPU-bound platform takes minutes,
+    // which presents exactly like a hang.
     let snapshot = buffer.lock().unwrap().snapshot();
     let dropped_audio_ms = snapshot.base * 1000 / WHISPER_RATE as u64;
     let audio_ms = snapshot.end() * 1000 / WHISPER_RATE as u64;
-    let stream_error = snapshot.error.clone();
+    // Wall clock covers the no-callback case — a privacy-blocked mic can
+    // deliver zero samples rather than zeroed buffers. When nothing ever
+    // committed, all-zero (or absent) samples mean the OS tap gave us
+    // nothing: dead device, or mic privacy serving silence on Windows.
+    // Skip the decode entirely — transcribing minutes of zeros is exactly
+    // the unbounded final pass this is meant to bound.
+    let elapsed_ms = recording_since.elapsed().as_millis() as u64;
+    let silent =
+        committed.is_empty() && captured_only_silence(&snapshot.samples, audio_ms.max(elapsed_ms));
+    let stream_error = snapshot.error.clone().or(silent.then(|| {
+        "The microphone captured only silence — check the input device and the OS microphone privacy setting".into()
+    }));
+    if silent {
+        emit_session(app, session_id, "finished", None);
+        return Ok(DictationResult {
+            text: committed,
+            language: None,
+            audio_ms,
+            model_load_ms: load_ms,
+            infer_ms: 0,
+            dropped_audio_ms,
+            stream_error,
+        });
+    }
+    let tail = uncommitted_tail(&snapshot, committed_end_ms);
     let final_opts = TranscribeOptions {
         language,
         translate,
@@ -815,19 +1044,18 @@ fn run_session(
         move || cancel.load(Ordering::Relaxed)
     };
     // `engine` drops on every return path → model memory released.
-    match engine.transcribe(&snapshot.samples, &final_opts, abort) {
+    match engine.transcribe(tail, &final_opts, abort) {
         Ok(transcript) => {
-            // When the buffer cap dropped the session's head, that speech is
-            // absent from the snapshot — recover it from the text committed
-            // by partial passes. The seam can overlap by a few words.
-            let text =
-                if dropped_audio_ms > 0 && !committed.is_empty() && !transcript.text.is_empty() {
-                    format!("{} {}", committed, transcript.text)
-                } else if dropped_audio_ms > 0 && !committed.is_empty() {
-                    committed
-                } else {
-                    transcript.text
-                };
+            // `committed` already covers the audio the tail skipped — the
+            // merge the dropped-head case relied on, now unconditional. A
+            // word clipped exactly at the boundary can echo in the tail.
+            let text = if !committed.is_empty() && !transcript.text.is_empty() {
+                format!("{} {}", committed, transcript.text)
+            } else if !committed.is_empty() {
+                committed
+            } else {
+                transcript.text
+            };
             emit_session(app, session_id, "finished", None);
             Ok(DictationResult {
                 text,
@@ -886,4 +1114,103 @@ pub fn dictation_transcribe_file(
         infer_ms: transcript.infer_ms,
         first_segment_ms: transcript.first_segment_ms,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(base: u64, len: usize) -> BufferSnapshot {
+        BufferSnapshot {
+            base,
+            samples: vec![1.0; len],
+            error: None,
+        }
+    }
+
+    fn empty_result() -> Result<DictationResult, String> {
+        Ok(DictationResult {
+            text: String::new(),
+            language: None,
+            audio_ms: 0,
+            model_load_ms: 0,
+            infer_ms: 0,
+            dropped_audio_ms: 0,
+            stream_error: None,
+        })
+    }
+
+    #[test]
+    fn tail_slices_from_the_commit_point() {
+        // Buffer covers absolute samples [1600, 4800); committed through
+        // 200 ms == absolute sample 3200 → the tail is the last 1600.
+        let snap = snapshot(1600, 3200);
+        let tail = uncommitted_tail(&snap, 200);
+        assert_eq!(tail.len(), 1600);
+    }
+
+    #[test]
+    fn tail_is_whole_buffer_when_nothing_committed() {
+        let snap = snapshot(0, 100);
+        assert_eq!(uncommitted_tail(&snap, 0).len(), 100);
+    }
+
+    #[test]
+    fn tail_slices_even_when_commits_were_textless() {
+        // Commit points can cover silence decoded to empty text — the
+        // boundary alone decides, so a long quiet prefix still bounds the
+        // final pass.
+        let snap = snapshot(1600, 3200);
+        assert_eq!(uncommitted_tail(&snap, 200).len(), 1600);
+    }
+
+    #[test]
+    fn tail_is_empty_when_commit_reached_the_end() {
+        let snap = snapshot(0, 100);
+        assert!(uncommitted_tail(&snap, 60_000).is_empty());
+    }
+
+    #[test]
+    fn tail_clamps_when_commit_predates_the_buffer() {
+        // The buffer cap dropped already-committed audio → re-decode what
+        // remains and let the merge prepend the committed text.
+        let snap = snapshot(1600, 100);
+        assert_eq!(uncommitted_tail(&snap, 10).len(), 100);
+    }
+
+    #[test]
+    fn silence_detection_flags_a_dead_tap() {
+        let silence = vec![0.0; 24_000];
+        assert!(captured_only_silence(&silence, 2_000));
+        // Too short to accuse the device — a quick toggle is legitimate.
+        assert!(!captured_only_silence(&silence, 500));
+        // No callbacks at all (empty buffer) is still a dead tap when the
+        // session ran long enough on the wall clock.
+        assert!(captured_only_silence(&[], 60_000));
+        let mut noise = silence;
+        noise[100] = 0.001;
+        assert!(!captured_only_silence(&noise, 60_000));
+    }
+
+    #[test]
+    fn join_with_timeout_collects_a_finished_worker() {
+        let join = std::thread::spawn(empty_result);
+        let outcome = join_with_timeout(join, std::time::Duration::from_secs(5));
+        assert!(outcome.map(|r| r.is_ok()).unwrap_or(false));
+    }
+
+    #[test]
+    fn join_with_timeout_hands_back_a_running_worker() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let join = std::thread::spawn(move || -> Result<DictationResult, String> {
+            let _ = rx.recv();
+            empty_result()
+        });
+        let join = match join_with_timeout(join, std::time::Duration::from_millis(50)) {
+            Ok(_) => panic!("worker should still be running"),
+            Err(join) => join,
+        };
+        drop(tx);
+        assert!(join.join().is_ok());
+    }
 }
