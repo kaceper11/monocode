@@ -4,12 +4,13 @@ import {
   ATTENTION_ACTION,
   ATTENTION_INFO,
   emitAttention,
-  resolveAttention,
   resolveAttentionWhere,
   type AttentionItem,
 } from "./attention";
+import { pushCheckToast } from "./checkToasts";
 import { gitDiffIndex } from "./fs";
 import { isInFlightSession, wasTurnInterrupted } from "./inFlight";
+import { notifyCheckResult } from "./notifications";
 import { pathKey } from "./paths";
 import { joinRelativeCwd, resolveCommandTarget } from "./projectCommands";
 import {
@@ -36,9 +37,10 @@ import { projectForTask, taskForSession } from "./taskWorkspaces";
  * output tail back to the owning agent.
  *
  * Same discipline as watchers and schedules: foreground-only (the run dies
- * with the WebView), one row per session's latest outcome, and a claimed
- * turn is never reprocessed — including across windows, via the persisted
- * claim list.
+ * with the WebView) and a claimed turn is never reprocessed — including
+ * across windows, via the persisted claim list. Each failure lands its own
+ * attention row so unread failures stack; a pass resolves the session's
+ * open rows and keeps only the latest outcome.
  */
 
 export type CheckRunStatus =
@@ -501,8 +503,27 @@ type CheckRunResult = {
   durationMs: number;
 };
 
-function attentionKey(sessionId: string) {
-  return `verify:${sessionId}`;
+/**
+ * The attention row is the durable record; the toast and OS banner are the
+ * transient cues. Only actionable outcomes cue — a pass lands quietly.
+ */
+function announceRun(run: CheckRunRecord, session: Session) {
+  emitAttention(outcomeItem(run, session.id));
+  if (run.status === "passed" || run.status === "skipped") return;
+  pushCheckToast(run, session);
+  void notifyCheckResult(session, {
+    status: run.status,
+    commandName: run.commandName,
+  });
+}
+
+/**
+ * Failures key by run so unread failures stack as separate rows; a pass
+ * keys by session so it just refreshes the latest outcome (and resolves
+ * the session's open rows itself — see `run`).
+ */
+function attentionKey(sessionId: string, runId?: string) {
+  return runId ? `verify:${sessionId}:${runId}` : `verify:${sessionId}`;
 }
 
 /** Working copies with a check currently executing — two sessions finishing
@@ -679,8 +700,7 @@ async function run(
         status: "error",
         detail: error instanceof Error ? error.message : String(error),
       });
-      if (hooks.getSession?.(sessionId))
-        emitAttention(outcomeItem(run, sessionId));
+      if (hooks.getSession?.(sessionId)) announceRun(run, session);
       return;
     }
 
@@ -723,9 +743,15 @@ async function run(
           }),
     });
     // The run is history regardless; the row only lands when the session is
-    // still around to act on it (it may have been deleted mid-run).
-    if (hooks.getSession?.(sessionId))
-      emitAttention(outcomeItem(run, sessionId));
+    // still around to act on it (it may have been deleted mid-run). A pass
+    // resolves the session's stacked failure rows first — the condition they
+    // reported is gone from the working copy.
+    if (status === "passed")
+      resolveAttentionWhere(
+        (item) =>
+          item.sessionId === sessionId && item.source?.kind === "verify",
+      );
+    if (hooks.getSession?.(sessionId)) announceRun(run, session);
 
     // Auto-fix: hand the tail back to the owning session, capped per failure
     // chain. The send goes through the same queued dispatch a manual click
@@ -818,7 +844,12 @@ async function sendRunToAgent(runId: string): Promise<string | void> {
     writeStore(next);
   }
   emitAttention({
-    ...outcomeItem(run, run.sessionId, "Sent the check output to the agent."),
+    ...outcomeItem(
+      run,
+      run.sessionId,
+      "Sent the check output to the agent.",
+      attentionKey(run.sessionId, `${run.id}:sent`),
+    ),
     signature: `sent:${run.id}:${Date.now()}`,
   });
   return undefined;
@@ -844,6 +875,7 @@ function outcomeItem(
   run: CheckRunRecord,
   sessionId: string,
   overrideDetail?: string,
+  key = attentionKey(sessionId, run.status === "passed" ? undefined : run.id),
 ): AttentionItem {
   const failed = run.status === "failed" || run.status === "timeout";
   const title =
@@ -854,7 +886,7 @@ function outcomeItem(
         : `Checks failed — ${run.sessionTitle}`;
   const detail = overrideDetail ?? run.detail ?? run.commandName;
   return {
-    key: attentionKey(sessionId),
+    key,
     kind: "check",
     title,
     detail,
@@ -875,10 +907,12 @@ function outcomeItem(
   };
 }
 
-/** Session archived/deleted — drop its stale outcome row and its send
+/** Session archived/deleted — drop its stacked outcome rows and its send
  * counters, which would otherwise outlive the session forever. */
 export function resolveVerifyForSession(sessionId: string) {
-  resolveAttention(attentionKey(sessionId));
+  resolveAttentionWhere(
+    (item) => item.sessionId === sessionId && item.source?.kind === "verify",
+  );
   const store = readStore();
   let changed = false;
   for (const state of Object.values(store.projects)) {

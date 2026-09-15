@@ -13,10 +13,7 @@ export const NOTIFICATIONS_CHANGE_EVENT = "monocode:notifications-change";
 export const NOTIFICATION_CLICK_EVENT = "monocode:notification-click";
 
 export type NotificationPermission =
-  | "prompt"
-  | "granted"
-  | "denied"
-  | "unsupported";
+  "prompt" | "granted" | "denied" | "unsupported";
 
 export function loadNotificationsEnabled(): boolean {
   try {
@@ -49,7 +46,9 @@ export function cachedNotificationPermission(): NotificationPermission {
 
 export async function probeNotificationPermission(): Promise<NotificationPermission> {
   try {
-    permission = await invoke<NotificationPermission>("notification_permission");
+    permission = await invoke<NotificationPermission>(
+      "notification_permission",
+    );
   } catch {
     permission = "unsupported";
   }
@@ -153,7 +152,11 @@ export function pendingInputNotifications(
 }
 
 /** App name, then the session title, then the reply itself. */
-export type NotificationText = { title: string; subtitle: string; body: string };
+export type NotificationText = {
+  title: string;
+  subtitle: string;
+  body: string;
+};
 
 const BODY_MAX = 240;
 
@@ -209,6 +212,44 @@ function clip(text: string): string {
   return paragraph.length > BODY_MAX
     ? `${paragraph.slice(0, BODY_MAX - 1)}…`
     : paragraph;
+}
+
+/**
+ * OS banner for a failed/timed-out/broken check run. `sessionVisible` is
+ * tied to focus on purpose: when the user is looking at the app the in-app
+ * check toast is the cue, so a native banner would double up; unfocused
+ * means the banner is the only signal. Clicking focuses the session.
+ */
+export async function notifyCheckResult(
+  session: Session,
+  run: { status: "failed" | "timeout" | "error"; commandName: string },
+): Promise<boolean> {
+  if (session.inboxAsk) return false;
+  const decision = shouldNotify({
+    enabled: loadNotificationsEnabled(),
+    permission,
+    windowFocused,
+    sessionVisible: windowFocused,
+  });
+  if (!decision) return false;
+  const headline =
+    run.status === "timeout"
+      ? "Checks timed out"
+      : run.status === "error"
+        ? "Checks didn't run"
+        : "Checks failed";
+  try {
+    await invoke("show_notification", {
+      sessionId: session.id,
+      title: "MonoCode",
+      subtitle: sessionDisplayTitle(session.title, session.harness),
+      body: clip(`${headline} · ${run.commandName}`),
+      sound: loadSoundsEnabled(),
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

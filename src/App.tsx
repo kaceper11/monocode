@@ -81,6 +81,7 @@ import {
 } from "react";
 import { Sidebar } from "./chrome/Sidebar";
 import { ApprovalToasts } from "./chrome/ApprovalToasts";
+import { CheckToasts } from "./chrome/CheckToasts";
 import { WhatsNewDialog } from "./chrome/WhatsNewDialog";
 import { TitleBar, type Tab as TitleTab } from "./chrome/TitleBar";
 import { MenuBar } from "./chrome/MenuBar";
@@ -1518,6 +1519,7 @@ export default function App({
   const [reminderNoticesHeight, setReminderNoticesHeight] = useState(0);
   const [linkedActivityNoticeHeight, setLinkedActivityNoticeHeight] =
     useState(0);
+  const [approvalToastsHeight, setApprovalToastsHeight] = useState(0);
 
   useEffect(() => {
     syncDockBadge(sessions);
@@ -9041,6 +9043,16 @@ export default function App({
         }
         onFocusSession={onOpenApprovalSession}
         onApproval={onApproval}
+        onHeightChange={setApprovalToastsHeight}
+      />
+      <CheckToasts
+        topOffset={
+          12 +
+          (reminderNoticesHeight ? reminderNoticesHeight + 8 : 0) +
+          (linkedActivityNoticeHeight ? linkedActivityNoticeHeight + 8 : 0) +
+          (approvalToastsHeight ? approvalToastsHeight + 8 : 0)
+        }
+        onFocusSession={onOpenApprovalSession}
       />
       <LinkedWorkItemUpdateNotice
         card={

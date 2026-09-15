@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { emittedAttention } from "./attention";
+import { getCheckToasts, resetCheckToasts } from "./checkToasts";
 import { INTERRUPT_MESSAGE } from "./inFlight";
 import {
   QUALITY_COMMAND_ID,
@@ -17,6 +18,7 @@ import { publishRepositoryFamilies } from "./repositoryFamilies";
 import { newSession, type Session } from "./session";
 import {
   MAX_FIX_SENDS,
+  resolveVerifyForSession,
   sendCheckToAgent,
   setVerifyHooks,
   suppressVerifyTurn,
@@ -128,6 +130,7 @@ beforeEach(() => {
   localStorage.clear();
   vi.mocked(invoke).mockClear();
   resetQualityProbeCache();
+  resetCheckToasts();
   publishRepositoryFamilies(new Map([[CWD, family]]));
   sendToSession.mockClear().mockResolvedValue(true);
   session = { ...newSession("claude", CWD), title: "claude · work" };
@@ -881,4 +884,104 @@ it("releases the claim when the session is busy again during settle", async () =
   verifyTurnFinished(session);
   await settle();
   expect(verifyRunsFor(project.id).at(-1)!.status).toBe("passed");
+});
+
+it("stacks consecutive failures as separate rows — unread failures don't vanish", async () => {
+  makeProject();
+  vi.mocked(invoke).mockImplementation((command) => {
+    if (command === "git_diff_index") return Promise.resolve(dirtyIndex);
+    if (command === "run_check") return Promise.resolve(checkResult(1, "nope"));
+    return Promise.reject(new Error(`unexpected invoke: ${command}`));
+  });
+  session = turnSession();
+  verifyTurnFinished(session);
+  await vi.waitFor(() => expect(verifyRunsFor(project.id)).toHaveLength(1));
+  session = turnSession();
+  verifyTurnFinished(session);
+  await vi.waitFor(() => expect(verifyRunsFor(project.id)).toHaveLength(2));
+  const rows = emittedAttention().filter((item) => item.kind === "check");
+  expect(rows).toHaveLength(2);
+  expect(new Set(rows.map((row) => row.key)).size).toBe(2);
+  expect(rows.every((row) => row.title.includes("Checks failed"))).toBe(true);
+  // Both runs also raised a transient toast each.
+  expect(
+    getCheckToasts()
+      .map((toast) => toast.runId)
+      .sort(),
+  ).toEqual(
+    verifyRunsFor(project.id)
+      .map((run) => run.id)
+      .sort(),
+  );
+});
+
+it("a pass resolves the session's stacked failure rows", async () => {
+  makeProject();
+  let code = 1;
+  vi.mocked(invoke).mockImplementation((command) => {
+    if (command === "git_diff_index") return Promise.resolve(dirtyIndex);
+    if (command === "run_check") return Promise.resolve(checkResult(code));
+    return Promise.reject(new Error(`unexpected invoke: ${command}`));
+  });
+  session = turnSession();
+  verifyTurnFinished(session);
+  await vi.waitFor(() => expect(verifyRunsFor(project.id)).toHaveLength(1));
+  session = turnSession();
+  verifyTurnFinished(session);
+  await vi.waitFor(() => expect(verifyRunsFor(project.id)).toHaveLength(2));
+  expect(
+    emittedAttention().filter((item) => item.kind === "check"),
+  ).toHaveLength(2);
+
+  code = 0;
+  session = turnSession();
+  verifyTurnFinished(session);
+  await vi.waitFor(() => expect(verifyRunsFor(project.id)).toHaveLength(3));
+  const rows = emittedAttention().filter((item) => item.kind === "check");
+  expect(rows).toHaveLength(1);
+  expect(rows[0].title).toContain("Checks passed");
+});
+
+it("resolving a session clears all of its stacked check rows", async () => {
+  makeProject();
+  vi.mocked(invoke).mockImplementation((command) => {
+    if (command === "git_diff_index") return Promise.resolve(dirtyIndex);
+    if (command === "run_check") return Promise.resolve(checkResult(1));
+    return Promise.reject(new Error(`unexpected invoke: ${command}`));
+  });
+  session = turnSession();
+  verifyTurnFinished(session);
+  await vi.waitFor(() => expect(verifyRunsFor(project.id)).toHaveLength(1));
+  session = turnSession();
+  verifyTurnFinished(session);
+  await vi.waitFor(() => expect(verifyRunsFor(project.id)).toHaveLength(2));
+  expect(
+    emittedAttention().filter((item) => item.kind === "check"),
+  ).toHaveLength(2);
+  resolveVerifyForSession(session.id);
+  expect(
+    emittedAttention().filter((item) => item.kind === "check"),
+  ).toHaveLength(0);
+});
+
+it("the sent confirmation stacks beside the failure row instead of replacing it", async () => {
+  makeProject("fix");
+  vi.mocked(invoke).mockImplementation((command) => {
+    if (command === "git_diff_index") return Promise.resolve(dirtyIndex);
+    if (command === "run_check") return Promise.resolve(checkResult(1, "nope"));
+    return Promise.reject(new Error(`unexpected invoke: ${command}`));
+  });
+  session = turnSession();
+  verifyTurnFinished(session);
+  await settle();
+  await vi.waitFor(() =>
+    expect(
+      emittedAttention().filter((item) => item.kind === "check"),
+    ).toHaveLength(2),
+  );
+  const rows = emittedAttention().filter((item) => item.kind === "check");
+  expect(
+    rows.some((row) => row.detail === "Sent the check output to the agent."),
+  ).toBe(true);
+  expect(rows.some((row) => row.action?.kind === "check-fix")).toBe(true);
 });
