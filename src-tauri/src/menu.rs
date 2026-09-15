@@ -21,13 +21,15 @@ pub fn dispatch(app: &AppHandle, id: &str) {
         | "forward_tab" | "split_right" | "split_down" | "focus_left" | "focus_right"
         | "focus_up" | "focus_down" | "toggle_sidebar" | "sidebar_opacity" | "open_project"
         | "go_to_file" | "open_search" | "open_inbox" | "open_notes" | "find_in_project"
-        | "find" | "new_terminal" | "new_terminal_tab" | "toggle_terminal" | "open_browser"
+        | "new_terminal" | "new_terminal_tab" | "toggle_terminal" | "open_browser"
         | "open_model_picker" | "open_settings" | "check_for_updates" => {
             let _ = app.emit(id, ());
         }
-        "zoom_in" | "zoom_out" | "zoom_reset" => {
-            // Zoom targets one window: a broadcast would make every window
-            // increment the shared scale setting on a single menu click.
+        "zoom_in" | "zoom_out" | "zoom_reset" | "find" | "browser_reload" | "browser_focus_url"
+        | "browser_devtools" => {
+            // Zoom, find and browser commands target one window: a
+            // broadcast would make every window increment the shared scale
+            // setting or open its find bar off a single menu click.
             let mut windows: Vec<_> = app.webview_windows().into_values().collect();
             windows.sort_by(|a, b| a.label().cmp(b.label()));
             let target = windows
@@ -149,6 +151,19 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .accelerator("CmdOrCtrl+Shift+B")
         .build(app)?;
 
+    // Menu accelerators are the only keys that reach us while a native
+    // browser webview owns focus — the shell's keydown handler is blind
+    // then. The frontend routes these to the focused browser tab only.
+    let browser_reload = MenuItemBuilder::with_id("browser_reload", "Reload Page")
+        .accelerator("CmdOrCtrl+R")
+        .build(app)?;
+    let browser_focus_url = MenuItemBuilder::with_id("browser_focus_url", "Focus Address Bar")
+        .accelerator("CmdOrCtrl+L")
+        .build(app)?;
+    let browser_devtools = MenuItemBuilder::with_id("browser_devtools", "Page Developer Tools")
+        .accelerator("CmdOrCtrl+Alt+I")
+        .build(app)?;
+
     let file = SubmenuBuilder::new(app, "File")
         .item(&new_window)
         .item(&open_project)
@@ -160,6 +175,11 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&new_terminal)
         .item(&new_terminal_tab)
         .item(&open_browser)
+        .separator()
+        .item(&browser_reload)
+        .item(&browser_focus_url)
+        .item(&browser_devtools)
+        .separator()
         .item(&split_right)
         .item(&split_down)
         .item(&close_tab)

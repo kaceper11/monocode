@@ -84,6 +84,9 @@ export type BrowserTabSource = {
   title?: string;
   /** Leaf expands to cover the whole pane area; other leaves stay mounted. */
   expanded?: boolean;
+  /** Keep cookies/site data across restarts — the default. `false` marks a
+   * private tab on the throwaway data store. */
+  persist?: boolean;
 };
 
 export type FilePaneTab = {
@@ -247,12 +250,16 @@ export function newTerminalFile(cwd: string, title?: string): FilePaneTab {
   };
 }
 
-export function newBrowserTab(cwd: string, url: string): FilePaneTab {
+export function newBrowserTab(
+  cwd: string,
+  url: string,
+  persist = true,
+): FilePaneTab {
   return {
     id: crypto.randomUUID(),
     path: url,
     cwd,
-    browser: { url },
+    browser: { url, ...(persist ? {} : { persist: false }) },
   };
 }
 
@@ -260,6 +267,7 @@ export type BrowserMetaPatch = {
   url?: string;
   title?: string;
   expanded?: boolean;
+  persist?: boolean;
 };
 
 /** Page-side state the webview reports back; keeps tab + snapshot current. */
@@ -277,17 +285,20 @@ export function updateBrowserTab(
       const title =
         patch.title !== undefined ? patch.title.trim() : file.browser.title;
       const expanded = patch.expanded ?? file.browser.expanded;
+      const persist = patch.persist ?? file.browser.persist;
       if (
         (!url || url === file.browser.url) &&
         title === file.browser.title &&
-        expanded === file.browser.expanded
+        expanded === file.browser.expanded &&
+        persist === file.browser.persist
       )
         return file;
       paneChanged = true;
       const browser: BrowserTabSource = {
-        url: url ?? file.browser.url,
+        url: url || file.browser.url,
         ...(title ? { title } : {}),
         ...(expanded ? { expanded: true } : {}),
+        ...(persist === false ? { persist: false } : {}),
       };
       return { ...file, ...(url ? { path: url } : {}), browser };
     });

@@ -183,6 +183,7 @@ import {
   normalizeBrowserUrl,
   OPEN_BROWSER_EVENT,
   rememberedBrowserUrl,
+  requestBrowserCommand,
 } from "./lib/browser";
 import { releaseNotesForVersion, releaseNotesTitle } from "./lib/releaseNotes";
 import { mergeOrderedSubset, orderByIds } from "./lib/reorder";
@@ -8076,6 +8077,18 @@ export default function App({
     fn();
   }, []);
 
+  /** Label of the browser tab in the focused pane — the routing target
+   * for menu accelerators and keys that reach the shell while a native
+   * webview owns the page's focus. */
+  const focusedBrowserLabel = () => {
+    const tab = tabsRef.current.find(
+      (entry) => entry.id === activeTabIdRef.current,
+    );
+    if (!tab || tab.diffFocused) return null;
+    const file = focusedFileTab(tab);
+    return file?.browser?.url ? `browser-${file.id}` : null;
+  };
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Browser-standard UI zoom. Runs before tabCommand and always applies —
@@ -8303,7 +8316,23 @@ export default function App({
       }),
       listen("find_in_project", () => actions.current.onFindInProject()),
       listen("find", () => {
-        openFindInActiveEditor();
+        const label = focusedBrowserLabel();
+        if (label) requestBrowserCommand(label, "find");
+        else openFindInActiveEditor();
+      }),
+      // Menu accelerators for the embedded browser — they fire even while
+      // the native webview holds focus, which a keydown handler can't.
+      listen("browser_reload", () => {
+        const label = focusedBrowserLabel();
+        if (label) requestBrowserCommand(label, "reload");
+      }),
+      listen("browser_focus_url", () => {
+        const label = focusedBrowserLabel();
+        if (label) requestBrowserCommand(label, "focus-url");
+      }),
+      listen("browser_devtools", () => {
+        const label = focusedBrowserLabel();
+        if (label) requestBrowserCommand(label, "devtools");
       }),
       listen("open_model_picker", () => {
         window.dispatchEvent(new Event("open_model_picker"));

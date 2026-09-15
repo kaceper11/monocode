@@ -461,6 +461,9 @@ const SUMMARY_SCRIPT: &str = r#"(() => {
 pub struct BrowserState {
     history: Mutex<HashMap<String, History>>,
     hooked: Mutex<HashSet<String>>,
+    /// History keys whose webview owns a dedicated persistent data store —
+    /// only those may be cleared without touching the app shell's store.
+    dedicated: Mutex<HashSet<String>>,
 }
 
 struct History {
@@ -610,6 +613,48 @@ fn app_origin<R: Runtime>(window: &Window<R>) -> Option<String> {
         .map(|url| url.origin().ascii_serialization())
 }
 
+/// Identifies the dedicated WKWebsiteDataStore holding persisted browser
+/// tabs — exactly 16 bytes ("monocode-browser").
+#[cfg(target_os = "macos")]
+const BROWSER_STORE_ID: [u8; 16] = *b"monocode-browser";
+
+/// macOS major version, queried once — feature gates below.
+#[cfg(target_os = "macos")]
+fn os_major() -> isize {
+    use objc2_foundation::NSProcessInfo;
+    static VERSION: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| {
+        NSProcessInfo::processInfo()
+            .operatingSystemVersion()
+            .majorVersion
+    })
+}
+
+/// `data_store_identifier` needs macOS 14; below it a persisted tab falls
+/// back to the default (shared) data store, which still persists but must
+/// never be cleared from here — it holds the app's own storage too.
+#[cfg(target_os = "macos")]
+fn dedicated_store_supported() -> bool {
+    os_major() >= 14
+}
+
+/// Run an eval whose JSON return value is needed. Async like
+/// `browser_probe`: the completion callback arrives on the main thread, so
+/// blocking inside a synchronous command deadlocks on Windows.
+async fn eval_json<R: Runtime>(view: &tauri::Webview<R>, script: String) -> Result<String, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    view.eval_with_callback(script, move |result| {
+        let _ = tx.send(result);
+    })
+    .map_err(|error| error.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        rx.recv_timeout(PROBE_TIMEOUT)
+            .map_err(|_| "The page didn't answer".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn find_webview<R: Runtime>(window: &Window<R>, label: &str) -> Result<tauri::Webview<R>, String> {
     // The window's own shell webview shares this namespace — a bad label
     // must never resolve to it (browser_close would destroy the app UI).
@@ -645,6 +690,11 @@ fn hook_window_close<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
             .lock()
             .unwrap()
             .retain(|entry, _| !entry.starts_with(&prefix));
+        state
+            .dedicated
+            .lock()
+            .unwrap()
+            .retain(|entry| !entry.starts_with(&prefix));
         state.hooked.lock().unwrap().remove(&key);
     });
 }
@@ -669,6 +719,7 @@ pub async fn browser_open(
     url: String,
     bounds: BrowserBounds,
     background: Option<Color>,
+    persist: Option<bool>,
 ) -> Result<(), String> {
     if !valid_label(&label) {
         return Err("Invalid browser label".into());
@@ -679,6 +730,8 @@ pub async fn browser_open(
 
     let window_label = window.label().to_string();
     let key = history_key(&window_label, &label);
+    let persist = persist.unwrap_or(true);
+
     // Idempotent open: a stale webview under the same label is replaced.
     if let Ok(existing) = find_webview(&window, &label) {
         let _ = existing.close();
@@ -708,9 +761,14 @@ pub async fn browser_open(
     let download_window = window_label.clone();
     let download_label = label.clone();
 
-    let builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed.clone()))
-        .incognito(true)
-        .devtools(false)
+    // `mut` only where a data store gets configured — mobile never does.
+    #[allow(unused_mut)]
+    let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed.clone()))
+        // Persisted tabs keep cookies/site data in the browser profile so
+        // dev logins survive webview recreation and app restarts; a tab
+        // marked private stays on the throwaway store.
+        .incognito(!persist)
+        .devtools(true)
         .focused(false)
         // The pane's own background — WKWebView paints it during the
         // process swap on every cross-site navigation, so matching the
@@ -845,6 +903,49 @@ pub async fn browser_open(
             false
         });
 
+    // A persisted tab needs its own data store, not the app shell's:
+    // WebView2/WebKitGTK take a data directory; WKWebView takes a named
+    // store (macOS 14+). `dedicated` must only be set when that store was
+    // actually applied — `browser_clear_data` trusts the flag, and the
+    // fallback (default store/shared WebContext) also holds the app's own
+    // storage. (On old WebView2 runtimes wry silently ignores `incognito`,
+    // so a "private" tab may still persist — never promise otherwise.)
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+    let dedicated = {
+        let mut applied = false;
+        if persist {
+            if let Ok(dir) = app
+                .path()
+                .app_local_data_dir()
+                .map(|dir| dir.join("browser"))
+            {
+                let _ = std::fs::create_dir_all(&dir);
+                builder = builder.data_directory(dir);
+                applied = true;
+            }
+        }
+        applied
+    };
+    #[cfg(target_os = "macos")]
+    let dedicated = persist && dedicated_store_supported();
+    #[cfg(target_os = "macos")]
+    if dedicated {
+        builder = builder.data_store_identifier(BROWSER_STORE_ID);
+    }
+    // Mobile: no dedicated store exists — `incognito` still applies, but
+    // there is nothing `browser_clear_data` may safely wipe.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    let dedicated = false;
+    {
+        let state = app.state::<BrowserState>();
+        let mut dedicated_keys = state.dedicated.lock().unwrap();
+        if dedicated {
+            dedicated_keys.insert(key.clone());
+        } else {
+            dedicated_keys.remove(&key);
+        }
+    }
+
     hook_window_close(&app, &window);
     window
         .add_child(
@@ -862,11 +963,9 @@ pub fn browser_close(window: Window, app: AppHandle, label: String) -> Result<()
         let _ = view.close();
     }
     let state = app.state::<BrowserState>();
-    state
-        .history
-        .lock()
-        .unwrap()
-        .remove(&history_key(window.label(), &label));
+    let key = history_key(window.label(), &label);
+    state.history.lock().unwrap().remove(&key);
+    state.dedicated.lock().unwrap().remove(&key);
     Ok(())
 }
 
@@ -959,24 +1058,16 @@ pub async fn browser_set_recording(
     on: bool,
 ) -> Result<bool, String> {
     let view = find_webview(&window, &label)?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    view.eval_with_callback(
+    let raw = eval_json(
+        &view,
         format!(
             "!!(window.__monocodeSetRec && (window.__monocodeSetRec({}), true))",
             if on { "true" } else { "false" }
         ),
-        move |result| {
-            let _ = tx.send(result);
-        },
     )
-    .map_err(|error| error.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        rx.recv_timeout(PROBE_TIMEOUT)
-            .map_err(|_| "Recording toggle timed out".to_string())
-    })
     .await
-    .map_err(|error| error.to_string())?
-    .map(|result| result.trim() == "true")
+    .map_err(|_| "Recording toggle timed out".to_string())?;
+    Ok(raw.trim() == "true")
 }
 
 /// Read the live location so the tab can tell "never loaded" apart from a
@@ -989,20 +1080,12 @@ pub async fn browser_set_recording(
 #[tauri::command]
 pub async fn browser_probe(window: Window, label: String) -> Result<String, String> {
     let view = find_webview(&window, &label)?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    view.eval_with_callback(
-        "({href:location.href,title:document.title,readyState:document.readyState})",
-        move |result| {
-            let _ = tx.send(result);
-        },
+    eval_json(
+        &view,
+        "({href:location.href,title:document.title,readyState:document.readyState})".to_string(),
     )
-    .map_err(|error| error.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        rx.recv_timeout(PROBE_TIMEOUT)
-            .map_err(|_| "Probe timed out".to_string())
-    })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|_| "Probe timed out".to_string())
 }
 
 #[derive(Serialize)]
@@ -1364,5 +1447,201 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
         headings,
         screenshot: screenshot_b64,
         detail,
+    })
+}
+
+/// Page-local find: text-node walk + CSS Custom Highlight painting +
+/// scroll-into-view. State lives on `window.__monocodeFind` so repeated
+/// calls step through matches; an empty query clears it.
+const FIND_SCRIPT: &str = r#"(arg) => {
+  const q = String((arg && arg.query) || "").slice(0, 200);
+  const NS = "monocode-find";
+  const state = (window.__monocodeFind = window.__monocodeFind || {
+    query: "",
+    index: -1,
+  });
+  const clear = () => {
+    try {
+      if (window.CSS && CSS.highlights) {
+        CSS.highlights.delete(NS);
+        CSS.highlights.delete(NS + "-current");
+      }
+    } catch (e) {}
+  };
+  if (!q) {
+    clear();
+    state.query = "";
+    state.index = -1;
+    return { count: 0, index: -1 };
+  }
+  const matches = [];
+  try {
+    const lower = q.toLowerCase();
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT,
+    );
+    let node;
+    // Matches are capped at 200; the walk itself needs a budget too —
+    // a huge DOM with few matches would otherwise blow the eval timeout.
+    let walked = 0;
+    while ((node = walker.nextNode()) && walked++ < 20000) {
+      if (matches.length >= 200) break;
+      const parent = node.parentElement;
+      if (!parent || parent.closest("script,style,noscript,iframe")) continue;
+      const text = node.nodeValue || "";
+      const hay = text.toLowerCase();
+      let i = hay.indexOf(lower);
+      while (i >= 0) {
+        const range = document.createRange();
+        range.setStart(node, i);
+        range.setEnd(node, i + q.length);
+        matches.push(range);
+        if (matches.length >= 200) break;
+        i = hay.indexOf(lower, i + q.length);
+      }
+    }
+  } catch (e) {}
+  if (window.CSS && CSS.highlights) {
+    try {
+      if (!document.getElementById("monocode-find-style")) {
+        const style = document.createElement("style");
+        style.id = "monocode-find-style";
+        style.textContent =
+          "::highlight(" + NS + ") { background-color: rgba(255,200,0,0.35); color: inherit; }" +
+          "::highlight(" + NS + "-current) { background-color: rgba(255,150,0,0.7); color: inherit; }";
+        (document.head || document.documentElement).appendChild(style);
+      }
+      CSS.highlights.set(NS, new Highlight(...matches));
+    } catch (e) {}
+  }
+  if (state.query !== q) {
+    state.query = q;
+    state.index = matches.length ? 0 : -1;
+  } else if (matches.length) {
+    const d = arg && arg.forward === false ? -1 : 1;
+    state.index = (state.index + d + matches.length) % matches.length;
+  } else {
+    state.index = -1;
+  }
+  if (state.index >= 0) {
+    try {
+      if (window.CSS && CSS.highlights)
+        CSS.highlights.set(NS + "-current", new Highlight(matches[state.index]));
+      const el = matches[state.index].startContainer.parentElement;
+      if (el) el.scrollIntoView({ block: "center" });
+    } catch (e) {}
+  }
+  return { count: matches.length, index: state.index };
+}"#;
+
+/// Toggle (or set) the page inspector. In release builds this needs the
+/// `devtools` cargo feature — enabled in Cargo.toml.
+#[tauri::command]
+pub fn browser_devtools(window: Window, label: String, open: Option<bool>) -> Result<bool, String> {
+    let view = find_webview(&window, &label)?;
+    let next = match open {
+        Some(open) => open,
+        None => !view.is_devtools_open(),
+    };
+    if next {
+        view.open_devtools();
+    } else {
+        view.close_devtools();
+    }
+    // Report the requested state, not a re-query: WebView2's
+    // `is_devtools_open` is hardcoded false (close is a no-op too), and
+    // WKWebView's inspector visibility is async right after show.
+    Ok(next)
+}
+
+/// Clear the browser profile's site data (cookies, storage). Only a tab
+/// backed by the dedicated store may clear it — on older macOS persistent
+/// tabs share the app shell's default data store, and clearing that would
+/// wipe app settings too.
+#[tauri::command]
+pub fn browser_clear_data(window: Window, app: AppHandle, label: String) -> Result<(), String> {
+    let key = history_key(window.label(), &label);
+    let dedicated = app
+        .state::<BrowserState>()
+        .dedicated
+        .lock()
+        .unwrap()
+        .contains(&key);
+    if !dedicated {
+        return Err("Only a persistent browser tab has its own data to clear".into());
+    }
+    find_webview(&window, &label)?
+        .clear_all_browsing_data()
+        .map_err(|error| error.to_string())
+}
+
+/// Copy a screenshot of the visible page to the system clipboard. Same
+/// platform capture as `browser_capture`, minus the DOM summary.
+#[tauri::command]
+pub async fn browser_copy_screenshot(
+    window: Window,
+    app: AppHandle,
+    label: String,
+) -> Result<(), String> {
+    let view = find_webview(&window, &label)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    start_screenshot(&view, tx)?;
+    let png = tauri::async_runtime::spawn_blocking(move || {
+        rx.recv_timeout(CAPTURE_TIMEOUT).ok().flatten()
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "Screenshot unavailable".to_string())?;
+    if png.len() > MAX_SCREENSHOT_BYTES {
+        return Err("Screenshot too large to copy".into());
+    }
+    let image = tauri::image::Image::from_bytes(&png).map_err(|error| error.to_string())?;
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    app.clipboard()
+        .write_image(&image)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserFindResult {
+    count: usize,
+    index: i32,
+}
+
+/// Text search inside the page — highlight via the CSS Custom Highlight
+/// API when present, scroll-into-view always. `forward: false` steps back.
+#[tauri::command]
+pub async fn browser_find(
+    window: Window,
+    label: String,
+    query: String,
+    forward: Option<bool>,
+) -> Result<BrowserFindResult, String> {
+    let view = find_webview(&window, &label)?;
+    let arg = serde_json::json!({
+        "query": query.chars().take(200).collect::<String>(),
+        "forward": forward.unwrap_or(true),
+    });
+    let arg = serde_json::to_string(&arg)
+        .map_err(|error| error.to_string())?
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
+    let raw = eval_json(&view, format!("({FIND_SCRIPT})({arg})")).await?;
+    #[derive(Deserialize)]
+    struct PageFind {
+        count: Option<usize>,
+        index: Option<i32>,
+    }
+    let parsed: PageFind = serde_json::from_str(&raw).unwrap_or(PageFind {
+        count: None,
+        index: None,
+    });
+    let count = parsed.count.unwrap_or(0).min(200);
+    Ok(BrowserFindResult {
+        count,
+        // Page-controlled value — clamp to the reported range.
+        index: parsed.index.unwrap_or(-1).clamp(-1, count as i32 - 1),
     })
 }

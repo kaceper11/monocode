@@ -5,12 +5,14 @@ import {
   browserClipboardUrl,
   browserFavorites,
   browserTabLabel,
+  isBrowserCommandRequest,
   isBrowserFavorite,
   isLocalhostUrl,
   normalizeBrowserUrl,
   rememberedBrowserUrl,
   rememberBrowserUrl,
   removeBrowserFavorite,
+  requestBrowserCommand,
   sanitizeCaptureUrl,
   subscribeBrowserFavorites,
   toggleBrowserFavorite,
@@ -319,6 +321,80 @@ describe("browser tabs in the layout", () => {
       restored.editorPanes[0].files[0].browser?.expanded,
     ).toBeUndefined();
   });
+
+  it("updateBrowserTab stores the private flag and keeps it through later patches", () => {
+    const browser = { ...newBrowserTab("/repo", "http://localhost:3000/"), id: "b1" };
+    const tab = {
+      ...newTab("s1"),
+      editorPanes: [{ id: "p1", files: [browser], activeFileId: "b1" }],
+    };
+    let next = updateBrowserTab(tab, "b1", { persist: false });
+    let entry = next.editorPanes[0].files[0];
+    expect(entry.browser?.persist).toBe(false);
+
+    // A title patch keeps the flag.
+    next = updateBrowserTab(next, "b1", { title: "App" });
+    entry = next.editorPanes[0].files[0];
+    expect(entry.browser?.persist).toBe(false);
+    expect(entry.browser?.title).toBe("App");
+  });
+
+  it("updateBrowserTab keeps the url on an empty patch and normalizes persist:true", () => {
+    const browser = { ...newBrowserTab("/repo", "http://localhost:3000/"), id: "b1" };
+    const tab = {
+      ...newTab("s1"),
+      editorPanes: [{ id: "p1", files: [browser], activeFileId: "b1" }],
+    };
+    // An empty url must not blank the tab or its file path — transient
+    // page events can report one during a load handoff.
+    let next = updateBrowserTab(tab, "b1", { url: "", title: "Loading" });
+    let entry = next.editorPanes[0].files[0];
+    expect(entry.browser?.url).toBe("http://localhost:3000/");
+    expect(entry.path).toBe("http://localhost:3000/");
+    expect(entry.browser?.title).toBe("Loading");
+
+    // persist is the default — a true patch must not serialize it.
+    next = updateBrowserTab(next, "b1", { persist: false });
+    entry = next.editorPanes[0].files[0];
+    expect(entry.browser?.persist).toBe(false);
+    next = updateBrowserTab(next, "b1", { persist: true });
+    entry = next.editorPanes[0].files[0];
+    expect(entry.browser?.persist).toBeUndefined();
+  });
+
+  it("newBrowserTab marks a private tab", () => {
+    const file = newBrowserTab("/repo", "http://localhost:3000/", false);
+    expect(file.browser?.persist).toBe(false);
+    expect(newBrowserTab("/repo", "http://localhost:3000/").browser?.persist).toBeUndefined();
+  });
+});
+
+describe("browser command requests", () => {
+  it("dispatches a labelled command event", () => {
+    const seen: string[] = [];
+    const onEvent = (event: Event) => {
+      if (isBrowserCommandRequest(event)) {
+        seen.push(`${event.detail.label}:${event.detail.command}`);
+      }
+    };
+    window.addEventListener("monocode:browser-command", onEvent);
+    try {
+      requestBrowserCommand("browser-1", "find");
+      requestBrowserCommand("browser-2", "devtools");
+    } finally {
+      window.removeEventListener("monocode:browser-command", onEvent);
+    }
+    expect(seen).toEqual(["browser-1:find", "browser-2:devtools"]);
+  });
+
+  it("rejects non-command events", () => {
+    expect(isBrowserCommandRequest(new Event("x"))).toBe(false);
+    expect(
+      isBrowserCommandRequest(
+        new CustomEvent("x", { detail: { label: "browser-1" } }),
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("browser tabs in the workspace snapshot", () => {
@@ -379,6 +455,32 @@ describe("browser tabs in the workspace snapshot", () => {
     const files = parsed?.tabs[0].editorPanes[0].files;
     expect(files?.[0].browser?.expanded).toBe(true);
     expect(files?.[1].browser?.expanded).toBeUndefined();
+  });
+
+  it("round-trips the private flag, sanitizing bad values", () => {
+    const parsed = parseWorkspaceSnapshot(
+      snapshotWith([
+        {
+          id: "b1",
+          path: "http://localhost:3000/",
+          cwd: "/repo",
+          browser: {
+            url: "http://localhost:3000/",
+            persist: false,
+          },
+        },
+        {
+          id: "b2",
+          path: "http://localhost:4000/",
+          cwd: "/repo",
+          browser: { url: "http://localhost:4000/", persist: "no" },
+        },
+      ]),
+    );
+    const files = parsed?.tabs[0].editorPanes[0].files;
+    expect(files?.[0].browser?.persist).toBe(false);
+    // A non-boolean persist falls back to the persistent default.
+    expect(files?.[1].browser?.persist).toBeUndefined();
   });
 
   it.each([

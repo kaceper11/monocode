@@ -15,6 +15,31 @@ import type { Attachment } from "./session";
 export const OPEN_BROWSER_EVENT = "monocode:open-browser";
 export const LINK_CHOICE_EVENT = "monocode:link-choice";
 
+/** App-level routing → the BrowserView owning `label`. Menu accelerators
+ * reach the window even while the native webview holds focus, so commands
+ * travel over a DOM event that only the addressed tab acts on. */
+export const BROWSER_COMMAND_EVENT = "monocode:browser-command";
+
+export type BrowserCommand =
+  | "reload"
+  | "focus-url"
+  | "find"
+  | "devtools";
+
+export function requestBrowserCommand(label: string, command: BrowserCommand) {
+  window.dispatchEvent(
+    new CustomEvent(BROWSER_COMMAND_EVENT, { detail: { label, command } }),
+  );
+}
+
+export function isBrowserCommandRequest(
+  event: Event,
+): event is CustomEvent<{ label: string; command: BrowserCommand }> {
+  if (!(event instanceof CustomEvent)) return false;
+  const detail = event.detail as { label?: string; command?: string } | null;
+  return !!detail && typeof detail.label === "string" && !!detail.command;
+}
+
 const BROWSER_EVENT_NAME = "monocode:browser";
 const MAX_URL_LENGTH = 8192;
 const REMEMBERED_KEY = "monocode.browserUrls";
@@ -350,8 +375,9 @@ export function browserOpen(
   url: string,
   bounds: BrowserBounds,
   background?: [number, number, number, number],
+  persist?: boolean,
 ): Promise<void> {
-  return invoke("browser_open", { label, url, bounds, background });
+  return invoke("browser_open", { label, url, bounds, background, persist });
 }
 
 export function browserClose(label: string): Promise<void> {
@@ -386,6 +412,35 @@ export function browserSetVisible(
   visible: boolean,
 ): Promise<void> {
   return invoke("browser_set_visible", { label, visible });
+}
+
+/** Toggle the page inspector; resolves whether it is open afterwards. */
+export function browserDevtools(label: string, open?: boolean): Promise<boolean> {
+  return invoke("browser_devtools", { label, open });
+}
+
+/** Wipe the persistent browser profile's site data (cookies, storage). */
+export function browserClearData(label: string): Promise<void> {
+  return invoke("browser_clear_data", { label });
+}
+
+/** PNG screenshot of the visible page → system clipboard. */
+export function browserCopyScreenshot(label: string): Promise<void> {
+  return invoke("browser_copy_screenshot", { label });
+}
+
+export type BrowserFindResult = {
+  count: number;
+  /** 0-based current match, -1 when nothing matched. */
+  index: number;
+};
+
+export function browserFind(
+  label: string,
+  query: string,
+  forward?: boolean,
+): Promise<BrowserFindResult> {
+  return invoke("browser_find", { label, query, forward });
 }
 
 /** Swap-flash color — the pane's painted background, so navigation
