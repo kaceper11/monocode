@@ -22,6 +22,8 @@ import { registerHarness, type HarnessAdapter } from "./registry";
 export const cursorAdapter: HarnessAdapter = {
   id: "cursor",
   live: true,
+  // The native notify-only steer path cannot confirm acceptance; queue follow-ups.
+  canSteer: false,
   sendTurn: sendCursorTurn,
   steerTurn: steerCursorTurn,
   cancelTurn: cancelCursorTurn,

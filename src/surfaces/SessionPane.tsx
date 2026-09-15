@@ -1,3 +1,6 @@
+import { markTurnRendered } from "../lib/turnTiming";
+import { matchesActiveTurnModel } from "../lib/harness/apply";
+import { canSteerHarnessSession } from "../lib/harness/registry";
 import { SessionIssues } from "../chrome/SessionIssues";
 import { TaskScopeChip } from "../chrome/TaskScopeChip";
 import { AgentActionsMenu } from "../chrome/AgentActionsMenu";
@@ -14,6 +17,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -44,6 +48,7 @@ import {
 } from "../lib/session";
 import { AgentTranscript } from "./AgentTranscript";
 import { EmptySession } from "./EmptySession";
+import { SessionSurface } from "./SessionSurface";
 import { MOD } from "../lib/platform";
 import {
   acknowledgeQuoteRequest,
@@ -98,7 +103,7 @@ type Props = {
       action?: import("../lib/agentActions").ActionRunRef;
       followUpBehavior?: import("../lib/settings").FollowUpBehavior;
     },
-  ) => void;
+  ) => boolean | Promise<boolean>;
   onStop: (sessionId: string) => void;
   onCompactContext: (sessionId: string) => boolean;
   onPlaceSessionInFolder: (
@@ -327,6 +332,9 @@ export const SessionPane = memo(function SessionPane({
     window.addEventListener(ADD_TO_CHAT_EVENT, onAdd);
     return () => window.removeEventListener(ADD_TO_CHAT_EVENT, onAdd);
   }, [addSelectionToChat, addToChatTarget]);
+  useLayoutEffect(() => {
+    if (visible && session.blocks.length > 0) markTurnRendered(session.id);
+  }, [visible, session.id, session.blocks]);
   const workCwd = sessionWorkCwd(session);
   // A task session's branch and working copy belong to the task child —
   // the generic pickers could move it out from under the task record, so
@@ -352,10 +360,11 @@ export const SessionPane = memo(function SessionPane({
   const isEmpty = session.blocks.length === 0;
   const showDeckProjectPicker = isEmpty && !looksLikeProject(session.cwd);
   const dockComposer = !isEmpty || inSplit || !!session.inboxAsk;
+  const [composerHost, setComposerHost] = useState<HTMLDivElement | null>(null);
   const draftRef = useRef<string | undefined>(undefined);
   const composer = (
     <Composer
-      enabled={visible}
+      enabled={visible && (dockComposer || composerHost !== null)}
       focused={focused && composerFocused}
       hotkeys={focused}
       shell={!dockComposer}
@@ -393,6 +402,8 @@ export const SessionPane = memo(function SessionPane({
       noteCard={session.noteCard}
       handoffCard={session.handoffCard}
       question={session.pendingQuestion}
+      modelChangePending={!!session.busy && !!session.activeTurnModel && !matchesActiveTurnModel(session)}
+      canSteer={matchesActiveTurnModel(session) && canSteerHarnessSession(session.harness, session.id)}
       onQuoteRequestConsumed={acknowledgeQuote}
       onInboxCardDismiss={fileId => onInboxCardDismiss?.(session.id, fileId)}
       onNoteCardDismiss={() => onNoteCardDismiss?.(session.id)}
@@ -550,7 +561,7 @@ export const SessionPane = memo(function SessionPane({
               hasChatBackground={Boolean(
                 projectBackground || globalBackgroundPath,
               )}
-              composer={dockComposer ? undefined : composer}
+              composer={dockComposer ? undefined : <div ref={setComposerHost} />}
             />
           )
         ) : (
@@ -558,6 +569,7 @@ export const SessionPane = memo(function SessionPane({
             <AgentTranscript
               blocks={session.blocks}
               busy={!!session.busy}
+              activity={session.activity}
               visible={visible}
               cwd={workCwd}
               harness={session.harness}
@@ -623,9 +635,12 @@ export const SessionPane = memo(function SessionPane({
           </>
         )}
       </div>
-      {dockComposer ? (
-        <div className="mx-auto w-full max-w-4xl shrink-0">{composer}</div>
-      ) : null}
+      {/* Keep the editor mounted while the first send moves it out of the welcome layout. */}
+      <div className={dockComposer ? "mx-auto w-full max-w-4xl shrink-0" : "hidden"}>
+        <SessionSurface host={dockComposer ? undefined : composerHost ?? undefined}>
+          {composer}
+        </SessionSurface>
+      </div>
     </div>
   );
 });

@@ -10,6 +10,7 @@ import {
   sendDevinTurn,
   setDevinRuntimeMode,
   steerDevinTurn,
+  canSteerDevinSession,
   stopDevinSession,
 } from "./devin";
 import { refreshDevinCatalog } from "./devinCatalog";
@@ -24,6 +25,7 @@ export const devinAdapter: HarnessAdapter = {
   prewarm: prewarmDevinSession,
   compactContext: compactDevinContext,
   steerTurn: steerDevinTurn,
+  canSteerSession: canSteerDevinSession,
   cancelTurn: cancelDevinTurn,
   respondApproval: respondDevinApproval,
   setRuntimeMode: setDevinRuntimeMode,

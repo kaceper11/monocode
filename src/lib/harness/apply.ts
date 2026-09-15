@@ -22,11 +22,50 @@ import { isReviewablePlan } from "../plan";
 import { resolveModel } from "../models";
 import type { HarnessEvent } from "./types";
 
+/** Apply one UI batch without copying the transcript for every text chunk. */
+export function applyHarnessEvents(
+  session: Session,
+  events: readonly HarnessEvent[],
+): Session {
+  if (events.length === 1) return applyHarnessEvent(session, events[0]);
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    session = applyHarnessEvent(session, event);
+    if (event.type !== "message.delta" && event.type !== "reasoning.delta") continue;
+    const role = event.type === "message.delta" ? "assistant" : "reasoning";
+    const last = session.blocks[session.blocks.length - 1];
+    // Empty reasoning deltas do not open a block. Let the next event do so.
+    if (last?.role !== role || !last.streaming) continue;
+    let text = last.text;
+    while (index + 1 < events.length) {
+      const next = events[index + 1];
+      if (next.type !== event.type) break;
+      // Join against the accumulated text: joining raw chunks first changes
+      // the meaning of snapshots, repeated tokens and Markdown whitespace.
+      text = joinStreamText(text, next.text);
+      index += 1;
+    }
+    if (text !== last.text) {
+      const blocks = session.blocks.slice();
+      blocks[blocks.length - 1] = { ...last, text };
+      session = { ...session, blocks };
+    }
+  }
+  return session;
+}
+
 export function applyHarnessEvent(
   session: Session,
   event: HarnessEvent,
 ): Session {
+  if (session.activity && (
+    event.type === "message.delta" || event.type === "reasoning.delta" ||
+    event.type === "tool.started" || event.type === "question.asked" ||
+    event.type === "approval.requested"
+  )) session = { ...session, activity: undefined };
   switch (event.type) {
+    case "session.activity":
+      return session.activity === event.text ? session : { ...session, activity: event.text };
     case "message.delta":
       return patchStreaming(session, "assistant", event.text, true);
     case "message.completed":
@@ -100,6 +139,10 @@ export function applyHarnessEvent(
       return session.pendingQuestion?.requestId === event.requestId
         ? { ...session, pendingQuestion: undefined }
         : session;
+    case "question.error":
+      return session.pendingQuestion?.requestId === event.requestId
+        ? { ...session, pendingQuestion: { ...session.pendingQuestion, error: event.message } }
+        : session;
     case "context":
       return {
         ...session,
@@ -120,11 +163,20 @@ export function applyHarnessEvent(
       });
     case "session.providerBound":
       return { ...session, providerSessionId: event.providerSessionId };
-    case "session.configChanged":
+    case "session.configChanged": {
+      const active = session.activeTurnModel;
+      const preserveNextChoice = !!active && !matchesActiveTurnModel(session);
+      const actual = active && {
+        harness: active.harness,
+        id: event.model ?? active.id,
+        name: event.model ? resolveModel(active.harness, event.model, session.cwd).name : active.name,
+      };
+      const start = lastMatchingBlock(session.blocks, (block) =>
+        block.role === "user" && block.startedAt != null && block.durationMs == null);
       return {
         ...session,
-        ...(event.model ? { model: event.model } : {}),
-        ...(event.modelSettings
+        ...(!preserveNextChoice && event.model ? { model: event.model } : {}),
+        ...(!preserveNextChoice && event.modelSettings
           ? {
               modelSettings: {
                 ...session.modelSettings,
@@ -132,7 +184,13 @@ export function applyHarnessEvent(
               },
             }
           : {}),
+        ...(active && actual ? {
+          activeTurnModel: { ...actual, settings: { ...active.settings, ...event.modelSettings } },
+          blocks: session.blocks.map((block, index) => start >= 0 && index >= start && block.role === "user"
+            ? { ...block, turnModel: actual } : block),
+        } : {}),
       };
+    }
     case "status":
       return appendStatus(session, event.text);
     default:
@@ -332,6 +390,25 @@ function turnModelFields(session: Session) {
   };
 }
 
+/** Capture the settings owned by a turn or manual compaction before IO starts. */
+export function startSessionActivity(session: Session): Session {
+  return {
+    ...session,
+    busy: true,
+    activity: undefined,
+    activeTurnModel: { ...turnModelFields(session).turnModel, settings: { ...session.modelSettings } },
+  };
+}
+
+/** A steer continues the running model; changed picker settings need a new turn. */
+export function matchesActiveTurnModel(session: Session): boolean {
+  const active = session.activeTurnModel;
+  if (!active || active.harness !== session.harness || active.id !== session.model) return false;
+  const selected = session.modelSettings ?? {};
+  return [...new Set([...Object.keys(active.settings), ...Object.keys(selected)])]
+    .every((key) => active.settings[key] === selected[key]);
+}
+
 export function appendUser(
   session: Session,
   text: string,
@@ -339,7 +416,7 @@ export function appendUser(
   extra?: UserTurnExtra,
 ): Session {
   return appendBlock(
-    { ...session, busy: true },
+    startSessionActivity(session),
     {
       id: crypto.randomUUID(),
       role: "user",
@@ -359,6 +436,7 @@ export function appendSteerUser(
   attachments: Attachment[] = [],
   extra?: UserTurnExtra,
 ): Session {
+  const active = session.activeTurnModel;
   return {
     ...session,
     busy: true,
@@ -368,7 +446,7 @@ export function appendSteerUser(
         id: crypto.randomUUID(),
         role: "user",
         text,
-        ...turnModelFields(session),
+        ...(active ? { turnModel: { harness: active.harness, id: active.id, name: active.name } } : {}),
         ...(attachments.length > 0 ? { attachments } : {}),
         ...userTurnFields(extra),
       },
@@ -380,6 +458,8 @@ export function stopStreaming(session: Session): Session {
   return {
     ...session,
     busy: false,
+    activeTurnModel: undefined,
+    activity: undefined,
     pendingQuestion: undefined,
     blocks: stampTurnDuration(session.blocks.map(stopBlockProgress)),
   };
@@ -529,9 +609,10 @@ function stampTurnDuration(blocks: Block[]): Block[] {
 function appendStatus(session: Session, text: string): Session {
   const trimmed = text.trim();
   if (!trimmed) return session;
-  const last = [...session.blocks]
-    .reverse()
-    .find((block) => block.role !== "reasoning");
+  const last = session.blocks[lastMatchingBlock(
+    session.blocks,
+    (block) => block.role !== "reasoning",
+  )];
   if (last?.role === "system" && last.text === trimmed) return session;
   return appendBlock(session, {
     id: crypto.randomUUID(),
@@ -541,7 +622,9 @@ function appendStatus(session: Session, text: string): Session {
 }
 
 function appendBlock(session: Session, block: Block): Session {
-  return { ...session, blocks: [...sealLastStream(session.blocks), block] };
+  const blocks = sealLastStream(session.blocks);
+  blocks.push(block);
+  return { ...session, blocks };
 }
 
 /** Append to the latest block only when it is the same role; never splice into an earlier one. */

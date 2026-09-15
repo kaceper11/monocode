@@ -529,10 +529,12 @@ export function nativeModelId(
   model: AgentModel | string,
   cwd?: string,
 ): string {
-  if (typeof model !== "string") {
-    return model.nativeId ?? nativeIdFrom(model.id);
-  }
-  return findModel(model, cwd)?.nativeId ?? nativeIdFrom(model);
+  const id = typeof model === "string" ? model : model.id;
+  const entry = typeof model === "string" ? findModel(model, cwd) : model;
+  // A live catalog replaces the placeholder list. Saved "Default" selections
+  // must still mean the provider default, never a literal model named "default".
+  const placeholder = MODELS.find(candidate => candidate.id === id && candidate.nativeId === "");
+  return entry?.nativeId ?? placeholder?.nativeId ?? nativeIdFrom(id);
 }
 
 export function defaultModelSettings(

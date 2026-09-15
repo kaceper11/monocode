@@ -496,25 +496,8 @@ export function museItemEvent(
     ];
   }
 
-  if (kind === "reminderChild") {
-    // Memory/reminder child sessions are host bookkeeping — recall runs at
-    // turn start, reconciliation holds turn/completed behind the end-of-turn
-    // drain. A status line on open explains the gap without stacking tool
-    // rows the user cannot act on; the item is still tracked in `items` so
-    // the live session can detect the drain.
-    if (phase === "started") {
-      return [
-        {
-          type: "status",
-          text:
-            stringField(rec, "fallbackText") ??
-            stringField(rec, "summary") ??
-            "Muse is running memory/reminder bookkeeping.",
-        },
-      ];
-    }
-    return [];
-  }
+  // Reminder bookkeeping is transient host activity, never transcript content.
+  if (kind === "reminderChild") return [];
 
   // workflow and unknown kinds render generically.
   const status = museItemStatus(rec.status, terminal);

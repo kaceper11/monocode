@@ -25,6 +25,7 @@ export class AcpSubagents {
     { id: number; kind: "message" | "reasoning"; text: string }
   >();
   private sequence = 0;
+  private completed = new Set<string>();
 
   isChild(params: unknown): boolean {
     return !!this.parent(params);
@@ -38,6 +39,7 @@ export class AcpSubagents {
           return [event];
         this.tools.add(event.callId);
         this.indexAliases(params, event.callId);
+        this.retireCompleted(event.callId, event.status);
         const backlog = this.pending.get(event.callId) ?? [];
         this.pending.delete(event.callId);
         return [event, ...backlog];
@@ -47,6 +49,7 @@ export class AcpSubagents {
     for (const event of events) {
       if (event.type === "tool.started" || event.type === "tool.updated") {
         this.owners.set(event.callId, parent);
+        this.retireCompleted(event.callId, event.status);
         this.indexAliases(params, event.callId);
         this.prose.delete(parent);
         output.push({
@@ -106,6 +109,27 @@ export class AcpSubagents {
     if (this.pending.size > 32)
       this.pending.delete(this.pending.keys().next().value!);
     return [];
+  }
+
+  /** Keep a bounded late-event window, retaining every unfinished parent. */
+  private retireCompleted(callId: string, status: string | undefined): void {
+    if (!["completed", "failed", "cancelled"].includes(status ?? "")) return;
+    this.completed.delete(callId);
+    this.completed.add(callId);
+    while (this.completed.size > 256) {
+      const retired = this.completed.values().next().value!;
+      this.completed.delete(retired);
+      this.tools.delete(retired);
+      this.owners.delete(retired);
+      this.prose.delete(retired);
+      this.pending.delete(retired);
+      for (const [child, parent] of this.owners) {
+        if (parent === retired) this.owners.delete(child);
+      }
+      for (const [alias, parent] of this.aliases) {
+        if (parent === retired) this.aliases.delete(alias);
+      }
+    }
   }
 
   private parent(params: unknown): string | undefined {

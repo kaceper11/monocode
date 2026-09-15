@@ -31,7 +31,7 @@ import {
 } from "./codexCatalog";
 import { codexQuestions, codexQuestionResponse } from "./codexQuestions";
 import { codexMcpConfirmation } from "./codexElicitation";
-import { joinStreamText, snapshotRemainder } from "./streamText";
+import { snapshotRemainder } from "./streamText";
 import { acquireSharedStart } from "./liveStart";
 import { markTurn } from "../turnTiming";
 import type {
@@ -77,16 +77,18 @@ type Live = {
   visibleQuestionId: number | null;
   nextApprovalUiId: number;
   cancelled: boolean;
+  cancellation: Promise<void> | null;
+  cancelGeneration: number;
   muteUpdates: boolean;
   activeTurnId: string | null;
+  completedTurnIds: Set<string>;
   turns: Promise<void>;
   /** Resolves when the current turn completes (or is cancelled). */
   turnDone: (() => void) | null;
   turnFailed: ((error: Error) => void) | null;
   /** turn/completed arrived before runTurn registered turnDone. */
   turnEndPending: boolean;
-  emittedAssistant: string;
-  emittedReasoning: string;
+  emittedText: Map<string, string>;
   /** The model the bound thread reports; backstops a placeholder picker id. */
   threadModel: string;
   /** Server requests received before the live session was bound. */
@@ -94,7 +96,8 @@ type Live = {
   /** Child thread id -> the agent tool row that spawned it. */
   subagentThreads: Map<string, string>;
   /** Child notifications that arrived before their row was known. */
-  pendingSubagent: Map<string, Array<{ method: string; params: unknown }>>;
+  pendingSubagent: Map<string, Array<{ method: string; params: unknown; bytes: number }>>;
+  pendingSubagentBytes: number;
   /** Agent rows still running, by call id, with the name to settle them under. */
   openAgentRows: Map<string, string>;
 };
@@ -107,6 +110,8 @@ type Resume = {
 const liveByThread = new Map<string, Live>();
 const resumeByThread = new Map<string, Resume>();
 const cancelledThreads = new Set<string>();
+const START_CANCELLED = new Error("Codex session stopped during startup");
+const startupByThread = new Map<string, { cancelled: boolean; rpc?: JsonRpcClient }>();
 
 let resolveCodexBinaryImpl: (cwd?: string) => Promise<{ path: string }> =
   resolveCodexBinary;
@@ -119,19 +124,25 @@ export function setCodexBinaryResolver(
 }
 
 export async function sendCodexTurn(input: SendTurnInput): Promise<void> {
+  const previous = liveByThread.get(input.sessionId);
+  const previousGeneration = previous?.cancelGeneration;
   let live: Live;
   try {
     live = await acquireLive(input);
   } catch (error) {
     cancelledThreads.delete(input.sessionId);
+    if (error === START_CANCELLED) return;
     throw error;
   }
   if (cancelledThreads.delete(input.sessionId)) return;
+  if (previous === live && previous.cancelGeneration !== previousGeneration) return;
+  const generation = live.cancelGeneration;
 
-  live.onEvent = input.onEvent;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (liveByThread.get(input.sessionId) !== live || live.cancelGeneration !== generation) return;
+      live.onEvent = input.onEvent;
       live.runtimeMode = input.runtimeMode;
       live.planning = input.intent === "plan";
       live.cancelled = false;
@@ -150,19 +161,25 @@ export async function sendCodexTurn(input: SendTurnInput): Promise<void> {
 export async function compactCodexContext(
   input: CompactContextInput,
 ): Promise<void> {
+  const previous = liveByThread.get(input.sessionId);
+  const previousGeneration = previous?.cancelGeneration;
   let live: Live;
   try {
     live = await acquireLive(input);
   } catch (error) {
     cancelledThreads.delete(input.sessionId);
+    if (error === START_CANCELLED) return;
     throw error;
   }
   if (cancelledThreads.delete(input.sessionId)) return;
+  if (previous === live && previous.cancelGeneration !== previousGeneration) return;
+  const generation = live.cancelGeneration;
 
-  live.onEvent = input.onEvent;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (liveByThread.get(input.sessionId) !== live || live.cancelGeneration !== generation) return;
+      live.onEvent = input.onEvent;
       live.cancelled = false;
       live.muteUpdates = false;
       flushEarlyRequests(live);
@@ -176,9 +193,14 @@ export async function compactCodexContext(
   await live.turns;
 }
 
+export function canSteerCodexSession(sessionId: string): boolean {
+  const live = liveByThread.get(sessionId);
+  return !!live?.activeTurnId && !live.cancelled && !live.muteUpdates;
+}
+
 export async function steerCodexTurn(input: SteerTurnInput): Promise<void> {
   const live = liveByThread.get(input.sessionId);
-  if (!live) throw new Error("No active Codex session");
+  if (!live || live.cwd !== input.cwd) throw new Error("No active Codex session in this workspace");
   const turnId = live.activeTurnId;
   if (!turnId) throw new Error("No active turn to steer");
 
@@ -286,31 +308,62 @@ export async function cancelCodexTurn(sessionId: string): Promise<void> {
   const live = liveByThread.get(sessionId);
   if (!live) {
     cancelledThreads.add(sessionId);
+    if (startupByThread.has(sessionId)) await stopCodexSession(sessionId);
     return;
   }
+  if (live.cancellation) return live.cancellation;
+  live.cancelGeneration += 1;
   live.cancelled = true;
   live.muteUpdates = true;
+  // Admission has no interruptible ID yet; close the owned host so the
+  // acknowledged request cannot execute after Stop. Resume stays available.
+  if (!live.activeTurnId) {
+    await stopCodexSession(sessionId);
+    return;
+  }
   clearServerRequests(live);
   const turnId = live.activeTurnId;
-  if (turnId) {
-    await live.rpc
-      .request("turn/interrupt", {
-        threadId: live.threadId,
-        turnId,
-      })
-      .catch(() => undefined);
-  }
+  // The visible turn settles at Stop press — the interrupt below only tells
+  // the host and must not hold the UI open for the wire round-trip. The
+  // remembered id keeps a late turn/completed from sealing the next turn.
+  rememberCompletedTurn(live, turnId);
   finishActiveTurn(live, [
     { type: "message.completed" },
     { type: "reasoning.completed" },
   ]);
+  const work = (async () => {
+    try {
+      await live.rpc.request("turn/interrupt", {
+        threadId: live.threadId,
+        turnId,
+      }, 15_000);
+    } catch {
+      // A rejected or unconfirmed Stop must not leave hidden execution alive.
+      if (liveByThread.get(sessionId) === live) await stopCodexSession(sessionId);
+    }
+  })();
+  live.cancellation = work;
+  // Awaiters see the work through `live.cancellation`; the detached cleanup
+  // chain must not surface a second unhandled rejection.
+  void work
+    .finally(() => {
+      if (live.cancellation === work) live.cancellation = null;
+    })
+    .catch(() => undefined);
 }
 
 export async function stopCodexSession(sessionId: string): Promise<void> {
+  const startup = startupByThread.get(sessionId);
+  if (startup) {
+    startup.cancelled = true;
+    startup.rpc?.close(START_CANCELLED);
+    startingByThread.delete(sessionId);
+  }
   cancelledThreads.delete(sessionId);
   const live = liveByThread.get(sessionId);
   liveByThread.delete(sessionId);
   if (live) {
+    live.cancelGeneration += 1;
     live.muteUpdates = true;
     live.cancelled = true;
     clearServerRequests(live);
@@ -321,7 +374,7 @@ export async function stopCodexSession(sessionId: string): Promise<void> {
   }
   // Only kill a child this adapter owns — after a harness switch another
   // adapter may hold a live child under the same session id.
-  if (live || startingByThread.has(sessionId)) {
+  if (live || startup || startingByThread.has(sessionId)) {
     unwatchChild(sessionId);
     await killChild(sessionId).catch(() => undefined);
   }
@@ -350,6 +403,8 @@ async function acquireLive(
   input: HarnessSessionInput,
   keepExisting = false,
 ): Promise<Live> {
+  const cancellation = liveByThread.get(input.sessionId)?.cancellation;
+  if (cancellation) await cancellation;
   return acquireSharedStart(
     input.sessionId,
     liveByThread,
@@ -368,13 +423,14 @@ export async function prewarmCodexSession(
   input: HarnessSessionInput,
 ): Promise<void> {
   if (liveByThread.has(input.sessionId)) return;
-  await acquireLive(input, true);
+  try { await acquireLive(input, true); } catch (error) {
+    if (error !== START_CANCELLED) throw error;
+  }
 }
 
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   const existing = liveByThread.get(input.sessionId);
   if (existing && existing.cwd === input.cwd) {
-    existing.onEvent = input.onEvent;
     return existing;
   }
   if (existing) {
@@ -382,6 +438,25 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     await stopCodexSession(input.sessionId);
   }
 
+  const startup: { cancelled: boolean; rpc?: JsonRpcClient } = { cancelled: false };
+  startupByThread.set(input.sessionId, startup);
+  try {
+    return await startLive(input, startup);
+  } catch (error) {
+    if (startup.cancelled) throw START_CANCELLED;
+    throw error;
+  } finally {
+    if (startupByThread.get(input.sessionId) === startup) startupByThread.delete(input.sessionId);
+  }
+}
+
+async function startLive(
+  input: HarnessSessionInput,
+  startup: { cancelled: boolean; rpc?: JsonRpcClient },
+): Promise<Live> {
+  const assertStarting = () => {
+    if (startup.cancelled) throw START_CANCELLED;
+  };
   const resume = resumeByThread.get(input.sessionId);
   const canResume = resume != null && resume.cwd === input.cwd;
   if (resume && resume.cwd !== input.cwd) {
@@ -389,6 +464,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   }
 
   const { path } = await resolveCodexBinaryImpl(input.cwd);
+  assertStarting();
   markTurn(input.sessionId, "codex binary resolved");
   const liveRef: { current: Live | null } = { current: null };
   // Requests can race session binding (e.g. a pending approval re-issued by
@@ -440,6 +516,9 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     { includeJsonrpc: false, label: "codex" },
   );
 
+  startup.rpc = rpc;
+  assertStarting();
+
   watchChild(
     input.sessionId,
     (line) => rpc.pushLine(line),
@@ -459,10 +538,10 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     },
   );
 
-  await spawnChild(input.sessionId, path, ["app-server"], input.cwd);
-  markTurn(input.sessionId, "codex spawned");
-
   try {
+    await spawnChild(input.sessionId, path, ["app-server"], input.cwd);
+    assertStarting();
+    markTurn(input.sessionId, "codex spawned");
     await rpc.request("initialize", {
       clientInfo: {
         name: "monocode",
@@ -541,20 +620,24 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       visibleQuestionId: null,
       nextApprovalUiId: 1,
       cancelled: false,
+      cancellation: null,
+      cancelGeneration: 0,
       muteUpdates: didResume,
       activeTurnId: null,
+      completedTurnIds: new Set(),
       turns: Promise.resolve(),
       turnDone: null,
       turnFailed: null,
       turnEndPending: false,
-      emittedAssistant: "",
-      emittedReasoning: "",
+      emittedText: new Map(),
       threadModel,
       earlyRequests,
       subagentThreads: new Map(),
       pendingSubagent: new Map(),
+      pendingSubagentBytes: 0,
       openAgentRows: new Map(),
     };
+    assertStarting();
     liveRef.current = live;
     liveByThread.set(input.sessionId, live);
     resumeByThread.set(input.sessionId, {
@@ -570,10 +653,14 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     return live;
   } catch (error) {
     rpc.close(error instanceof Error ? error : new Error(String(error)));
-    await stopCodexSession(input.sessionId);
+    if (!startup.cancelled) {
+      if (startupByThread.get(input.sessionId) === startup) startupByThread.delete(input.sessionId);
+      await stopCodexSession(input.sessionId);
+    }
     throw error;
   }
 }
+
 
 /**
  * The session's app-server already answers account/read and model/list, so the
@@ -626,8 +713,7 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
     return;
   }
 
-  live.emittedAssistant = "";
-  live.emittedReasoning = "";
+  live.emittedText.clear();
 
   const turnPromise = new Promise<void>((resolve, reject) => {
     live.turnDone = resolve;
@@ -642,7 +728,7 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
     );
     markTurn(input.sessionId, "codex turn/start ack");
     const turnId = response.turn?.id;
-    if (turnId) {
+    if (turnId && live.turnDone) {
       live.activeTurnId = live.activeTurnId ?? turnId;
     }
     settlePendingTurn(live);
@@ -661,8 +747,7 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
 }
 
 async function runCompaction(live: Live): Promise<void> {
-  live.emittedAssistant = "";
-  live.emittedReasoning = "";
+  live.emittedText.clear();
   const turnPromise = new Promise<void>((resolve, reject) => {
     live.turnDone = resolve;
     live.turnFailed = reject;
@@ -712,6 +797,10 @@ function handleNotification(live: Live, method: string, params: unknown): void {
     handleSubagentNotification(live, threadId, method, params);
     return;
   }
+  const eventTurnId = stringField(rec, "turnId") ?? stringField(asRecord(rec?.turn), "id");
+  if (eventTurnId && live.completedTurnIds.has(eventTurnId)) return;
+  if ((method === "turn/completed" || method === "turn/aborted") &&
+      eventTurnId && live.activeTurnId && eventTurnId !== live.activeTurnId) return;
   // A Codex turn is a sequence of items. Completing an agentMessage does not
   // mean the turn is over — more tools and messages can still arrive. Only
   // turn/completed (and turn/aborted) settle sendCodexTurn, which is what the
@@ -732,14 +821,22 @@ function handleNotification(live: Live, method: string, params: unknown): void {
     if (duplicate && duplicateAgentRow(event)) continue;
     trackAgentRow(live, event);
     if (event.type === "message.delta") {
-      publishCodexText(live, "assistant", event.text, snapshot);
+      publishCodexText(live, "assistant", event.text, snapshot, stringField(rec, "itemId") ?? stringField(asRecord(rec?.item), "id"));
       continue;
     }
     if (event.type === "reasoning.delta") {
-      publishCodexText(live, "reasoning", event.text, snapshot);
+      publishCodexText(live, "reasoning", event.text, snapshot, stringField(rec, "itemId") ?? stringField(asRecord(rec?.item), "id"));
       continue;
     }
     live.onEvent(event);
+  }
+  if (snapshot) {
+    const item = asRecord(rec?.item);
+    const role = item?.type === "agentMessage" ? "assistant" : item?.type === "reasoning" ? "reasoning" : undefined;
+    if (role) {
+      live.emittedText.delete(`${role}:${stringField(item, "id") ?? "current"}`);
+      live.emittedText.delete(`${role}:current`);
+    }
   }
   // Metadata and steps can arrive before the spawn. Create its row first.
   for (const childId of codexSubagentThreadIds(asRecord(rec?.item) ?? {})) {
@@ -747,14 +844,17 @@ function handleNotification(live: Live, method: string, params: unknown): void {
     if (!owner) continue;
     const backlog = live.pendingSubagent.get(childId);
     live.pendingSubagent.delete(childId);
-    for (const pending of backlog ?? [])
+    for (const pending of backlog ?? []) {
+      live.pendingSubagentBytes -= pending.bytes;
       emitSubagentSteps(live, owner, pending.method, pending.params);
+    }
   }
   settleSubagentRows(live, rec);
   if (mapped.activeTurnId !== undefined) {
     live.activeTurnId = mapped.activeTurnId;
   }
   if (mapped.turnCompleted) {
+    rememberCompletedTurn(live, eventTurnId ?? live.activeTurnId);
     finishActiveTurn(live);
   }
 }
@@ -804,6 +904,11 @@ function bindSubagentThreads(
       if (owner !== callId) claimed += 1;
       continue;
     }
+    if (live.subagentThreads.size >= 128) {
+      const retired = [...live.subagentThreads].find(([, row]) => !live.openAgentRows.has(row));
+      if (retired) live.subagentThreads.delete(retired[0]);
+      else continue;
+    }
     live.subagentThreads.set(childId, callId);
   }
   return children.length > 0 && claimed === children.length;
@@ -843,8 +948,12 @@ function handleSubagentNotification(
   )
     return;
   const backlog = live.pendingSubagent.get(threadId) ?? [];
-  if (backlog.length >= MAX_PENDING_SUBAGENT) return;
-  backlog.push({ method, params });
+  const bytes = JSON.stringify(params ?? null).length * 2;
+  if (backlog.length >= MAX_PENDING_SUBAGENT || bytes > 64 * 1024 ||
+      live.pendingSubagentBytes + bytes > 1024 * 1024 ||
+      (!live.pendingSubagent.has(threadId) && live.pendingSubagent.size >= 64)) return;
+  backlog.push({ method, params, bytes });
+  live.pendingSubagentBytes += bytes;
   live.pendingSubagent.set(threadId, backlog);
 }
 
@@ -919,27 +1028,39 @@ function publishCodexText(
   role: "assistant" | "reasoning",
   text: string,
   snapshot: boolean,
+  itemId?: string,
 ): void {
-  const already =
-    role === "assistant" ? live.emittedAssistant : live.emittedReasoning;
+  const keyed = `${role}:${itemId ?? "current"}`;
+  const key = snapshot && !live.emittedText.has(keyed) && live.emittedText.has(`${role}:current`) ? `${role}:current` : keyed;
+  const already = live.emittedText.get(key) ?? "";
   const emit = snapshot ? snapshotRemainder(already, text) : text;
-  if (!emit) return;
-  if (role === "assistant") {
-    live.emittedAssistant = joinStreamText(already, emit);
-    live.onEvent({ type: "message.delta", text: emit });
-    return;
+  if (snapshot) live.emittedText.delete(key);
+  else {
+    if (live.emittedText.size >= 64 && !live.emittedText.has(key)) {
+      live.emittedText.delete(live.emittedText.keys().next().value!);
+    }
+    live.emittedText.set(key, already + emit);
   }
-  live.emittedReasoning = joinStreamText(already, emit);
-  live.onEvent({ type: "reasoning.delta", text: emit });
+  if (emit) live.onEvent({ type: role === "assistant" ? "message.delta" : "reasoning.delta", text: emit });
+}
+
+/** Keep recent terminal identities across admissions, including successful Stops. */
+function rememberCompletedTurn(live: Live, turnId: string | null | undefined): void {
+  if (!turnId || live.completedTurnIds.has(turnId)) return;
+  if (live.completedTurnIds.size >= 64) {
+    live.completedTurnIds.delete(live.completedTurnIds.values().next().value!);
+  }
+  live.completedTurnIds.add(turnId);
 }
 
 function finishActiveTurn(live: Live, extraEvents: HarnessEvent[] = []): void {
   clearServerRequests(live);
   closeOpenAgentRows(live);
+  live.pendingSubagent.clear();
+  live.pendingSubagentBytes = 0;
   live.turnEndPending = false;
   live.activeTurnId = null;
-  live.emittedAssistant = "";
-  live.emittedReasoning = "";
+  live.emittedText.clear();
   for (const event of extraEvents) {
     live.onEvent(event);
   }
@@ -1222,8 +1343,15 @@ export function __codexTestReset(): void {
   liveByThread.clear();
   resumeByThread.clear();
   cancelledThreads.clear();
+  startupByThread.clear();
 }
 
 export function __codexTestResumeMap(): Map<string, Resume> {
   return resumeByThread;
+}
+
+/** Bounded-state inspection for regression tests. */
+export function __codexTestRetained(sessionId: string) {
+  const live = liveByThread.get(sessionId);
+  return { children: live?.subagentThreads.size ?? 0, pending: live?.pendingSubagent.size ?? 0, bytes: live?.pendingSubagentBytes ?? 0, completedTurns: live?.completedTurnIds.size ?? 0 };
 }

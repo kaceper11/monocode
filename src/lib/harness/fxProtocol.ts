@@ -1,3 +1,9 @@
+import {
+  acpPermissionOptions,
+  type AcpPermissionOption,
+  acpPermissionOptionId,
+  isAcpMcpToolCall,
+} from "./acp";
 import type { PromptContentBlock } from "../attachments";
 import type { AgentModel, ModelSetting, ModelSettingChoice } from "../models";
 import type { RuntimeMode, ToolPreview } from "../session";
@@ -12,7 +18,6 @@ import {
 } from "./preview";
 import { fxToolInfo, fxToolVerb } from "./fxTool";
 import { acpAgentInfo } from "./acpSubagents";
-import { acpPermissionOptionId, isAcpMcpToolCall } from "./acp";
 
 export type FxModeId = "ask" | "code";
 
@@ -22,6 +27,7 @@ export type FxPermissionRequest = {
   callId?: string;
   preview?: ToolPreview;
   optionIds: string[];
+  options?: AcpPermissionOption[];
 };
 
 export type SessionConfigOption = {
@@ -113,6 +119,7 @@ export function permissionRequestFromAcp(
       stringField(subject ?? {}, "toolCallId"),
     preview,
     optionIds,
+    options: acpPermissionOptions(rec?.options),
   };
 }
 

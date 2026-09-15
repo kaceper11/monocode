@@ -23,6 +23,8 @@ export type UserQuestionPrompt = {
   questions: UserQuestion[];
   /** Deadline owned by the harness; interaction can disable automatic skipping. */
   autoResolveAt?: number;
+  /** Invalid reply; the question remains open for correction. */
+  error?: string;
 };
 
 export type UserQuestionReply =
@@ -96,7 +98,7 @@ export function buildQuestionReply(
   for (const question of answered) {
     const selected = answers[question.id];
     if (selected?.length) nextAnswers[question.id] = selected;
-    const text = custom[question.id]?.trim();
+    const text = question.allowCustom ? custom[question.id]?.trim() : undefined;
     if (text) nextCustom[question.id] = text;
   }
   return {
@@ -125,6 +127,7 @@ export function isCustomSelection(
   question: UserQuestion,
   optionId: string,
 ): boolean {
+  if (!question.allowCustom) return false;
   if (optionId === CUSTOM_OPTION_ID) return true;
   const option = question.options.find((item) => item.id === optionId);
   return option ? isOtherOption(option) : false;

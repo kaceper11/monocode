@@ -1,7 +1,14 @@
+import {
+  acpStopReasonMessage,
+  acpUnsupportedControl,
+  type AcpPermissionOption,
+  AcpClient,
+  type AcpHandlers,
+} from "./acp";
+import { acquireSharedStart } from "./liveStart";
 import { nativeModelId } from "../models";
 import { AcpSubagents } from "./acpSubagents";
 import type { RuntimeMode } from "../session";
-import { AcpClient, type AcpHandlers } from "./acp";
 import type { JsonRpcId } from "./jsonRpc";
 import {
   killChild,
@@ -45,6 +52,7 @@ import { questionPromptTitle, type UserQuestionReply } from "../userQuestion";
 type PendingApproval = {
   kind?: string;
   optionIds: string[];
+  options?: AcpPermissionOption[];
   resolve: (decision: ApprovalDecision) => void;
 };
 
@@ -54,6 +62,7 @@ type Live = {
   acpSessionId: string;
   cwd: string;
   modelId: string;
+  appliedEffort?: string;
   contextWindow?: number;
   muteUpdates: boolean;
   cancelled: boolean;
@@ -67,6 +76,7 @@ type Live = {
   questions: Map<string, (reply: UserQuestionReply) => void>;
   /** Synthetic requestId source for ACP requests with non-numeric ids. */
   nextRequestId: number;
+  turnGeneration: number;
   turns: Promise<void>;
 };
 
@@ -89,6 +99,7 @@ const CLIENT_CAPABILITIES = {
 const liveByThread = new Map<string, Live>();
 const resumeByThread = new Map<string, Resume>();
 const cancelledThreads = new Set<string>();
+const startingClients = new Map<string, AcpClient>();
 
 /**
  * Live Grok Build adapter. Spawns `grok agent stdio` and talks ACP.
@@ -97,17 +108,19 @@ const cancelledThreads = new Set<string>();
 export async function sendGrokTurn(input: SendTurnInput): Promise<void> {
   let live: Live;
   try {
-    live = await ensureLive(input);
+    live = await acquireLive(input);
   } catch (error) {
     cancelledThreads.delete(input.sessionId);
     throw error;
   }
   if (cancelledThreads.delete(input.sessionId)) return;
 
-  live.onEvent = input.onEvent;
+  const generation = live.turnGeneration;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (liveByThread.get(input.sessionId) !== live || live.turnGeneration !== generation) return;
+      live.onEvent = input.onEvent;
       // Posture applies when the queued turn actually runs — applying it at
       // enqueue time would flip the running turn's permission handling.
       live.runtimeMode = input.runtimeMode;
@@ -126,7 +139,7 @@ export async function sendGrokTurn(input: SendTurnInput): Promise<void> {
     await live.turns;
   } catch (error) {
     if (liveByThread.get(input.sessionId) === live) {
-      await stopGrokSession(input.sessionId);
+      await stopGrokSession(input.sessionId, true);
     }
     throw error;
   }
@@ -137,14 +150,16 @@ export async function compactGrokContext(
 ): Promise<void> {
   let live = liveByThread.get(input.sessionId);
   if (!live || live.cwd !== input.cwd) {
-    live = await ensureLive(input);
+    live = await acquireLive(input);
   }
   if (cancelledThreads.delete(input.sessionId)) return;
 
-  live.onEvent = input.onEvent;
+  const generation = live.turnGeneration;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (liveByThread.get(input.sessionId) !== live || live.turnGeneration !== generation) return;
+      live.onEvent = input.onEvent;
       live.cancelled = false;
       live.muteUpdates = false;
       try {
@@ -198,7 +213,7 @@ export function setGrokRuntimeMode(
     if (runtimeMode === "auto") live.autoMode = true;
   }
   for (const [key, pending] of live.approvals) {
-    if (!pickAutoOption(runtimeMode, pending.kind, pending.optionIds)) {
+    if (!pickAutoOption(runtimeMode, pending.kind, pending.optionIds, pending.options)) {
       continue;
     }
     live.approvals.delete(key);
@@ -218,25 +233,36 @@ export async function cancelGrokTurn(sessionId: string): Promise<void> {
   const live = liveByThread.get(sessionId);
   if (!live) {
     cancelledThreads.add(sessionId);
+    const starting = startingClients.get(sessionId);
+    if (starting) {
+      starting.close(new Error("cancelled"));
+      unwatchChild(sessionId);
+      await killChild(sessionId).catch(() => undefined);
+    }
     return;
   }
+  live.turnGeneration += 1;
   live.cancelled = true;
   live.muteUpdates = true;
   for (const [, pending] of live.approvals) pending.resolve("deny");
   live.approvals.clear();
   for (const [, resolve] of live.questions) resolve({ kind: "skipped" });
   live.questions.clear();
+  live.acp.rejectPending(new Error("cancelled"));
   await live.acp
     .notify("session/cancel", { sessionId: live.acpSessionId })
     .catch(() => undefined);
-  live.acp.rejectPending(new Error("cancelled"));
 }
 
-export async function stopGrokSession(sessionId: string): Promise<void> {
-  cancelledThreads.delete(sessionId);
+export async function stopGrokSession(sessionId: string, internal = false): Promise<void> {
+  if (!internal && startingByThread.has(sessionId)) cancelledThreads.add(sessionId);
+  else cancelledThreads.delete(sessionId);
+  const starting = startingClients.get(sessionId);
+  starting?.close(new Error("cancelled"));
   const live = liveByThread.get(sessionId);
   liveByThread.delete(sessionId);
   if (live) {
+    live.cancelled = true;
     live.muteUpdates = true;
     for (const [, pending] of live.approvals) pending.resolve("deny");
     live.approvals.clear();
@@ -244,8 +270,10 @@ export async function stopGrokSession(sessionId: string): Promise<void> {
     live.questions.clear();
   }
   live?.acp.close();
-  unwatchChild(sessionId);
-  await killChild(sessionId).catch(() => undefined);
+  if (live || starting) {
+    unwatchChild(sessionId);
+    await killChild(sessionId).catch(() => undefined);
+  }
 }
 
 export async function forgetGrokSession(sessionId: string): Promise<void> {
@@ -263,6 +291,12 @@ export function bindGrokSession(
   resumeByThread.set(threadId, { acpSessionId: sessionId, cwd });
 }
 
+const startingByThread = new Map<string, Promise<Live>>();
+
+function acquireLive(input: Parameters<typeof ensureLive>[0]): Promise<Live> {
+  return acquireSharedStart(input.sessionId, liveByThread, startingByThread, () => ensureLive(input));
+}
+
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   const wantPlanning = input.intent === "plan";
   const wantFullAccess = input.runtimeMode === "full-access" && !wantPlanning;
@@ -275,11 +309,10 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     existing.autoMode === wantAutoMode &&
     existing.planning === wantPlanning
   ) {
-    existing.onEvent = input.onEvent;
     return existing;
   }
   if (existing) {
-    await stopGrokSession(input.sessionId);
+    await stopGrokSession(input.sessionId, true);
   }
 
   const resume = resumeByThread.get(input.sessionId);
@@ -288,9 +321,12 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     resumeByThread.delete(input.sessionId);
   }
 
+  if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
   const { path } = await resolveGrokBinary(input.cwd);
+  if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(input.sessionId, handlers);
+  startingClients.set(input.sessionId, acp);
   const liveRef: { current: Live | null } = { current: null };
   const muteGate = { current: false };
 
@@ -313,6 +349,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     }
     void handleRequest(live, id, method, params).catch((error) => {
       console.debug("[monocode] grok request handler failed", error);
+      (liveRef.current?.onEvent ?? input.onEvent)({ type: "session.error", message: error instanceof Error ? error.message : String(error) });
       void acp
         .respondError(id, { code: -32603, message: "Internal error" })
         .catch(() => undefined);
@@ -353,7 +390,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     },
   );
 
-  await spawnChild(
+  try {
+    await spawnChild(
     input.sessionId,
     path,
     grokSpawnArgs({
@@ -365,7 +403,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     input.cwd,
   );
 
-  try {
+    if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
     let init: unknown;
     try {
       init = await acp.request(
@@ -407,7 +445,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
         );
         acpSessionId = sessionIdFromResult(setup) ?? resume.acpSessionId;
         didLoad = true;
-      } catch {
+      } catch (error) {
+        if (!acpUnsupportedControl(error)) throw new Error(`Could not resume the saved conversation; its binding was preserved. ${error instanceof Error ? error.message : String(error)}`);
         muteGate.current = true;
         try {
           setup = await acp.request(
@@ -421,10 +460,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
           );
           acpSessionId = sessionIdFromResult(setup) ?? resume.acpSessionId;
           didLoad = true;
-        } catch {
-          setup = undefined;
-          acpSessionId = undefined;
-          didLoad = false;
+        } catch (error) {
+          throw new Error(`Could not load the saved conversation; its binding was preserved. ${error instanceof Error ? error.message : String(error)}`);
         } finally {
           muteGate.current = false;
         }
@@ -464,8 +501,11 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       approvals: new Map(),
       questions: new Map(),
       nextRequestId: 1_000_000_000,
+      turnGeneration: 0,
       turns: Promise.resolve(),
     };
+    if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
+    startingClients.delete(input.sessionId);
     liveRef.current = live;
     liveByThread.set(input.sessionId, live);
     resumeByThread.set(input.sessionId, {
@@ -480,7 +520,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     return live;
   } catch (error) {
     acp.close(error instanceof Error ? error : new Error(String(error)));
-    await stopGrokSession(input.sessionId);
+    await stopGrokSession(input.sessionId, true);
+    if (startingClients.get(input.sessionId) === acp) startingClients.delete(input.sessionId);
     throw error;
   }
 }
@@ -499,30 +540,25 @@ async function applyModelSelection(
       )
       .then(() => {
         live.modelId = base;
-      })
-      .catch((error: unknown) => {
-        ignoreUnsupportedControl("set_model", error);
       });
   }
 
   const effort = grokEffort(input.modelSettings);
-  if (!effort) return;
+  if (!effort || live.appliedEffort === effort) return;
   await live.acp
     .request(
       "session/set_mode",
       { sessionId: live.acpSessionId, modeId: effort },
       CONTROL_TIMEOUT_MS,
-    )
-    .catch((error: unknown) => {
-      ignoreUnsupportedControl("set_mode", error);
-    });
+    );
+  live.appliedEffort = effort;
 }
 
 async function prompt(live: Live, input: SendTurnInput): Promise<void> {
   try {
     const blocks = grokPromptBlocks(input.text, input.attachments);
     if (blocks.length === 0) return;
-    await live.acp.request(
+    const result = await live.acp.request<{ stopReason?: string }>(
       "session/prompt",
       {
         sessionId: live.acpSessionId,
@@ -531,6 +567,8 @@ async function prompt(live: Live, input: SendTurnInput): Promise<void> {
       PROMPT_TIMEOUT_MS,
     );
     if (live.cancelled) return;
+    const stopMessage = acpStopReasonMessage("Grok", result?.stopReason ?? "");
+    if (stopMessage) live.onEvent({ type: "session.error", message: stopMessage });
     live.onEvent({ type: "message.completed" });
     live.onEvent({ type: "reasoning.completed" });
   } catch (error) {
@@ -546,11 +584,6 @@ async function prompt(live: Live, input: SendTurnInput): Promise<void> {
   }
 }
 
-function ignoreUnsupportedControl(method: string, error: unknown): void {
-  console.debug(`[monocode] grok ${method} failed`, error);
-  const detail = error instanceof Error ? error.message : String(error);
-  if (/timed out|not running|exited|closed|pipe/i.test(detail)) throw error;
-}
 
 function handleNotification(live: Live, method: string, params: unknown) {
   const updateParams =
@@ -596,12 +629,14 @@ async function handleRequest(
     method === "_x.ai/ask_user_question" ||
     method === "x.ai/ask_user_question"
   ) {
-    await handleAskQuestion(live, id, params);
+    await live.acp.queueQuestion((cancelled) => handleAskQuestion(live, id, params, cancelled));
     return;
   }
   if (method === "_x.ai/exit_plan_mode" || method === "x.ai/exit_plan_mode") {
-    const plan = planFromExitPlan(params);
-    if (plan) live.onEvent({ type: "plan", text: plan });
+    if (!live.cancelled && !live.muteUpdates) {
+      const plan = planFromExitPlan(params);
+      if (plan) live.onEvent({ type: "plan", text: plan });
+    }
     await live.acp
       // End the provider-owned plan turn without approving implementation.
       // MonoCode's separate Build turn is the only approval boundary.
@@ -642,6 +677,7 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     const optionId = permissionOptionId(
       readOnly ? "allow" : "deny",
       request.optionIds,
+      request.options,
     );
     await live.acp
       .respond(
@@ -658,6 +694,7 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     live.runtimeMode,
     request.kind,
     request.optionIds,
+    request.options,
   );
   if (auto) {
     await live.acp
@@ -682,13 +719,14 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     live.approvals.set(String(requestId), {
       kind: request.kind,
       optionIds: request.optionIds,
+      options: request.options,
       resolve,
     });
   });
   live.approvals.delete(String(requestId));
   live.onEvent({ type: "approval.resolved", requestId, decision });
 
-  const optionId = permissionOptionId(decision, request.optionIds);
+  const optionId = live.cancelled || live.muteUpdates ? undefined : permissionOptionId(decision, request.optionIds, request.options);
   await live.acp
     .respond(
       id,
@@ -699,8 +737,8 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     .catch(() => undefined);
 }
 
-async function handleAskQuestion(live: Live, id: JsonRpcId, params: unknown) {
-  if (live.cancelled || live.muteUpdates) {
+async function handleAskQuestion(live: Live, id: JsonRpcId, params: unknown, cancelled = false) {
+  if (cancelled || live.cancelled || live.muteUpdates) {
     // ask_user_question's wire shape is flat — not the permission envelope.
     await live.acp
       .respond(id, { outcome: "skip_interview" })

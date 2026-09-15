@@ -1,8 +1,9 @@
+import { markTurn } from "../turnTiming";
 import { writeChild } from "./child";
 
 type Pending = {
   resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
+  reject: (error: Error, cancelWrite?: boolean) => void;
 };
 
 export type JsonRpcId = number | string;
@@ -52,6 +53,7 @@ export class JsonRpcClient {
   }
 
   pushLine(line: string) {
+    if (this.closed) return;
     const trimmed = line.trim();
     if (!trimmed) return;
     let msg: JsonRpcMessage;
@@ -91,8 +93,16 @@ export class JsonRpcClient {
     timeoutMs = 0,
   ): Promise<T> {
     if (this.closed) throw new Error("Harness process is not running");
+    if (
+      method === "turn/start" ||
+      method === "turn/steer" ||
+      method === "session/prompt"
+    ) {
+      markTurn(this.sessionId, `${method} write`);
+    }
     const id = this.nextId++;
     const key = String(id);
+    const cancellation = new AbortController();
     // Register before writing. A local harness can answer quickly enough for
     // Tauri to deliver its stdout event before harness_write resolves; adding
     // the pending entry after send() silently discarded that response.
@@ -101,6 +111,7 @@ export class JsonRpcClient {
         timeoutMs > 0
           ? setTimeout(() => {
               this.pending.delete(key);
+              cancellation.abort();
               reject(new Error(`${method} timed out`));
             }, timeoutMs)
           : undefined;
@@ -109,28 +120,29 @@ export class JsonRpcClient {
           if (timer) clearTimeout(timer);
           resolve(value as T);
         },
-        reject: (error) => {
+        reject: (error, cancelWrite = true) => {
           if (timer) clearTimeout(timer);
+          if (cancelWrite) cancellation.abort();
           reject(error);
         },
       });
     });
-    try {
-      await this.send({
+    // The response owns settlement, including while the native write is blocked.
+    // Observe the send independently: never wait for it before exposing timeout/cancel.
+    void this.send(
+      {
         ...(this.includeJsonrpc ? { jsonrpc: "2.0" } : {}),
         id,
         method,
         ...(params !== undefined ? { params } : {}),
-      });
-    } catch (error) {
+      },
+      cancellation.signal,
+    ).catch((error: unknown) => {
       const pending = this.pending.get(key);
-      if (pending) {
-        this.pending.delete(key);
-        pending.reject(
-          error instanceof Error ? error : new Error(String(error)),
-        );
-      }
-    }
+      if (!pending) return;
+      this.pending.delete(key);
+      pending.reject(error instanceof Error ? error : new Error(String(error)));
+    });
     return response;
   }
 
@@ -162,8 +174,9 @@ export class JsonRpcClient {
     });
   }
 
-  private async send(payload: object): Promise<void> {
-    await writeChild(this.sessionId, JSON.stringify(payload));
+  private async send(payload: object, signal?: AbortSignal): Promise<void> {
+    if (this.closed) throw new Error("Harness process is not running");
+    await writeChild(this.sessionId, JSON.stringify(payload), signal);
   }
 
   private handle(msg: JsonRpcMessage) {
@@ -180,7 +193,9 @@ export class JsonRpcClient {
         // (e.g. -32601 → method not supported → config-option fallback).
         failure.code = msg.error.code;
         failure.data = msg.error.data;
-        pending.reject(failure);
+        // A server error confirms delivery; it must not cancel/kill a healthy
+        // host just because the native write acknowledgement is still queued.
+        pending.reject(failure, false);
         return;
       }
       pending.resolve(msg.result);

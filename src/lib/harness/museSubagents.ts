@@ -45,6 +45,7 @@ export type MuseRoutedChild = {
   events: HarnessEvent[];
   /** Nested child sessions discovered while routing. */
   follow: { sessionId: string; callId: string; meta: MuseSubagentMeta }[];
+  end: string[];
 };
 
 /** Identity shown on the parent row's run: agent path leaf, then its role. */
@@ -66,6 +67,7 @@ export function museSubagentMeta(
 
 export class MuseSubagentTrails {
   private followed = new Map<string, FollowedMuseChild>();
+  private closingCalls = new Set<string>();
 
   has(sessionId: string): boolean {
     return this.followed.has(sessionId);
@@ -88,7 +90,7 @@ export class MuseSubagentTrails {
     callId: string,
     meta?: MuseSubagentMeta,
   ): FollowedMuseChild | undefined {
-    if (!sessionId || this.followed.has(sessionId)) return undefined;
+    if (!sessionId || this.followed.has(sessionId) || this.closingCalls.has(callId)) return undefined;
     if (this.followed.size >= MUSE_MAX_FOLLOWED) return undefined;
     const child: FollowedMuseChild = {
       callId,
@@ -102,8 +104,18 @@ export class MuseSubagentTrails {
     return child;
   }
 
+  closeCall(callId: string): void {
+    this.closingCalls.add(callId);
+  }
+
+  sessionsForCall(callId: string): string[] {
+    return [...this.followed].filter(([, child]) => child.callId === callId).map(([id]) => id);
+  }
+
   unregister(sessionId: string): void {
+    const callId = this.followed.get(sessionId)?.callId;
     this.followed.delete(sessionId);
+    if (callId && this.sessionsForCall(callId).length === 0) this.closingCalls.delete(callId);
   }
 
   /**
@@ -117,7 +129,7 @@ export class MuseSubagentTrails {
     params: unknown,
   ): MuseRoutedChild {
     const child = this.followed.get(sessionId);
-    const out: MuseRoutedChild = { events: [], follow: [] };
+    const out: MuseRoutedChild = { events: [], follow: [], end: [] };
     if (!child) return out;
     const rec = asRecord(params);
     const cursor = stringField(rec, "viewCursor");
@@ -142,6 +154,7 @@ export class MuseSubagentTrails {
       // keeps that activity on the same root row.
       if (stringField(item, "kind") === "subagent") {
         const nested = stringField(item, "childSessionId");
+        if (nested && nested !== sessionId && phase === "completed") out.end.push(nested);
         if (nested && nested !== sessionId && !this.followed.has(nested)) {
           out.follow.push({
             sessionId: nested,
@@ -199,6 +212,9 @@ export class MuseSubagentTrails {
         let prose = child.prose.get(itemId);
         if (!prose || prose.kind !== kind) prose = { kind, text: "" };
         prose.text = (prose.text + event.text).slice(0, MAX_PROSE_CHARS);
+        if (!child.prose.has(itemId) && child.prose.size >= 128) {
+          child.prose.delete(child.prose.keys().next().value!);
+        }
         child.prose.set(itemId, prose);
         out.events.push({
           type: "agent.step",

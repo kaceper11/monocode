@@ -7,8 +7,10 @@ import {
   respondCopilotApproval,
   respondCopilotQuestion,
   sendCopilotTurn,
+  prewarmCopilotSession,
   setCopilotRuntimeMode,
   steerCopilotTurn,
+  canSteerCopilotSession,
   stopCopilotSession,
 } from "./copilot";
 import { refreshCopilotCatalog } from "./copilotCatalog";
@@ -20,8 +22,10 @@ export const copilotAdapter: HarnessAdapter = {
   canSteer: true,
   commands: copilotCommandProvider,
   sendTurn: sendCopilotTurn,
+  prewarm: prewarmCopilotSession,
   compactContext: compactCopilotContext,
   steerTurn: steerCopilotTurn,
+  canSteerSession: canSteerCopilotSession,
   cancelTurn: cancelCopilotTurn,
   respondApproval: respondCopilotApproval,
   setRuntimeMode: setCopilotRuntimeMode,

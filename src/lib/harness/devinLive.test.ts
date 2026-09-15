@@ -188,6 +188,52 @@ describe("devin live turn sequence", () => {
     await stopDevinSession("t2");
   });
 
+  it.each([false, true])("waits for a follow-up when the main prompt finishes first (failed=%s)", async (failed) => {
+    const events: HarnessEvent[] = [];
+    const turn = sendDevinTurn(baseInput(events, "first", `main-first-${failed}`) as never);
+
+    await waitFor(() => byMethod("initialize").length > 0, "initialize");
+    reply(byMethod("initialize")[0].id, {
+      protocolVersion: 1,
+      agentCapabilities: { loadSession: true },
+    });
+    await waitFor(() => byMethod("session/new").length > 0, "session/new");
+    reply(byMethod("session/new")[0].id, {
+      ...SETUP,
+      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+    });
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
+    const mainPromptId = lastByMethod("session/prompt").id;
+
+    // While the main prompt is unanswered, a steer is its own session/prompt.
+    const steer = steerDevinTurn({
+      sessionId: `main-first-${failed}`,
+      cwd: "/repo",
+      model: "devin:default",
+      text: "also check the tests",
+      attachments: [],
+    } as never);
+    await waitFor(
+      () => byMethod("session/prompt").length === 2,
+      "steer prompt",
+    );
+    const steerPromptId = lastByMethod("session/prompt").id;
+    expect(byMethod("session/prompt")[1].params.prompt[0].text).toBe(
+      "also check the tests",
+    );
+
+    let settled = false;
+    void turn.then(() => { settled = true; });
+    reply(mainPromptId, { stopReason: "end_turn" });
+    await new Promise(r => setTimeout(r, 0));
+    expect(settled).toBe(false);
+    reply(steerPromptId, { stopReason: failed ? "max_tokens" : "end_turn" });
+    await steer;
+    await turn;
+    expect(events.some(e => e.type === "session.error")).toBe(failed);
+    await stopDevinSession(`main-first-${failed}`);
+  });
+
   it("surfaces a permission request in supervised mode and resolves it", async () => {
     const events: HarnessEvent[] = [];
     const turn = sendDevinTurn(baseInput(events, "run tests", "t3") as never);

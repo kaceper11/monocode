@@ -1,9 +1,11 @@
-import { promptBlocks, type PromptContentBlock } from "../attachments";
 import {
+  acpPermissionOptions,
+  type AcpPermissionOption,
   acpAutoOption,
   acpPermissionOptionId,
   isAcpMcpToolCall,
 } from "./acp";
+import { promptBlocks, type PromptContentBlock } from "../attachments";
 import type { AgentModel, ModelSetting, ModelSettingChoice } from "../models";
 import type { Attachment, RuntimeMode, ToolPreview } from "../session";
 import { normalizeTaskListStatus } from "../taskList";
@@ -59,6 +61,7 @@ export type GrokPermissionRequest = {
   callId?: string;
   preview?: ToolPreview;
   optionIds: string[];
+  options?: AcpPermissionOption[];
 };
 
 export type GrokAskQuestion = UserQuestion;
@@ -236,6 +239,7 @@ export function permissionRequestFromAcp(
       stringField(rec ?? {}, "toolCallId"),
     preview: mergePreview(preview, grok.path, grok.query, kind),
     optionIds,
+    options: acpPermissionOptions(rec?.options),
   };
 }
 

@@ -447,3 +447,13 @@ it("keeps Windows-discovered model catalogs out of WSL pickers", () => {
   expect(preferredModelId("claude", cwd)).not.toBe("claude:windows-only");
   resetHarnessModelOverlays();
 });
+
+it.each(["codex", "devin", "copilot", "muse"] as const)("keeps %s Default semantics after a live catalog replaces placeholders", async (harness) => {
+  const { nativeModelId, resetHarnessModelOverlays, setHarnessModels } = await import("./models");
+  resetHarnessModelOverlays();
+  expect(nativeModelId(`${harness}:default`, "/repo")).toBe("");
+  setHarnessModels(harness, [{ id: `${harness}:live`, nativeId: "live", harness, name: "Live" }], "/repo");
+  expect(nativeModelId(`${harness}:default`, "/repo")).toBe("");
+  expect(nativeModelId(`${harness}:live`, "/repo")).toBe("live");
+  resetHarnessModelOverlays();
+});

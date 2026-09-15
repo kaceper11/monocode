@@ -315,22 +315,26 @@ fn translate_agent_cwd(host: &Location, line: String) -> Result<String, String> 
     let Ok(mut message) = serde_json::from_str::<Value>(&line) else {
         return Ok(line);
     };
-    // ACP and Codex carry execution cwd in this protocol field. Never rewrite
-    // prompts, tool results, resume identifiers or arbitrary nested strings.
+    // Translate execution fields only; prompts and nested tool data stay intact.
     if message.get("method").and_then(Value::as_str).is_none() {
         return Ok(line);
     }
-    if let Some(cwd) = message.pointer("/params/cwd").and_then(Value::as_str) {
-        if let Some(target) = location(cwd)? {
-            if !target.distribution.eq_ignore_ascii_case(&host.distribution) {
-                return Err("Agent cwd belongs to a different WSL distribution".into());
+    let mut changed = false;
+    for field in ["cwd", "workspaceRoot"] {
+        if let Some(cwd) = message["params"][field].as_str() {
+            if let Some(target) = location(cwd)? {
+                if !target.distribution.eq_ignore_ascii_case(&host.distribution) {
+                    return Err("Agent cwd belongs to a different WSL distribution".into());
+                }
+                message["params"][field] = target.path.into();
+                changed = true;
+            } else if !cwd.starts_with('/') || cwd.starts_with("//") || cwd.contains('\\') {
+                return Err("Agent cwd must be a path in its Linux distribution".into());
             }
-            message["params"]["cwd"] = target.path.into();
-            return Ok(message.to_string());
         }
-        if !cwd.starts_with('/') || cwd.starts_with("//") || cwd.contains('\\') {
-            return Err("Agent cwd must be a path in its Linux distribution".into());
-        }
+    }
+    if changed {
+        return Ok(message.to_string());
     }
     Ok(line)
 }
@@ -1395,21 +1399,32 @@ with tempfile.TemporaryDirectory(prefix='monocode-env-') as directory:
     #[test]
     fn agent_protocol_translates_only_execution_cwd_and_rejects_other_hosts() {
         let host = Location::new("Ubuntu", "/repo space ż").unwrap();
-        let prompt = format!("Read {} literally", host.identity());
-        let line =
-            json!({"method":"thread/start", "params":{"cwd":host.identity(), "prompt":prompt}})
-                .to_string();
-        let translated: Value =
-            serde_json::from_str(&translate_agent_cwd(&host, line).unwrap()).unwrap();
-        assert_eq!(translated["params"]["cwd"], host.path);
-        assert_eq!(translated["params"]["prompt"], prompt);
-        for cwd in ["C:\\repo", "//wsl.localhost/Debian/repo"] {
-            assert!(translate_agent_cwd(
-                &host,
-                json!({"method":"session/new","params":{"cwd":cwd}}).to_string()
-            )
-            .is_err());
+        for field in ["cwd", "workspaceRoot"] {
+            let mut request = json!({"method":"session/start", "params":{
+                "prompt": "Keep ~/literal and //wsl.localhost/Ubuntu/repo",
+                "tool": {"cwd":"~"}
+            }});
+            request["params"][field] = host.identity().into();
+            let translated: Value =
+                serde_json::from_str(&translate_agent_cwd(&host, request.to_string()).unwrap())
+                    .unwrap();
+            request["params"][field] = host.path.clone().into();
+            assert_eq!(translated, request);
+            for cwd in ["~", "C:\\repo", "//wsl.localhost/Debian/repo"] {
+                request["params"][field] = cwd.into();
+                assert!(translate_agent_cwd(&host, request.to_string()).is_err());
+            }
         }
+        assert!(translate_agent_cwd(
+            &host,
+            json!({
+                "method":"session/start", "params":{
+                    "cwd":host.identity(), "workspaceRoot":"//wsl.localhost/Debian/repo"
+                }
+            })
+            .to_string()
+        )
+        .is_err());
     }
     #[cfg(unix)]
     #[test]

@@ -35,6 +35,8 @@ vi.mock("./child", () => ({
 
 const {
   sendCopilotTurn,
+  prewarmCopilotSession,
+  steerCopilotTurn,
   cancelCopilotTurn,
   respondCopilotApproval,
   respondCopilotQuestion,
@@ -137,6 +139,43 @@ describe("copilot live turn", () => {
     sent.length = 0;
     spawned.length = 0;
     killed.length = 0;
+  });
+
+  it("shares a cold start between prewarm and Send", async () => {
+    const warm = prewarmCopilotSession({
+      sessionId: "warm-send", cwd: "/repo", model: "copilot:default",
+      runtimeMode: "auto", onEvent: () => {},
+    });
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "warm-send", { runtimeMode: "auto" });
+    await warm;
+    await waitFor(() => byMethod("session/prompt").length === 1, "prompt");
+    expect(spawned).toHaveLength(1);
+    expect(byMethod("initialize")).toHaveLength(1);
+    notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ready" } });
+    reply(lastByMethod("session/prompt").id, { stopReason: "end_turn" });
+    await turn;
+    expect(events.some(event => event.type === "message.delta" && event.text === "ready")).toBe(true);
+    await stopCopilotSession("warm-send");
+  });
+
+  it.each([false, true])("waits for the final follow-up result (failed=%s)", async (failed) => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, `main-first-${failed}`, { runtimeMode: "auto" });
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
+    const first = lastByMethod("session/prompt").id;
+    const steer = steerCopilotTurn({ sessionId: `main-first-${failed}`, cwd: "/repo", model: "copilot:default", text: "second" });
+    await waitFor(() => byMethod("session/prompt").length === 2, "steer");
+    let settled = false;
+    void turn.then(() => { settled = true; });
+    reply(first, { stopReason: "end_turn" });
+    await new Promise(r => setTimeout(r, 0));
+    expect(settled).toBe(false);
+    reply(lastByMethod("session/prompt").id, { stopReason: failed ? "max_tokens" : "end_turn" });
+    await steer;
+    await turn;
+    expect(events.some(e => e.type === "session.error")).toBe(failed);
+    await stopCopilotSession(`main-first-${failed}`);
   });
 
   it("launches --acp --stdio with the chosen effort and streams a turn", async () => {

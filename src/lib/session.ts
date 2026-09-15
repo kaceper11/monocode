@@ -184,6 +184,8 @@ export type QueuedMessage = {
   id: string;
   text: string;
   attachments: Attachment[];
+  /** Delivery was not confirmed; paused until the user reviews before retrying. */
+  deliveryError?: string;
   noteCard?: NoteComposerCard;
   handoffCard?: HandoffComposerCard;
   intent?: TurnIntent;
@@ -297,6 +299,10 @@ export type Session = {
   blocks: Block[];
   /** True while a harness turn is in flight. */
   busy?: boolean;
+  /** Actual running selection, distinct from the composer's next-turn choice. */
+  activeTurnModel?: TurnModel & { settings: Record<string, string> };
+  /** Transient provider activity, cleared by content or turn completion. */
+  activity?: string;
   /** Follow-ups waiting for current turn. In-memory only. */
   queuedMessages?: QueuedMessage[];
   /** Paused after user stops current turn; resuming waits for continued turn. */
@@ -378,6 +384,11 @@ export const HARNESS_TITLE: Record<HarnessId, string> = {
 /** fx ACP rejects attachment prompt blocks. */
 export function harnessSupportsAttachments(id: HarnessId): boolean {
   return id !== "fx";
+}
+
+/** Decisions belong to the running provider, even after a next-provider pick. */
+export function sessionDecisionHarness(session: Session): HarnessId {
+  return session.activeTurnModel?.harness ?? session.pendingSwitch?.from ?? session.harness;
 }
 
 export function newSession(

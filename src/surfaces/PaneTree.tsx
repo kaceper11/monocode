@@ -73,7 +73,7 @@ type Shared = {
     text: string,
     attachments: Attachment[],
     options?: { intent?: TurnIntent },
-  ) => void;
+  ) => boolean | Promise<boolean>;
   onStop: (sessionId: string) => void;
   onCompactContext: (sessionId: string) => boolean;
   onPlaceSessionInFolder: (

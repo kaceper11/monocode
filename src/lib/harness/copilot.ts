@@ -1,14 +1,6 @@
 import {
-  hasLiveCatalog,
-  modelsFor,
-  nativeModelId,
-  setHarnessModels,
-} from "../models";
-import { pathKey } from "../paths";
-import type { RuntimeMode } from "../session";
-import type { UserQuestionReply } from "../userQuestion";
-import { questionPromptTitle } from "../userQuestion";
-import {
+  acpUnsupportedControl,
+  type AcpPermissionOption,
   acpAuthError,
   acpAutoOption,
   acpCommandsFromUpdate,
@@ -31,6 +23,18 @@ import {
   type AcpConfigOption,
   type AcpHandlers,
 } from "./acp";
+import { acquireSharedStart } from "./liveStart";
+import { markTurn } from "../turnTiming";
+import {
+  hasLiveCatalog,
+  modelsFor,
+  nativeModelId,
+  setHarnessModels,
+} from "../models";
+import { pathKey } from "../paths";
+import type { RuntimeMode } from "../session";
+import type { UserQuestionReply } from "../userQuestion";
+import { questionPromptTitle } from "../userQuestion";
 import { AcpSubagents } from "./acpSubagents";
 import type { JsonRpcId } from "./jsonRpc";
 import {
@@ -69,6 +73,7 @@ import type {
 type PendingApproval = {
   kind?: string;
   optionIds: string[];
+  options?: AcpPermissionOption[];
   resolve: (decision: ApprovalDecision) => void;
 };
 
@@ -99,6 +104,8 @@ type Live = {
   configOptions: AcpConfigOption[];
   modeIds: string[];
   currentModeId?: string;
+  desiredModeId?: string;
+  modeUpdates: Promise<void>;
   commands: NativeCommand[];
   /** `session/prompt` calls Copilot is still answering (main turn plus steers). */
   promptInFlight: number;
@@ -109,6 +116,7 @@ type Live = {
   onEvent: (event: HarnessEvent) => void;
   approvals: Map<string, PendingApproval>;
   questions: Map<string, (reply: UserQuestionReply) => void>;
+  turnGeneration: number;
   turns: Promise<void>;
 };
 
@@ -125,6 +133,7 @@ const PROMPT_TIMEOUT_MS = 30 * 60_000;
 const liveByThread = new Map<string, Live>();
 const resumeByThread = new Map<string, Resume>();
 const cancelledThreads = new Set<string>();
+const startingClients = new Map<string, AcpClient>();
 /**
  * Threads whose Copilot build rejected the `--effort` launch flag; their
  * sessions run at the CLI's default effort until forgotten.
@@ -147,17 +156,19 @@ const commandListeners = new Map<
 export async function sendCopilotTurn(input: SendTurnInput): Promise<void> {
   let live: Live;
   try {
-    live = await ensureLive(input);
+    live = await acquireLive(input);
   } catch (error) {
     cancelledThreads.delete(input.sessionId);
     throw error;
   }
   if (cancelledThreads.delete(input.sessionId)) return;
 
-  live.onEvent = input.onEvent;
+  const generation = live.turnGeneration;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (liveByThread.get(input.sessionId) !== live || live.turnGeneration !== generation) return;
+      live.onEvent = input.onEvent;
       // Posture is set when this send actually runs so a queued turn does
       // not flip the running turn's auto-permission behavior mid-flight.
       live.runtimeMode = input.runtimeMode;
@@ -165,15 +176,13 @@ export async function sendCopilotTurn(input: SendTurnInput): Promise<void> {
       live.cancelled = false;
       live.muteUpdates = false;
       try {
-        await applyModelSelection(live, input);
-        if (live.cancelled) return;
-        await applyRuntimeMode(
-          live,
-          input.runtimeMode,
-          input.intent === "plan",
-        );
+        await Promise.all([
+          applyModelSelection(live, input),
+          applyRuntimeMode(live, input.sessionId, input.runtimeMode, input.intent === "plan"),
+        ]);
         if (live.cancelled) return;
         await prompt(live, input);
+        await live.acp.waitForPrompts();
       } catch (error) {
         if (live.cancelled) return;
         throw error;
@@ -185,7 +194,7 @@ export async function sendCopilotTurn(input: SendTurnInput): Promise<void> {
     // A failed turn leaves Copilot's transport state unknowable. Keep the
     // provider session id but recycle the child so the next turn resumes.
     if (liveByThread.get(input.sessionId) === live) {
-      await stopCopilotSession(input.sessionId);
+      await stopCopilotSession(input.sessionId, true);
     }
     throw error;
   }
@@ -197,7 +206,7 @@ export async function compactCopilotContext(
   let live = liveByThread.get(input.sessionId);
   if (!live || pathKey(live.cwd) !== pathKey(input.cwd)) {
     try {
-      live = await ensureLive(input);
+      live = await acquireLive(input);
     } catch (error) {
       cancelledThreads.delete(input.sessionId);
       throw error;
@@ -205,30 +214,18 @@ export async function compactCopilotContext(
   }
   if (cancelledThreads.delete(input.sessionId)) return;
 
-  live.onEvent = input.onEvent;
+  const generation = live.turnGeneration;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (liveByThread.get(input.sessionId) !== live || live.turnGeneration !== generation) return;
+      live.onEvent = input.onEvent;
       live.cancelled = false;
       live.muteUpdates = false;
       try {
         live.onEvent({ type: "status", text: "Compacting context…" });
-        live.promptInFlight += 1;
-        try {
-          await live.acp.request(
-            "session/prompt",
-            {
-              sessionId: live.acpSessionId,
-              prompt: [{ type: "text", text: "/compact" }],
-            },
-            PROMPT_TIMEOUT_MS,
-          );
-        } finally {
-          live.promptInFlight -= 1;
-        }
-        if (live.cancelled) return;
-        live.onEvent({ type: "message.completed" });
-        live.onEvent({ type: "reasoning.completed" });
+        await prompt(live, { ...input, text: "/compact", attachments: [] });
+        await live.acp.waitForPrompts();
       } catch (error) {
         if (live.cancelled) return;
         throw error;
@@ -238,42 +235,25 @@ export async function compactCopilotContext(
     await live.turns;
   } catch (error) {
     if (liveByThread.get(input.sessionId) === live) {
-      await stopCopilotSession(input.sessionId);
+      await stopCopilotSession(input.sessionId, true);
     }
     throw error;
   }
 }
 
-/**
- * Copilot accepts `session/prompt` while a turn is running and folds it into
- * the same turn as a steer. Only reachable from the busy path; without a live
- * child there is nothing to steer.
- */
+/** Whether a follow-up can be written now, without racing startup or cleanup. */
+export function canSteerCopilotSession(sessionId: string): boolean {
+  const live = liveByThread.get(sessionId);
+  return !!live && !live.cancelled && !live.muteUpdates && live.promptInFlight > 0;
+}
+
 export async function steerCopilotTurn(input: SteerTurnInput): Promise<void> {
   const live = liveByThread.get(input.sessionId);
-  if (!live || pathKey(live.cwd) !== pathKey(input.cwd)) {
+  if (!live || pathKey(live.cwd) !== pathKey(input.cwd) || !canSteerCopilotSession(input.sessionId)) {
     throw new Error("No active Copilot session to steer");
   }
-  const blocks = acpPromptBlocks(input.text, input.attachments);
-  if (blocks.length === 0) return;
-  live.promptInFlight += 1;
-  let finished = false;
-  try {
-    await live.acp.request(
-      "session/prompt",
-      { sessionId: live.acpSessionId, prompt: blocks },
-      PROMPT_TIMEOUT_MS,
-    );
-    finished = true;
-  } finally {
-    live.promptInFlight -= 1;
-  }
-  // A steer that ran as its own turn must still close the streaming blocks;
-  // when it folded into a running turn that turn's prompt emits them instead.
-  if (finished && !live.cancelled && live.promptInFlight === 0) {
-    live.onEvent({ type: "message.completed" });
-    live.onEvent({ type: "reasoning.completed" });
-  }
+  // Use the same terminal/error handling as a main prompt.
+  await prompt(live, { ...input, runtimeMode: live.runtimeMode, onEvent: live.onEvent });
 }
 
 export function respondCopilotApproval(
@@ -300,12 +280,15 @@ export function setCopilotRuntimeMode(
   if (!live) return;
   const changed = live.runtimeMode !== runtimeMode;
   live.runtimeMode = runtimeMode;
-  void applyRuntimeMode(live, runtimeMode, live.planning).catch(
-    () => undefined,
-  );
+  const generation = live.turnGeneration;
+  void applyRuntimeMode(live, sessionId, runtimeMode, live.planning).catch((error: unknown) => {
+    if (liveByThread.get(sessionId) !== live || live.cancelled || live.muteUpdates ||
+        live.turnGeneration !== generation || live.runtimeMode !== runtimeMode) return;
+    live.onEvent({ type: "session.error", message: error instanceof Error ? error.message : String(error) });
+  });
   if (!changed) return;
   for (const [key, pending] of live.approvals) {
-    if (!acpAutoOption(runtimeMode, pending.kind, pending.optionIds)) {
+    if (!acpAutoOption(runtimeMode, pending.kind, pending.optionIds, pending.options)) {
       continue;
     }
     live.approvals.delete(key);
@@ -342,19 +325,29 @@ export async function cancelCopilotTurn(sessionId: string): Promise<void> {
   const live = liveByThread.get(sessionId);
   if (!live) {
     cancelledThreads.add(sessionId);
+    const starting = startingClients.get(sessionId);
+    if (starting) {
+      starting.close(new Error("cancelled"));
+      unwatchChild(sessionId);
+      await killChild(sessionId).catch(() => undefined);
+    }
     return;
   }
+  live.turnGeneration += 1;
   live.cancelled = true;
   live.muteUpdates = true;
   settlePending(live);
+  live.acp.rejectPending(new Error("cancelled"));
   await live.acp
     .notify("session/cancel", { sessionId: live.acpSessionId })
     .catch(() => undefined);
-  live.acp.rejectPending(new Error("cancelled"));
 }
 
-export async function stopCopilotSession(sessionId: string): Promise<void> {
-  cancelledThreads.delete(sessionId);
+export async function stopCopilotSession(sessionId: string, internal = false): Promise<void> {
+  if (!internal && startingByThread.has(sessionId)) cancelledThreads.add(sessionId);
+  else cancelledThreads.delete(sessionId);
+  const starting = startingClients.get(sessionId);
+  starting?.close(new Error("cancelled"));
   const live = liveByThread.get(sessionId);
   liveByThread.delete(sessionId);
   if (live) {
@@ -366,8 +359,10 @@ export async function stopCopilotSession(sessionId: string): Promise<void> {
     settlePending(live);
   }
   live?.acp.close();
-  unwatchChild(sessionId);
-  await killChild(sessionId).catch(() => undefined);
+  if (live || starting) {
+    unwatchChild(sessionId);
+    await killChild(sessionId).catch(() => undefined);
+  }
 }
 
 export async function forgetCopilotSession(sessionId: string): Promise<void> {
@@ -426,6 +421,17 @@ function commandContextKey(context: CommandContext): string {
   return `${context.sessionId ?? ""}\n${pathKey(context.cwd)}`;
 }
 
+const startingByThread = new Map<string, Promise<Live>>();
+
+function acquireLive(input: HarnessSessionInput, keepExisting = false): Promise<Live> {
+  return acquireSharedStart(input.sessionId, liveByThread, startingByThread, () => ensureLive(input), keepExisting);
+}
+
+export async function prewarmCopilotSession(input: HarnessSessionInput): Promise<void> {
+  if (liveByThread.has(input.sessionId)) return;
+  await acquireLive(input, true);
+}
+
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   // `--effort` is fixed when the server starts, so a reasoning change is the
   // one selection that must recycle this session's child (the ACP session is
@@ -442,11 +448,10 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   ) {
     // Posture stays with the running turn; a queued send stamps its own
     // runtimeMode/planning when its task actually starts.
-    existing.onEvent = input.onEvent;
     return existing;
   }
   if (existing) {
-    await stopCopilotSession(input.sessionId);
+    await stopCopilotSession(input.sessionId, true);
   }
 
   const resume = resumeByThread.get(input.sessionId);
@@ -455,9 +460,13 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     resumeByThread.delete(input.sessionId);
   }
 
+  if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
   const { path } = await resolveCopilotBinary(input.cwd);
+  if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
+  markTurn(input.sessionId, "copilot binary resolved");
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(input.sessionId, handlers);
+  startingClients.set(input.sessionId, acp);
   const liveRef: { current: Live | null } = { current: null };
   // The server may emit session/update (commands, mode, config, or the
   // session/load transcript replay) before the live record exists; buffer
@@ -487,6 +496,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     }
     void handleRequest(live, id, method, params).catch((err) => {
       console.debug("[monocode] copilot request handler failed", err);
+      emit({ type: "session.error", message: err instanceof Error ? err.message : String(err) });
       void acp
         .respondError(id, { code: -32603, message: "Internal error" })
         .catch(() => undefined);
@@ -529,10 +539,13 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     await spawnChild(input.sessionId, path, copilotSpawnArgs(effort), input.cwd);
   } catch (error) {
     unwatchChild(input.sessionId);
+    acp.close(error instanceof Error ? error : new Error(String(error)));
+    startingClients.delete(input.sessionId);
     throw error;
   }
 
   try {
+    if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
     let initResult: unknown;
     try {
       initResult = await acp.request(
@@ -554,6 +567,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     let acpSessionId: string | undefined;
     let didLoad = false;
 
+    if (canLoad && !supportsLoad) throw new Error("This agent cannot resume the saved conversation. Its binding was preserved; start a new chat to continue without its context.");
     if (canLoad && resume && supportsLoad) {
       try {
         setup = await acp.request(
@@ -568,13 +582,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
         acpSessionId = sessionIdFromResult(setup) ?? resume.acpSessionId;
         didLoad = true;
       } catch (loadError) {
-        console.debug("[monocode] copilot session/load failed", loadError);
-        // The failed load may have replayed the old session's transcript;
-        // drop it so it is not echoed unmuted into the fresh session.
-        earlyNotifications.length = 0;
-        setup = undefined;
-        acpSessionId = undefined;
-        didLoad = false;
+        throw new Error(`Could not resume the saved conversation; its binding was preserved. ${loadError instanceof Error ? loadError.message : String(loadError)}`);
       }
     }
 
@@ -618,6 +626,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
         ? modes.availableModeIds
         : acpModeIdsFromConfig(configOptions),
       currentModeId: modes.currentModeId,
+      modeUpdates: Promise.resolve(),
       commands: [],
       promptInFlight: 0,
       muteUpdates: didLoad,
@@ -627,8 +636,11 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       onEvent: input.onEvent,
       approvals: new Map(),
       questions: new Map(),
+      turnGeneration: 0,
       turns: Promise.resolve(),
     };
+    if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
+    startingClients.delete(input.sessionId);
     liveRef.current = live;
     liveByThread.set(input.sessionId, live);
     resumeByThread.set(input.sessionId, {
@@ -653,7 +665,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     // error or timeout with the process still running is unrelated to it.
     const flagSuspect = Boolean(effort) && childExited;
     acp.close(error instanceof Error ? error : new Error(String(error)));
-    await stopCopilotSession(input.sessionId);
+    await stopCopilotSession(input.sessionId, true);
+    if (startingClients.get(input.sessionId) === acp) startingClients.delete(input.sessionId);
     // Re-check after the cleanup await — a cancel can land while stopping.
     if (wasCancelled || cancelledThreads.has(input.sessionId)) {
       cancelledThreads.add(input.sessionId);
@@ -766,23 +779,41 @@ function modelApplyError(modelId: string, error: unknown): string {
 
 async function applyRuntimeMode(
   live: Live,
+  sessionId: string,
   runtimeMode: RuntimeMode,
   planning = false,
 ): Promise<void> {
-  const wanted = acpModeId(runtimeMode, planning, live.modeIds);
-  if (!wanted || wanted === live.currentModeId) return;
-  await live.acp
-    .request(
-      "session/set_mode",
-      { sessionId: live.acpSessionId, modeId: wanted },
-      CONTROL_TIMEOUT_MS,
-    )
-    .then(() => {
-      live.currentModeId = wanted;
-    })
-    .catch((error: unknown) => {
+  live.desiredModeId = acpModeId(runtimeMode, planning, live.modeIds);
+  const generation = live.turnGeneration;
+  const current = () => liveByThread.get(sessionId) === live &&
+    !live.cancelled && !live.muteUpdates && live.turnGeneration === generation;
+  // Read the latest selection after the previous write, not its old confirmed cache.
+  live.modeUpdates = live.modeUpdates.catch(() => undefined).then(async () => {
+    if (!current()) return;
+    const wanted = live.desiredModeId;
+    if (!wanted || wanted === live.currentModeId) return;
+    try {
+      await live.acp.request(
+        "session/set_mode",
+        { sessionId: live.acpSessionId, modeId: wanted },
+        CONTROL_TIMEOUT_MS,
+      );
+    } catch (error) {
+      // A timeout/cancel may lose the acknowledgement after the provider applied it.
+      live.currentModeId = undefined;
+      if (!current() || wanted !== live.desiredModeId) return;
       ignoreUnsupportedControl("set_mode", error);
-    });
+      return;
+    }
+    if (current()) live.currentModeId = wanted;
+    else live.currentModeId = undefined;
+  });
+  // A selection made during preparation must also settle before prompting.
+  let pending: Promise<void>;
+  do {
+    pending = live.modeUpdates;
+    await pending;
+  } while (current() && pending !== live.modeUpdates);
 }
 
 /** Returns true when the response carried a refreshed config option list. */
@@ -856,8 +887,7 @@ function isUnsupportedControl(error: unknown): boolean {
 
 function ignoreUnsupportedControl(method: string, error: unknown): void {
   console.debug(`[monocode] copilot ${method} failed`, error);
-  const detail = error instanceof Error ? error.message : String(error);
-  if (/timed out|not running|exited|closed|pipe/i.test(detail)) throw error;
+  if (!acpUnsupportedControl(error)) throw error;
 }
 
 function handleNotification(live: Live, method: string, params: unknown) {
@@ -963,7 +993,7 @@ async function handleRequest(
     return;
   }
   if (method === "elicitation/create") {
-    await handleElicitation(live, id, params);
+    await live.acp.queueQuestion((cancelled) => handleElicitation(live, id, params, cancelled));
     return;
   }
   await live.acp
@@ -999,6 +1029,7 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     const optionId = acpPermissionOptionId(
       readOnly ? "allow" : "deny",
       request.optionIds,
+      request.options,
     );
     await live.acp
       .respond(
@@ -1015,6 +1046,7 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     live.runtimeMode,
     request.kind,
     request.optionIds,
+    request.options,
   );
   if (auto) {
     await live.acp
@@ -1042,13 +1074,14 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     live.approvals.set(key, {
       kind: request.kind,
       optionIds: request.optionIds,
+      options: request.options,
       resolve,
     });
   });
   live.approvals.delete(key);
   live.onEvent({ type: "approval.resolved", requestId, decision });
 
-  const optionId = acpPermissionOptionId(decision, request.optionIds);
+  const optionId = live.cancelled || live.muteUpdates ? undefined : acpPermissionOptionId(decision, request.optionIds, request.options);
   await live.acp
     .respond(
       id,
@@ -1059,9 +1092,9 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     .catch(() => undefined);
 }
 
-async function handleElicitation(live: Live, id: JsonRpcId, params: unknown) {
-  const parsed = acpElicitation(params);
-  if (!parsed || live.cancelled || live.muteUpdates) {
+async function handleElicitation(live: Live, id: JsonRpcId, params: unknown, cancelled = false) {
+  const parsed = cancelled || live.cancelled || live.muteUpdates ? null : acpElicitation(params);
+  if (!parsed) {
     await live.acp
       .respond(id, { action: "cancel" })
       .catch(() => undefined);
@@ -1076,19 +1109,27 @@ async function handleElicitation(live: Live, id: JsonRpcId, params: unknown) {
   });
 
   const key = String(requestId);
-  const reply = await new Promise<UserQuestionReply>((resolve) => {
-    live.questions.set(key, resolve);
-  });
-  live.questions.delete(key);
-  live.onEvent({
-    type: "question.resolved",
-    requestId,
-    decision: reply.kind === "answered" ? "answered" : "skipped",
-  });
-
-  await live.acp
-    .respond(id, acpElicitationResult(reply, parsed.questions, parsed.fields))
-    .catch(() => undefined);
+  while (true) {
+    const reply = await new Promise<UserQuestionReply>((resolve) => {
+      live.questions.set(key, resolve);
+    });
+    live.questions.delete(key);
+    let result: Record<string, unknown>;
+    try {
+      result = acpElicitationResult(reply, parsed.questions, parsed.fields);
+    } catch (error) {
+      live.onEvent({ type: "question.error", requestId, message: error instanceof Error ? error.message : String(error) });
+      // Keep the same form and request open so the user can correct the value.
+      continue;
+    }
+    live.onEvent({
+      type: "question.resolved",
+      requestId,
+      decision: reply.kind === "answered" ? "answered" : "skipped",
+    });
+    await live.acp.respond(id, result).catch(() => undefined);
+    return;
+  }
 }
 
 function copilotAuthError(error: unknown, verb = "start"): Error {

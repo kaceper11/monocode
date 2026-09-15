@@ -1,4 +1,8 @@
-import { AcpClient } from "./acp";
+import {
+  acpPermissionRequest,
+  acpPermissionOptionId,
+  AcpClient,
+} from "./acp";
 import type { JsonRpcId } from "./jsonRpc";
 import {
   killChild,
@@ -233,13 +237,11 @@ async function handleTextRequest(
   params: unknown,
 ) {
   if (method === "session/request_permission") {
-    const optionIds = permissionOptionIds(params);
-    const optionId =
-      optionIds.find((value) => /reject|deny|cancel/i.test(value)) ??
-      "reject-once";
-    await acp
-      .respond(id, { outcome: { outcome: "selected", optionId } })
-      .catch(() => undefined);
+    const request = acpPermissionRequest(params);
+    const optionId = acpPermissionOptionId("deny", request.optionIds, request.options);
+    await acp.respond(id, optionId
+      ? { outcome: { outcome: "selected", optionId } }
+      : { outcome: { outcome: "cancelled" } }).catch(() => undefined);
     return;
   }
   if (method === "cursor/ask_question") {
@@ -256,14 +258,6 @@ async function handleTextRequest(
   await acp.respond(id, {}).catch(() => undefined);
 }
 
-function permissionOptionIds(params: unknown): string[] {
-  const rec = asRecord(params);
-  const options = Array.isArray(rec?.options) ? rec.options : [];
-  return options.flatMap((item) => {
-    const id = asRecord(item)?.optionId;
-    return typeof id === "string" ? [id] : [];
-  });
-}
 
 function extractModelConfigId(raw: unknown): string {
   if (!Array.isArray(raw)) return "model";

@@ -39,6 +39,9 @@ export type AcpHandlers = {
  */
 export class AcpClient {
   private readonly rpc: JsonRpcClient;
+  private readonly prompts = new Set<Promise<unknown>>();
+  private questions: Promise<void> = Promise.resolve();
+  private questionGeneration = 0;
 
   constructor(
     sessionId: string,
@@ -62,15 +65,37 @@ export class AcpClient {
   }
 
   close(error?: Error) {
+    this.questionGeneration += 1;
     this.rpc.close(error);
   }
 
   rejectPending(error?: Error) {
+    this.questionGeneration += 1;
     this.rpc.rejectPending(error);
   }
 
-  request<T>(method: string, params?: unknown, timeoutMs = 0): Promise<T> {
-    return this.rpc.request<T>(method, params, timeoutMs);
+  /** The composer presents one question at a time; cancelled queued asks still get a reply. */
+  queueQuestion(run: (cancelled: boolean) => Promise<void>): Promise<void> {
+    const generation = this.questionGeneration;
+    const pending = this.questions.catch(() => undefined)
+      .then(() => run(generation !== this.questionGeneration));
+    this.questions = pending;
+    return pending;
+  }
+
+  request<T>(method: string, params?: unknown, timeoutMs = method === "session/prompt" ? 30 * 60_000 : 15_000): Promise<T> {
+    const request = this.rpc.request<T>(method, params, timeoutMs);
+    if (method === "session/prompt") {
+      this.prompts.add(request);
+      const remove = () => { this.prompts.delete(request); };
+      request.then(remove, remove);
+    }
+    return request;
+  }
+
+  /** A turn includes every follow-up accepted before it becomes idle. */
+  async waitForPrompts(): Promise<void> {
+    while (this.prompts.size) await Promise.all([...this.prompts]);
   }
 
   notify(method: string, params?: unknown): Promise<void> {
@@ -104,18 +129,39 @@ type AcpConfigChoice = {
   contextWindow?: number;
 };
 
+export type AcpPermissionOption = { optionId: string; kind?: string };
+
+export function acpPermissionOptions(raw: unknown): AcpPermissionOption[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((value) => {
+    const option = asRecord(value);
+    const optionId = stringField(option ?? {}, "optionId") ?? stringField(option ?? {}, "option_id");
+    return optionId ? [{ optionId, kind: stringField(option ?? {}, "kind") }] : [];
+  });
+}
+
 export type AcpPermissionRequest = {
   title: string;
   kind?: string;
   callId?: string;
   preview?: ToolPreview;
   optionIds: string[];
+  options?: AcpPermissionOption[];
 };
 
 /** One schema property of an ACP `elicitation/create` request. */
 export type AcpElicitField = {
   key: string;
   multi: boolean;
+  required?: boolean;
+  minItems?: number;
+  maxItems?: number;
+  numberType?: "number" | "integer";
+  minimum?: number;
+  maximum?: number;
+  exclusiveMinimum?: number;
+  exclusiveMaximum?: number;
+  multipleOf?: number;
   /** UserQuestion option id → the schema value the agent expects back. */
   values: Record<string, unknown>;
 };
@@ -485,6 +531,7 @@ export function acpPermissionRequest(
       stringField(rec ?? {}, "toolCallId"),
     preview,
     optionIds,
+    options: acpPermissionOptions(rec?.options),
   };
 }
 
@@ -499,6 +546,7 @@ export function acpAutoOption(
   runtimeMode: RuntimeMode,
   kind: string | undefined,
   optionIds: string[],
+  options: AcpPermissionOption[] = [],
 ): string | null {
   if (optionIds.length === 0) return null;
   const tool = (kind ?? "").toLowerCase();
@@ -511,28 +559,27 @@ export function acpAutoOption(
       return null;
     }
   }
-  if (runtimeMode === "full-access") {
-    return pickOption(optionIds, [
-      "allow-always",
-      "allow_always",
-      "allow-once",
-      "allow_once",
-      "allow",
-    ]);
+  const kinds = runtimeMode === "full-access"
+    ? ["allow_always", "allow_once"] : ["allow_once", "allow_always"];
+  for (const kind of kinds) {
+    const offered = options.find((option) => option.kind === kind);
+    if (offered) return offered.optionId;
   }
-  return pickOption(optionIds, [
-    "allow-once",
-    "allow_once",
-    "allow-always",
-    "allow_always",
-    "allow",
-  ]);
+  const untyped = optionIds.filter((id) => !options.find((option) => option.optionId === id)?.kind);
+  return pickOption(untyped, runtimeMode === "full-access"
+    ? ["allow-always", "allow_always", "allow-once", "allow_once", "allow"]
+    : ["allow-once", "allow_once", "allow-always", "allow_always", "allow"]);
 }
 
 export function acpPermissionOptionId(
   decision: ApprovalDecision,
   optionIds: string[],
+  options: AcpPermissionOption[] = [],
 ): string | undefined {
+  for (const kind of decision === "allow" ? ["allow_once", "allow_always"] : ["reject_once", "reject_always"]) {
+    const offered = options.find((option) => option.kind === kind);
+    if (offered) return offered.optionId;
+  }
   const wanted =
     decision === "allow"
       ? [
@@ -550,12 +597,13 @@ export function acpPermissionOptionId(
           "reject",
           "deny",
         ];
-  const match = pickOption(optionIds, wanted);
+  const untyped = optionIds.filter((id) => !options.find((option) => option.optionId === id)?.kind);
+  const match = pickOption(untyped, wanted);
   if (match) return match;
   // Never invent an id the agent did not offer; fall back to the first
   // advertised option that looks like an allow/reject, else nothing.
   const kind = decision === "allow" ? "allow" : "reject";
-  return optionIds.find((id) => id.toLowerCase().includes(kind));
+  return untyped.find((id) => id.toLowerCase().startsWith(`${kind}-`) || id.toLowerCase().startsWith(`${kind}_`));
 }
 
 /**
@@ -603,7 +651,8 @@ export function acpElicitation(params: unknown): {
       options.push({ id, label });
       values[id] = entry;
     });
-    for (const item of Array.isArray(target.oneOf) ? target.oneOf : []) {
+    const titledOptions = multi ? target.anyOf ?? target.oneOf : target.oneOf;
+    for (const item of Array.isArray(titledOptions) ? titledOptions : []) {
       const choice = asRecord(item);
       if (!choice || choice.const == null) continue;
       const id = String(choice.const);
@@ -637,7 +686,23 @@ export function acpElicitation(params: unknown): {
       allowCustom: options.length === 0,
       options,
     });
-    fields.push({ key, multi, values });
+    if (type && !["string", "number", "integer", "boolean", "array"].includes(type)) {
+      throw new Error(`Unsupported question field ${key}: ${type}`);
+    }
+    if (multi && options.length === 0) throw new Error(`Unsupported free-form array question: ${key}`);
+    fields.push({ key, multi, values,
+      required: Array.isArray(schema?.required) && schema.required.includes(key),
+      ...(typeof field.minItems === "number" ? { minItems: field.minItems } : {}),
+      ...(typeof field.maxItems === "number" ? { maxItems: field.maxItems } : {}),
+      ...((type === "number" || type === "integer") ? {
+        numberType: type,
+        ...(typeof field.minimum === "number" ? { minimum: field.minimum } : {}),
+        ...(typeof field.maximum === "number" ? { maximum: field.maximum } : {}),
+        ...(typeof field.exclusiveMinimum === "number" ? { exclusiveMinimum: field.exclusiveMinimum } : {}),
+        ...(typeof field.exclusiveMaximum === "number" ? { exclusiveMaximum: field.exclusiveMaximum } : {}),
+        ...(typeof field.multipleOf === "number" ? { multipleOf: field.multipleOf } : {}),
+      } : {}),
+    });
   }
   if (questions.length === 0) return null;
   const title = stringField(inner ?? {}, "message");
@@ -657,16 +722,36 @@ export function acpElicitationResult(
     if (!question) continue;
     const custom = reply.custom?.[field.key]?.trim();
     const selected = reply.answers[field.key] ?? [];
+    if (field.numberType && custom && question.allowCustom) {
+      const number = Number(custom);
+      if (!Number.isFinite(number) || (field.numberType === "integer" && !Number.isSafeInteger(number)) ||
+          (field.minimum != null && number < field.minimum) ||
+          (field.maximum != null && number > field.maximum) ||
+          (field.exclusiveMinimum != null && number <= field.exclusiveMinimum) ||
+          (field.exclusiveMaximum != null && number >= field.exclusiveMaximum) ||
+          (field.multipleOf != null && (!(field.multipleOf > 0) || Math.abs(number / field.multipleOf - Math.round(number / field.multipleOf)) > 1e-9))) {
+        throw new Error(`Invalid ${field.numberType} answer for ${field.key}`);
+      }
+      content[field.key] = number;
+      continue;
+    }
     if (selected.length === 0 && custom && question.allowCustom) {
       content[field.key] = custom;
       continue;
     }
     const values = selected.flatMap((id) => {
       if (id in field.values) return [field.values[id]];
-      if (custom) return [custom];
+      if (custom && question.allowCustom) return [custom];
       return [];
     });
-    if (values.length === 0) continue;
+    if (values.length === 0) {
+      if (field.required) throw new Error(`Answer the required question: ${field.key}`);
+      continue;
+    }
+    if (field.multi && ((field.minItems != null && values.length < field.minItems) ||
+        (field.maxItems != null && values.length > field.maxItems))) {
+      throw new Error(`Invalid number of selections for ${field.key}`);
+    }
     content[field.key] = field.multi ? values : values[0];
   }
   if (Object.keys(content).length === 0) return { action: "cancel" };
@@ -901,4 +986,19 @@ function sumNumbers(
     found = true;
   }
   return found ? total : undefined;
+}
+
+/** Only a missing method permits trying an older control; policy failures do not. */
+export function acpUnsupportedControl(error: unknown): boolean {
+  return (error as { code?: number } | null)?.code === -32601 ||
+    /method not found|not implemented|unknown method/i.test(error instanceof Error ? error.message : String(error));
+}
+
+export function acpAssertConfigApplied(
+  options: { id: string; currentValue?: string | boolean }[], id: string, value: string | boolean,
+): void {
+  const current = options.find((option) => option.id === id)?.currentValue;
+  if (current != null && String(current) !== String(value)) {
+    throw new Error(`Agent did not apply ${id}=${value} (still ${current}). Pick a supported setting before sending.`);
+  }
 }

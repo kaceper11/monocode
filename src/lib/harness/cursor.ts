@@ -1,14 +1,21 @@
-import { nativeModelId } from "../models";
-import { AcpSubagents } from "./acpSubagents";
-import type { RuntimeMode } from "../session";
-import { promptBlocks } from "../attachments";
-import { isTaskListToolName, taskListFromToolInput } from "../taskList";
 import {
+  acpStopReasonMessage,
+  acpUnsupportedControl,
+  acpAssertConfigApplied,
+  acpPermissionOptions,
+  acpPermissionOptionId,
+  type AcpPermissionOption,
   AcpClient,
   acpAutoOption,
   isAcpMcpToolCall,
   type AcpHandlers,
 } from "./acp";
+import { acquireSharedStart } from "./liveStart";
+import { nativeModelId } from "../models";
+import { AcpSubagents } from "./acpSubagents";
+import type { RuntimeMode } from "../session";
+import { promptBlocks } from "../attachments";
+import { isTaskListToolName, taskListFromToolInput } from "../taskList";
 import type { JsonRpcId } from "./jsonRpc";
 import {
   killChild,
@@ -76,6 +83,7 @@ type PendingToolEnrichment = {
 type PendingApproval = {
   kind?: string;
   optionIds: string[];
+  options?: AcpPermissionOption[];
   resolve: (decision: ApprovalDecision) => void;
 };
 
@@ -110,6 +118,7 @@ type Live = {
   subagentTimer?: ReturnType<typeof setTimeout>;
   subagentRefresh?: Promise<void>;
   promptActive: boolean;
+  turnGeneration: number;
   turns: Promise<void>;
 };
 
@@ -121,6 +130,7 @@ type Resume = {
 const liveByThread = new Map<string, Live>();
 const resumeByThread = new Map<string, Resume>();
 const cancelledThreads = new Set<string>();
+const startingClients = new Map<string, AcpClient>();
 
 const CLIENT_CAPABILITIES = {
   fs: { readTextFile: false, writeTextFile: false },
@@ -131,17 +141,19 @@ const CLIENT_CAPABILITIES = {
 export async function sendCursorTurn(input: SendTurnInput): Promise<void> {
   let live: Live;
   try {
-    live = await ensureLive(input);
+    live = await acquireLive(input);
   } catch (error) {
     cancelledThreads.delete(input.sessionId);
     throw error;
   }
   if (cancelledThreads.delete(input.sessionId)) return;
 
-  live.onEvent = input.onEvent;
+  const generation = live.turnGeneration;
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (liveByThread.get(input.sessionId) !== live || live.turnGeneration !== generation) return;
+      live.onEvent = input.onEvent;
       // Posture applies when the queued turn actually runs — applying it at
       // enqueue time would flip the running turn's permission handling.
       live.runtimeMode = input.runtimeMode;
@@ -158,7 +170,12 @@ export async function sendCursorTurn(input: SendTurnInput): Promise<void> {
         throw error;
       }
     });
-  await live.turns;
+  try {
+    await live.turns;
+  } catch (error) {
+    if (liveByThread.get(input.sessionId) === live) await stopCursorSession(input.sessionId, true);
+    throw error;
+  }
 }
 
 export async function steerCursorTurn(input: SteerTurnInput): Promise<void> {
@@ -203,7 +220,7 @@ export function setCursorRuntimeMode(
   if (!live || live.runtimeMode === runtimeMode) return;
   live.runtimeMode = runtimeMode;
   for (const [key, pending] of live.approvals) {
-    if (!pickAutoOption(runtimeMode, pending.kind, pending.optionIds)) {
+    if (!pickAutoOption(runtimeMode, pending.kind, pending.optionIds, pending.options)) {
       continue;
     }
     live.approvals.delete(key);
@@ -224,8 +241,15 @@ export async function cancelCursorTurn(sessionId: string): Promise<void> {
   const live = liveByThread.get(sessionId);
   if (!live) {
     cancelledThreads.add(sessionId);
+    const starting = startingClients.get(sessionId);
+    if (starting) {
+      starting.close(new Error("cancelled"));
+      unwatchChild(sessionId);
+      await killChild(sessionId).catch(() => undefined);
+    }
     return;
   }
+  live.turnGeneration += 1;
   live.cancelled = true;
   live.muteUpdates = true;
   live.promptActive = false;
@@ -239,18 +263,22 @@ export async function cancelCursorTurn(sessionId: string): Promise<void> {
   live.approvals.clear();
   for (const [, resolve] of live.questions) resolve({ kind: "skipped" });
   live.questions.clear();
+  live.acp.rejectPending(new Error("cancelled"));
   await live.acp
     .notify("session/cancel", { sessionId: live.acpSessionId })
     .catch(() => undefined);
-  live.acp.rejectPending(new Error("cancelled"));
 }
 
 /** Kill the Cursor process but keep the ACP session id so we can session/load. */
-export async function stopCursorSession(sessionId: string): Promise<void> {
-  cancelledThreads.delete(sessionId);
+export async function stopCursorSession(sessionId: string, internal = false): Promise<void> {
+  if (!internal && startingByThread.has(sessionId)) cancelledThreads.add(sessionId);
+  else cancelledThreads.delete(sessionId);
+  const starting = startingClients.get(sessionId);
+  starting?.close(new Error("cancelled"));
   const live = liveByThread.get(sessionId);
   liveByThread.delete(sessionId);
   if (live) {
+    live.cancelled = true;
     live.muteUpdates = true;
     live.promptActive = false;
     retireCursorSubagentPolling(live);
@@ -264,8 +292,10 @@ export async function stopCursorSession(sessionId: string): Promise<void> {
     live.questions.clear();
   }
   live?.acp.close();
-  unwatchChild(sessionId);
-  await killChild(sessionId).catch(() => undefined);
+  if (live || starting) {
+    unwatchChild(sessionId);
+    await killChild(sessionId).catch(() => undefined);
+  }
 }
 
 /** Delete or idle detach — drop the Cursor conversation too. */
@@ -286,15 +316,20 @@ export function bindCursorSession(
   resumeByThread.set(threadId, { acpSessionId: sessionId, cwd });
 }
 
+const startingByThread = new Map<string, Promise<Live>>();
+
+function acquireLive(input: Parameters<typeof ensureLive>[0]): Promise<Live> {
+  return acquireSharedStart(input.sessionId, liveByThread, startingByThread, () => ensureLive(input));
+}
+
 async function ensureLive(input: SendTurnInput): Promise<Live> {
   const existing = liveByThread.get(input.sessionId);
   if (existing && existing.cwd === input.cwd) {
-    existing.onEvent = input.onEvent;
     return existing;
   }
   if (existing) {
     resumeByThread.delete(input.sessionId);
-    await stopCursorSession(input.sessionId);
+    await stopCursorSession(input.sessionId, true);
   }
 
   const resume = resumeByThread.get(input.sessionId);
@@ -303,9 +338,12 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     resumeByThread.delete(input.sessionId);
   }
 
+  if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
   const { path } = await resolveCursorBinary(input.cwd);
+  if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(input.sessionId, handlers);
+  startingClients.set(input.sessionId, acp);
   const liveRef: { current: Live | null } = { current: null };
   const muteGate = { current: false };
 
@@ -331,6 +369,7 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     }
     void handleRequest(live, id, method, params).catch((error) => {
       console.debug("[monocode] cursor request handler failed", error);
+      (liveRef.current?.onEvent ?? input.onEvent)({ type: "session.error", message: error instanceof Error ? error.message : String(error) });
       void acp
         .respondError(id, { code: -32603, message: "Internal error" })
         .catch(() => undefined);
@@ -361,9 +400,10 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     },
   );
 
-  await spawnChild(input.sessionId, path, ["acp"], input.cwd);
-
   try {
+    await spawnChild(input.sessionId, path, ["acp"], input.cwd);
+
+    if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
     await acp.request("initialize", {
       protocolVersion: 1,
       clientCapabilities: CLIENT_CAPABILITIES,
@@ -387,10 +427,8 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
         });
         acpSessionId = resume.acpSessionId;
         didLoad = true;
-      } catch {
-        setup = undefined;
-        acpSessionId = undefined;
-        didLoad = false;
+      } catch (error) {
+        throw new Error(`Could not resume the saved Cursor conversation; its binding was preserved. ${error instanceof Error ? error.message : String(error)}`);
       } finally {
         muteGate.current = false;
       }
@@ -432,8 +470,11 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
       subagentGeneration: 0,
       subagentFinalPolls: 0,
       promptActive: false,
+      turnGeneration: 0,
       turns: Promise.resolve(),
     };
+    if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
+    startingClients.delete(input.sessionId);
     liveRef.current = live;
     liveByThread.set(input.sessionId, live);
     resumeByThread.set(input.sessionId, {
@@ -448,7 +489,8 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     return live;
   } catch (error) {
     acp.close(error instanceof Error ? error : new Error(String(error)));
-    await stopCursorSession(input.sessionId);
+    await stopCursorSession(input.sessionId, true);
+    if (startingClients.get(input.sessionId) === acp) startingClients.delete(input.sessionId);
     throw error;
   }
 }
@@ -462,19 +504,19 @@ async function applyModelSelection(
 
   try {
     await setConfigOption(live, live.modelConfigId, base);
-  } catch {
+  } catch (error) {
+    if (!acpUnsupportedControl(error)) throw error;
     await live.acp
       .request("session/set_model", {
         sessionId: live.acpSessionId,
         modelId: base,
-      })
-      .catch(() => undefined);
+      });
   }
 
   for (const [settingId, value] of Object.entries(settings)) {
     const configId = resolveSettingConfigId(live.configOptions, settingId);
-    if (!configId) continue;
-    await setConfigOption(live, configId, value).catch(() => undefined);
+    if (!configId) throw new Error(`Cursor does not support the selected ${settingId} setting.`);
+    await setConfigOption(live, configId, value);
   }
 }
 
@@ -496,6 +538,7 @@ async function setConfigOption(
   );
   if (result?.configOptions) {
     live.configOptions = readConfigOptions(result.configOptions);
+    acpAssertConfigApplied(live.configOptions, configId, value);
     live.modelConfigId = extractModelConfigId(result) || live.modelConfigId;
   }
 }
@@ -510,8 +553,15 @@ async function prompt(live: Live, input: SendTurnInput): Promise<void> {
     live.subagentRevisions = {};
     live.backgroundAgentTools.clear();
     live.taskListTools.clear();
+    // Keep only a bounded late-enrichment window for completed tool ids.
+    const completed = [...live.toolStatuses].filter(([, status]) => ["completed", "failed", "cancelled"].includes(status));
+    for (const [callId] of completed.slice(0, -256)) {
+      live.toolStatuses.delete(callId);
+      live.enrichedTools.delete(callId);
+      live.pendingToolEnrichments.delete(callId);
+    }
     live.promptActive = true;
-    await live.acp.request("session/prompt", {
+    const result = await live.acp.request<{ stopReason?: string }>("session/prompt", {
       sessionId: live.acpSessionId,
       prompt: blocks,
     });
@@ -520,7 +570,9 @@ async function prompt(live: Live, input: SendTurnInput): Promise<void> {
       live.backgroundAgentTools.clear();
       return;
     }
-    settleCursorBackgroundAgents(live, "completed");
+    const stopMessage = acpStopReasonMessage("Cursor", result?.stopReason ?? "");
+    if (stopMessage) live.onEvent({ type: "session.error", message: stopMessage });
+    settleCursorBackgroundAgents(live, stopMessage ? "failed" : "completed");
     await refreshCursorSubagents(live);
     if (live.cancelled || live.muteUpdates) return;
     live.subagentFinalPolls = 3;
@@ -562,14 +614,22 @@ async function handleRequest(
     return;
   }
   if (method === "cursor/ask_question") {
-    await handleAskQuestion(live, id, params);
+    await live.acp.queueQuestion((cancelled) => handleAskQuestion(live, id, params, cancelled));
     return;
   }
   if (method === "cursor/create_plan") {
+    if (live.cancelled || live.muteUpdates) {
+      await live.acp.respond(id, { outcome: { outcome: "cancelled" } });
+      return;
+    }
     const rec = asRecord(params);
     const plan = typeof rec?.plan === "string" ? rec.plan : "";
     if (plan) live.onEvent({ type: "plan", text: plan });
-    await live.acp.respond(id, { outcome: { outcome: "accepted" } });
+    // Implementation approval belongs to MonoCode's separate Build turn.
+    await live.acp.respond(id, { outcome: {
+      outcome: "rejected",
+      reason: "Review the plan in MonoCode and start a Build turn to approve implementation.",
+    } });
     return;
   }
   if (isCursorTodoUpdate(method)) {
@@ -649,15 +709,15 @@ function handleCursorTask(live: Live, params: unknown): void {
     queueCursorToolEnrichment(live, callId, "agent");
 }
 
-async function handleAskQuestion(live: Live, id: JsonRpcId, params: unknown) {
-  if (live.cancelled || live.muteUpdates) {
+async function handleAskQuestion(live: Live, id: JsonRpcId, params: unknown, cancelled = false) {
+  if (cancelled || live.cancelled || live.muteUpdates) {
     await live.acp
       .respond(id, { outcome: { outcome: "cancelled" } })
       .catch(() => undefined);
     return;
   }
   const rec = asRecord(params);
-  const questions = questionsFromUnknown(params);
+  const questions = questionsFromUnknown(params).map((question) => ({ ...question, allowCustom: false }));
   const title =
     (typeof rec?.title === "string" && rec.title.trim()) ||
     questionPromptTitle(questions);
@@ -677,20 +737,26 @@ async function handleAskQuestion(live: Live, id: JsonRpcId, params: unknown) {
     questions,
     ...(callId ? { callId } : {}),
   });
+  if (questions.some((question) => question.options.length === 0)) {
+    live.onEvent({ type: "question.error", requestId, message: "Cursor cannot receive typed answers through this question protocol. Skip this question and send your answer as a follow-up message." });
+  }
 
-  const reply = await new Promise<UserQuestionReply>((resolve) => {
-    live.questions.set(String(requestId), resolve);
-  });
-  live.questions.delete(String(requestId));
-  live.onEvent({
-    type: "question.resolved",
-    requestId,
-    decision: reply.kind,
-  });
-
-  await live.acp
-    .respond(id, cursorAskQuestionResponse(reply, questions))
-    .catch(() => undefined);
+  while (true) {
+    const reply = await new Promise<UserQuestionReply>((resolve) => {
+      live.questions.set(String(requestId), resolve);
+    });
+    live.questions.delete(String(requestId));
+    let result: Record<string, unknown>;
+    try {
+      result = cursorAskQuestionResponse(reply, questions);
+    } catch (error) {
+      live.onEvent({ type: "question.error", requestId, message: error instanceof Error ? error.message : String(error) });
+      continue;
+    }
+    live.onEvent({ type: "question.resolved", requestId, decision: reply.kind });
+    await live.acp.respond(id, result).catch(() => undefined);
+    return;
+  }
 }
 
 function cursorAskQuestionResponse(
@@ -699,6 +765,15 @@ function cursorAskQuestionResponse(
 ): Record<string, unknown> {
   if (reply.kind !== "answered") {
     return { outcome: { outcome: "skipped", reason: "User skipped" } };
+  }
+  if (Object.values(reply.custom ?? {}).some((value) => value.trim()) ||
+      Object.values(reply.answers).some((selected) => selected.includes(CUSTOM_OPTION_ID))) {
+    throw new Error("Cursor cannot receive a typed answer through this question protocol. Choose an offered option or skip and send the answer as a follow-up message.");
+  }
+  for (const question of questions) {
+    if ((reply.answers[question.id] ?? []).some((id) => !question.options.some((option) => option.id === id))) {
+      throw new Error("Choose an option offered by Cursor.");
+    }
   }
   return {
     outcome: {
@@ -783,29 +858,20 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     }
   }
 
-  const options = Array.isArray(rec?.options) ? rec.options : [];
-  const optionIds = options
-    .map((item) => asRecord(item)?.optionId)
-    .filter((value): value is string => typeof value === "string");
+  const options = acpPermissionOptions(rec?.options);
+  const optionIds = options.map((option) => option.optionId);
 
   if (live.planning) {
     const normalized = (preview?.kind ?? kind ?? "").toLowerCase();
     const readOnly = normalized === "read" || normalized === "search";
-    const optionId = readOnly
-      ? pickOption(optionIds, ["allow-once", "allow_once", "allow"])
-      : pickOption(optionIds, ["reject-once", "reject_once", "reject-always"]);
-    await live.acp
-      .respond(id, {
-        outcome: {
-          outcome: "selected",
-          optionId: optionId ?? (readOnly ? "allow-once" : "reject-once"),
-        },
-      })
-      .catch(() => undefined);
+    const optionId = acpPermissionOptionId(readOnly ? "allow" : "deny", optionIds, options);
+    await live.acp.respond(id, optionId
+      ? { outcome: { outcome: "selected", optionId } }
+      : { outcome: { outcome: "cancelled" } }).catch(() => undefined);
     return;
   }
 
-  const auto = pickAutoOption(live.runtimeMode, kind, optionIds);
+  const auto = pickAutoOption(live.runtimeMode, kind, optionIds, options);
   if (auto) {
     await live.acp
       .respond(id, { outcome: { outcome: "selected", optionId: auto } })
@@ -824,30 +890,15 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
   });
 
   const decision = await new Promise<ApprovalDecision>((resolve) => {
-    live.approvals.set(String(requestId), { kind, optionIds, resolve });
+    live.approvals.set(String(requestId), { kind, optionIds, options, resolve });
   });
   live.approvals.delete(String(requestId));
   live.onEvent({ type: "approval.resolved", requestId, decision });
 
-  const optionId =
-    decision === "allow"
-      ? pickOption(optionIds, [
-          "allow-once",
-          "allow_once",
-          "allow-always",
-          "allow_always",
-        ])
-      : pickOption(optionIds, ["reject-once", "reject_once", "reject-always"]);
-
-  await live.acp
-    .respond(id, {
-      outcome: {
-        outcome: "selected",
-        optionId:
-          optionId ?? (decision === "allow" ? "allow-once" : "reject-once"),
-      },
-    })
-    .catch(() => undefined);
+  const optionId = live.cancelled || live.muteUpdates ? undefined : acpPermissionOptionId(decision, optionIds, options);
+  await live.acp.respond(id, optionId
+    ? { outcome: { outcome: "selected", optionId } }
+    : { outcome: { outcome: "cancelled" } }).catch(() => undefined);
 }
 
 function handleSessionUpdate(live: Live, params: unknown) {
@@ -1310,16 +1361,11 @@ function pickAutoOption(
   runtimeMode: RuntimeMode,
   kind: string | undefined,
   optionIds: string[],
+  options: AcpPermissionOption[] = [],
 ): string | null {
-  return acpAutoOption(runtimeMode, kind, optionIds);
+  return acpAutoOption(runtimeMode, kind, optionIds, options);
 }
 
-function pickOption(optionIds: string[], preferred: string[]): string | null {
-  for (const id of preferred) {
-    if (optionIds.includes(id)) return id;
-  }
-  return null;
-}
 
 function readConfigOptions(raw: unknown): SessionConfigOption[] {
   if (!Array.isArray(raw)) return [];

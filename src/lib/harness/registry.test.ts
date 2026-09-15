@@ -4,6 +4,7 @@ import type { HarnessId } from "../session";
 import {
   HARNESS_IDLE_PARK_MS,
   canCompactHarnessContext,
+  canSteerHarnessSession,
   compactHarnessContext,
   isLiveHarness,
   listHarnesses,
@@ -38,6 +39,15 @@ function stub(
 }
 
 describe("harness registry", () => {
+  it("requires explicit live-session readiness before steering", () => {
+    registerHarness(stub("claude"));
+    expect(canSteerHarnessSession("claude", "cold")).toBe(false);
+    registerHarness(stub("claude", { canSteerSession: (id) => id === "running" }));
+    expect(canSteerHarnessSession("claude", "cold")).toBe(false);
+    expect(canSteerHarnessSession("claude", "running")).toBe(true);
+    registerHarness(stub("claude", { canSteer: false, canSteerSession: () => true }));
+    expect(canSteerHarnessSession("claude", "running")).toBe(false);
+  });
   afterEach(() => {
     resetHarnessModelOverlays();
     resetHarnessIdlePark();
@@ -243,6 +253,55 @@ describe("harness registry", () => {
     await vi.advanceTimersByTimeAsync(HARNESS_IDLE_PARK_MS);
     expect(stopSession).toHaveBeenCalledWith("s4");
   });
+
+  it.each(["prewarm", "compact", "steer"] as const)(
+    "does not idle-park during a pending %s operation",
+    async (operation) => {
+      vi.useFakeTimers();
+      let finish!: () => void;
+      const pending = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const stopSession = vi.fn(async () => undefined);
+      registerHarness(
+        stub("codex", {
+          prewarm: vi
+            .fn()
+            .mockImplementationOnce(() =>
+              operation === "prewarm" ? pending : Promise.resolve(),
+            )
+            .mockResolvedValue(undefined),
+          compactContext: () => pending,
+          steerTurn: () => pending,
+          stopSession,
+        }),
+      );
+      const input = {
+        harness: "codex" as const,
+        sessionId: "busy-operation",
+        cwd: "/tmp",
+        model: "codex:default",
+        runtimeMode: "supervised" as const,
+        text: "follow up",
+        onEvent: () => undefined,
+      };
+      // A concurrent warmup can finish and arm the idle timer first.
+      const warmup = prewarmHarness(input);
+      const active =
+        operation === "prewarm"
+          ? warmup
+          : operation === "compact"
+            ? compactHarnessContext(input)
+            : steerHarnessTurn(input);
+      await prewarmHarness(input);
+      await vi.advanceTimersByTimeAsync(HARNESS_IDLE_PARK_MS * 2);
+      expect(stopSession).not.toHaveBeenCalled();
+      finish();
+      await Promise.all([warmup, active]);
+      await vi.advanceTimersByTimeAsync(HARNESS_IDLE_PARK_MS);
+      expect(stopSession).toHaveBeenCalledExactlyOnceWith("busy-operation");
+    },
+  );
 
   it("a failed steer still leaves the child on an idle-park timer", async () => {
     vi.useFakeTimers();

@@ -81,7 +81,7 @@ export class OpenCodeClient {
   async abortSession(sessionID: string): Promise<void> {
     await this.request<unknown>("POST", `/session/${enc(sessionID)}/abort`, {
       body: {},
-    }).catch(() => undefined);
+    });
   }
 
   async summarizeSession(

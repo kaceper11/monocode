@@ -337,9 +337,8 @@ describe("grok live turn sequence", () => {
     const resolved = events.find((e) => e.type === "approval.resolved")!;
     expect(resolved.decision).toBe("deny");
     expect(events.some((e) => e.type === "session.ended")).toBe(true);
-    // Exit answers the parked ask with a rejection, never an allow.
-    const response = parse().find((m) => m.id === 61 && m.result)!;
-    expect(response.result.outcome.optionId).toBe("reject-once");
+    // The UI settles the ask; a closed transport must not write to a replacement child.
+    expect(parse().find((m) => m.id === 61 && m.result)).toBeUndefined();
     await settled;
   });
 

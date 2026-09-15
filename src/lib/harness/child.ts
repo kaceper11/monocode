@@ -3,10 +3,19 @@ import type { HarnessId } from "../session";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-type LinePayload = { sessionId: string; line: string };
-type ExitPayload = { sessionId: string; code: number | null; pid?: number };
-type SsePayload = { sessionId: string; data: string };
-type SseEndPayload = { sessionId: string; error?: string | null };
+type LinePayload = { sessionId: string; generation: number; line: string };
+type ExitPayload = {
+  sessionId: string;
+  code: number | null;
+  generation: number;
+  pid?: number;
+};
+type SsePayload = { sessionId: string; generation: number; data: string };
+type SseEndPayload = {
+  sessionId: string;
+  generation: number;
+  error?: string | null;
+};
 
 type LineHandler = (line: string) => void;
 type ExitHandler = (code: number | null) => void;
@@ -21,6 +30,24 @@ const sseHandlers = new Map<string, SseHandler>();
 const sseEndHandlers = new Map<string, SseEndHandler>();
 const sseBuffer = new Map<string, string[]>();
 const livePid = new Map<string, number>();
+const childGeneration = new Map<string, number>();
+const sseGeneration = new Map<string, number>();
+const stopping = new Map<string, Promise<void>>();
+let nextGeneration = Date.now() * 1000;
+let stoppingAll: Promise<void> | undefined;
+const writes = new Map<
+  string,
+  {
+    generation: number;
+    tail: Promise<void>;
+    count: number;
+    bytes: number;
+    failed: boolean;
+  }
+>();
+const WRITE_TIMEOUT_MS = 10_000;
+const MAX_PENDING_WRITES = 128;
+const MAX_PENDING_WRITE_BYTES = 64 * 1024 * 1024;
 const pendingExit = new Map<
   string,
   Array<{ code: number | null; pid: number }>
@@ -79,7 +106,8 @@ function ensureBridge() {
   const installation = Promise.all([
     register(
       listen<LinePayload>("harness-stdout", (event) => {
-        const { sessionId, line } = event.payload;
+        const { sessionId, generation, line } = event.payload;
+        if (childGeneration.get(sessionId) !== generation) return;
         const handler = lineHandlers.get(sessionId);
         if (handler) {
           handler(line);
@@ -90,13 +118,15 @@ function ensureBridge() {
     ),
     register(
       listen<LinePayload>("harness-stderr", (event) => {
-        const { sessionId, line } = event.payload;
+        const { sessionId, generation, line } = event.payload;
+        if (childGeneration.get(sessionId) !== generation) return;
         stderrHandlers.get(sessionId)?.(line);
       }),
     ),
     register(
       listen<ExitPayload>("harness-exit", (event) => {
-        const { sessionId, code, pid } = event.payload;
+        const { sessionId, generation, code, pid } = event.payload;
+        if (childGeneration.get(sessionId) !== generation) return;
         const handler = exitHandlers.get(sessionId);
         if (!handler || pid == null || pid <= 0) return;
         const currentPid = livePid.get(sessionId);
@@ -114,7 +144,8 @@ function ensureBridge() {
     ),
     register(
       listen<SsePayload>("harness-sse", (event) => {
-        const { sessionId, data } = event.payload;
+        const { sessionId, generation, data } = event.payload;
+        if (sseGeneration.get(sessionId) !== generation) return;
         const handler = sseHandlers.get(sessionId);
         if (handler) {
           handler(data);
@@ -125,7 +156,8 @@ function ensureBridge() {
     ),
     register(
       listen<SseEndPayload>("harness-sse-end", (event) => {
-        const { sessionId, error } = event.payload;
+        const { sessionId, generation, error } = event.payload;
+        if (sseGeneration.get(sessionId) !== generation) return;
         sseEndHandlers.get(sessionId)?.(error ?? undefined);
       }),
     ),
@@ -153,11 +185,12 @@ function teardownBridge() {
   sseHandlers.clear();
   sseEndHandlers.clear();
   sseBuffer.clear();
+  childGeneration.clear();
+  sseGeneration.clear();
+  writes.clear();
   livePid.clear();
   pendingExit.clear();
-  void pending
-    ?.then((fns) => fns.forEach((fn) => fn()))
-    .catch(() => undefined);
+  void pending?.then((fns) => fns.forEach((fn) => fn())).catch(() => undefined);
 }
 
 export function startHarnessBridge(): () => void {
@@ -247,15 +280,34 @@ export async function spawnChild(
   args: string[],
   cwd: string,
 ): Promise<void> {
+  const generation = ++nextGeneration;
+  childGeneration.set(sessionId, generation);
   livePid.delete(sessionId);
   pendingExit.delete(sessionId);
-  const pid = await invoke<number>("harness_spawn", {
-    sessionId,
-    command,
-    args,
-    cwd,
-  });
-  if (typeof pid !== "number" || pid <= 0) return;
+  lineBuffer.delete(sessionId);
+  writes.delete(sessionId);
+  await stoppingAll;
+  await stopping.get(sessionId);
+  if (childGeneration.get(sessionId) !== generation)
+    throw new Error("Harness startup cancelled");
+  let pid: number;
+  try {
+    pid = await invoke<number>("harness_spawn", {
+      sessionId,
+      generation,
+      command,
+      args,
+      cwd,
+    });
+  } catch (error) {
+    if (childGeneration.get(sessionId) === generation)
+      childGeneration.delete(sessionId);
+    throw error;
+  }
+  if (childGeneration.get(sessionId) !== generation)
+    throw new Error("Harness startup cancelled");
+  if (typeof pid !== "number" || pid <= 0)
+    throw new Error("Harness did not return a process ID");
   livePid.set(sessionId, pid);
   const exits = pendingExit.get(sessionId);
   pendingExit.delete(sessionId);
@@ -265,15 +317,98 @@ export async function spawnChild(
   exitHandlers.get(sessionId)?.(exited.code);
 }
 
-export function writeChild(sessionId: string, line: string): Promise<void> {
-  return invoke("harness_write", { sessionId, line });
+/** Ordered and bounded before IPC, so a stalled pipe cannot queue unbounded native jobs. */
+export function writeChild(
+  sessionId: string,
+  line: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted)
+    return Promise.reject(new Error("Harness write cancelled"));
+  const generation = childGeneration.get(sessionId);
+  if (generation == null)
+    return Promise.reject(new Error("Harness process is not running"));
+  let queue = writes.get(sessionId);
+  if (!queue || queue.generation !== generation) {
+    queue = {
+      generation,
+      tail: Promise.resolve(),
+      count: 0,
+      bytes: 0,
+      failed: false,
+    };
+    writes.set(sessionId, queue);
+  }
+  const bytes = line.length * 2;
+  if (
+    queue.failed ||
+    queue.count >= MAX_PENDING_WRITES ||
+    queue.bytes + bytes > MAX_PENDING_WRITE_BYTES
+  ) {
+    return Promise.reject(
+      new Error("Harness input queue is full or unavailable"),
+    );
+  }
+  queue.count += 1;
+  queue.bytes += bytes;
+  const owned = queue;
+  const write = owned.tail.then(async () => {
+    if (
+      signal?.aborted ||
+      owned.failed ||
+      childGeneration.get(sessionId) !== generation
+    )
+      throw new Error("Harness write cancelled");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    try {
+      await Promise.race([
+        invoke<void>("harness_write", { sessionId, generation, line }),
+        new Promise<never>((_resolve, reject) => {
+          onAbort = () =>
+            reject(new Error("Harness write cancelled; delivery is unknown"));
+          signal?.addEventListener("abort", onAbort, { once: true });
+          timer = setTimeout(
+            () =>
+              reject(new Error("Harness write timed out; delivery is unknown")),
+            WRITE_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } catch (error) {
+      owned.failed = true;
+      if (childGeneration.get(sessionId) === generation) {
+        void killChild(sessionId).catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+    }
+  });
+  const settled = write.finally(() => {
+    owned.count -= 1;
+    owned.bytes -= bytes;
+  });
+  owned.tail = settled.catch(() => undefined);
+  return settled;
 }
 
 export function killChild(sessionId: string): Promise<void> {
+  const generation = ++nextGeneration;
+  childGeneration.delete(sessionId);
+  sseGeneration.delete(sessionId);
   livePid.delete(sessionId);
+  writes.delete(sessionId);
   pendingExit.delete(sessionId);
   unwatchChild(sessionId);
-  return invoke("harness_kill", { sessionId });
+  const pending = invoke<void>("harness_kill", { sessionId, generation });
+  stopping.set(sessionId, pending);
+  const cleanup = () => {
+    if (stopping.get(sessionId) === pending) stopping.delete(sessionId);
+  };
+  void pending.then(cleanup, cleanup);
+  return pending;
 }
 
 export function killAllChildren(): Promise<void> {
@@ -284,9 +419,20 @@ export function killAllChildren(): Promise<void> {
   sseHandlers.clear();
   sseEndHandlers.clear();
   sseBuffer.clear();
+  childGeneration.clear();
+  sseGeneration.clear();
+  writes.clear();
   livePid.clear();
   pendingExit.clear();
-  return invoke("harness_kill_all");
+  const pending = invoke<void>("harness_kill_all", {
+    generation: ++nextGeneration,
+  });
+  stoppingAll = pending;
+  const cleanup = () => {
+    if (stoppingAll === pending) stoppingAll = undefined;
+  };
+  void pending.then(cleanup, cleanup);
+  return pending;
 }
 
 export function resolveCursorBinary(cwd?: string): Promise<{ path: string }> {
@@ -382,17 +528,25 @@ export function harnessHttp(input: {
   return invoke("harness_http", input);
 }
 
-export function openHarnessSse(
+export async function openHarnessSse(
   sessionId: string,
   url: string,
   headers?: Record<string, string>,
 ): Promise<void> {
-  return invoke("harness_sse_open", { sessionId, url, headers });
+  const generation = ++nextGeneration;
+  sseGeneration.set(sessionId, generation);
+  await stoppingAll;
+  await stopping.get(sessionId);
+  if (sseGeneration.get(sessionId) !== generation)
+    throw new Error("Event stream startup cancelled");
+  return invoke("harness_sse_open", { sessionId, generation, url, headers });
 }
 
 export function closeHarnessSse(sessionId: string): Promise<void> {
+  const generation = ++nextGeneration;
+  sseGeneration.delete(sessionId);
   unwatchSse(sessionId);
-  return invoke("harness_sse_close", { sessionId });
+  return invoke("harness_sse_close", { sessionId, generation });
 }
 
 export function execChild(
