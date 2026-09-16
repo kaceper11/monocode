@@ -468,7 +468,7 @@ export const FileTree = memo(function FileTree({
         return;
       case "add-to-chat":
       case "send-to-agent":
-        await run(async () => requestAgentContext({ context: await contextFromFiles([target.path], cwd), cwd, sourceSessionId, prepareInSource: id === "add-to-chat" }));
+        await run(async () => requestAgentContext({ context: await contextFromFiles([target.path], cwd), cwd, sourceSessionId, destination: id === "add-to-chat" ? { kind: "source" } : undefined }));
         return;
       case "copy-path":
         await copyText(target.path);

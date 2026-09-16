@@ -54,8 +54,8 @@ it("reviews before handoff, restores selection for Ask, and cancels without deli
     return createElement(
       "div",
       null,
-      createElement("button", { onClick: () => context.open("send") }, "Send"),
-      createElement("button", { onClick: () => context.open("ask") }, "Ask"),
+      createElement("button", { onClick: () => context.open() }, "Send"),
+      createElement("button", { onClick: () => context.open() }, "Ask"),
       createElement(InboxContextPicker, { context, onConfirm: delivered }),
     );
   }
@@ -86,12 +86,11 @@ it("reviews before handoff, restores selection for Ask, and cancels without deli
         '[aria-label="Include comment by Sam"]',
       )!,
     );
-    await click(button("Choose conversation"));
+    await click(button("Open discussion"));
     expect(delivered).toHaveBeenCalledWith(
       expect.objectContaining({
         prompt: expect.stringContaining("Discuss this"),
       }),
-      "send",
     );
     expect(delivered.mock.calls[0][0].prompt).not.toContain("Requirements");
     await act(async () => root.render(null));
@@ -115,7 +114,6 @@ it("reviews before handoff, restores selection for Ask, and cancels without deli
       expect.objectContaining({
         prompt: expect.stringContaining("Discuss this"),
       }),
-      "ask",
     );
   } finally {
     await act(async () => root.unmount());

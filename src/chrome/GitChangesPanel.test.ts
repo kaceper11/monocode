@@ -126,7 +126,7 @@ it("keeps changes selected until the chosen recipient accepts context", async ()
     expect(requestAgentContext).toHaveBeenCalledWith(
       expect.objectContaining({
         sourceSessionId: "original",
-        taskId: "t1",
+        destination: { kind: "task", taskId: "t1" },
       }),
     );
     await act(async () =>

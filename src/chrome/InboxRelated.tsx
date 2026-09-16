@@ -25,7 +25,6 @@ export function InboxRelated({ item }: { item: InboxItem }) {
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<readonly string[]>([]);
   const [sendError, setSendError] = useState("");
-  const [sending, setSending] = useState(false);
   const generation = useRef(0);
   useEffect(
     () => () => {
@@ -73,20 +72,19 @@ export function InboxRelated({ item }: { item: InboxItem }) {
   };
 
   const send = () => {
-    if (sending) return;
-    setSending(true);
     setSendError("");
     try {
       const items = [item, ...selectedItems()];
       requestAgentContext({
-        tickets: items,
+        inboxItems: items,
         context: contextFromTickets(items),
         cwd: item.projectPath || undefined,
+        // The send landed — the row checkboxes served their purpose.
+        onPrepared: () => setSelected([]),
+        onFailed: (reason) => setSendError(reason),
       });
     } catch (reason) {
       setSendError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setSending(false);
     }
   };
 
@@ -228,7 +226,6 @@ export function InboxRelated({ item }: { item: InboxItem }) {
           <div className="flex items-center gap-2 border-t border-content/10 pt-2">
             <button
               type="button"
-              disabled={sending}
               className="rounded-md bg-content/10 px-2.5 py-1.5 hover:bg-content/15 disabled:opacity-40"
               onClick={send}
             >

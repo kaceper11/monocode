@@ -1526,6 +1526,18 @@ export function taskForSession(
   return host ? { task, child: host } : null;
 }
 
+/** A send originating from a task-owned session preselects that task as the
+ * destination; anything else leaves the choice to the picker. */
+export function taskDestinationForSession(
+  sessionId: string | undefined,
+): { kind: "task"; taskId: string } | undefined {
+  if (!sessionId) return undefined;
+  const found = taskForSession(sessionId);
+  return found && !found.task.archived
+    ? { kind: "task", taskId: found.task.id }
+    : undefined;
+}
+
 /**
  * Task children already claiming a working copy — concurrent-writer evidence.
  * Returns every non-archived task child bound to the exact path.

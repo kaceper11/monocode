@@ -3,8 +3,6 @@ import {
   removeSessionWorkItem,
   linkedWorkItemFromInboxItem,
 } from "../lib/sessionWorkItem";
-import { createTask } from "../lib/taskWorkspaces";
-import { ensureProjectForPath } from "../lib/projects";
 // @vitest-environment happy-dom
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
@@ -16,6 +14,10 @@ import { clearInboxCache, listInboxItems } from "../lib/githubTasks";
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
   convertFileSrc: (path: string) => path,
+}));
+vi.mock("../lib/agentContext", async (original) => ({
+  ...(await original<typeof import("../lib/agentContext")>()),
+  requestAgentContext: vi.fn(),
 }));
 vi.mock("./AgentMarkdown", () => ({
   AgentMarkdown: ({ text }: { text: string }) => createElement("p", null, text),
@@ -134,8 +136,7 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
-  const onStartTask = vi.fn().mockRejectedValue(new Error("Handoff failed"));
-  const onSendToTask = vi.fn();
+  const { requestAgentContext } = await import("../lib/agentContext");
   const onAsk = vi.fn().mockResolvedValue("ask-session");
   const button = (text: string) =>
     [...document.querySelectorAll("button")].find(
@@ -153,8 +154,6 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
           onAsk,
           onAskRestart: async () => "",
           onAskMount: () => {},
-          onStartTask,
-          onSendToTask,
           conversationId: "existing",
         }),
       ),
@@ -188,51 +187,20 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
     );
     expect(container.querySelector('[aria-label="Conversation"]')).toBeNull();
     await click(button("Send to agent"));
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
-    // The item hands off unchanged — the task sheet owns project selection.
-    expect(onStartTask).toHaveBeenCalledWith(
+    // The item hands off to the unified send flow — the picker owns context
+    // selection and the task-first destination choice.
+    expect(requestAgentContext).toHaveBeenCalledWith(
       expect.objectContaining({
-        provider: "azure",
-        identifier: "Bug 141",
-        projectPath: "",
-        repo: "",
-        site: "https://dev.azure.com/team",
+        inboxItems: [
+          expect.objectContaining({
+            provider: "azure",
+            identifier: "Bug 141",
+            projectPath: "",
+            repo: "",
+            site: "https://dev.azure.com/team",
+          }),
+        ],
       }),
-      null,
-    );
-    expect(document.body.textContent).toContain("Handoff failed");
-    // Send-to-task menu — the + on a task with a working copy sends the
-    // item linked with a fresh session instead of opening the task's.
-    const project = ensureProjectForPath("/tmp/task-proj", {
-      commonDir: "/tmp/task-proj/.git",
-      checkout: "/tmp/task-proj",
-    });
-    const task = createTask({
-      projectId: project.id,
-      name: "Existing task",
-      children: [
-        {
-          repositoryId: project.repositories[0].id,
-          mode: "existing",
-          workingCopy: "/tmp/wc",
-        },
-      ],
-    });
-    onStartTask.mockResolvedValueOnce(undefined);
-    await click(
-      document.querySelector<HTMLElement>(
-        'button[aria-label="Send to a task"]',
-      )!,
-    );
-    await click(
-      document.querySelector<HTMLElement>(
-        `button[aria-label="New conversation in task ${task.name}"]`,
-      )!,
-    );
-    expect(onStartTask).toHaveBeenLastCalledWith(
-      expect.objectContaining({ id: "141" }),
-      task.id,
-      { freshSession: true },
     );
     await click(button("GitHub"));
     await click(button("Azure"));
@@ -253,11 +221,27 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
         ) as HTMLInputElement
       ).checked,
     ).toBe(true);
-    await click(button("Send to task"));
-    expect(onSendToTask).toHaveBeenCalledWith([
-      expect.objectContaining({ provider: "azure", account: "ada", id: "141" }),
-    ]);
-    // Sending exits select mode and clears the selection.
+    await click(
+      container.querySelector<HTMLElement>(
+        'button[aria-label="Send selected tickets to an agent"]',
+      )!,
+    );
+    expect(requestAgentContext).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        inboxItems: [
+          expect.objectContaining({
+            provider: "azure",
+            account: "ada",
+            id: "141",
+          }),
+        ],
+      }),
+    );
+    // The selection survives until the route accepts — a cancelled picker
+    // keeps it for retry, and onPrepared ends select mode.
+    expect(container.querySelector('input[type="checkbox"]')).not.toBeNull();
+    const sentRequest = vi.mocked(requestAgentContext).mock.calls.at(-1)?.[0];
+    await act(async () => sentRequest?.onPrepared?.());
     expect(container.querySelector('input[type="checkbox"]')).toBeNull();
     fail = true;
     await click(container.querySelector('[aria-label="Refresh"]')!);
@@ -275,7 +259,7 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
       cwd: "/local/project",
       title: "Existing",
       linkedWorkItem: linkedWorkItemFromInboxItem(
-        onSendToTask.mock.calls[0][0][0],
+        vi.mocked(requestAgentContext).mock.calls.at(-1)![0].inboxItems![0],
       )!,
     };
     let finishToggle: (() => void) | undefined;
@@ -301,8 +285,6 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
           onAsk,
           onAskRestart: async () => "",
           onAskMount: () => {},
-          onStartTask,
-          onSendToTask,
           onOpenDelivery,
           conversationId: "existing",
           sessions: [linked as import("../lib/sessionStore").SessionSummary],
@@ -411,8 +393,6 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
           onAsk,
           onAskRestart: async () => "",
           onAskMount: () => {},
-          onStartTask,
-          onSendToTask,
           onOpenDelivery,
           conversationId: "existing",
           sessions: [
@@ -524,7 +504,11 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
       (container.querySelector("#inbox-ticket-list") as HTMLElement).hidden,
     ).toBe(false);
     await click(container.querySelector('[aria-label="Select tickets"]')!);
-    expect(button("Send to task")).toBeUndefined();
+    expect(
+      container.querySelector(
+        'button[aria-label="Send selected tickets to an agent"]',
+      ),
+    ).toBeNull();
     await click(button("Done"));
 
     await act(async () =>
@@ -535,7 +519,6 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
           onAsk,
           onAskRestart: async () => "",
           onAskMount: () => {},
-          onStartTask,
           conversationId: "existing",
           target: { ...linked.linkedWorkItem },
         }),
@@ -551,8 +534,6 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
           onAsk,
           onAskRestart: async () => "",
           onAskMount: () => {},
-          onStartTask,
-          onSendToTask,
           visible,
         }),
       );
@@ -579,8 +560,6 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
           onAsk,
           onAskRestart: async () => "",
           onAskMount: () => {},
-          onStartTask,
-          onSendToTask,
           conversationId: "existing",
           selectionRevision: 1,
         }),
@@ -606,7 +585,6 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
           onAsk,
           onAskRestart: async () => "",
           onAskMount: () => {},
-          onStartTask,
           visible,
           target,
         }),

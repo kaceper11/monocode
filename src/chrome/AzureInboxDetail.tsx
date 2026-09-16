@@ -21,6 +21,7 @@ import {
 } from "../lib/azurePipelines";
 import { saveDeliveryProvider } from "../lib/deliveryProviders";
 import type { InboxItem, InboxComposerCard } from "../lib/githubTasks";
+import { contextFromTickets, requestAgentContext } from "../lib/agentContext";
 import { CwdPicker } from "./CwdPicker";
 import { AzurePrReview } from "./AzurePrReview";
 import { AzureCiReview } from "./AzureCiReview";
@@ -245,8 +246,25 @@ export function AzureInboxDetail({
         <div className="flex flex-wrap items-center gap-2">
           <button
             className={ACTION_FILLED}
+            onClick={() => {
+              try {
+                requestAgentContext({
+                  inboxItems: [item],
+                  context: contextFromTickets([item]),
+                  cwd: item.projectPath || cwd || undefined,
+                  onFailed: (reason) => setError(reason),
+                });
+              } catch (reason) {
+                setError(String(reason));
+              }
+            }}
+          >
+            Send to agent
+          </button>
+          <button
+            className={ACTION_OUTLINE}
             disabled={context.busy}
-            onClick={() => context.open("ask")}
+            onClick={() => context.open()}
           >
             <MessageSquare className="size-3.5" strokeWidth={1.75} />
             Ask agent

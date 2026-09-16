@@ -2,33 +2,41 @@
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
-import { searchSessions } from "../lib/sessionStore";
 import { AgentContextPicker } from "./AgentContextPicker";
 import { contextFromText, contextFromTickets } from "../lib/agentContext";
 import type { Session } from "../lib/session";
+import type { TaskWorkspace } from "../lib/taskWorkspaces";
 
-vi.mock("../lib/sessionStore", async original => ({ ...(await original<typeof import("../lib/sessionStore")>()), searchSessions: vi.fn().mockResolvedValue({ hits: [], truncated: false }) }));
-vi.mock("./SecondOpinionButton", () => ({ SecondOpinionButton: () => null }));
-vi.mock("./CwdPicker", () => ({ CwdPicker: () => null }));
-vi.mock("../lib/session", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../lib/session")>()),
-  newDefaultSession: (cwd: string) => ({
-    id: "fresh",
-    harness: "codex",
-    cwd,
-    title: "New session",
-  }),
-}));
+async function mockTasks(tasks: Partial<TaskWorkspace>[]) {
+  return vi
+    .spyOn(await import("../lib/taskWorkspaces"), "loadTaskWorkspaces")
+    .mockReturnValue(tasks as TaskWorkspace[]);
+}
 
-it("retains the destination after failure and opens it once after attaching context", async () => {
+const ticket = {
+  provider: "github",
+  kind: "issue",
+  number: 8,
+  title: "Link tickets",
+  state: "open",
+  repo: "a/b",
+  url: "https://github.com/a/b/issues/8",
+  labels: [],
+} as import("../lib/githubTasks").InboxItem;
+
+const submit = () =>
+  [...document.querySelectorAll("button")].find((button) =>
+    ["Send to task", "Create task…"].includes(button.textContent ?? ""),
+  )!;
+
+it("retains the task destination after failure and sends once it succeeds", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const tasks = await mockTasks([
+    { id: "t1", name: "Fix the flake", archived: false, sessionIds: [], children: [] },
+  ]);
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
-  const sessions = [
-    { id: "a", harness: "codex", cwd: "/a", title: "Source", busy: true },
-    { id: "b", harness: "claude", cwd: "/b", title: "Recipient" },
-  ] as Session[];
   const request = {
     context: contextFromText("Selection", "Only selected text", "/a message-2"),
     sourceSessionId: "a",
@@ -37,174 +45,96 @@ it("retains the destination after failure and opens it once after attaching cont
   const onPrepare = vi
     .fn()
     .mockImplementationOnce(() => {
-      throw new Error("Recipient closed");
+      throw new Error("Task launch failed");
     })
-    .mockReturnValue("b");
-  const onOpen = vi.fn(),
-    onClose = vi.fn();
-  const render = (available = sessions) =>
-    root.render(
-      createElement(AgentContextPicker, {
-        request,
-        sessions: available,
-        recents: [],
-        onPrepare,
-        onOpen,
-        onClose,
-      }),
-    );
-  const button = (text: string) =>
-    [...document.querySelectorAll("button")].find(
-      (el) => el.textContent === text,
-    )!;
+    .mockReturnValue("task-session");
+  const onClose = vi.fn();
   try {
-    await act(async () => render());
+    await act(async () =>
+      root.render(
+        createElement(AgentContextPicker, {
+          request,
+          sessions: [
+            { id: "a", harness: "codex", cwd: "/a", title: "Source" },
+          ] as Session[],
+          onPrepare,
+          onClose,
+        }),
+      ),
+    );
     await act(async () =>
       (
-        document.querySelector('button[data-destination="b"]') as HTMLElement
+        document.querySelector(
+          'button[data-destination="task:t1"]',
+        ) as HTMLElement
       ).click(),
     );
-    await act(async () => button("Add to chat").click());
-    expect(document.body.textContent).toContain("Recipient closed");
+    await act(async () => submit().click());
+    expect(document.body.textContent).toContain("Task launch failed");
     expect(
-      (
-        document.querySelector('button[data-destination="b"]') as HTMLElement
-      ).getAttribute("aria-pressed"),
+      document
+        .querySelector('button[data-destination="task:t1"]')
+        ?.getAttribute("aria-pressed"),
     ).toBe("true");
     await act(async () => {
-      const submit = button("Add to chat");
-      submit.click();
-      submit.click();
+      submit().click();
+      submit().click();
     });
     expect(onPrepare).toHaveBeenCalledTimes(2);
     expect(onPrepare).toHaveBeenLastCalledWith(
       expect.objectContaining({
         context: expect.objectContaining({ entries: request.context.entries }),
       }),
-      "b",
+      { kind: "task", taskId: "t1" },
       expect.any(AbortSignal),
     );
-    expect(onOpen).toHaveBeenCalledExactlyOnceWith("b");
     expect(onClose).toHaveBeenCalledOnce();
-    expect(document.body.textContent).not.toContain("Prepared in");
   } finally {
     await act(async () => root.unmount());
     host.remove();
+    tasks.mockRestore();
     vi.unstubAllGlobals();
   }
 });
 
-it("opens a ticket conversation directly with compact choices and no preparation form", async () => {
+it("sends tickets to a new task by default", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
-  const onPrepare = vi.fn().mockReturnValue("existing"),
-    onOpen = vi.fn(),
-    onClose = vi.fn();
-  const ticket = {
-    provider: "github",
-    kind: "issue",
-    number: 8,
-    title: "Link tickets",
-    state: "open",
-    repo: "a/b",
-    url: "https://github.com/a/b/issues/8",
-    labels: [],
-  } as import("../lib/githubTasks").InboxItem;
-  try {
-    await act(async () =>
-      root.render(
-        createElement(AgentContextPicker, {
-          request: { context: contextFromTickets([ticket]), cwd: "/a" },
-          sessions: [
-            {
-              id: "existing",
-              harness: "codex",
-              cwd: "/a",
-              title: "Existing",
-            } as Session,
-          ],
-          recents: [],
-          onPrepare,
-          onOpen,
-          onClose,
-        }),
-      ),
-    );
-    expect(document.body.textContent).not.toContain("Unknown");
-    expect(document.querySelector("textarea, input[type=radio]")).toBeNull();
-    await act(async () =>
-      (
-        document.querySelector('[data-destination="existing"]') as HTMLElement
-      ).click(),
-    );
-    await act(async () =>
-      [...document.querySelectorAll("button")]
-        .find((button) => button.textContent === "Open conversation")!
-        .click(),
-    );
-    expect(onPrepare).toHaveBeenCalledTimes(1);
-    expect(onOpen).toHaveBeenCalledWith("existing");
-    expect(onClose).toHaveBeenCalledTimes(1);
-  } finally {
-    await act(async () => root.unmount());
-    host.remove();
-    vi.unstubAllGlobals();
-  }
-});
-
-it("creates one conversation for a ticket bundle without reopening it through the existing-session path", async () => {
-  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  const host = document.createElement("div");
-  document.body.append(host);
-  const root = createRoot(host);
-  const onPrepare = vi.fn().mockReturnValue("fresh"),
-    onOpen = vi.fn(),
-    onClose = vi.fn();
-  const ticket = {
-    provider: "github",
-    kind: "issue",
-    number: 8,
-    title: "Link tickets",
-    state: "open",
-    repo: "a/b",
-    url: "https://github.com/a/b/issues/8",
-    labels: [],
-  } as import("../lib/githubTasks").InboxItem;
+  const onPrepare = vi.fn().mockReturnValue("task-session");
+  const onClose = vi.fn();
+  const tickets = [
+    ticket,
+    { ...ticket, number: 13, url: "https://github.com/a/b/issues/13" },
+  ];
   try {
     await act(async () =>
       root.render(
         createElement(AgentContextPicker, {
           request: {
-            context: contextFromTickets([
-              ticket,
-              {
-                ...ticket,
-                number: 13,
-                url: "https://github.com/a/b/issues/13",
-              },
-            ]),
+            context: contextFromTickets(tickets),
+            inboxItems: tickets,
             cwd: "/a",
           },
           sessions: [],
-          recents: [],
           onPrepare,
-          onOpen,
           onClose,
         }),
       ),
     );
-    await act(async () => {
-      const submit = [...document.querySelectorAll("button")].find(
-        (button) => button.textContent === "Open conversation",
-      )!;
-      submit.click();
-      submit.click();
-    });
+    expect(
+      document
+        .querySelector('[data-destination="new-task"]')
+        ?.getAttribute("aria-pressed"),
+    ).toBe("true");
+    await act(async () => submit().click());
     expect(onPrepare).toHaveBeenCalledTimes(1);
-    expect(onPrepare.mock.calls[0][0].context.entries).toHaveLength(2);
-    expect(onOpen).not.toHaveBeenCalled();
+    expect(onPrepare).toHaveBeenLastCalledWith(
+      expect.anything(),
+      { kind: "new-task" },
+      expect.any(AbortSignal),
+    );
     expect(onClose).toHaveBeenCalledTimes(1);
   } finally {
     await act(async () => root.unmount());
@@ -213,112 +143,240 @@ it("creates one conversation for a ticket bundle without reopening it through th
   }
 });
 
-it("offers an inactive saved conversation without loading its transcript", async () => {
+it("asks for a task when no task owns the source session", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  const host = document.createElement("div"); document.body.append(host);
+  const tasks = await mockTasks([
+    { id: "t1", name: "Fix the flake", archived: false, sessionIds: [], children: [] },
+  ]);
+  const host = document.createElement("div");
+  document.body.append(host);
   const root = createRoot(host);
-  const onPrepare = vi.fn().mockResolvedValue("saved");
+  const onPrepare = vi.fn().mockReturnValue("task-session");
   try {
-    await act(async () => root.render(createElement(AgentContextPicker, {
-      request: { context: contextFromText("File", "snapshot", "/project"), cwd: "/project" }, sessions: [],
-      history: [{ id: "saved", title: "Inactive conversation", cwd: "/project", harness: "codex", model: "", runtimeMode: "supervised", createdAt: 1, updatedAt: 2 }],
-      recents: [], onPrepare, onOpen: vi.fn(), onClose: vi.fn(),
-    })));
-    await act(async () => (document.querySelector('[data-destination="saved"]') as HTMLButtonElement).click());
-    await act(async () => [...document.querySelectorAll("button")].find(button => button.textContent === "Add to chat")!.click());
-    expect(onPrepare).toHaveBeenCalledWith(expect.anything(), "saved", expect.any(AbortSignal));
-  } finally { await act(async () => root.unmount()); host.remove(); vi.unstubAllGlobals(); }
-});
-
-it("searches saved conversations across projects", async () => {
-  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  vi.useFakeTimers();
-  vi.mocked(searchSessions).mockResolvedValueOnce({ hits: [{ kind: "conversation", sessionId: "remote-saved", title: "Other project task", cwd: "/other/project", harness: "claude", updatedAt: 1 }], truncated: false });
-  const host = document.createElement("div"); document.body.append(host);
-  const root = createRoot(host);
-  try {
-    await act(async () => root.render(createElement(AgentContextPicker, { request: { context: contextFromText("File", "body", "/current"), cwd: "/current" }, sessions: [], recents: [], onPrepare: vi.fn(), onOpen: vi.fn(), onClose: vi.fn() })));
-    const input = document.querySelector('[aria-label="Search conversations"]') as HTMLInputElement;
-    await act(async () => {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "Other project");
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
-    expect(searchSessions).toHaveBeenCalledWith({ query: "Other project", includeArchived: false });
-    expect(document.querySelector('[data-destination="remote-saved"]')?.textContent).toContain("/other/project");
-  } finally { await act(async () => root.unmount()); host.remove(); vi.useRealTimers(); vi.unstubAllGlobals(); }
-});
-
-it("requires an explicit destination when the source does not own the work", async () => {
-  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  const host = document.createElement("div"); document.body.append(host);
-  const root = createRoot(host);
-  const onPrepare = vi.fn().mockReturnValue("chosen");
-  try {
-    await act(async () => root.render(createElement(AgentContextPicker, {
-      request: { context: contextFromText("PR review", "selected thread", "Azure PR #13"), cwd: "/project", requireDestinationSelection: true },
-      sessions: [{ id: "chosen", title: "Review owner", cwd: "/project", harness: "codex" } as Session],
-      recents: [], onPrepare, onOpen: vi.fn(), onClose: vi.fn(),
-    })));
-    const submit = () => [...document.querySelectorAll("button")].find(button => button.textContent === "Add to chat")!;
+    await act(async () =>
+      root.render(
+        createElement(AgentContextPicker, {
+          request: {
+            context: contextFromText("PR review", "selected thread", "Azure PR #13"),
+            cwd: "/project",
+          },
+          sessions: [],
+          onPrepare,
+          onClose: vi.fn(),
+        }),
+      ),
+    );
+    // No default — an unrelated task must be chosen deliberately.
+    expect(document.body.textContent).toContain("Choose a task.");
     expect(submit().disabled).toBe(true);
-    expect(document.body.textContent).toContain("Choose an agent conversation");
-    await act(async () => (document.querySelector('[data-destination="chosen"]') as HTMLButtonElement).click());
+    await act(async () =>
+      (
+        document.querySelector(
+          'button[data-destination="new-task"]',
+        ) as HTMLElement
+      ).click(),
+    );
     expect(submit().disabled).toBe(false);
+    expect(submit().textContent).toBe("Create task…");
     await act(async () => submit().click());
-    expect(onPrepare).toHaveBeenCalledWith(expect.anything(), "chosen", expect.any(AbortSignal));
-  } finally { await act(async () => root.unmount()); host.remove(); vi.unstubAllGlobals(); }
+    expect(onPrepare).toHaveBeenCalledWith(
+      expect.anything(),
+      { kind: "new-task" },
+      expect.any(AbortSignal),
+    );
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    tasks.mockRestore();
+    vi.unstubAllGlobals();
+  }
 });
 
-it("requires exact-checkout repair ownership, editable selection, and sends only once to the chosen owner", async () => {
+it("preselects the task claiming the repair's evidence checkout", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  const registry = await import("../lib/harness/registry");
-  const live = vi.spyOn(registry, "isLiveHarness").mockReturnValue(true);
-  const host = document.createElement("div"); document.body.append(host);
+  const tasks = await mockTasks([
+    {
+      id: "t-match",
+      name: "Repo task",
+      archived: false,
+      sessionIds: [],
+      children: [
+        {
+          id: "c1",
+          workingCopy: "/repo",
+          sessionIds: [],
+          launch: { state: "ready" },
+        },
+      ],
+    },
+    { id: "t-other", name: "Other", archived: false, sessionIds: [], children: [] },
+  ]);
+  const host = document.createElement("div");
+  document.body.append(host);
   const root = createRoot(host);
-  const sessions = [{ id: "owner", harness: "codex", cwd: "/repo", title: "Owner", blocks: [], busy: true }, { id: "focused", harness: "codex", cwd: "/other", title: "Other focused session", blocks: [] }] as unknown as Session[];
-  const context = contextFromText("Failure", "Run 8, attempt 2", "Azure account/repo/run"); context.instruction = "Fix selected failure";
-  const request: import("../lib/agentContext").AgentContextRequest = { context, cwd: "/repo", sourceSessionId: "owner", repair: { kind: "ci", scope: "pipeline-7", run: { id: 8, revision: "run-8" }, job: { name: "Tests" }, log: { attempt: 2 }, source: { target: { accountId: "account", repositoryType: "GitHub", repositoryId: "team/repo" } }, head: { cwd: "/repo", branch: "feature", commit: "abc", remote: "https://github.com/team/repo" } } as import("../lib/repair").RepairEvidence };
-  let finish!: (id: string) => void;
-  const onPrepare = vi.fn(() => new Promise<string>(resolve => { finish = resolve; }));
-  const onOpen = vi.fn(), onClose = vi.fn();
-  const button = (text: string) => [...document.body.querySelectorAll("button")].find(button => button.textContent === text)!;
+  const context = contextFromText("Failure", "Run 8, attempt 2", "Azure account/repo/run");
+  context.instruction = "Fix selected failure";
+  const request: import("../lib/agentContext").AgentContextRequest = {
+    context,
+    cwd: "/repo",
+    sourceSessionId: "owner",
+    repair: {
+      kind: "ci",
+      scope: "pipeline-7",
+      run: { id: 8, revision: "run-8" },
+      job: { name: "Tests" },
+      log: { attempt: 2 },
+      source: {
+        target: {
+          accountId: "account",
+          repositoryType: "GitHub",
+          repositoryId: "team/repo",
+        },
+      },
+      head: {
+        cwd: "/repo",
+        branch: "feature",
+        commit: "abc",
+        remote: "https://github.com/team/repo",
+      },
+    } as import("../lib/repair").RepairEvidence,
+  };
+  const onPrepare = vi.fn().mockResolvedValue("task-session");
+  const onClose = vi.fn();
   try {
-    await act(async () => root.render(createElement(AgentContextPicker, { request, sessions, recents: [], onPrepare, onOpen, onClose })));
-    expect(button("Queue for owner").disabled).toBe(false);
-    await act(async () => (document.body.querySelector('[data-destination="focused"]') as HTMLElement).click());
-    expect(button("Send to owner").disabled).toBe(true);
-    expect(document.body.textContent).toContain("exact checkout");
-    await act(async () => (document.body.querySelector('[data-destination="owner"]') as HTMLElement).click());
-    const check = document.body.querySelector('input[type="checkbox"]') as HTMLInputElement;
-    await act(async () => check.click()); expect(button("Queue for owner").disabled).toBe(true);
+    await act(async () =>
+      root.render(
+        createElement(AgentContextPicker, {
+          request,
+          sessions: [],
+          onPrepare,
+          onClose,
+        }),
+      ),
+    );
+    // The evidence-owning task is preselected and first; the other task
+    // shows why it is a weaker destination.
+    expect(
+      document
+        .querySelector('[data-destination="task:t-match"]')
+        ?.getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(document.body.textContent).toContain("Send to · Repo task");
+    expect(
+      document.querySelector('[data-destination="task:t-other"]')
+        ?.textContent,
+    ).toContain("No matching checkout");
+    // Selection and instruction gate the send.
+    const check = document.body.querySelector(
+      'input[type="checkbox"]',
+    ) as HTMLInputElement;
     await act(async () => check.click());
-    await act(async () => { button("Queue for owner").click(); button("Queue for owner").click(); });
+    expect(submit().disabled).toBe(true);
+    await act(async () => check.click());
+    await act(async () => {
+      submit().click();
+      submit().click();
+    });
     expect(onPrepare).toHaveBeenCalledOnce();
-    expect(onPrepare).toHaveBeenCalledWith(expect.objectContaining({ context: expect.objectContaining({ instruction: "Fix selected failure" }) }), "owner", expect.any(AbortSignal));
-    await act(async () => finish("owner")); expect(onOpen).toHaveBeenCalledExactlyOnceWith("owner");
-  } finally { await act(async () => root.unmount()); host.remove(); live.mockRestore(); vi.unstubAllGlobals(); }
+    expect(onPrepare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        context: expect.objectContaining({
+          instruction: "Fix selected failure",
+        }),
+      }),
+      { kind: "task", taskId: "t-match" },
+      expect.any(AbortSignal),
+    );
+    expect(onClose).toHaveBeenCalledOnce();
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    tasks.mockRestore();
+    vi.unstubAllGlobals();
+  }
 });
 
 it("keeps a stale repair draft visible but prevents another send until evidence is refreshed", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  const registry = await import("../lib/harness/registry"); const live = vi.spyOn(registry, "isLiveHarness").mockReturnValue(true);
-  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
-  const context = contextFromText("Failure", "Selected log", "Azure"); context.instruction = "Fix failure";
-  const request = { context, cwd: "/repo", sourceSessionId: "owner", repair: {kind: "ci", scope: "ci", run: {id: 8, revision: "run-8"}, job: {name: "Tests"}, log: {attempt: 2}, source: {target: {accountId: "a",repositoryId:"repo",repositoryType:"GitHub"}}, head: {cwd:"/repo",branch:"feature",commit:"head",remote:"https://github.com/a/b"}} } as import("../lib/agentContext").AgentContextRequest;
-  const sessions = [{id:"owner",harness:"codex",cwd:"/repo",title:"Owner",blocks:[]}] as unknown as Session[];
-  const onPrepare = vi.fn().mockRejectedValue(new Error("Run changed. Refresh evidence."));
+  const tasks = await mockTasks([
+    {
+      id: "t1",
+      name: "Repo task",
+      archived: false,
+      sessionIds: [],
+      children: [
+        {
+          id: "c1",
+          workingCopy: "/repo",
+          sessionIds: [],
+          launch: { state: "ready" },
+        },
+      ],
+    },
+  ]);
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const context = contextFromText("Failure", "Selected log", "Azure");
+  context.instruction = "Fix failure";
+  const request = {
+    context,
+    cwd: "/repo",
+    sourceSessionId: "owner",
+    repair: {
+      kind: "ci",
+      scope: "ci",
+      run: { id: 8, revision: "run-8" },
+      job: { name: "Tests" },
+      log: { attempt: 2 },
+      source: {
+        target: {
+          accountId: "a",
+          repositoryId: "repo",
+          repositoryType: "GitHub",
+        },
+      },
+      head: {
+        cwd: "/repo",
+        branch: "feature",
+        commit: "head",
+        remote: "https://github.com/a/b",
+      },
+    },
+  } as import("../lib/agentContext").AgentContextRequest;
+  const onPrepare = vi
+    .fn()
+    .mockRejectedValue(new Error("Run changed. Refresh evidence."));
   const onRefreshEvidence = vi.fn();
   const onClose = vi.fn();
   request.onRefreshEvidence = onRefreshEvidence;
   try {
-    await act(async()=>root.render(createElement(AgentContextPicker,{request,sessions,recents:[],onPrepare,onOpen:vi.fn(),onClose})));
-    const button=()=>[...document.querySelectorAll("button")].find(b=>b.textContent==="Send to owner")!;
-    await act(async()=>button().click());
-    expect(button().disabled).toBe(true); expect(document.body.textContent).toContain("Refresh evidence");
-    await act(async()=>button().click()); expect(onPrepare).toHaveBeenCalledOnce();
-    await act(async () => [...document.querySelectorAll("button")].find(b => b.textContent === "Refresh evidence")!.click());
+    await act(async () =>
+      root.render(
+        createElement(AgentContextPicker, {
+          request,
+          sessions: [],
+          onPrepare,
+          onClose,
+        }),
+      ),
+    );
+    await act(async () => submit().click());
+    expect(submit().disabled).toBe(true);
+    expect(document.body.textContent).toContain("Refresh evidence");
+    await act(async () => submit().click());
+    expect(onPrepare).toHaveBeenCalledOnce();
+    await act(async () =>
+      [...document.querySelectorAll("button")]
+        .find((b) => b.textContent === "Refresh evidence")!
+        .click(),
+    );
     expect(onRefreshEvidence).toHaveBeenCalledExactlyOnceWith("Fix failure");
     expect(onClose).toHaveBeenCalledOnce();
-  } finally {await act(async()=>root.unmount());host.remove();live.mockRestore();vi.unstubAllGlobals();}
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    tasks.mockRestore();
+    vi.unstubAllGlobals();
+  }
 });

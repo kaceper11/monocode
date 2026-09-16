@@ -259,8 +259,12 @@ export function ConfluencePicker({
       requestAgentContext({
         context,
         ...(destination === "chat"
-          ? { prepareInSource: true, sourceSessionId: sessionId, cwd }
-          : { requireDestinationSelection: true }),
+          ? {
+              destination: { kind: "source" as const },
+              sourceSessionId: sessionId,
+              cwd,
+            }
+          : {}),
       });
       onClose();
     } catch (reason) {

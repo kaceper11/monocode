@@ -11,6 +11,10 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
   convertFileSrc: (path: string) => path,
 }));
+vi.mock("../lib/agentContext", async (original) => ({
+  ...(await original<typeof import("../lib/agentContext")>()),
+  requestAgentContext: vi.fn(),
+}));
 vi.mock("./AgentMarkdown", () => ({
   AgentMarkdown: ({ text }: { text: string }) => createElement("p", null, text),
 }));
@@ -77,7 +81,7 @@ it("retains the selected Jira ticket through handoff and refresh failures", asyn
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
-  const onStartTask = vi.fn().mockRejectedValue(new Error("Handoff failed"));
+  const { requestAgentContext } = await import("../lib/agentContext");
   const button = (text: string) =>
     [...document.querySelectorAll("button")].find(
       (button) => button.textContent?.trim() === text,
@@ -96,7 +100,6 @@ it("retains the selected Jira ticket through handoff and refresh failures", asyn
           onAsk: async () => "",
           onAskRestart: async () => "",
           onAskMount: () => {},
-          onStartTask,
         }),
       );
     });
@@ -107,18 +110,20 @@ it("retains the selected Jira ticket through handoff and refresh failures", asyn
       )!,
     );
     await click(button("Send to agent"));
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
-    // The item hands off unchanged — the task sheet owns project selection.
-    expect(onStartTask).toHaveBeenCalledWith(
+    // The item hands off to the unified send flow — the picker owns context
+    // selection and the task-first destination choice.
+    expect(requestAgentContext).toHaveBeenCalledWith(
       expect.objectContaining({
-        identifier: "ENG-41",
-        site: "https://team.atlassian.net",
-        projectPath: "",
-        repo: "",
+        inboxItems: [
+          expect.objectContaining({
+            identifier: "ENG-41",
+            site: "https://team.atlassian.net",
+            projectPath: "",
+            repo: "",
+          }),
+        ],
       }),
-      null,
     );
-    expect(document.body.textContent).toContain("Handoff failed");
     await click(button("GitHub"));
     await click(button("Jira"));
     expect(container.querySelector("h1")?.textContent).toBe("Ticket 41");

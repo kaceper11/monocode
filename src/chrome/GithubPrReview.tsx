@@ -39,6 +39,7 @@ import {
   type RepairEvidence,
 } from "../lib/repair";
 import { requestAgentContext, type AgentContext } from "../lib/agentContext";
+import { taskDestinationForSession } from "../lib/taskWorkspaces";
 import { diffCommentLocation } from "../lib/diffComment";
 import { notifyGitChanged } from "../lib/fs";
 import { openProjectPath } from "../lib/recents";
@@ -325,7 +326,7 @@ function GithubPrPanel({
         onRefreshEvidence,
         cwd: draft.evidence.head.cwd,
         sourceSessionId,
-        requireDestinationSelection: !sourceSessionId,
+        destination: taskDestinationForSession(sourceSessionId),
         onPrepared: onClose,
       });
     });

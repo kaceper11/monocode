@@ -2760,7 +2760,6 @@ function SessionCard({
             </span>
             <span className="flex shrink-0 items-center gap-1.5">
               {linkedUpdateDot}
-              {workItemBadge}
               {status}
             </span>
           </span>
@@ -2783,7 +2782,6 @@ function SessionCard({
           {compact ? (
             <span className="flex shrink-0 items-center gap-1.5">
               {linkedUpdateDot}
-              {workItemBadge}
               {status}
             </span>
           ) : null}

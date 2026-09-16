@@ -381,7 +381,7 @@ it("sends live merge state — host, cwd, branch, incoming ref, paths, bounded d
   const request = vi.mocked(requestAgentContext).mock.calls.at(-1)?.[0];
   expect(request?.sourceSessionId).toBe("owner-1");
   expect(request?.cwd).toBe("/repo");
-  expect(request?.requireDestinationSelection).toBe(false);
+  expect(request?.destination).toEqual({ kind: "source" });
   const entries = request?.context.entries ?? [];
   expect(entries).toHaveLength(2);
   expect(entries[0].text).toContain("Working copy: /repo");
@@ -447,7 +447,9 @@ it("routes to the destination picker when the working copy has no owner", async 
   });
   await sendMergeConflictsToAgent({ cwd: "/repo" });
   const request = vi.mocked(requestAgentContext).mock.calls.at(-1)?.[0];
-  expect(request?.requireDestinationSelection).toBe(true);
+  // No owning session — the source destination can't resolve and the
+  // handler falls back to the destination picker.
+  expect(request?.destination).toEqual({ kind: "source" });
   expect(request?.sourceSessionId).toBeUndefined();
 });
 
@@ -756,7 +758,7 @@ it("syncs every linked working copy and routes conflicts to their agents", async
   expect(ask).not.toHaveBeenCalled();
   const request = vi.mocked(requestAgentContext).mock.calls.at(-1)?.[0];
   expect(request?.sourceSessionId).toBe("session-c");
-  expect(request?.requireDestinationSelection).toBe(false);
+  expect(request?.destination).toEqual({ kind: "source" });
   const text = request?.context.entries[0].text ?? "";
   expect(text).toContain("incoming and the current changes");
   expect(text).toContain("ask me questions");

@@ -90,6 +90,7 @@ import {
   linkTicketContext,
   prepareSessionContext,
   type AgentContextRequest,
+  type AgentDestination,
 } from "./lib/agentContext";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { invoke } from "@tauri-apps/api/core";
@@ -378,6 +379,8 @@ import {
   pruneTaskSession,
   recordTaskActiveChild,
   subscribeTaskWorkspaces,
+  taskChildrenForWorkingCopy,
+  taskDestinationForSession,
   taskForSession,
   taskOwnedChildForWorkingCopy,
   taskOwnsCheckout,
@@ -2164,11 +2167,26 @@ export default function App({
     if (inboxViewOpen) setInboxMounted(true);
   }, [inboxViewOpen]);
   const [contextRequest, setContextRequest] = useState<AgentContextRequest>();
+  /** Imperative mirror of `contextRequest` — the receive handler needs the
+   * occupied/free answer synchronously, before state lands. */
+  const contextRequestOpenRef = useRef(false);
   useEffect(() => {
     const receive = (event: Event) => {
       const request = (event as CustomEvent<AgentContextRequest>).detail;
-      if (request.taskId || request.newTask) {
-        void routeContextToTaskRef.current(request);
+      const destination = request.destination;
+      // Repairs always open the review picker — a destination there only
+      // preselects a task or conversation, it never skips the evidence step.
+      if (
+        !request.repair &&
+        (destination?.kind === "task" || destination?.kind === "new-task")
+      ) {
+        void routeContextToTaskRef
+          .current(request, destination)
+          .catch((error: unknown) =>
+            request.onFailed?.(
+              error instanceof Error ? error.message : String(error),
+            ),
+          );
         return;
       }
       const source = sessionsRef.current.find(
@@ -2176,8 +2194,17 @@ export default function App({
           session.id ===
           (request.sourceSessionId ?? activeSessionIdRef.current),
       );
+      if (!request.repair && destination?.kind === "session") {
+        void prepareContextDestinationRef
+          .current(request, destination)
+          .then((id) => {
+            if (id) void selectHistorySessionRef.current?.(id);
+          })
+          .catch((error) => request.onFailed?.(String(error)));
+        return;
+      }
       if (
-        request.prepareInSource &&
+        destination?.kind === "source" &&
         !request.repair &&
         source &&
         (!request.cwd || sessionWorkCwd(source) === request.cwd)
@@ -2195,18 +2222,23 @@ export default function App({
           /* Keep the selection available in the review sheet. */
         }
       }
-      setContextRequest(
-        (current) =>
-          current ?? {
-            ...request,
-            sourceSessionId:
-              request.sourceSessionId ??
-              (source &&
-              (!request.cwd || sessionWorkCwd(source) === request.cwd)
-                ? source.id
-                : undefined),
-          },
-      );
+      // One picker at a time — a second send would silently vanish, so
+      // tell the sender instead of dropping it.
+      if (contextRequestOpenRef.current) {
+        request.onFailed?.(
+          "Another send is already open — finish or cancel it first.",
+        );
+        return;
+      }
+      contextRequestOpenRef.current = true;
+      setContextRequest({
+        ...request,
+        sourceSessionId:
+          request.sourceSessionId ??
+          (source && (!request.cwd || sessionWorkCwd(source) === request.cwd)
+            ? source.id
+            : undefined),
+      });
     };
     window.addEventListener(PREPARE_AGENT_CONTEXT, receive);
     return () => window.removeEventListener(PREPARE_AGENT_CONTEXT, receive);
@@ -2214,24 +2246,31 @@ export default function App({
 
   const prepareContextDestination = async (
     request: AgentContextRequest,
-    destination: string | Session,
+    destination: AgentDestination,
     signal?: AbortSignal,
   ): Promise<string> => {
-    const context = request.tickets
-      ? await contextFromTicketDescriptions(request.tickets, signal)
-      : request.context;
-    if (
-      typeof destination === "string" &&
-      !sessionsRef.current.some((session) => session.id === destination)
-    ) {
-      await ensureOpenSession(destination);
+    // Task destinations resolve a conversation inside the task model —
+    // launching or creating one when needed — then run the same tail as a
+    // picked conversation.
+    if (destination.kind === "task" || destination.kind === "new-task")
+      return (
+        (await routeContextToTaskRef.current(request, destination, signal)) ??
+        ""
+      );
+    const context = request.context;
+    const sessionId =
+      destination.kind === "session"
+        ? destination.sessionId
+        : request.sourceSessionId;
+    if (!sessionId) throw new Error("Choose an agent conversation or a task.");
+    if (!sessionsRef.current.some((session) => session.id === sessionId)) {
+      await ensureOpenSession(sessionId);
       signal?.throwIfAborted();
     }
+    const target = sessionsRef.current.find(
+      (session) => session.id === sessionId,
+    );
     signal?.throwIfAborted();
-    const existing = typeof destination === "string";
-    const target = existing
-      ? sessionsRef.current.find((session) => session.id === destination)
-      : destination;
     if (!target)
       throw new Error("Conversation closed. Choose another destination.");
     if (request.repair) {
@@ -2252,14 +2291,6 @@ export default function App({
       };
       signal?.throwIfAborted();
       reserveRepair(delivery, repairCheckingRef.current.has(target.id));
-      if (!existing) {
-        const updated = [...sessionsRef.current, target];
-        sessionsRef.current = updated;
-        setSessions(updated);
-        const tab = newTab(target.id);
-        appendTab(tab, target.cwd);
-        setActiveTabId(tab.id);
-      }
       const accepted = await onSubmit(
         target.id,
         composeAgentContext(context, ""),
@@ -2277,52 +2308,30 @@ export default function App({
           repairRecords().find((row) => row.id === delivery.id)?.detail ||
             "Repair was not delivered. Refresh evidence and retry.",
         );
+      request.onPrepared?.();
       return target.id;
     }
-    const tickets = request.context.entries.every((entry) => !!entry.ticket);
     const prepared =
       request.attachmentsOptional &&
       context.attachments.length &&
       !harnessSupportsAttachments(target.harness)
         ? { ...context, attachments: [] }
         : context;
-    let next = tickets
+    // Any resolvable work item links onto the session — a mixed batch still
+    // stages every entry's context.
+    const next = context.entries.some((entry) => entry.workItem)
       ? linkTicketContext(target, prepared)
       : prepareSessionContext(target, prepared, true);
-    if (existing) {
-      const updated = sessionsRef.current.map((session) =>
-        session.id === next.id ? next : session,
-      );
-      sessionsRef.current = updated;
-      setSessions(updated);
-    } else {
-      const created = (next = {
-        ...next,
-        ...(tickets
-          ? {
-              title: request.context.entries
-                .map((entry) => entry.ticket!.identifier)
-                .join(", "),
-            }
-          : {}),
-      });
-      const updated = [...sessionsRef.current, created];
-      sessionsRef.current = updated;
-      setSessions(updated);
-      const tab = newTab(created.id);
-      appendTab(tab, created.cwd);
-      setActiveTabId(tab.id);
-      if (tickets) {
-        setInboxViewOpen(true);
-        setInboxConversationId(created.id);
-      } else setInboxViewOpen(false);
-      setNotesViewOpen(false);
-      setComposerFocused(true);
-    }
-    if (tickets) persistSession(next);
+    const updated = sessionsRef.current.map((session) =>
+      session.id === next.id ? next : session,
+    );
+    sessionsRef.current = updated;
+    setSessions(updated);
     request.onPrepared?.();
     return next.id;
   };
+  const prepareContextDestinationRef = useRef(prepareContextDestination);
+  prepareContextDestinationRef.current = prepareContextDestination;
   const onToggleConversationTicket = async (
     sessionId: string,
     item: InboxItem,
@@ -5935,6 +5944,9 @@ export default function App({
     initialName?: string;
     initialBrief?: string;
     initialChildren?: TaskChildDraft[];
+    /** Send-to-new-task continuation — runs once in place of the default
+     * open after the task is created. */
+    continueSend?: (taskId: string) => void;
     /** Remount key — a retarget never inherits the previous form's state. */
     nonce: number;
   } | null>(null);
@@ -6524,18 +6536,22 @@ export default function App({
 
   /** Another conversation for a task, rooted in a child's working copy.
    * Linked explicitly (not via the location claim) so shared checkouts link
-   * too; title + ticket match what the claim/`ensureOpenSession` would set. */
-  const onNewTaskConversation = useCallback(
-    (taskId: string, childId: string) => {
+   * too; title + ticket match what the claim/`ensureOpenSession` would set.
+   * Returns the session so task-destination sends can stage onto it
+   * synchronously. */
+  const openTaskConversation = useCallback(
+    (taskId: string, childId: string): Session | undefined => {
       const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
       const child = task?.children.find((entry) => entry.id === childId);
-      if (!task || task.archived || !child?.workingCopy) return;
+      if (!task || task.archived || !child?.workingCopy) return undefined;
       const session = newDefaultSession(child.workingCopy);
       session.title = task.name;
       session.linkedWorkItem = task.ticket;
       linkTaskSession(task.id, session.id);
       const tab = newTab(session.id);
-      setSessions((prev) => [...prev, session]);
+      const next = [...sessionsRef.current, session];
+      sessionsRef.current = next;
+      setSessions(next);
       appendTab(tab, child.workingCopy);
       setActiveTabId(tab.id);
       setComposerFocused(true);
@@ -6544,8 +6560,15 @@ export default function App({
       // search, …) would otherwise stay on top of the new conversation.
       setTaskDetailsId(null);
       dismissOverlays();
+      return session;
     },
     [appendTab, armTaskFocus, dismissOverlays],
+  );
+  const onNewTaskConversation = useCallback(
+    (taskId: string, childId: string) => {
+      openTaskConversation(taskId, childId);
+    },
+    [openTaskConversation],
   );
 
   /** Resolves the owning project for a send-to-task path without inventing
@@ -6569,165 +6592,320 @@ export default function App({
     return ensureProjectForPath(family.checkout || path, family);
   }, []);
 
-  /** Prepared change/file context routed to a task: stage it on the task's
-   * session — starting the task first when it has none — or open the create
-   * sheet with a file-list brief for a new task. */
-  const routeContextToTask = useCallback(
-    async (request: AgentContextRequest) => {
-      const done = () => request.onPrepared?.();
-      /** The project repository whose family inventory contains `path` —
-       * the anchor itself or any member worktree. */
-      const repoOwningPath = (
-        project: ProjectRecord | undefined,
-        path: string,
-      ) => {
-        const key = pathKey(path);
-        return project?.repositories.find((repo) => {
-          if (pathKey(repo.anchor) === key) return true;
-          const family = familyForRepository(repo, getVerifiedFamilies());
-          return family ? familyHasCopy(family, path) : false;
-        });
-      };
-      if (request.newTask || !request.taskId) {
-        const path =
-          request.cwd || active?.cwd || sessionDefaults?.cwd || projectCwd;
-        // Unresolved context still opens the sheet — its project picker owns
-        // the choice the inbox used to ask for up front.
-        const project = await ensureTaskProject(path);
-        // The changes live in request.cwd — that working copy becomes the
-        // task's child so the work stays where the files already changed.
-        const changedRepo = request.cwd
-          ? repoOwningPath(project, request.cwd)
-          : undefined;
-        const files = request.context.entries
-          .map((entry) => `- ${entry.title}`)
-          .join("\n");
-        openTaskSheet({
-          ...(project ? { projectId: project.id } : {}),
-          ...(files
-            ? {
-                initialBrief: `Selected changes${request.cwd ? ` in ${prettyCwd(request.cwd)}` : ""}:\n${files}`,
-              }
-            : {}),
-          ...(changedRepo && request.cwd
-            ? {
-                initialChildren: [
-                  {
-                    repositoryId: changedRepo.id,
-                    mode: "existing" as const,
-                    workingCopy: request.cwd,
-                  },
-                ],
-              }
-            : {}),
-        });
-        done();
-        return;
-      }
-      const task = loadTaskWorkspaces().find(
-        (entry) => entry.id === request.taskId && !entry.archived,
+  /** Prepared context routed to a task: stage it on the task's session —
+   * starting the task first when it has none — or open the create sheet and
+   * continue the send once the task exists. Repairs resolve the child whose
+   * working copy matches the evidence checkout, so the fix lands where the
+   * files are. */
+  const routeContextToTask = async (
+    request: AgentContextRequest,
+    destination: Extract<AgentDestination, { kind: "task" | "new-task" }>,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> => {
+    const done = () => request.onPrepared?.();
+    /** The project repository whose family inventory contains `path` —
+     * the anchor itself or any member worktree. */
+    const repoOwningPath = (
+      project: ProjectRecord | undefined,
+      path: string,
+    ) => {
+      const key = pathKey(path);
+      return project?.repositories.find((repo) => {
+        if (pathKey(repo.anchor) === key) return true;
+        const family = familyForRepository(repo, getVerifiedFamilies());
+        return family ? familyHasCopy(family, path) : false;
+      });
+    };
+    let context = request.context;
+    // Work items carried by the entries also link onto the task — its
+    // Issues row and future sessions then see the same ticket.
+    const workItems = [
+      ...new Map(
+        context.entries.flatMap((entry) =>
+          entry.workItem
+            ? [
+                [
+                  `${entry.workItem.url} · ${entry.workItem.account ?? ""}`,
+                  entry.workItem,
+                ] as const,
+              ]
+            : [],
+        ),
+      ).values(),
+    ];
+    /** Same delivery rule as the session tail — text entries still land
+     * when the resolved harness can't take attachments. */
+    const deliverable = (target: Session) =>
+      request.attachmentsOptional &&
+      context.attachments.length &&
+      !harnessSupportsAttachments(target.harness)
+        ? { ...context, attachments: [] }
+        : context;
+    /** A task conversation rooted at the evidence checkout: the matching
+     * child is prepared when needed, then a live session rooted there wins
+     * over a freshly linked conversation at the same copy. */
+    const repairTaskSession = async (task: TaskWorkspace): Promise<string> => {
+      const evidence = request.repair!;
+      const key = pathKey(evidence.head.cwd);
+      let child = task.children.find(
+        (entry) => entry.workingCopy && pathKey(entry.workingCopy) === key,
       );
-      if (!task) {
-        // Target vanished — release the selection rather than stranding it.
-        done();
-        return;
-      }
-      // Record the worktree holding the changes on the task when its
-      // repository isn't a child yet — the task then lists where the
-      // selected change actually lives.
-      const taskProject = projectForTask(task);
-      const changedRepo = request.cwd
-        ? repoOwningPath(taskProject, request.cwd)
-        : undefined;
-      if (
-        changedRepo &&
-        !task.children.some((child) => child.repositoryId === changedRepo.id)
-      ) {
-        try {
-          addTaskChildren(task.id, [
-            {
-              repositoryId: changedRepo.id,
-              mode: "existing",
-              workingCopy: request.cwd,
-            },
-          ]);
-        } catch (error) {
-          // A conflicting copy claim — the staged context still carries
-          // the change, but say so instead of silently skipping the repo.
-          request = {
-            ...request,
-            context: {
-              ...request.context,
-              entries: [
-                ...request.context.entries,
-                {
-                  id: crypto.randomUUID(),
-                  title: "Repository not added to the task",
-                  origin: "Send to task",
-                  text: `The working copy holding these changes was not added to "${task.name}": ${String(error)}`,
-                },
-              ],
-            },
-          };
-        }
-      }
-      let sessionId = firstTaskSessionId(task);
-      // A deleted conversation id must not shadow a relaunch.
-      if (sessionId && !(await taskSessionAlive(sessionId)))
-        sessionId = undefined;
-      // No session yet — the send starts the task, then stages the context.
-      if (!sessionId) {
-        try {
-          sessionId = await launchTaskChildren(task.id);
-        } catch (error) {
-          request.onFailed?.(String(error));
-          return;
-        }
-      }
-      if (!sessionId) {
-        // Nothing staged — keep the sender's selection so the send can be
-        // retried, and land on details where the failed/pending launch
-        // state explains why.
-        request.onFailed?.(
-          `"${task.name}" has no session — its working copies aren't ready yet.`,
+      if (!child) {
+        const repo = repoOwningPath(projectForTask(task), evidence.head.cwd);
+        if (!repo)
+          throw new Error(
+            `"${task.name}" has no working copy at ${evidence.head.cwd} — add that checkout to the task, or pick a conversation rooted there.`,
+          );
+        // The create sheet treats another task's claim as concurrent-writer
+        // evidence — hold the same line here instead of silently binding a
+        // shared checkout.
+        const claimed = taskChildrenForWorkingCopy(
+          evidence.head.cwd,
+          loadTaskWorkspaces(),
+          task.id,
+        )[0];
+        if (claimed)
+          throw new Error(
+            `${evidence.head.cwd} already belongs to "${claimed.task.name}" — send the repair there instead.`,
+          );
+        child = addTaskChildren(task.id, [
+          {
+            repositoryId: repo.id,
+            mode: "existing",
+            workingCopy: evidence.head.cwd,
+          },
+        ]).find(
+          (entry) => entry.workingCopy && pathKey(entry.workingCopy) === key,
         );
-        setTaskDetailsId(task.id);
-        return;
       }
-      try {
-        // Open first — a session that was only on disk loads into
-        // sessionsRef here, so staging before this call could silently drop
-        // the context.
-        await onSelectHistorySession(sessionId);
-        const target = sessionsRef.current.find(
-          (session) => session.id === sessionId,
+      if (!child)
+        throw new Error(
+          `The checkout at ${evidence.head.cwd} could not be added to "${task.name}".`,
         );
-        if (target) {
-          const next = prepareSessionContext(target, request.context, true);
+      if (child.launch.state !== "ready")
+        await launchTaskChildren(task.id, [child.id]);
+      const current =
+        loadTaskWorkspaces().find((entry) => entry.id === task.id) ?? task;
+      child = current.children.find((entry) => entry.id === child!.id);
+      if (!child?.workingCopy || child.launch.state !== "ready")
+        throw new Error(
+          child?.launch.state === "failed"
+            ? (child.launch.error ??
+                `The checkout at ${evidence.head.cwd} is not ready.`)
+            : `The checkout at ${evidence.head.cwd} is not ready yet — prepare it from the task first.`,
+        );
+      const resolved = await Promise.all(
+        [...taskSessionIds(current)].map(async (id) => ({
+          id,
+          session:
+            sessionsRef.current.find((entry) => entry.id === id) ??
+            (await getSession(id).catch(() => null)),
+        })),
+      );
+      for (const { id, session } of resolved) {
+        if (!session || pathKey(sessionWorkCwd(session)) !== key) continue;
+        // The repair tail needs the session in sessionsRef — if it can't
+        // be restored, the next candidate still gets its chance.
+        if (!(await ensureOpenSession(id))) continue;
+        return id;
+      }
+      const session = openTaskConversation(task.id, child.id);
+      if (!session)
+        throw new Error(
+          `A conversation could not be opened in ${evidence.head.cwd}.`,
+        );
+      return session.id;
+    };
+    /** The create sheet's post-creation step: the send continues on the
+     * new task's conversation instead of stopping at a linked ticket. */
+    const continueSend = (taskId: string) => {
+      void (async () => {
+        try {
+          const task = loadTaskWorkspaces().find(
+            (entry) => entry.id === taskId && !entry.archived,
+          );
+          if (!task) {
+            request.onFailed?.("That task no longer exists.");
+            return;
+          }
+          const sessionId = request.repair
+            ? await repairTaskSession(task)
+            : await launchTaskChildren(taskId);
+          if (!sessionId) {
+            // Children still pending or failed — details show why; the
+            // brief already carries the context summary, so the send did
+            // land on the task.
+            setTaskDetailsId(taskId);
+            request.onPrepared?.();
+            return;
+          }
+          await onSelectHistorySession(sessionId);
+          if (request.repair) {
+            // The sheet's confirm is a fresh user action — the picker's
+            // abort signal died with it and must not reach this send.
+            await prepareContextDestinationRef.current(
+              { ...request, context },
+              { kind: "session", sessionId },
+            );
+            return;
+          }
+          const target = sessionsRef.current.find(
+            (entry) => entry.id === sessionId,
+          );
+          if (!target) {
+            request.onFailed?.(
+              "The task's conversation is no longer available.",
+            );
+            return;
+          }
+          const next = workItems.length
+            ? linkTicketContext(target, deliverable(target))
+            : prepareSessionContext(target, deliverable(target), true);
           const updated = sessionsRef.current.map((session) =>
             session.id === next.id ? next : session,
           );
           sessionsRef.current = updated;
           setSessions(updated);
+          request.onPrepared?.();
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          request.onFailed?.(reason);
+          await message(reason, { title: "Send to task", kind: "error" });
         }
+      })();
+    };
+    if (destination.kind === "new-task") {
+      // A second send would remount the sheet and silently discard the
+      // form the user is editing — refuse instead.
+      if (taskSheet)
+        throw new Error("Finish or cancel the open task sheet first.");
+      const copyPath = request.repair?.head.cwd ?? request.cwd;
+      const path =
+        copyPath || active?.cwd || sessionDefaults?.cwd || projectCwd;
+      // Unresolved context still opens the sheet — its project picker owns
+      // the choice the inbox used to ask for up front.
+      const project = await ensureTaskProject(path);
+      // The changes/evidence live in copyPath — that working copy becomes
+      // the task's child so the work stays where the files already are.
+      const changedRepo = copyPath
+        ? repoOwningPath(project, copyPath)
+        : undefined;
+      const files = context.entries
+        .map((entry) => `- ${entry.title}`)
+        .join("\n");
+      openTaskSheet({
+        ...(project ? { projectId: project.id } : {}),
+        ...(workItems.length ? { initialTickets: workItems } : {}),
+        ...(files
+          ? {
+              initialBrief: `${request.repair ? "Repair evidence" : "Selected changes"}${copyPath ? ` in ${prettyCwd(copyPath)}` : ""}:\n${files}`,
+            }
+          : {}),
+        ...(changedRepo && copyPath
+          ? {
+              initialChildren: [
+                {
+                  repositoryId: changedRepo.id,
+                  mode: "existing" as const,
+                  workingCopy: copyPath,
+                },
+              ],
+            }
+          : {}),
+        continueSend,
+      });
+      // Not `done()` — the send lands only when continueSend stages it, so
+      // a cancelled sheet leaves the sender's selection intact.
+      return undefined;
+    }
+    const task = loadTaskWorkspaces().find(
+      (entry) => entry.id === destination.taskId && !entry.archived,
+    );
+    if (!task) throw new Error("That task no longer exists.");
+    for (const workItem of workItems) linkTicketToTask(task.id, workItem);
+    // Record the worktree holding the changes on the task when its
+    // repository isn't a child yet — the task then lists where the
+    // selected change actually lives. Repairs resolve their own child in
+    // repairTaskSession instead.
+    const taskProject = projectForTask(task);
+    const changedRepo =
+      !request.repair && request.cwd
+        ? repoOwningPath(taskProject, request.cwd)
+        : undefined;
+    if (
+      changedRepo &&
+      !task.children.some((child) => child.repositoryId === changedRepo.id)
+    ) {
+      try {
+        addTaskChildren(task.id, [
+          {
+            repositoryId: changedRepo.id,
+            mode: "existing",
+            workingCopy: request.cwd,
+          },
+        ]);
       } catch (error) {
-        // Same rule as a failed launch: keep the selection, say why.
-        request.onFailed?.(String(error));
-        return;
+        // A conflicting copy claim — the staged context still carries
+        // the change, but say so instead of silently skipping the repo.
+        context = {
+          ...context,
+          entries: [
+            ...context.entries,
+            {
+              id: crypto.randomUUID(),
+              title: "Repository not added to the task",
+              origin: "Send to task",
+              text: `The working copy holding these changes was not added to "${task.name}": ${String(error)}`,
+            },
+          ],
+        };
       }
-      done();
-    },
-    [
-      active?.cwd,
-      ensureTaskProject,
-      launchTaskChildren,
-      onSelectHistorySession,
-      openTaskSheet,
-      projectCwd,
-      sessionDefaults?.cwd,
-      taskSessionAlive,
-    ],
-  );
+    }
+    let sessionId: string | undefined;
+    if (request.repair) {
+      sessionId = await repairTaskSession(task);
+    } else {
+      sessionId = firstTaskSessionId(task);
+      // A deleted conversation id must not shadow a relaunch.
+      if (sessionId && !(await taskSessionAlive(sessionId)))
+        sessionId = undefined;
+      // No session yet — the send starts the task, then stages the context.
+      if (!sessionId) sessionId = await launchTaskChildren(task.id);
+    }
+    if (!sessionId) {
+      // Land on details where the failed/pending launch state explains
+      // why — the throw then keeps the sender's selection for a retry.
+      setTaskDetailsId(task.id);
+      throw new Error(
+        `"${task.name}" has no session — its working copies aren't ready yet.`,
+      );
+    }
+    // Open first — a session that was only on disk loads into sessionsRef
+    // here, so staging before this call could silently drop the context.
+    await onSelectHistorySession(sessionId);
+    if (request.repair) {
+      return await prepareContextDestinationRef.current(
+        { ...request, context },
+        { kind: "session", sessionId },
+        signal,
+      );
+    }
+    const target = sessionsRef.current.find(
+      (session) => session.id === sessionId,
+    );
+    if (!target)
+      throw new Error("The task's conversation is no longer available.");
+    const next = workItems.length
+      ? linkTicketContext(target, deliverable(target))
+      : prepareSessionContext(target, deliverable(target), true);
+    const updated = sessionsRef.current.map((session) =>
+      session.id === next.id ? next : session,
+    );
+    sessionsRef.current = updated;
+    setSessions(updated);
+    done();
+    return sessionId;
+  };
   const routeContextToTaskRef = useRef(routeContextToTask);
   routeContextToTaskRef.current = routeContextToTask;
 
@@ -6814,36 +6992,6 @@ export default function App({
       history,
       onNewTaskConversation,
       onOpenTask,
-      openTaskSheet,
-      projectCwd,
-      sessionDefaults?.cwd,
-    ],
-  );
-
-  /** Inbox multi-select — every picked item links onto the new task; the
-   * sheet opens with them all in its Issues row. */
-  const onSendItemsToTask = useCallback(
-    async (items: InboxItem[]) => {
-      const linked = items
-        .map(linkedWorkItemFromInboxItem)
-        .filter((entry): entry is LinkedWorkItem => !!entry);
-      const path =
-        items[0]?.projectPath ||
-        active?.cwd ||
-        sessionDefaults?.cwd ||
-        projectCwd;
-      // Initial selection only — the sheet's project picker owns the choice.
-      const project = await ensureTaskProject(path);
-      setInboxViewOpen(false);
-      openTaskSheet({
-        ...(project ? { projectId: project.id } : {}),
-        ...(items[0] ? { initialName: inboxItemTaskName(items[0]) } : {}),
-        ...(linked.length ? { initialTickets: linked } : {}),
-      });
-    },
-    [
-      active?.cwd,
-      ensureTaskProject,
       openTaskSheet,
       projectCwd,
       sessionDefaults?.cwd,
@@ -8138,13 +8286,22 @@ export default function App({
     (
       draft: { evidence: RepairEvidence; context: AgentContext },
       sessionId?: string,
+      options?: {
+        instruction?: string;
+        onRefresh?: (instruction: string) => void;
+      },
     ) => {
+      // When the sending conversation belongs to a task, preselect that
+      // task — the repair resolves its checkout-matching child on confirm.
       requestAgentContext({
-        context: draft.context,
+        context: options?.instruction
+          ? { ...draft.context, instruction: options.instruction }
+          : draft.context,
         repair: draft.evidence,
         cwd: draft.evidence.head.cwd,
         sourceSessionId: sessionId,
-        requireDestinationSelection: !sessionId,
+        destination: taskDestinationForSession(sessionId),
+        onRefreshEvidence: options?.onRefresh,
       });
     },
     [],
@@ -8158,10 +8315,15 @@ export default function App({
     async (task: TaskWorkspace, cwd?: string): Promise<string | undefined> => {
       const key = cwd ? pathKey(cwd) : undefined;
       let first: string | undefined;
-      for (const id of taskSessionIds(task)) {
-        const session =
-          sessionsRef.current.find((entry) => entry.id === id) ??
-          (await getSession(id).catch(() => null));
+      const resolved = await Promise.all(
+        [...taskSessionIds(task)].map(async (id) => ({
+          id,
+          session:
+            sessionsRef.current.find((entry) => entry.id === id) ??
+            (await getSession(id).catch(() => null)),
+        })),
+      );
+      for (const { id, session } of resolved) {
         if (!session) {
           // Dead id — same pruning taskSessionAlive performs.
           pruneTaskSession(id);
@@ -8181,7 +8343,7 @@ export default function App({
    * conversation. With no live conversation the destination picker asks where
    * the evidence should go. */
   const onFixTaskCi = useCallback(
-    async (task: TaskWorkspace, fix: TaskCiFix) => {
+    async (task: TaskWorkspace, fix: TaskCiFix, instruction?: string) => {
       try {
         const sessionId = await taskActionSession(
           task,
@@ -8209,7 +8371,20 @@ export default function App({
                   repo: fix.repo,
                   number: fix.number,
                 });
-        dispatchRepairDraft(draft, sessionId);
+        requestAgentContext({
+          context: instruction
+            ? { ...draft.context, instruction }
+            : draft.context,
+          repair: draft.evidence,
+          cwd: draft.evidence.head.cwd,
+          sourceSessionId: sessionId,
+          // The task is the known destination — confirm resolves the child
+          // whose working copy matches the evidence checkout.
+          destination: { kind: "task", taskId: task.id },
+          // Rebuild the draft on refresh — stale evidence dead-ends the
+          // picker otherwise.
+          onRefreshEvidence: (next) => void onFixTaskCi(task, fix, next),
+        });
       } catch (error) {
         await message(error instanceof Error ? error.message : String(error), {
           title: task.name,
@@ -8217,7 +8392,7 @@ export default function App({
         });
       }
     },
-    [dispatchRepairDraft, taskActionSession],
+    [taskActionSession],
   );
 
   /** Opens a details row's review surface — PR comments, checks, pipeline
@@ -8439,9 +8614,16 @@ export default function App({
   }, []);
 
   const onAttentionAction = useCallback(
-    async (item: AttentionItem) => {
+    async (item: AttentionItem, instruction?: string) => {
       const action = item.action;
       if (!action) return;
+      // Repair sends whose evidence this handler rebuilds can be refreshed
+      // in place — re-running the action re-reads the provider and keeps
+      // the instruction the user already typed.
+      const repairOpts = {
+        instruction,
+        onRefresh: (next: string) => void onAttentionAction(item, next),
+      };
       try {
         switch (action.kind) {
           case "open-session":
@@ -8471,18 +8653,18 @@ export default function App({
               context: action.context,
               cwd: item.cwd,
               sourceSessionId: action.sessionId,
-              requireDestinationSelection: !action.sessionId,
             });
             return;
-          case "repair":
+          case "repair": {
             requestAgentContext({
               context: action.context,
               repair: action.evidence,
               cwd: action.evidence.head.cwd,
               sourceSessionId: item.sessionId,
-              requireDestinationSelection: !item.sessionId,
+              destination: taskDestinationForSession(item.sessionId),
             });
             return;
+          }
           case "azure-pr-comments": {
             const { pr, revision } = await readAzurePr(action.target);
             if (pr.status !== "active")
@@ -8506,7 +8688,7 @@ export default function App({
               "threads",
             );
             const draft = await commentsRepair(association, threads.items, 0);
-            dispatchRepairDraft(draft, action.sessionId);
+            dispatchRepairDraft(draft, action.sessionId, repairOpts);
             return;
           }
           case "github-pr-comments": {
@@ -8531,12 +8713,12 @@ export default function App({
               number: action.number,
               comments,
             });
-            dispatchRepairDraft(draft, action.sessionId);
+            dispatchRepairDraft(draft, action.sessionId, repairOpts);
             return;
           }
           case "azure-ci-fix": {
             const draft = await azureCiRepairDraft(action);
-            dispatchRepairDraft(draft, action.sessionId);
+            dispatchRepairDraft(draft, action.sessionId, repairOpts);
             return;
           }
           case "github-ci-fix": {
@@ -8545,7 +8727,7 @@ export default function App({
               repo: action.repo,
               number: action.number,
             });
-            dispatchRepairDraft(draft, action.sessionId);
+            dispatchRepairDraft(draft, action.sessionId, repairOpts);
             return;
           }
           case "update-branch":
@@ -8663,7 +8845,6 @@ export default function App({
         ),
         cwd: item.cwd,
         sourceSessionId: watcher.target?.sessionId,
-        requireDestinationSelection: !watcher.target?.sessionId,
       });
     },
     runAction: async (watcher, item) => {
@@ -8782,7 +8963,6 @@ export default function App({
         ),
         cwd: schedule.target.cwd,
         sourceSessionId: schedule.target.sessionId,
-        requireDestinationSelection: !schedule.target.sessionId,
       });
     },
     runSchedule: async (schedule) => {
@@ -9595,7 +9775,11 @@ export default function App({
           onCreated={(taskId) => {
             // The sheet unmounts as Task Details mounts — same-commit swap.
             modalSwap();
-            onOpenTask(taskId);
+            // A send-to-new-task continuation owns post-create navigation —
+            // it stages the context (or dispatches the repair) once the
+            // task's conversation exists.
+            if (taskSheet.continueSend) taskSheet.continueSend(taskId);
+            else onOpenTask(taskId);
             setProjectRailOpen((open) => {
               if (open) return open;
               saveProjectRailOpen(true);
@@ -10030,13 +10214,11 @@ export default function App({
               besideRail={projectRailOpen}
               onClose={onLeaveInbox}
               onToggleSidebar={onToggleSidebar}
-              onStartTask={onStartItemToTask}
               onOpenSettings={() => openSettings("inbox")}
               onAsk={onAskInboxItem}
               onAskRestart={onRestartInboxAsk}
               onAskMount={setInboxAskPortal}
               sessions={inboxRelatedSessions}
-              liveSessionIds={liveSessionIds}
               onOpenSession={onOpenInboxSession}
               onOpenDelivery={onOpenInboxDelivery}
               busySessionIds={busySessionIds}
@@ -10050,7 +10232,6 @@ export default function App({
               selectionRevision={inboxSelectionRevision}
               onCloseConversation={() => setInboxConversationId(undefined)}
               onToggleConversationTicket={onToggleConversationTicket}
-              onSendToTask={onSendItemsToTask}
               onOpenIntegrations={onOpenInboxIntegrations}
             />
           </div>
@@ -10060,19 +10241,11 @@ export default function App({
             request={contextRequest}
             history={sidebarHistory}
             sessions={sessions}
-            recents={recents}
             onPrepare={prepareContextDestination}
-            onOpen={(id) => {
-              if (
-                contextRequest.context.entries.every((entry) => !!entry.ticket)
-              )
-                void onOpenInboxSession(id);
-              else {
-                setInboxViewOpen(false);
-                void onSelectHistorySession(id);
-              }
+            onClose={() => {
+              contextRequestOpenRef.current = false;
+              setContextRequest(undefined);
             }}
-            onClose={() => setContextRequest(undefined)}
           />
         ) : null}
         {notesViewOpen ? (
