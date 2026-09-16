@@ -350,7 +350,10 @@ export async function sendMergeConflictsToAgent(
     }),
     cwd: target.cwd,
     sourceSessionId: target.sessionId,
-    requireDestinationSelection: !target.sessionId,
+    // Stage straight on the owning conversation when it's open at this
+    // checkout — a bulk sync can dispatch several conflict sends at once,
+    // and only one picker request can be open at a time.
+    destination: { kind: "source" },
   });
   return true;
 }

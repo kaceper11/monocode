@@ -27,6 +27,33 @@ export const MAX_CONTEXT_TEXT = 32_000;
 export const MAX_CONTEXT_ITEMS = 20;
 export const PREPARE_AGENT_CONTEXT = "monocode:prepare-agent-context";
 
+/** Where a prepared context lands. Tasks are the only destination the
+ * picker offers — a task resolves to its conversation (launching it on
+ * confirm when none is live). `session`/`source` stay for direct sends
+ * that already know the owning conversation (repairs' resolved task
+ * conversation, merge-conflict owner sends). */
+export type AgentDestination =
+  | { kind: "task"; taskId: string }
+  | { kind: "new-task" }
+  | { kind: "session"; sessionId: string }
+  /** Stage on the source conversation directly, no picker. */
+  | { kind: "source" };
+
+/** Coarse context selection shared by every item in a batch send — the
+ * fine per-item picker stays single-item only. */
+export type BatchContextChoice = {
+  description: boolean;
+  /** Most-recent comments per item; 0 omits discussion. */
+  comments: number;
+  files: boolean;
+};
+
+export const DEFAULT_BATCH_CONTEXT: BatchContextChoice = {
+  description: true,
+  comments: 0,
+  files: false,
+};
+
 /** Selected snapshots only. Session links remain owned by linkedWorkItem. */
 export type AgentContext = {
   id: string;
@@ -46,18 +73,18 @@ export type AgentContext = {
 };
 export type AgentContextRequest = {
   context: AgentContext;
-  tickets?: readonly InboxItem[];
+  /** Inbox items whose context the user selects inside the picker — one
+   * item gets the full description/comments/files sections, several get
+   * the shared batch toggles. The built result replaces `context` at
+   * confirm. */
+  inboxItems?: readonly InboxItem[];
+  /** Initial batch selection for a multi-item `inboxItems` send. */
+  batch?: BatchContextChoice;
+  /** Where the context goes; absent opens the destination picker. */
+  destination?: AgentDestination;
   sourceSessionId?: string;
   cwd?: string;
   repair?: import("./repair").RepairEvidence;
-  prepareInSource?: boolean;
-  /** Route the context to a task's session instead of a picked
-   * conversation — the task is started if it has no session yet. */
-  taskId?: string;
-  /** Route to a new task — opens the create sheet with the context
-   * summarized into its shared brief. */
-  newTask?: boolean;
-  requireDestinationSelection?: boolean;
   /** When the chosen harness can't take attachments, deliver the text
    * entries instead of failing — the entries carry the same context. */
   attachmentsOptional?: boolean;
@@ -201,7 +228,7 @@ export async function contextFromTicketDescriptions(
         signal?.throwIfAborted();
         const body = details.body || "No description provided.";
         const text = `${item.title}\n${item.url}\nState: ${item.state}\n\n${body.slice(0, MAX_CONTEXT_TEXT)}`;
-        entries[index] = { ...context.entries[index], text: text.slice(0, MAX_CONTEXT_TEXT), truncated: text.length > MAX_CONTEXT_TEXT || body.length > MAX_CONTEXT_TEXT };
+        entries[index] = { ...context.entries[index], text: text.slice(0, MAX_CONTEXT_TEXT), truncated: body.length > MAX_CONTEXT_TEXT };
       } catch (error) {
         failed = true;
         throw new Error(

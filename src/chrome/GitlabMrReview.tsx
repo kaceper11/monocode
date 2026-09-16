@@ -20,6 +20,7 @@ import {
   type RepairEvidence,
 } from "../lib/repair";
 import { requestAgentContext, type AgentContext } from "../lib/agentContext";
+import { taskDestinationForSession } from "../lib/taskWorkspaces";
 import { RepairStatus } from "./RepairStatus";
 import {
   ReviewDetails,
@@ -314,7 +315,7 @@ function GitlabMrPanel({
         onRefreshEvidence,
         cwd: draft.evidence.head.cwd,
         sourceSessionId,
-        requireDestinationSelection: !sourceSessionId,
+        destination: taskDestinationForSession(sourceSessionId),
         onPrepared: onClose,
       });
     });

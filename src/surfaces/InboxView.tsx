@@ -29,7 +29,6 @@ import {
   Plus,
   RefreshCw,
   Search,
-  Task,
   Zap,
   type IconComponent,
 } from "../chrome/icons";
@@ -90,16 +89,14 @@ import {
   subscribeBranchPrVersion,
 } from "../hooks/useBranchPr";
 import type { InboxComposerCard } from "../lib/githubTasks";
+import { contextFromTickets, requestAgentContext } from "../lib/agentContext";
 import { ProjectLogoIcon } from "../chrome/ProjectLogoIcon";
 import { ProjectMascot } from "../chrome/ProjectMascot";
 import { OverlayNav } from "../chrome/TitleBar";
 import { Popover } from "../chrome/Popover";
 import {
   loadTaskWorkspaces,
-  projectForTask,
   subscribeTaskWorkspaces,
-  taskSessionIds,
-  liveTaskSessionIds,
   taskWorkspacesSnapshot,
 } from "../lib/taskWorkspaces";
 import { WindowControls } from "../chrome/WindowControls";
@@ -388,15 +385,7 @@ type Props = {
   onClose?: () => void;
   onToggleSidebar?: () => void;
   onOpenSettings?: () => void;
-  onStartTask?: (
-    item: InboxItem,
-    taskId: string | null,
-    opts?: { freshSession?: boolean },
-  ) => void;
   sessions?: readonly SessionSummary[];
-  /** Every resolvable session id — `sessions` here is ticket-filtered, so
-   * task conversation counts must key off this full set instead. */
-  liveSessionIds?: ReadonlySet<string>;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
   onOpenDelivery?: (
     sessionId: string,
@@ -424,7 +413,6 @@ type Props = {
     item: InboxItem,
     selected: boolean,
   ) => Promise<void>;
-  onSendToTask?: (items: InboxItem[]) => void;
   /** Opens Settings on the card where the given source is connected. */
   onOpenIntegrations?: (source: ConnectableInboxSource) => void;
 };
@@ -439,9 +427,7 @@ export function InboxView({
   onClose,
   onToggleSidebar,
   onOpenSettings,
-  onStartTask,
   sessions = [],
-  liveSessionIds,
   onOpenSession,
   onOpenDelivery,
   busySessionIds,
@@ -455,7 +441,6 @@ export function InboxView({
   selectionRevision = 0,
   onCloseConversation,
   onToggleConversationTicket,
-  onSendToTask,
   onOpenIntegrations,
 }: Props) {
   const [selectingTickets, setSelectingTickets] = useState(false);
@@ -1269,20 +1254,31 @@ export function InboxView({
             {!editingLinks ? (
               <button
                 type="button"
+                aria-label="Send selected tickets to an agent"
                 disabled={!selectionCount}
                 onClick={() => {
-                  void Promise.resolve(
-                    onSendToTask?.([...selectedTickets.values()]),
-                  )
-                    .then(() => {
-                      setSelectedTickets(new Map());
-                      setSelectingTickets(false);
-                    })
-                    .catch((error) => setSelectionError(String(error)));
+                  const items = [...selectedTickets.values()];
+                  try {
+                    requestAgentContext({
+                      inboxItems: items,
+                      context: contextFromTickets(items),
+                      cwd: items[0]?.projectPath || cwd || undefined,
+                      // Selection survives until the route accepts — a
+                      // cancelled picker or a failed launch keeps it so the
+                      // send can be retried without re-picking tickets.
+                      onPrepared: () => {
+                        setSelectedTickets(new Map());
+                        setSelectingTickets(false);
+                      },
+                      onFailed: (reason) => setSelectionError(reason),
+                    });
+                  } catch (error) {
+                    setSelectionError(String(error));
+                  }
                 }}
                 className="rounded-md bg-content/10 px-2 py-1 text-[11px] disabled:opacity-40"
               >
-                Send to task
+                Send to agent
               </button>
             ) : null}
             <button
@@ -1336,21 +1332,19 @@ export function InboxView({
                 <Zap className="size-3.5" strokeWidth={1.75} />
               </button>
             ) : null}
-            {onSendToTask ? (
-              <button
-                type="button"
-                aria-label="Select tickets"
-                title="Select tickets"
-                onClick={() => {
-                  setSelectingTickets(true);
-                  setFilterMenu(null);
-                  setSelectionError("");
-                }}
-                className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
-              >
-                <Check className="size-3.5" strokeWidth={1.75} />
-              </button>
-            ) : null}
+            <button
+              type="button"
+              aria-label="Select tickets"
+              title="Select tickets"
+              onClick={() => {
+                setSelectingTickets(true);
+                setFilterMenu(null);
+                setSelectionError("");
+              }}
+              className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
+            >
+              <Check className="size-3.5" strokeWidth={1.75} />
+            </button>
             <button
               type="button"
               title="Mark all as read"
@@ -1678,13 +1672,11 @@ export function InboxView({
                 selected ? relatedSessionsForInboxItem(selected, sessions) : []
               }
               viewingSessionId={conversationId}
-              liveIds={liveSessionIds}
               onDiscuss={async (context) => {
                 if (!selected) return;
                 await onAsk(selected, context);
                 setDiscussionOpen(true);
               }}
-              onStartTask={onStartTask}
               onOpenDelivery={onOpenDelivery}
               onOpenSession={(id) => {
                 setPreviewingTicket(false);
@@ -1724,9 +1716,7 @@ function InboxDetailBody({
   revision = 0,
   relatedSessions,
   viewingSessionId,
-  liveIds,
   onDiscuss,
-  onStartTask,
   onOpenSession,
   onOpenDelivery,
   myWork,
@@ -1736,19 +1726,11 @@ function InboxDetailBody({
   cwd: string;
   projects: InboxProjectOption[];
   revision?: number;
-  /** Ids that resolve to live sessions — "N conversations" labels and
-   * multi-conversation routing count these, not stale task records. */
-  liveIds?: ReadonlySet<string>;
   relatedSessions: readonly SessionSummary[];
   /** Session the user is currently reading in the inbox conversation
    * panel — delivery rows host on it when it shares the working copy. */
   viewingSessionId?: string;
   onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
-  onStartTask?: (
-    item: InboxItem,
-    taskId: string | null,
-    opts?: { freshSession?: boolean },
-  ) => void;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
   onOpenDelivery?: (
     sessionId: string,
@@ -1789,9 +1771,7 @@ function InboxDetailBody({
       revision={revision}
       relatedSessions={relatedSessions}
       viewingSessionId={viewingSessionId}
-      liveIds={liveIds}
       onDiscuss={onDiscuss}
-      onStartTask={onStartTask}
       onOpenSession={onOpenSession}
       onOpenDelivery={onOpenDelivery}
       myWork={myWork}
@@ -1992,9 +1972,7 @@ export function InboxDetail({
   revision,
   relatedSessions,
   viewingSessionId,
-  liveIds,
   onDiscuss,
-  onStartTask,
   onOpenSession,
   onOpenDelivery,
   myWork,
@@ -2008,15 +1986,7 @@ export function InboxDetail({
    * shares the working copy it hosts the delivery tab so the review opens
    * next to the conversation the user is actually looking at. */
   viewingSessionId?: string;
-  /** Ids that resolve to live sessions — conversation counts must not
-   * include records whose session is gone. */
-  liveIds?: ReadonlySet<string>;
   onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
-  onStartTask?: (
-    item: InboxItem,
-    taskId: string | null,
-    opts?: { freshSession?: boolean },
-  ) => void;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
   onOpenDelivery?: (
     sessionId: string,
@@ -2102,8 +2072,6 @@ export function InboxDetail({
   };
   const [deliveryBusy, setDeliveryBusy] = useState(false);
   const [deliveryError, setDeliveryError] = useState("");
-  const [sendMenu, setSendMenu] = useState(false);
-  const sendAnchor = useRef<HTMLButtonElement>(null);
   const deliveryPending = useRef(false);
   const deliveryMounted = useRef(true);
   useEffect(() => {
@@ -2812,59 +2780,30 @@ export function InboxDetail({
               </p>
             ) : null}
             <div className="flex flex-wrap items-center gap-2 pt-1">
-              {onStartTask && item.kind !== "pr" ? (
-                <>
-                  <button
-                    type="button"
-                    disabled={context.busy}
-                    onClick={() => {
-                      setSendError("");
-                      void Promise.resolve(onStartTask(item, null)).catch(
-                        (reason) => setSendError(String(reason)),
-                      );
-                    }}
-                    className={`${ACTION_FILLED} disabled:cursor-default disabled:opacity-40`}
-                  >
-                    Send to agent
-                  </button>
-                  <button
-                    ref={sendAnchor}
-                    type="button"
-                    disabled={context.busy}
-                    title="Send to a task"
-                    aria-label="Send to a task"
-                    aria-expanded={sendMenu}
-                    onClick={() => setSendMenu(true)}
-                    className={`${ACTION_FILLED} -ml-1.5 !px-1.5 disabled:cursor-default disabled:opacity-40`}
-                  >
-                    <ChevronDown className="size-3.5" strokeWidth={1.75} />
-                  </button>
-                  {sendMenu ? (
-                    <SendTargetMenu
-                      anchor={sendAnchor}
-                      liveIds={liveIds}
-                      onPick={(taskId) => {
-                        setSendMenu(false);
-                        void Promise.resolve(onStartTask?.(item, taskId)).catch(
-                          (reason) => setSendError(String(reason)),
-                        );
-                      }}
-                      onPickFresh={(taskId) => {
-                        setSendMenu(false);
-                        void Promise.resolve(
-                          onStartTask?.(item, taskId, { freshSession: true }),
-                        ).catch((reason) => setSendError(String(reason)));
-                      }}
-                      onClose={() => setSendMenu(false)}
-                    />
-                  ) : null}
-                </>
-              ) : null}
+              <button
+                type="button"
+                onClick={() => {
+                  setSendError("");
+                  try {
+                    requestAgentContext({
+                      inboxItems: [item],
+                      context: contextFromTickets([item]),
+                      cwd: item.projectPath || cwd || undefined,
+                      onFailed: (reason) => setSendError(reason),
+                    });
+                  } catch (reason) {
+                    setSendError(String(reason));
+                  }
+                }}
+                className={`${ACTION_FILLED} disabled:cursor-default disabled:opacity-40`}
+              >
+                Send to agent
+              </button>
               <button
                 type="button"
                 disabled={context.busy}
                 onClick={() => {
-                  context.open("ask");
+                  context.open();
                 }}
                 className={item.kind === "pr" ? ACTION_FILLED : ACTION_OUTLINE}
               >
@@ -2928,11 +2867,6 @@ export function InboxDetail({
             ) : null}
             <InboxContextPicker
               context={context}
-              destination={
-                <span className="truncate" title={item.projectPath}>
-                  {projectName(item.projectPath)}
-                </span>
-              }
               onConfirm={async (card) => {
                 await onDiscuss?.(card);
               }}
@@ -3371,116 +3305,5 @@ function BranchDeliveryRow({
         </Popover>
       ) : null}
     </div>
-  );
-}
-
-/** Send-to-agent task targets — picking one links the item onto it; the
- * new-task path is the sibling "Send to agent" button. */
-function SendTargetMenu({
-  anchor,
-  liveIds,
-  onPick,
-  onPickFresh,
-  onClose,
-}: {
-  anchor: React.RefObject<HTMLButtonElement | null>;
-  /** Live session ids — when absent the recorded count is used. */
-  liveIds?: ReadonlySet<string>;
-  onPick: (taskId: string) => void;
-  /** Link + start a fresh agent session in the task instead of opening its
-   * existing conversation(s). */
-  onPickFresh?: (taskId: string) => void;
-  onClose: () => void;
-}) {
-  // Subscribed, not a one-shot read — a task created or archived while the
-  // menu is open shows up (or disappears) immediately.
-  const tasksRaw = useSyncExternalStore(
-    subscribeTaskWorkspaces,
-    taskWorkspacesSnapshot,
-  );
-  const tasks = useMemo(
-    () => loadTaskWorkspaces().filter((entry) => !entry.archived),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [tasksRaw],
-  );
-  const itemClass =
-    "flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5";
-  return (
-    <Popover
-      anchor={anchor}
-      onDismiss={onClose}
-      role="menu"
-      aria-label="Send to a task"
-      className="w-64 overflow-hidden"
-    >
-      <div className="px-1.5 py-1.5">
-        {tasks.length ? (
-          tasks.map((task) => {
-            const project = projectForTask(task);
-            const projectLabel = project
-              ? project.name?.trim() ||
-                (project.anchor ? projectName(project.anchor) : "Project")
-              : "";
-            // Sending only links the ticket and opens the task — work starts
-            // from the task's own Start action, so say which it will be.
-            const conversations = liveIds
-              ? liveTaskSessionIds(task, liveIds).length
-              : taskSessionIds(task).size;
-            const fresh = task.children.some((child) => child.workingCopy);
-            return (
-              <div
-                key={task.id}
-                role="none"
-                className="flex items-center gap-0.5"
-              >
-                <button
-                  type="button"
-                  role="menuitem"
-                  className={itemClass}
-                  title={
-                    conversations > 1
-                      ? `Link to "${task.name}" — opens task details`
-                      : conversations
-                        ? `Link to "${task.name}" — opens its conversation`
-                        : `Link to "${task.name}" — opens the task`
-                  }
-                  onClick={() => onPick(task.id)}
-                >
-                  <Task
-                    className="size-3.5 shrink-0 text-content/50"
-                    strokeWidth={1.75}
-                  />
-                  <span className="min-w-0 flex-1 truncate">{task.name}</span>
-                  <span className="shrink-0 truncate text-[10px] text-content/40">
-                    {projectLabel}
-                    {conversations > 1
-                      ? ` · ${conversations} conversations`
-                      : conversations
-                        ? " · conversation"
-                        : ""}
-                  </span>
-                </button>
-                {onPickFresh && fresh ? (
-                  <button
-                    type="button"
-                    role="menuitem"
-                    title={`Link to "${task.name}" and start a fresh agent conversation in it`}
-                    aria-label={`New conversation in task ${task.name}`}
-                    onClick={() => onPickFresh(task.id)}
-                    className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
-                  >
-                    <Plus className="size-3.5" strokeWidth={1.75} />
-                  </button>
-                ) : null}
-              </div>
-            );
-          })
-        ) : (
-          <p className="px-2 py-1.5 text-[12px] text-content/45">
-            No tasks yet — Send to agent opens the task sheet.
-          </p>
-        )}
-      </div>
-    </Popover>
   );
 }

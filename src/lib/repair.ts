@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getVerifiedFamilies } from "./repositoryFamilies";
 import { loadRecents } from "./recents";
-import { wslLocation } from "./paths";
+import { pathKey, wslLocation } from "./paths";
 import { notifyGitChanged } from "./fs";
 import {
   boundAgentContext,
@@ -256,7 +256,7 @@ export function repairOwnerError(
   if (
     !session ||
     session.inboxAsk ||
-    sessionWorkCwd(session) !== evidence.head.cwd
+    pathKey(sessionWorkCwd(session)) !== pathKey(evidence.head.cwd)
   )
     return "Choose an agent bound to this exact checkout.";
   if (!isLiveHarness(session.harness))

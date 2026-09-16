@@ -142,5 +142,5 @@ it("retains the initiating conversation across a slow capture and focus change",
   props = { ...props, sourceSessionId: "other" };
   await act(async () => render(1));
   await act(async () => finish(contextFromText("first.ts", "snapshot", cwd)));
-  expect(requestAgentContext).toHaveBeenCalledWith(expect.objectContaining({ sourceSessionId: "original", prepareInSource: true }));
+  expect(requestAgentContext).toHaveBeenCalledWith(expect.objectContaining({ sourceSessionId: "original", destination: { kind: "source" } }));
 });

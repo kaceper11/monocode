@@ -34,7 +34,6 @@ function renderDetail(
       revision: 0,
       relatedSessions,
       onDiscuss: () => {},
-      onStartTask: () => {},
     }),
   );
 }

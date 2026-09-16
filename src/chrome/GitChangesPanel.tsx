@@ -5,7 +5,11 @@ import { loadAzurePrAssociations } from "../lib/azureRepos";
 import { loadCiSources, ciState, ciContext } from "../lib/azurePipelines";
 import { useDeliveryStores } from "../hooks/useDeliveryStores";
 import type { DeliveryTabSource } from "../lib/layout";
-import { contextFromChanges, requestAgentContext } from "../lib/agentContext";
+import {
+  contextFromChanges,
+  requestAgentContext,
+  type AgentDestination,
+} from "../lib/agentContext";
 import {
   abortMerge,
   opLabel,
@@ -1248,9 +1252,7 @@ function ChangedFiles({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [tasksRaw],
   );
-  const prepareSelected = async (
-    route: { prepareInSource: true } | { taskId: string } | { newTask: true },
-  ) => {
+  const prepareSelected = async (destination: AgentDestination) => {
     if (contextLoading.current) return;
     contextLoading.current = true;
     const generation = contextGeneration.current;
@@ -1281,7 +1283,7 @@ function ChangedFiles({
           context,
           cwd,
           sourceSessionId,
-          ...route,
+          destination,
           onPrepared: () => {
             if (generation !== contextGeneration.current) return;
             setContextSelected(new Set());
@@ -1565,7 +1567,7 @@ function ChangedFiles({
                 type="button"
                 disabled={!contextSelected.size || contextBusy}
                 className="h-7 flex-1 rounded-md text-[12px] text-content/80 hover:bg-content/5 disabled:opacity-40"
-                onClick={() => void prepareSelected({ prepareInSource: true })}
+                onClick={() => void prepareSelected({ kind: "source" })}
               >
                 {contextBusy ? "Loading…" : "Add to chat"}
               </button>
@@ -1594,8 +1596,10 @@ function ChangedFiles({
               anchor={taskMenuButton}
               tasks={contextTasks}
               liveIds={liveSessionIds}
-              onPick={(taskId) => void prepareSelected({ taskId })}
-              onNewTask={() => void prepareSelected({ newTask: true })}
+              onPick={(taskId) =>
+                void prepareSelected({ kind: "task", taskId })
+              }
+              onNewTask={() => void prepareSelected({ kind: "new-task" })}
               onClose={() => setTaskMenuOpen(false)}
             />
           ) : null}

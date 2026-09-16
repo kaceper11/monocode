@@ -25,6 +25,7 @@ import {
   type AzureStatus,
 } from "../lib/azure";
 import { requestAgentContext } from "../lib/agentContext";
+import { taskDestinationForSession } from "../lib/taskWorkspaces";
 import { openWatchSheet } from "../lib/watchers";
 import {
   ciContext,
@@ -630,7 +631,9 @@ function CiSourcePanel({
           : ciLogContext(source, head, selected, job, checked),
         cwd: head.cwd,
         sourceSessionId: source.session,
-        requireDestinationSelection: !source.session,
+        destination: draft
+          ? taskDestinationForSession(source.session)
+          : undefined,
       });
     }, true);
   const external = (id?: number) =>

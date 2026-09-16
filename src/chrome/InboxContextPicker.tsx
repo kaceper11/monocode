@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Modal } from "./Modal";
 import { InboxProviderMark } from "./InboxProviderMark";
 import { Check, ChevronRight } from "./icons";
@@ -53,7 +53,7 @@ export function useInboxContext(item: InboxItem) {
   const [pages, setPages] = useState(1);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [action, setAction] = useState<"ask" | "send" | null>(null);
+  const [asking, setAsking] = useState(false);
   const alive = useRef(true);
   const trigger = useRef<HTMLElement | null>(null);
   useEffect(() => {
@@ -114,14 +114,14 @@ export function useInboxContext(item: InboxItem) {
     error,
     load,
     prepare,
-    action,
-    open: (next: "ask" | "send") => {
+    asking,
+    open: () => {
       trigger.current = globalThis.document.activeElement as HTMLElement;
-      setAction(next);
+      setAsking(true);
       if (!document) void load().catch(() => {});
     },
     close: () => {
-      setAction(null);
+      setAsking(false);
       requestAnimationFrame(() => trigger.current?.focus());
     },
     change: (next: ContextSelection) => {
@@ -132,57 +132,23 @@ export function useInboxContext(item: InboxItem) {
   };
 }
 
-export function InboxContextPicker({
+/** The shared context-selection sections — description, discussion and
+ * files — used by the Ask modal and the unified send picker's single-item
+ * flow. Edits go to `onDraft`; the owner decides what happens on confirm. */
+export function ContextSelectionSections({
   context,
-  destination,
-  onConfirm,
+  draft,
+  onDraft,
 }: {
   context: ReturnType<typeof useInboxContext>;
-  destination?: ReactNode;
-  onConfirm: (card: InboxComposerCard, action: "ask" | "send") => Promise<void>;
+  draft: ContextSelection;
+  onDraft: (next: ContextSelection) => void;
 }) {
-  const { item, document, selection, pages, busy, error } = context;
-  const action = context.action;
-  const [confirmError, setConfirmError] = useState("");
-  const [confirming, setConfirming] = useState(false);
-  const [draft, setDraft] = useState(selection);
+  const { item, document, pages, busy } = context;
   const [preview, setPreview] = useState<{ id: string; url: string }>();
   const [previewError, setPreviewError] = useState("");
   const [previewBusy, setPreviewBusy] = useState(false);
   const generation = useRef(0);
-  const body = useRef<HTMLFieldSetElement>(null);
-  useEffect(() => {
-    if (!action) return;
-    const trap = (event: KeyboardEvent) => {
-      if (event.key !== "Tab") return;
-      const dialog = body.current?.closest('[role="dialog"]');
-      const controls = [
-        ...(dialog?.querySelectorAll<HTMLElement>(
-          'button:not(:disabled), input:not(:disabled), summary, select:not(:disabled), [tabindex="0"]',
-        ) ?? []),
-      ].filter((el) => el.getClientRects().length > 0);
-      const first = controls[0],
-        last = controls[controls.length - 1];
-      if (event.shiftKey && globalThis.document.activeElement === first) {
-        event.preventDefault();
-        last?.focus();
-      } else if (
-        !event.shiftKey &&
-        globalThis.document.activeElement === last
-      ) {
-        event.preventDefault();
-        first?.focus();
-      }
-    };
-    window.addEventListener("keydown", trap);
-    return () => window.removeEventListener("keydown", trap);
-  }, [action]);
-  useEffect(() => {
-    setDraft(selection);
-  }, [selection, action]);
-  useEffect(() => {
-    setConfirmError("");
-  }, [action]);
   useEffect(
     () => () => {
       if (preview) URL.revokeObjectURL(preview.url);
@@ -195,19 +161,13 @@ export function InboxContextPicker({
     },
     [],
   );
-  const close = () => {
-    generation.current++;
-    context.close();
-    setPreview(undefined);
-    setPreviewBusy(false);
-  };
   const toggle = (kind: "comments" | "files", id: string) =>
-    setDraft((current) => ({
-      ...current,
-      [kind]: current[kind].includes(id)
-        ? current[kind].filter((value) => value !== id)
-        : [...current[kind], id],
-    }));
+    onDraft({
+      ...draft,
+      [kind]: draft[kind].includes(id)
+        ? draft[kind].filter((value) => value !== id)
+        : [...draft[kind], id],
+    });
   const missing = [
     ...draft.comments
       .filter((id) => !document?.comments.some((c) => c.id === id))
@@ -218,17 +178,256 @@ export function InboxContextPicker({
   ];
   return (
     <>
-      {action ? (
+      <label className="flex cursor-pointer items-center gap-3 rounded-lg border border-content/10 p-3 hover:bg-content/5">
+        <ContextCheckbox
+          label="Include description"
+          checked={draft.description}
+          onChange={() =>
+            onDraft({ ...draft, description: !draft.description })
+          }
+        />
+        <span className="min-w-0 flex-1">
+          <span className="block font-medium">Description</span>
+          <span className="block text-[12px] text-content/45">
+            {item.kind === "ci" ? "Run details and revision" : item.kind === "pr" ? "PR description and revision" : "Ticket details and requirements"}
+          </span>
+        </span>
+      </label>
+      {draft.description && document ? (
+        <details className="group/preview">
+          <summary className="flex cursor-pointer list-none items-center gap-2 rounded-md px-2 py-1.5 text-[12px] text-content/55 hover:bg-content/5 hover:text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent [&::-webkit-details-marker]:hidden">
+            <ChevronRight className="size-3.5 shrink-0 group-open/preview:rotate-90" />
+            Preview description
+          </summary>
+          <div className="mt-3 rounded-lg border border-content/10 p-3">
+            <AgentMarkdown
+              text={document.description || "No description"}
+              textOnly
+            />
+          </div>
+        </details>
+      ) : null}
+      <details className="group/section overflow-hidden rounded-lg border border-content/10">
+        <summary className="flex cursor-pointer list-none items-center gap-2.5 p-3 font-medium hover:bg-content/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent [&::-webkit-details-marker]:hidden">
+          <ChevronRight className="size-3.5 shrink-0 text-content/45 group-open/section:rotate-90" />
+          Comments
+          <span className="ml-auto text-[11px] font-normal text-content/45">
+            {draft.comments.length
+              ? `${draft.comments.length} selected`
+              : (document?.comments.length ?? 0)}
+          </span>
+        </summary>
+        <div className="border-t border-content/10 p-3">
+          {document?.comments.map((comment) => (
+            <div key={comment.id} className="mb-2 flex items-start gap-2">
+              <ContextCheckbox
+                label={`Include comment by ${comment.author}`}
+                checked={draft.comments.includes(comment.id)}
+                onChange={() => toggle("comments", comment.id)}
+              />
+              <details className="group/comment min-w-0 flex-1">
+                <summary className="cursor-pointer list-none rounded px-1 hover:bg-content/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent [&::-webkit-details-marker]:hidden">
+                  <span className="flex items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate">
+                      {comment.author || "Unknown author"}
+                    </span>
+                    <span className="text-[11px] text-content/40">
+                      {comment.createdAt?.slice(0, 10)}
+                    </span>
+                    <ChevronRight className="size-3 shrink-0 text-content/45 group-open/comment:rotate-90" />
+                  </span>
+                  <span className="mt-0.5 block truncate text-[12px] text-content/55">
+                    {comment.body || "Empty comment"}
+                  </span>
+                </summary>
+                <div className="mt-2">
+                  <AgentMarkdown text={comment.body} textOnly />
+                </div>
+              </details>
+            </div>
+          ))}
+          {document && !document.comments.length ? (
+            <p className="text-content/45">No comments</p>
+          ) : null}
+          {document?.more ? (
+            pages < 5 ? (
+              <button
+                type="button"
+                disabled={busy}
+                className="py-1 text-content/70 underline"
+                onClick={() =>
+                  void context.load(pages + 1).catch(() => {})
+                }
+              >
+                Load more comments
+              </button>
+            ) : (
+              <p className="text-content/45">
+                Reached the five-page limit per comment type. Open the
+                provider for more discussion.
+              </p>
+            )
+          ) : null}
+        </div>
+      </details>
+      <details className="group/section overflow-hidden rounded-lg border border-content/10">
+        <summary className="flex cursor-pointer list-none items-center gap-2.5 p-3 font-medium hover:bg-content/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent [&::-webkit-details-marker]:hidden">
+          <ChevronRight className="size-3.5 shrink-0 text-content/45 group-open/section:rotate-90" />
+          Images & files
+          <span className="ml-auto text-[11px] font-normal text-content/45">
+            {draft.files.length
+              ? `${draft.files.length} selected`
+              : (document?.files.length ?? 0)}
+          </span>
+        </summary>
+        <div className="border-t border-content/10 p-3">
+          <p className="mb-2 text-[12px] text-content/45">
+            Up to 20 files / 20 MiB total. Only selected files are
+            downloaded when you continue.
+          </p>
+          {document?.files.map((file) => (
+            <div key={file.id} className="mb-2">
+              <div className="flex items-start gap-2">
+                <ContextCheckbox
+                  label={`Include ${file.name}`}
+                  disabled={
+                    !!file.unavailable ||
+                    (file.size ?? 0) > 20 * 1024 * 1024
+                  }
+                  checked={draft.files.includes(file.id)}
+                  onChange={() => toggle("files", file.id)}
+                />
+                <span className="min-w-0 flex-1 break-words">
+                  {file.name}
+                  <span className="block text-content/45">
+                    {file.unavailable ??
+                      (file.size === null
+                        ? "Size checked on download"
+                        : `${(file.size / 1024).toFixed(0)} KiB`)}
+                  </span>
+                </span>
+                {!file.unavailable ? (
+                  <button
+                    type="button"
+                    disabled={previewBusy}
+                    className="text-content/60 underline"
+                    onClick={() => {
+                      const current = ++generation.current;
+                      setPreviewBusy(true);
+                      setPreviewError("");
+                      void downloadContextFile(
+                        item,
+                        document,
+                        pages,
+                        file.id,
+                      )
+                        .then((download) => {
+                          if (current !== generation.current) return;
+                          if (
+                            ![
+                              "image/png",
+                              "image/jpeg",
+                              "image/gif",
+                              "image/webp",
+                            ].includes(download.type)
+                          )
+                            throw new Error(
+                              "Preview is available for images only. Other files can be attached without opening or executing them.",
+                            );
+                          setPreview({
+                            id: file.id,
+                            url: URL.createObjectURL(download),
+                          });
+                        })
+                        .catch((reason) => {
+                          if (current === generation.current)
+                            setPreviewError(String(reason));
+                        })
+                        .finally(() => {
+                          if (current === generation.current)
+                            setPreviewBusy(false);
+                        });
+                    }}
+                  >
+                    Preview
+                  </button>
+                ) : null}
+              </div>
+              {preview?.id === file.id ? (
+                <img
+                  alt={file.name}
+                  src={preview.url}
+                  className="mt-2 max-h-48 max-w-full rounded"
+                />
+              ) : null}
+            </div>
+          ))}
+          {document && !document.files.length ? (
+            <p className="text-content/45">No uploaded files found</p>
+          ) : null}
+          {previewError ? (
+            <p role="alert" className="text-red-400">
+              {previewError}
+            </p>
+          ) : null}
+        </div>
+      </details>
+      {missing.map(({ kind, id }) => (
+        <p key={`${kind}:${id}`} className="text-amber-400">
+          Selected {kind === "files" ? "file" : "comment"} not loaded or
+          no longer available.{" "}
+          <button
+            type="button"
+            className="underline"
+            onClick={() => toggle(kind, id)}
+          >
+            Remove selection
+          </button>
+        </p>
+      ))}
+    </>
+  );
+}
+
+export function InboxContextPicker({
+  context,
+  onConfirm,
+}: {
+  context: ReturnType<typeof useInboxContext>;
+  onConfirm: (card: InboxComposerCard) => Promise<void>;
+}) {
+  const { item, document, selection, busy, error } = context;
+  const asking = context.asking;
+  const [confirmError, setConfirmError] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const [draft, setDraft] = useState(selection);
+  const generation = useRef(0);
+  useEffect(() => {
+    setDraft(selection);
+  }, [selection, asking]);
+  useEffect(() => {
+    setConfirmError("");
+  }, [asking]);
+  useEffect(
+    () => () => {
+      generation.current++;
+    },
+    [],
+  );
+  const close = () => {
+    generation.current++;
+    context.close();
+  };
+  return (
+    <>
+      {asking ? (
         <Modal
           title={
-            action === "send"
-              ? "Send to agent"
-              : action === "ask"
-                ? item.kind === "ci" ? "Ask about this CI run" : item.kind === "pr" ? "Ask about this PR" : "Ask about this ticket"
-                : "Agent context"
+            item.kind === "ci" ? "Ask about this CI run" : item.kind === "pr" ? "Ask about this PR" : "Ask about this ticket"
           }
           description="Review the context for your next message."
           onClose={close}
+          trapFocus
           className="max-h-[80vh] text-[13px] text-content [&_header_h2]:text-lg"
         >
           <div className="mx-4 mt-4 flex items-start gap-2 rounded-lg border border-content/10 bg-content/5 p-3">
@@ -245,226 +444,17 @@ export function InboxContextPicker({
             </div>
           </div>
           <fieldset
-            ref={body}
             disabled={busy || confirming}
             className="p-4 space-y-3 min-w-0"
           >
-            {action === "send" && destination ? (
-              <div className="flex items-center justify-between gap-3 border-b border-content/10 pb-3">
-                <span className="text-content/55">Local project</span>
-                {destination}
-              </div>
-            ) : null}
             <p className="text-content/45">
               Title and link always included.
             </p>
-            <label className="flex cursor-pointer items-center gap-3 rounded-lg border border-content/10 p-3 hover:bg-content/5">
-              <ContextCheckbox
-                label="Include description"
-                checked={draft.description}
-                onChange={() =>
-                  setDraft({ ...draft, description: !draft.description })
-                }
-              />
-              <span className="min-w-0 flex-1">
-                <span className="block font-medium">Description</span>
-                <span className="block text-[12px] text-content/45">
-                  {item.kind === "ci" ? "Run details and revision" : item.kind === "pr" ? "PR description and revision" : "Ticket details and requirements"}
-                </span>
-              </span>
-            </label>
-            {draft.description && document ? (
-              <details className="group/preview">
-                <summary className="flex cursor-pointer list-none items-center gap-2 rounded-md px-2 py-1.5 text-[12px] text-content/55 hover:bg-content/5 hover:text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent [&::-webkit-details-marker]:hidden">
-                  <ChevronRight className="size-3.5 shrink-0 group-open/preview:rotate-90" />
-                  Preview description
-                </summary>
-                <div className="mt-3 rounded-lg border border-content/10 p-3">
-                  <AgentMarkdown
-                    text={document.description || "No description"}
-                    textOnly
-                  />
-                </div>
-              </details>
-            ) : null}
-            <details className="group/section overflow-hidden rounded-lg border border-content/10">
-              <summary className="flex cursor-pointer list-none items-center gap-2.5 p-3 font-medium hover:bg-content/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent [&::-webkit-details-marker]:hidden">
-                <ChevronRight className="size-3.5 shrink-0 text-content/45 group-open/section:rotate-90" />
-                Comments
-                <span className="ml-auto text-[11px] font-normal text-content/45">
-                  {draft.comments.length
-                    ? `${draft.comments.length} selected`
-                    : (document?.comments.length ?? 0)}
-                </span>
-              </summary>
-              <div className="border-t border-content/10 p-3">
-                {document?.comments.map((comment) => (
-                  <div key={comment.id} className="mb-2 flex items-start gap-2">
-                    <ContextCheckbox
-                      label={`Include comment by ${comment.author}`}
-                      checked={draft.comments.includes(comment.id)}
-                      onChange={() => toggle("comments", comment.id)}
-                    />
-                    <details className="group/comment min-w-0 flex-1">
-                      <summary className="cursor-pointer list-none rounded px-1 hover:bg-content/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent [&::-webkit-details-marker]:hidden">
-                        <span className="flex items-center gap-2">
-                          <span className="min-w-0 flex-1 truncate">
-                            {comment.author || "Unknown author"}
-                          </span>
-                          <span className="text-[11px] text-content/40">
-                            {comment.createdAt?.slice(0, 10)}
-                          </span>
-                          <ChevronRight className="size-3 shrink-0 text-content/45 group-open/comment:rotate-90" />
-                        </span>
-                        <span className="mt-0.5 block truncate text-[12px] text-content/55">
-                          {comment.body || "Empty comment"}
-                        </span>
-                      </summary>
-                      <div className="mt-2">
-                        <AgentMarkdown text={comment.body} textOnly />
-                      </div>
-                    </details>
-                  </div>
-                ))}
-                {document && !document.comments.length ? (
-                  <p className="text-content/45">No comments</p>
-                ) : null}
-                {document?.more ? (
-                  pages < 5 ? (
-                    <button
-                      type="button"
-                      disabled={busy}
-                      className="py-1 text-content/70 underline"
-                      onClick={() =>
-                        void context.load(pages + 1).catch(() => {})
-                      }
-                    >
-                      Load more comments
-                    </button>
-                  ) : (
-                    <p className="text-content/45">
-                      Reached the five-page limit per comment type. Open the
-                      provider for more discussion.
-                    </p>
-                  )
-                ) : null}
-              </div>
-            </details>
-            <details className="group/section overflow-hidden rounded-lg border border-content/10">
-              <summary className="flex cursor-pointer list-none items-center gap-2.5 p-3 font-medium hover:bg-content/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent [&::-webkit-details-marker]:hidden">
-                <ChevronRight className="size-3.5 shrink-0 text-content/45 group-open/section:rotate-90" />
-                Images & files
-                <span className="ml-auto text-[11px] font-normal text-content/45">
-                  {draft.files.length
-                    ? `${draft.files.length} selected`
-                    : (document?.files.length ?? 0)}
-                </span>
-              </summary>
-              <div className="border-t border-content/10 p-3">
-                <p className="mb-2 text-[12px] text-content/45">
-                  Up to 20 files / 20 MiB total. Only selected files are
-                  downloaded when you continue.
-                </p>
-                {document?.files.map((file) => (
-                  <div key={file.id} className="mb-2">
-                    <div className="flex items-start gap-2">
-                      <ContextCheckbox
-                        label={`Include ${file.name}`}
-                        disabled={
-                          !!file.unavailable ||
-                          (file.size ?? 0) > 20 * 1024 * 1024
-                        }
-                        checked={draft.files.includes(file.id)}
-                        onChange={() => toggle("files", file.id)}
-                      />
-                      <span className="min-w-0 flex-1 break-words">
-                        {file.name}
-                        <span className="block text-content/45">
-                          {file.unavailable ??
-                            (file.size === null
-                              ? "Size checked on download"
-                              : `${(file.size / 1024).toFixed(0)} KiB`)}
-                        </span>
-                      </span>
-                      {!file.unavailable ? (
-                        <button
-                          type="button"
-                          disabled={previewBusy}
-                          className="text-content/60 underline"
-                          onClick={() => {
-                            const current = ++generation.current;
-                            setPreviewBusy(true);
-                            setPreviewError("");
-                            void downloadContextFile(
-                              item,
-                              document,
-                              pages,
-                              file.id,
-                            )
-                              .then((download) => {
-                                if (current !== generation.current) return;
-                                if (
-                                  ![
-                                    "image/png",
-                                    "image/jpeg",
-                                    "image/gif",
-                                    "image/webp",
-                                  ].includes(download.type)
-                                )
-                                  throw new Error(
-                                    "Preview is available for images only. Other files can be attached without opening or executing them.",
-                                  );
-                                setPreview({
-                                  id: file.id,
-                                  url: URL.createObjectURL(download),
-                                });
-                              })
-                              .catch((reason) => {
-                                if (current === generation.current)
-                                  setPreviewError(String(reason));
-                              })
-                              .finally(() => {
-                                if (current === generation.current)
-                                  setPreviewBusy(false);
-                              });
-                          }}
-                        >
-                          Preview
-                        </button>
-                      ) : null}
-                    </div>
-                    {preview?.id === file.id ? (
-                      <img
-                        alt={file.name}
-                        src={preview.url}
-                        className="mt-2 max-h-48 max-w-full rounded"
-                      />
-                    ) : null}
-                  </div>
-                ))}
-                {document && !document.files.length ? (
-                  <p className="text-content/45">No uploaded files found</p>
-                ) : null}
-                {previewError ? (
-                  <p role="alert" className="text-red-400">
-                    {previewError}
-                  </p>
-                ) : null}
-              </div>
-            </details>
-            {missing.map(({ kind, id }) => (
-              <p key={`${kind}:${id}`} className="text-amber-400">
-                Selected {kind === "files" ? "file" : "comment"} not loaded or
-                no longer available.{" "}
-                <button
-                  type="button"
-                  className="underline"
-                  onClick={() => toggle(kind, id)}
-                >
-                  Remove selection
-                </button>
-              </p>
-            ))}
+            <ContextSelectionSections
+              context={context}
+              draft={draft}
+              onDraft={setDraft}
+            />
             {error || confirmError ? (
               <p role="alert" className="text-red-400">
                 {confirmError || error}
@@ -496,7 +486,7 @@ export function InboxContextPicker({
             </button>
             <button
               type="button"
-              disabled={busy || confirming || previewBusy || !document}
+              disabled={busy || confirming || !document}
               className="rounded bg-content/10 px-3 py-1.5 text-content disabled:opacity-40"
               onClick={async () => {
                 const current = generation.current;
@@ -506,7 +496,7 @@ export function InboxContextPicker({
                   const card = await context.prepare(draft);
                   if (current !== generation.current) return;
                   context.change(draft);
-                  await onConfirm(card, action);
+                  await onConfirm(card);
                   if (current === generation.current) close();
                 } catch (reason) {
                   if (current === generation.current)
@@ -516,11 +506,7 @@ export function InboxContextPicker({
                 }
               }}
             >
-              {busy || confirming
-                ? "Preparing…"
-                : action === "ask"
-                  ? "Open discussion"
-                  : "Choose conversation"}
+              {busy || confirming ? "Preparing…" : "Open discussion"}
             </button>
           </div>
         </Modal>

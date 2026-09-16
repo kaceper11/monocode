@@ -837,7 +837,6 @@ export function BrowserView({
             context,
             cwd: cwdRef.current,
             attachmentsOptional: true,
-            requireDestinationSelection: true,
           });
           if (capture.detail) showNotice(capture.detail);
         } catch (error) {

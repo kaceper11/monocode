@@ -23,6 +23,7 @@ import {
   type AzureStatus,
 } from "../lib/azure";
 import { contextFromText, requestAgentContext } from "../lib/agentContext";
+import { taskDestinationForSession } from "../lib/taskWorkspaces";
 import { openWatchSheet } from "../lib/watchers";
 import { buildUnifiedFile, formatUnifiedHunk } from "../lib/unifiedDiff";
 import { UnifiedDiffView } from "../surfaces/UnifiedDiffView";
@@ -862,7 +863,6 @@ function AzurePrDetails({
         context: azurePrContext(association, thread),
         cwd: association.cwd,
         sourceSessionId: association.sourceSessionId,
-        requireDestinationSelection: !association.sourceSessionId,
         onPrepared: onHandoff,
       });
     });
@@ -896,7 +896,11 @@ function AzurePrDetails({
           draft.evidence.kind === "comments"
             ? draft.evidence.association.sourceSessionId
             : undefined,
-        requireDestinationSelection: false,
+        destination: taskDestinationForSession(
+          draft.evidence.kind === "comments"
+            ? draft.evidence.association.sourceSessionId
+            : undefined,
+        ),
         onPrepared: onHandoff,
       });
     });
@@ -1403,7 +1407,6 @@ function AzurePrFile({
         context,
         cwd: association.cwd,
         sourceSessionId: association.sourceSessionId,
-        requireDestinationSelection: !association.sourceSessionId,
         onPrepared: onHandoff,
       });
     } catch (error) {
