@@ -49,13 +49,35 @@ export function subscribeTaskPrs(listener: () => void) {
 // counter that still lets useSyncExternalStore see them.
 let version = 0;
 
-export function taskPrsSnapshot(): string {
-  return `${version}:${localStorage.getItem(KEY) ?? ""}`;
+/** Blocked storage (SecurityError) must not break every subscribed surface. */
+function readRaw(): string | null {
+  try {
+    return localStorage.getItem(KEY);
+  } catch {
+    return null;
+  }
 }
 
+export function taskPrsSnapshot(): string {
+  return `${version}:${readRaw() ?? ""}`;
+}
+
+// The parse result is memoized against the raw string — store subscribers
+// (TaskDetails rows, the PR sheet) call `all()` on every publish.
+let cachedRaw: string | null = null;
+let cachedRows: Record<string, TaskPrDraft> = {};
+
 function all(): Record<string, TaskPrDraft> {
+  const raw = readRaw();
+  if (raw === cachedRaw) return cachedRows;
+  cachedRows = parse(raw);
+  cachedRaw = raw;
+  return cachedRows;
+}
+
+function parse(raw: string | null): Record<string, TaskPrDraft> {
   try {
-    const value: unknown = JSON.parse(localStorage.getItem(KEY) || "{}");
+    const value: unknown = JSON.parse(raw || "{}");
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
     const out: Record<string, TaskPrDraft> = {};
     for (const [key, row] of Object.entries(value)) {
@@ -143,7 +165,9 @@ export function saveTaskPrDraft(
     result?: TaskPrResult | null;
   },
 ) {
-  const rows = all();
+  // Copy — mutating the memoized rows before setItem lands would leave the
+  // cache claiming a save storage never took.
+  const rows = { ...all() };
   const key = taskPrRowKey(taskId, childId);
   const previous = rows[key] ?? {
     target: "",
@@ -172,8 +196,43 @@ export function saveTaskPrDraft(
   const entries = Object.entries(rows)
     .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
     .slice(0, MAX_ROWS);
-  localStorage.setItem(KEY, JSON.stringify(Object.fromEntries(entries)));
+  const next = Object.fromEntries(entries);
+  localStorage.setItem(KEY, JSON.stringify(next));
+  cachedRows = next;
+  cachedRaw = readRaw();
   window.dispatchEvent(new Event(TASK_PRS_CHANGED));
+}
+
+/** Deletes run inside task teardown — a blocked-storage throw must not abort
+ * the removal and orphan watchers the caller was about to lift. */
+function writeRowsBestEffort(rows: Record<string, TaskPrDraft>) {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(rows));
+  } catch {
+    return;
+  }
+  cachedRows = rows;
+  cachedRaw = readRaw();
+  window.dispatchEvent(new Event(TASK_PRS_CHANGED));
+}
+
+export function deleteTaskPrDraft(taskId: string, childId: string) {
+  const rows = all();
+  const key = taskPrRowKey(taskId, childId);
+  if (!(key in rows)) return;
+  const { [key]: _dropped, ...rest } = rows;
+  writeRowsBestEffort(rest);
+}
+
+/** Drops every draft a task owns — removal paths keep no orphaned rows. */
+export function deleteTaskPrDraftsFor(taskId: string) {
+  const rows = all();
+  const prefix = `${taskId}:`;
+  const rest = Object.fromEntries(
+    Object.entries(rows).filter(([key]) => !key.startsWith(prefix)),
+  );
+  if (Object.keys(rest).length === Object.keys(rows).length) return;
+  writeRowsBestEffort(rest);
 }
 
 // In-flight creations are tracked outside the sheet so closing it mid-run
@@ -240,7 +299,9 @@ export function withRelatedPrs(body: string, entries: RelatedPr[]): string {
   const base = (
     start !== -1 && end !== -1 && end > start
       ? body.slice(0, start) + body.slice(end + RELATED_END.length)
-      : body
+      : // A marker whose pair was hand-deleted would otherwise ride along
+        // with every rewrite.
+        body.replace(RELATED_START, "").replace(RELATED_END, "")
   ).trimEnd();
   const usable = entries
     .filter(

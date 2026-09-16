@@ -12,7 +12,12 @@ import {
 } from "./azurePipelines";
 import type { GitPr } from "./fs";
 import { pathKey } from "./paths";
-import type { TaskChild, TaskWorkspace } from "./taskWorkspaces";
+import type { TaskDeliveryRef } from "./taskCi";
+import {
+  taskSessionIds,
+  type TaskChild,
+  type TaskWorkspace,
+} from "./taskWorkspaces";
 
 /**
  * Compact delivery state for one task child — counts and attention flags only,
@@ -53,15 +58,6 @@ export function deliveryStores(): DeliveryStores {
   return { prs: allAzurePrAssociations(), ci: allCiSources() };
 }
 
-/** Every session a task owns — the task-level conversation plus legacy
- * per-child ids. */
-export function taskSessionIds(task: TaskWorkspace): Set<string> {
-  const ids = new Set(task.sessionIds);
-  for (const child of task.children)
-    for (const id of child.sessionIds) ids.add(id);
-  return ids;
-}
-
 /**
  * The saved provider links matched to one child checkout — the rows behind
  * `childDelivery`'s counts, for callers (task details) that render the links
@@ -96,15 +92,52 @@ export function childDeliveryLinks(
   githubPr?: GitPr | null,
   stores: DeliveryStores = deliveryStores(),
 ): ChildDeliveryLinks {
+  const sessions = taskSessionIds(task);
+  return deliveryLinksFor(
+    child.workingCopy,
+    branches,
+    (session) => session === undefined || sessions.has(session),
+    githubPr,
+    stores,
+  );
+}
+
+/** Delivery saved against an arbitrary working copy — e.g. the checkout a
+ * related inbox thread sits in. Scoped to that copy's branch plus links
+ * recorded from the given sessions (or left unassigned). */
+export function sessionDeliveryLinks(input: {
+  cwd: string;
+  /** Current branch plus any recorded fallbacks (sessions keep one). */
+  branches: readonly (string | null | undefined)[];
+  sessionIds: readonly string[];
+  githubPr?: GitPr | null;
+  stores?: DeliveryStores;
+}): ChildDeliveryLinks {
+  const sessions = new Set(input.sessionIds);
+  return deliveryLinksFor(
+    input.cwd,
+    input.branches,
+    (session) => session === undefined || sessions.has(session),
+    input.githubPr,
+    input.stores ?? deliveryStores(),
+  );
+}
+
+/** Link matching shared by task children and ad-hoc working copies (e.g. a
+ * related inbox thread's checkout). `scoped` decides which saved links'
+ * recorded session may count; `undefined` means unassigned links always do. */
+function deliveryLinksFor(
+  cwd: string | undefined,
+  branches: readonly (string | null | undefined)[],
+  scoped: (session: string | undefined) => boolean,
+  githubPr: GitPr | null | undefined,
+  stores: DeliveryStores,
+): ChildDeliveryLinks {
   const links: ChildDeliveryLinks = { prs: [], githubPr: githubPr ?? null, ci: [] };
-  const cwd = child.workingCopy;
   if (!cwd) return links;
   const cwdKey = pathKey(cwd);
   const known = new Set(branches.filter((b): b is string => !!b));
   if (!known.size) return links;
-  const sessions = taskSessionIds(task);
-  const scoped = (session: string | undefined) =>
-    session === undefined || sessions.has(session);
 
   // The same link can be saved under several matching scopes (unassigned
   // plus one or more task sessions) — dedupe on the provider identity.
@@ -176,15 +209,25 @@ export function childDelivery(
 ): TaskChildDelivery {
   const delivery = { ...EMPTY_DELIVERY };
   if (!child.workingCopy || !branches.some(Boolean)) return delivery;
-  const rows = childDeliveryRows(task, child, branches, stores);
-  for (const row of rows.prs) {
+  return deliveryFromLinks(
+    childDeliveryLinks(task, child, branches, githubPr, stores),
+  );
+}
+
+/** Counts/attention flags from already-resolved links — for callers that
+ * render the links themselves and shouldn't pay a second store scan. */
+export function deliveryFromLinks(links: ChildDeliveryLinks): TaskChildDelivery {
+  const delivery = { ...EMPTY_DELIVERY };
+  for (const row of links.prs) {
+    if (row.pr.status.toLowerCase() !== "active") continue;
     delivery.prs += 1;
     if (row.pr.reviewers.some((reviewer) => reviewer.vote < 0))
       delivery.prNeedsAttention = true;
   }
-  if (githubPr && githubPr.state.toLowerCase() === "open") delivery.prs += 1;
+  if (links.githubPr && links.githubPr.state.toLowerCase() === "open")
+    delivery.prs += 1;
 
-  for (const row of rows.ci) {
+  for (const row of links.ci) {
     delivery.ci += 1;
     const run = row.last?.run;
     if (!run || !ciMatches(run)) continue;
@@ -194,6 +237,89 @@ export function childDelivery(
       delivery.ciRunning = true;
   }
   return delivery;
+}
+
+/** A badge's click target — a child plus the delivery ref that opens its
+ * review surface. */
+export type TaskDeliveryTarget = {
+  child: TaskChild;
+  ref: TaskDeliveryRef;
+};
+
+export type TaskDeliveryOverview = {
+  prs: number;
+  ci: number;
+  ciRunning: boolean;
+  /** An open/active PR has a negative reviewer vote. */
+  prAttention: boolean;
+  /** A linked pipeline's latest verified run failed. */
+  ciFailing: boolean;
+  /** Attention PR first, else any open PR — the badge's click target. */
+  prTarget?: TaskDeliveryTarget;
+  /** Failing pipeline first, else any linked one. */
+  ciTarget?: TaskDeliveryTarget;
+};
+
+/**
+ * Aggregate delivery over every child with a working copy — the counts the
+ * rail menu's badges show plus the single best click target per kind.
+ * `resolve` supplies the caller's branch/GitHub-PR peeks so the aggregation
+ * stays synchronous and never fetches.
+ */
+export function taskDeliveryOverview(
+  task: TaskWorkspace,
+  resolve: (child: TaskChild) => {
+    branches: readonly (string | null | undefined)[];
+    githubPr?: GitPr | null;
+  },
+  stores: DeliveryStores = deliveryStores(),
+): TaskDeliveryOverview {
+  let prs = 0;
+  let ci = 0;
+  let ciRunning = false;
+  let prAny: TaskDeliveryTarget | undefined;
+  let prAttention: TaskDeliveryTarget | undefined;
+  let ciAny: TaskDeliveryTarget | undefined;
+  let ciFailing: TaskDeliveryTarget | undefined;
+  for (const child of task.children) {
+    if (!child.workingCopy) continue;
+    const { branches, githubPr } = resolve(child);
+    const links = childDeliveryLinks(task, child, branches, githubPr, stores);
+    const delivery = deliveryFromLinks(links);
+    prs += delivery.prs;
+    ci += delivery.ci;
+    ciRunning ||= delivery.ciRunning;
+    const active = links.prs.filter(
+      (row) => row.pr.status.toLowerCase() === "active",
+    );
+    if (active.some((row) => row.pr.reviewers.some((vote) => vote.vote < 0)))
+      prAttention ??= { child, ref: { kind: "pr" } };
+    if (!prAny) {
+      if (active.length) prAny = { child, ref: { kind: "pr" } };
+      else if (links.githubPr && links.githubPr.state.toLowerCase() === "open")
+        prAny = {
+          child,
+          ref: {
+            kind: "pr",
+            provider: "github",
+            number: links.githubPr.number,
+          },
+        };
+    }
+    if (delivery.ci > 0) {
+      ciAny ??= { child, ref: { kind: "ci" } };
+      if (delivery.ciFailing) ciFailing ??= { child, ref: { kind: "ci" } };
+    }
+  }
+  return {
+    prs,
+    ci,
+    ciRunning,
+    prAttention: !!prAttention,
+    ciFailing: !!ciFailing,
+    prTarget: prAttention ?? prAny,
+    ciTarget: ciFailing ?? ciAny,
+  };
 }
 
 /**

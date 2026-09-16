@@ -21,13 +21,24 @@ import {
 } from "../lib/repair";
 import { requestAgentContext, type AgentContext } from "../lib/agentContext";
 import { RepairStatus } from "./RepairStatus";
+import {
+  ReviewDetails,
+  ReviewError,
+  ReviewHeader,
+  ReviewPill,
+  ReviewShell,
+  ReviewStatus,
+  reviewAction,
+  reviewButton,
+  reviewField,
+  reviewToneText,
+  type ReviewTone,
+} from "./ReviewChrome";
+import { Bot, ExternalLink, Loader, RefreshCw } from "./icons";
 import { InboxPrDiff } from "../surfaces/InboxPrDiff";
 import { AgentMarkdown } from "../surfaces/AgentMarkdown";
 
-const button =
-  "rounded-md px-2 py-1 text-[12px] text-content hover:bg-content/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40";
-const field =
-  "w-full rounded-md border border-content/15 bg-content/5 px-2 py-1.5 text-[12px] text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent";
+const button = reviewButton;
 const message = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
@@ -68,6 +79,32 @@ function mergeStatusLabel(status: string): string {
     denied_policies_denied: "Denied by policy",
   };
   return known[value] ?? value.replace(/_/g, " ");
+}
+
+function mergeStatusTone(status: string): ReviewTone | "" {
+  const value = status.trim().toLowerCase();
+  if (value === "mergeable" || value === "can_be_merged") return "passing";
+  if (
+    [
+      "cannot_be_merged",
+      "conflict",
+      "broken_status",
+      "blocked_status",
+      "denied_policies_denied",
+    ].includes(value)
+  )
+    return "failing";
+  if (
+    [
+      "checking",
+      "ci_still_running",
+      "approvals_syncing",
+      "preparing",
+      "cannot_be_merged_recheck",
+    ].includes(value)
+  )
+    return "running";
+  return "";
 }
 
 function pipelineStatusLabel(status: string): string {
@@ -307,85 +344,90 @@ function GitlabMrPanel({
   })();
 
   return (
-    <section
-      aria-label="GitLab merge request"
-      className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
-    >
-      <div className="mx-auto w-full max-w-3xl space-y-3 px-5 py-4 text-[12px]">
-        {!embedded ? (
-          <header className="flex items-center justify-between gap-3 border-b border-content/10 pb-3">
-            <h2 className="text-[13px] font-medium">Merge request</h2>
-            <span className="truncate text-content/50" title={cwd}>
-              {repo ? `${repo} · ` : ""}
-              {branch || "Repository checkout"}
-            </span>
-          </header>
-        ) : null}
-        {mr ? (
-          <section className="space-y-2">
-            {!embedded ? (
-              <h3 className="font-medium">
-                !{mr.number} {mr.title}
-              </h3>
-            ) : null}
-            <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-content/55">
-              <span className="rounded bg-content/5 px-1.5 py-0.5 text-[11px] text-content/75">
-                {mr.draft
-                  ? "Draft"
+    <ReviewShell label="GitLab merge request">
+      {!embedded ? (
+        <ReviewHeader
+          label="Merge request"
+          context={`${repo ? `${repo} · ` : ""}${branch || "Repository checkout"}`}
+          title={cwd}
+        />
+      ) : null}
+      {mr ? (
+        <section className="space-y-2">
+          {!embedded ? (
+            <h3 className="text-[14px] font-medium leading-snug">
+              !{mr.number} {mr.title}
+            </h3>
+          ) : null}
+          <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-content/55">
+            <ReviewPill
+              tone={
+                mr.draft
+                  ? "draft"
                   : mr.state === "open"
-                    ? "Open"
-                    : mr.state || "Unknown"}
+                    ? "open"
+                    : mr.state === "merged"
+                      ? "merged"
+                      : mr.state === "closed"
+                        ? "closed"
+                        : "neutral"
+              }
+            >
+              {mr.draft
+                ? "Draft"
+                : mr.state === "open"
+                  ? "Open"
+                  : (
+                      {
+                        merged: "Merged",
+                        closed: "Closed",
+                      } as Record<string, string>
+                    )[mr.state] ||
+                    mr.state ||
+                    "Unknown"}
+            </ReviewPill>
+            {embedded && repo ? <span>{repo}</span> : null}
+            <span
+              className="min-w-0 truncate"
+              title={`${mr.headRefName} → ${mr.baseRefName} · ${mr.headSha || "unknown revision"}`}
+            >
+              {mr.headRefName} → {mr.baseRefName}
+              {mr.headSha ? ` · ${mr.headSha.slice(0, 8)}` : ""}
+            </span>
+            {approvalsSummary ? (
+              <span className={mr.approved ? "text-emerald-400/90" : undefined}>
+                {approvalsSummary}
               </span>
-              {repo ? <span>{repo}</span> : null}
-              {approvalsSummary ? <span>{approvalsSummary}</span> : null}
-              {mergeStatusLabel(mr.mergeStatus) ? (
-                <span>Merge: {mergeStatusLabel(mr.mergeStatus)}</span>
-              ) : null}
-              {!mr.blockingDiscussionsResolved ? (
-                <span className="text-rose-400/90">
-                  Blocking discussions unresolved
-                </span>
-              ) : null}
-              {pipeline ? (
-                <span
-                  className={
-                    pipelineFailing
-                      ? "text-rose-400/90"
-                      : pipeline.status === "success"
-                        ? "text-emerald-400/90"
-                        : "text-content/60"
-                  }
-                >
-                  Pipeline: {pipelineStatusLabel(pipeline.status)}
-                </span>
-              ) : null}
+            ) : null}
+            {mergeStatusLabel(mr.mergeStatus) ? (
               <span
-                className="min-w-0 truncate"
-                title={`${mr.headRefName} → ${mr.baseRefName}`}
+                className={
+                  reviewToneText[mergeStatusTone(mr.mergeStatus) || "neutral"]
+                }
               >
-                {mr.headRefName} → {mr.baseRefName}
+                {mergeStatusLabel(mr.mergeStatus)}
               </span>
-            </p>
-            <details>
-              <summary className="cursor-pointer text-content/60">
-                Project and revision
-              </summary>
-              <p className="break-all text-content/55">
-                Project: {repo || "resolved from checkout"}
-                <br />
-                {mr.headRefName} → {mr.baseRefName}
-                <br />
-                Head revision: {mr.headSha || "unknown"}
-              </p>
-            </details>
-            <div className="flex flex-wrap gap-1">
-              <button
-                className={button}
-                disabled={busy}
-                onClick={() => void refresh()}
-              >
-                Refresh MR
-              </button>
+            ) : null}
+            {!mr.blockingDiscussionsResolved ? (
+              <span className="text-rose-400/90">
+                Blocking discussions unresolved
+              </span>
+            ) : null}
+          </p>
+          <div className="flex flex-wrap gap-1">
+            <button
+              className={button}
+              disabled={busy}
+              onClick={() => void refresh()}
+            >
+              {busy ? (
+                <Loader className="size-3.5 animate-spin" strokeWidth={1.75} />
+              ) : (
+                <RefreshCw className="size-3.5" strokeWidth={1.75} />
+              )}
+              Refresh MR
+            </button>
+            {!embedded ? (
               <button
                 className={button}
                 onClick={() => {
@@ -394,51 +436,55 @@ function GitlabMrPanel({
                   );
                 }}
               >
+                <ExternalLink className="size-3.5" strokeWidth={1.75} />
                 Open on GitLab
               </button>
-            </div>
-          </section>
-        ) : null}
-        {repoError ? <p role="alert">{repoError}</p> : null}
-        {!verified && !repoError ? (
-          <p>
-            {busy
+            ) : null}
+          </div>
+        </section>
+      ) : null}
+      {repoError ? <ReviewError>{repoError}</ReviewError> : null}
+      {!verified && !repoError ? (
+        <div className="flex items-center gap-2">
+          <ReviewStatus>
+            {busy || !error
               ? "Loading merge request…"
-              : "Could not read this MR. Retry with Refresh MR."}
-          </p>
-        ) : null}
-        {verified && mr ? (
-          <>
-            <RepairStatus scope={gitlabMrScope(repo, number)} cwd={cwd} />
-            <RepairStatus scope={`gitlab-ci:${repo}#${number}`} cwd={cwd} />
-          </>
-        ) : null}
-        {verified && mr ? (
-          <GitlabMrSections
-            key={`${mr.headSha}:${repairRefresh}`}
-            cwd={cwd}
-            number={number}
-            mr={mr}
-            diff={diff}
-            thread={thread}
-            threadError={threadError}
-            threads={threads}
-            conversation={conversation}
-            unresolved={unresolved}
-            pipelineFailing={pipelineFailing}
-            busy={busy}
-            sendComments={sendComments}
-            sendPipeline={sendPipeline}
-            onThreadRefresh={() => void refresh()}
-          />
-        ) : null}
-        {error ? (
-          <p role="alert" className="break-words">
-            {error}
-          </p>
-        ) : null}
-      </div>
-    </section>
+              : "Could not read this MR."}
+          </ReviewStatus>
+          {!busy && error ? (
+            <button className={button} onClick={() => void refresh()}>
+              Retry
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {verified && mr ? (
+        <>
+          <RepairStatus scope={gitlabMrScope(repo, number)} cwd={cwd} />
+          <RepairStatus scope={`gitlab-ci:${repo}#${number}`} cwd={cwd} />
+        </>
+      ) : null}
+      {verified && mr ? (
+        <GitlabMrSections
+          key={`${mr.headSha}:${repairRefresh}`}
+          cwd={cwd}
+          number={number}
+          mr={mr}
+          diff={diff}
+          thread={thread}
+          threadError={threadError}
+          threads={threads}
+          conversation={conversation}
+          unresolved={unresolved}
+          pipelineFailing={pipelineFailing}
+          busy={busy}
+          sendComments={sendComments}
+          sendPipeline={sendPipeline}
+          onThreadRefresh={() => void refresh()}
+        />
+      ) : null}
+      {error ? <ReviewError>{error}</ReviewError> : null}
+    </ReviewShell>
   );
 }
 
@@ -476,59 +522,86 @@ function GitlabMrSections({
   const open = mr.state === "open";
   const pipeline = mr.pipeline;
   return (
-    <div className="space-y-2">
-      {open && unresolved.length ? (
-        <button
-          className={button}
-          disabled={busy}
-          onClick={() => sendComments(unresolved)}
-        >
-          Address comments
-        </button>
-      ) : null}
-      {open && pipelineFailing ? (
-        <button className={button} disabled={busy} onClick={sendPipeline}>
-          Send failing pipeline to agent
-        </button>
+    <div className="space-y-3">
+      {open && (unresolved.length || pipelineFailing) ? (
+        <div className="flex flex-wrap gap-1.5">
+          {unresolved.length ? (
+            <button
+              className={reviewAction}
+              disabled={busy}
+              onClick={() => sendComments(unresolved)}
+            >
+              <Bot className="size-3.5" strokeWidth={1.75} />
+              Address {unresolved.length} unresolved discussion
+              {unresolved.length === 1 ? "" : "s"}
+            </button>
+          ) : null}
+          {pipelineFailing ? (
+            <button
+              className={reviewAction}
+              disabled={busy}
+              onClick={sendPipeline}
+            >
+              <Bot className="size-3.5" strokeWidth={1.75} />
+              Send failing pipeline to agent
+            </button>
+          ) : null}
+        </div>
       ) : null}
       {pipeline ? (
-        <details className="rounded-md border border-content/10 px-2 py-1">
-          <summary className="cursor-pointer text-content/60">
-            Pipeline #{pipeline.id} · {pipelineStatusLabel(pipeline.status)}
-          </summary>
-          <p className="break-all pt-1 text-content/50">
+        <ReviewDetails
+          bordered
+          summary={
+            <>
+              Pipeline:{" "}
+              <span
+                className={
+                  pipelineFailing
+                    ? "text-rose-400/90"
+                    : pipeline.status === "success"
+                      ? "text-emerald-400/90"
+                      : "text-amber-400/90"
+                }
+              >
+                {pipelineStatusLabel(pipeline.status)}
+              </span>
+            </>
+          }
+        >
+          <p>
             Pipeline {pipeline.id} on {pipeline.sha.slice(0, 8) || "unknown"}
           </p>
           {pipeline.url ? (
             <button
               className={button}
-              onClick={() =>
-                void openUrl(pipeline.url).catch(() => undefined)
-              }
+              onClick={() => void openUrl(pipeline.url).catch(() => undefined)}
             >
+              <ExternalLink className="size-3.5" strokeWidth={1.75} />
               Open pipeline
             </button>
           ) : null}
-        </details>
+        </ReviewDetails>
       ) : null}
-      <section aria-label="Merge request diff" className="space-y-1">
-        <h4 className="text-content/60">Changed files</h4>
+      <section aria-label="Merge request diff">
         {diff ? (
           <InboxPrDiff diff={diff} />
         ) : (
-          <p className="text-content/50">
-            Diff unavailable. Refresh MR to retry.
+          <p className="flex items-center gap-2 text-content/50">
+            Diff unavailable.
+            <button className={button} onClick={onThreadRefresh}>
+              Retry
+            </button>
           </p>
         )}
       </section>
-      <section aria-label="Review discussions" className="space-y-1">
-        <h4 className="text-content/60">
+      <section aria-label="Review discussions" className="space-y-1.5">
+        <h4 className="text-[11px] font-medium uppercase tracking-wider text-content/45">
           Discussions ({threads.length}
-          {thread?.truncated ? " · newest threads omitted" : ""})
+          {thread?.truncated ? " · newest omitted" : ""})
         </h4>
-        {threadError ? <p role="alert">{threadError}</p> : null}
+        {threadError ? <ReviewError>{threadError}</ReviewError> : null}
         {threads.length === 0 && !threadError ? (
-          <p>No review discussions.</p>
+          <p className="text-content/50">No review discussions.</p>
         ) : null}
         {threads.map((comment) => (
           <GitlabReviewThread
@@ -544,11 +617,12 @@ function GitlabMrSections({
         ))}
       </section>
       {conversation.length ? (
-        <details className="border-t border-content/10 pt-2 text-content/60">
-          <summary className="cursor-pointer">
-            Conversation ({conversation.length})
-          </summary>
-          <div className="space-y-2 pt-2">
+        <ReviewDetails
+          lazy
+          summary={`Conversation (${conversation.length})`}
+          className="border-t border-content/10 pt-2"
+        >
+          <div className="space-y-2 pt-1">
             {conversation.slice(0, 50).map((comment) => (
               <div key={comment.id}>
                 <p className="text-content/55">{comment.author}</p>
@@ -556,7 +630,7 @@ function GitlabMrSections({
               </div>
             ))}
           </div>
-        </details>
+        </ReviewDetails>
       ) : null}
     </div>
   );
@@ -595,7 +669,10 @@ function GitlabReviewThread({
   }, []);
   const allReplies = comment.replies ?? [];
   const replies = allReplies.slice(0, 50);
-  const act = async (kind: "reply" | "resolve", action: () => Promise<void>) => {
+  const act = async (
+    kind: "reply" | "resolve",
+    action: () => Promise<void>,
+  ) => {
     if (acting) return;
     const id = generation.current;
     const current = () => mounted.current && generation.current === id;
@@ -626,14 +703,42 @@ function GitlabReviewThread({
         !comment.resolved,
       );
     });
+  const total = 1 + replies.length;
+  const excerpt = (comment.body.split("\n")[0] ?? "").slice(0, 100);
   return (
-    <details className="rounded-md border border-content/10 px-2 py-1">
-      <summary className="cursor-pointer break-words">
-        {comment.path || "Review discussion"}
-        {comment.line != null ? `:${comment.line}` : ""} ·{" "}
-        {comment.resolved ? "Resolved" : "Unresolved"} · {1 + replies.length}{" "}
-        notes
-      </summary>
+    <ReviewDetails
+      bordered
+      lazy
+      summary={
+        <>
+          <span
+            className={`size-1.5 shrink-0 rounded-full ${
+              comment.resolved ? "bg-emerald-400/70" : "bg-amber-400/80"
+            }`}
+            title={comment.resolved ? "Resolved" : "Unresolved"}
+          />
+          <span className="min-w-0 flex-1 truncate">
+            <span className="text-content/80">{comment.author}</span>
+            {excerpt ? (
+              <span className="text-content/50"> — {excerpt}</span>
+            ) : null}
+          </span>
+          <span className="shrink-0 text-content/40">
+            {comment.path || "General"}
+            {comment.line != null ? `:${comment.line}` : ""} ·{" "}
+            <span
+              className={
+                comment.resolved ? "text-emerald-400/80" : "text-amber-400/90"
+              }
+            >
+              {comment.resolved ? "Resolved" : "Unresolved"}
+            </span>{" "}
+            · {total} note
+            {total === 1 ? "" : "s"}
+          </span>
+        </>
+      }
+    >
       <div className="space-y-2 pt-2">
         {allReplies.length > replies.length ? (
           <p className="text-content/45">
@@ -654,6 +759,7 @@ function GitlabReviewThread({
               disabled={busy || !!acting}
               onClick={() => sendComments([comment])}
             >
+              <Bot className="size-3.5" strokeWidth={1.75} />
               Send discussion to agent
             </button>
           ) : null}
@@ -675,7 +781,7 @@ function GitlabReviewThread({
           <div className="space-y-1">
             <textarea
               aria-label="Reply to discussion"
-              className={field}
+              className={reviewField}
               rows={2}
               maxLength={64_000}
               value={draft}
@@ -690,12 +796,12 @@ function GitlabReviewThread({
             >
               {acting === "reply" ? "Replying…" : "Reply"}
             </button>
-            {actionError ? <p role="alert">{actionError}</p> : null}
+            {actionError ? <ReviewError>{actionError}</ReviewError> : null}
           </div>
         ) : actionError ? (
-          <p role="alert">{actionError}</p>
+          <ReviewError>{actionError}</ReviewError>
         ) : null}
       </div>
-    </details>
+    </ReviewDetails>
   );
 }

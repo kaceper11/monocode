@@ -14,9 +14,12 @@ import {
   childForRepository,
   composeTaskPrompt,
   composeTaskSessionPrompt,
+  composeTaskUpdateNotice,
   createTask,
   isTaskChildLaunching,
+  linkTaskSession,
   linkTicketToTask,
+  liveTaskSessionIds,
   loadTaskWorkspaces,
   markTaskChildLaunching,
   PRIMARY_ATTEMPT_ID,
@@ -34,6 +37,7 @@ import {
   taskForSession,
   taskHostConflict,
   taskMatchesQuery,
+  taskOwnedChildForWorkingCopy,
   taskOwnsCheckout,
   tasksForProject,
   unmarkTaskChildLaunching,
@@ -52,7 +56,7 @@ import {
   saveAzurePrAssociation,
   type AzurePrAssociation,
 } from "./azureRepos";
-import { saveTaskPrDraft } from "./taskPrs";
+import { listTaskPrDrafts, saveTaskPrDraft, taskPrRowKey } from "./taskPrs";
 
 function family(commonDir: string, checkout: string): RepositoryFamily {
   return {
@@ -320,6 +324,97 @@ describe("createTask", () => {
         children: [later(repo.id), later(repo.id)],
       }),
     ).toThrow("already in this task");
+  });
+
+  it("creates a child that attaches an existing branch to a new worktree", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "Fix",
+      children: [
+        {
+          repositoryId: repo.id,
+          mode: "branch",
+          existingBranch: "refs/heads/topic",
+          baseCommit: "def4567890",
+          path: "/tmp/app-topic",
+        },
+      ],
+    });
+    const [child] = task.children;
+    expect(child.existingBranch).toBe("refs/heads/topic");
+    // The short name feeds prompts, labels and branch uniqueness.
+    expect(child.branch).toBe("topic");
+    expect(child.baseCommit).toBe("def4567890");
+    // No base ref — the branch is never created, so no creation inputs.
+    expect(child.baseRef).toBeUndefined();
+    expect(child.workingCopy).toBe("/tmp/app-topic");
+    expect(taskOwnsCheckout(child)).toBe(true);
+    const prompt = composeTaskSessionPrompt(task, project);
+    expect(prompt).toContain("branch: topic");
+    expect(prompt).not.toContain("(from");
+  });
+
+  it("rejects branch children missing a local ref, tip or location", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    expect(() =>
+      createTask({
+        projectId: project.id,
+        name: "X",
+        children: [{ repositoryId: repo.id, mode: "branch", path: "/tmp/x" }],
+      }),
+    ).toThrow("branch and location");
+    expect(() =>
+      createTask({
+        projectId: project.id,
+        name: "X",
+        children: [
+          {
+            repositoryId: repo.id,
+            mode: "branch",
+            // A remote-tracking ref is not a local branch to attach.
+            existingBranch: "refs/remotes/origin/topic",
+            baseCommit: "abc123",
+            path: "/tmp/x",
+          },
+        ],
+      }),
+    ).toThrow("local branch");
+  });
+
+  it("counts an existing-branch child in branch uniqueness", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        {
+          repositoryId: repo.id,
+          mode: "branch",
+          existingBranch: "refs/heads/topic",
+          baseCommit: "abc123",
+          path: "/tmp/app-topic",
+        },
+      ],
+    });
+    const second = addTaskAttempt(task.id, "retry");
+    expect(() =>
+      addTaskChildren(task.id, [
+        {
+          repositoryId: repo.id,
+          attemptId: second.id,
+          mode: "worktree",
+          baseRef: "refs/heads/main",
+          baseCommit: "abc123",
+          // `topic` and `refs/heads/topic` are the same branch to Git.
+          branch: "topic",
+          path: "/tmp/app-topic-2",
+        },
+      ]),
+    ).toThrow("already used for this repository");
   });
 });
 
@@ -887,6 +982,26 @@ describe("reviseTask", () => {
     const [stored] = loadTaskWorkspaces();
     expect(stored.name).toBe("Old");
     expect(stored.children).toHaveLength(2);
+  });
+
+  it("refuses to edit an archived task", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "Old",
+      children: [later(repo.id)],
+    });
+    archiveTask(task.id);
+    expect(() =>
+      reviseTask(task.id, {
+        name: "Renamed",
+        keepRepositoryIds: [repo.id],
+        responsibilities: new Map(),
+        additions: [],
+      }),
+    ).toThrow("archived");
+    expect(loadTaskWorkspaces()[0].name).toBe("Old");
   });
 
   it("drops lastActiveChildId when that child is removed", () => {
@@ -1469,8 +1584,11 @@ describe("delivery watcher teardown", () => {
     expect(watchers[0].source).toEqual(
       expect.objectContaining({ sessionId: "s2" }),
     );
-    // Removing the task then lifts it — its coverage is task-scoped.
+    // Removing the task doesn't lift it — the surviving session still owns
+    // the link. Pruning that session finally drops the watcher.
     removeTask(task.id);
+    expect(loadWatchers()).toHaveLength(1);
+    pruneTaskSession("s2");
     expect(loadWatchers()).toHaveLength(0);
   });
 
@@ -1554,5 +1672,457 @@ describe("delivery watcher teardown", () => {
     expect(loadWatchers().map((watcher) => watcher.source)).toEqual([
       expect.objectContaining({ cwd: "/tmp/app-copy" }),
     ]);
+  });
+});
+
+describe("reviseTask setups", () => {
+  it("configures a deferred child in place — id and responsibility stay", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [later(repo.id), later(lib.id)],
+    });
+    const deferred = task.children[1];
+    const next = reviseTask(task.id, {
+      name: "X",
+      keepRepositoryIds: [repo.id, lib.id],
+      responsibilities: new Map([[deferred.id, "Owns lib"]]),
+      additions: [],
+      setups: new Map([
+        [
+          deferred.id,
+          {
+            repositoryId: lib.id,
+            mode: "existing",
+            workingCopy: "/tmp/lib-copy",
+          },
+        ],
+      ]),
+    });
+    const [first, second] = next.children;
+    expect(second.id).toBe(deferred.id);
+    expect(second.workingCopy).toBe("/tmp/lib-copy");
+    expect(second.responsibility).toBe("Owns lib");
+    // A setup child launches fresh — it never carries a stale launch state.
+    expect(second.launch.state).toBe("pending");
+    expect(first.id).toBe(task.children[0].id);
+  });
+
+  it("resets a failed launch back to pending through setup", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [later(repo.id)],
+    });
+    const child = task.children[0];
+    updateTaskChild(task.id, child.id, {
+      workingCopy: "/tmp/gone",
+      launch: { state: "failed", error: "missing" },
+    });
+    const next = reviseTask(task.id, {
+      name: "X",
+      keepRepositoryIds: [repo.id],
+      responsibilities: new Map(),
+      additions: [],
+      setups: new Map([
+        [
+          child.id,
+          { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/back" },
+        ],
+      ]),
+    });
+    expect(next.children[0].workingCopy).toBe("/tmp/back");
+    expect(next.children[0].launch.state).toBe("pending");
+    expect(next.children[0].launch.error).toBeUndefined();
+  });
+});
+
+describe("unique working-copy bindings", () => {
+  it("rejects two children claiming the same path", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    expect(() =>
+      createTask({
+        projectId: project.id,
+        name: "X",
+        children: [
+          { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/same" },
+          { repositoryId: lib.id, mode: "existing", workingCopy: "/tmp/same" },
+        ],
+      }),
+    ).toThrow();
+  });
+
+  it("rejects a setup colliding with a sibling's copy", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/same" },
+        later(lib.id),
+      ],
+    });
+    const deferred = task.children[1];
+    expect(() =>
+      reviseTask(task.id, {
+        name: "X",
+        keepRepositoryIds: [repo.id, lib.id],
+        responsibilities: new Map(),
+        additions: [],
+        setups: new Map([
+          [
+            deferred.id,
+            {
+              repositoryId: lib.id,
+              mode: "existing",
+              workingCopy: "/tmp/same",
+            },
+          ],
+        ]),
+      }),
+    ).toThrow();
+  });
+});
+
+describe("ticket sanitation", () => {
+  it("drops tickets without a usable url and bounds stored text", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const bad = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [later(repo.id)],
+      ticket: {
+        kind: "issue",
+        repo: "r",
+        number: 1,
+        url: "javascript:alert(1)",
+        title: "bad",
+      },
+    });
+    expect(bad.ticket).toBeUndefined();
+    const huge = createTask({
+      projectId: project.id,
+      name: "Y",
+      children: [later(repo.id)],
+      ticket: {
+        kind: "issue",
+        repo: "r",
+        number: 2,
+        url: "https://example.com/2",
+        title: "t".repeat(1000),
+        context: "c".repeat(10000),
+      },
+    });
+    expect(huge.ticket?.title).toHaveLength(500);
+    expect(huge.ticket?.context).toHaveLength(4000);
+  });
+
+  it("dedupes additional items by url and account together", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const item = (account?: string) => ({
+      kind: "issue" as const,
+      repo: "r",
+      number: 7,
+      url: "https://example.com/7",
+      ...(account ? { account } : {}),
+    });
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [later(repo.id)],
+      ticket: {
+        kind: "issue",
+        repo: "r",
+        number: 1,
+        url: "https://example.com/1",
+        additionalItems: [
+          item("acc-a"),
+          // Same url, same account — a duplicate.
+          item("acc-a"),
+          // Same url under a different account is a different ticket.
+          item("acc-b"),
+          item(),
+        ],
+      },
+    });
+    const extra = task.ticket?.additionalItems ?? [];
+    expect(extra).toHaveLength(3);
+    expect(extra.map((entry) => entry.account)).toEqual([
+      "acc-a",
+      "acc-b",
+      undefined,
+    ]);
+  });
+});
+
+describe("prompt honesty", () => {
+  it("never claims a recorded path exists before launch prepares it", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        {
+          repositoryId: repo.id,
+          mode: "worktree",
+          baseRef: "refs/heads/main",
+          baseCommit: "abc1234567",
+          branch: "checkout",
+          path: "/tmp/app-checkout",
+        },
+      ],
+    });
+    const child = task.children[0];
+    // Pending: the path is a target, not an existing checkout.
+    let prompt = composeTaskSessionPrompt(task, project);
+    expect(prompt).toContain("working copy: /tmp/app-checkout");
+    expect(prompt).toContain("not prepared yet");
+    // Failed: the prompt must not read as a usable checkout.
+    updateTaskChild(task.id, child.id, {
+      launch: { state: "failed", error: "branch exists" },
+    });
+    prompt = composeTaskSessionPrompt(loadTaskWorkspaces()[0], project);
+    expect(prompt).toContain("preparation failed: branch exists");
+    expect(prompt).not.toContain("not prepared yet");
+    // Ready: the bare path line stands on its own.
+    updateTaskChild(task.id, child.id, { launch: { state: "ready" } });
+    prompt = composeTaskSessionPrompt(loadTaskWorkspaces()[0], project);
+    expect(prompt).toContain("working copy: /tmp/app-checkout");
+    expect(prompt).not.toContain("not prepared yet");
+    expect(prompt).not.toContain("preparation failed");
+  });
+});
+
+describe("composeTaskUpdateNotice", () => {
+  it("restates name, ticket and the repository set", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "Checkout",
+      ticket: {
+        kind: "issue",
+        repo: "r",
+        number: 3,
+        url: "https://example.com/3",
+        identifier: "APP-3",
+      },
+      brief: "Do the thing.",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/app-copy" },
+        later(lib.id),
+      ],
+    });
+    const notice = composeTaskUpdateNotice(task, project);
+    expect(notice).toContain('"Checkout"');
+    expect(notice).toContain("APP-3");
+    expect(notice).toContain("Do the thing.");
+    expect(notice).toContain("/tmp/app-copy");
+    expect(notice).toContain("no working copy prepared yet");
+  });
+});
+
+describe("task PR draft cleanup", () => {
+  it("drops a child's draft when the child is removed", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/a" },
+        { repositoryId: lib.id, mode: "existing", workingCopy: "/tmp/b" },
+      ],
+    });
+    const [first, second] = task.children;
+    saveTaskPrDraft(task.id, first.id, { title: "one" });
+    saveTaskPrDraft(task.id, second.id, { title: "two" });
+    expect(Object.keys(listTaskPrDrafts())).toHaveLength(2);
+    removeTaskChild(task.id, first.id);
+    expect(listTaskPrDrafts()[taskPrRowKey(task.id, first.id)]).toBeUndefined();
+    expect(listTaskPrDrafts()[taskPrRowKey(task.id, second.id)]).toBeDefined();
+  });
+
+  it("drops every draft when the task is removed", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/a" },
+      ],
+    });
+    saveTaskPrDraft(task.id, task.children[0].id, { title: "one" });
+    removeTask(task.id);
+    expect(listTaskPrDrafts()).toEqual({});
+  });
+
+  it("drops drafts for repositories removed by reviseTask", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        { repositoryId: repo.id, mode: "existing", workingCopy: "/tmp/a" },
+        { repositoryId: lib.id, mode: "existing", workingCopy: "/tmp/b" },
+      ],
+    });
+    saveTaskPrDraft(task.id, task.children[0].id, { title: "one" });
+    saveTaskPrDraft(task.id, task.children[1].id, { title: "two" });
+    reviseTask(task.id, {
+      name: "X",
+      keepRepositoryIds: [lib.id],
+      responsibilities: new Map(),
+      additions: [],
+    });
+    const rows = listTaskPrDrafts();
+    expect(rows[taskPrRowKey(task.id, task.children[0].id)]).toBeUndefined();
+    expect(rows[taskPrRowKey(task.id, task.children[1].id)]).toBeDefined();
+  });
+});
+
+describe("linkTaskSession", () => {
+  const worktreeDraft = (repositoryId: string) => ({
+    repositoryId,
+    mode: "worktree" as const,
+    baseRef: "refs/heads/main",
+    baseCommit: "abc123",
+    branch: "topic",
+    path: "/tmp/app-topic",
+  });
+
+  it("appends to the task's conversations, keeping the primary first", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [worktreeDraft(repo.id)],
+    });
+    updateTask(task.id, (current) => ({
+      ...current,
+      sessionIds: ["primary"],
+    }));
+    linkTaskSession(task.id, "scratch");
+    linkTaskSession(task.id, "scratch");
+    const stored = loadTaskWorkspaces().find(
+      (entry) => entry.id === task.id,
+    )!;
+    expect(stored.sessionIds).toEqual(["primary", "scratch"]);
+    expect(taskForSession("scratch")?.task.id).toBe(task.id);
+  });
+
+  it("drops from the list when the session is pruned", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [worktreeDraft(repo.id)],
+    });
+    linkTaskSession(task.id, "scratch");
+    pruneTaskSession("scratch");
+    const stored = loadTaskWorkspaces().find(
+      (entry) => entry.id === task.id,
+    )!;
+    expect(stored.sessionIds ?? []).not.toContain("scratch");
+  });
+});
+
+describe("liveTaskSessionIds", () => {
+  const worktreeDraft = (repositoryId: string) => ({
+    repositoryId,
+    mode: "worktree" as const,
+    baseRef: "refs/heads/main",
+    baseCommit: "abc123",
+    branch: "topic",
+    path: "/tmp/app-topic",
+  });
+
+  it("drops recorded ids that no live session resolves", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [worktreeDraft(repo.id)],
+    });
+    linkTaskSession(task.id, "primary");
+    linkTaskSession(task.id, "extra");
+    const stored = loadTaskWorkspaces().find(
+      (entry) => entry.id === task.id,
+    )!;
+    const live = new Set(["primary"]);
+    expect(liveTaskSessionIds(stored, live)).toEqual(["primary"]);
+    expect(liveTaskSessionIds(stored, new Set(["primary", "extra"]))).toEqual([
+      "primary",
+      "extra",
+    ]);
+    expect(liveTaskSessionIds(stored, new Set())).toEqual([]);
+  });
+});
+
+describe("taskOwnedChildForWorkingCopy", () => {
+  it("claims a task-owned worktree but not a borrowed copy", () => {
+    const project = projectWith("/tmp/app", "/tmp/lib");
+    const [repo, lib] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        {
+          repositoryId: repo.id,
+          mode: "worktree",
+          baseRef: "refs/heads/main",
+          baseCommit: "abc123",
+          branch: "topic",
+          path: "/tmp/app-topic",
+        },
+        {
+          repositoryId: lib.id,
+          mode: "existing",
+          workingCopy: "/tmp/lib",
+        },
+      ],
+    });
+    const [owned] = task.children;
+    expect(taskOwnedChildForWorkingCopy("/tmp/app-topic")?.child.id).toBe(
+      owned.id,
+    );
+    // A borrowed existing copy is the user's — sessions there stay free.
+    expect(taskOwnedChildForWorkingCopy("/tmp/lib")).toBeUndefined();
+    expect(taskOwnedChildForWorkingCopy("/tmp/none")).toBeUndefined();
+  });
+
+  it("ignores copies on archived tasks", () => {
+    const project = projectWith("/tmp/app");
+    const [repo] = project.repositories;
+    const task = createTask({
+      projectId: project.id,
+      name: "X",
+      children: [
+        {
+          repositoryId: repo.id,
+          mode: "worktree",
+          baseRef: "refs/heads/main",
+          baseCommit: "abc123",
+          branch: "topic",
+          path: "/tmp/app-topic",
+        },
+      ],
+    });
+    archiveTask(task.id);
+    expect(taskOwnedChildForWorkingCopy("/tmp/app-topic")).toBeUndefined();
   });
 });

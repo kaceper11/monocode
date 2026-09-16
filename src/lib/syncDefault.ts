@@ -191,11 +191,41 @@ async function runSync(
 }
 
 /**
- * Conflict resolution choice after a sync or update (or later, from the
- * merge banner): send the merge context to an agent, or leave the real
- * state in the tree — with one more explicit chance to abort instead.
- * `op` names what produced the state ("merge" by default, "rebase" from
- * the update-branch flow).
+ * Pending conflict-resolution sheets — one per working copy. The app renders
+ * them as in-app modals (never chained native asks — a cancel must close,
+ * not open the next question). Dismiss = "keep": the conflicts stay in the
+ * tree, which is always the safe default.
+ */
+export type MergeResolutionChoice = "agent" | "abort" | "keep";
+export type MergeResolutionRequest = {
+  key: string;
+  cwd: string;
+  sessionId?: string;
+  title: string;
+  op: "merge" | "rebase";
+  syncedWith: string;
+  conflicts: string[];
+  choose: (choice: MergeResolutionChoice) => void;
+};
+export const MERGE_RESOLUTIONS_CHANGED = "monocode:merge-resolutions";
+const pendingResolutions = new Map<string, MergeResolutionRequest>();
+let resolutionSnapshot: readonly MergeResolutionRequest[] = [];
+const emitResolutions = () => {
+  resolutionSnapshot = [...pendingResolutions.values()];
+  window.dispatchEvent(new Event(MERGE_RESOLUTIONS_CHANGED));
+};
+export const mergeResolutionSnapshot = () => resolutionSnapshot;
+export function subscribeMergeResolutions(listener: () => void): () => void {
+  window.addEventListener(MERGE_RESOLUTIONS_CHANGED, listener);
+  return () => window.removeEventListener(MERGE_RESOLUTIONS_CHANGED, listener);
+}
+
+/**
+ * Conflict resolution after a sync or update: offer send-to-agent, abort, or
+ * keep via the in-app sheet — the conflicted state stays in the tree either
+ * way. `op` names what produced the state ("merge" by default, "rebase" from
+ * the update-branch flow). Re-offering the same working copy resolves the
+ * earlier sheet as "keep" first so sheets never stack.
  */
 export async function offerMergeResolution(
   target: SyncTarget,
@@ -203,55 +233,50 @@ export async function offerMergeResolution(
   conflicts: string[],
   op: "merge" | "rebase" = "merge",
 ): Promise<void> {
+  const key = pathKey(target.cwd);
+  pendingResolutions.get(key)?.choose("keep");
+  const choice = await new Promise<MergeResolutionChoice>((resolve) => {
+    let done = false;
+    pendingResolutions.set(key, {
+      key,
+      cwd: target.cwd,
+      sessionId: target.sessionId,
+      title: target.title ?? "",
+      op,
+      syncedWith,
+      conflicts,
+      choose: (choice) => {
+        if (done) return;
+        done = true;
+        pendingResolutions.delete(key);
+        emitResolutions();
+        resolve(choice);
+      },
+    });
+    emitResolutions();
+  });
   const title = target.title || "Merge conflicts";
-  const list = conflicts.slice(0, 10).join("\n");
-  // The backend caps at 100 — at the cap the count is honest but the list
-  // is truncated; the shown slice is capped at 10 either way.
-  const count = conflicts.length === 100 ? "100+" : `${conflicts.length}`;
-  const action =
-    op === "rebase" ? `Rebasing onto ${syncedWith}` : `Merging ${syncedWith}`;
-  const send = await ask(
-    `${action} left ${count} conflicted file${conflicts.length === 1 ? "" : "s"}${list ? `:\n${list}` : ""}\n\nThe conflicted state is preserved in the working copy. Send the merge context to ${target.sessionId ? "the owning conversation" : "an agent"}?`,
-    {
-      title,
-      kind: "warning",
-      okLabel: target.sessionId ? "Send to owning agent" : "Send to agent",
-      cancelLabel: "Resolve manually",
-    },
-  );
-  if (send) {
+  if (choice === "agent") {
+    // Re-reads live merge state — a merge resolved meanwhile sends nothing.
     const sent = await sendMergeConflictsToAgent(target);
     if (!sent)
-      await message(
-        `The ${op} is no longer in progress — nothing was sent.`,
-        { title, kind: "info" },
-      );
-    return;
-  }
-  // The banner stays live while this dialog waits — the operation may
-  // already have been aborted (or finished) elsewhere; never abort blind.
-  const live = await gitMergeContext(target.cwd).catch(() => null);
-  if (live && !live.merging) {
-    await message(`The ${op} is no longer in progress — nothing to abort.`, {
-      title,
-      kind: "info",
-    });
-    return;
-  }
-  // A failed read still offers the abort — but names no operation rather
-  // than guessing this flow's op for whatever is actually in progress.
-  const liveOp = live ? `the ${opLabel(live.op).toLowerCase()}` : "the operation";
-  if (
-    await ask(
-      `Keep the conflicts in the tree, or abort ${liveOp} and restore the previous state?`,
-      {
+      await message(`The ${op} is no longer in progress — nothing was sent.`, {
         title,
-        kind: "warning",
-        okLabel: live ? `Abort ${opLabel(live.op)}` : "Abort",
-        cancelLabel: "Keep conflicts",
-      },
-    )
-  ) {
+        kind: "info",
+      });
+    return;
+  }
+  if (choice === "abort") {
+    // The operation may already have been aborted (or finished) elsewhere —
+    // never abort blind.
+    const live = await gitMergeContext(target.cwd).catch(() => null);
+    if (live && !live.merging) {
+      await message(`The ${op} is no longer in progress — nothing to abort.`, {
+        title,
+        kind: "info",
+      });
+      return;
+    }
     await gitMergeAbort(target.cwd);
     notifyGitChanged(target.cwd);
   }
@@ -261,10 +286,13 @@ export async function offerMergeResolution(
  * Dispatch the live merge state to the owning conversation (or the
  * destination picker when the working copy has none). Reads fresh state so
  * a merge already resolved or aborted sends nothing; the conflict stays in
- * the tree either way. Returns false when there is nothing left to send.
+ * the tree either way. `extraInstruction` adds caller-specific guidance —
+ * the bulk task sync uses it to require "ask me" over guessing. Returns
+ * false when there is nothing left to send.
  */
 export async function sendMergeConflictsToAgent(
   target: SyncTarget,
+  extraInstruction?: string,
 ): Promise<boolean> {
   const merge = await gitMergeContext(target.cwd);
   if (!merge.merging) return false;
@@ -284,6 +312,7 @@ export async function sendMergeConflictsToAgent(
     merge.conflicts.length === 100 ? "first 100" : `${merge.conflicts.length}`;
   const text = [
     `A ${op.toLowerCase()} in ${branch} stopped with conflicts in this working copy. Resolve it in place — preserve both sides' intent, then run the checks this repository offers.`,
+    ...(extraInstruction ? ["", extraInstruction] : []),
     "",
     `Host: ${host}`,
     `Working copy: ${target.cwd}`,
@@ -324,6 +353,130 @@ export async function sendMergeConflictsToAgent(
     requireDestinationSelection: !target.sessionId,
   });
   return true;
+}
+
+/** Conflict guidance for the task-level bulk sync — the owning agent must
+ * keep both sides and escalate ambiguity to the user instead of guessing. */
+const TASK_SYNC_DIRECTIVE =
+  "Preserve both the incoming and the current changes — the resolution must not drop either side's work. If anything about the correct resolution is unclear, ask me questions before continuing; do not guess.";
+
+/** One row per linked working copy in a task sync report. */
+export type TaskBranchSyncRow = {
+  cwd: string;
+  /** Branch once known, the path before that. */
+  label: string;
+  state:
+    | "running"
+    | "merged"
+    | "up-to-date"
+    | "conflicts-sent"
+    | "conflicts"
+    | "skipped"
+    | "failed";
+  detail?: string;
+};
+
+/** Minimal task shape the sync needs — TaskWorkspace satisfies it. */
+type TaskSyncSource = {
+  children: readonly { workingCopy?: string; sessionIds: readonly string[] }[];
+  sessionIds?: readonly string[];
+};
+
+/**
+ * Task-level quick action: fetch and merge the remote default into every
+ * linked working copy, one at a time so copies of the same repository never
+ * race on the object store. No per-copy confirmation — the backend refuses
+ * dirty trees and in-progress operations, nothing is pushed, and conflicts
+ * stay recoverable. Conflicted copies with an owning session go straight
+ * to their agent with the preserve-and-ask directive; sessionless ones are
+ * reported for manual resolution. `onRows` receives the report as rows
+ * resolve so the sheet can stream progress.
+ */
+export async function syncTaskBranches(
+  task: TaskSyncSource,
+  onRows?: (rows: readonly TaskBranchSyncRow[]) => void,
+): Promise<TaskBranchSyncRow[]> {
+  const targets: { cwd: string; sessionId?: string }[] = [];
+  const seen = new Set<string>();
+  for (const child of task.children) {
+    if (!child.workingCopy) continue;
+    const key = pathKey(child.workingCopy);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    targets.push({
+      cwd: child.workingCopy,
+      sessionId: child.sessionIds[0] ?? task.sessionIds?.[0],
+    });
+  }
+  const rows: TaskBranchSyncRow[] = targets.map(({ cwd }) => ({
+    cwd,
+    label: cwd,
+    state: "running",
+  }));
+  const emit = () => onRows?.(rows.map((row) => ({ ...row })));
+  emit();
+  for (let index = 0; index < targets.length; index++) {
+    const target = targets[index];
+    const row = rows[index];
+    const release = acquireSyncSlot(target.cwd);
+    if (!release) {
+      row.state = "skipped";
+      row.detail = "A sync is already running on this working copy.";
+      emit();
+      continue;
+    }
+    try {
+      const read = await gitDiffIndex(target.cwd);
+      row.label = read.branch ?? target.cwd;
+      const refusal = syncPreflightRefusal(read);
+      if (refusal) {
+        row.state = "skipped";
+        row.detail = refusal;
+      } else {
+        const result = await gitSyncBranch(
+          target.cwd,
+          read.branch ?? undefined,
+        );
+        notifyGitChanged(target.cwd);
+        switch (result.outcome) {
+          case "merged":
+            row.state = "merged";
+            row.detail = `${result.commitCount} incoming commit${result.commitCount === 1 ? "" : "s"} from ${result.syncedWith}`;
+            break;
+          case "up-to-date":
+            row.state = "up-to-date";
+            row.detail = `Already up to date with ${result.syncedWith}`;
+            break;
+          case "conflicted": {
+            if (!target.sessionId) {
+              row.state = "conflicts";
+              row.detail = `${result.conflicts.length} conflict${result.conflicts.length === 1 ? "" : "s"} left — no owning conversation; resolve in Git Changes.`;
+              break;
+            }
+            const sent = await sendMergeConflictsToAgent(
+              { cwd: target.cwd, sessionId: target.sessionId },
+              TASK_SYNC_DIRECTIVE,
+            );
+            row.state = sent ? "conflicts-sent" : "conflicts";
+            row.detail = sent
+              ? "Conflicts sent to the owning conversation."
+              : "The operation finished before conflicts could be sent.";
+            break;
+          }
+          default:
+            row.state = "skipped";
+            row.detail = result.reason || "The sync was refused.";
+        }
+      }
+    } catch (error) {
+      row.state = "failed";
+      row.detail = error instanceof Error ? error.message : String(error);
+    } finally {
+      release();
+      emit();
+    }
+  }
+  return rows;
 }
 
 /** Explicit abort of the operation in progress — always confirmed. The

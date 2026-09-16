@@ -109,6 +109,7 @@ export function AttentionQueue({
   onAction,
   onSnooze,
   onDismissItem,
+  onDismissAll,
   onOpenAutomations,
 }: {
   anchor: PopoverAnchor;
@@ -117,6 +118,7 @@ export function AttentionQueue({
   onAction: (item: AttentionItem) => void;
   onSnooze: (item: AttentionItem) => void;
   onDismissItem: (item: AttentionItem) => void;
+  onDismissAll: (items: AttentionItem[]) => void;
   onOpenAutomations: () => void;
 }) {
   // Selection is tracked by row key, not index — a poll resolving a row
@@ -184,6 +186,13 @@ export function AttentionQueue({
       case "d":
       case "Backspace":
       case "Delete":
+        if (event.shiftKey) {
+          if (items.length) {
+            event.preventDefault();
+            onDismissAll(items);
+          }
+          return;
+        }
         if (current) {
           event.preventDefault();
           onDismissItem(current);
@@ -212,17 +221,28 @@ export function AttentionQueue({
     >
       <div className="flex items-center justify-between border-b border-content/10 px-3 py-2">
         <p className="text-[12px] font-medium">Attention</p>
-        <button
-          type="button"
-          className="flex items-center gap-1 rounded px-1.5 py-1 text-[11px] text-content/50 hover:bg-content/5 hover:text-content"
-          onClick={() => {
-            onDismiss();
-            onOpenAutomations();
-          }}
-        >
-          <Settings className="size-3" strokeWidth={1.75} />
-          Automations
-        </button>
+        <span className="flex items-center gap-1">
+          {items.length ? (
+            <button
+              type="button"
+              className="flex items-center gap-1 rounded px-1.5 py-1 text-[11px] text-content/50 hover:bg-content/5 hover:text-content"
+              onClick={() => onDismissAll(items)}
+            >
+              Clear all
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="flex items-center gap-1 rounded px-1.5 py-1 text-[11px] text-content/50 hover:bg-content/5 hover:text-content"
+            onClick={() => {
+              onDismiss();
+              onOpenAutomations();
+            }}
+          >
+            <Settings className="size-3" strokeWidth={1.75} />
+            Automations
+          </button>
+        </span>
       </div>
       <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto p-1" role="listbox" aria-label="Attention items">
         {items.length ? (
@@ -320,8 +340,8 @@ export function AttentionQueue({
         )}
       </div>
       <div className="border-t border-content/10 px-3 py-1.5 text-[10px] text-content/40">
-        ↑↓ move · Enter act · S snooze · D dismiss — muted rows resurface on
-        change
+        ↑↓ move · Enter act · S snooze · D dismiss · ⇧D clear — muted rows
+        resurface on change
       </div>
     </Popover>
   );

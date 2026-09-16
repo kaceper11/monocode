@@ -20,6 +20,43 @@ export type RepositoryFamily = {
   identity?: string | null;
 };
 
+/** True when `path` is the family's main checkout or a live member
+ * worktree (present on disk, not prunable). */
+export function familyHasLiveCopy(
+  family: RepositoryFamily,
+  path: string,
+): boolean {
+  if (pathKey(family.checkout) === pathKey(path)) return true;
+  return family.worktrees.some(
+    (entry) =>
+      pathKey(entry.path) === pathKey(path) && !entry.missing && !entry.prunable,
+  );
+}
+
+/** True when `path` appears anywhere in the family inventory — checkout or
+ * worktree, live or not. For "is this path claimed" checks, not liveness. */
+export function familyHasCopy(
+  family: RepositoryFamily,
+  path: string,
+): boolean {
+  if (pathKey(family.checkout) === pathKey(path)) return true;
+  return family.worktrees.some((entry) => pathKey(entry.path) === pathKey(path));
+}
+
+/** A healthy family member that can host the next preflight/remove call —
+ * never a missing copy, a prunable registration or any excluded path.
+ * Prefers the main checkout's worktree slot, else the first usable one. */
+export function healthyFamilyMember(
+  family: RepositoryFamily | undefined,
+  exclude: ReadonlySet<string> = new Set(),
+): string | undefined {
+  const usable = (family?.worktrees ?? []).filter(
+    (entry) =>
+      !entry.missing && !entry.prunable && !exclude.has(pathKey(entry.path)),
+  );
+  return usable.find((entry) => entry.main)?.path ?? usable[0]?.path;
+}
+
 let verifiedFamilies: ReadonlyMap<string, RepositoryFamily> = new Map();
 const listeners = new Set<() => void>();
 export const getVerifiedFamilies = () => verifiedFamilies;
@@ -107,7 +144,11 @@ export function setWorkingCopyHidden(path: string, hidden: boolean) {
   );
   if (hidden) next.unshift(path);
   // Presentation only: Git inventory, session paths and original recents stay intact.
-  localStorage.setItem(HIDDEN_KEY, JSON.stringify(next.slice(0, 2000)));
+  try {
+    localStorage.setItem(HIDDEN_KEY, JSON.stringify(next.slice(0, 2000)));
+  } catch {
+    /* Quota/denied storage — a dropped hide preference is harmless. */
+  }
   for (const listener of preferenceListeners) listener();
 }
 export function lastWorkingCopyUse(

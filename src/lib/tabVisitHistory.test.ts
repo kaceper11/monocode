@@ -12,7 +12,9 @@ import {
 
 const tab = (id: string, leaf?: string): VisitLocation =>
   leaf === undefined ? { tab: id } : { tab: id, leaf };
-const view = (name: "inbox" | "search" | "settings" | "notes"): VisitLocation => ({
+const view = (
+  name: "inbox" | "search" | "settings" | "notes",
+): VisitLocation => ({
   view: name,
 });
 
@@ -51,7 +53,10 @@ describe("tab visit history", () => {
   });
 
   it("records a leaf change inside the same tab", () => {
-    let history = recordTabVisit(emptyTabVisitHistory(tab("a", "s1")), tab("a", "s2"));
+    let history = recordTabVisit(
+      emptyTabVisitHistory(tab("a", "s1")),
+      tab("a", "s2"),
+    );
     history = tabVisitBack(history)!;
     expect(history.current).toEqual(tab("a", "s1"));
   });
@@ -63,6 +68,27 @@ describe("tab visit history", () => {
     history = tabVisitBack(history)!;
     history = tabVisitBack(history)!;
     expect(history.current).toEqual(tab("a"));
+  });
+
+  it("distinguishes inbox visits by the embedded conversation", () => {
+    const inbox = (conversation?: string): VisitLocation =>
+      conversation === undefined
+        ? view("inbox")
+        : { view: "inbox", conversation };
+    let history = recordTabVisit(
+      emptyTabVisitHistory(view("inbox")),
+      inbox("s1"),
+    );
+    // A conversation switch inside the inbox is a real location change.
+    history = recordTabVisit(history, inbox("s2"));
+    history = recordTabVisit(history, tab("b"));
+    expect(tabVisitBack(history)?.current).toEqual(inbox("s2"));
+    history = tabVisitBack(history)!;
+    expect(history.current).toEqual(inbox("s2"));
+    history = tabVisitBack(history)!;
+    expect(history.current).toEqual(inbox("s1"));
+    history = tabVisitBack(history)!;
+    expect(history.current).toEqual(view("inbox"));
   });
 
   it("does not keep a closed current tab on the back stack", () => {
@@ -83,7 +109,10 @@ describe("tab visit history", () => {
   });
 
   it("keeps overlay visits when the tab underneath closes", () => {
-    let history = recordTabVisit(emptyTabVisitHistory(tab("a")), view("search"));
+    let history = recordTabVisit(
+      emptyTabVisitHistory(tab("a")),
+      view("search"),
+    );
     history = recordTabVisit(history, tab("b"));
     history = pruneTabVisitHistory(history, new Set(["b"]), tab("b"));
     expect(tabVisitBack(history)?.current).toEqual(view("search"));

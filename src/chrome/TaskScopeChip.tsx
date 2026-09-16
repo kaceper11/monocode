@@ -1,38 +1,28 @@
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { basename } from "../lib/fs";
+import { useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { prettyCwd } from "../lib/paths";
 import {
-  projectsSnapshot,
-  repositoryDisplayName,
-  subscribeProjects,
-} from "../lib/projects";
-import {
   OPEN_TASK_DETAILS,
-  repositoryForChild,
-  subscribeTaskWorkspaces,
-  taskForSession,
-  taskWorkspacesSnapshot,
+  OPEN_TASK_PRS,
+  taskChildPrepared,
+  taskChildRepoName,
   type TaskChild,
   type TaskWorkspace,
 } from "../lib/taskWorkspaces";
 import {
   childDelivery,
-  deliveryStores,
   type DeliveryStores,
 } from "../lib/taskDelivery";
-import { AZURE_PR_ASSOCIATIONS_CHANGED } from "../lib/azureRepos";
-import { AZURE_CI_SOURCES_CHANGED } from "../lib/azurePipelines";
+import { useDeliveryStores } from "../hooks/useDeliveryStores";
+import { useTaskChildData } from "../hooks/useTaskChildData";
 import {
   diffStatsVersion,
   peekProjectDiffStats,
   subscribeDiffStatsVersion,
-  useProjectDiffStats,
 } from "../hooks/useProjectDiffStats";
 import {
   branchPrVersion,
   cachedBranchPr,
   subscribeBranchPrVersion,
-  useCachedBranchPr,
 } from "../hooks/useBranchPr";
 import { Popover } from "./Popover";
 import {
@@ -47,13 +37,25 @@ import {
   Loader,
 } from "./icons";
 
-function childRepoName(task: TaskWorkspace, child: TaskChild): string {
-  const repo = repositoryForChild(task, child);
-  return repo
-    ? repositoryDisplayName(repo)
-    : child.workingCopy
-      ? basename(child.workingCopy)
-      : "Repository";
+/** Launch-state glyph for a task child — failed, working, prepared, idle.
+ * Shared by the scope chip and task details so the states read identically. */
+export function TaskChildStateIcon({ child }: { child: TaskChild }) {
+  if (child.launch.state === "failed")
+    return (
+      <CircleAlert
+        className="size-3.5 shrink-0 text-red-400"
+        strokeWidth={1.75}
+      />
+    );
+  if (child.launch.state === "working")
+    return (
+      <Loader className="size-3.5 shrink-0 animate-spin text-content/50" />
+    );
+  if (taskChildPrepared(child))
+    return (
+      <Check className="size-3.5 shrink-0 text-emerald-400" strokeWidth={2} />
+    );
+  return <CircleDot className="size-3.5 shrink-0 text-content/30" />;
 }
 
 /** Delivery badges for a child row: linked PRs and CI pipelines, colored
@@ -117,6 +119,7 @@ function TaskChildRow({
   stores,
   onOpen,
   onRetry,
+  onSetup,
 }: {
   task: TaskWorkspace;
   entry: TaskChild;
@@ -125,20 +128,16 @@ function TaskChildRow({
   stores: DeliveryStores;
   onOpen?: () => void;
   onRetry?: () => void;
+  onSetup?: () => void;
 }) {
-  const ready =
-    entry.sessionIds.length > 0 || entry.launch.state === "ready";
+  const ready = taskChildPrepared(entry);
   const failed = entry.launch.state === "failed";
   // Rows only mount while the popover is open — stats subscribe on sight.
-  const stats = useProjectDiffStats(
-    entry.workingCopy ?? "",
-    !!entry.workingCopy,
-  );
-  const branch = stats?.branch ?? entry.branch;
-  const githubPr = useCachedBranchPr(entry.workingCopy ?? "", branch);
-  const delivery = useMemo(
-    () => childDelivery(task, entry, [branch, entry.branch], githubPr, stores),
-    [task, entry, branch, githubPr, stores],
+  const { stats, branch, delivery } = useTaskChildData(
+    task,
+    entry,
+    true,
+    stores,
   );
   const detail =
     branch || (stats?.files ?? 0) > 0 || delivery.prs > 0 || delivery.ci > 0;
@@ -148,39 +147,30 @@ function TaskChildRow({
         type="button"
         disabled={!ready}
         onClick={onOpen}
-        className="flex min-w-0 flex-1 flex-col rounded-lg px-2 py-1.5 text-left text-content hover:bg-content/5 disabled:opacity-50"
+        className="flex min-w-0 flex-1 flex-col rounded-lg px-2 py-1.5 text-left text-content hover:bg-content/5 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
       >
         <span className="flex min-w-0 items-center gap-2 self-stretch">
-          {entry.launch.state === "failed" ? (
-            <CircleAlert
-              className="size-3.5 shrink-0 text-red-400"
-              strokeWidth={1.75}
-            />
-          ) : entry.launch.state === "working" ? (
-            <Loader className="size-3.5 shrink-0 animate-spin text-content/50" />
-          ) : ready ? (
-            <Check
-              className="size-3.5 shrink-0 text-emerald-400"
-              strokeWidth={2}
-            />
-          ) : (
-            <CircleDot className="size-3.5 shrink-0 text-content/30" />
-          )}
+          <TaskChildStateIcon child={entry} />
           <span className="min-w-0 flex-1 truncate text-[12px]">
-            {childRepoName(task, entry)}
+            {taskChildRepoName(task, entry)}
           </span>
           {needsInput ? (
             <span className="size-1.5 shrink-0 rounded-full bg-amber-400" />
           ) : null}
           <DeliveryBadges delivery={delivery} />
-          <span className="shrink-0 truncate text-[10px] text-content/40">
+          <span
+            className="shrink-0 truncate text-[10px] text-content/40"
+            title={
+              !ready && entry.workingCopy ? prettyCwd(entry.workingCopy) : undefined
+            }
+          >
             {current
               ? "Current"
               : ready
                 ? ""
                 : entry.workingCopy
                   ? prettyCwd(entry.workingCopy)
-                  : "Prepare later"}
+                  : "Not set up"}
           </span>
         </span>
         {detail ? (
@@ -201,9 +191,20 @@ function TaskChildRow({
           </span>
         ) : null}
       </button>
-      {(failed ||
-        (!ready && entry.launch.state !== "working" && entry.workingCopy)) &&
-      onRetry ? (
+      {// No copy recorded — there's nothing to retry; configure it first.
+      // Matches TaskDetails: Set up beats Retry when both could apply.
+      !ready && !entry.workingCopy && entry.launch.state !== "working" ? (
+        onSetup ? (
+          <button
+            type="button"
+            title="Choose a working copy for this repository"
+            onClick={onSetup}
+            className="shrink-0 rounded-md px-1.5 py-1 text-[10px] text-accent hover:bg-content/8 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+          >
+            Set up
+          </button>
+        ) : null
+      ) : onRetry ? (
         <button
           type="button"
           title={
@@ -211,7 +212,7 @@ function TaskChildRow({
             (failed ? "Retry launch" : "Start this repository")
           }
           onClick={onRetry}
-          className="shrink-0 rounded-md px-1.5 py-1 text-[10px] text-content/60 hover:bg-content/8 hover:text-content"
+          className="shrink-0 rounded-md px-1.5 py-1 text-[10px] text-content/60 hover:bg-content/8 hover:text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
         >
           {failed ? "Retry" : "Start"}
         </button>
@@ -227,48 +228,24 @@ function TaskChildRow({
  * session's working copy.
  */
 export function TaskScopeChip({
-  sessionId,
-  cwd,
+  scope,
   needsInputIds,
   onOpenChild,
   onRetryChild,
+  onSetupChild,
 }: {
-  sessionId: string;
-  /** The session's actual working copy — the host child is derived from
-   * it, not from whichever child was last clicked. */
-  cwd?: string;
+  /** The session's task binding, resolved by the pane — recomputing it here
+   * would double the store subscription and scan for every session card. */
+  scope: { task: TaskWorkspace; child: TaskChild } | null;
   needsInputIds?: ReadonlySet<string>;
   onOpenChild?: (taskId: string, childId: string) => void;
   onRetryChild?: (taskId: string, childId: string) => void;
+  /** Opens the edit sheet so a no-copy child picks its working copy. */
+  onSetupChild?: (taskId: string, childId: string) => void;
 }) {
-  const tasksRaw = useSyncExternalStore(
-    subscribeTaskWorkspaces,
-    taskWorkspacesSnapshot,
-  );
-  const projectsRaw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
-  const scope = useMemo(
-    () => taskForSession(sessionId, cwd),
-    // Stores re-read on every write.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [sessionId, cwd, tasksRaw, projectsRaw],
-  );
   const [open, setOpen] = useState(false);
   // Re-read saved provider links when they change so badges stay current.
-  const [deliveryTick, setDeliveryTick] = useState(0);
-  useEffect(() => {
-    const bump = () => setDeliveryTick((value) => value + 1);
-    window.addEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, bump);
-    window.addEventListener(AZURE_CI_SOURCES_CHANGED, bump);
-    return () => {
-      window.removeEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, bump);
-      window.removeEventListener(AZURE_CI_SOURCES_CHANGED, bump);
-    };
-  }, []);
-  const stores = useMemo(
-    () => deliveryStores(),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [deliveryTick],
-  );
+  const stores = useDeliveryStores();
   const anchor = useRef<HTMLButtonElement>(null);
   // Re-derive when a stats or PR cache publish lands — the peeks below never
   // subscribe or fetch, so the ticks are what keep the dot honest.
@@ -298,7 +275,7 @@ export function TaskScopeChip({
           })
         : false,
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [scope, stores, tasksRaw, statsV, prV],
+    [scope, stores, statsV, prV],
   );
   if (!scope) return null;
   const { task, child } = scope;
@@ -324,7 +301,7 @@ export function TaskScopeChip({
         />
         <span className="truncate">{task.name}</span>
         <span className="shrink-0 text-content/40">
-          · {childRepoName(task, child)}
+          · {taskChildRepoName(task, child)}
         </span>
         <ChevronDown
           aria-hidden="true"
@@ -361,10 +338,7 @@ export function TaskScopeChip({
                 (current &&
                   task.sessionIds?.some((id) => needsInputIds?.has(id))) ||
                 entry.sessionIds.some((id) => needsInputIds?.has(id));
-              const ready =
-                entry.sessionIds.length > 0 ||
-                entry.launch.state === "ready";
-              const failed = entry.launch.state === "failed";
+              const ready = taskChildPrepared(entry);
               return (
                 <TaskChildRow
                   key={entry.id}
@@ -382,14 +356,23 @@ export function TaskScopeChip({
                       : undefined
                   }
                   onRetry={
-                    (failed ||
-                      (!ready &&
-                        entry.launch.state !== "working" &&
-                        entry.workingCopy)) &&
+                    // Matches details: retry needs a copy to relaunch — a
+                    // copy-less failed child gets Set up instead.
+                    !ready &&
+                    entry.launch.state !== "working" &&
+                    entry.workingCopy &&
                     onRetryChild
                       ? () => {
                           setOpen(false);
                           onRetryChild(task.id, entry.id);
+                        }
+                      : undefined
+                  }
+                  onSetup={
+                    !ready && !entry.workingCopy && onSetupChild
+                      ? () => {
+                          setOpen(false);
+                          onSetupChild(task.id, entry.id);
                         }
                       : undefined
                   }
@@ -406,7 +389,7 @@ export function TaskScopeChip({
                   new CustomEvent(OPEN_TASK_DETAILS, { detail: task.id }),
                 );
               }}
-              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
             >
               <Task
                 aria-hidden="true"
@@ -420,12 +403,12 @@ export function TaskScopeChip({
               onClick={() => {
                 setOpen(false);
                 window.dispatchEvent(
-                  new CustomEvent("monocode:open-task-prs", {
+                  new CustomEvent(OPEN_TASK_PRS, {
                     detail: task.id,
                   }),
                 );
               }}
-              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
             >
               <GitPullRequest
                 aria-hidden="true"

@@ -11,7 +11,7 @@ const MAX_STACK = 50;
 export type OverlayView = "inbox" | "search" | "settings" | "notes";
 
 export type VisitLocation =
-  | { view: OverlayView }
+  | { view: OverlayView; conversation?: string }
   | { tab: string; leaf?: string; diff?: boolean };
 
 export type TabVisitHistory = {
@@ -20,12 +20,14 @@ export type TabVisitHistory = {
   current: VisitLocation;
 };
 
-export function sameVisitLocation(
-  a: VisitLocation,
-  b: VisitLocation,
-): boolean {
+export function sameVisitLocation(a: VisitLocation, b: VisitLocation): boolean {
   if ("view" in a || "view" in b) {
-    return "view" in a && "view" in b && a.view === b.view;
+    return (
+      "view" in a &&
+      "view" in b &&
+      a.view === b.view &&
+      a.conversation === b.conversation
+    );
   }
   return a.tab === b.tab && a.leaf === b.leaf && !!a.diff === !!b.diff;
 }
@@ -79,10 +81,14 @@ export function canTabVisitForward(history: TabVisitHistory): boolean {
 function collapseAdjacent(history: TabVisitHistory): TabVisitHistory {
   const back: VisitLocation[] = [];
   for (const entry of history.back) {
-    if (back.length && sameVisitLocation(back[back.length - 1], entry)) continue;
+    if (back.length && sameVisitLocation(back[back.length - 1], entry))
+      continue;
     back.push(entry);
   }
-  while (back.length && sameVisitLocation(back[back.length - 1], history.current)) {
+  while (
+    back.length &&
+    sameVisitLocation(back[back.length - 1], history.current)
+  ) {
     back.pop();
   }
   const forward = history.forward.filter(

@@ -1,8 +1,21 @@
 import { commentsRepair, unresolvedThread } from "../lib/repair";
 import { RepairStatus } from "./RepairStatus";
+import {
+  ReviewDetails,
+  ReviewError,
+  ReviewHeader,
+  ReviewPill,
+  ReviewShell,
+  ReviewStatus,
+  reviewAction,
+  reviewButton,
+  reviewField,
+  reviewDanger,
+} from "./ReviewChrome";
+import { Bot, ExternalLink, Loader, RefreshCw } from "./icons";
+import { AzureConnectionDetails } from "./AzureConnectionDetails";
 import type { LinkedWorkItem } from "../lib/session";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { emit } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   AZURE_CHANGE_EVENT,
@@ -36,10 +49,7 @@ import {
 } from "../lib/azureRepos";
 import { AgentMarkdown } from "../surfaces/AgentMarkdown";
 
-const button =
-  "rounded-md px-2 py-1 text-[12px] text-content hover:bg-content/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40";
-const field =
-  "w-full rounded-md border border-content/15 bg-content/5 px-2 py-1.5 text-[12px] text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent";
+const button = reviewButton;
 const drafts = new Map<string, { link: string; branch: string }>();
 const threadSelections = new Map<string, { id: number | null; page: number }>();
 const message = (error: unknown) =>
@@ -123,6 +133,7 @@ function AzurePrPanel({
   const [choosing, setChoosing] = useState(!association);
   const [linking, setLinking] = useState(false);
   const [repairRefresh, setRepairRefresh] = useState(0);
+  const [refreshKey, setRefreshKey] = useState(0);
   const [discovery, setDiscovery] = useState<{
     groups: AzurePrDiscoveryGroup[];
     errors: string[];
@@ -149,16 +160,18 @@ function AzurePrPanel({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [verified, setVerified] = useState(false);
+  // Unlinking must not let a still-resolving discovery auto re-link the PR.
+  const suppressAutoChoose = useRef(false);
   const generation = useRef(0);
   const pending = useRef(false);
-  const body = useRef<HTMLDivElement>(null);
   const repairDraft = useRef<{ key: string; instruction: string } | null>(null);
   useEffect(() => {
     const refresh = () => {
       const run = ++generation.current;
       pending.current = false;
       setBusy(false);
-      setVerified(false);
+      // `verified` stays — `sameAccount` gates display until the refreshed
+      // status lands, so the panel does not collapse on an account event.
       setCandidates(null);
       void azureConnected()
         .then((next) => {
@@ -264,6 +277,7 @@ function AzurePrPanel({
     });
   useEffect(() => {
     if (
+      suppressAutoChoose.current ||
       association ||
       link.trim() ||
       !discovery ||
@@ -287,6 +301,7 @@ function AzurePrPanel({
       if (current()) {
         onChange({ ...association, ...summary });
         setVerified(true);
+        setRefreshKey((key) => key + 1);
       }
     });
   const connected = !!status?.connected && !!status.accountId;
@@ -299,320 +314,354 @@ function AzurePrPanel({
     // Read once on opening or reconnecting; saving the result must not poll.
   }, [status, repairRefresh]);
   return (
-    <section
-      aria-label="Azure pull requests"
-      className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
-    >
-      <div
-        ref={body}
-        className="mx-auto w-full max-w-3xl space-y-3 px-5 py-4 text-[12px]"
-      >
-        {!embedded ? <header className="flex items-center justify-between gap-3 border-b border-content/10 pb-3">
-          <h2 className="text-[13px] font-medium">Pull requests</h2>
-          <span className="truncate text-content/50" title={cwd}>
-            {branch || "Detached checkout"}
+    <ReviewShell label="Azure pull requests">
+      {!embedded ? (
+        <ReviewHeader
+          label="Pull requests"
+          context={`${association ? `${association.repositoryName} · ` : ""}${branch || "Detached checkout"}`}
+          title={cwd}
+        />
+      ) : null}
+      <AzureConnectionDetails
+        label="Azure Repos"
+        status={status ?? undefined}
+        connected={connected}
+        connectHint="Connect the shared Azure DevOps account to inspect PRs."
+        onLeave={onClose}
+        onError={setError}
+      />
+      {choosing && association ? (
+        <p className="flex flex-wrap items-center gap-2 text-content/50">
+          <span className="min-w-0 truncate">
+            Currently linked: #{association.pr.pullRequestId}{" "}
+            {association.pr.title}
           </span>
-        </header> : null}
-        <details className="text-content/60" open={!connected}>
-          <summary className="cursor-pointer focus-visible:outline-accent">
-            Azure Repos
-            {connected && status?.account
-              ? ` · ${status.account}`
-              : " · Connect account"}
-          </summary>
-          <p className="break-words text-content/60">
-            {status
-              ? connected
-                ? `${status.account} · ${status.site} · credentials on this device`
-                : "Connect the shared Azure DevOps account to inspect PRs."
-              : "Checking Azure connection…"}
-          </p>
-          <p className="break-all text-content/50">
-            Worktree: {cwd}
-            <br />
-            Branch: {branch || "detached"} · Session:{" "}
-            {sourceSessionId ?? "Choose an agent when sending"}
-          </p>
-          <button
-            className={button}
-            onClick={() => {
-              void emit("open_settings", { section: "general" })
-                .then(onClose)
-                .catch((error) => setError(message(error)));
-            }}
-          >
-            {" "}
-            {connected ? "Connection settings" : "Connect Azure DevOps"}
-          </button>
-        </details>
-        {!embedded && !choosing && association ? (
-          <button className={button} onClick={() => setChoosing(true)}>
-            Choose another PR
-          </button>
-        ) : null}
-        {choosing ? (
-          <section className="space-y-2" aria-label="Related Azure PRs">
-            <div className="flex items-center justify-between">
-              <h3 className="font-medium">Linked to this work</h3>
-              <button
-                className={button}
-                disabled={discovering || !connected}
-                onClick={() => setDiscoveryVersion((value) => value + 1)}
-              >
-                Refresh matches
-              </button>
-            </div>
-            {discovering ? (
-              <p role="status">Finding story links, then branch matches…</p>
-            ) : null}
-            {discovery?.errors.map((error) => (
-              <p key={error} className="break-words text-content/60">
-                {error}
-              </p>
-            ))}
-            {discovery &&
-            !discovery.groups.some((group) => group.items.length) ? (
-              <p className="text-content/60">
-                No accessible PR found for this story or branch. Link an
-                existing PR to review it here.
-              </p>
-            ) : null}
-            {discovery?.groups.map((group, groupIndex) => (
-              <div
-                key={`${azurePrKey(group.target)}:${groupIndex}`}
-                className="space-y-1"
-              >
-                {group.items.length ? (
-                  <p className="break-words text-content/50">
-                    {group.origins.join(" · ")}
-                  </p>
-                ) : null}
-                {group.items.map((pr) => (
-                  <button
-                    key={pr.pullRequestId}
-                    className={`${button} block w-full text-left`}
-                    disabled={busy}
-                    onClick={() => void choose(pr, group)}
-                  >
-                    <span className="block">
-                      #{pr.pullRequestId} {pr.title} · {pr.status}
-                    </span>
-                    <span className="block break-words text-content/50">
-                      {group.projectName}/{group.repositoryName} ·{" "}
-                      {pr.sourceRefName} → {pr.targetRefName} ·{" "}
-                      {pr.lastMergeSourceCommit?.commitId.slice(0, 8) ??
-                        "unknown revision"}
-                    </span>
-                  </button>
-                ))}
-                {group.nextSkip != null ? (
-                  <button
-                    className={button}
-                    disabled={busy}
-                    onClick={() =>
-                      void run(async (current) => {
-                        const page = await findAzurePrs(
-                          group.target,
-                          branch,
-                          group.nextSkip!,
-                        );
-                        if (current())
-                          setDiscovery((previous) =>
-                            previous
-                              ? {
-                                  ...previous,
-                                  groups: previous.groups.map((value, index) =>
-                                    index === groupIndex
-                                      ? { ...page, origins: group.origins }
-                                      : value,
-                                  ),
-                                }
-                              : previous,
-                          );
-                      })
-                    }
-                  >
-                    Next PRs · {group.repositoryName}
-                  </button>
-                ) : null}
-              </div>
-            ))}
-            {loadAzurePrAssociations(cwd, branch, sourceSessionId).map(
-              (saved) => (
+          {!embedded ? (
+            <button
+              className={reviewDanger}
+              disabled={busy}
+              onClick={() => {
+                try {
+                  suppressAutoChoose.current = true;
+                  onChange(null);
+                  setVerified(false);
+                } catch (error) {
+                  setError(message(error));
+                }
+              }}
+            >
+              Unlink PR
+            </button>
+          ) : null}
+        </p>
+      ) : null}
+      {!embedded && !choosing && association ? (
+        <button className={button} onClick={() => setChoosing(true)}>
+          Choose another PR
+        </button>
+      ) : null}
+      {choosing ? (
+        <section className="space-y-2" aria-label="Related Azure PRs">
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="font-medium">Linked to this work</h3>
+            <div className="flex items-center gap-1">
+              {!embedded ? (
                 <button
-                  key={azurePrKey(saved.target)}
+                  className={button}
+                  disabled={discovering || !connected}
+                  onClick={() => setDiscoveryVersion((value) => value + 1)}
+                >
+                  Refresh matches
+                </button>
+              ) : null}
+              {association && !linking ? (
+                <button className={button} onClick={() => setChoosing(false)}>
+                  Cancel
+                </button>
+              ) : null}
+            </div>
+          </div>
+          {discovering ? (
+            <ReviewStatus>
+              Finding story links, then branch matches…
+            </ReviewStatus>
+          ) : null}
+          {discovery?.errors.map((error) => (
+            <p key={error} className="break-words text-content/60">
+              {error}
+            </p>
+          ))}
+          {discovery &&
+          !discovery.groups.some((group) => group.items.length) ? (
+            <p className="text-content/60">
+              No accessible PR found for this story or branch. Link an existing
+              PR to review it here.
+            </p>
+          ) : null}
+          {discovery?.groups.map((group, groupIndex) => (
+            <div
+              key={`${azurePrKey(group.target)}:${groupIndex}`}
+              className="space-y-1"
+            >
+              {group.items.length ? (
+                <p className="break-words text-content/50">
+                  {group.origins.join(" · ")}
+                </p>
+              ) : null}
+              {group.items.map((pr) => (
+                <button
+                  key={pr.pullRequestId}
                   className={`${button} block w-full text-left`}
-                  disabled={
-                    busy ||
-                    saved.target.accountId !== status?.accountId ||
-                    saved.target.site !== status?.site
-                  }
+                  disabled={busy}
+                  onClick={() => void choose(pr, group)}
+                >
+                  <span className="block">
+                    #{pr.pullRequestId} {pr.title} · {pr.status}
+                  </span>
+                  <span className="block break-words text-content/50">
+                    {group.projectName}/{group.repositoryName} ·{" "}
+                    {pr.sourceRefName} → {pr.targetRefName} ·{" "}
+                    {pr.lastMergeSourceCommit?.commitId.slice(0, 8) ??
+                      "unknown revision"}
+                  </span>
+                </button>
+              ))}
+              {group.nextSkip != null ? (
+                <button
+                  className={button}
+                  disabled={busy}
                   onClick={() =>
-                    void choose(saved.pr, {
-                      target: saved.target,
-                      projectName: saved.projectName,
-                      repositoryName: saved.repositoryName,
-                      items: [saved.pr],
-                      nextSkip: null,
+                    void run(async (current) => {
+                      const page = await findAzurePrs(
+                        group.target,
+                        branch,
+                        group.nextSkip!,
+                      );
+                      if (current())
+                        setDiscovery((previous) =>
+                          previous
+                            ? {
+                                ...previous,
+                                groups: previous.groups.map((value, index) =>
+                                  index === groupIndex
+                                    ? { ...page, origins: group.origins }
+                                    : value,
+                                ),
+                              }
+                            : previous,
+                        );
                     })
                   }
                 >
-                  Saved PR #{saved.pr.pullRequestId} · {saved.projectName}/
-                  {saved.repositoryName} · {saved.pr.title}
+                  Next PRs · {group.repositoryName}
                 </button>
-              ),
-            )}
-          </section>
-        ) : null}
-        {choosing && !linking ? (
-          <button className={`${button} bg-content/10`} disabled={!connected || busy} onClick={() => setLinking(true)}>
-            Link a PR
-          </button>
-        ) : null}
-        {choosing && linking ? (
-            <form
-              className="max-w-lg space-y-3 rounded-md border border-content/10 p-3"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void find();
-              }}
-            >
-              <p className="font-medium">Link a PR</p>
-              <label className="block">
-                PR link or repository remote
-                <input
-                  aria-label="Azure PR link or repository remote"
-                  maxLength={2048}
-                  className={field}
-                  value={link}
-                  disabled={busy}
-                  onChange={(event) => {
-                    setLink(event.target.value);
-                    rememberDraft(event.target.value, lookupBranch);
-                    setCandidates(null);
-                    setLookup(null);
-                  }}
-                  placeholder="https://dev.azure.com/org/project/_git/repo/pullrequest/13"
-                />
-              </label>
-              <details className="text-content/60">
-                <summary className="cursor-pointer">Find by branch</summary>
-                <label className="mt-2 block">
-                  Branch (for repository lookup)
-                  <input
-                    maxLength={1024}
-                    className={field}
-                    value={lookupBranch}
-                    disabled={busy}
-                    onChange={(event) => {
-                      setLookupBranch(event.target.value);
-                      rememberDraft(link, event.target.value);
-                      setCandidates(null);
-                      setLookup(null);
-                    }}
-                  />
-                </label>
-              </details>
+              ) : null}
+            </div>
+          ))}
+          {loadAzurePrAssociations(cwd, branch, sourceSessionId).map(
+            (saved) => (
               <button
-                className={button}
-                disabled={busy || !connected || !link.trim()}
-              >
-                {busy ? "Verifying…" : "Find PR"}
-              </button>
-              <button type="button" className={button} disabled={busy} onClick={() => { setLinking(false); setCandidates(null); setLookup(null); }}>
-                Cancel
-              </button>
-            </form>
-        ) : null}
-        {error ? (
-          <p role="alert" className="break-words text-content">
-            {error}
-          </p>
-        ) : null}
-        {candidates ? (
-          <div className="space-y-1">
-            <p>
-              {candidates.items.length
-                ? "Choose the exact PR to link:"
-                : "No matching PR. Check the branch or paste a specific PR link."}
-            </p>
-            {candidates.items.map((pr) => (
-              <button
-                key={pr.pullRequestId}
+                key={azurePrKey(saved.target)}
                 className={`${button} block w-full text-left`}
-                disabled={busy}
-                onClick={() => void choose(pr)}
+                disabled={
+                  busy ||
+                  saved.target.accountId !== status?.accountId ||
+                  saved.target.site !== status?.site
+                }
+                onClick={() =>
+                  void choose(saved.pr, {
+                    target: saved.target,
+                    projectName: saved.projectName,
+                    repositoryName: saved.repositoryName,
+                    items: [saved.pr],
+                    nextSkip: null,
+                  })
+                }
               >
-                <span className="block">
-                  #{pr.pullRequestId} {pr.title} · {pr.status}
-                </span>
-                <span className="block break-words text-content/50">
-                  {candidates.projectName}/{candidates.repositoryName} ·{" "}
-                  {pr.sourceRefName} → {pr.targetRefName} ·{" "}
-                  {pr.lastMergeSourceCommit?.commitId.slice(0, 8) ??
-                    "unknown revision"}
-                </span>
+                Saved PR #{saved.pr.pullRequestId} · {saved.projectName}/
+                {saved.repositoryName} · {saved.pr.title}
               </button>
-            ))}
-            {candidates.nextSkip != null ? (
-              <button
+            ),
+          )}
+        </section>
+      ) : null}
+      {choosing && !linking ? (
+        <button
+          className={`${button} bg-content/10`}
+          disabled={!connected || busy}
+          onClick={() => setLinking(true)}
+        >
+          Link a PR
+        </button>
+      ) : null}
+      {choosing && linking ? (
+        <form
+          className="max-w-lg space-y-3 rounded-md border border-content/10 p-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void find();
+          }}
+        >
+          <p className="font-medium">Link a PR</p>
+          <label className="block">
+            PR link or repository remote
+            <input
+              aria-label="Azure PR link or repository remote"
+              maxLength={2048}
+              className={reviewField}
+              value={link}
+              disabled={busy}
+              onChange={(event) => {
+                setLink(event.target.value);
+                rememberDraft(event.target.value, lookupBranch);
+                setCandidates(null);
+                setLookup(null);
+              }}
+              placeholder="https://dev.azure.com/org/project/_git/repo/pullrequest/13"
+            />
+          </label>
+          <ReviewDetails summary="Find by branch">
+            <label className="mt-2 block">
+              Branch (for repository lookup)
+              <input
+                maxLength={1024}
+                className={reviewField}
+                value={lookupBranch}
                 disabled={busy}
-                className={button}
-                onClick={() => void find(candidates.nextSkip!)}
-              >
-                Next PRs
-              </button>
-            ) : null}
-          </div>
-        ) : null}
-        {association ? (
-          <section className="space-y-2 border-t border-content/10 pt-3">
-            {!embedded ? <h3 className="font-medium">
-              #{association.pr.pullRequestId} {association.pr.title}
-            </h3> : null}
-            <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-content/55">
-              <span className="rounded bg-content/5 px-1.5 py-0.5 text-[11px] text-content/75">{association.pr.isDraft ? "Draft" : association.pr.status === "active" ? "Open" : association.pr.status}</span>
-              <span>{association.projectName}/{association.repositoryName}</span>
-              <span className="min-w-0 truncate" title={`${association.pr.sourceRefName} → ${association.pr.targetRefName}`}>{association.pr.sourceRefName.replace(/^refs\/heads\//, "")} → {association.pr.targetRefName.replace(/^refs\/heads\//, "")}</span>
-            </p>
-            <details>
-              <summary className="cursor-pointer text-content/60">
-                Repository, account and revision
-              </summary>
-              <p className="break-all text-content/55">
-                Account: {association.account} ({association.target.accountId})
-                <br />
-                Repository: {association.target.repository}
-                <br />
-                {association.pr.sourceRefName} → {association.pr.targetRefName}
-                <br />
-                Source / target revision: {association.revision}
-              </p>
-              {!embedded ? <button
-                className={button}
-                disabled={busy}
-                onClick={() => {
-                  try {
-                    onChange(null);
-                    setVerified(false);
-                    setChoosing(true);
-                  } catch (error) {
-                    setError(message(error));
-                  }
+                onChange={(event) => {
+                  setLookupBranch(event.target.value);
+                  rememberDraft(link, event.target.value);
+                  setCandidates(null);
+                  setLookup(null);
                 }}
-              >
-                Unlink PR
-              </button> : null}
-            </details>
-            <div className="flex flex-wrap gap-1">
+              />
+            </label>
+          </ReviewDetails>
+          <button
+            className={button}
+            disabled={busy || !connected || !link.trim()}
+          >
+            {busy ? "Verifying…" : "Find PR"}
+          </button>
+          <button
+            type="button"
+            className={button}
+            disabled={busy}
+            onClick={() => {
+              setLinking(false);
+              setCandidates(null);
+              setLookup(null);
+            }}
+          >
+            Cancel
+          </button>
+        </form>
+      ) : null}
+      {error ? <ReviewError>{error}</ReviewError> : null}
+      {candidates ? (
+        <div className="space-y-1">
+          <p>
+            {candidates.items.length
+              ? "Choose the exact PR to link:"
+              : "No matching PR. Check the branch or paste a specific PR link."}
+          </p>
+          {candidates.items.map((pr) => (
+            <button
+              key={pr.pullRequestId}
+              className={`${button} block w-full text-left`}
+              disabled={busy}
+              onClick={() => void choose(pr)}
+            >
+              <span className="block">
+                #{pr.pullRequestId} {pr.title} · {pr.status}
+              </span>
+              <span className="block break-words text-content/50">
+                {candidates.projectName}/{candidates.repositoryName} ·{" "}
+                {pr.sourceRefName} → {pr.targetRefName} ·{" "}
+                {pr.lastMergeSourceCommit?.commitId.slice(0, 8) ??
+                  "unknown revision"}
+              </span>
+            </button>
+          ))}
+          {candidates.nextSkip != null ? (
+            <button
+              disabled={busy}
+              className={button}
+              onClick={() => void find(candidates.nextSkip!)}
+            >
+              Next PRs
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {association && !choosing ? (
+        <section className="space-y-2 border-t border-content/10 pt-3">
+          {!embedded ? (
+            <h3 className="font-medium">
+              #{association.pr.pullRequestId} {association.pr.title}
+            </h3>
+          ) : null}
+          <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-content/55">
+            <ReviewPill
+              tone={
+                association.pr.isDraft
+                  ? "draft"
+                  : association.pr.status === "active"
+                    ? "open"
+                    : association.pr.status === "completed"
+                      ? "merged"
+                      : association.pr.status === "abandoned"
+                        ? "closed"
+                        : "neutral"
+              }
+            >
+              {association.pr.isDraft
+                ? "Draft"
+                : association.pr.status === "active"
+                  ? "Open"
+                  : association.pr.status === "completed"
+                    ? "Completed"
+                    : association.pr.status === "abandoned"
+                      ? "Abandoned"
+                      : association.pr.status}
+            </ReviewPill>
+            <span>
+              {embedded
+                ? `${association.projectName}/${association.repositoryName}`
+                : association.projectName}
+            </span>
+            <span
+              className="min-w-0 truncate"
+              title={`${association.pr.sourceRefName} → ${association.pr.targetRefName}`}
+            >
+              {association.pr.sourceRefName.replace(/^refs\/heads\//, "")} →{" "}
+              {association.pr.targetRefName.replace(/^refs\/heads\//, "")}
+            </span>
+          </p>
+          <ReviewDetails summary="Account and revisions">
+            <p className="break-all">
+              Account: {association.account} ({association.target.accountId})
+              <br />
+              Repository: {association.target.repository}
+              <br />
+              Source / target revision: {association.revision}
+            </p>
+          </ReviewDetails>
+          <div className="flex flex-wrap gap-1">
+            <button
+              className={button}
+              disabled={busy || !sameAccount}
+              onClick={() => void refresh()}
+            >
+              {busy ? (
+                <Loader className="size-3.5 animate-spin" strokeWidth={1.75} />
+              ) : (
+                <RefreshCw className="size-3.5" strokeWidth={1.75} />
+              )}
+              Refresh PR
+            </button>
+            {!embedded ? (
               <button
-                className={button}
-                disabled={busy || !sameAccount}
-                onClick={() => void refresh()}
-              >
-                Refresh PR
-              </button>
-              {!embedded ? <button
                 className={button}
                 onClick={() => {
                   void openUrl(azurePrUrl(association.target)).catch((error) =>
@@ -620,39 +669,43 @@ function AzurePrPanel({
                   );
                 }}
               >
+                <ExternalLink className="size-3.5" strokeWidth={1.75} />
                 Open in Azure
-              </button> : null}
-            </div>
-            {!sameAccount ? (
-              <p role="alert">
-                Reconnect the linked Azure account to read this PR, or choose
-                another PR.
-              </p>
-            ) : !verified ? (
-              <p>
-                {busy ? "Updating PR…" : "Could not update this saved PR. Retry with Refresh PR."}
-              </p>
+              </button>
             ) : null}
-            <details className="text-content/60">
-              <summary className="cursor-pointer">
-                Reviewers ({association.pr.reviewers.length})
-              </summary>
-              <p>
-                {association.pr.reviewers
-                  .slice(0, 50)
-                  .map(
-                    (reviewer) =>
-                      `${reviewer.displayName}: ${vote(reviewer.vote)}${reviewer.isRequired ? " (required)" : ""}`,
-                  )
-                  .join("; ") || "None listed"}
-              </p>
-            </details>
-            {sameAccount ? (
-              <fieldset disabled={!verified || busy} className="min-w-0">
+          </div>
+          {!sameAccount ? (
+            <ReviewError>
+              Reconnect the linked Azure account to read this PR, or choose
+              another PR.
+            </ReviewError>
+          ) : !verified ? (
+            <ReviewStatus>
+              {busy
+                ? "Updating PR…"
+                : "Could not update this saved PR. Retry with Refresh PR."}
+            </ReviewStatus>
+          ) : null}
+          <ReviewDetails
+            summary={`Reviewers (${association.pr.reviewers.length})`}
+          >
+            <p>
+              {association.pr.reviewers
+                .slice(0, 50)
+                .map(
+                  (reviewer) =>
+                    `${reviewer.displayName}: ${vote(reviewer.vote)}${reviewer.isRequired ? " (required)" : ""}`,
+                )
+                .join("; ") || "None listed"}
+            </p>
+          </ReviewDetails>
+          {sameAccount ? (
+            <fieldset disabled={!verified || busy} className="min-w-0">
               <AzurePrDetails
                 key={`${association.revision}:${azurePrKey(association.target)}`}
                 association={association}
                 verified={verified}
+                refreshKey={refreshKey}
                 onStale={() => {
                   setVerified(false);
                   setError(
@@ -660,19 +713,25 @@ function AzurePrPanel({
                   );
                 }}
                 onHandoff={onClose}
-                repairInstruction={repairDraft.current?.key === azurePrKey(association.target) ? repairDraft.current.instruction : undefined}
+                repairInstruction={
+                  repairDraft.current?.key === azurePrKey(association.target)
+                    ? repairDraft.current.instruction
+                    : undefined
+                }
                 onRefreshEvidence={(instruction) => {
-                  repairDraft.current = { key: azurePrKey(association.target), instruction };
+                  repairDraft.current = {
+                    key: azurePrKey(association.target),
+                    instruction,
+                  };
                   onReveal?.();
-                  setRepairRefresh(value => value + 1);
+                  setRepairRefresh((value) => value + 1);
                 }}
               />
-              </fieldset>
-            ) : null}
-          </section>
-        ) : null}
-      </div>
-    </section>
+            </fieldset>
+          ) : null}
+        </section>
+      ) : null}
+    </ReviewShell>
   );
 }
 
@@ -690,9 +749,22 @@ function vote(value: number) {
   );
 }
 
+const threadStatusLabel = (status: string) =>
+  (
+    ({
+      active: "active",
+      pending: "pending",
+      fixed: "fixed",
+      wontFix: "won't fix",
+      byDesign: "by design",
+      closed: "closed",
+    }) as Record<string, string>
+  )[status] ?? status;
+
 function AzurePrDetails({
   association,
   verified,
+  refreshKey = 0,
   onStale,
   onHandoff,
   onRefreshEvidence,
@@ -700,6 +772,7 @@ function AzurePrDetails({
 }: {
   association: AzurePrAssociation;
   verified: boolean;
+  refreshKey?: number;
   onStale: () => void;
   onHandoff: () => void;
   onRefreshEvidence: (instruction: string) => void;
@@ -774,7 +847,7 @@ function AzurePrDetails({
     });
   useEffect(() => {
     if (verified) void load();
-  }, [verified]);
+  }, [verified, refreshKey]);
   const send = (thread: AzurePrThread) =>
     read(async (current) => {
       // Recheck the revision before opening the existing #8 destination picker.
@@ -793,7 +866,10 @@ function AzurePrDetails({
         onPrepared: onHandoff,
       });
     });
-  const repairComments = (selected = threads?.items ?? [], commentId?: number) =>
+  const repairComments = (
+    selected = threads?.items ?? [],
+    commentId?: number,
+  ) =>
     read(async (current) => {
       const controller = new AbortController();
       preparation.current = controller;
@@ -804,143 +880,234 @@ function AzurePrDetails({
         () => current() && !controller.signal.aborted,
         commentId,
         controller.signal,
-      ).finally(() => { if (preparation.current === controller) preparation.current = null; });
+      ).finally(() => {
+        if (preparation.current === controller) preparation.current = null;
+      });
       if (!current()) return;
       requestAgentContext({
-        context: { ...draft.context, instruction: repairInstruction ?? draft.context.instruction },
+        context: {
+          ...draft.context,
+          instruction: repairInstruction ?? draft.context.instruction,
+        },
         repair: draft.evidence,
         onRefreshEvidence,
         cwd: draft.evidence.head.cwd,
-        sourceSessionId: draft.evidence.kind === "comments" ? draft.evidence.association.sourceSessionId : undefined,
+        sourceSessionId:
+          draft.evidence.kind === "comments"
+            ? draft.evidence.association.sourceSessionId
+            : undefined,
         requireDestinationSelection: false,
         onPrepared: onHandoff,
       });
     });
+  const unresolvedCount = threads?.items.filter(unresolvedThread).length ?? 0;
+  const sendableComments = (threads?.items ?? [])
+    .filter(unresolvedThread)
+    .reduce(
+      (count, thread) =>
+        count + thread.comments.filter((comment) => !comment.isDeleted).length,
+      0,
+    );
   return (
     <div className="space-y-2">
       <RepairStatus
         scope={azurePrKey(association.target)}
         cwd={association.cwd}
       />
-      {association.pr.status === "active" &&
-      threads?.items.some(unresolvedThread) ? (
+      {association.pr.status === "active" && unresolvedCount > 0 ? (
         <button
-          className={button}
+          className={reviewAction}
           disabled={busy}
           onClick={() => void repairComments()}
         >
-          Address comments{threads.items.filter(unresolvedThread).reduce((count, thread) => count + thread.comments.filter(comment => !comment.isDeleted).length, 0) > 20 ? " · first 20 comments" : ""}
+          <Bot className="size-3.5" strokeWidth={1.75} />
+          Address comments
+          {sendableComments > 20 ? " · first 20 comments" : ""}
         </button>
       ) : null}
-      <button className={button} disabled={busy} onClick={() => void load()}>
-        {busy
-          ? preparation.current ? "Preparing checkout…" : "Loading review…"
-          : threads
-            ? "Refresh comments"
-            : "Load comments"}
-      </button>
-      {association.pr.status === "active" ? (
-        <button
-          className={button}
-          onClick={() =>
-            openWatchSheet({
-              source: {
-                kind: "azure-pr",
-                target: association.target,
-                projectName: association.projectName,
-                repositoryName: association.repositoryName,
-                cwd: association.cwd,
-                branch: association.branch,
-                ...(association.sourceSessionId
-                  ? { sessionId: association.sourceSessionId }
-                  : {}),
-              },
-              name: `Reviews · ${association.repositoryName} !${association.target.number}`,
-            })
-          }
-        >
-          Watch reviews
-        </button>
+      {busy && (preparation.current || !threads) ? (
+        <ReviewStatus>
+          {preparation.current ? "Preparing checkout…" : "Loading comments…"}
+        </ReviewStatus>
       ) : null}
-      {busy && preparation.current ? <button className={button} onClick={() => preparation.current?.abort()}>Cancel preparation</button> : null}
-      {error ? <p role="alert">{error}</p> : null}
-      {threads?.items.length === 0 ? <p>No review threads.</p> : null}
+      <div className="flex flex-wrap gap-1">
+        {association.pr.status === "active" ? (
+          <button
+            className={button}
+            onClick={() =>
+              openWatchSheet({
+                source: {
+                  kind: "azure-pr",
+                  target: association.target,
+                  projectName: association.projectName,
+                  repositoryName: association.repositoryName,
+                  cwd: association.cwd,
+                  branch: association.branch,
+                  ...(association.sourceSessionId
+                    ? { sessionId: association.sourceSessionId }
+                    : {}),
+                },
+                name: `Reviews · ${association.repositoryName} !${association.target.number}`,
+              })
+            }
+          >
+            Watch reviews
+          </button>
+        ) : null}
+        {busy && preparation.current ? (
+          <button
+            className={button}
+            onClick={() => preparation.current?.abort()}
+          >
+            Cancel preparation
+          </button>
+        ) : null}
+      </div>
+      {error ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <ReviewError>{error}</ReviewError>
+          <button
+            className={button}
+            disabled={busy}
+            onClick={() => void load()}
+          >
+            Retry
+          </button>
+        </div>
+      ) : null}
+      {threads?.items.length === 0 ? (
+        <p className="text-content/45">No review threads.</p>
+      ) : null}
       {threads?.items
         .filter((thread) => !thread.isDeleted)
-        .map((thread) => (
-          <details
-            key={thread.id}
-            open={expanded === thread.id}
-            onToggle={(event) => {
-              if (event.currentTarget.open) rememberThread(thread.id);
-              else if (expanded === thread.id) rememberThread(null);
-            }}
-            className="rounded-md border border-content/10 px-2 py-1"
-          >
-            <summary className="cursor-pointer break-words">
-              Thread {thread.id} · {thread.status} ·{" "}
-              {thread.threadContext?.filePath ?? "General discussion"}
-            </summary>
-            {expanded === thread.id ? (
-              <div className="space-y-2 pt-2">
-                <p className="text-content/50">
-                  Right line {thread.threadContext?.rightFileStart?.line ?? "—"}{" "}
-                  · Left line {thread.threadContext?.leftFileStart?.line ?? "—"}{" "}
-                  · Iteration{" "}
-                  {thread.pullRequestThreadContext?.iterationContext
-                    ?.secondComparingIteration ?? "not supplied"}
-                </p>
-                {thread.comments
-                  .filter((comment) => !comment.isDeleted)
-                  .slice(0, 50)
-                  .map((comment) => (
-                    <div key={comment.id}>
-                      <p className="text-content/55">
-                        {comment.author?.displayName ?? "Unknown author"}
-                      </p>
-                      <AgentMarkdown
-                        text={(comment.content ?? "").slice(0, 32_000)}
-                        cwd={association.cwd}
-                      />
-                      {association.pr.status === "active" && unresolvedThread(thread) ? <button className={button} disabled={busy} onClick={() => void repairComments([thread], comment.id)}>Address this comment</button> : null}
-                    </div>
-                  ))}
-                {thread.comments.length > 50 ? (
-                  <p>Showing 50 comments. Open in Azure for the rest.</p>
-                ) : null}
-                <button
-                  className={button}
-                  disabled={busy}
-                  onClick={() => void send(thread)}
-                >
-                  Send thread to agent
-                </button>
-              </div>
-            ) : null}
-          </details>
-        ))}
-      {threads && pageRef.current > 0 ? (
-        <button
-          className={button}
-          disabled={busy}
-          onClick={() => void load(Math.max(0, pageRef.current - 50))}
-        >
-          Previous threads
-        </button>
+        .map((thread) => {
+          const firstComment = thread.comments.find(
+            (comment) => !comment.isDeleted,
+          );
+          const location = thread.threadContext?.filePath
+            ? `${thread.threadContext.filePath.split("/").pop()}${
+                thread.threadContext.rightFileStart?.line != null
+                  ? `:${thread.threadContext.rightFileStart.line}`
+                  : ""
+              }`
+            : null;
+          return (
+            <ReviewDetails
+              key={thread.id}
+              bordered
+              open={expanded === thread.id}
+              onToggle={(event) => {
+                if (event.currentTarget.open) rememberThread(thread.id);
+                else if (expanded === thread.id) rememberThread(null);
+              }}
+              summary={
+                <>
+                  <span
+                    className={`size-1.5 shrink-0 rounded-full ${
+                      unresolvedThread(thread)
+                        ? "bg-amber-400/80"
+                        : "bg-emerald-400/70"
+                    }`}
+                  />
+                  <span className="min-w-0 truncate">
+                    Thread {thread.id} ·{" "}
+                    <span
+                      className={
+                        unresolvedThread(thread)
+                          ? "text-amber-400/90"
+                          : "text-emerald-400/80"
+                      }
+                    >
+                      {threadStatusLabel(thread.status)}
+                    </span>
+                    {firstComment?.author?.displayName
+                      ? ` — ${firstComment.author.displayName}`
+                      : ""}
+                  </span>
+                  <span className="shrink-0 text-content/45">
+                    {location ?? "General discussion"} ·{" "}
+                    {thread.comments.filter((comment) => !comment.isDeleted)
+                      .length || "No"}{" "}
+                    comments
+                  </span>
+                </>
+              }
+            >
+              {expanded === thread.id ? (
+                <div className="space-y-2">
+                  <p className="text-content/45">
+                    {threadStatusLabel(thread.status)}
+                    {location ? ` · ${location}` : ""} · Iteration{" "}
+                    {thread.pullRequestThreadContext?.iterationContext
+                      ?.secondComparingIteration ?? "—"}
+                  </p>
+                  {thread.comments
+                    .filter((comment) => !comment.isDeleted)
+                    .slice(0, 50)
+                    .map((comment) => (
+                      <div key={comment.id}>
+                        <p className="text-content/55">
+                          {comment.author?.displayName ?? "Unknown author"}
+                        </p>
+                        <AgentMarkdown
+                          text={(comment.content ?? "").slice(0, 32_000)}
+                          cwd={association.cwd}
+                        />
+                        {association.pr.status === "active" &&
+                        unresolvedThread(thread) ? (
+                          <button
+                            className={button}
+                            disabled={busy}
+                            onClick={() =>
+                              void repairComments([thread], comment.id)
+                            }
+                          >
+                            Address this comment
+                          </button>
+                        ) : null}
+                      </div>
+                    ))}
+                  {thread.comments.length > 50 ? (
+                    <p className="text-content/45">
+                      Showing 50 comments. Open in Azure for the rest.
+                    </p>
+                  ) : null}
+                  <button
+                    className={reviewAction}
+                    disabled={busy}
+                    onClick={() => void send(thread)}
+                  >
+                    <Bot className="size-3.5" strokeWidth={1.75} />
+                    Send thread to agent
+                  </button>
+                </div>
+              ) : null}
+            </ReviewDetails>
+          );
+        })}
+      {threads && (pageRef.current > 0 || threads.nextSkip != null) ? (
+        <div className="flex flex-wrap gap-1">
+          {pageRef.current > 0 ? (
+            <button
+              className={button}
+              disabled={busy}
+              onClick={() => void load(Math.max(0, pageRef.current - 50))}
+            >
+              Previous threads
+            </button>
+          ) : null}
+          {threads.nextSkip != null ? (
+            <button
+              className={button}
+              disabled={busy}
+              onClick={() => void load(threads.nextSkip!)}
+            >
+              Next threads
+            </button>
+          ) : null}
+        </div>
       ) : null}
-      {threads?.nextSkip != null ? (
-        <button
-          className={button}
-          disabled={busy}
-          onClick={() => void load(threads.nextSkip!)}
-        >
-          Next threads
-        </button>
-      ) : null}
-      <details className="border-t border-content/10 pt-2 text-content/60">
-        <summary className="cursor-pointer">
-          Files, policies and statuses
-        </summary>
+      <ReviewDetails lazy summary="Files, policies and statuses">
         <AzureReviewSection
           association={association}
           section="iterations"
@@ -956,7 +1123,7 @@ function AzurePrDetails({
           section="statuses"
           onHandoff={onHandoff}
         />
-      </details>
+      </ReviewDetails>
     </div>
   );
 }
@@ -1001,6 +1168,7 @@ function AzureReviewSection({
     mounted.current = true;
     pending.current = false;
     setBusy(false);
+    void load();
     return () => {
       mounted.current = false;
       generation.current++;
@@ -1043,20 +1211,35 @@ function AzureReviewSection({
   };
   return (
     <section className="space-y-1 border-t border-content/10 pt-2">
-      <button className={button} disabled={busy} onClick={() => void load()}>
-        {busy
-          ? `Loading ${label.toLowerCase()}…`
-          : `${page ? "Refresh" : "Load"} ${label.toLowerCase()}`}
-      </button>
+      <div className="flex items-center justify-between gap-2">
+        <p className="font-medium">{label}</p>
+        {page ? (
+          <button
+            aria-label={`Refresh ${label.toLowerCase()}`}
+            className={button}
+            disabled={busy}
+            onClick={() => void load(pageSkip)}
+          >
+            {busy ? (
+              <Loader className="size-3.5 animate-spin" strokeWidth={1.75} />
+            ) : (
+              <RefreshCw className="size-3.5" strokeWidth={1.75} />
+            )}
+          </button>
+        ) : null}
+      </div>
       {section === "policies" || section === "statuses" ? (
         <p className="text-content/50">
           {label} are provider evidence, not an independently verified CI
           result.
         </p>
       ) : null}
+      {busy && !page ? (
+        <ReviewStatus>Loading {label.toLowerCase()}…</ReviewStatus>
+      ) : null}
       {error ? (
-        <p role="alert">
-          {error}{" "}
+        <div className="flex flex-wrap items-center gap-2">
+          <ReviewError>{error}</ReviewError>
           <button
             className={button}
             disabled={busy}
@@ -1064,10 +1247,10 @@ function AzureReviewSection({
           >
             Retry {label.toLowerCase()}
           </button>
-        </p>
+        </div>
       ) : null}
       {page?.items.length === 0 ? (
-        <p>No {label.toLowerCase()} returned.</p>
+        <p className="text-content/45">No {label.toLowerCase()} returned.</p>
       ) : null}
       {page?.items.map((row, index) => (
         <div
@@ -1235,15 +1418,15 @@ function AzurePrFile({
   return (
     <div className="space-y-2">
       {error ? (
-        <p role="alert">
-          {error}{" "}
+        <div className="flex flex-wrap items-center gap-2">
+          <ReviewError>{error}</ReviewError>
           <button
             className={button}
             onClick={() => setRetry((value) => value + 1)}
           >
             Retry file
           </button>
-        </p>
+        </div>
       ) : null}
       {!file && !error ? <p>Loading selected file…</p> : null}
       {file && diff ? (

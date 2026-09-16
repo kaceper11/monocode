@@ -88,10 +88,16 @@ export function parseGithubPrLocation(url: string): { repo: string; number: numb
 export async function githubDeliveryTarget(
   cwd: string,
   prUrl?: string,
+  kind: "pr" | "ci" = "pr",
 ): Promise<{ repo: string; number: number }> {
   if (prUrl) return parseGithubPrLocation(prUrl);
   const pr = await gitPrStatus(cwd);
-  if (!pr) throw new Error("No GitHub PR found for this branch. Open the PR branch or choose another provider.");
+  if (!pr)
+    throw new Error(
+      kind === "ci"
+        ? "No open GitHub PR on this branch — checks are reviewed on the PR. Create one or open the PR branch."
+        : "No GitHub PR found for this branch. Open the PR branch or choose another provider.",
+    );
   if (pr.url) {
     try {
       return parseGithubPrLocation(pr.url);

@@ -1,5 +1,5 @@
 import { X } from "./icons";
-import { useEffect, useId, useRef, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import { LAYER, PopoverLayerOffset } from "../lib/layers";
@@ -10,6 +10,18 @@ export type ModalSize = "sm" | "md" | "lg";
  * nested dialog (e.g. the WSL picker inside a sheet) never tears down the
  * dialog underneath. */
 const openModals: symbol[] = [];
+
+/** Timestamp of the last close→open swap — set by the closing modal's click
+ * handler, read by the next modal at render time. */
+let modalSwapAt = 0;
+const MODAL_SWAP_MS = 400;
+
+/** Call right before closing one modal to open another in the same gesture.
+ * The replacement skips its entrance animation — replaying it would flash
+ * the screen undimmed for a frame between the two backdrops. */
+export function modalSwap() {
+  modalSwapAt = Date.now();
+}
 
 const WIDTH: Record<ModalSize, string> = {
   sm: "w-[min(420px,calc(100vw-24px))]",
@@ -58,6 +70,10 @@ export function ModalPanel({
   const descriptionId = description ? `${uid}-desc` : undefined;
 
   useEffect(() => {
+    // A child's own autoFocus already claimed focus inside the dialog —
+    // don't steal it for the close button.
+    const dialog = closeRef.current?.closest('[role="dialog"]');
+    if (dialog?.contains(document.activeElement)) return;
     closeRef.current?.focus();
   }, []);
 
@@ -161,8 +177,19 @@ export function ModalPanel({
 }
 
 export function Modal(props: Props) {
+  // Read at render time — the marker was written synchronously by the closing
+  // modal's click handler, before this mount. Kept through render so a
+  // StrictMode double-read still sees it, then consumed on mount so no
+  // later, unrelated dialog can inherit it.
+  const [swap] = useState(() => Date.now() - modalSwapAt < MODAL_SWAP_MS);
+  useEffect(() => {
+    modalSwapAt = 0;
+  }, []);
   return createPortal(
-    <div className="fixed inset-0" style={{ zIndex: LAYER.dialog }}>
+    <div
+      className={`fixed inset-0${swap ? " modal-swap" : ""}`}
+      style={{ zIndex: LAYER.dialog }}
+    >
       <div
         className="modal-backdrop absolute inset-0 bg-black/40"
         onMouseDown={props.onClose}

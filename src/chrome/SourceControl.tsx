@@ -11,6 +11,9 @@ type Props = {
   selectedPath?: string;
   selectedKind?: GitFileDiffKind;
   selectedSha?: string;
+  /** Live session ids — task "N conversations" labels count these, not
+   * stale task records. */
+  liveSessionIds?: ReadonlySet<string>;
   onOpenFile: (path: string, kind: GitFileDiffKind) => void;
   onOpenDelivery?: (cwd: string, source: DeliveryTabSource) => void;
   onOpenAllChanges: () => void;
@@ -25,6 +28,7 @@ export function SourceControl({
   selectedPath,
   selectedKind,
   selectedSha,
+  liveSessionIds,
   onOpenFile,
   onOpenAllChanges,
   onOpenDelivery,
@@ -40,6 +44,7 @@ export function SourceControl({
         selectedPath={selectedPath}
         selectedKind={selectedKind}
         selectedSha={selectedSha}
+        liveSessionIds={liveSessionIds}
         onOpenFile={onOpenFile}
         onOpenDelivery={onOpenDelivery}
         onOpenAllChanges={onOpenAllChanges}

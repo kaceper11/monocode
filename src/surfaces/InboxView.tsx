@@ -1,4 +1,8 @@
-import { ACTION_FILLED, ACTION_OUTLINE, ACTION_GHOST } from "../chrome/inboxActions";
+import {
+  ACTION_FILLED,
+  ACTION_OUTLINE,
+  ACTION_GHOST,
+} from "../chrome/inboxActions";
 import { AzureInboxDetail } from "../chrome/AzureInboxDetail";
 import { Select } from "../chrome/Select";
 
@@ -11,6 +15,7 @@ import {
   CircleDot,
   CircleX,
   ExternalLink,
+  GitBranch,
   GitCompare,
   GitMerge,
   GitPullRequest,
@@ -29,6 +34,7 @@ import {
   type IconComponent,
 } from "../chrome/icons";
 import {
+  Fragment,
   memo,
   useCallback,
   useEffect,
@@ -44,17 +50,18 @@ import {
 } from "../chrome/InboxFiltersMenu";
 import { InboxConnectMenu } from "../chrome/InboxConnectMenu";
 import { InboxProviderMark } from "../chrome/InboxProviderMark";
-import { ContextCheckbox, InboxContextPicker, useInboxContext } from "../chrome/InboxContextPicker";
+import {
+  ContextCheckbox,
+  InboxContextPicker,
+  useInboxContext,
+} from "../chrome/InboxContextPicker";
 import { InboxRelated } from "../chrome/InboxRelated";
 import {
   InboxMyWorkSection,
   MyWorkBadges,
   myWorkBadges,
 } from "../chrome/InboxMyWorkSection";
-import {
-  inboxMyWorkForItems,
-  type InboxMyWork,
-} from "../lib/inboxMyWork";
+import { inboxMyWorkForItems, type InboxMyWork } from "../lib/inboxMyWork";
 import type { AttentionItem } from "../lib/attention";
 import {
   listTaskPrDrafts,
@@ -66,9 +73,12 @@ import {
   projectsSnapshot,
   subscribeProjects,
 } from "../lib/projects";
-import { deliveryStores } from "../lib/taskDelivery";
-import { AZURE_PR_ASSOCIATIONS_CHANGED } from "../lib/azureRepos";
-import { AZURE_CI_SOURCES_CHANGED } from "../lib/azurePipelines";
+import { useDeliveryStores } from "../hooks/useDeliveryStores";
+import {
+  deliveryFromLinks,
+  sessionDeliveryLinks,
+  type TaskChildDelivery,
+} from "../lib/taskDelivery";
 import {
   diffStatsVersion,
   peekProjectDiffStats,
@@ -88,6 +98,8 @@ import {
   loadTaskWorkspaces,
   projectForTask,
   subscribeTaskWorkspaces,
+  taskSessionIds,
+  liveTaskSessionIds,
   taskWorkspacesSnapshot,
 } from "../lib/taskWorkspaces";
 import { WindowControls } from "../chrome/WindowControls";
@@ -147,15 +159,19 @@ import {
   type InboxFilters,
   type InboxSource,
 } from "../lib/inboxFilters";
-import { projectKey, projectName } from "../lib/paths";
+import { pathKey, projectKey, projectName } from "../lib/paths";
 import { IS_MAC } from "../lib/platform";
-import { sameProjectPath, type RecentProject } from "../lib/recents";
+import { type RecentProject } from "../lib/recents";
 import {
   getVerifiedFamilies,
   subscribeRepositoryFamilies,
   type RepositoryFamily,
 } from "../lib/repositoryFamilies";
-import { sessionDisplayTitle, type LinkedWorkItem } from "../lib/session";
+import {
+  sessionDisplayTitle,
+  sessionWorkCwd,
+  type LinkedWorkItem,
+} from "../lib/session";
 import type { SessionSummary } from "../lib/sessionStore";
 import {
   inboxRelatedSessionCounts,
@@ -204,7 +220,16 @@ import {
 } from "../lib/tabGroups";
 import { AgentMarkdown } from "./AgentMarkdown";
 import { TicketImages } from "./InboxMedia";
-import { AZURE_CHANGE_EVENT, azureConnected, azureDetails, azureThread, peekAzureDetails, peekAzureThread, loadAzureFilter, type AzureFilter } from "../lib/azure";
+import {
+  AZURE_CHANGE_EVENT,
+  azureConnected,
+  azureDetails,
+  azureThread,
+  peekAzureDetails,
+  peekAzureThread,
+  loadAzureFilter,
+  type AzureFilter,
+} from "../lib/azure";
 import {
   InboxComments,
   InboxCommentForm,
@@ -276,33 +301,6 @@ function inboxProjectOptions(
       };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
-}
-
-function InboxProjectMark({
-  project,
-}: {
-  project: Pick<
-    InboxProjectOption,
-    "name" | "logoPath" | "mascotName" | "mascotColor"
-  >;
-}) {
-  if (project.logoPath) {
-    return (
-      <ProjectLogoIcon
-        path={project.logoPath}
-        className="size-3.5 shrink-0 rounded-sm"
-        imageClassName="size-3.5"
-      />
-    );
-  }
-  return (
-    <ProjectMascot
-      project={project.name}
-      color={project.mascotColor}
-      name={project.mascotName}
-      className="size-3 shrink-0"
-    />
-  );
 }
 
 function peekInboxForRail(recents: RecentProject[], cwd: string) {
@@ -390,10 +388,24 @@ type Props = {
   onClose?: () => void;
   onToggleSidebar?: () => void;
   onOpenSettings?: () => void;
-  onStartTask?: (item: InboxItem, taskId: string | null) => void;
+  onStartTask?: (
+    item: InboxItem,
+    taskId: string | null,
+    opts?: { freshSession?: boolean },
+  ) => void;
   sessions?: readonly SessionSummary[];
+  /** Every resolvable session id — `sessions` here is ticket-filtered, so
+   * task conversation counts must key off this full set instead. */
+  liveSessionIds?: ReadonlySet<string>;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
+  onOpenDelivery?: (
+    sessionId: string,
+    kind: "pr" | "ci",
+    current: () => boolean,
+    provider: "github" | "azure" | "gitlab",
+    prUrl?: string,
+    gitlabTarget?: { repo: string; number: number },
+  ) => Promise<void>;
   /** Live session state for "my work" badges — mid-turn and input-blocked. */
   busySessionIds?: ReadonlySet<string>;
   needsInputSessionIds?: ReadonlySet<string>;
@@ -407,7 +419,11 @@ type Props = {
   conversationRevision?: number;
   selectionRevision?: number;
   onCloseConversation?: () => void;
-  onToggleConversationTicket?: (sessionId: string, item: InboxItem, selected: boolean) => Promise<void>;
+  onToggleConversationTicket?: (
+    sessionId: string,
+    item: InboxItem,
+    selected: boolean,
+  ) => Promise<void>;
   onSendToTask?: (items: InboxItem[]) => void;
   /** Opens Settings on the card where the given source is connected. */
   onOpenIntegrations?: (source: ConnectableInboxSource) => void;
@@ -425,6 +441,7 @@ export function InboxView({
   onOpenSettings,
   onStartTask,
   sessions = [],
+  liveSessionIds,
   onOpenSession,
   onOpenDelivery,
   busySessionIds,
@@ -443,14 +460,33 @@ export function InboxView({
 }: Props) {
   const [selectingTickets, setSelectingTickets] = useState(false);
   const [issuesCollapsed, setIssuesCollapsed] = useState(false);
-  useEffect(() => { if (selectionRevision) { setSelectingTickets(true); setIssuesCollapsed(false); } }, [selectionRevision]);
-  const [selectedTickets, setSelectedTickets] = useState<Map<string, InboxItem>>(new Map());
+  useEffect(() => {
+    if (selectionRevision) {
+      setSelectingTickets(true);
+      setIssuesCollapsed(false);
+    }
+  }, [selectionRevision]);
+  const [selectedTickets, setSelectedTickets] = useState<
+    Map<string, InboxItem>
+  >(new Map());
   const [selectionError, setSelectionError] = useState("");
-  const [pendingTickets, setPendingTickets] = useState<Map<string, boolean>>(new Map());
-  const conversationLinks = sessionWorkItems(sessions.find(session => session.id === conversationId) ?? {});
+  const [pendingTickets, setPendingTickets] = useState<Map<string, boolean>>(
+    new Map(),
+  );
+  const conversationLinks = sessionWorkItems(
+    sessions.find((session) => session.id === conversationId) ?? {},
+  );
   const editingLinks = !!conversationId && !!onToggleConversationTicket;
-  const selectionCount = editingLinks ? conversationLinks.length : selectedTickets.size;
-  const ticketSelected = (item: InboxItem) => pendingTickets.get(contextTicketKey(item)) ?? (editingLinks ? conversationLinks.some(link => inboxItemMatchesLinkedWorkItem(item, link)) : selectedTickets.has(contextTicketKey(item)));
+  const selectionCount = editingLinks
+    ? conversationLinks.length
+    : selectedTickets.size;
+  const ticketSelected = (item: InboxItem) =>
+    pendingTickets.get(contextTicketKey(item)) ??
+    (editingLinks
+      ? conversationLinks.some((link) =>
+          inboxItemMatchesLinkedWorkItem(item, link),
+        )
+      : selectedTickets.has(contextTicketKey(item)));
   const toggleTicket = (item: InboxItem) => {
     if (item.delivery) return;
     setSelectionError("");
@@ -458,19 +494,38 @@ export function InboxView({
       const key = contextTicketKey(item);
       if (pendingTickets.has(key)) return;
       const selected = !ticketSelected(item);
-      setPendingTickets(previous => new Map(previous).set(key, selected));
+      setPendingTickets((previous) => new Map(previous).set(key, selected));
       void onToggleConversationTicket!(conversationId!, item, selected)
-        .catch(error => setSelectionError(`Could not save ticket links: ${String(error)}`))
-        .finally(() => setPendingTickets(previous => { const next = new Map(previous); next.delete(key); return next; }));
+        .catch((error) =>
+          setSelectionError(`Could not save ticket links: ${String(error)}`),
+        )
+        .finally(() =>
+          setPendingTickets((previous) => {
+            const next = new Map(previous);
+            next.delete(key);
+            return next;
+          }),
+        );
       return;
     }
     const identity = contextTicketKey(item);
-    if (!selectedTickets.has(identity) && selectedTickets.size >= 20) { setSelectionError("Select at most 20 tickets."); return; }
-    setSelectedTickets(previous => { const next = new Map(previous); if (next.has(identity)) next.delete(identity); else next.set(identity, { ...item }); return next; });
+    if (!selectedTickets.has(identity) && selectedTickets.size >= 20) {
+      setSelectionError("Select at most 20 tickets.");
+      return;
+    }
+    setSelectedTickets((previous) => {
+      const next = new Map(previous);
+      if (next.has(identity)) next.delete(identity);
+      else next.set(identity, { ...item });
+      return next;
+    });
   };
   const [discussionOpen, setDiscussionOpen] = useState(false);
   const [previewingTicket, setPreviewingTicket] = useState(false);
-  useEffect(() => setPreviewingTicket(false), [conversationId, conversationRevision]);
+  useEffect(
+    () => setPreviewingTicket(false),
+    [conversationId, conversationRevision],
+  );
   useEffect(() => {
     if (visible) return;
     setSelectingTickets(false);
@@ -506,11 +561,17 @@ export function InboxView({
   const [filters, setFilters] = useState(loadInboxFilters);
   const [connections, setConnections] = useState(loadInboxConnections);
   const [source, setSource] = useState(() =>
-    resolveInboxSource(loadInboxSource(), connections, loadVisibleInboxSources()),
+    resolveInboxSource(
+      loadInboxSource(),
+      connections,
+      loadVisibleInboxSources(),
+    ),
   );
   const [connectMenuOpen, setConnectMenuOpen] = useState(false);
   const connectButtonRef = useRef<HTMLButtonElement | null>(null);
-  const [preferredSources, setVisibleSources] = useState(loadVisibleInboxSources);
+  const [preferredSources, setVisibleSources] = useState(
+    loadVisibleInboxSources,
+  );
   const [filterMenu, setFilterMenu] = useState<{ x: number; y: number } | null>(
     null,
   );
@@ -521,7 +582,11 @@ export function InboxView({
   const [jiraSite, setJiraSite] = useState("");
   const [azureSite, setAzureSite] = useState("");
   const azureOwner = useRef("");
-  const [azureFilter, setAzureFilter] = useState<AzureFilter>({ project: "", query: "", assigned: true });
+  const [azureFilter, setAzureFilter] = useState<AzureFilter>({
+    project: "",
+    query: "",
+    assigned: true,
+  });
   const [jiraFilter, setJiraFilter] = useState<JiraFilter>(DEFAULT_JIRA_FILTER);
   const [jiraProjects, setJiraProjects] = useState<JiraOption[]>([]);
   const [jiraFavorites, setJiraFavorites] = useState<JiraOption[]>([]);
@@ -532,19 +597,16 @@ export function InboxView({
   // families — adding a project or moving a repository republishes both and
   // lands here without waiting for a remount.
   const projectsRaw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
-  const [families, setFamilies] = useState<ReadonlyMap<string, RepositoryFamily>>(
-    () => getVerifiedFamilies(),
-  );
+  const [families, setFamilies] = useState<
+    ReadonlyMap<string, RepositoryFamily>
+  >(() => getVerifiedFamilies());
   // Discovery publishes once per probed path; coalesce the burst like the
   // rail's useRepositoryFamilies instead of regrouping a step at a time.
   useEffect(() => {
     let timer = 0;
     const unsubscribe = subscribeRepositoryFamilies(() => {
       window.clearTimeout(timer);
-      timer = window.setTimeout(
-        () => setFamilies(getVerifiedFamilies()),
-        40,
-      );
+      timer = window.setTimeout(() => setFamilies(getVerifiedFamilies()), 40);
     });
     return () => {
       window.clearTimeout(timer);
@@ -569,21 +631,28 @@ export function InboxView({
   );
   const linearProjects = useMemo(() => linearProjectOptions(items), [items]);
   const activeFilters = useMemo(
-    () =>
-      pruneInboxFilters(filters, inboxProjectIdentities(projects)),
+    () => pruneInboxFilters(filters, inboxProjectIdentities(projects)),
     [filters, projects],
   );
   const filtersActive =
-    source === "azure" ? !!(azureFilter.query || !azureFilter.assigned || activeFilters.time !== "all" || activeFilters.status.open || activeFilters.status.closed) : source === "jira"
+    source === "azure"
       ? !!(
-          jiraFilter.project ||
-          jiraFilter.filter ||
-          !jiraFilter.assigned ||
+          azureFilter.query ||
+          !azureFilter.assigned ||
           activeFilters.time !== "all" ||
           activeFilters.status.open ||
           activeFilters.status.closed
         )
-      : hasActiveInboxFilters(activeFilters, source, linearHiddenTeamIds);
+      : source === "jira"
+        ? !!(
+            jiraFilter.project ||
+            jiraFilter.filter ||
+            !jiraFilter.assigned ||
+            activeFilters.time !== "all" ||
+            activeFilters.status.open ||
+            activeFilters.status.closed
+          )
+        : hasActiveInboxFilters(activeFilters, source, linearHiddenTeamIds);
   const fetchState = inboxFetchState(activeFilters);
   const fetchQuery = useMemo<InboxQuery>(
     () => ({
@@ -612,7 +681,11 @@ export function InboxView({
     setDiscussionOpen(false);
     setSelectedKey(linkedWorkItemInboxKey(target));
     setSource(target.provider ?? "github");
-    setVisibleSources(previous => previous.includes(target.provider ?? "github") ? previous : [target.provider ?? "github", ...previous]);
+    setVisibleSources((previous) =>
+      previous.includes(target.provider ?? "github")
+        ? previous
+        : [target.provider ?? "github", ...previous],
+    );
     setSearchInput("");
   }, [target, visible]);
 
@@ -658,23 +731,30 @@ export function InboxView({
     let cancelled = false;
     const update = (changed = false) => {
       if (changed) clearInboxCache();
-      void jiraConnected().then(status => {
-        if (cancelled) return;
-        setJiraSite(status.site);
-        setConnections(prev => ({
-          ...prev,
-          jira: status.connected && atlassianCapable(status, "Jira"),
-        }));
-        setJiraProjects([]);
-        setJiraFavorites([]);
-        setJiraFilter(loadJiraFilter(status.site));
-        if (changed) setRefresh(value => value + 1);
-      }).catch(() => { /* The list shows the connection error locally. */ });
+      void jiraConnected()
+        .then((status) => {
+          if (cancelled) return;
+          setJiraSite(status.site);
+          setConnections((prev) => ({
+            ...prev,
+            jira: status.connected && atlassianCapable(status, "Jira"),
+          }));
+          setJiraProjects([]);
+          setJiraFavorites([]);
+          setJiraFilter(loadJiraFilter(status.site));
+          if (changed) setRefresh((value) => value + 1);
+        })
+        .catch(() => {
+          /* The list shows the connection error locally. */
+        });
     };
     update();
     const onChange = () => update(true);
     window.addEventListener(JIRA_CHANGE_EVENT, onChange);
-    return () => { cancelled = true; window.removeEventListener(JIRA_CHANGE_EVENT, onChange); };
+    return () => {
+      cancelled = true;
+      window.removeEventListener(JIRA_CHANGE_EVENT, onChange);
+    };
   }, [visible]);
 
   useEffect(() => {
@@ -694,7 +774,9 @@ export function InboxView({
       .catch((error) => {
         if (!cancelled) setJiraOptionsError(String(error));
       });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [visible, source, jiraSite, !!filterMenu, refresh]);
 
   useEffect(() => {
@@ -702,21 +784,33 @@ export function InboxView({
     let cancelled = false;
     const update = (changed = false) => {
       if (changed) clearInboxCache();
-      void azureConnected().then(status => {
-        if (cancelled) return;
-        const owner = status.connected ? `${status.site}:${status.accountId}` : "";
-        if (changed && azureOwner.current !== owner) setItems(previous => previous.filter(item => item.provider !== "azure"));
-        azureOwner.current = owner;
-        setAzureSite(status.connected ? status.site : "");
-        setConnections(prev => ({ ...prev, azure: status.connected }));
-        setAzureFilter(loadAzureFilter(status.site, status.project));
-        if (changed) setRefresh(value => value + 1);
-      }).catch(() => { /* The list owns connection errors. */ });
+      void azureConnected()
+        .then((status) => {
+          if (cancelled) return;
+          const owner = status.connected
+            ? `${status.site}:${status.accountId}`
+            : "";
+          if (changed && azureOwner.current !== owner)
+            setItems((previous) =>
+              previous.filter((item) => item.provider !== "azure"),
+            );
+          azureOwner.current = owner;
+          setAzureSite(status.connected ? status.site : "");
+          setConnections((prev) => ({ ...prev, azure: status.connected }));
+          setAzureFilter(loadAzureFilter(status.site, status.project));
+          if (changed) setRefresh((value) => value + 1);
+        })
+        .catch(() => {
+          /* The list owns connection errors. */
+        });
     };
     update();
     const onChange = () => update(true);
     window.addEventListener(AZURE_CHANGE_EVENT, onChange);
-    return () => { cancelled = true; window.removeEventListener(AZURE_CHANGE_EVENT, onChange); };
+    return () => {
+      cancelled = true;
+      window.removeEventListener(AZURE_CHANGE_EVENT, onChange);
+    };
   }, [visible]);
 
   // The mount read does the real work: opening Settings unmounts this view, so
@@ -782,7 +876,9 @@ export function InboxView({
     saveInboxSource(next);
   }, [connections, source, preferredSources]);
 
-  const visibleSources = visibleInboxSources(connections).filter(source => preferredSources.includes(source));
+  const visibleSources = visibleInboxSources(connections).filter((source) =>
+    preferredSources.includes(source),
+  );
   const connectableSources = connectableInboxSources(connections);
   const sourceAvailable = visibleSources.includes(source);
   const noSourcesConnected = visibleSources.length === 0;
@@ -811,10 +907,18 @@ export function InboxView({
     prevRefresh.current = refresh;
     const cached = peekInboxList(fetchProjects, fetchQuery);
     if (cached) {
-      setItems(previous => [...cached.items, ...previous.filter(item =>
-        (item.provider === "jira" && cached.errors.jira && jiraSite === item.site) ||
-        (item.provider === "azure" && cached.errors.azure && azureSite === item.site)
-      )]);
+      setItems((previous) => [
+        ...cached.items,
+        ...previous.filter(
+          (item) =>
+            (item.provider === "jira" &&
+              cached.errors.jira &&
+              jiraSite === item.site) ||
+            (item.provider === "azure" &&
+              cached.errors.azure &&
+              azureSite === item.site),
+        ),
+      ]);
       setProviderErrors(cached.errors);
       setLoading(false);
     }
@@ -831,10 +935,18 @@ export function InboxView({
     void listInboxItems(fetchProjects, fetchQuery, { force })
       .then((next) => {
         if (cancelled) return;
-        setItems(previous => [...next.items, ...previous.filter(item =>
-          (item.provider === "jira" && next.errors.jira && jiraSite === item.site) ||
-          (item.provider === "azure" && next.errors.azure && azureSite === item.site)
-        )]);
+        setItems((previous) => [
+          ...next.items,
+          ...previous.filter(
+            (item) =>
+              (item.provider === "jira" &&
+                next.errors.jira &&
+                jiraSite === item.site) ||
+              (item.provider === "azure" &&
+                next.errors.azure &&
+                azureSite === item.site),
+          ),
+        ]);
         setProviderErrors(next.errors);
       })
       .catch((err: unknown) => {
@@ -911,7 +1023,10 @@ export function InboxView({
     targetItem,
   ]);
 
-  const relatedSessionCounts = useMemo(() => inboxRelatedSessionCounts(visibleItems, sessions), [visibleItems, sessions]);
+  const relatedSessionCounts = useMemo(
+    () => inboxRelatedSessionCounts(visibleItems, sessions),
+    [visibleItems, sessions],
+  );
 
   // "My work" inputs are all already-cached snapshots — the version ticks
   // re-derive the join when a store publish lands; nothing here fetches.
@@ -928,16 +1043,7 @@ export function InboxView({
     subscribeBranchPrVersion,
     branchPrVersion,
   );
-  const [deliveryTick, setDeliveryTick] = useState(0);
-  useEffect(() => {
-    const bump = () => setDeliveryTick((value) => value + 1);
-    window.addEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, bump);
-    window.addEventListener(AZURE_CI_SOURCES_CHANGED, bump);
-    return () => {
-      window.removeEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, bump);
-      window.removeEventListener(AZURE_CI_SOURCES_CHANGED, bump);
-    };
-  }, []);
+  const stores = useDeliveryStores();
   const myWorkByItem = useMemo(
     () =>
       inboxMyWorkForItems(visibleItems, {
@@ -947,7 +1053,7 @@ export function InboxView({
         tasks: loadTaskWorkspaces(),
         projects: loadProjects(),
         prDrafts: listTaskPrDrafts(),
-        stores: deliveryStores(),
+        stores,
         attention: attentionItems,
         branchForCwd: (cwd) => peekProjectDiffStats(cwd)?.branch,
         githubPrFor: cachedBranchPr,
@@ -963,7 +1069,7 @@ export function InboxView({
       tasksRaw,
       projectsRaw,
       prDraftsRaw,
-      deliveryTick,
+      stores,
       statsVersion,
       branchPrV,
     ],
@@ -997,17 +1103,16 @@ export function InboxView({
   /** "Watch this query" (#23) — binds a watcher to the current source tab's
    * filter. GitHub queries span repos, so the sheet asks which repository. */
   const watchRepos = useMemo(
-    () =>
-      [
-        ...new Map(
-          items
-            .filter((item) => item.provider === "github" && item.repo)
-            .map((item) => [
-              `${item.projectPath}|${item.repo}`,
-              { cwd: item.projectPath, repo: item.repo },
-            ]),
-        ).values(),
-      ],
+    () => [
+      ...new Map(
+        items
+          .filter((item) => item.provider === "github" && item.repo)
+          .map((item) => [
+            `${item.projectPath}|${item.repo}`,
+            { cwd: item.projectPath, repo: item.repo },
+          ]),
+      ).values(),
+    ],
     [items],
   );
   const canWatch =
@@ -1111,7 +1216,11 @@ export function InboxView({
       ref={resize.setPaneRef}
       id="inbox-ticket-list"
       hidden={!!conversationId && issuesCollapsed}
-      className={conversationId && issuesCollapsed ? "hidden" : "relative flex h-full min-h-0 shrink-0 flex-col border-r border-content/10"}
+      className={
+        conversationId && issuesCollapsed
+          ? "hidden"
+          : "relative flex h-full min-h-0 shrink-0 flex-col border-r border-content/10"
+      }
     >
       <div className="flex h-9 shrink-0 items-center gap-px border-b border-content/10 px-2">
         {visibleSources.length > 0 ? (
@@ -1152,97 +1261,196 @@ export function InboxView({
         ) : null}
       </div>
       <div className="flex h-9 shrink-0 items-center gap-1 border-b border-content/10 px-2">
-        {selectingTickets ? <>
-          <span className="min-w-0 flex-1 text-[12px] text-content/60">{selectionCount} {editingLinks ? "linked" : "selected"}</span>
-          {!editingLinks ? <button type="button" disabled={!selectionCount} onClick={() => {
-            void Promise.resolve(onSendToTask?.([...selectedTickets.values()]))
-              .then(() => { setSelectedTickets(new Map()); setSelectingTickets(false); })
-              .catch((error) => setSelectionError(String(error)));
-          }} className="rounded-md bg-content/10 px-2 py-1 text-[11px] disabled:opacity-40">Send to task</button> : null}
-          <button type="button" aria-label="Done selecting tickets" onClick={() => { setSelectedTickets(new Map()); setSelectingTickets(false); setSelectionError(""); }} className="rounded-md px-2 py-1 text-[11px] text-content/60 hover:bg-content/5">Done</button>
-        </> : <>
-
-        <div className="relative flex h-7 min-w-0 flex-1 items-center">
-          <Search className="pointer-events-none absolute left-2 size-3 shrink-0 opacity-50" />
-          <input
-            value={searchInput}
-            onChange={(event) => setSearchInput(event.target.value)}
-            placeholder="Filter inbox"
-            aria-label="Filter inbox"
-            spellCheck={false}
-            autoComplete="off"
-            className="h-7 w-full rounded-md bg-transparent pl-7 pr-2 text-[12px] text-content outline-none placeholder:text-content/40"
-          />
-        </div>
-        <button
-          type="button"
-          title="Filters and visible sources"
-          aria-label="Filter inbox"
-          aria-expanded={!!filterMenu}
-          aria-haspopup="menu"
-          onClick={onFilterButtonClick}
-          className={`grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content ${
-            filterMenu || filtersActive ? "bg-content/10 text-content" : ""
-          }`}
-        >
-          <ListFilter className="size-3" strokeWidth={1.75} />
-        </button>
-        {canWatch ? (
-          <button
-            type="button"
-            title="Watch this query — poll it while MonoCode is open"
-            aria-label="Watch this query"
-            onClick={onWatchQuery}
-            className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
-          >
-            <Zap className="size-3.5" strokeWidth={1.75} />
-          </button>
-        ) : null}
-        {onSendToTask ? <button type="button" aria-label="Select tickets" title="Select tickets" onClick={() => { setSelectingTickets(true); setFilterMenu(null); setSelectionError(""); }} className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"><Check className="size-3.5" strokeWidth={1.75} /></button> : null}
-        <button
-          type="button"
-          title="Mark all as read"
-          aria-label="Mark all as read"
-          disabled={!sourceHasUnseen}
-          onClick={() => markInboxItemsSeen(sourceEntries)}
-          className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content disabled:cursor-default disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-content/45"
-        >
-          <CheckCheck className="size-3.5" strokeWidth={1.75} />
-        </button>
-        <button
-          type="button"
-          aria-label="Refresh"
-          onClick={() => setRefresh((value) => value + 1)}
-          className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
-        >
-          {loading || revalidating ? (
-            <LoaderCircle
-              className="size-3.5 animate-spin"
-              strokeWidth={1.75}
-            />
-          ) : (
-            <RefreshCw className="size-3.5" strokeWidth={1.75} />
-          )}
-        </button>
-        </>}
+        {selectingTickets ? (
+          <>
+            <span className="min-w-0 flex-1 text-[12px] text-content/60">
+              {selectionCount} {editingLinks ? "linked" : "selected"}
+            </span>
+            {!editingLinks ? (
+              <button
+                type="button"
+                disabled={!selectionCount}
+                onClick={() => {
+                  void Promise.resolve(
+                    onSendToTask?.([...selectedTickets.values()]),
+                  )
+                    .then(() => {
+                      setSelectedTickets(new Map());
+                      setSelectingTickets(false);
+                    })
+                    .catch((error) => setSelectionError(String(error)));
+                }}
+                className="rounded-md bg-content/10 px-2 py-1 text-[11px] disabled:opacity-40"
+              >
+                Send to task
+              </button>
+            ) : null}
+            <button
+              type="button"
+              aria-label="Done selecting tickets"
+              onClick={() => {
+                setSelectedTickets(new Map());
+                setSelectingTickets(false);
+                setSelectionError("");
+              }}
+              className="rounded-md px-2 py-1 text-[11px] text-content/60 hover:bg-content/5"
+            >
+              Done
+            </button>
+          </>
+        ) : (
+          <>
+            <div className="relative flex h-7 min-w-0 flex-1 items-center">
+              <Search className="pointer-events-none absolute left-2 size-3 shrink-0 opacity-50" />
+              <input
+                value={searchInput}
+                onChange={(event) => setSearchInput(event.target.value)}
+                placeholder="Filter inbox"
+                aria-label="Filter inbox"
+                spellCheck={false}
+                autoComplete="off"
+                className="h-7 w-full rounded-md bg-transparent pl-7 pr-2 text-[12px] text-content outline-none placeholder:text-content/40"
+              />
+            </div>
+            <button
+              type="button"
+              title="Filters and visible sources"
+              aria-label="Filter inbox"
+              aria-expanded={!!filterMenu}
+              aria-haspopup="menu"
+              onClick={onFilterButtonClick}
+              className={`grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content ${
+                filterMenu || filtersActive ? "bg-content/10 text-content" : ""
+              }`}
+            >
+              <ListFilter className="size-3" strokeWidth={1.75} />
+            </button>
+            {canWatch ? (
+              <button
+                type="button"
+                title="Watch this query — poll it while MonoCode is open"
+                aria-label="Watch this query"
+                onClick={onWatchQuery}
+                className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
+              >
+                <Zap className="size-3.5" strokeWidth={1.75} />
+              </button>
+            ) : null}
+            {onSendToTask ? (
+              <button
+                type="button"
+                aria-label="Select tickets"
+                title="Select tickets"
+                onClick={() => {
+                  setSelectingTickets(true);
+                  setFilterMenu(null);
+                  setSelectionError("");
+                }}
+                className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
+              >
+                <Check className="size-3.5" strokeWidth={1.75} />
+              </button>
+            ) : null}
+            <button
+              type="button"
+              title="Mark all as read"
+              aria-label="Mark all as read"
+              disabled={!sourceHasUnseen}
+              onClick={() => markInboxItemsSeen(sourceEntries)}
+              className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content disabled:cursor-default disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-content/45"
+            >
+              <CheckCheck className="size-3.5" strokeWidth={1.75} />
+            </button>
+            <button
+              type="button"
+              aria-label="Refresh"
+              onClick={() => setRefresh((value) => value + 1)}
+              className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
+            >
+              {loading || revalidating ? (
+                <LoaderCircle
+                  className="size-3.5 animate-spin"
+                  strokeWidth={1.75}
+                />
+              ) : (
+                <RefreshCw className="size-3.5" strokeWidth={1.75} />
+              )}
+            </button>
+          </>
+        )}
       </div>
-      {selectionError ? <p role="alert" className="px-3 py-1 text-[11px] text-red-400">{selectionError}</p> : null}
+      {selectionError ? (
+        <p role="alert" className="px-3 py-1 text-[11px] text-red-400">
+          {selectionError}
+        </p>
+      ) : null}
       <div
         ref={listLock}
         className="min-h-0 flex-1 overflow-y-auto overscroll-none"
       >
-        {sourceError && visibleItems.length > 0 ? <p role="status" className="px-3 py-2 text-[12px] text-content/50">{sourceError} <button type="button" onClick={() => setRefresh(value => value + 1)} className="underline">Retry</button></p> : null}
-        {noSourcesConnected ? <p className="px-3 py-3 text-[12px] text-content/50">Add a connection to start using the Inbox.</p> : sourceError && visibleItems.length === 0 ? (
+        {sourceError && visibleItems.length > 0 ? (
+          <p role="status" className="px-3 py-2 text-[12px] text-content/50">
+            {sourceError}{" "}
+            <button
+              type="button"
+              onClick={() => setRefresh((value) => value + 1)}
+              className="underline"
+            >
+              Retry
+            </button>
+          </p>
+        ) : null}
+        {noSourcesConnected ? (
+          <p className="px-3 py-3 text-[12px] text-content/50">
+            Add a connection to start using the Inbox.
+          </p>
+        ) : sourceError && visibleItems.length === 0 ? (
           <div className="px-3 py-2 text-[12px] text-content/50">
             <p>{sourceError}</p>
-            {source === "azure" ? <div className="mt-2 flex gap-3">
-              {onOpenSettings ? <button type="button" className="underline" onClick={onOpenSettings}>{azureSite ? "Connection settings" : "Connect Azure DevOps"}</button> : null}
-              {azureSite ? <button type="button" className="underline" onClick={() => setRefresh(value => value + 1)}>Retry</button> : null}
-            </div> : null}
-            {source === "jira" ? <div className="mt-2 flex gap-3">
-              {onOpenSettings ? <button type="button" className="underline" onClick={onOpenSettings}>{jiraSite ? "Connection settings" : "Connect Jira"}</button> : null}
-              {jiraSite ? <button type="button" className="underline" onClick={() => setRefresh(value => value + 1)}>Retry</button> : null}
-            </div> : null}
+            {source === "azure" ? (
+              <div className="mt-2 flex gap-3">
+                {onOpenSettings ? (
+                  <button
+                    type="button"
+                    className="underline"
+                    onClick={onOpenSettings}
+                  >
+                    {azureSite ? "Connection settings" : "Connect Azure DevOps"}
+                  </button>
+                ) : null}
+                {azureSite ? (
+                  <button
+                    type="button"
+                    className="underline"
+                    onClick={() => setRefresh((value) => value + 1)}
+                  >
+                    Retry
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+            {source === "jira" ? (
+              <div className="mt-2 flex gap-3">
+                {onOpenSettings ? (
+                  <button
+                    type="button"
+                    className="underline"
+                    onClick={onOpenSettings}
+                  >
+                    {jiraSite ? "Connection settings" : "Connect Jira"}
+                  </button>
+                ) : null}
+                {jiraSite ? (
+                  <button
+                    type="button"
+                    className="underline"
+                    onClick={() => setRefresh((value) => value + 1)}
+                  >
+                    Retry
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         ) : loading && items.length === 0 ? (
           <div className="flex justify-center py-10 text-content/40">
@@ -1250,29 +1458,33 @@ export function InboxView({
           </div>
         ) : visibleItems.length === 0 ? (
           <p className="px-3 py-2 text-[12px] text-content/50">
-            {source === "azure" ? "No Azure items match these filters" : source === "jira" ? "No Jira issues match these filters" : narrowedByUser
-              ? searchNarrowed
-                ? source === "linear"
-                  ? "No matching Linear issues"
-                  : source === "gitlab"
-                    ? "No matching issues or merge requests"
-                    : "No matching issues or pull requests"
-                : source === "linear"
-                  ? "No Linear issues match these filters"
-                  : source === "gitlab"
-                    ? activeFilters.assignedToMe
-                      ? "Nothing needs your attention"
-                      : "No GitLab items match these filters"
-                    : "No issues or pull requests match these filters"
-              : source === "linear"
-                ? "No Linear issues"
-                : source === "gitlab"
-                  ? projects.length === 0
-                    ? "Open a project to fill the inbox"
-                    : "No matching issues or merge requests"
-                  : projects.length === 0
-                    ? "Open a project to fill the inbox"
-                    : "No matching issues or pull requests"}
+            {source === "azure"
+              ? "No Azure items match these filters"
+              : source === "jira"
+                ? "No Jira issues match these filters"
+                : narrowedByUser
+                  ? searchNarrowed
+                    ? source === "linear"
+                      ? "No matching Linear issues"
+                      : source === "gitlab"
+                        ? "No matching issues or merge requests"
+                        : "No matching issues or pull requests"
+                    : source === "linear"
+                      ? "No Linear issues match these filters"
+                      : source === "gitlab"
+                        ? activeFilters.assignedToMe
+                          ? "Nothing needs your attention"
+                          : "No GitLab items match these filters"
+                        : "No issues or pull requests match these filters"
+                  : source === "linear"
+                    ? "No Linear issues"
+                    : source === "gitlab"
+                      ? projects.length === 0
+                        ? "Open a project to fill the inbox"
+                        : "No matching issues or merge requests"
+                      : projects.length === 0
+                        ? "Open a project to fill the inbox"
+                        : "No matching issues or pull requests"}
           </p>
         ) : (
           <ul className="flex flex-col gap-0.5 p-1.5">
@@ -1287,24 +1499,46 @@ export function InboxView({
                 ? projectByKey.get(projectId)
                 : undefined;
               return (
-                <li key={key} className={selectingTickets ? "flex items-center gap-1" : undefined}>
-                  {selectingTickets ? <ContextCheckbox label={`Select ${item.provider} ${item.identifier || item.number} ${item.title}`} checked={ticketSelected(item)} disabled={!!item.delivery || pendingTickets.has(contextTicketKey(item))} onChange={() => toggleTicket(item)} /> : null}
-                  <div className="min-w-0 flex-1"><InboxCard
-                    item={item}
-                    active={selected != null && key === inboxItemKey(selected)}
-                    projectLabel={project?.name}
-                    logoPath={resolveTabGroupLogo(projectId, logos)}
-                    mascotName={resolveTabGroupMascot(projectId, groupMascots)}
-                    mascotColor={resolveTabGroupColor(
-                      projectId,
-                      groupColors,
-                      groupCustomColors,
-                      project?.name ?? projectName(item.projectPath),
-                    )}
-                    relatedSessionCount={relatedSessionCounts.get(item) ?? 0}
-                    myWork={myWorkByItem.get(item)}
-                    onSelect={selectTicketPreview}
-                  /></div>
+                <li
+                  key={key}
+                  className={
+                    selectingTickets ? "flex items-center gap-1" : undefined
+                  }
+                >
+                  {selectingTickets ? (
+                    <ContextCheckbox
+                      label={`Select ${item.provider} ${item.identifier || item.number} ${item.title}`}
+                      checked={ticketSelected(item)}
+                      disabled={
+                        !!item.delivery ||
+                        pendingTickets.has(contextTicketKey(item))
+                      }
+                      onChange={() => toggleTicket(item)}
+                    />
+                  ) : null}
+                  <div className="min-w-0 flex-1">
+                    <InboxCard
+                      item={item}
+                      active={
+                        selected != null && key === inboxItemKey(selected)
+                      }
+                      projectLabel={project?.name}
+                      logoPath={resolveTabGroupLogo(projectId, logos)}
+                      mascotName={resolveTabGroupMascot(
+                        projectId,
+                        groupMascots,
+                      )}
+                      mascotColor={resolveTabGroupColor(
+                        projectId,
+                        groupColors,
+                        groupCustomColors,
+                        project?.name ?? projectName(item.projectPath),
+                      )}
+                      relatedSessionCount={relatedSessionCounts.get(item) ?? 0}
+                      myWork={myWorkByItem.get(item)}
+                      onSelect={selectTicketPreview}
+                    />
+                  </div>
                 </li>
               );
             })}
@@ -1343,7 +1577,10 @@ export function InboxView({
       jiraProjects={jiraProjects}
       jiraFavorites={jiraFavorites}
       jiraOptionsError={jiraOptionsError}
-      onJiraFilterChange={next => { setJiraFilter(next); saveJiraFilter(jiraSite, next); }}
+      onJiraFilterChange={(next) => {
+        setJiraFilter(next);
+        saveJiraFilter(jiraSite, next);
+      }}
       onClose={() => setFilterMenu(null)}
     />
   ) : null;
@@ -1353,7 +1590,7 @@ export function InboxView({
       <InboxConnectMenu
         anchor={connectButtonRef}
         sources={connectableSources}
-        onConnect={source => onOpenIntegrations?.(source)}
+        onConnect={(source) => onOpenIntegrations?.(source)}
         onClose={() => setConnectMenuOpen(false)}
       />
     ) : null;
@@ -1379,8 +1616,26 @@ export function InboxView({
             strokeWidth={1.75}
           />
           <span className="min-w-0 truncate text-content">Inbox</span>
-          {conversationId ? <button type="button" aria-expanded={!issuesCollapsed} aria-controls="inbox-ticket-list" onClick={() => setIssuesCollapsed(value => !value)} className="rounded-md px-2 py-1 text-[11px] text-content/60 hover:bg-content/5">{issuesCollapsed ? "Show issues" : "Hide issues"}</button> : null}
-          {conversationId && previewingTicket ? <button type="button" className="ml-auto rounded-md px-2 py-1 text-[11px] text-content/60 hover:bg-content/5" onClick={() => setPreviewingTicket(false)}>Back to conversation</button> : null}
+          {conversationId ? (
+            <button
+              type="button"
+              aria-expanded={!issuesCollapsed}
+              aria-controls="inbox-ticket-list"
+              onClick={() => setIssuesCollapsed((value) => !value)}
+              className="rounded-md px-2 py-1 text-[11px] text-content/60 hover:bg-content/5"
+            >
+              {issuesCollapsed ? "Show issues" : "Hide issues"}
+            </button>
+          ) : null}
+          {conversationId && previewingTicket ? (
+            <button
+              type="button"
+              className="ml-auto rounded-md px-2 py-1 text-[11px] text-content/60 hover:bg-content/5"
+              onClick={() => setPreviewingTicket(false)}
+            >
+              Back to conversation
+            </button>
+          ) : null}
         </div>
         {IS_MAC ? null : <WindowControls />}
       </div>
@@ -1390,12 +1645,28 @@ export function InboxView({
         <div className="relative flex min-h-0 min-w-0 flex-1">
           <div
             hidden={!!conversationId && !previewingTicket}
-            className={conversationId && !previewingTicket ? "hidden" : "min-h-0 min-w-0 flex-1"}
+            className={
+              conversationId && !previewingTicket
+                ? "hidden"
+                : "min-h-0 min-w-0 flex-1"
+            }
           >
-            {target && !selected && selectedKey === targetSelectionKey && !loading && source === target.provider && target.provider !== "github" ? (
+            {target &&
+            !selected &&
+            selectedKey === targetSelectionKey &&
+            !loading &&
+            source === target.provider &&
+            target.provider !== "github" ? (
               <div role="status" className="p-4 text-[13px] text-content/60">
-                <p className="mb-2 font-medium text-content">{target.title || target.identifier || `Issue ${target.number}`}</p>
-                <p>This linked issue is not available in the current Inbox. Check the connected account and provider filters.</p>
+                <p className="mb-2 font-medium text-content">
+                  {target.title ||
+                    target.identifier ||
+                    `Issue ${target.number}`}
+                </p>
+                <p>
+                  This linked issue is not available in the current Inbox. Check
+                  the connected account and provider filters.
+                </p>
               </div>
             ) : null}
             <InboxDetailBody
@@ -1406,27 +1677,36 @@ export function InboxView({
               relatedSessions={
                 selected ? relatedSessionsForInboxItem(selected, sessions) : []
               }
-              onDiscuss={async context => {
+              viewingSessionId={conversationId}
+              liveIds={liveSessionIds}
+              onDiscuss={async (context) => {
                 if (!selected) return;
                 await onAsk(selected, context);
                 setDiscussionOpen(true);
               }}
               onStartTask={onStartTask}
               onOpenDelivery={onOpenDelivery}
-              onOpenSession={id => { setPreviewingTicket(false); return onOpenSession?.(id); }}
+              onOpenSession={(id) => {
+                setPreviewingTicket(false);
+                return onOpenSession?.(id);
+              }}
               myWork={selected ? myWorkByItem.get(selected) : undefined}
               onAttentionAction={onAttentionAction}
             />
           </div>
-          {(conversationId && !previewingTicket) || (discussionOpen && selected) ? (
+          {(conversationId && !previewingTicket) ||
+          (discussionOpen && selected) ? (
             <InboxDiscussionPanel
               onOpen={onAsk}
               onRestart={onAskRestart}
               onMount={onAskMount}
-              key={conversationId ?? (selected ? inboxAskKey(selected) : "") }
+              key={conversationId ?? (selected ? inboxAskKey(selected) : "")}
               sessionId={conversationId}
               item={selected ?? undefined}
-              onClose={() => { setDiscussionOpen(false); onCloseConversation?.(); }}
+              onClose={() => {
+                setDiscussionOpen(false);
+                onCloseConversation?.();
+              }}
             />
           ) : null}
         </div>
@@ -1443,6 +1723,8 @@ function InboxDetailBody({
   projects,
   revision = 0,
   relatedSessions,
+  viewingSessionId,
+  liveIds,
   onDiscuss,
   onStartTask,
   onOpenSession,
@@ -1454,11 +1736,28 @@ function InboxDetailBody({
   cwd: string;
   projects: InboxProjectOption[];
   revision?: number;
+  /** Ids that resolve to live sessions — "N conversations" labels and
+   * multi-conversation routing count these, not stale task records. */
+  liveIds?: ReadonlySet<string>;
   relatedSessions: readonly SessionSummary[];
+  /** Session the user is currently reading in the inbox conversation
+   * panel — delivery rows host on it when it shares the working copy. */
+  viewingSessionId?: string;
   onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
-  onStartTask?: (item: InboxItem, taskId: string | null) => void;
+  onStartTask?: (
+    item: InboxItem,
+    taskId: string | null,
+    opts?: { freshSession?: boolean },
+  ) => void;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
+  onOpenDelivery?: (
+    sessionId: string,
+    kind: "pr" | "ci",
+    current: () => boolean,
+    provider: "github" | "azure" | "gitlab",
+    prUrl?: string,
+    gitlabTarget?: { repo: string; number: number },
+  ) => Promise<void>;
   myWork?: InboxMyWork;
   onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
 }) {
@@ -1470,15 +1769,27 @@ function InboxDetailBody({
       </div>
     );
   }
-  if (item.delivery) return <AzureInboxDetail key={inboxItemKey(item)} item={item} cwd={cwd} projects={projects} relatedSessions={relatedSessions} onOpenSession={onOpenSession} onDiscuss={onDiscuss} />;
+  if (item.delivery)
+    return (
+      <AzureInboxDetail
+        key={inboxItemKey(item)}
+        item={item}
+        cwd={cwd}
+        projects={projects}
+        relatedSessions={relatedSessions}
+        onOpenSession={onOpenSession}
+        onDiscuss={onDiscuss}
+      />
+    );
   return (
     <InboxDetail
       key={inboxItemKey(item)}
       item={item}
       cwd={cwd}
-      projects={projects}
       revision={revision}
       relatedSessions={relatedSessions}
+      viewingSessionId={viewingSessionId}
+      liveIds={liveIds}
       onDiscuss={onDiscuss}
       onStartTask={onStartTask}
       onOpenSession={onOpenSession}
@@ -1498,7 +1809,12 @@ type InboxStatusMark = {
 /** Status reads from the glyph first and the color second, so it survives color blindness. */
 function inboxStatusMark(item: InboxItem): InboxStatusMark {
   const label = inboxItemStatus(item);
-  if (item.kind === "ci") return {Icon:CircleX,className:"text-rose-400/90",label:"Needs attention"};
+  if (item.kind === "ci")
+    return {
+      Icon: CircleX,
+      className: "text-rose-400/90",
+      label: "Needs attention",
+    };
   const pr = item.kind === "pr";
   if (label === "Draft") {
     return {
@@ -1549,17 +1865,25 @@ const InboxCard = memo(function InboxCard({
   useInboxSeenTick();
   const status = inboxStatusMark(item);
   const kindLabel =
-    item.kind === "ci" ? "CI" : item.kind === "pr"
-      ? item.provider === "gitlab"
-        ? "Merge request"
-        : "Pull request"
-      : "Issue";
+    item.kind === "ci"
+      ? "CI"
+      : item.kind === "pr"
+        ? item.provider === "gitlab"
+          ? "Merge request"
+          : "Pull request"
+        : "Issue";
   const time = formatRelativeTime(item.updatedAt);
   const name = projectLabel?.trim() || projectName(item.projectPath);
   const linear = item.provider === "linear";
   const jira = item.provider === "jira";
   const azure = item.provider === "azure";
-  const source = azure ? `${item.site?.split("/").pop()} / ${item.projectName}` : jira ? item.projectName : linear ? item.teamName || item.repo : item.repo || name;
+  const source = azure
+    ? `${item.site?.split("/").pop()} / ${item.projectName}`
+    : jira
+      ? item.projectName
+      : linear
+        ? item.teamName || item.repo
+        : item.repo || name;
   const attentionLabel =
     item.provider === "gitlab"
       ? gitlabAttentionLabel(item.attentionReason ?? "")
@@ -1596,7 +1920,8 @@ const InboxCard = memo(function InboxCard({
             strokeWidth={1.75}
           />
           <span className="min-w-0 truncate text-[11px] text-content/50">
-            {jira || (azure && !item.delivery) ? "" : `${kindLabel} · `}{inboxItemRef(item)}
+            {jira || (azure && !item.delivery) ? "" : `${kindLabel} · `}
+            {inboxItemRef(item)}
             {attentionLabel ? ` · ${attentionLabel}` : ""}
           </span>
         </span>
@@ -1641,7 +1966,11 @@ const InboxCard = memo(function InboxCard({
               className="size-3 shrink-0"
             />
           )}
-          {jira || azure ? <span className="max-w-[55%] truncate" title={item.state}>{item.state} ·</span> : null}
+          {jira || azure ? (
+            <span className="max-w-[55%] truncate" title={item.state}>
+              {item.state} ·
+            </span>
+          ) : null}
           <span className="min-w-0 truncate">{source}</span>
         </span>
         <MyWorkBadges work={myWork} />
@@ -1660,9 +1989,10 @@ const InboxCard = memo(function InboxCard({
 export function InboxDetail({
   item,
   cwd,
-  projects,
   revision,
   relatedSessions,
+  viewingSessionId,
+  liveIds,
   onDiscuss,
   onStartTask,
   onOpenSession,
@@ -1672,35 +2002,103 @@ export function InboxDetail({
 }: {
   item: InboxItem;
   cwd: string;
-  projects: InboxProjectOption[];
   revision: number;
   relatedSessions: readonly SessionSummary[];
+  /** Session currently embedded in the inbox conversation panel — when it
+   * shares the working copy it hosts the delivery tab so the review opens
+   * next to the conversation the user is actually looking at. */
+  viewingSessionId?: string;
+  /** Ids that resolve to live sessions — conversation counts must not
+   * include records whose session is gone. */
+  liveIds?: ReadonlySet<string>;
   onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
-  onStartTask?: (item: InboxItem, taskId: string | null) => void;
+  onStartTask?: (
+    item: InboxItem,
+    taskId: string | null,
+    opts?: { freshSession?: boolean },
+  ) => void;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => Promise<void>;
+  onOpenDelivery?: (
+    sessionId: string,
+    kind: "pr" | "ci",
+    current: () => boolean,
+    provider: "github" | "azure" | "gitlab",
+    prUrl?: string,
+    gitlabTarget?: { repo: string; number: number },
+  ) => Promise<void>;
   myWork?: InboxMyWork;
   onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
 }) {
   const detailLock = useLockOverscroll<HTMLDivElement>();
-  const [deliveryProviders, setDeliveryProviders] = useState<Record<string, "github" | "azure" | "gitlab">>(() => {
-    try { const saved = JSON.parse(localStorage.getItem("monocode.inboxDeliveryProviders.v1") || "{}"); return saved && typeof saved === "object" && !Array.isArray(saved) ? Object.fromEntries(Object.entries(saved).filter(([, value]) => value === "github" || value === "azure" || value === "gitlab").slice(-100)) as Record<string, "github" | "azure" | "gitlab"> : {}; }
-    catch { return {}; }
+  const [deliveryProviders, setDeliveryProviders] = useState<
+    Record<string, "github" | "azure" | "gitlab">
+  >(() => {
+    try {
+      const saved = JSON.parse(
+        localStorage.getItem("monocode.inboxDeliveryProviders.v2") || "{}",
+      );
+      return saved && typeof saved === "object" && !Array.isArray(saved)
+        ? (Object.fromEntries(
+            Object.entries(saved)
+              .filter(
+                ([, value]) =>
+                  value === "github" || value === "azure" || value === "gitlab",
+              )
+              .slice(-100),
+          ) as Record<string, "github" | "azure" | "gitlab">)
+        : {};
+    } catch {
+      return {};
+    }
   });
-  const [choosingProviders, setChoosingProviders] = useState<string | null>(null);
-  const providerKey = (sessionId: string, kind: "pr" | "ci") => JSON.stringify([contextTicketKey(item), sessionId, kind]);
-  const deliveryProvider = (sessionId: string, kind: "pr" | "ci") => {
-    const saved = deliveryProviders[providerKey(sessionId, kind)];
-    const provider = saved === "github" || saved === "azure" || saved === "gitlab" ? saved : item.provider === "github" || item.provider === "azure" || item.provider === "gitlab" ? item.provider : undefined;
+  const [choosingProviders, setChoosingProviders] = useState<string | null>(
+    null,
+  );
+  // Delivery is branch-scoped: a provider choice belongs to the working copy
+  // (normalized), not to one conversation or ticket that happened to send it.
+  const providerKey = (scope: string, kind: "pr" | "ci") =>
+    JSON.stringify([scope, kind]);
+  const deliveryProvider = (
+    scope: string,
+    kind: "pr" | "ci",
+    inferred?: "github" | "azure" | "gitlab",
+  ) => {
+    const saved = deliveryProviders[providerKey(scope, kind)] ?? inferred;
+    const provider =
+      saved === "github" || saved === "azure" || saved === "gitlab"
+        ? saved
+        : item.provider === "github" ||
+            item.provider === "azure" ||
+            item.provider === "gitlab"
+          ? item.provider
+          : undefined;
     // GitLab pipelines ride the MR surface — never a standalone CI delivery.
     return provider === "gitlab" && kind === "ci" ? undefined : provider;
   };
-  const saveProvider = (sessionId: string, kind: "pr" | "ci", provider: string) => {
-    if (provider !== "" && provider !== "github" && provider !== "azure" && provider !== "gitlab") return;
-    const key = providerKey(sessionId, kind);
-    const next = Object.fromEntries([...Object.entries(deliveryProviders).filter(([entry]) => entry !== key), ...(provider ? [[key, provider]] : [])].slice(-100));
-    try { localStorage.setItem("monocode.inboxDeliveryProviders.v1", JSON.stringify(next)); setDeliveryProviders(next); }
-    catch { setDeliveryError("Could not save delivery providers. Try again."); }
+  const saveProvider = (scope: string, kind: "pr" | "ci", provider: string) => {
+    if (
+      provider !== "" &&
+      provider !== "github" &&
+      provider !== "azure" &&
+      provider !== "gitlab"
+    )
+      return;
+    const key = providerKey(scope, kind);
+    const next = Object.fromEntries(
+      [
+        ...Object.entries(deliveryProviders).filter(([entry]) => entry !== key),
+        ...(provider ? [[key, provider]] : []),
+      ].slice(-100),
+    );
+    try {
+      localStorage.setItem(
+        "monocode.inboxDeliveryProviders.v2",
+        JSON.stringify(next),
+      );
+      setDeliveryProviders(next);
+    } catch {
+      setDeliveryError("Could not save delivery providers. Try again.");
+    }
   };
   const [deliveryBusy, setDeliveryBusy] = useState(false);
   const [deliveryError, setDeliveryError] = useState("");
@@ -1708,18 +2106,67 @@ export function InboxDetail({
   const sendAnchor = useRef<HTMLButtonElement>(null);
   const deliveryPending = useRef(false);
   const deliveryMounted = useRef(true);
-  useEffect(() => { deliveryMounted.current = true; return () => { deliveryMounted.current = false; }; }, []);
-  const openDelivery = async (sessionId: string, kind: "pr" | "ci") => {
+  useEffect(() => {
+    deliveryMounted.current = true;
+    return () => {
+      deliveryMounted.current = false;
+    };
+  }, []);
+  const openDelivery = async (
+    sessionId: string,
+    scope: string,
+    kind: "pr" | "ci",
+    inferred?: "github" | "azure" | "gitlab",
+  ) => {
     if (!onOpenDelivery || deliveryPending.current) return;
-    const provider = deliveryProvider(sessionId, kind);
-    if (!provider) { setChoosingProviders(sessionId); return; }
+    const provider = deliveryProvider(scope, kind, inferred);
+    if (!provider) {
+      setChoosingProviders(scope);
+      return;
+    }
     deliveryPending.current = true;
     setDeliveryBusy(true);
     setDeliveryError("");
-    try { await onOpenDelivery(sessionId, kind, () => deliveryMounted.current, provider, item.provider === "github" && item.kind === "pr" ? item.url : undefined, item.provider === "gitlab" && item.kind === "pr" ? { repo: item.repo, number: item.number } : undefined); }
-    catch (error) { if (deliveryMounted.current) setDeliveryError(error instanceof Error ? error.message : String(error)); }
-    finally { deliveryPending.current = false; if (deliveryMounted.current) setDeliveryBusy(false); }
+    try {
+      await onOpenDelivery(
+        sessionId,
+        kind,
+        () => deliveryMounted.current,
+        provider,
+        item.provider === "github" && item.kind === "pr" ? item.url : undefined,
+        item.provider === "gitlab" && item.kind === "pr"
+          ? { repo: item.repo, number: item.number }
+          : undefined,
+      );
+    } catch (error) {
+      if (deliveryMounted.current)
+        setDeliveryError(
+          error instanceof Error ? error.message : String(error),
+        );
+    } finally {
+      deliveryPending.current = false;
+      if (deliveryMounted.current) setDeliveryBusy(false);
+    }
   };
+  // Delivery is branch-scoped — threads in one working copy open the same
+  // PR/CI, so group them by normalized work cwd (worktree first), matching
+  // what a delivery open resolves. `relatedSessions` is fresh each render —
+  // no memo.
+  const threadGroups: {
+    key: string;
+    cwd: string;
+    sessions: SessionSummary[];
+  }[] = [];
+  for (const session of relatedSessions) {
+    const cwd = sessionWorkCwd(session);
+    const key = cwd ? pathKey(cwd) : "";
+    const group = key
+      ? threadGroups.find((entry) => entry.key === key)
+      : undefined;
+    if (group) group.sessions.push(session);
+    else threadGroups.push({ key, cwd, sessions: [session] });
+  }
+  const stores = useDeliveryStores();
   const linear = item.provider === "linear";
   const jira = item.provider === "jira";
   const azure = item.provider === "azure";
@@ -1732,20 +2179,36 @@ export function InboxDetail({
       : null;
   const gitlabKind =
     gitlab && (item.kind === "issue" || item.kind === "pr") ? item.kind : null;
-  const cached = azure ? peekAzureDetails(item) : jira ? peekJiraDetails(item) : linear
-    ? peekLinearIssueDetails(item.id ?? "")
-    : gitlabKind
-      ? peekGitlabWorkItemDetails(item.repo, gitlabKind, item.number)
-      : githubKind
-        ? peekGithubWorkItemDetails(item.projectPath, githubKind, item.number)
-        : null;
-  const cachedThread = azure ? peekAzureThread(item) : jira ? peekJiraThread(item) : linear
-    ? peekLinearIssueThread(item.id ?? "")
-    : gitlabKind
-      ? peekGitlabWorkItemThread(item.repo, gitlabKind, item.number)
-      : githubKind
-        ? peekGithubWorkItemThread(item.projectPath, githubKind, item.number)
-        : null;
+  const cached = azure
+    ? peekAzureDetails(item)
+    : jira
+      ? peekJiraDetails(item)
+      : linear
+        ? peekLinearIssueDetails(item.id ?? "")
+        : gitlabKind
+          ? peekGitlabWorkItemDetails(item.repo, gitlabKind, item.number)
+          : githubKind
+            ? peekGithubWorkItemDetails(
+                item.projectPath,
+                githubKind,
+                item.number,
+              )
+            : null;
+  const cachedThread = azure
+    ? peekAzureThread(item)
+    : jira
+      ? peekJiraThread(item)
+      : linear
+        ? peekLinearIssueThread(item.id ?? "")
+        : gitlabKind
+          ? peekGitlabWorkItemThread(item.repo, gitlabKind, item.number)
+          : githubKind
+            ? peekGithubWorkItemThread(
+                item.projectPath,
+                githubKind,
+                item.number,
+              )
+            : null;
   const [details, setDetails] = useState<GithubWorkItemDetails | null>(cached);
   const [loading, setLoading] = useState(cached == null);
   const [error, setError] = useState<string | null>(null);
@@ -1754,41 +2217,39 @@ export function InboxDetail({
     GithubWorkItemThread | LinearIssueThread | GitlabWorkItemThread | null
   >(cachedThread);
   const [threadLoading, setThreadLoading] = useState(cachedThread == null);
-  const galleryAttachments = [...new Map([
-    ...(details?.attachments ?? []),
-    ...(azure && thread && "attachments" in thread ? thread.attachments ?? [] : []),
-  ].map(file => [file.id, file])).values()];
+  const galleryAttachments = [
+    ...new Map(
+      [
+        ...(details?.attachments ?? []),
+        ...(azure && thread && "attachments" in thread
+          ? (thread.attachments ?? [])
+          : []),
+      ].map((file) => [file.id, file]),
+    ).values(),
+  ];
   const [threadError, setThreadError] = useState<string | null>(null);
   const [replyTo, setReplyTo] = useState<InboxReplyTarget | null>(null);
   const [posting, setPosting] = useState(false);
   const [postError, setPostError] = useState<string | null>(null);
-  const defaultProject =
-    projects.find(
-      (project) =>
-        sameProjectPath(project.path, cwd) ||
-        project.paths.some((path) => sameProjectPath(path, cwd)),
-    )?.path ??
-    projects[0]?.path ??
-    cwd;
-  const [startProject, setStartProject] = useState(defaultProject);
   const context = useInboxContext(item);
   const [sendError, setSendError] = useState("");
   const [retry, setRetry] = useState(0);
-  const chooseStartProject = ticket || (gitlab && !item.projectPath);
   const status = ticket
     ? item.state || inboxItemStatus(item)
     : inboxItemStatus(item);
   const statusMark = inboxStatusMark(item);
 
-  const source = azure ? `${item.site?.split("/").pop()} / ${item.projectName}` : jira ? item.projectName : linear
-    ? item.teamName || item.repo
-    : item.repo || projectName(item.projectPath);
+  const source = azure
+    ? `${item.site?.split("/").pop()} / ${item.projectName}`
+    : jira
+      ? item.projectName
+      : linear
+        ? item.teamName || item.repo
+        : item.repo || projectName(item.projectPath);
   const attentionLabel = gitlab
     ? gitlabAttentionLabel(item.attentionReason ?? "")
     : "";
-  const markdownCwd = chooseStartProject
-    ? startProject || cwd
-    : item.projectPath || cwd;
+  const markdownCwd = item.projectPath || cwd;
   const authorName = details?.author?.trim() ?? "";
   const extraAssignees = item.assignees.filter(
     (person) =>
@@ -1813,13 +2274,21 @@ export function InboxDetail({
 
   useEffect(() => {
     let cancelled = false;
-    const cachedDetails = azure ? peekAzureDetails(item) : jira ? peekJiraDetails(item) : linear
-      ? peekLinearIssueDetails(item.id ?? "")
-      : gitlabKind
-        ? peekGitlabWorkItemDetails(item.repo, gitlabKind, item.number)
-        : githubKind
-          ? peekGithubWorkItemDetails(item.projectPath, githubKind, item.number)
-          : null;
+    const cachedDetails = azure
+      ? peekAzureDetails(item)
+      : jira
+        ? peekJiraDetails(item)
+        : linear
+          ? peekLinearIssueDetails(item.id ?? "")
+          : gitlabKind
+            ? peekGitlabWorkItemDetails(item.repo, gitlabKind, item.number)
+            : githubKind
+              ? peekGithubWorkItemDetails(
+                  item.projectPath,
+                  githubKind,
+                  item.number,
+                )
+              : null;
     if (cachedDetails) {
       setDetails(cachedDetails);
       setLoading(false);
@@ -1829,15 +2298,19 @@ export function InboxDetail({
       setError(null);
       setDetails(null);
     }
-    const pending = azure ? azureDetails(item) : jira ? jiraDetails(item) : linear
-      ? item.id
-        ? linearIssueDetails(item.id)
-        : Promise.reject(new Error("Missing Linear issue"))
-      : gitlabKind
-        ? gitlabWorkItemDetails(item.repo, gitlabKind, item.number)
-        : githubKind
-          ? githubWorkItemDetails(item.projectPath, githubKind, item.number)
-          : Promise.reject(new Error("Unknown inbox item"));
+    const pending = azure
+      ? azureDetails(item)
+      : jira
+        ? jiraDetails(item)
+        : linear
+          ? item.id
+            ? linearIssueDetails(item.id)
+            : Promise.reject(new Error("Missing Linear issue"))
+          : gitlabKind
+            ? gitlabWorkItemDetails(item.repo, gitlabKind, item.number)
+            : githubKind
+              ? githubWorkItemDetails(item.projectPath, githubKind, item.number)
+              : Promise.reject(new Error("Unknown inbox item"));
     void pending
       .then((next) => {
         if (cancelled) return;
@@ -1872,7 +2345,11 @@ export function InboxDetail({
     let cancelled = false;
     if (ticket) {
       const id = item.id ?? "";
-      const cachedThread = azure ? peekAzureThread(item) : jira ? peekJiraThread(item) : peekLinearIssueThread(id);
+      const cachedThread = azure
+        ? peekAzureThread(item)
+        : jira
+          ? peekJiraThread(item)
+          : peekLinearIssueThread(id);
       if (cachedThread) {
         setThread(cachedThread);
         setThreadLoading(false);
@@ -1882,7 +2359,13 @@ export function InboxDetail({
         setThreadError(null);
         setThread(null);
       }
-      void (azure ? azureThread(item) : jira ? jiraThread(item) : linearIssueThread(id))
+      void (
+        azure
+          ? azureThread(item)
+          : jira
+            ? jiraThread(item)
+            : linearIssueThread(id)
+      )
         .then((next) => {
           if (cancelled) return;
           setThread(next);
@@ -2040,330 +2523,575 @@ export function InboxDetail({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      <div data-inbox-detail-header className="relative z-10 shrink-0 border-b border-content/10">
-      <div className="mx-auto flex w-full max-w-5xl flex-col gap-2.5 px-8 pt-5 pb-5">
-      <header className="flex flex-col gap-3">
-        <div className="flex items-center gap-2 text-[12px] text-content/50">
-          <InboxProviderMark provider={item.provider} className="size-3.5" />
-          {azure ? null : <span>
-            {item.kind === "pr"
-              ? gitlab
-                ? "Merge request"
-                : "Pull request"
-              : "Issue"}
-          </span>}
-          <span className="tabular-nums">{inboxItemRef(item)}</span>
-          <span className={`flex items-center gap-1 ${statusMark.className}`}>
-            <statusMark.Icon className="size-3.5" strokeWidth={1.75} />
-            {status}
-          </span>
-          {attentionLabel ? (
-            <span className="shrink-0 text-accent">{attentionLabel}</span>
-          ) : null}
-          {source ? <span className="truncate">{source}</span> : null}
-        </div>
-        <h1 title={item.title}
-          className="line-clamp-2 text-[20px] font-semibold leading-tight text-content">
-          {item.title}
-        </h1>
-        <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-[12px] text-content/50">
-          {authorName ? (
-            <InboxPerson
-              name={authorName}
-              avatarUrl={inboxPersonAvatarUrl(
-                item.provider,
-                authorName,
-                details?.authorAvatarUrl,
-              )}
-              size={16}
-            />
-          ) : null}
-          {showAssignment ? (
-            <>
-              {authorName ? <span aria-hidden>·</span> : null}
-              {extraAssignees.length > 0 ? (
-                <span className="flex min-w-0 flex-wrap items-center gap-2">
-                  {extraAssignees.map((person) => (
-                    <InboxPerson
-                      key={person.login}
-                      name={person.login}
-                      avatarUrl={inboxPersonAvatarUrl(
-                        item.provider,
-                        person.login,
-                        person.avatarUrl,
-                      )}
-                      size={16}
-                    />
-                  ))}
+      <div
+        data-inbox-detail-header
+        className="relative z-10 shrink-0 border-b border-content/10"
+      >
+        <div className="mx-auto flex w-full max-w-5xl flex-col gap-2.5 px-8 pt-5 pb-5">
+          <header className="flex flex-col gap-3">
+            <div className="flex items-center gap-2 text-[12px] text-content/50">
+              <InboxProviderMark
+                provider={item.provider}
+                className="size-3.5"
+              />
+              {azure ? null : (
+                <span>
+                  {item.kind === "pr"
+                    ? gitlab
+                      ? "Merge request"
+                      : "Pull request"
+                    : "Issue"}
                 </span>
-              ) : (
-                <span>Unassigned</span>
               )}
-            </>
-          ) : null}
-          {formatRelativeTime(item.updatedAt) ? (
-            <>
-              <span aria-hidden>·</span>
-              <span>Updated {formatRelativeTime(item.updatedAt)}</span>
-            </>
-          ) : null}
-          {baseRef && headRef ? (
-            <>
-              <span aria-hidden>·</span>
-              <span className="inline-flex min-w-0 items-center gap-1">
-                <GitCompare className="size-3 shrink-0" strokeWidth={1.75} />
-                <span className="min-w-0 truncate">
-                  {baseRef} ← {headRef}
-                </span>
+              <span className="tabular-nums">{inboxItemRef(item)}</span>
+              <span
+                className={`flex items-center gap-1 ${statusMark.className}`}
+              >
+                <statusMark.Icon className="size-3.5" strokeWidth={1.75} />
+                {status}
               </span>
-            </>
-          ) : null}
-          {reviewLabel ? (
-            <>
-              <span aria-hidden>·</span>
-              <span className={reviewClass}>{reviewLabel}</span>
-            </>
-          ) : null}
-        </div>
-        {relatedSessions.length > 0 ? (
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="mr-0.5 inline-flex items-center gap-1 text-[11px] text-content/45">
-              <MessageMultiple className="size-3.5" strokeWidth={1.75} />
-              Related {relatedSessions.length === 1 ? "thread" : "threads"}
-            </span>
-            {relatedSessions.map((session) => {
-              const title = sessionDisplayTitle(session.title, session.harness);
-              return (
-                <span key={session.id} className="inline-flex items-center gap-0.5">
-                <button
-                  type="button"
-                  title={`Open thread: ${title}`}
-                  onClick={() => void onOpenSession?.(session.id)}
-                  className="inline-flex max-w-64 items-center gap-1 rounded-md bg-content/5 px-2 py-1 text-[11px] text-content/70 hover:bg-content/10 hover:text-content"
-                >
-                  <span className="truncate">{title}</span>
-                  {session.archived ? (
-                    <span className="shrink-0 text-content/40">Archived</span>
-                  ) : null}
-                </button>                  {onOpenDelivery && session.cwd ? ([['pr', 'PRs'], ['ci', 'CI']] as const).map(([kind, label]) => (
-                    <button key={kind} type="button" aria-label={`${label} for ${title}`} title={`${label} · ${session.cwd}`} disabled={deliveryBusy}
-                      className="h-6 rounded-md px-1.5 text-[11px] text-content/50 hover:bg-content/5 hover:text-content focus-visible:outline-accent disabled:opacity-40"
-                      onClick={() => void openDelivery(session.id, kind)}>{deliveryProvider(session.id, kind) === "github" ? `GitHub ${label} ↗` : deliveryProvider(session.id, kind) === "azure" ? `Azure ${label}` : deliveryProvider(session.id, kind) === "gitlab" ? `GitLab ${label}` : `Choose ${label}`}</button>
-                  )) : null}
-                  {onOpenDelivery && session.cwd ? <button type="button" aria-label={`Delivery providers for ${title}`} className="h-6 rounded-md px-1.5 text-[11px] text-content/40 hover:bg-content/5" onClick={() => setChoosingProviders(choosingProviders === session.id ? null : session.id)}>Providers</button> : null}
-                  {choosingProviders === session.id ? <span className="flex flex-wrap items-center gap-2 rounded-md border border-content/10 p-2">
-                    {([['pr', 'PR provider'], ['ci', 'CI provider']] as const).map(([kind, label]) => <span key={kind} className="text-[11px] text-content/60">{label}<Select label={`${label} for ${title}`} value={deliveryProvider(session.id, kind) ?? ""} options={[{value:"", label:item.provider === "github" || item.provider === "azure" || item.provider === "gitlab" ? "Use ticket provider" : "Choose provider"}, {value:"github",label:kind === "pr" ? "GitHub" : "GitHub checks"}, {value:"azure",label:kind === "pr" ? "Azure Repos" : "Azure Pipelines"}, ...(kind === "pr" ? [{value:"gitlab",label:"GitLab"}] : [])]} onChange={value => saveProvider(session.id, kind, value)} /></span>)}
-                    <button type="button" className="px-2 py-1 text-[11px]" onClick={() => setChoosingProviders(null)}>Done</button>
-                  </span> : null}
-                </span>
-              );
-            })}
-          </div>
-        ) : null}
-        {deliveryBusy ? <p role="status" className="text-[11px] text-content/50">Opening review…</p> : null}
-        {deliveryError ? <p role="alert" className="text-[12px] text-content/70">{deliveryError}</p> : null}
-        <div className="flex flex-wrap items-center gap-2 pt-1">
-          {onStartTask && item.kind !== "pr" ? (
-            <>
-              <button
-                type="button"
-                disabled={
-                  context.busy
-                }
-                onClick={() => {
-                  setSendError("");
-                  void Promise.resolve(onStartTask(chooseStartProject ? { ...item, projectPath: startProject } : item, null)).catch(reason => setSendError(String(reason)));
-                }}
-                className={`${ACTION_FILLED} disabled:cursor-default disabled:opacity-40`}
-              >
-                Send to agent
-              </button>
-              <button
-                ref={sendAnchor}
-                type="button"
-                disabled={context.busy}
-                title="Send to a task"
-                aria-label="Send to a task"
-                aria-expanded={sendMenu}
-                onClick={() => setSendMenu(true)}
-                className={`${ACTION_FILLED} -ml-1.5 !px-1.5 disabled:cursor-default disabled:opacity-40`}
-              >
-                <ChevronDown className="size-3.5" strokeWidth={1.75} />
-              </button>
-              {chooseStartProject ? <InboxProjectPicker projects={projects} value={startProject} onChange={setStartProject} /> : null}
-              {sendMenu ? (
-                <SendTargetMenu
-                  anchor={sendAnchor}
-                  onPick={(taskId) => {
-                    setSendMenu(false);
-                    onStartTask?.(chooseStartProject ? { ...item, projectPath: startProject } : item, taskId);
-                  }}
-                  onClose={() => setSendMenu(false)}
+              {attentionLabel ? (
+                <span className="shrink-0 text-accent">{attentionLabel}</span>
+              ) : null}
+              {source ? <span className="truncate">{source}</span> : null}
+            </div>
+            <h1
+              title={item.title}
+              className="line-clamp-2 text-[20px] font-semibold leading-tight text-content"
+            >
+              {item.title}
+            </h1>
+            <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-[12px] text-content/50">
+              {authorName ? (
+                <InboxPerson
+                  name={authorName}
+                  avatarUrl={inboxPersonAvatarUrl(
+                    item.provider,
+                    authorName,
+                    details?.authorAvatarUrl,
+                  )}
+                  size={16}
                 />
               ) : null}
-            </>
-          ) : null}
-          <button
-            type="button"
-            disabled={context.busy}
-            onClick={() => {
-              context.open("ask");
-            }}
-            className={item.kind === "pr" ? ACTION_FILLED : ACTION_OUTLINE}
-          >
-            <MessageSquare className="size-3.5" strokeWidth={1.75} /> Ask agent
-          </button>
-          {isPr && (item.provider === "github" || gitlab) ? <button type="button" className={ACTION_OUTLINE} onClick={() => setTab("code")}>Review PR</button> : null}
-          {item.provider === "github" && item.kind === "pr" && item.repo ? (
-            <button
-              type="button"
-              className={ACTION_GHOST}
-              title="Watch reviews and checks on this PR"
-              onClick={() =>
-                openWatchSheet({
-                  source: {
-                    kind: "github-pr",
-                    cwd: item.projectPath,
-                    repo: item.repo,
-                    number: item.number,
-                  },
-                  name: `Reviews · ${item.repo}#${item.number}`,
-                })
+              {showAssignment ? (
+                <>
+                  {authorName ? <span aria-hidden>·</span> : null}
+                  {extraAssignees.length > 0 ? (
+                    <span className="flex min-w-0 flex-wrap items-center gap-2">
+                      {extraAssignees.map((person) => (
+                        <InboxPerson
+                          key={person.login}
+                          name={person.login}
+                          avatarUrl={inboxPersonAvatarUrl(
+                            item.provider,
+                            person.login,
+                            person.avatarUrl,
+                          )}
+                          size={16}
+                        />
+                      ))}
+                    </span>
+                  ) : (
+                    <span>Unassigned</span>
+                  )}
+                </>
+              ) : null}
+              {formatRelativeTime(item.updatedAt) ? (
+                <>
+                  <span aria-hidden>·</span>
+                  <span>Updated {formatRelativeTime(item.updatedAt)}</span>
+                </>
+              ) : null}
+              {baseRef && headRef ? (
+                <>
+                  <span aria-hidden>·</span>
+                  <span className="inline-flex min-w-0 items-center gap-1">
+                    <GitCompare
+                      className="size-3 shrink-0"
+                      strokeWidth={1.75}
+                    />
+                    <span className="min-w-0 truncate">
+                      {baseRef} ← {headRef}
+                    </span>
+                  </span>
+                </>
+              ) : null}
+              {reviewLabel ? (
+                <>
+                  <span aria-hidden>·</span>
+                  <span className={reviewClass}>{reviewLabel}</span>
+                </>
+              ) : null}
+            </div>
+            {relatedSessions.length > 0 ? (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="mr-0.5 inline-flex items-center gap-1 text-[11px] text-content/45">
+                  <MessageMultiple className="size-3.5" strokeWidth={1.75} />
+                  Related {relatedSessions.length === 1 ? "thread" : "threads"}
+                </span>
+                {threadGroups.map((group) => (
+                  <Fragment key={group.key || group.sessions[0].id}>
+                    {group.sessions.map((session) => (
+                      <RelatedThreadChip
+                        key={session.id}
+                        session={session}
+                        onOpen={() =>
+                          void Promise.resolve(
+                            onOpenSession?.(session.id),
+                          ).catch((reason) => setSendError(String(reason)))
+                        }
+                      />
+                    ))}
+                  </Fragment>
+                ))}
+                {choosingProviders
+                  ? (() => {
+                      const group = threadGroups.find(
+                        (entry) => entry.key === choosingProviders,
+                      );
+                      if (!group) return null;
+                      const title =
+                        peekProjectDiffStats(group.cwd)?.branch?.trim() ||
+                        projectName(group.cwd);
+                      return (
+                        <span className="flex w-full flex-wrap items-center gap-2 rounded-md border border-content/10 p-2">
+                          {(
+                            [
+                              ["pr", "PR provider"],
+                              ["ci", "CI provider"],
+                            ] as const
+                          ).map(([kind, label]) => (
+                            <span
+                              key={kind}
+                              className="text-[11px] text-content/60"
+                            >
+                              {label}
+                              <Select
+                                label={`${label} for ${title}`}
+                                value={
+                                  deliveryProviders[
+                                    providerKey(group.key, kind)
+                                  ] ?? ""
+                                }
+                                options={[
+                                  {
+                                    value: "",
+                                    label:
+                                      item.provider === "github" ||
+                                      item.provider === "azure" ||
+                                      item.provider === "gitlab"
+                                        ? "Use ticket provider"
+                                        : "Choose provider",
+                                  },
+                                  {
+                                    value: "github",
+                                    label:
+                                      kind === "pr"
+                                        ? "GitHub"
+                                        : "GitHub checks",
+                                  },
+                                  {
+                                    value: "azure",
+                                    label:
+                                      kind === "pr"
+                                        ? "Azure Repos"
+                                        : "Azure Pipelines",
+                                  },
+                                  ...(kind === "pr"
+                                    ? [{ value: "gitlab", label: "GitLab" }]
+                                    : []),
+                                ]}
+                                onChange={(value) =>
+                                  saveProvider(group.key, kind, value)
+                                }
+                              />
+                            </span>
+                          ))}
+                          <button
+                            type="button"
+                            className="px-2 py-1 text-[11px]"
+                            onClick={() => setChoosingProviders(null)}
+                          >
+                            Done
+                          </button>
+                        </span>
+                      );
+                    })()
+                  : null}
+              </div>
+            ) : null}
+            {onOpenDelivery &&
+            threadGroups.some(
+              (group) =>
+                group.key &&
+                group.cwd !== "~" &&
+                group.sessions.some((entry) => !isAskThread(entry)),
+            ) ? (
+              <div className="space-y-0.5">
+                <span className="inline-flex items-center gap-1 px-1 text-[11px] text-content/45">
+                  <GitBranch className="size-3.5" strokeWidth={1.75} />
+                  Branches
+                </span>
+                {threadGroups.map((group) => {
+                  // "~" and cwd-less threads have no checkout to resolve against.
+                  if (!group.key || group.cwd === "~") return null;
+                  // The copy's delivery tab needs a workspace host — an ask
+                  // thread can't mount it; identity only picks where the review
+                  // opens, not which branch's PR/CI shows (that's the cwd's).
+                  const host =
+                    group.sessions.find(
+                      (entry) =>
+                        entry.id === viewingSessionId && !isAskThread(entry),
+                    ) ??
+                    group.sessions.find(
+                      (entry) => !entry.archived && !isAskThread(entry),
+                    ) ??
+                    group.sessions.find((entry) => !isAskThread(entry));
+                  if (!host) return null;
+                  const branch = peekProjectDiffStats(
+                    group.cwd,
+                  )?.branch?.trim();
+                  // Scope links to the host session — the opened surface filters
+                  // by its source session, so a wider count would over-promise.
+                  const links = sessionDeliveryLinks({
+                    cwd: group.cwd,
+                    branches: [
+                      branch,
+                      ...group.sessions.map((entry) => entry.branch),
+                    ],
+                    sessionIds: [host.id],
+                    githubPr: cachedBranchPr(group.cwd, branch),
+                    stores,
+                  });
+                  const delivery = deliveryFromLinks(links);
+                  // Saved pick → the provider that actually has links → ticket.
+                  const inferred = (kind: "pr" | "ci") =>
+                    kind === "pr"
+                      ? links.prs.length
+                        ? ("azure" as const)
+                        : links.githubPr
+                          ? ("github" as const)
+                          : undefined
+                      : links.ci.length
+                        ? ("azure" as const)
+                        : links.githubPr
+                          ? ("github" as const)
+                          : undefined;
+                  return (
+                    <BranchDeliveryRow
+                      key={group.key}
+                      cwd={group.cwd}
+                      branch={branch}
+                      delivery={delivery}
+                      busy={deliveryBusy}
+                      providerFor={(kind) =>
+                        deliveryProvider(group.key, kind, inferred(kind))
+                      }
+                      onOpen={(kind) =>
+                        void openDelivery(
+                          host.id,
+                          group.key,
+                          kind,
+                          inferred(kind),
+                        )
+                      }
+                      onChooseProviders={() => setChoosingProviders(group.key)}
+                    />
+                  );
+                })}
+              </div>
+            ) : null}
+            {deliveryBusy ? (
+              <p role="status" className="text-[11px] text-content/50">
+                Opening review…
+              </p>
+            ) : null}
+            {deliveryError ? (
+              <p role="alert" className="text-[12px] text-content/70">
+                {deliveryError}
+              </p>
+            ) : null}
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              {onStartTask && item.kind !== "pr" ? (
+                <>
+                  <button
+                    type="button"
+                    disabled={context.busy}
+                    onClick={() => {
+                      setSendError("");
+                      void Promise.resolve(onStartTask(item, null)).catch(
+                        (reason) => setSendError(String(reason)),
+                      );
+                    }}
+                    className={`${ACTION_FILLED} disabled:cursor-default disabled:opacity-40`}
+                  >
+                    Send to agent
+                  </button>
+                  <button
+                    ref={sendAnchor}
+                    type="button"
+                    disabled={context.busy}
+                    title="Send to a task"
+                    aria-label="Send to a task"
+                    aria-expanded={sendMenu}
+                    onClick={() => setSendMenu(true)}
+                    className={`${ACTION_FILLED} -ml-1.5 !px-1.5 disabled:cursor-default disabled:opacity-40`}
+                  >
+                    <ChevronDown className="size-3.5" strokeWidth={1.75} />
+                  </button>
+                  {sendMenu ? (
+                    <SendTargetMenu
+                      anchor={sendAnchor}
+                      liveIds={liveIds}
+                      onPick={(taskId) => {
+                        setSendMenu(false);
+                        void Promise.resolve(onStartTask?.(item, taskId)).catch(
+                          (reason) => setSendError(String(reason)),
+                        );
+                      }}
+                      onPickFresh={(taskId) => {
+                        setSendMenu(false);
+                        void Promise.resolve(
+                          onStartTask?.(item, taskId, { freshSession: true }),
+                        ).catch((reason) => setSendError(String(reason)));
+                      }}
+                      onClose={() => setSendMenu(false)}
+                    />
+                  ) : null}
+                </>
+              ) : null}
+              <button
+                type="button"
+                disabled={context.busy}
+                onClick={() => {
+                  context.open("ask");
+                }}
+                className={item.kind === "pr" ? ACTION_FILLED : ACTION_OUTLINE}
+              >
+                <MessageSquare className="size-3.5" strokeWidth={1.75} /> Ask
+                agent
+              </button>
+              {isPr && (item.provider === "github" || gitlab) ? (
+                <button
+                  type="button"
+                  className={ACTION_OUTLINE}
+                  onClick={() => setTab("code")}
+                >
+                  Review PR
+                </button>
+              ) : null}
+              {item.provider === "github" && item.kind === "pr" && item.repo ? (
+                <button
+                  type="button"
+                  className={ACTION_GHOST}
+                  title="Watch reviews and checks on this PR"
+                  onClick={() =>
+                    openWatchSheet({
+                      source: {
+                        kind: "github-pr",
+                        cwd: item.projectPath,
+                        repo: item.repo,
+                        number: item.number,
+                      },
+                      name: `Reviews · ${item.repo}#${item.number}`,
+                    })
+                  }
+                >
+                  <Zap className="size-3.5" strokeWidth={1.75} /> Watch
+                </button>
+              ) : null}
+              <button
+                type="button"
+                onClick={() => void openUrl(item.url)}
+                className={ACTION_GHOST}
+              >
+                <ExternalLink className="size-3.5" strokeWidth={1.75} />
+                {item.kind === "pr"
+                  ? gitlab
+                    ? "Open on GitLab"
+                    : "Open on GitHub"
+                  : azure
+                    ? "Open in Azure DevOps"
+                    : jira
+                      ? "Open in Jira"
+                      : linear
+                        ? "Open in Linear"
+                        : gitlab
+                          ? "Open on GitLab"
+                          : "Open on GitHub"}
+              </button>
+            </div>
+            {sendError ? (
+              <p role="alert" className="text-[12px] text-red-400">
+                {sendError}
+              </p>
+            ) : null}
+            <InboxContextPicker
+              context={context}
+              destination={
+                <span className="truncate" title={item.projectPath}>
+                  {projectName(item.projectPath)}
+                </span>
               }
+              onConfirm={async (card) => {
+                await onDiscuss?.(card);
+              }}
+            />
+            {(jira || azure) && error && details ? (
+              <p role="status" className="text-[12px] text-content/50">
+                {error}{" "}
+                <button
+                  type="button"
+                  className={ACTION_GHOST}
+                  onClick={() => setRetry((value) => value + 1)}
+                >
+                  Retry
+                </button>
+              </p>
+            ) : null}
+          </header>
+          {isPr && (item.provider === "github" || gitlab) ? (
+            <div
+              role="tablist"
+              aria-label={
+                gitlab ? "Merge request sections" : "Pull request sections"
+              }
+              className="flex h-9 gap-4 items-stretch border-b border-content/10"
             >
-              <Zap className="size-3.5" strokeWidth={1.75} /> Watch
-            </button>
-          ) : null}
-          <button
-            type="button"
-            onClick={() => void openUrl(item.url)}
-            className={ACTION_GHOST}
-          >
-            <ExternalLink className="size-3.5" strokeWidth={1.75} />
-            {item.kind === "pr"
-              ? gitlab
-                ? "Open on GitLab"
-                : "Open on GitHub"
-              : azure ? "Open in Azure DevOps" : jira ? "Open in Jira" : linear
-                ? "Open in Linear"
-                : gitlab
-                  ? "Open on GitLab"
-                  : "Open on GitHub"}
-          </button>
-        </div>
-        {sendError ? <p role="alert" className="text-[12px] text-red-400">{sendError}</p> : null}
-        <InboxContextPicker context={context}
-          destination={chooseStartProject ? <InboxProjectPicker projects={projects} value={startProject} onChange={setStartProject} /> : <span className="truncate" title={item.projectPath}>{projectName(item.projectPath)}</span>}
-          onConfirm={async (card) => {
-            await onDiscuss?.(card);
-          }} />
-        {(jira || azure) && error && details ? <p role="status" className="text-[12px] text-content/50">{error} <button type="button" className={ACTION_GHOST} onClick={() => setRetry(value => value + 1)}>Retry</button></p> : null}
-      </header>
-      {isPr && (item.provider === "github" || gitlab) ? (
-        <div
-          role="tablist"
-          aria-label={
-            gitlab ? "Merge request sections" : "Pull request sections"
-          }
-          className="flex h-9 gap-4 items-stretch border-b border-content/10"
-        >
-          <InboxDetailTab
-            label="Summary"
-            selected={tab === "summary"}
-            onSelect={() => setTab("summary")}
-          />
-          <InboxDetailTab
-            label="Code"
-            selected={tab === "code"}
-            onSelect={() => setTab("code")}
-          />
-        </div>
-      ) : (
-        <div className="border-t border-content/10" />
-      )}
-      </div>
-      </div>
-      <div ref={detailLock} data-inbox-detail-scroll className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-none">
-      <div className="mx-auto flex w-full max-w-5xl flex-col gap-5 px-8 py-5">
-        {item.labels.length > 0 ? (
-          <div className="flex flex-wrap gap-1">
-            {item.labels.map((label) => (
-              <InboxLabel key={label.name} label={label} />
-            ))}
-          </div>
-        ) : null}
-      {isPr && tab === "code" ? (
-        item.provider === "github" ? (
-          <GithubPrReview
-            key={`${item.projectPath}:${item.repo}:${item.number}:${revision}`}
-            embedded
-            cwd={item.projectPath}
-            repo={item.repo}
-            number={item.number}
-            enabled
-            onClose={() => undefined}
-          />
-        ) : gitlab ? (
-          <GitlabMrReview
-            key={`${item.projectPath}:${item.repo}:${item.number}:${revision}`}
-            embedded
-            cwd={item.projectPath}
-            repo={item.repo}
-            number={item.number}
-            enabled
-            onClose={() => undefined}
-          />
-        ) : null
-      ) : loading ? (
-        <div className="flex justify-center py-10 text-content/40">
-          <LoaderCircle className="size-4 animate-spin" strokeWidth={1.75} />
-        </div>
-      ) : error && !details ? (
-        <div className="text-[13px] text-content/50">{error}{jira || azure ? <button type="button" className={ACTION_GHOST} onClick={() => setRetry(value => value + 1)}>Retry</button> : null}</div>
-      ) : (
-        <>
-          {details?.body.trim() ? (
-            <AgentMarkdown
-              text={details.body}
-              cwd={markdownCwd}
-              allowRemoteMedia
-            />
+              <InboxDetailTab
+                label="Summary"
+                selected={tab === "summary"}
+                onSelect={() => setTab("summary")}
+              />
+              <InboxDetailTab
+                label="Code"
+                selected={tab === "code"}
+                onSelect={() => setTab("code")}
+              />
+            </div>
           ) : (
-            <p className="text-[13px] text-content/45">No description</p>
+            <div className="border-t border-content/10" />
           )}
-          {(jira || azure) && galleryAttachments.length ? <TicketImages key={`${item.site}:${item.id}:${revision}`} item={item} attachments={galleryAttachments} /> : null}
-          {myWork?.hasWork ? (
-            <InboxMyWorkSection
-              work={myWork}
-              onOpenSession={onOpenSession}
-              onOpenDelivery={onOpenDelivery}
-              onOpenAttention={onAttentionAction}
-            />
-          ) : null}
-          <InboxRelated key={`related:${inboxItemKey(item)}:${revision}`} item={item} />
-          <InboxComments
-            thread={thread}
-            loading={threadLoading}
-            error={threadError}
-            cwd={markdownCwd}
-            provider={item.provider}
-            replyMode={linear ? "parent" : gitlab ? undefined : "thread"}
-            onReply={jira || azure ? undefined : setReplyTo}
-          />
-          {(jira || azure) && threadError ? <button type="button" className={ACTION_GHOST} onClick={() => setRetry(value => value + 1)}>Retry comments</button> : null}
-          {jira || azure ? null : <InboxCommentForm
-            replyTo={replyTo}
-            posting={posting}
-            error={postError}
-            onCancelReply={() => {
-              setReplyTo(null);
-              setPostError(null);
-            }}
-            onSubmit={postComment}
-          />}
-        </>
-      )}
+        </div>
       </div>
+      <div
+        ref={detailLock}
+        data-inbox-detail-scroll
+        className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-none"
+      >
+        <div className="mx-auto flex w-full max-w-5xl flex-col gap-5 px-8 py-5">
+          {item.labels.length > 0 ? (
+            <div className="flex flex-wrap gap-1">
+              {item.labels.map((label) => (
+                <InboxLabel key={label.name} label={label} />
+              ))}
+            </div>
+          ) : null}
+          {isPr && tab === "code" ? (
+            item.provider === "github" ? (
+              <GithubPrReview
+                key={`${item.projectPath}:${item.repo}:${item.number}:${revision}`}
+                embedded
+                cwd={item.projectPath}
+                repo={item.repo}
+                number={item.number}
+                enabled
+                onClose={() => undefined}
+              />
+            ) : gitlab ? (
+              <GitlabMrReview
+                key={`${item.projectPath}:${item.repo}:${item.number}:${revision}`}
+                embedded
+                cwd={item.projectPath}
+                repo={item.repo}
+                number={item.number}
+                enabled
+                onClose={() => undefined}
+              />
+            ) : null
+          ) : loading ? (
+            <div className="flex justify-center py-10 text-content/40">
+              <LoaderCircle
+                className="size-4 animate-spin"
+                strokeWidth={1.75}
+              />
+            </div>
+          ) : error && !details ? (
+            <div className="text-[13px] text-content/50">
+              {error}
+              {jira || azure ? (
+                <button
+                  type="button"
+                  className={ACTION_GHOST}
+                  onClick={() => setRetry((value) => value + 1)}
+                >
+                  Retry
+                </button>
+              ) : null}
+            </div>
+          ) : (
+            <>
+              {details?.body.trim() ? (
+                <AgentMarkdown
+                  text={details.body}
+                  cwd={markdownCwd}
+                  allowRemoteMedia
+                />
+              ) : (
+                <p className="text-[13px] text-content/45">No description</p>
+              )}
+              {(jira || azure) && galleryAttachments.length ? (
+                <TicketImages
+                  key={`${item.site}:${item.id}:${revision}`}
+                  item={item}
+                  attachments={galleryAttachments}
+                />
+              ) : null}
+              {myWork?.hasWork ? (
+                <InboxMyWorkSection
+                  work={myWork}
+                  onOpenSession={onOpenSession}
+                  onOpenDelivery={onOpenDelivery}
+                  onOpenAttention={onAttentionAction}
+                />
+              ) : null}
+              <InboxRelated
+                key={`related:${inboxItemKey(item)}:${revision}`}
+                item={item}
+              />
+              <InboxComments
+                thread={thread}
+                loading={threadLoading}
+                error={threadError}
+                cwd={markdownCwd}
+                provider={item.provider}
+                replyMode={linear ? "parent" : gitlab ? undefined : "thread"}
+                onReply={jira || azure ? undefined : setReplyTo}
+              />
+              {(jira || azure) && threadError ? (
+                <button
+                  type="button"
+                  className={ACTION_GHOST}
+                  onClick={() => setRetry((value) => value + 1)}
+                >
+                  Retry comments
+                </button>
+              ) : null}
+              {jira || azure ? null : (
+                <InboxCommentForm
+                  replyTo={replyTo}
+                  posting={posting}
+                  error={postError}
+                  onCancelReply={() => {
+                    setReplyTo(null);
+                    setPostError(null);
+                  }}
+                  onSubmit={postComment}
+                />
+              )}
+            </>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -2419,102 +3147,6 @@ function InboxPerson({
   );
 }
 
-function InboxProjectPicker({
-  projects,
-  value,
-  onChange,
-}: {
-  projects: InboxProjectOption[];
-  value: string;
-  onChange: (path: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const button = useRef<HTMLButtonElement>(null);
-  const menu = useRef<HTMLDivElement>(null);
-  const selected =
-    projects.find(
-      (project) =>
-        sameProjectPath(project.path, value) ||
-        project.paths.some((path) => sameProjectPath(path, value)),
-    ) ?? projects[0] ?? null;
-
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (event: PointerEvent) => {
-      const target = event.target as Node;
-      if (button.current?.contains(target) || menu.current?.contains(target)) {
-        return;
-      }
-      setOpen(false);
-    };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      setOpen(false);
-    };
-    window.addEventListener("pointerdown", onPointerDown);
-    window.addEventListener("keydown", onKey, true);
-    return () => {
-      window.removeEventListener("pointerdown", onPointerDown);
-      window.removeEventListener("keydown", onKey, true);
-    };
-  }, [open]);
-
-  return (
-    <div className="relative">
-      <button
-        ref={button}
-        type="button"
-        disabled={projects.length === 0}
-        onClick={() => setOpen((next) => !next)}
-        className="inline-flex h-7 max-w-48 items-center gap-1.5 rounded-md border border-content/10 bg-content/5 px-2 text-[12px] text-content/80 hover:bg-content/10 hover:text-content disabled:cursor-default disabled:opacity-40"
-      >
-        {selected ? <InboxProjectMark project={selected} /> : null}
-        <span className="min-w-0 truncate">
-          {selected?.name ?? "Choose project"}
-        </span>
-        <ChevronDown
-          className="size-3 shrink-0 text-content/45"
-          strokeWidth={1.75}
-        />
-      </button>
-      {open ? (
-        <div
-          ref={menu}
-          role="listbox"
-          className="absolute left-0 top-full z-30 mt-1 max-h-64 min-w-full max-w-64 overflow-y-auto rounded-lg border border-content/10 bg-background-base/55 p-1 shadow-xl backdrop-blur-xl outline-none"
-        >
-          {projects.map((project) => {
-            const active = selected
-              ? project.key === selected.key
-              : false;
-            return (
-              <button
-                key={project.key}
-                type="button"
-                role="option"
-                aria-selected={active}
-                onClick={() => {
-                  onChange(project.path);
-                  setOpen(false);
-                }}
-                className={`flex h-7 w-full items-center gap-1.5 rounded-md px-2 text-left text-[12px] ${
-                  active
-                    ? "bg-content/10 text-content"
-                    : "text-content/80 hover:bg-content/5 hover:text-content"
-                }`}
-              >
-                <InboxProjectMark project={project} />
-                <span className="min-w-0 truncate">{project.name}</span>
-              </button>
-            );
-          })}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 function InboxLabel({
   label,
   compact = false,
@@ -2547,15 +3179,217 @@ function labelColor(value: string): string | null {
   return `#${hex}`;
 }
 
+/** One related thread — a chip that opens the session. Delivery actions
+ * live on the per-branch `BranchDeliveryRow` in the Branches section. */
+function RelatedThreadChip({
+  session,
+  onOpen,
+}: {
+  session: SessionSummary;
+  onOpen: () => void;
+}) {
+  const title = sessionDisplayTitle(session.title, session.harness);
+  return (
+    <span className="inline-flex items-stretch overflow-hidden rounded-md bg-content/5 text-[11px] text-content/70">
+      <button
+        type="button"
+        title={`Open thread: ${title}`}
+        onClick={onOpen}
+        className="inline-flex max-w-64 items-center gap-1 px-2 py-1 hover:bg-content/10 hover:text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+      >
+        <span className="truncate">{title}</span>
+        {session.archived ? (
+          <span className="shrink-0 text-content/40">Archived</span>
+        ) : null}
+      </button>
+    </span>
+  );
+}
+
+/** Live `Session` objects flow through `SessionSummary` lists structurally —
+ * an ask thread carries `inboxAsk` even though the summary type omits it. */
+const isAskThread = (session: SessionSummary) =>
+  "inboxAsk" in session && session.inboxAsk != null;
+
+/** A working-copy row in the item's branch overview: branch name, compact
+ * PR/CI status badges (saved links + caches — no fetch), and a chevron menu
+ * with the open/provider actions. */
+function BranchDeliveryRow({
+  cwd,
+  branch,
+  delivery,
+  busy,
+  providerFor,
+  onOpen,
+  onChooseProviders,
+}: {
+  cwd: string;
+  branch: string | undefined;
+  delivery: TaskChildDelivery;
+  busy: boolean;
+  providerFor: (kind: "pr" | "ci") => "github" | "azure" | "gitlab" | undefined;
+  onOpen: (kind: "pr" | "ci") => void;
+  onChooseProviders: () => void;
+}) {
+  const [menu, setMenu] = useState(false);
+  const anchor = useRef<HTMLButtonElement>(null);
+  const label = branch || projectName(cwd);
+  const providerName = (kind: "pr" | "ci") => {
+    const provider = providerFor(kind);
+    return provider === "github"
+      ? "GitHub"
+      : provider === "azure"
+        ? "Azure"
+        : provider === "gitlab"
+          ? "GitLab"
+          : undefined;
+  };
+  const open = (kind: "pr" | "ci") =>
+    providerFor(kind) ? onOpen(kind) : onChooseProviders();
+  const badge =
+    "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] leading-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent disabled:opacity-50";
+  const itemClass =
+    "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5 disabled:opacity-50";
+  return (
+    <div className="flex items-center gap-2 px-1 py-0.5">
+      <GitBranch
+        className="size-3.5 shrink-0 text-content/40"
+        strokeWidth={1.75}
+      />
+      <span
+        className="min-w-0 flex-1 truncate text-[12px] text-content/80"
+        title={cwd}
+      >
+        {label}
+        {branch ? (
+          <span className="text-content/40"> · {projectName(cwd)}</span>
+        ) : null}
+      </span>
+      {delivery.prs > 0 ? (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => open("pr")}
+          aria-label={`${delivery.prs} pull request${delivery.prs > 1 ? "s" : ""} on ${label}${delivery.prNeedsAttention ? ", needs review" : ""}`}
+          title={`${delivery.prs} pull request${delivery.prs > 1 ? "s" : ""} on ${label}`}
+          className={`${badge} ${
+            delivery.prNeedsAttention
+              ? "border-red-400/40 text-red-300"
+              : "border-content/15 text-content/60 hover:text-content"
+          }`}
+        >
+          <GitPullRequest className="size-3" strokeWidth={1.75} />
+          {delivery.prs > 1 ? delivery.prs : "PR"}
+          {delivery.prNeedsAttention ? " · needs review" : ""}
+        </button>
+      ) : null}
+      {delivery.ci > 0 ? (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => open("ci")}
+          aria-label={`${delivery.ci} pipeline${delivery.ci > 1 ? "s" : ""} on ${label}${delivery.ciFailing ? ", failing" : delivery.ciRunning ? ", running" : ""}`}
+          title={`${delivery.ci} pipeline${delivery.ci > 1 ? "s" : ""} on ${label}`}
+          className={`${badge} ${
+            delivery.ciFailing
+              ? "border-red-400/40 text-red-300"
+              : delivery.ciRunning
+                ? "border-amber-400/40 text-amber-300"
+                : "border-content/15 text-content/60 hover:text-content"
+          }`}
+        >
+          <Zap className="size-3" strokeWidth={1.75} />
+          {delivery.ci > 1 ? delivery.ci : "CI"}
+          {delivery.ciFailing
+            ? " · failing"
+            : delivery.ciRunning
+              ? " · running"
+              : ""}
+        </button>
+      ) : null}
+      <button
+        ref={anchor}
+        type="button"
+        title={`PRs and CI for ${label}`}
+        aria-label={`Delivery actions for ${label} in ${projectName(cwd)}`}
+        aria-haspopup="menu"
+        aria-expanded={menu}
+        onClick={() => setMenu(true)}
+        className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+      >
+        <ChevronDown className="size-3.5" strokeWidth={1.75} />
+      </button>
+      {menu ? (
+        <Popover
+          anchor={anchor}
+          onDismiss={() => setMenu(false)}
+          role="menu"
+          aria-label={`Delivery for ${label || "branch"}`}
+          className="w-48 overflow-hidden"
+        >
+          <div className="px-1.5 py-1.5">
+            {(["pr", "ci"] as const).map((kind) => {
+              const provider = providerName(kind);
+              const kindLabel = kind === "pr" ? "PRs" : "CI";
+              return (
+                <button
+                  key={kind}
+                  type="button"
+                  role="menuitem"
+                  disabled={busy}
+                  title={
+                    provider
+                      ? `${kindLabel} · ${provider}`
+                      : `Pick a ${kindLabel} provider first`
+                  }
+                  onClick={() => {
+                    setMenu(false);
+                    open(kind);
+                  }}
+                  className={itemClass}
+                >
+                  {provider
+                    ? provider === "GitHub" && kind === "ci"
+                      ? "GitHub checks"
+                      : `${provider} ${kindLabel}`
+                    : `Choose ${kindLabel} provider`}
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setMenu(false);
+                onChooseProviders();
+              }}
+              className={itemClass}
+            >
+              Providers…
+            </button>
+          </div>
+        </Popover>
+      ) : null}
+    </div>
+  );
+}
+
 /** Send-to-agent task targets — picking one links the item onto it; the
  * new-task path is the sibling "Send to agent" button. */
 function SendTargetMenu({
   anchor,
+  liveIds,
   onPick,
+  onPickFresh,
   onClose,
 }: {
   anchor: React.RefObject<HTMLButtonElement | null>;
+  /** Live session ids — when absent the recorded count is used. */
+  liveIds?: ReadonlySet<string>;
   onPick: (taskId: string) => void;
+  /** Link + start a fresh agent session in the task instead of opening its
+   * existing conversation(s). */
+  onPickFresh?: (taskId: string) => void;
   onClose: () => void;
 }) {
   // Subscribed, not a one-shot read — a task created or archived while the
@@ -2587,23 +3421,58 @@ function SendTargetMenu({
               ? project.name?.trim() ||
                 (project.anchor ? projectName(project.anchor) : "Project")
               : "";
+            // Sending only links the ticket and opens the task — work starts
+            // from the task's own Start action, so say which it will be.
+            const conversations = liveIds
+              ? liveTaskSessionIds(task, liveIds).length
+              : taskSessionIds(task).size;
+            const fresh = task.children.some((child) => child.workingCopy);
             return (
-              <button
-                type="button"
-                role="menuitem"
+              <div
                 key={task.id}
-                className={itemClass}
-                onClick={() => onPick(task.id)}
+                role="none"
+                className="flex items-center gap-0.5"
               >
-                <Task
-                  className="size-3.5 shrink-0 text-content/50"
-                  strokeWidth={1.75}
-                />
-                <span className="min-w-0 flex-1 truncate">{task.name}</span>
-                <span className="shrink-0 truncate text-[10px] text-content/40">
-                  {projectLabel}
-                </span>
-              </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className={itemClass}
+                  title={
+                    conversations > 1
+                      ? `Link to "${task.name}" — opens task details`
+                      : conversations
+                        ? `Link to "${task.name}" — opens its conversation`
+                        : `Link to "${task.name}" — opens the task`
+                  }
+                  onClick={() => onPick(task.id)}
+                >
+                  <Task
+                    className="size-3.5 shrink-0 text-content/50"
+                    strokeWidth={1.75}
+                  />
+                  <span className="min-w-0 flex-1 truncate">{task.name}</span>
+                  <span className="shrink-0 truncate text-[10px] text-content/40">
+                    {projectLabel}
+                    {conversations > 1
+                      ? ` · ${conversations} conversations`
+                      : conversations
+                        ? " · conversation"
+                        : ""}
+                  </span>
+                </button>
+                {onPickFresh && fresh ? (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    title={`Link to "${task.name}" and start a fresh agent conversation in it`}
+                    aria-label={`New conversation in task ${task.name}`}
+                    onClick={() => onPickFresh(task.id)}
+                    className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
+                  >
+                    <Plus className="size-3.5" strokeWidth={1.75} />
+                  </button>
+                ) : null}
+              </div>
             );
           })
         ) : (

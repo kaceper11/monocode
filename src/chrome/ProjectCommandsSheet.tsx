@@ -279,10 +279,8 @@ export function ProjectCommandsSheet({
     );
   };
 
-  const editingCommand =
-    editing && editing.scope !== "group" ? editing : null;
-  const editingGroup =
-    editing && editing.scope === "group" ? editing : null;
+  const editingCommand = editing && editing.scope !== "group" ? editing : null;
+  const editingGroup = editing && editing.scope === "group" ? editing : null;
 
   return (
     <Modal
@@ -468,9 +466,9 @@ export function ProjectCommandsSheet({
                       Add step
                     </button>
                     <p className="text-[11px] text-content/40">
-                      OS host runs on the machine itself — use it for steps
-                      like <span className="font-mono">wsl --shutdown</span>{" "}
-                      that must outlive the WSL terminal.
+                      OS host runs on the machine itself — use it for steps like{" "}
+                      <span className="font-mono">wsl --shutdown</span> that
+                      must outlive the WSL terminal.
                     </p>
                   </div>
                 ) : (
@@ -523,8 +521,7 @@ export function ProjectCommandsSheet({
                       }
                     />
                     <p className="mt-1 text-[11px] text-content/40">
-                      Inside a task this runs in the repository’s task
-                      worktree.
+                      Inside a task this runs in the repository’s task worktree.
                     </p>
                   </div>
                 ) : null}
@@ -842,9 +839,7 @@ export function ProjectCommandsSheet({
                             },
                           }),
                         () => {
-                          if (
-                            window.confirm(`Delete group “${group.name}”?`)
-                          )
+                          if (window.confirm(`Delete group “${group.name}”?`))
                             deleteProjectCommandGroup(project.id, group.id);
                         },
                         group.name,

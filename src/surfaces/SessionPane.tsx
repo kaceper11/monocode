@@ -4,12 +4,8 @@ import { canSteerHarnessSession } from "../lib/harness/registry";
 import { SessionIssues } from "../chrome/SessionIssues";
 import { TaskScopeChip } from "../chrome/TaskScopeChip";
 import { AgentActionsMenu } from "../chrome/AgentActionsMenu";
-import {
-  subscribeTaskWorkspaces,
-  taskForSession,
-  taskWorkspacesSnapshot,
-  projectForTask,
-} from "../lib/taskWorkspaces";
+import { projectForTask } from "../lib/taskWorkspaces";
+import { useTaskScope } from "../hooks/useTaskScope";
 import { projectForPath } from "../lib/projects";
 import { requestAgentContext, contextFromText } from "../lib/agentContext";
 import { ChevronDown, GripVertical, X } from "../chrome/icons";
@@ -122,6 +118,7 @@ type Props = {
   onAddIssues?: (sessionId: string) => void;
   onOpenTaskChild?: (taskId: string, childId: string) => void;
   onRetryTaskChild?: (taskId: string, childId: string) => void;
+  onSetupTaskChild?: (taskId: string, childId: string) => void;
   needsInputSessionIds?: ReadonlySet<string>;
   onInboxCardDismiss?: (sessionId: string, fileId?: string) => void;
   onNoteCardDismiss?: (sessionId: string) => void;
@@ -202,6 +199,7 @@ export const SessionPane = memo(function SessionPane({
   onAddIssues,
   onOpenTaskChild,
   onRetryTaskChild,
+  onSetupTaskChild,
   needsInputSessionIds,
   onInboxCardDismiss,
   onNoteCardDismiss,
@@ -339,16 +337,7 @@ export const SessionPane = memo(function SessionPane({
   // A task session's branch and working copy belong to the task child —
   // the generic pickers could move it out from under the task record, so
   // scope navigation happens through TaskScopeChip instead.
-  const tasksRaw = useSyncExternalStore(
-    subscribeTaskWorkspaces,
-    taskWorkspacesSnapshot,
-  );
-  const taskScope = useMemo(
-    () => taskForSession(session.id, workCwd),
-    // The store re-reads on every write.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [session.id, workCwd, tasksRaw],
-  );
+  const taskScope = useTaskScope(session.id, workCwd);
   const taskScoped = Boolean(taskScope);
   const actionProject = useMemo(
     () =>
@@ -542,11 +531,11 @@ export const SessionPane = memo(function SessionPane({
         </div>
       ) : null}
       <TaskScopeChip
-        sessionId={session.id}
-        cwd={workCwd}
+        scope={taskScope}
         needsInputIds={needsInputSessionIds}
         onOpenChild={onOpenTaskChild}
         onRetryChild={onRetryTaskChild}
+        onSetupChild={onSetupTaskChild}
       />
       <SessionIssues session={session} onAdd={onAddIssues ? () => onAddIssues(session.id) : undefined} />
       <div ref={transcriptScope} className="@container relative min-h-0 flex-1">

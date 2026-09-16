@@ -3,6 +3,7 @@ import { looksLikeProject } from "./paths";
 import type { ProjectRecord } from "./projects";
 import type { Session } from "./session";
 import {
+  taskChildPrepared,
   taskChildRepoLabel,
   type TaskWorkspace,
 } from "./taskWorkspaces";
@@ -257,7 +258,9 @@ export function actionContextSources(input: {
   // scan a meaningless or enormous tree — only offer it where a task working
   // copy or a project-like directory exists.
   const changesCwd =
-    (input.task?.children.some((child) => child.workingCopy) ?? false) ||
+    (input.task?.children.some(
+      (child) => child.workingCopy && taskChildPrepared(child),
+    ) ?? false) ||
     !!(input.cwd && looksLikeProject(input.cwd));
   return [
     {
@@ -288,10 +291,16 @@ function taskContextText(
   if (task.brief?.trim()) lines.push("", task.brief.trim());
   lines.push("", "Repositories:");
   for (const child of task.children) {
+    // The label already carries `/branch` and `· attempt` — don't repeat them.
     const parts = [`- ${taskChildRepoLabel(task, child, project)}`];
-    if (child.workingCopy) parts.push(`working copy: ${child.workingCopy}`);
-    else parts.push("no working copy prepared yet");
-    if (child.branch) parts.push(`branch: ${child.branch}`);
+    if (child.workingCopy) {
+      parts.push(`working copy: ${child.workingCopy}`);
+      if (child.launch.state === "failed")
+        parts.push(
+          `preparation failed${child.launch.error ? `: ${child.launch.error}` : ""}`,
+        );
+      else if (!taskChildPrepared(child)) parts.push("not prepared yet");
+    } else parts.push("no working copy prepared yet");
     lines.push(parts.join(" — "));
     if (child.responsibility?.trim())
       lines.push(`  Responsibility: ${child.responsibility.trim()}`);
@@ -397,7 +406,9 @@ export function actionChangesCwds(input: {
 }): { label: string; cwd: string }[] {
   if (input.task) {
     const copies = input.task.children
-      .filter((child) => child.workingCopy)
+      // Only a verified-ready or session-owned copy is real — an unprepared
+      // path may not exist, or worse, may now hold an unrelated repo.
+      .filter((child) => child.workingCopy && taskChildPrepared(child))
       .map((child) => ({
         label: taskChildRepoLabel(input.task!, child, input.project),
         cwd: child.workingCopy!,

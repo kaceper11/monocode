@@ -321,32 +321,10 @@ pub fn git_worktree_refs(cwd: String) -> Result<Vec<WorktreeRef>, String> {
     .collect()
 }
 
-fn create(
-    root: &Path,
-    base: &str,
-    commit: &str,
-    branch: &str,
-    path: &str,
-) -> Result<String, String> {
-    if !base.starts_with("refs/heads/") && !base.starts_with("refs/remotes/") {
-        return Err("Choose an explicit local or remote-tracking ref".into());
-    }
-    let actual = git(
-        root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &format!("{base}^{{commit}}"),
-        ],
-    )?;
-    if actual.trim() != commit {
-        return Err("Base ref changed. Refresh and review its commit again.".into());
-    }
-    if branch.starts_with('-') || branch.trim() != branch {
-        return Err("Invalid branch name".into());
-    }
-    git(root, &["check-ref-format", &format!("refs/heads/{branch}")])?;
+/// Resolves the caller-chosen worktree path: absolute, on the repository's
+/// execution host, and never an existing path. Returns the canonical host
+/// identity and the path Git sees inside that host.
+fn new_worktree_target(root: &Path, path: &str) -> Result<(String, String), String> {
     git_path(root, path)?;
     let target = if let Some(location) = crate::wsl::location(path)? {
         crate::wsl::path_request(&location, "new_path", serde_json::json!({}))?
@@ -366,23 +344,123 @@ fn create(
         path_to_js(&target)
     };
     let linux_target = git_path(root, &target)?;
+    Ok((target, linux_target))
+}
+
+/// A timed-out `worktree add` is uncertain, so confirmation always reads the
+/// inventory back — the caller's predicate pins path, head and branch
+/// identity. Anything unconfirmed errors without removing data.
+fn confirmed_target(
+    root: &Path,
+    target: &str,
+    result: Result<String, String>,
+    matches: impl Fn(&Worktree) -> bool,
+) -> Result<String, String> {
+    let entries = match inventory(root) {
+        Ok(entries) => entries,
+        // When the add itself failed, that cause is the actionable one.
+        Err(err) => return Err(result.err().unwrap_or(err)),
+    };
+    if entries
+        .iter()
+        .any(|entry| entry.path == target && matches(entry))
+    {
+        seed_local_only(root, Path::new(target));
+        return Ok(target.to_owned());
+    }
+    result?;
+    Err(format!(
+        "Operation could not be confirmed. Refresh and inspect {target}; no data was removed."
+    ))
+}
+
+/// Re-reads a ref's commit and refuses when it differs from what the user
+/// reviewed — a moved ref must surface, not silently open newer work.
+fn verified_tip(root: &Path, reference: &str, expected: &str, moved: &str) -> Result<(), String> {
+    let actual = git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{reference}^{{commit}}"),
+        ],
+    )?;
+    if actual.trim() != expected {
+        return Err(moved.into());
+    }
+    Ok(())
+}
+
+fn create(
+    root: &Path,
+    base: &str,
+    commit: &str,
+    branch: &str,
+    path: &str,
+) -> Result<String, String> {
+    if !base.starts_with("refs/heads/") && !base.starts_with("refs/remotes/") {
+        return Err("Choose an explicit local or remote-tracking ref".into());
+    }
+    verified_tip(
+        root,
+        base,
+        commit,
+        "Base ref changed. Refresh and review its commit again.",
+    )?;
+    if branch.starts_with('-') || branch.trim() != branch {
+        return Err("Invalid branch name".into());
+    }
+    git(root, &["check-ref-format", &format!("refs/heads/{branch}")])?;
+    let (target, linux_target) = new_worktree_target(root, path)?;
     let result = git(
         root,
         &["worktree", "add", "-b", branch, "--", &linux_target, commit],
     );
-    let entries = inventory(root)?;
-    if entries.iter().any(|e| {
-        e.path == target
-            && e.head == commit
-            && e.branch.as_deref() == Some(&format!("refs/heads/{branch}"))
-    }) {
-        seed_local_only(root, Path::new(&target));
-        return Ok(target);
+    let expected = format!("refs/heads/{branch}");
+    confirmed_target(root, &target, result, |entry| {
+        entry.head == commit && entry.branch.as_deref() == Some(expected.as_str())
+    })
+}
+
+/// Adds a worktree checked out on an existing local branch — `git worktree
+/// add <path> <branch>` without `-b`, so no new ref is created. Git refuses
+/// when the branch is checked out elsewhere; the reviewed tip is verified
+/// first so a moved branch surfaces instead of silently opening newer work.
+fn checkout(root: &Path, branch: &str, commit: &str, path: &str) -> Result<String, String> {
+    if !branch.starts_with("refs/heads/") {
+        return Err("Choose a local branch to check out".into());
     }
-    result?;
-    Err(format!(
-        "Creation could not be confirmed. Refresh and inspect {target}; no data was removed."
-    ))
+    // The short name is what `worktree add` attaches — reject anything that
+    // could dwim elsewhere (rev syntax like `foo^{}`, `HEAD`, a same-named
+    // tag) and detach an orphan worktree the caller never reviewed.
+    git(root, &["check-ref-format", branch])?;
+    verified_tip(
+        root,
+        branch,
+        commit,
+        "Branch moved since it was reviewed. Refresh and review again.",
+    )?;
+    let short = &branch["refs/heads/".len()..];
+    let resolved = git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--symbolic-full-name",
+            "--end-of-options",
+            short,
+        ],
+    )?;
+    if resolved.trim() != branch {
+        return Err("Branch name does not resolve to the reviewed local ref.".into());
+    }
+    let (target, linux_target) = new_worktree_target(root, path)?;
+    // `worktree add` attaches only for the short name; the full ref detaches.
+    let result = git(root, &["worktree", "add", "--", &linux_target, short]);
+    confirmed_target(root, &target, result, |entry| {
+        entry.head == commit && entry.branch.as_deref() == Some(branch)
+    })
 }
 
 /// Cap for a carried file — matches the WSL bridge's `restore_bytes` limit.
@@ -458,6 +536,21 @@ pub fn git_worktree_create(
         .try_write()
         .map_err(|_| "Another worktree operation or process startup is in progress")?;
     create(&expand_home(&cwd), &base, &commit, &branch, &path)
+}
+
+/// `branch` is the full `refs/heads/…` ref of an existing local branch;
+/// `commit` is its reviewed tip.
+#[tauri::command(async)]
+pub fn git_worktree_checkout(
+    cwd: String,
+    branch: String,
+    commit: String,
+    path: String,
+) -> Result<String, String> {
+    let _guard = LIFECYCLE
+        .try_write()
+        .map_err(|_| "Another worktree operation or process startup is in progress")?;
+    checkout(&expand_home(&cwd), &branch, &commit, &path)
 }
 
 #[derive(Serialize, serde::Deserialize)]
@@ -1028,6 +1121,67 @@ pub(crate) mod tests {
         )
         .is_err());
         assert!(create(&repo.0, "--bad", &base, "another", &repo.target("unused")).is_err());
+    }
+
+    #[test]
+    fn checkout_adds_a_worktree_for_an_existing_branch_only() {
+        let repo = Repo::new();
+        let tip = repo.head();
+        git(&repo.0, &["branch", "topic"]).unwrap();
+        // A local branch with no worktree gets one — checked out on the
+        // branch itself, no new ref.
+        let target = repo.target("topic żółć");
+        assert_eq!(
+            checkout(&repo.0, "refs/heads/topic", &tip, &target).unwrap(),
+            target
+        );
+        let entries = inventory(&repo.0).unwrap();
+        let entry = entries.iter().find(|e| e.path == target).unwrap();
+        assert_eq!(entry.head, tip);
+        assert_eq!(entry.branch.as_deref(), Some("refs/heads/topic"));
+        // Attaching created no ref — `topic` still tips at the reviewed commit.
+        assert_eq!(
+            git(&repo.0, &["rev-parse", "refs/heads/topic"])
+                .unwrap()
+                .trim(),
+            tip
+        );
+        // Now checked out, the branch can't be attached to a second worktree.
+        assert!(checkout(&repo.0, "refs/heads/topic", &tip, &repo.target("again")).is_err());
+        // So can't the branch the main checkout already holds.
+        assert!(checkout(&repo.0, "refs/heads/main", &tip, &repo.target("main again")).is_err());
+        // Nonexistent refs, empty short names and rev syntax are refused
+        // before any worktree is added.
+        assert!(checkout(&repo.0, "refs/heads/ghost", &tip, &repo.target("ghost")).is_err());
+        assert!(checkout(&repo.0, "refs/heads/", &tip, &repo.target("empty")).is_err());
+        assert!(checkout(&repo.0, "refs/heads/topic^{}", &tip, &repo.target("peel")).is_err());
+        // A tag sharing the branch's name must not dwim to the tag.
+        git(&repo.0, &["branch", "clash"]).unwrap();
+        git(&repo.0, &["tag", "clash", &tip]).unwrap();
+        assert!(checkout(&repo.0, "refs/heads/clash", &tip, &repo.target("clash")).is_err());
+        // None of the refusals left a registered worktree behind.
+        let after = inventory(&repo.0).unwrap();
+        let paths: Vec<&str> = after.iter().map(|entry| entry.path.as_str()).collect();
+        for leftover in ["again", "main again", "ghost", "empty", "peel", "clash"] {
+            assert!(!paths.iter().any(|path| path.ends_with(leftover)));
+        }
+        // Only local branches — no remote refs, no invented names.
+        git(&repo.0, &["update-ref", "refs/remotes/origin/topic", &tip]).unwrap();
+        assert!(checkout(
+            &repo.0,
+            "refs/remotes/origin/topic",
+            &tip,
+            &repo.target("remote")
+        )
+        .is_err());
+        // A branch that moved since review is refused.
+        git(&repo.0, &["commit", "--allow-empty", "-m", "move"]).unwrap();
+        git(&repo.0, &["branch", "-f", "moved", "HEAD"]).unwrap();
+        assert!(
+            checkout(&repo.0, "refs/heads/moved", &tip, &repo.target("moved"))
+                .unwrap_err()
+                .contains("moved")
+        );
     }
 
     #[test]

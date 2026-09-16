@@ -114,7 +114,8 @@ it("keeps changes selected until the chosen recipient accepts context", async ()
       host.querySelector('input[type="checkbox"]') as HTMLInputElement;
     const menuItem = (text: string) =>
       [...document.body.querySelectorAll('[role="menuitem"]')].find(
-        (item) => item.textContent?.trim() === text,
+        // Rows carry a status suffix ("· conversation", "· 1 to prepare").
+        (item) => item.textContent?.trim().startsWith(text),
       ) as HTMLButtonElement;
     await act(async () => checkbox().click());
     // The task menu opens; the selection stays until a target accepts it.

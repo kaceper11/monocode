@@ -1,6 +1,8 @@
+import { basename } from "./fs";
 import { pathKey, prettyCwd, wslLocation } from "./paths";
 import {
   loadProjects,
+  repositoryDisplayName,
   type ProjectRecord,
   type ProjectRepository,
 } from "./projects";
@@ -15,7 +17,12 @@ import {
   ciKey,
   unbindCiSourceSession,
 } from "./azurePipelines";
-import { listTaskPrDrafts, taskPrRowKey } from "./taskPrs";
+import {
+  deleteTaskPrDraft,
+  deleteTaskPrDraftsFor,
+  listTaskPrDrafts,
+  taskPrRowKey,
+} from "./taskPrs";
 import { parseGithubWorkItemUrl } from "./sessionWorkItem";
 import {
   ensureDeliveryWatcher,
@@ -24,14 +31,26 @@ import {
   type DeliverySurvival,
   type DeliveryWatcherSource,
 } from "./watchers";
+import {
+  ATTENTION_ACTION,
+  emitAttention,
+  resolveAttention,
+} from "./attention";
 
 const KEY = "monocode.taskWorkspaces.v1";
 const EVENT = "monocode:task-workspaces-changed";
 /** Opens the task details sheet — the App-level listener owns the modal. */
 export const OPEN_TASK_DETAILS = "monocode:open-task-details";
+/** CustomEvent<string> carrying a task id — opens its PRs sheet. */
+export const OPEN_TASK_PRS = "monocode:open-task-prs";
 const MAX_TASKS = 100;
 const MAX_ATTEMPTS = 20;
 const MAX_CHILDREN = 50;
+const MAX_BRIEF = 8_000;
+const MAX_TASK_NAME = 300;
+const MAX_TICKET_TEXT = 500;
+const MAX_TICKET_CONTEXT = 4_000;
+const MAX_ADDITIONAL_ITEMS = 20;
 
 /**
  * Per-child launch lifecycle. `pending` children are actionable but have no
@@ -73,12 +92,14 @@ export type TaskChild = {
   attemptId: string;
   /** Chosen working copy (host-qualified); absent while prepared later. */
   workingCopy?: string;
-  /** New-worktree creation inputs recorded at review time. */
+  /** New-worktree creation inputs recorded at review time. `branch` also
+   * holds the short name of an `existingBranch` child. */
   branch?: string;
   baseRef?: string;
   baseCommit?: string;
-  /** Intended merge target (e.g. the parent feature branch) — display only. */
-  mergeTarget?: string;
+  /** Full `refs/heads/…` ref of an existing local branch whose worktree the
+   * task adds at launch — the branch itself is never created or removed. */
+  existingBranch?: string;
   responsibility?: string;
   /** Ordinary session ids; sessions themselves stay single-cwd. */
   sessionIds: string[];
@@ -115,18 +136,19 @@ export type TaskChildDraft = {
   repositoryId: string;
   /** Target attempt; absent → the task's primary attempt. */
   attemptId?: string;
-  mode: "worktree" | "existing" | "main" | "later";
+  mode: "worktree" | "branch" | "existing" | "later";
   /** For `worktree`: reviewed base + new branch + target path. */
   baseRef?: string;
   baseCommit?: string;
   branch?: string;
   path?: string;
-  /** For `existing`/`main`: the chosen copy. */
+  /** For `branch`: the full `refs/heads/…` ref of an existing local branch
+   * with no worktree; `baseCommit` is its reviewed tip and `path` the new
+   * worktree location. */
+  existingBranch?: string;
+  /** For `existing`: the chosen copy. */
   workingCopy?: string;
-  mergeTarget?: string;
   responsibility?: string;
-  /** Required when the chosen copy already has writers or an active task. */
-  sharedCopyAccepted?: boolean;
 };
 
 /**
@@ -176,6 +198,63 @@ function cleanStrings(value: unknown, max: number): string[] {
   return out;
 }
 
+const PROVIDERS = new Set(["github", "linear", "gitlab", "jira", "azure"]);
+
+/** Bounded copy of a provider ticket — untrusted storage/provider text never
+ * lands unbounded, and `additionalItems` is itself validated, deduped
+ * (url+account) and capped rather than trusted wholesale. */
+function cleanTicket(value: unknown): LinkedWorkItem | undefined {
+  if (!isRecord(value)) return undefined;
+  const url = cleanString(value.url);
+  const kind = value.kind === "issue" || value.kind === "pr" ? value.kind : null;
+  if (!url || url.length > 2048 || !/^https:\/\//i.test(url) || !kind)
+    return undefined;
+  const text = (field: unknown, cap: number) => {
+    const cleaned = cleanString(field);
+    return cleaned ? cleaned.slice(0, cap) : undefined;
+  };
+  const item: LinkedWorkItem = {
+    kind,
+    repo: cleanString(value.repo)?.slice(0, 250) ?? "",
+    number: Number.isFinite(value.number) ? (value.number as number) : 0,
+    url,
+  };
+  const provider = cleanString(value.provider);
+  if (provider && PROVIDERS.has(provider))
+    item.provider = provider as LinkedWorkItem["provider"];
+  const account = text(value.account, 200);
+  if (account) item.account = account;
+  const identifier = text(value.identifier, 120);
+  if (identifier) item.identifier = identifier;
+  const id = text(value.id, 120);
+  if (id) item.id = id;
+  const site = text(value.site, 500);
+  if (site && /^https?:\/\//i.test(site)) item.site = site;
+  const title = text(value.title, MAX_TICKET_TEXT);
+  if (title) item.title = title;
+  const context = text(value.context, MAX_TICKET_CONTEXT);
+  if (context) item.context = context;
+  if (Array.isArray(value.additionalItems)) {
+    const seen = new Set([`${url}\0${item.account ?? ""}`]);
+    const items: LinkedWorkItem[] = [];
+    for (const raw of value.additionalItems) {
+      // Nested items never carry items of their own — recursion stays flat,
+      // matching the session sanitizer's shape.
+      const extra = isRecord(raw)
+        ? cleanTicket({ ...raw, additionalItems: undefined })
+        : undefined;
+      if (!extra) continue;
+      const key = `${extra.url}\0${extra.account ?? ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(extra);
+      if (items.length >= MAX_ADDITIONAL_ITEMS) break;
+    }
+    if (items.length) item.additionalItems = items;
+  }
+  return item;
+}
+
 function sanitizeAttempt(value: unknown): TaskAttempt | null {
   if (!isRecord(value)) return null;
   const id = cleanString(value.id);
@@ -221,8 +300,8 @@ function sanitizeChild(
     ...(cleanString(value.baseCommit)
       ? { baseCommit: cleanString(value.baseCommit) }
       : {}),
-    ...(cleanString(value.mergeTarget)
-      ? { mergeTarget: cleanString(value.mergeTarget) }
+    ...(cleanString(value.existingBranch)
+      ? { existingBranch: cleanString(value.existingBranch) }
       : {}),
     ...(cleanString(value.responsibility)
       ? { responsibility: cleanString(value.responsibility) }
@@ -248,7 +327,7 @@ function sanitizeTask(value: unknown): TaskWorkspace | null {
   if (!isRecord(value)) return null;
   const id = cleanString(value.id);
   const projectId = cleanString(value.projectId);
-  const name = cleanString(value.name);
+  const name = cleanString(value.name)?.slice(0, MAX_TASK_NAME);
   if (!id || !projectId || !name) return null;
   const createdAt =
     typeof value.createdAt === "number" && Number.isFinite(value.createdAt)
@@ -276,6 +355,8 @@ function sanitizeTask(value: unknown): TaskWorkspace | null {
   }
   const attemptIds = new Set(attempts.map((attempt) => attempt.id));
   const seenPairs = new Set<string>();
+  const seenPaths = new Set<string>();
+  const seenBranches = new Set<string>();
   const children = Array.isArray(value.children)
     ? value.children
         .map((child) => sanitizeChild(child, id, attemptIds, attempts[0].id))
@@ -285,9 +366,23 @@ function sanitizeTask(value: unknown): TaskWorkspace | null {
           // this; storage re-enforces it because the dangling-attempt remap
           // above can manufacture a pair. Dedupe before the MAX_CHILDREN
           // trim so a dropped duplicate can't evict a real checkout.
-          const pair = `${child.attemptId}${child.repositoryId}`;
+          const pair = `${child.attemptId}\0${child.repositoryId}`;
           if (seenPairs.has(pair)) return false;
           seenPairs.add(pair);
+          // Hand-edited or legacy-corrupt storage can double-claim a
+          // checkout or branch — drop the later binding, matching the
+          // write-path invariants in assertUniqueChildBindings.
+          if (child.workingCopy) {
+            const key = pathKey(child.workingCopy);
+            if (seenPaths.has(key)) return false;
+            seenPaths.add(key);
+          }
+          if (child.branch) {
+            const normalized = child.branch.replace(/^refs\/heads\//, "");
+            const key = `${child.repositoryId}\0${normalized}`;
+            if (seenBranches.has(key)) return false;
+            seenBranches.add(key);
+          }
           return true;
         })
         .slice(0, MAX_CHILDREN)
@@ -298,10 +393,10 @@ function sanitizeTask(value: unknown): TaskWorkspace | null {
     id,
     projectId,
     name,
-    ...(isRecord(value.ticket)
-      ? { ticket: value.ticket as LinkedWorkItem }
+    ...(cleanTicket(value.ticket) ? { ticket: cleanTicket(value.ticket) } : {}),
+    ...(cleanString(value.brief)
+      ? { brief: cleanString(value.brief)!.slice(0, MAX_BRIEF) }
       : {}),
-    ...(cleanString(value.brief) ? { brief: cleanString(value.brief) } : {}),
     attempts,
     children,
     sessionIds: cleanStrings(value.sessionIds, 20),
@@ -322,14 +417,26 @@ function sanitizeTask(value: unknown): TaskWorkspace | null {
  * alter sanitize output without touching storage. */
 let tasksCacheRaw: string | null | undefined;
 let tasksCache: TaskWorkspace[] = [];
+/** Serialized copy kept after a failed write — snapshot/read truth must not
+ * diverge from the in-memory record while storage stays full/denied. */
+let memoryRaw: string | null = null;
 
 function invalidateTaskCache() {
   tasksCacheRaw = undefined;
 }
 
+function readTaskRaw(): string | null {
+  if (memoryRaw !== null) return memoryRaw;
+  try {
+    return localStorage.getItem(KEY);
+  } catch {
+    return null;
+  }
+}
+
 export function loadTaskWorkspaces(): TaskWorkspace[] {
   try {
-    const raw = localStorage.getItem(KEY);
+    const raw = readTaskRaw();
     if (raw === tasksCacheRaw) return tasksCache;
     const parsed = raw ? JSON.parse(raw) : null;
     tasksCache = Array.isArray(parsed)
@@ -345,11 +452,32 @@ export function loadTaskWorkspaces(): TaskWorkspace[] {
   }
 }
 
+const STORE_QUOTA_ATTENTION_KEY = "task-store:quota";
+
 function saveTaskWorkspaces(tasks: TaskWorkspace[]) {
+  const serialized = JSON.stringify(tasks.slice(0, MAX_TASKS));
   try {
-    localStorage.setItem(KEY, JSON.stringify(tasks.slice(0, MAX_TASKS)));
+    localStorage.setItem(KEY, serialized);
+    memoryRaw = null;
+    // The write echo: readers see this serialized copy, no re-parse needed.
+    tasksCache = tasks.slice(0, MAX_TASKS);
+    tasksCacheRaw = serialized;
+    resolveAttention(STORE_QUOTA_ATTENTION_KEY);
   } catch {
-    /* storage full or unavailable — keep the in-memory record */
+    /* storage full or unavailable — keep the in-memory record, but say so. */
+    memoryRaw = serialized;
+    tasksCache = tasks.slice(0, MAX_TASKS);
+    tasksCacheRaw = serialized;
+    emitAttention({
+      key: STORE_QUOTA_ATTENTION_KEY,
+      kind: "watcher",
+      title: "Couldn't save tasks — local storage is full",
+      detail:
+        "Task changes are kept in memory only and disappear on restart.",
+      urgency: ATTENTION_ACTION,
+      at: Date.now(),
+      signature: "quota",
+    });
   }
   window.dispatchEvent(new Event(EVENT));
 }
@@ -368,7 +496,7 @@ export function subscribeTaskWorkspaces(listener: () => void) {
 
 /** Raw snapshot for useSyncExternalStore — stable until a write lands. */
 export function taskWorkspacesSnapshot(): string | null {
-  return localStorage.getItem(KEY);
+  return readTaskRaw();
 }
 
 export function tasksForProject(
@@ -408,10 +536,9 @@ export function taskMatchesQuery(
   for (const child of task.children) {
     const repo = repositoryForChild(task, child, project);
     fields.push(
-      repo ? repositoryDisplay(repo) : undefined,
+      repo ? repositoryDisplayName(repo) : undefined,
       child.workingCopy,
       child.branch,
-      child.mergeTarget,
       child.responsibility,
     );
   }
@@ -425,7 +552,7 @@ export function taskMatchesQuery(
 }
 
 /** Distinct execution hosts are never mixed: native vs WSL distribution. */
-export function taskHostKey(path: string): string {
+function taskHostKey(path: string): string {
   const location = wslLocation(path);
   return location ? `wsl:${location.distribution.toLowerCase()}` : "native";
 }
@@ -454,6 +581,19 @@ function repositoryOf(
   return project?.repositories.find((repo) => repo.id === repositoryId);
 }
 
+/** Host-check inputs for a child set: each working copy plus its
+ * repository's anchor, so a copy typed on the wrong host conflicts at
+ * write time instead of failing `git_path` at launch. */
+function childHostPaths(
+  project: ProjectRecord | undefined,
+  children: readonly TaskChild[],
+): (string | undefined)[] {
+  return children.flatMap((child) => [
+    child.workingCopy,
+    repositoryOf(project, child.repositoryId)?.anchor,
+  ]);
+}
+
 /**
  * Creates a task from reviewed drafts. Throws on an empty selection, unknown
  * repository ids or a mixed-host working-copy set. Draft inputs are copied
@@ -465,11 +605,22 @@ function repositoryOf(
 function assertUniqueChildBindings(children: readonly TaskChild[]) {
   const seen = new Set<string>();
   const seenBranches = new Set<string>();
+  const seenPaths = new Set<string>();
   for (const child of children) {
-    const key = `${child.attemptId}${child.repositoryId}`;
+    const key = `${child.attemptId}\0${child.repositoryId}`;
     if (seen.has(key))
       throw new Error("A selected repository is already in this task");
     seen.add(key);
+    if (child.workingCopy) {
+      // Two children pointing at one checkout share Git state silently —
+      // delivery, cleanup and sessions would double-claim the same path.
+      const key = pathKey(child.workingCopy);
+      if (seenPaths.has(key))
+        throw new Error(
+          `Working copy ${prettyCwd(child.workingCopy)} is already used in this task`,
+        );
+      seenPaths.add(key);
+    }
     if (child.branch) {
       // `refs/heads/x` and `x` are the same branch to Git.
       const normalized = child.branch.replace(/^refs\/heads\//, "");
@@ -501,19 +652,35 @@ function buildTaskChildren(
       draft.mode === "later"
         ? undefined
         : cleanString(
-            draft.mode === "worktree" ? draft.path : draft.workingCopy,
+            draft.mode === "worktree" || draft.mode === "branch"
+              ? draft.path
+              : draft.workingCopy,
           );
     const createsWorktree = draft.mode === "worktree";
+    const attachesBranch = draft.mode === "branch";
     const branch = cleanString(draft.branch);
     const baseRef = cleanString(draft.baseRef);
     const baseCommit = cleanString(draft.baseCommit);
+    const existingBranch = cleanString(draft.existingBranch);
     if (createsWorktree && (!baseRef || !baseCommit || !branch || !workingCopy))
       throw new Error(
-        `Choose a base, branch and location for ${repositoryDisplay(repository)}`,
+        `Choose a base, branch and location for ${repositoryDisplayName(repository)}`,
       );
-    if (!createsWorktree && draft.mode !== "later" && !workingCopy)
+    if (
+      attachesBranch &&
+      (!existingBranch?.startsWith("refs/heads/") || !baseCommit || !workingCopy)
+    )
       throw new Error(
-        `Choose a working copy for ${repositoryDisplay(repository)}`,
+        `Choose a local branch and location for ${repositoryDisplayName(repository)}`,
+      );
+    if (
+      !createsWorktree &&
+      !attachesBranch &&
+      draft.mode !== "later" &&
+      !workingCopy
+    )
+      throw new Error(
+        `Choose a working copy for ${repositoryDisplayName(repository)}`,
       );
     return {
       id: crypto.randomUUID(),
@@ -527,8 +694,14 @@ function buildTaskChildren(
             baseCommit: baseCommit!,
           }
         : {}),
-      ...(cleanString(draft.mergeTarget)
-        ? { mergeTarget: cleanString(draft.mergeTarget) }
+      ...(attachesBranch
+        ? {
+            // `branch` keeps the short name so prompts, labels and branch
+            // uniqueness behave the same as for a created worktree.
+            branch: existingBranch!.replace(/^refs\/heads\//, ""),
+            existingBranch: existingBranch!,
+            baseCommit: baseCommit!,
+          }
         : {}),
       ...(cleanString(draft.responsibility)
         ? { responsibility: cleanString(draft.responsibility) }
@@ -546,7 +719,7 @@ export function createTask(input: {
   brief?: string;
   children: TaskChildDraft[];
 }): TaskWorkspace {
-  const name = input.name.trim();
+  const name = input.name.trim().slice(0, MAX_TASK_NAME);
   if (!name) throw new Error("Enter a task name");
   const project = loadProjects().find(
     (entry) => entry.id === input.projectId,
@@ -561,9 +734,7 @@ export function createTask(input: {
   const primary: TaskAttempt = { id: PRIMARY_ATTEMPT_ID, createdAt: Date.now() };
   const children = buildTaskChildren(project, drafts, [primary]);
   assertUniqueChildBindings(children);
-  const conflict = taskHostConflict(
-    children.map((child) => child.workingCopy),
-  );
+  const conflict = taskHostConflict(childHostPaths(project, children));
   if (conflict) throw new Error(conflict);
   // The store trims to MAX_TASKS from the tail — without this the new task
   // would be silently dropped instead of saved.
@@ -573,8 +744,10 @@ export function createTask(input: {
     id: crypto.randomUUID(),
     projectId: input.projectId,
     name,
-    ...(input.ticket ? { ticket: input.ticket } : {}),
-    ...(cleanString(input.brief) ? { brief: cleanString(input.brief) } : {}),
+    ...(cleanTicket(input.ticket) ? { ticket: cleanTicket(input.ticket) } : {}),
+    ...(cleanString(input.brief)
+      ? { brief: cleanString(input.brief)!.slice(0, MAX_BRIEF) }
+      : {}),
     attempts: [primary],
     children,
     sessionIds: [],
@@ -590,21 +763,26 @@ export function linkTicketToTask(
   taskId: string,
   ticket: LinkedWorkItem,
 ): void {
+  const clean = cleanTicket(ticket);
+  if (!clean) return;
   updateTask(taskId, (current) => {
-    if (!current.ticket) return { ...current, ticket };
+    if (current.archived) return current;
+    if (!current.ticket) return { ...current, ticket: clean };
+    const same = (entry: LinkedWorkItem) =>
+      entry.url === clean.url &&
+      (entry.account ?? "") === (clean.account ?? "");
     if (
-      current.ticket.url === ticket.url ||
-      (current.ticket.additionalItems ?? []).some(
-        (entry) => entry.url === ticket.url,
-      )
+      same(current.ticket) ||
+      (current.ticket.additionalItems ?? []).some(same)
     )
       return current;
+    const additional = [
+      ...(current.ticket.additionalItems ?? []),
+      clean,
+    ].slice(0, MAX_ADDITIONAL_ITEMS);
     return {
       ...current,
-      ticket: {
-        ...current.ticket,
-        additionalItems: [...(current.ticket.additionalItems ?? []), ticket],
-      },
+      ticket: { ...current.ticket, additionalItems: additional },
     };
   });
 }
@@ -617,8 +795,15 @@ export function updateTask(
   const index = tasks.findIndex((task) => task.id === taskId);
   if (index < 0) return undefined;
   const next = update(tasks[index]);
-  tasks[index] = next;
-  saveTaskWorkspaces(tasks);
+  // Any children change re-validates the binding invariants — updateTask is
+  // otherwise an unguarded seam around assertUniqueChildBindings.
+  if (next.children !== tasks[index].children)
+    assertUniqueChildBindings(next.children);
+  // Copy before writing — mutating the cached array in place would leave the
+  // snapshot-keyed indexes serving pre-write maps after a failed save.
+  const updated = [...tasks];
+  updated[index] = next;
+  saveTaskWorkspaces(updated);
   return next;
 }
 
@@ -637,24 +822,31 @@ export function reviseTask(
     responsibilities: ReadonlyMap<string, string>;
     /** Drafts for repositories being added. */
     additions: readonly TaskChildDraft[];
+    /** Re-drafted copy fields for kept children, keyed by child id — the
+     * "set up" path for children saved without a working copy. The child id,
+     * responsibility and links stay; the launch resets to pending. */
+    setups?: ReadonlyMap<string, TaskChildDraft>;
   },
 ): TaskWorkspace {
   const existing = loadTaskWorkspaces().find((entry) => entry.id === taskId);
   if (!existing) throw new Error("Task no longer exists");
+  // Archived tasks are read-only — unarchive before editing.
+  if (existing.archived) throw new Error("Task is archived");
   const project = projectForTask(existing);
   if (!project) throw new Error("Project no longer exists");
-  const name = revision.name.trim();
+  const name = revision.name.trim().slice(0, MAX_TASK_NAME);
   if (!name) throw new Error("Enter a task name");
   const dropped: TaskChild[] = [];
   const next = updateTask(taskId, (current) => {
-    const kept = current.children.filter((child) =>
-      revision.keepRepositoryIds.includes(child.repositoryId),
-    );
-    dropped.push(
-      ...current.children.filter(
-        (child) => !revision.keepRepositoryIds.includes(child.repositoryId),
-      ),
-    );
+    // A child with a launch in flight can't be dropped — the run's final
+    // write would land on a child that no longer exists, orphaning a worktree
+    // it may have just created. It survives the revision; the sheet can only
+    // offer removal once the launch settles.
+    const launchable = (child: TaskChild) =>
+      revision.keepRepositoryIds.includes(child.repositoryId) ||
+      isTaskChildLaunching(taskId, child.id);
+    const kept = current.children.filter(launchable);
+    dropped.push(...current.children.filter((child) => !launchable(child)));
     const drafts = revision.additions.filter(
       (child) => child && child.repositoryId,
     );
@@ -663,30 +855,54 @@ export function reviseTask(
     if (kept.length + drafts.length > MAX_CHILDREN)
       throw new Error(`A task supports up to ${MAX_CHILDREN} repositories`);
     const added = buildTaskChildren(project, drafts, current.attempts);
-    assertUniqueChildBindings([...kept, ...added]);
+    const revised = kept.map((child) => {
+      const resp = cleanString(revision.responsibilities.get(child.id));
+      const setup = revision.setups?.get(child.id);
+      // A setup draft for a different repository would rebind the child —
+      // the store doesn't trust the map keying.
+      if (!setup || setup.repositoryId !== child.repositoryId)
+        return { ...child, responsibility: resp };
+      // Re-run the draft's copy fields through the same validation a fresh
+      // child gets — the id and responsibility are preserved; the session
+      // binding is not (it pointed at the old copy).
+      const [built] = buildTaskChildren(project, [setup], current.attempts);
+      return {
+        ...child,
+        workingCopy: built.workingCopy,
+        branch: built.branch,
+        baseRef: built.baseRef,
+        baseCommit: built.baseCommit,
+        existingBranch: built.existingBranch,
+        // The copy is rebound — sessions rooted at the old path must not be
+        // treated as covering the new one.
+        sessionIds: [],
+        launch: { state: "pending" as const },
+        // The setup form's Responsibility input writes the draft — honor it;
+        // a blank field keeps the existing value rather than wiping it.
+        responsibility: built.responsibility ?? resp,
+      };
+    });
+    assertUniqueChildBindings([...revised, ...added]);
     const conflict = taskHostConflict(
-      [...kept, ...added].map((child) => child.workingCopy),
+      childHostPaths(project, [...revised, ...added]),
     );
     if (conflict) throw new Error(conflict);
     return {
       ...current,
       name,
-      ticket: revision.ticket,
-      brief: cleanString(revision.brief),
-      children: [
-        ...kept.map((child) => {
-          const resp = cleanString(revision.responsibilities.get(child.id));
-          return { ...child, responsibility: resp };
-        }),
-        ...added,
-      ],
-      ...(kept.some((child) => child.id === current.lastActiveChildId)
+      ticket: cleanTicket(revision.ticket),
+      brief: cleanString(revision.brief)?.slice(0, MAX_BRIEF),
+      children: [...revised, ...added],
+      ...(revised.some((child) => child.id === current.lastActiveChildId)
         ? {}
         : { lastActiveChildId: undefined }),
     };
   });
   if (!next) throw new Error("Task no longer exists");
-  for (const child of dropped) teardownDeliveryScope(childDeliveryScope(child));
+  // Draft rows die before teardown — a saved PR result still counts as
+  // coverage. The child's sessions survive removal — tear down by checkout
+  // only so watchers a live session owns stay covered.
+  teardownDroppedChildren(taskId, dropped);
   return next;
 }
 
@@ -695,12 +911,23 @@ export function updateTaskChild(
   childId: string,
   patch: Partial<TaskChild>,
 ): TaskWorkspace | undefined {
-  return updateTask(taskId, (task) => ({
-    ...task,
-    children: task.children.map((child) =>
-      child.id === childId ? { ...child, ...patch } : child,
-    ),
-  }));
+  // Identity fields can create same-path/branch collisions the launch path
+  // assumes are impossible — patches carrying them re-validate the set.
+  const bindsCopy =
+    "workingCopy" in patch ||
+    "branch" in patch ||
+    "repositoryId" in patch ||
+    "attemptId" in patch;
+  return updateTask(taskId, (task) => {
+    const next = {
+      ...task,
+      children: task.children.map((child) =>
+        child.id === childId ? { ...child, ...patch } : child,
+      ),
+    };
+    if (bindsCopy) assertUniqueChildBindings(next.children);
+    return next;
+  });
 }
 
 /** Adds new repository children to an existing task. Same validation as
@@ -720,7 +947,7 @@ export function addTaskChildren(
   const added = buildTaskChildren(project, valid, task.attempts);
   assertUniqueChildBindings([...task.children, ...added]);
   const conflict = taskHostConflict(
-    [...task.children, ...added].map((child) => child.workingCopy),
+    childHostPaths(project, [...task.children, ...added]),
   );
   if (conflict) throw new Error(conflict);
   updateTask(taskId, (current) => ({
@@ -773,12 +1000,8 @@ export function removeTaskAttempt(taskId: string, attemptId: string) {
   const dropped = task.children.filter(
     (child) => child.attemptId === attemptId,
   );
-  teardownDeliveryScope({
-    sessionIds: dropped.flatMap((child) => child.sessionIds),
-    cwds: dropped.flatMap((child) =>
-      child.workingCopy ? [child.workingCopy] : [],
-    ),
-  });
+  // Draft rows die first so teardown coverage checks can't re-anchor to them.
+  teardownDroppedChildren(taskId, dropped);
   updateTask(taskId, (current) => {
     const removed = new Set(
       current.children
@@ -882,10 +1105,12 @@ export function preferredTaskChild(
 }
 
 /** True when the task created this checkout rather than borrowing an
- * existing/main copy — `branch`+`base` are only recorded for worktree-mode
- * children. Cleanup offers must use this, never path heuristics. */
+ * existing/main copy — recorded for worktree-mode children (`branch`+`base`)
+ * and existing-branch children (`existingBranch`), whose worktree the task
+ * adds even though the branch itself stays user-owned. Cleanup offers must
+ * use this, never path heuristics. */
 export function taskOwnsCheckout(child: TaskChild): boolean {
-  return Boolean(child.branch && child.baseRef);
+  return Boolean((child.branch && child.baseRef) || child.existingBranch);
 }
 
 export function recordTaskActiveChild(taskId: string, childId: string) {
@@ -893,6 +1118,31 @@ export function recordTaskActiveChild(taskId: string, childId: string) {
     task.children.some((child) => child.id === childId)
       ? { ...task, lastActiveChildId: childId }
       : task,
+  );
+}
+
+/** Attaches an existing session to a task's conversation list — appended
+ * after recorded ids so the launch conversation (`sessionIds[0]`) stays
+ * primary. */
+export function linkTaskSession(taskId: string, sessionId: string) {
+  updateTask(taskId, (task) => {
+    const ids = task.sessionIds ?? [];
+    // Match the load-time bound — in-memory state must agree with what a
+    // reload keeps.
+    if (ids.includes(sessionId) || ids.length >= 20) return task;
+    return { ...task, sessionIds: [...ids, sessionId] };
+  });
+}
+
+/** The task-owned child claiming a path — a session created inside a
+ * task-made worktree is work on that task and attaches to it. Borrowed
+ * copies (`existing`/`main` children) never claim: the path is the user's
+ * and sessions there are not necessarily task work. */
+export function taskOwnedChildForWorkingCopy(
+  path: string,
+): { task: TaskWorkspace; child: TaskChild } | undefined {
+  return taskChildrenForWorkingCopy(path).find((entry) =>
+    taskOwnsCheckout(entry.child),
   );
 }
 
@@ -910,15 +1160,26 @@ function taskDeliveryScope(task: TaskWorkspace) {
   };
 }
 
-const childDeliveryScope = (child: TaskChild) => ({
-  sessionIds: child.sessionIds,
-  cwds: child.workingCopy ? [child.workingCopy] : [],
-});
-
 type DeliveryScope = {
   sessionIds?: readonly string[];
   cwds?: readonly string[];
 };
+
+/** Teardown for children leaving a task. Draft rows die first so coverage
+ * checks can't re-anchor to them; teardown is checkout-scoped because the
+ * child's sessions outlive the binding — watchers a live session owns stay
+ * covered. */
+function teardownDroppedChildren(
+  taskId: string,
+  children: readonly TaskChild[],
+) {
+  for (const child of children) deleteTaskPrDraft(taskId, child.id);
+  teardownDeliveryScope({
+    cwds: children.flatMap((child) =>
+      child.workingCopy ? [child.workingCopy] : [],
+    ),
+  });
+}
 
 /** A stored link still covering the delivery from OUTSIDE the torn-down
  * scope keeps its watcher. Rows bound to the scope itself don't count —
@@ -973,7 +1234,15 @@ function deliveryLinkedOutsideScope(scope: DeliveryScope) {
       );
       return row ? { sessionId: row.session } : false;
     }
-    // github-pr — coverage comes from a live task child's saved PR result.
+    // github-pr — the watcher's own live session covers it first (a session
+    // that linked the PR and is still around keeps its watcher), then a live
+    // task child's saved PR result.
+    if (
+      source.kind === "github-pr" &&
+      source.sessionId &&
+      covers(source.cwd, source.sessionId)
+    )
+      return { sessionId: source.sessionId };
     for (const task of tasks) {
       if (task.archived) continue;
       for (const child of task.children) {
@@ -1068,7 +1337,20 @@ function rewatchDeliveryScope(task: TaskWorkspace) {
 /** Removes the task record only — sessions, worktrees and branches stay. */
 export function removeTask(taskId: string) {
   const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-  if (task) teardownDeliveryScope(taskDeliveryScope(task));
+  if (task) {
+    // Draft rows die first — a saved PR result still counts as coverage, so
+    // teardown must run after they're gone or watchers re-anchor to a row
+    // that's about to disappear.
+    deleteTaskPrDraftsFor(taskId);
+    // The task's sessions outlive it — tearing down by session id would kill
+    // watchers a live session still owns. Scope the teardown to checkouts:
+    // rows bound to a surviving session keep their coverage.
+    teardownDeliveryScope({
+      cwds: task.children.flatMap((child) =>
+        child.workingCopy ? [child.workingCopy] : [],
+      ),
+    });
+  }
   saveTaskWorkspaces(
     loadTaskWorkspaces().filter((entry) => entry.id !== taskId),
   );
@@ -1093,7 +1375,7 @@ export function removeTaskChild(taskId: string, childId: string) {
       "This is the task's last repository checkout — remove the task instead.",
     );
   const removed = task.children.find((child) => child.id === childId);
-  if (removed) teardownDeliveryScope(childDeliveryScope(removed));
+  if (removed) teardownDroppedChildren(taskId, [removed]);
   updateTask(taskId, (task) => ({
     ...task,
     children: task.children.filter((child) => child.id !== childId),
@@ -1135,38 +1417,113 @@ export function pruneTaskSession(sessionId: string) {
   teardownDeliveryScope({ sessionIds: [sessionId] });
 }
 
-/** Reverse lookup — which task child owns an ordinary session. `cwd` is
- * the session's actual working copy: a task-level session reports the
- * child it is rooted in rather than whatever `lastActiveChildId` says. */
+/** sessionId → owning task, rebuilt only when the store snapshot changes.
+ * Session cards each ask for their scope — without the index every card
+ * rescans every task and child on every render. First writer wins, matching
+ * the scan order `taskForSession` used to apply. */
+let sessionIndexCache:
+  | { tasks: readonly TaskWorkspace[]; map: Map<string, TaskWorkspace> }
+  | undefined;
+
+function sessionTaskIndex(
+  tasks: readonly TaskWorkspace[],
+): Map<string, TaskWorkspace> {
+  if (sessionIndexCache?.tasks === tasks) return sessionIndexCache.map;
+  const map = new Map<string, TaskWorkspace>();
+  for (const task of tasks) {
+    if (task.archived) continue;
+    for (const id of task.sessionIds ?? []) {
+      if (!map.has(id)) map.set(id, task);
+    }
+    for (const child of task.children)
+      for (const id of child.sessionIds)
+        if (!map.has(id)) map.set(id, task);
+  }
+  sessionIndexCache = { tasks, map };
+  return map;
+}
+
+/** working-copy pathKey → claiming children, same snapshot-keyed caching. */
+let copyIndexCache:
+  | {
+      tasks: readonly TaskWorkspace[];
+      map: Map<string, { task: TaskWorkspace; child: TaskChild }[]>;
+    }
+  | undefined;
+
+function workingCopyIndex(
+  tasks: readonly TaskWorkspace[],
+): Map<string, { task: TaskWorkspace; child: TaskChild }[]> {
+  if (copyIndexCache?.tasks === tasks) return copyIndexCache.map;
+  const map = new Map<string, { task: TaskWorkspace; child: TaskChild }[]>();
+  for (const task of tasks) {
+    if (task.archived) continue;
+    for (const child of task.children) {
+      if (!child.workingCopy) continue;
+      const key = pathKey(child.workingCopy);
+      const list = map.get(key);
+      const claim = { task, child };
+      if (list) list.push(claim);
+      else map.set(key, [claim]);
+    }
+  }
+  copyIndexCache = { tasks, map };
+  return map;
+}
+
+/** Every session a task owns — the task-level conversation plus legacy
+ * per-child ids. */
+export function taskSessionIds(task: TaskWorkspace): Set<string> {
+  const ids = new Set(task.sessionIds);
+  for (const child of task.children)
+    for (const id of child.sessionIds) ids.add(id);
+  return ids;
+}
+
+/** Recorded ids that resolve to live sessions — "N conversations" labels
+ * and multi-conversation routing count these, not stale records that only
+ * prune on open. */
+export function liveTaskSessionIds(
+  task: TaskWorkspace,
+  live: ReadonlySet<string>,
+): string[] {
+  return [...taskSessionIds(task)].filter((id) => live.has(id));
+}
+
+/** The session a task is reachable through — its own task-level session
+ * first, else the first child-owned one (legacy per-repo sessions). */
+export function firstTaskSessionId(task: TaskWorkspace): string | undefined {
+  return (
+    task.sessionIds?.[0] ??
+    task.children.find((child) => child.sessionIds.length)?.sessionIds[0]
+  );
+}
+
 export function taskForSession(
   sessionId: string,
   cwd?: string,
   tasks: readonly TaskWorkspace[] = loadTaskWorkspaces(),
 ): { task: TaskWorkspace; child: TaskChild } | null {
-  for (const task of tasks) {
-    if (task.archived) continue;
-    const child = task.children.find((entry) =>
-      entry.sessionIds.includes(sessionId),
-    );
-    if (child) return { task, child };
-    // A task-level session displays its host child — the repository the
-    // conversation is rooted at.
-    if (task.sessionIds?.includes(sessionId)) {
-      const keyed = cwd ? pathKey(cwd) : undefined;
-      const host =
-        (keyed
-          ? task.children.find(
-              (entry) =>
-                entry.workingCopy && pathKey(entry.workingCopy) === keyed,
-            )
-          : undefined) ??
-        task.children.find((entry) => entry.id === task.lastActiveChildId) ??
-        preferredTaskChild(task, (entry) => Boolean(entry.workingCopy)) ??
-        task.children[0];
-      return { task, child: host };
-    }
-  }
-  return null;
+  const task = sessionTaskIndex(tasks).get(sessionId);
+  if (!task) return null;
+  const child = task.children.find((entry) =>
+    entry.sessionIds.includes(sessionId),
+  );
+  if (child) return { task, child };
+  // A task-level session displays its host child — the repository the
+  // conversation is rooted at.
+  const keyed = cwd ? pathKey(cwd) : undefined;
+  const host =
+    (keyed
+      ? task.children.find(
+          (entry) =>
+            entry.workingCopy && pathKey(entry.workingCopy) === keyed,
+        )
+      : undefined) ??
+    task.children.find((entry) => entry.id === task.lastActiveChildId) ??
+    preferredTaskChild(task, (entry) => Boolean(entry.workingCopy)) ??
+    task.children[0];
+  return host ? { task, child: host } : null;
 }
 
 /**
@@ -1178,15 +1535,10 @@ export function taskChildrenForWorkingCopy(
   tasks: readonly TaskWorkspace[] = loadTaskWorkspaces(),
   excludeTaskId?: string,
 ): { task: TaskWorkspace; child: TaskChild }[] {
-  const key = pathKey(path);
-  const out: { task: TaskWorkspace; child: TaskChild }[] = [];
-  for (const task of tasks) {
-    if (task.archived || task.id === excludeTaskId) continue;
-    for (const child of task.children)
-      if (child.workingCopy && pathKey(child.workingCopy) === key)
-        out.push({ task, child });
-  }
-  return out;
+  const claims = workingCopyIndex(tasks).get(pathKey(path)) ?? [];
+  return excludeTaskId
+    ? claims.filter((claim) => claim.task.id !== excludeTaskId)
+    : claims;
 }
 
 export function projectForTask(task: TaskWorkspace): ProjectRecord | undefined {
@@ -1216,6 +1568,21 @@ function repoAcrossAttempts(
   );
 }
 
+/** Display name for a child's repository — the record's name, else the
+ * working-copy basename, else a placeholder for a copy-less child. */
+export function taskChildRepoName(
+  task: TaskWorkspace,
+  child: TaskChild,
+  project?: ProjectRecord,
+): string {
+  const repo = repositoryForChild(task, child, project);
+  return repo
+    ? repositoryDisplayName(repo)
+    : child.workingCopy
+      ? basename(child.workingCopy)
+      : "Repository";
+}
+
 /** `repo/branch` display label for a child — repo name falls back to the
  * working-copy basename when the repository record is gone. */
 export function taskChildRepoLabel(
@@ -1223,15 +1590,7 @@ export function taskChildRepoLabel(
   child: TaskChild,
   project?: ProjectRecord,
 ): string {
-  const repo = repositoryForChild(task, child, project);
-  const repoName = repo
-    ? repositoryDisplay(repo)
-    : child.workingCopy
-      ? (prettyCwd(child.workingCopy)
-          .split("/")
-          .filter(Boolean)
-          .pop() ?? child.workingCopy)
-      : "Repository";
+  const repoName = taskChildRepoName(task, child, project);
   const base = child.branch ? `${repoName}/${child.branch}` : repoName;
   // The same repository under two attempts needs the attempt label;
   // otherwise it adds noise without disambiguating.
@@ -1240,12 +1599,54 @@ export function taskChildRepoLabel(
     : base;
 }
 
-function repositoryDisplay(repository: ProjectRepository): string {
-  return (
-    repository.label ??
-    prettyCwd(repository.anchor).split("/").filter(Boolean).pop() ??
-    repository.anchor
-  );
+/** A child the agent can actually work in — its copy is verified ready, or a
+ * session already owns it. A pending/failed child may still carry a recorded
+ * path that doesn't exist yet. */
+export function taskChildPrepared(child: TaskChild): boolean {
+  return child.launch.state === "ready" || child.sessionIds.length > 0;
+}
+
+/** Per-child prompt fields shared by the session prompt, the update notice
+ * and the legacy per-child brief — copy state, branch/base, attempt. */
+function childPromptParts(
+  task: TaskWorkspace,
+  child: TaskChild,
+  project: ProjectRecord | undefined,
+): string {
+  const repository = project
+    ? repositoryOf(project, child.repositoryId)
+    : undefined;
+  const name = repository ? repositoryDisplayName(repository) : child.repositoryId;
+  const parts = [`- ${name}`];
+  if (child.workingCopy) {
+    parts.push(`working copy: ${child.workingCopy}`);
+    // A recorded path is only real once launch prepared it — pending and
+    // failed children must not read as existing checkouts.
+    if (child.launch.state === "failed")
+      parts.push(
+        `preparation failed${child.launch.error ? `: ${child.launch.error}` : ""}`,
+      );
+    else if (!taskChildPrepared(child)) parts.push("not prepared yet");
+  } else {
+    parts.push("no working copy prepared yet");
+  }
+  if (child.branch) {
+    const base = child.baseRef
+      ? ` (from ${child.baseRef.replace(/^refs\/(heads|remotes)\//, "")}${child.baseCommit ? ` @ ${child.baseCommit.slice(0, 10)}` : ""})`
+      : "";
+    parts.push(`branch: ${child.branch}${base}`);
+  }
+  // Any multi-attempt task labels each child's attempt — a repo unique to a
+  // later attempt is still parallel work the label should mark.
+  if (task.attempts.length > 1)
+    parts.push(`attempt: ${taskAttemptLabel(task, child.attemptId)}`);
+  return parts.join(" — ");
+}
+
+function childResponsibilityLine(child: TaskChild): string | undefined {
+  return child.responsibility?.trim()
+    ? `  Responsibility: ${child.responsibility.trim()}`
+    : undefined;
 }
 
 /** The one task session's prompt — names every repository's working copy,
@@ -1271,33 +1672,46 @@ export function composeTaskSessionPrompt(
   if (task.brief?.trim()) lines.push(task.brief.trim(), "");
   lines.push("Repositories:");
   for (const child of task.children) {
-    const repository = project
-      ? repositoryOf(project, child.repositoryId)
-      : undefined;
-    const name = repository
-      ? repositoryDisplay(repository)
-      : child.repositoryId;
-    const parts = [`- ${name}`];
-    if (child.workingCopy) parts.push(`working copy: ${child.workingCopy}`);
-    else parts.push("no working copy prepared yet");
-    if (child.branch) {
-      const base = child.baseRef
-        ? ` (from ${child.baseRef.replace(/^refs\/(heads|remotes)\//, "")}${child.baseCommit ? ` @ ${child.baseCommit.slice(0, 10)}` : ""})`
-        : "";
-      parts.push(`branch: ${child.branch}${base}`);
-      if (child.mergeTarget) parts.push(`merge target: ${child.mergeTarget}`);
-    }
-    if (repoAcrossAttempts(task, child.repositoryId))
-      parts.push(`attempt: ${taskAttemptLabel(task, child.attemptId)}`);
-    lines.push(parts.join(" — "));
-    if (child.responsibility?.trim())
-      lines.push(`  Responsibility: ${child.responsibility.trim()}`);
+    lines.push(childPromptParts(task, child, project));
+    const resp = childResponsibilityLine(child);
+    if (resp) lines.push(resp);
   }
   lines.push(
     "",
     "Work in each repository's own working copy — they are separate checkouts, not copies of each other.",
   );
   return lines.join("\n").trim();
+}
+
+/** Post-launch delta for the task session — the brief describes the set as
+ * it was at launch, so repository changes since then are restated compactly. */
+export function composeTaskUpdateNotice(
+  task: TaskWorkspace,
+  project: ProjectRecord | undefined,
+): string {
+  const lines = [`The task "${task.name}" was updated.`];
+  const tickets = [
+    task.ticket,
+    ...(task.ticket?.additionalItems ?? []),
+  ].filter((ticket): ticket is LinkedWorkItem => Boolean(ticket));
+  if (tickets.length) {
+    const labels = tickets.map((ticket) =>
+      [ticket.identifier, ticket.title, ticket.url]
+        .filter(Boolean)
+        .join(" — "),
+    );
+    if (labels.length === 1) lines.push(`Linked ticket: ${labels[0]}`);
+    else lines.push("Linked tickets:", ...labels.map((label) => `- ${label}`));
+  }
+  if (task.brief?.trim()) lines.push(`Brief: ${task.brief.trim()}`);
+  lines.push("The current repository set:");
+  for (const child of task.children) {
+    lines.push(childPromptParts(task, child, project));
+    const resp = childResponsibilityLine(child);
+    if (resp) lines.push(resp);
+  }
+  lines.push("Work in each repository's own working copy.");
+  return lines.join("\n");
 }
 
 /**
@@ -1324,18 +1738,23 @@ export function composeTaskPrompt(
     else lines.push("Tickets:", ...labels.map((label) => `- ${label}`), "");
   }
   if (task.brief?.trim()) lines.push(task.brief.trim(), "");
-  const name = repository ? repositoryDisplay(repository) : child.repositoryId;
+  const name = repository ? repositoryDisplayName(repository) : child.repositoryId;
   lines.push(`Repository: ${name}`);
-  if (child.workingCopy) lines.push(`Working copy: ${child.workingCopy}`);
+  if (child.workingCopy) {
+    lines.push(`Working copy: ${child.workingCopy}`);
+    if (child.launch.state === "failed")
+      lines.push(
+        `Preparation failed${child.launch.error ? `: ${child.launch.error}` : ""}`,
+      );
+    else if (!taskChildPrepared(child)) lines.push("Not prepared yet.");
+  }
   if (child.branch) {
     const base = child.baseRef
       ? ` (from ${child.baseRef.replace(/^refs\/(heads|remotes)\//, "")}${child.baseCommit ? ` @ ${child.baseCommit.slice(0, 10)}` : ""})`
       : "";
     lines.push(`Branch: ${child.branch}${base}`);
-    if (child.mergeTarget)
-      lines.push(`Merge target: ${child.mergeTarget}`);
   }
-  if (repoAcrossAttempts(task, child.repositoryId))
+  if (task.attempts.length > 1)
     lines.push(`Attempt: ${taskAttemptLabel(task, child.attemptId)}`);
   if (child.responsibility?.trim())
     lines.push("", `Your responsibility: ${child.responsibility.trim()}`);

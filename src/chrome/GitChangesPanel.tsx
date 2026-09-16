@@ -1,8 +1,9 @@
 import { Select } from "./Select";
 import { deliveryProvider, saveDeliveryProvider, resolvePrProviders, githubDeliveryTarget, gitlabDeliveryTarget, GITLAB_CI_ON_MR, DELIVERY_PROVIDERS_CHANGED, type DeliveryProvider } from "../lib/deliveryProviders";
 import { GITLAB_CHANGE_EVENT, gitlabRepo } from "../lib/gitlab";
-import { loadAzurePrAssociations, AZURE_PR_ASSOCIATIONS_CHANGED } from "../lib/azureRepos";
-import { loadCiSources, ciState, ciContext, AZURE_CI_SOURCES_CHANGED } from "../lib/azurePipelines";
+import { loadAzurePrAssociations } from "../lib/azureRepos";
+import { loadCiSources, ciState, ciContext } from "../lib/azurePipelines";
+import { useDeliveryStores } from "../hooks/useDeliveryStores";
 import type { DeliveryTabSource } from "../lib/layout";
 import { contextFromChanges, requestAgentContext } from "../lib/agentContext";
 import {
@@ -12,23 +13,23 @@ import {
   syncWithDefaultBranch,
 } from "../lib/syncDefault";
 import {
+  liveTaskSessionIds,
   loadTaskWorkspaces,
   projectForTask,
-  repositoryForChild,
   subscribeTaskWorkspaces,
-  taskForSession,
+  taskSessionIds,
   taskWorkspacesSnapshot,
   type TaskChild,
   type TaskWorkspace,
 } from "../lib/taskWorkspaces";
+import { useTaskScope } from "../hooks/useTaskScope";
+import { useTaskChildData as useTaskChildDataShared } from "../hooks/useTaskChildData";
 import {
-  childDelivery,
-  deliveryStores,
-  EMPTY_DELIVERY,
+  taskStatusSegments,
   type DeliveryStores,
   type TaskChildDelivery,
 } from "../lib/taskDelivery";
-import { projectsSnapshot, repositoryDisplayName, subscribeProjects } from "../lib/projects";
+import { projectsSnapshot, subscribeProjects } from "../lib/projects";
 import { pathKey, projectName } from "../lib/paths";
 import { Popover } from "./Popover";
 import { ContextCheckbox } from "./InboxContextPicker";
@@ -114,11 +115,8 @@ import { generateCommitMessage, generatePrContent } from "../lib/harness";
 import { watchGithubPrUrl } from "../lib/watchers";
 import { invalidateWatchedFiles } from "../lib/fileWatch";
 import { MOD } from "../lib/platform";
-import {
-  applyProjectDiffStats,
-  useProjectDiffStats,
-} from "../hooks/useProjectDiffStats";
-import { useBranchPr, useCachedBranchPr } from "../hooks/useBranchPr";
+import { applyProjectDiffStats } from "../hooks/useProjectDiffStats";
+import { useBranchPr } from "../hooks/useBranchPr";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 
 const GIT_POLL_MS = 2000;
@@ -151,6 +149,9 @@ type Props = {
   selectedPath?: string;
   selectedKind?: GitFileDiffKind;
   selectedSha?: string;
+  /** Live session ids — task "N conversations" labels count these, not
+   * stale task records. */
+  liveSessionIds?: ReadonlySet<string>;
   onOpenFile: (path: string, kind: GitFileDiffKind) => void;
   onOpenDelivery?: (cwd: string, source: DeliveryTabSource) => void;
   onOpenAllChanges: () => void;
@@ -165,6 +166,7 @@ export function GitChangesPanel({
   selectedPath,
   selectedKind,
   selectedSha,
+  liveSessionIds,
   onOpenFile,
   onOpenAllChanges,
   onOpenDelivery,
@@ -173,20 +175,10 @@ export function GitChangesPanel({
   // A task session's panel can inspect any prepared child working copy —
   // everything below keys off viewCwd so Git, PR and CI state never mixes
   // two children.
-  const tasksRaw = useSyncExternalStore(
-    subscribeTaskWorkspaces,
-    taskWorkspacesSnapshot,
-  );
-  const projectsRaw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
-  const task = useMemo(
-    () =>
-      sourceSessionId
-        ? (taskForSession(sourceSessionId, cwd)?.task ?? null)
-        : null,
-    // Stores re-read on every write.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [sourceSessionId, cwd, tasksRaw, projectsRaw],
-  );
+  // Subscribe-only: `projectForTask` below resolves at render against the
+  // latest project records.
+  useSyncExternalStore(subscribeProjects, projectsSnapshot);
+  const task = useTaskScope(sourceSessionId, cwd)?.task ?? null;
   const [viewCwd, setViewCwd] = useState(cwd);
   const prevCwd = useRef(cwd);
   useEffect(() => {
@@ -255,39 +247,22 @@ export function GitChangesPanel({
 
   const { index, patch } = useDiffIndex(viewCwd, enabled);
   const files = index?.files ?? EMPTY_FILES;
-  const [deliveryTick, refreshDelivery] = useState(0);
-  useEffect(() => {
-    const refresh = () => refreshDelivery(value => value + 1);
-    window.addEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, refresh);
-    window.addEventListener(AZURE_CI_SOURCES_CHANGED, refresh);
-    window.addEventListener(GITLAB_CHANGE_EVENT, refresh);
-    window.addEventListener("storage", refresh);
-    window.addEventListener(DELIVERY_PROVIDERS_CHANGED, refresh);
-    return () => {
-      window.removeEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, refresh);
-      window.removeEventListener(AZURE_CI_SOURCES_CHANGED, refresh);
-      window.removeEventListener(GITLAB_CHANGE_EVENT, refresh);
-      window.removeEventListener("storage", refresh);
-      window.removeEventListener(DELIVERY_PROVIDERS_CHANGED, refresh);
-    };
-  }, []);
+  const stores = useDeliveryStores([
+    GITLAB_CHANGE_EVENT,
+    "storage",
+    DELIVERY_PROVIDERS_CHANGED,
+  ]);
   // Parsed once per scope/store change — this render runs on every poll.
   const prs = useMemo(
     () =>
       loadAzurePrAssociations(viewCwd, index?.branch ?? "", sourceSessionId),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [viewCwd, index?.branch, sourceSessionId, deliveryTick],
+    [viewCwd, index?.branch, sourceSessionId, stores],
   );
   const pipelines = useMemo(
     () => loadCiSources(viewCwd, index?.branch ?? "", sourceSessionId),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [viewCwd, index?.branch, sourceSessionId, deliveryTick],
-  );
-  const stores = useMemo(
-    () => deliveryStores(),
-    // Re-parsed when any delivery store signals a change.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [deliveryTick],
+    [viewCwd, index?.branch, sourceSessionId, stores],
   );
 
   const [repository, setRepository] = useState<{cwd: string; branch: string; provider?: DeliveryProvider}>();
@@ -315,14 +290,13 @@ export function GitChangesPanel({
         setRepository({cwd: viewCwd, branch: context.branch, provider});
     }).catch(() => { /* Explicit provider selection remains available. */ });
     return () => { deliveryGeneration.current++; };
-  }, [viewCwd, index?.branch, index?.remote, index?.upstream, sourceSessionId, enabled, deliveryTick]);
+  }, [viewCwd, index?.branch, index?.remote, index?.upstream, sourceSessionId, enabled, stores]);
   const defaultProvider = repository?.cwd === viewCwd && repository.branch === index?.branch ? repository.provider : undefined;
-  const providerFor = (kind: "pr" | "ci") => {
-    // GitLab pipelines ride the MR surface — never a standalone CI delivery.
-    const provider = deliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind)
+  const providerFor = (kind: "pr" | "ci") =>
+    // GitLab pipelines ride the MR surface — the row still names GitLab so a
+    // click can explain that instead of pretending a CI choice exists.
+    deliveryProvider(viewCwd, index?.branch ?? "", sourceSessionId, kind)
       ?? ((kind === "pr" ? prs.length : pipelines.length) ? "azure" : defaultProvider);
-    return provider === "gitlab" && kind === "ci" ? undefined : provider;
-  };
   const openDelivery = async (kind: "pr" | "ci") => {
     const provider = providerFor(kind);
     if (!provider) { setChoosingProviders(true); return; }
@@ -332,7 +306,7 @@ export function GitChangesPanel({
     setDeliveryBusy(true); setDeliveryError("");
     try {
       if (provider === "github") {
-        const target = await githubDeliveryTarget(viewCwd);
+        const target = await githubDeliveryTarget(viewCwd, undefined, kind);
         if (generation !== deliveryGeneration.current) return;
         onOpenDelivery?.(viewCwd, {kind, branch: index?.branch ?? "", sourceSessionId, provider: "github", repo: target.repo, number: target.number});
       } else if (provider === "gitlab") {
@@ -408,7 +382,7 @@ export function GitChangesPanel({
           ] as const
         ).map(([kind, label]) => {
           const provider = providerFor(kind);
-          const providerLabel = provider === "github" ? (kind === "pr" ? "GitHub" : "GitHub checks") : provider === "azure" ? (kind === "pr" ? "Azure Repos" : "Azure Pipelines") : provider === "gitlab" ? (kind === "pr" ? "GitLab" : "GitLab pipelines") : "Choose provider";
+          const providerLabel = provider === "github" ? (kind === "pr" ? "GitHub" : "GitHub checks") : provider === "azure" ? (kind === "pr" ? "Azure Repos" : "Azure Pipelines") : provider === "gitlab" ? (kind === "pr" ? "GitLab" : "GitLab pipelines · on the MR") : "Choose provider";
           const linked = provider === "azure";
           return (
           <button
@@ -464,6 +438,7 @@ export function GitChangesPanel({
         selectedKind={selectedKind}
         enabled={enabled}
         fill
+        liveSessionIds={liveSessionIds}
         onOpenFile={onOpenFile}
         onOpenAllChanges={onOpenAllChanges}
         onMutated={(paths, apply, touchWorktree, mutationCwd) => {
@@ -789,33 +764,10 @@ function useTaskChildData(
   enabled: boolean,
   stores: DeliveryStores,
 ) {
-  const stats = useProjectDiffStats(
-    entry?.workingCopy ?? "",
-    enabled && !!entry?.workingCopy,
-  );
-  const branch = stats?.branch ?? entry?.branch;
-  const githubPr = useCachedBranchPr(entry?.workingCopy ?? "", branch);
-  const delivery = useMemo(
-    () =>
-      entry
-        ? childDelivery(
-            task,
-            entry,
-            [branch, entry.branch],
-            githubPr,
-            stores,
-          )
-        : EMPTY_DELIVERY,
-    [task, entry, branch, githubPr, stores],
-  );
-  const repo = entry ? repositoryForChild(task, entry) : undefined;
-  const repoName = repo
-    ? repositoryDisplayName(repo)
-    : entry?.workingCopy
-      ? basename(entry.workingCopy)
-      : "Repository";
+  const data = useTaskChildDataShared(task, entry, enabled, stores);
+  // Copy presence, not launch state — the chip offers any recorded copy.
   const prepared = !!entry?.workingCopy && entry.workingCopy !== "~";
-  return { stats, branch, delivery, repoName, prepared };
+  return { ...data, prepared };
 }
 
 function TaskChildChip({
@@ -874,6 +826,7 @@ function ChangedFiles({
   selectedKind,
   enabled,
   fill,
+  liveSessionIds,
   onOpenFile,
   onOpenAllChanges,
   onMutated,
@@ -887,6 +840,8 @@ function ChangedFiles({
   selectedKind?: GitFileDiffKind;
   enabled: boolean;
   fill: boolean;
+  /** Live session ids — task "N conversations" labels count these. */
+  liveSessionIds?: ReadonlySet<string>;
   onOpenFile: (path: string, kind: GitFileDiffKind) => void;
   onOpenAllChanges: () => void;
   onMutated: (
@@ -1332,6 +1287,11 @@ function ChangedFiles({
             setContextSelected(new Set());
             setSelectingContext(false);
           },
+          onFailed: (reason) => {
+            // The selection stays — say why the send never staged.
+            if (generation === contextGeneration.current)
+              setContextError(reason);
+          },
         });
       }
     } catch (reason) {
@@ -1633,6 +1593,7 @@ function ChangedFiles({
             <ContextTaskMenu
               anchor={taskMenuButton}
               tasks={contextTasks}
+              liveIds={liveSessionIds}
               onPick={(taskId) => void prepareSelected({ taskId })}
               onNewTask={() => void prepareSelected({ newTask: true })}
               onClose={() => setTaskMenuOpen(false)}
@@ -2786,12 +2747,15 @@ function sameIndex(prev: GitDiffIndex | null, next: GitDiffIndex): boolean {
 function ContextTaskMenu({
   anchor,
   tasks,
+  liveIds,
   onPick,
   onNewTask,
   onClose,
 }: {
   anchor: React.RefObject<HTMLButtonElement | null>;
   tasks: readonly import("../lib/taskWorkspaces").TaskWorkspace[];
+  /** Live session ids — when absent the recorded count is used. */
+  liveIds?: ReadonlySet<string>;
   onPick: (taskId: string) => void;
   onNewTask: () => void;
   onClose: () => void;
@@ -2829,12 +2793,30 @@ function ContextTaskMenu({
             ? project.name?.trim() ||
               (project.anchor ? projectName(project.anchor) : "Project")
             : "";
+          // Destination clarity: sending lands in the task's primary
+          // conversation when one exists — otherwise the pick starts the
+          // task first.
+          const conversations = liveIds
+            ? liveTaskSessionIds(task, liveIds).length
+            : taskSessionIds(task).size;
+          const status = conversations
+            ? conversations > 1
+              ? `${conversations} conversations`
+              : "conversation"
+            : taskStatusSegments(task).join(" · ") || "not started";
           return (
             <button
               type="button"
               role="menuitem"
               key={task.id}
               className={itemClass}
+              title={
+                conversations > 1
+                  ? `Send to "${task.name}" — its primary conversation gets the selection`
+                  : conversations
+                    ? `Send to "${task.name}" — its conversation gets the selection`
+                    : `Send to "${task.name}" — starts the task first`
+              }
               onClick={() => onPick(task.id)}
             >
               <Task
@@ -2844,6 +2826,7 @@ function ContextTaskMenu({
               <span className="min-w-0 flex-1 truncate">{task.name}</span>
               <span className="shrink-0 truncate text-[10px] text-content/40">
                 {projectLabel}
+                {status ? ` · ${status}` : ""}
               </span>
             </button>
           );

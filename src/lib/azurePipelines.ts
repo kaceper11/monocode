@@ -225,11 +225,18 @@ export function ciLogContext(
 const KEY = "monocode.azureCiSources.v1";
 /** Every saved CI source, validated — one storage read for callers that
  * aggregate several scopes (e.g. a task's repository children). */
+// Validated rows keyed on the raw snapshot — delivery badges call this per
+// child per row, so repeated parses of the same blob are the hot path.
+let sourcesCacheRaw: string | undefined;
+let sourcesCache: CiSource[] = [];
+
 export function allCiSources(): CiSource[] {
   try {
-    const rows: unknown = JSON.parse(localStorage.getItem(KEY) ?? "[]");
+    const raw = localStorage.getItem(KEY) ?? "[]";
+    if (raw === sourcesCacheRaw) return sourcesCache;
+    const rows: unknown = JSON.parse(raw);
     if (!Array.isArray(rows)) return [];
-    return rows
+    sourcesCache = rows
       .slice(0, 100)
       .filter((row): row is CiSource => {
         try {
@@ -259,6 +266,8 @@ export function allCiSources(): CiSource[] {
             ? row.last
             : undefined,
       }));
+    sourcesCacheRaw = raw;
+    return sourcesCache;
   } catch {
     return [];
   }
@@ -303,7 +312,12 @@ export function unbindCiSourceSession(sessionId: string) {
       seen.add(key);
       return true;
     });
-  localStorage.setItem(KEY, JSON.stringify(next));
+  try {
+    localStorage.setItem(KEY, JSON.stringify(next));
+  } catch {
+    /* Quota/denied storage — teardown must not abort on a dropped unbind. */
+    return;
+  }
   if (typeof window !== "undefined")
     window.dispatchEvent(new Event(AZURE_CI_SOURCES_CHANGED));
 }
@@ -313,13 +327,9 @@ export function saveCiSources(
   branch: string,
   session?: string,
 ) {
-  let rows: CiSource[] = [];
-  try {
-    const stored = JSON.parse(localStorage.getItem(KEY) ?? "[]");
-    if (Array.isArray(stored)) rows = stored;
-  } catch {
-    /* Recover this feature's malformed cache. */
-  }
+  // Merge against validated rows — a raw parse would keep malformed entries
+  // alive through every rewrite.
+  const rows = allCiSources();
   const scope = ciScope(cwd, branch, session);
   // Scope members before this write — diffed against the new set below so
   // only first-time links register a watcher and departed ones are lifted.
@@ -336,7 +346,12 @@ export function saveCiSources(
   const others = rows.filter((row) => row && !inScope(row));
   const merged = [...sources.slice(0, 20), ...others];
   const stored = merged.slice(0, 100);
-  localStorage.setItem(KEY, JSON.stringify(stored));
+  try {
+    localStorage.setItem(KEY, JSON.stringify(stored));
+  } catch {
+    /* Quota/denied storage — report the drop, don't crash the handler. */
+    return;
+  }
   if (typeof window !== "undefined") window.dispatchEvent(new Event(AZURE_CI_SOURCES_CHANGED));
   const before = new Set(previous.map((row) => ciKey(row.target)));
   const covered = (target: CiTarget, atCwd: string, atBranch: string) =>

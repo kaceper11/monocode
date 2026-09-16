@@ -62,6 +62,9 @@ export type AgentContextRequest = {
    * entries instead of failing — the entries carry the same context. */
   attachmentsOptional?: boolean;
   onPrepared?: () => void;
+  /** The route failed before staging — the sender keeps its selection and
+   * shows this reason so the send can be retried. */
+  onFailed?: (reason: string) => void;
   onRefreshEvidence?: (instruction: string) => void;
 };
 

@@ -372,6 +372,7 @@ pub fn run() {
             fs::worktrees::git_repository_family,
             fs::worktrees::git_worktree_refs,
             fs::worktrees::git_worktree_create,
+            fs::worktrees::git_worktree_checkout,
             fs::worktrees::git_worktree_remove,
             fs::worktrees::git_worktree_safety,
             fs::worktrees::git_worktree_removal_preview,

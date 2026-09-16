@@ -6,10 +6,12 @@ import {
   ChevronDown,
   ChevronUp,
   CircleAlert,
+  CircleDashed,
   Folder,
   FolderOpen,
   FolderTree,
   GitBranch,
+  GitPullRequest,
   ImagePlus,
   Inbox,
   MoreHorizontal,
@@ -32,8 +34,12 @@ import {
   useState,
   useSyncExternalStore,
   type MouseEvent,
+  type ReactNode,
 } from "react";
-import { probeRepositoryFamily, useRepositoryFamilies } from "../hooks/useRepositoryFamilies";
+import {
+  probeRepositoryFamily,
+  useRepositoryFamilies,
+} from "../hooks/useRepositoryFamilies";
 import {
   groupRailProjectsByMembership,
   loadProjects,
@@ -94,7 +100,13 @@ import {
 } from "../lib/appearance";
 import { basename, revealPath, type GitDiffStats } from "../lib/fs";
 import { IS_MAC, IS_WIN, MOD } from "../lib/platform";
-import { pathKey, prettyCwd, projectKey, projectName, wslLocation } from "../lib/paths";
+import {
+  pathKey,
+  prettyCwd,
+  projectKey,
+  projectName,
+  wslLocation,
+} from "../lib/paths";
 import {
   collectRailProjects,
   loadPinnedProjects,
@@ -149,10 +161,13 @@ import {
   OPEN_TASK_DETAILS,
   repositoryForChild,
   subscribeTaskWorkspaces,
+  taskChildPrepared,
   taskChildRepoLabel,
   taskChildrenForWorkingCopy,
   taskForSession,
   taskMatchesQuery,
+  taskSessionIds,
+  liveTaskSessionIds,
   taskWorkspacesSnapshot,
   loadTaskWorkspaces,
   projectForTask,
@@ -161,13 +176,19 @@ import {
 } from "../lib/taskWorkspaces";
 import {
   childDelivery,
-  deliveryStores,
+  taskDeliveryOverview,
   taskStatusSegments,
   type DeliveryStores,
   type TaskChildDelivery,
 } from "../lib/taskDelivery";
-import { AZURE_PR_ASSOCIATIONS_CHANGED } from "../lib/azureRepos";
-import { AZURE_CI_SOURCES_CHANGED } from "../lib/azurePipelines";
+import type { TaskDeliveryRef } from "../lib/taskCi";
+import {
+  linkedWorkItemUpdateKey,
+  type LinkedSessionUpdate,
+} from "../lib/linkedSessionUpdates";
+import { OPEN_INBOX_WORK_ITEM } from "../lib/sessionWorkItem";
+import { InboxProviderMark } from "./InboxProviderMark";
+import { useDeliveryStores } from "../hooks/useDeliveryStores";
 import type { SettingsSectionId } from "../lib/settings";
 
 const REVEAL_LABEL = IS_MAC
@@ -218,6 +239,196 @@ function projectMenuExtraItems(
   return items;
 }
 
+/** Provider state strings differ in case — GitHub shouts, Jira/Azure don't. */
+function overviewStatus(value: string): string {
+  const trimmed = value.trim();
+  return trimmed && trimmed === trimmed.toUpperCase()
+    ? trimmed.toLowerCase()
+    : trimmed;
+}
+
+function OverviewChip({
+  tone = "muted",
+  title,
+  onClick,
+  children,
+}: {
+  tone?: "muted" | "amber" | "red";
+  title?: string;
+  onClick?: () => void;
+  children: ReactNode;
+}) {
+  const colors =
+    tone === "red"
+      ? "border-red-400/30 text-red-400"
+      : tone === "amber"
+        ? "border-amber-400/30 text-amber-400"
+        : "border-content/10 text-content/60";
+  const className = `flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] leading-none ${colors}`;
+  if (!onClick) return <span className={className}>{children}</span>;
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      title={title}
+      onClick={onClick}
+      className={`${className} hover:bg-content/8 hover:text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent`}
+    >
+      {children}
+    </button>
+  );
+}
+
+/**
+ * Compact status strip at the top of a task's rail menu — the linked
+ * ticket's inbox state plus delivery/waiting badges, each a quick action
+ * into the surface that owns it. Saved provider links and cache peeks only;
+ * the menu never fetches.
+ */
+function TaskMenuOverview({
+  task,
+  needsInputIds,
+  liveIds,
+  linkedItemUpdates,
+  onOpenTask,
+  onOpenDetails,
+  onOpenDelivery,
+}: {
+  task: TaskWorkspace;
+  needsInputIds?: ReadonlySet<string>;
+  liveIds?: ReadonlySet<string>;
+  /** Remote snapshots of linked tickets that changed — keyed by
+   * `linkedWorkItemUpdateKey`. */
+  linkedItemUpdates?: ReadonlyMap<string, LinkedSessionUpdate>;
+  onOpenTask?: () => void;
+  onOpenDetails?: () => void;
+  onOpenDelivery?: (child: TaskChild, ref: TaskDeliveryRef) => void;
+}) {
+  const stores = useDeliveryStores();
+  const statsV = useSyncExternalStore(
+    subscribeDiffStatsVersion,
+    diffStatsVersion,
+  );
+  const prV = useSyncExternalStore(subscribeBranchPrVersion, branchPrVersion);
+  const overview = useMemo(
+    () =>
+      taskDeliveryOverview(
+        task,
+        (child) => {
+          const branch =
+            peekProjectDiffStats(child.workingCopy!)?.branch ?? child.branch;
+          return {
+            branches: [branch, child.branch],
+            githubPr: cachedBranchPr(child.workingCopy!, branch),
+          };
+        },
+        stores,
+      ),
+    // statsV/prV only tick the caches — the peeks re-read inside.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [task, stores, statsV, prV],
+  );
+
+  const tickets = task.ticket
+    ? [task.ticket, ...(task.ticket.additionalItems ?? [])]
+    : [];
+  const ticket = tickets[0];
+  const ticketUpdate = ticket
+    ? tickets
+        .map((item) => linkedItemUpdates?.get(linkedWorkItemUpdateKey(item)))
+        .find(Boolean)
+    : undefined;
+  const ticketStatus = ticketUpdate
+    ? overviewStatus(
+        ticketUpdate.item.attentionReason ??
+          ticketUpdate.item.stateType ??
+          ticketUpdate.item.state ??
+          "",
+      )
+    : "";
+  const waiting = [
+    ...(liveIds ? liveTaskSessionIds(task, liveIds) : taskSessionIds(task)),
+  ].filter((id) => needsInputIds?.has(id)).length;
+
+  if (!ticket && !overview.prs && !overview.ci && !waiting) return null;
+  const openDelivery =
+    (target: { child: TaskChild; ref: TaskDeliveryRef } | undefined) => () =>
+      target && onOpenDelivery
+        ? onOpenDelivery(target.child, target.ref)
+        : onOpenDetails?.();
+  return (
+    <div className="flex flex-wrap items-center gap-1 border-b border-content/10 px-2.5 py-2">
+      {ticket ? (
+        <OverviewChip
+          tone={ticketUpdate ? "amber" : "muted"}
+          title={ticketUpdate?.item.title ?? ticket.title ?? ticket.url}
+          onClick={() =>
+            window.dispatchEvent(
+              new CustomEvent(OPEN_INBOX_WORK_ITEM, { detail: ticket }),
+            )
+          }
+        >
+          <InboxProviderMark
+            provider={ticket.provider ?? "github"}
+            className="size-3 shrink-0"
+          />
+          {ticket.identifier || `#${ticket.number}`}
+          {ticketStatus ? ` · ${ticketStatus}` : ""}
+          {tickets.length > 1 ? ` +${tickets.length - 1}` : ""}
+        </OverviewChip>
+      ) : null}
+      {overview.prs ? (
+        <OverviewChip
+          tone={overview.prAttention ? "red" : "muted"}
+          title={
+            overview.prAttention
+              ? "A pull request needs the author — open its review"
+              : "Open the pull request review"
+          }
+          onClick={openDelivery(overview.prTarget)}
+        >
+          <GitPullRequest className="size-3 shrink-0" strokeWidth={1.75} />
+          {overview.prs > 1 ? `${overview.prs} PRs` : "PR"}
+          {overview.prAttention ? " · needs review" : ""}
+        </OverviewChip>
+      ) : null}
+      {overview.ci ? (
+        <OverviewChip
+          tone={
+            overview.ciFailing ? "red" : overview.ciRunning ? "amber" : "muted"
+          }
+          title={
+            overview.ciFailing
+              ? "A linked pipeline failed — open its review"
+              : overview.ciRunning
+                ? "A linked pipeline is running — open its review"
+                : "Open the pipeline review"
+          }
+          onClick={openDelivery(overview.ciTarget)}
+        >
+          <CircleDashed className="size-3 shrink-0" strokeWidth={1.75} />
+          {overview.ci > 1 ? `${overview.ci} CI` : "CI"}
+          {overview.ciFailing
+            ? " · failing"
+            : overview.ciRunning
+              ? " · running"
+              : ""}
+        </OverviewChip>
+      ) : null}
+      {waiting ? (
+        <OverviewChip
+          tone="amber"
+          title="A conversation in this task is waiting on you"
+          onClick={onOpenTask}
+        >
+          <span className="size-1.5 shrink-0 rounded-full bg-amber-400" />
+          {waiting === 1 ? "1 waiting" : `${waiting} waiting`}
+        </OverviewChip>
+      ) : null}
+    </div>
+  );
+}
+
 type Props = {
   cwd: string;
   recents: RecentProject[];
@@ -252,13 +463,31 @@ type Props = {
     taskId?: string;
   }) => void;
   onOpenTask?: (taskId: string) => void;
+  /** Explicitly launches pending/failed children — heavier than opening,
+   * so it stays behind the row's menu rather than the row click. */
+  onStartTask?: (taskId: string) => void;
   /** Just-created task — highlighted as current until a task session takes
    * over. Purely presentational; never launches work. */
   focusTaskId?: string;
   onEditTask?: (taskId: string) => void;
   onCreateTaskPrs?: (taskId: string) => void;
+  /** Bulk merge of the remote default into every linked working copy —
+   * conflicts route to each copy's owning agent. */
+  onSyncTaskBranches?: (taskId: string) => void;
   /** Sessions currently needing input (approval or question) — per-child dots. */
   needsInputSessionIds?: ReadonlySet<string>;
+  /** Every resolvable session id — task "N conversations" labels count
+   * these, never stale task records. */
+  liveSessionIds?: ReadonlySet<string>;
+  /** Remote snapshots of linked tickets that changed — the task menu's
+   * inbox-item status chip. Keyed by `linkedWorkItemUpdateKey`. */
+  linkedItemUpdates?: ReadonlyMap<string, LinkedSessionUpdate>;
+  /** Opens a child's PR/CI review inside the task's conversation. */
+  onOpenTaskDelivery?: (
+    task: TaskWorkspace,
+    child: TaskChild,
+    ref: TaskDeliveryRef,
+  ) => void;
   onRemoveProject?: (path: string, options: { purgeData: boolean }) => void;
   liveAgents?: LiveAgent[];
   activeSessionId?: string;
@@ -298,10 +527,15 @@ export function ProjectRail({
   onNewTask,
   onOpenCommands,
   onOpenTask,
+  onStartTask,
   focusTaskId,
   onEditTask,
   onCreateTaskPrs,
+  onSyncTaskBranches,
   needsInputSessionIds,
+  liveSessionIds,
+  linkedItemUpdates,
+  onOpenTaskDelivery,
   onRemoveProject,
   liveAgents = [],
   activeSessionId,
@@ -326,10 +560,11 @@ export function ProjectRail({
   const [railOrder, setRailOrder] = useState(loadProjectRailOrder);
   const [pinnedPaths, setPinnedPaths] = useState(loadPinnedProjects);
   useEffect(
-    () => subscribeRemovedWorktree(() => {
-      setRailOrder(loadProjectRailOrder());
-      setPinnedPaths(loadPinnedProjects());
-    }),
+    () =>
+      subscribeRemovedWorktree(() => {
+        setRailOrder(loadProjectRailOrder());
+        setPinnedPaths(loadPinnedProjects());
+      }),
     [],
   );
   const [groupLabels, setGroupLabels] = useState(loadTabGroupLabels);
@@ -371,7 +606,6 @@ export function ProjectRail({
     taskWorkspacesSnapshot,
   );
 
-
   /** Task owning the focused session. */
   const activeTask = useMemo(
     () => (activeSessionId ? taskForSession(activeSessionId)?.task : undefined),
@@ -393,11 +627,8 @@ export function ProjectRail({
     const set = new Set<string>();
     for (const task of loadTaskWorkspaces()) {
       if (task.archived) continue;
-      const ids = [
-        ...(task.sessionIds ?? []),
-        ...task.children.flatMap((entry) => entry.sessionIds),
-      ];
-      if (ids.some((id) => busySessionIds.has(id))) set.add(task.id);
+      if ([...taskSessionIds(task)].some((id) => busySessionIds.has(id)))
+        set.add(task.id);
     }
     return set;
     // tasksRaw changes on every store write.
@@ -554,9 +785,7 @@ export function ProjectRail({
     setTaskMenu({ task, x, y, rowRect });
   };
 
-  const [addMenu, setAddMenu] = useState<{ x: number; y: number } | null>(
-    null,
-  );
+  const [addMenu, setAddMenu] = useState<{ x: number; y: number } | null>(null);
 
   const closeAddMenu = () => setAddMenu(null);
 
@@ -689,10 +918,17 @@ export function ProjectRail({
     // checkouts, worktrees, branches and credentials stay on disk. Purge still
     // applies the existing per-path session cleanup.
     deleteProject(project.id);
+    // Tasks bound to the deleted record would be orphaned — they could no
+    // longer resolve a project (no edit, no relaunch, no repo inventory).
+    // Archive instead of deleting so their worktree/cleanup records survive;
+    // recreating the project restores access via unarchive.
+    for (const task of loadTaskWorkspaces()) {
+      if (task.projectId === project.id && !task.archived)
+        archiveTask(task.id, true);
+    }
     dropVerifyForProject(project.id);
     const members = memberRecentPaths(project);
-    for (const member of members)
-      onRemoveProject?.(member, { purgeData });
+    for (const member of members) onRemoveProject?.(member, { purgeData });
     if (!members.includes(path) && !isProjectRailKey(path))
       onRemoveProject?.(path, { purgeData });
   };
@@ -707,8 +943,7 @@ export function ProjectRail({
         groupLabels,
         isProjectRailKey(path) ? "Project" : basename(path),
       );
-    if (action === "pin" || action === "unpin")
-      onTogglePin(path, menuProject);
+    if (action === "pin" || action === "unpin") onTogglePin(path, menuProject);
     else if (action === "new-task") onNewTask?.(path, projectId);
     else if (action === "commands") {
       onOpenCommands?.({
@@ -721,8 +956,7 @@ export function ProjectRail({
         path: isProjectRailKey(path) ? undefined : path,
         projectId,
       });
-    }
-    else if (action === "repositories") {
+    } else if (action === "repositories") {
       setRepositoriesProject({ path, projectId });
     } else if (action === "background") {
       setBackgroundProject({
@@ -731,8 +965,7 @@ export function ProjectRail({
       });
     } else if (action === "reveal") {
       if (!isProjectRailKey(path)) void revealPath(path);
-    }
-    else if (action === "archive") {
+    } else if (action === "archive") {
       removeProjectEntry(path, projectId, false);
     } else if (action === "delete") {
       setRemoving({ path, name: displayName, projectId });
@@ -1069,18 +1302,110 @@ export function ProjectRail({
           aria-label={`Task ${taskMenu.task.name}`}
           className="overflow-hidden"
         >
+          <TaskMenuOverview
+            task={taskMenu.task}
+            needsInputIds={needsInputSessionIds}
+            liveIds={liveSessionIds}
+            linkedItemUpdates={linkedItemUpdates}
+            onOpenTask={
+              onOpenTask
+                ? () => {
+                    onOpenTask(taskMenu.task.id);
+                    setTaskMenu(null);
+                  }
+                : undefined
+            }
+            onOpenDetails={() => {
+              window.dispatchEvent(
+                new CustomEvent(OPEN_TASK_DETAILS, {
+                  detail: taskMenu.task.id,
+                }),
+              );
+              setTaskMenu(null);
+            }}
+            onOpenDelivery={
+              onOpenTaskDelivery
+                ? (child, ref) => {
+                    setTaskMenu(null);
+                    void onOpenTaskDelivery(taskMenu.task, child, ref);
+                  }
+                : undefined
+            }
+          />
           <div className="px-1.5 py-1.5">
-            <button
-              type="button"
-              role="menuitem"
-              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
-              onClick={() => {
-                onOpenTask?.(taskMenu.task.id);
-                setTaskMenu(null);
-              }}
-            >
-              Open task
-            </button>
+            {(() => {
+              // No live set (tests render the rail without sessions) — count
+              // the recorded ids as before.
+              const conversations = liveTaskSessionIds(
+                taskMenu.task,
+                liveSessionIds ?? taskSessionIds(taskMenu.task),
+              ).length;
+              return (
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+                  onClick={() => {
+                    // Several conversations — the details sheet's list is the
+                    // picker; one or none goes straight to open's behavior.
+                    if (conversations > 1)
+                      window.dispatchEvent(
+                        new CustomEvent(OPEN_TASK_DETAILS, {
+                          detail: taskMenu.task.id,
+                        }),
+                      );
+                    else onOpenTask?.(taskMenu.task.id);
+                    setTaskMenu(null);
+                  }}
+                >
+                  {conversations > 1
+                    ? `Open ${conversations} conversations…`
+                    : conversations
+                      ? "Open conversation"
+                      : "Open task"}
+                </button>
+              );
+            })()}
+            {!taskMenu.task.archived &&
+            (taskMenu.task.children.some(
+              (child) => !taskChildPrepared(child),
+            ) ||
+              // Every child ready but no live session anywhere — Start
+              // recreates the conversation the task lost.
+              !liveTaskSessionIds(
+                taskMenu.task,
+                liveSessionIds ?? taskSessionIds(taskMenu.task),
+              ).length) &&
+            onStartTask ? (
+              <button
+                type="button"
+                role="menuitem"
+                title="Prepare working copies and start the agent"
+                className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+                onClick={() => {
+                  onStartTask(taskMenu.task.id);
+                  setTaskMenu(null);
+                }}
+              >
+                Start task
+              </button>
+            ) : null}
+            {!taskMenu.task.archived &&
+            onSyncTaskBranches &&
+            taskMenu.task.children.some((child) => child.workingCopy) ? (
+              <button
+                type="button"
+                role="menuitem"
+                title="Fetch and merge the remote default into every linked working copy — conflicts go to each copy's agent"
+                className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+                onClick={() => {
+                  onSyncTaskBranches(taskMenu.task.id);
+                  setTaskMenu(null);
+                }}
+              >
+                Sync all branches with remote default
+              </button>
+            ) : null}
             <button
               type="button"
               role="menuitem"
@@ -1096,17 +1421,19 @@ export function ProjectRail({
             >
               Task details…
             </button>
-            <button
-              type="button"
-              role="menuitem"
-              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
-              onClick={() => {
-                onEditTask?.(taskMenu.task.id);
-                setTaskMenu(null);
-              }}
-            >
-              Edit task…
-            </button>
+            {!taskMenu.task.archived && onEditTask ? (
+              <button
+                type="button"
+                role="menuitem"
+                className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+                onClick={() => {
+                  onEditTask(taskMenu.task.id);
+                  setTaskMenu(null);
+                }}
+              >
+                Edit task…
+              </button>
+            ) : null}
             {onOpenCommands ? (
               <button
                 type="button"
@@ -1126,18 +1453,19 @@ export function ProjectRail({
                 Commands…
               </button>
             ) : null}
-            <button
-              type="button"
-              role="menuitem"
-              disabled={!onCreateTaskPrs}
-              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5 disabled:opacity-50"
-              onClick={() => {
-                onCreateTaskPrs?.(taskMenu.task.id);
-                setTaskMenu(null);
-              }}
-            >
-              Create pull requests…
-            </button>
+            {!taskMenu.task.archived && onCreateTaskPrs ? (
+              <button
+                type="button"
+                role="menuitem"
+                className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5"
+                onClick={() => {
+                  onCreateTaskPrs(taskMenu.task.id);
+                  setTaskMenu(null);
+                }}
+              >
+                Create pull requests…
+              </button>
+            ) : null}
             <button
               type="button"
               role="menuitem"
@@ -1456,7 +1784,10 @@ function ProjectSection({
   searchActive: boolean;
   onSelect: (path: string) => void;
   onTogglePin: (path: string, project?: ProjectRecord) => void;
-  onContextMenu: (item: RailProjectItem, event: MouseEvent<HTMLElement>) => void;
+  onContextMenu: (
+    item: RailProjectItem,
+    event: MouseEvent<HTMLElement>,
+  ) => void;
   onOpenMenu: (
     item: RailProjectItem,
     x: number,
@@ -1525,7 +1856,9 @@ function ProjectSection({
 const nameClassName =
   "min-w-0 flex-1 truncate text-sm font-medium leading-tight";
 
-function useExpandedRow(key: string): [boolean | null, (next: boolean) => void] {
+function useExpandedRow(
+  key: string,
+): [boolean | null, (next: boolean) => void] {
   const [expanded, setExpanded] = useState<boolean | null>(null);
   useEffect(() => {
     try {
@@ -1599,8 +1932,7 @@ function WorkingCopyRows({
     anchor: HTMLButtonElement;
   } | null>(null);
   const menuClaim = useMemo(
-    () =>
-      menu ? taskChildrenForWorkingCopy(menu.child.path)[0] : undefined,
+    () => (menu ? taskChildrenForWorkingCopy(menu.child.path)[0] : undefined),
     // tasksRaw changes on every store write.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [menu, tasksRaw],
@@ -1661,11 +1993,7 @@ function WorkingCopyRows({
         id: "remove",
         label: "Remove Git worktree…",
         danger: true,
-        disabled:
-          child.main ||
-          unavailable ||
-          !!child.locked ||
-          !child.branch,
+        disabled: child.main || unavailable || !!child.locked || !child.branch,
       },
     ];
   };
@@ -1803,8 +2131,7 @@ function WorkingCopyRows({
           onClose={() => {
             setMenu(null);
             (
-              menu.anchor.parentElement?.querySelector("button") ??
-              menu.anchor
+              menu.anchor.parentElement?.querySelector("button") ?? menu.anchor
             ).focus();
           }}
         />
@@ -1849,7 +2176,8 @@ function ProjectRepositoryRow({
   const openRepository = () =>
     onSelect(
       lastWorkingCopyPath(repo.commonDir, family) ??
-        (family?.worktrees.find((child) => child.main && !child.missing)?.path ||
+        (family?.worktrees.find((child) => child.main && !child.missing)
+          ?.path ||
           repo.anchor),
     );
   return (
@@ -1863,9 +2191,7 @@ function ProjectRepositoryRow({
             onClick={() => setExpanded(!visible)}
             className="shrink-0 rounded px-0.5 text-content/45 hover:text-content"
           >
-            <ChevronDown
-              className={`size-3 ${visible ? "" : "-rotate-90"}`}
-            />
+            <ChevronDown className={`size-3 ${visible ? "" : "-rotate-90"}`} />
           </button>
         ) : (
           <span className="w-4 shrink-0" />
@@ -2015,22 +2341,7 @@ function TasksSection({
   const searchRef = useRef<HTMLInputElement>(null);
   // Re-read saved provider links when they change — one parse shared by all
   // rows; the rail never fetches live provider data itself.
-  const [deliveryTick, setDeliveryTick] = useState(0);
-  useEffect(() => {
-    const bump = () => setDeliveryTick((value) => value + 1);
-    window.addEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, bump);
-    window.addEventListener(AZURE_CI_SOURCES_CHANGED, bump);
-    return () => {
-      window.removeEventListener(AZURE_PR_ASSOCIATIONS_CHANGED, bump);
-      window.removeEventListener(AZURE_CI_SOURCES_CHANGED, bump);
-    };
-  }, []);
-  const stores = useMemo(
-    () => deliveryStores(),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [deliveryTick],
-  );
-  if (!tasks.length && !archivedTasks.length) return null;
+  const stores = useDeliveryStores();
   // The rail stays compact — current and working tasks sort first, the
   // long tail hides behind a toggle like the archived list. Filtering shows
   // every match (live and archived) without the cap.
@@ -2083,19 +2394,21 @@ function TasksSection({
         <span className="min-w-0 flex-1 truncate px-1 text-xs text-content/50">
           Tasks
         </span>
-        <button
-          type="button"
-          title="Search tasks"
-          aria-label="Search tasks"
-          aria-expanded={searching}
-          onClick={() => {
-            setSearching(true);
-            searchRef.current?.focus();
-          }}
-          className={`grid size-5 shrink-0 place-items-center rounded-md hover:bg-content/8 hover:text-content ${searching ? "text-content" : "text-content/50"}`}
-        >
-          <Search className="size-3.5" strokeWidth={1.75} />
-        </button>
+        {tasks.length || archivedTasks.length ? (
+          <button
+            type="button"
+            title="Search tasks"
+            aria-label="Search tasks"
+            aria-expanded={searching}
+            onClick={() => {
+              setSearching(true);
+              searchRef.current?.focus();
+            }}
+            className={`grid size-5 shrink-0 place-items-center rounded-md hover:bg-content/8 hover:text-content ${searching ? "text-content" : "text-content/50"}`}
+          >
+            <Search className="size-3.5" strokeWidth={1.75} />
+          </button>
+        ) : null}
         {onNewTask ? (
           <button
             type="button"
@@ -2137,6 +2450,22 @@ function TasksSection({
       ) : null}
       <div className="flex flex-col gap-px px-2">
         {visibleTasks.map((task) => row(task))}
+        {!tasks.length && !archivedTasks.length ? (
+          onNewTask ? (
+            <button
+              type="button"
+              onClick={onNewTask}
+              className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-[11px] text-content/40 hover:bg-content/5 hover:text-content/60"
+            >
+              <Plus className="size-3 shrink-0" strokeWidth={1.75} />
+              New task
+            </button>
+          ) : (
+            <p className="px-4 pb-1 text-[11px] leading-tight text-content/40">
+              No tasks yet
+            </p>
+          )
+        ) : null}
         {filtering && !visibleTasks.length && !visibleArchived.length ? (
           <p className="px-4 pb-1 text-[11px] leading-tight text-content/40">
             No matching tasks
@@ -2379,8 +2708,7 @@ function ProjectFamilyCard(
       sameProjectPath(child.path, cwd) ||
       !hidden.some((path) => sameProjectPath(path, child.path)),
   );
-  const visible =
-    expanded ?? (isGroup || (!multiRepo && children.length > 1));
+  const visible = expanded ?? (isGroup || (!multiRepo && children.length > 1));
   const selected =
     multiRepo || isGroup
       ? !!project && projectContainsPath(project, cwd, families)
@@ -2486,15 +2814,21 @@ function ProjectFamilyCard(
           />
         </div>
       )}
-      {visible && !multiRepo && !isGroup && allChildren.length > children.length && (
-        <button
-          type="button"
-          className="w-full rounded px-2 py-1 text-left text-[10px] text-content/50 hover:bg-content/5"
-          onClick={(event) => { anchor.current = event.currentTarget; setMenu({ create: false }); }}
-        >
-          {allChildren.length - children.length} hidden · Manage worktrees
-        </button>
-      )}
+      {visible &&
+        !multiRepo &&
+        !isGroup &&
+        allChildren.length > children.length && (
+          <button
+            type="button"
+            className="w-full rounded px-2 py-1 text-left text-[10px] text-content/50 hover:bg-content/5"
+            onClick={(event) => {
+              anchor.current = event.currentTarget;
+              setMenu({ create: false });
+            }}
+          >
+            {allChildren.length - children.length} hidden · Manage worktrees
+          </button>
+        )}
       {menu && (
         <Popover
           anchor={anchor}
@@ -2502,7 +2836,10 @@ function ProjectFamilyCard(
           width={320}
           maxHeight={380}
           onDismiss={() => {
-            if (!working) { setMenu(null); anchor.current?.focus(); }
+            if (!working) {
+              setMenu(null);
+              anchor.current?.focus();
+            }
           }}
           role="dialog"
           aria-label="Worktrees"
@@ -2517,7 +2854,10 @@ function ProjectFamilyCard(
                 (entry) => !entry.missing && !entry.prunable,
               )?.path ?? props.item.path
             }
-            onClose={() => { setMenu(null); anchor.current?.focus(); }}
+            onClose={() => {
+              setMenu(null);
+              anchor.current?.focus();
+            }}
             onOpen={onSelect}
             onBusyChange={setWorking}
           />
@@ -2560,7 +2900,10 @@ function ProjectCard({
   index: number;
   onSelect: (path: string) => void;
   onTogglePin: (path: string, project?: ProjectRecord) => void;
-  onContextMenu: (item: RailProjectItem, event: MouseEvent<HTMLElement>) => void;
+  onContextMenu: (
+    item: RailProjectItem,
+    event: MouseEvent<HTMLElement>,
+  ) => void;
   onOpenMenu: (
     item: RailProjectItem,
     x: number,
@@ -2578,8 +2921,7 @@ function ProjectCard({
   const key = projectKey(item.path);
   const seed = projectName(item.path);
   const name =
-    item.project?.name ??
-    resolveTabGroupLabel(key, groupLabels, fallbackName);
+    item.project?.name ?? resolveTabGroupLabel(key, groupLabels, fallbackName);
   const logoPath = resolveTabGroupLogo(key, groupLogos);
   const color = resolveTabGroupColor(key, groupColors, groupCustomColors, seed);
   const dragging = sortable.draggingId === item.path;
@@ -2593,8 +2935,7 @@ function ProjectCard({
     sortable.toIndex === index &&
     sortable.fromIndex !== null &&
     sortable.toIndex > sortable.fromIndex;
-  const diffEnabled =
-    Boolean(item.path) && item.path !== "~" && !groupRow;
+  const diffEnabled = Boolean(item.path) && item.path !== "~" && !groupRow;
   const stats = useProjectDiffStats(item.path, diffEnabled);
   const files = stats?.files ?? 0;
   const additions = stats?.additions ?? 0;

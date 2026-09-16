@@ -1,6 +1,21 @@
 import { Select } from "./Select";
 import { ciRepair } from "../lib/repair";
 import { RepairStatus } from "./RepairStatus";
+import {
+  ReviewDetails,
+  ReviewError,
+  ReviewHeader,
+  ReviewShell,
+  ReviewStatus,
+  reviewAction,
+  reviewButton,
+  reviewField,
+  reviewDanger,
+  reviewToneText,
+  type ReviewTone,
+} from "./ReviewChrome";
+import { Bot, ExternalLink, Loader, RefreshCw } from "./icons";
+import { AzureConnectionDetails } from "./AzureConnectionDetails";
 import { useEffect, useRef, useState } from "react";
 import { emit } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -36,23 +51,40 @@ import {
   type CiSource,
 } from "../lib/azurePipelines";
 
-const button =
-  "rounded-md px-2 py-1 text-[12px] text-content hover:bg-content/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40";
-const field =
-  "w-full rounded-md border border-content/15 bg-content/5 px-2 py-1.5 text-[12px] text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent";
+const button = reviewButton;
 const failure = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 // Two initial sources at a time across visible CI panes; explicit refreshes stay immediate.
 const initialLoads: Promise<unknown>[] = [Promise.resolve(), Promise.resolve()];
 let initialSlot = 0;
-const scheduleInitialLoad = (action: () => Promise<void>, current: () => boolean) => {
+const scheduleInitialLoad = (
+  action: () => Promise<void>,
+  current: () => boolean,
+) => {
   const slot = initialSlot++ % initialLoads.length;
-  initialLoads[slot] = initialLoads[slot].then(() => current() ? action() : undefined).catch(() => undefined);
+  initialLoads[slot] = initialLoads[slot]
+    .then(() => (current() ? action() : undefined))
+    .catch(() => undefined);
 };
 const drafts = new Map<string, string>();
+/** Run/job state → pill tone: in-flight amber, passed emerald, failed rose,
+ * cancelled/skipped/abandoned dim. */
+const ciTone = (status: string, result?: string | null): ReviewTone =>
+  status !== "completed"
+    ? "running"
+    : result === "succeeded"
+      ? "passing"
+      : result === "partiallySucceeded" || result === "succeededWithIssues"
+        ? "running"
+        : result === "failed"
+          ? "failing"
+          : result
+            ? "closed"
+            : "neutral";
 
 export function AzureCiReview({
   inboxTarget,
+  embedded = false,
   cwd,
   branch,
   sourceSessionId,
@@ -61,6 +93,7 @@ export function AzureCiReview({
   onReveal,
 }: {
   inboxTarget?: CiTarget;
+  embedded?: boolean;
   cwd: string;
   branch: string;
   sourceSessionId?: string;
@@ -78,6 +111,7 @@ export function AzureCiReview({
   return enabled ? (
     <CiPanel
       inboxTarget={inboxTarget}
+      embedded={embedded}
       key={ciScope(cwd, branch, sourceSessionId)}
       cwd={cwd}
       branch={branch}
@@ -92,6 +126,7 @@ export function AzureCiReview({
 
 function CiPanel({
   inboxTarget,
+  embedded,
   cwd,
   branch,
   session,
@@ -101,6 +136,7 @@ function CiPanel({
   onReveal,
 }: {
   inboxTarget?: CiTarget;
+  embedded?: boolean;
   cwd: string;
   branch: string;
   session?: string;
@@ -115,6 +151,7 @@ function CiPanel({
   const [version, setVersion] = useState(0);
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const scope = ciScope(cwd, branch, session);
   const [link, setLink] = useState(drafts.get(scope) ?? "");
   const [remote, setRemote] = useState("");
@@ -125,7 +162,8 @@ function CiPanel({
   sourceRef.current = sources;
   useEffect(() => {
     const run = ++generation.current;
-    setStatus(undefined);
+    // Keep the last resolved status while re-reading — clearing it flips the
+    // connection details open and flashes "Connect account" on each refresh.
     setError("");
     setBusy(false);
     pending.current = false;
@@ -138,12 +176,19 @@ function CiPanel({
           );
         setStatus(status);
         setCheckout(context);
-        setRemote((previous) => context.remotes.some((remote) => remote.url === previous)
-          ? previous : context.remotes.length === 1 ? context.remotes[0].url : "");
+        setRemote((previous) =>
+          context.remotes.some((remote) => remote.url === previous)
+            ? previous
+            : context.remotes.length === 1
+              ? context.remotes[0].url
+              : "",
+        );
+        setRefreshing(false);
       })
       .catch((error) => {
         if (run === generation.current) {
           setCheckout(undefined);
+          setRefreshing(false);
           setError(failure(error));
         }
       });
@@ -207,148 +252,135 @@ function CiPanel({
     }
   };
   return (
-    <section
-      aria-label="Azure pipeline runs"
-      className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
-    >
-      <div className="mx-auto w-full max-w-3xl space-y-3 px-5 py-4 text-[12px]">
-        <header className="flex items-center justify-between gap-3 border-b border-content/10 pb-3">
-          <h2 className="text-[13px] font-medium">CI</h2>
-          <span className="truncate text-content/50" title={cwd}>
-            {branch || "Detached checkout"}
-            {checkout?.commit ? ` · ${checkout.commit.slice(0, 8)}` : ""}
-          </span>
-        </header>
-        <details className="text-content/60" open={!status?.connected}>
-          <summary className="cursor-pointer focus-visible:outline-accent">
-            Azure Pipelines
-            {status?.connected && status.account
-              ? ` · ${status.account}`
-              : " · Connect account"}
-          </summary>
-          <p className="break-words text-content/60">
-            {status?.connected
-              ? `${status.account} · ${status.site} · credentials on this device`
-              : "Connect the shared Azure account with Build (Read) to inspect CI."}
-          </p>
-          <p className="break-all text-content/50">
-            Worktree: {cwd}
-            <br />
-            Branch: {branch || "detached"} · Session:{" "}
-            {session ?? "Choose when sending"}
-            <br />
-            Checkout commit: {checkout?.commit ?? "Checking…"}
-          </p>
-          <p className="text-content/50">
-            Each source is independent. A passing run does not establish that
-            all required CI passes. PR merge builds need verified source-head
-            evidence.
-          </p>
-          <button className={button} onClick={connect}>
-            {status?.connected ? "Connection settings" : "Connect Azure DevOps"}
+    <ReviewShell label="Azure pipeline runs">
+      {!embedded ? (
+        <ReviewHeader
+          label="CI"
+          context={`${branch || "Detached checkout"}${checkout?.commit ? ` · ${checkout.commit.slice(0, 8)}` : ""}`}
+          title={cwd}
+        />
+      ) : null}
+      <AzureConnectionDetails
+        label="Azure Pipelines"
+        status={status}
+        connected={!!status?.connected}
+        connectHint="Connect the shared Azure account with Build (Read) to inspect CI."
+        onLeave={onClose}
+        onError={setError}
+      >
+        <p className="text-content/50">
+          Each source is independent. A passing run does not establish that all
+          required CI passes. PR merge builds need verified source-head
+          evidence.
+        </p>
+      </AzureConnectionDetails>
+      <div className="flex flex-wrap gap-1">
+        <button
+          className={button}
+          disabled={busy || refreshing}
+          onClick={() => {
+            setRefreshing(true);
+            setVersion((v) => v + 1);
+          }}
+        >
+          {refreshing ? (
+            <Loader className="size-3.5 animate-spin" strokeWidth={1.75} />
+          ) : (
+            <RefreshCw className="size-3.5" strokeWidth={1.75} />
+          )}
+          Refresh all
+        </button>
+        {!inboxTarget && !adding ? (
+          <button
+            className={`${button} bg-content/10`}
+            disabled={!status?.connected}
+            onClick={() => setAdding(true)}
+          >
+            {sources.length ? "Add pipeline" : "Connect a pipeline"}
           </button>
-        </details>
-        <div className="flex flex-wrap gap-1">
+        ) : null}
+      </div>
+      {error ? <ReviewError>{error}</ReviewError> : null}
+      {!sources.length ? (
+        <ReviewStatus>
+          {status
+            ? "No Azure pipeline is linked to this branch yet. Connect one to see runs and failed jobs for this checkout."
+            : "Checking Azure Pipelines…"}
+        </ReviewStatus>
+      ) : null}
+      {adding ? (
+        <form
+          className="max-w-lg space-y-3 rounded-md border border-content/10 p-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void add();
+          }}
+        >
+          <p className="font-medium">Connect pipeline</p>
+          <label className="block">
+            Pipeline link
+            <input
+              aria-label="Azure pipeline link"
+              className={reviewField}
+              value={link}
+              maxLength={2048}
+              disabled={busy}
+              placeholder="https://dev.azure.com/org/project/_build?definitionId=7"
+              onChange={(e) => {
+                setLink(e.target.value);
+                drafts.delete(scope);
+                drafts.set(scope, e.target.value);
+                if (drafts.size > 100)
+                  drafts.delete(drafts.keys().next().value!);
+              }}
+            />
+          </label>
+          <label className="block">
+            Repository for this pipeline
+            <Select
+              label="Pipeline repository remote"
+              value={remote}
+              disabled={busy}
+              options={[
+                { value: "", label: "Choose repository" },
+                ...(checkout?.remotes.map((value) => ({
+                  value: value.url,
+                  label: `${value.name} · ${value.url}`,
+                })) ?? []),
+              ]}
+              onChange={setRemote}
+            />
+          </label>
           <button
             className={button}
-            disabled={busy}
-            onClick={() => setVersion((v) => v + 1)}
+            disabled={
+              busy || !status?.connected || !checkout || !link.trim() || !remote
+            }
           >
-            Refresh
+            {busy ? "Verifying…" : "Connect pipeline"}
           </button>
-          {!inboxTarget && !adding ? (
-            <button
-              className={`${button} bg-content/10`}
-              disabled={!status?.connected}
-              onClick={() => setAdding(true)}
-            >
-              {sources.length ? "Add pipeline" : "Connect a pipeline"}
-            </button>
-          ) : null}
-        </div>
-        {error ? (
-          <p role="alert" className="break-words">
-            {error}
-          </p>
-        ) : null}
-        {!sources.length ? (
-          <p className="text-content/60">
-            No pipeline connected. Add one to see runs and failed jobs for this
-            checkout.
-          </p>
-        ) : null}
-        {adding ? (
-          <form
-            className="max-w-lg space-y-3 rounded-md border border-content/10 p-3"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void add();
-            }}
+          <button
+            type="button"
+            className={button}
+            disabled={busy}
+            onClick={() => setAdding(false)}
           >
-            <p className="font-medium">Connect pipeline</p>
-            <label className="block">
-              Pipeline link
-              <input
-                aria-label="Azure pipeline link"
-                className={field}
-                value={link}
-                maxLength={2048}
-                disabled={busy}
-                placeholder="https://dev.azure.com/org/project/_build?definitionId=7"
-                onChange={(e) => {
-                  setLink(e.target.value);
-                  drafts.delete(scope);
-                  drafts.set(scope, e.target.value);
-                  if (drafts.size > 100)
-                    drafts.delete(drafts.keys().next().value!);
-                }}
-              />
-            </label>
-            <label className="block">
-              Repository for this pipeline
-              <Select
-                label="Pipeline repository remote"
-                value={remote}
-                disabled={busy}
-                options={[
-                  { value: "", label: "Choose repository" },
-                  ...(checkout?.remotes.map((value) => ({
-                    value: value.url,
-                    label: `${value.name} · ${value.url}`,
-                  })) ?? []),
-                ]}
-                onChange={setRemote}
-              />
-            </label>
-            <button
-              className={button}
-              disabled={
-                busy ||
-                !status?.connected ||
-                !checkout ||
-                !link.trim() ||
-                !remote
-              }
-            >
-              {busy ? "Verifying…" : "Connect pipeline"}
-            </button>
-            <button
-              type="button"
-              className={button}
-              disabled={busy}
-              onClick={() => setAdding(false)}
-            >
-              Cancel
-            </button>
-          </form>
-        ) : null}
-        {checkout
-          ? sources.filter(source => !inboxTarget || ciKey(source.target) === ciKey(inboxTarget)).map((source, index) => (
+            Cancel
+          </button>
+        </form>
+      ) : null}
+      {checkout
+        ? sources
+            .filter(
+              (source) =>
+                !inboxTarget || ciKey(source.target) === ciKey(inboxTarget),
+            )
+            .map((source, index) => (
               <CiSourcePanel
                 key={`${ciKey(source.target)}:${checkout.commit}`}
                 refreshVersion={version}
                 autoDetails={index === 0}
-                embedded={!!inboxTarget}
+                embedded={embedded || !!inboxTarget}
                 source={source}
                 head={{
                   cwd,
@@ -375,17 +407,23 @@ function CiPanel({
                 }
                 onHandoff={onClose}
                 onReconnect={connect}
-                repairInstruction={repairDraft.current?.key === ciKey(source.target) ? repairDraft.current.instruction : undefined}
+                repairInstruction={
+                  repairDraft.current?.key === ciKey(source.target)
+                    ? repairDraft.current.instruction
+                    : undefined
+                }
                 onRefreshEvidence={(instruction) => {
-                  repairDraft.current = { key: ciKey(source.target), instruction };
+                  repairDraft.current = {
+                    key: ciKey(source.target),
+                    instruction,
+                  };
                   onReveal?.();
                   setVersion((value) => value + 1);
                 }}
               />
             ))
-          : null}
-      </div>
-    </section>
+        : null}
+    </ReviewShell>
   );
 }
 
@@ -431,6 +469,9 @@ function CiSourcePanel({
     !!status?.connected &&
     status.site === source.target.site &&
     status.accountId === source.target.accountId;
+  // Deps must be stable across refreshes — `status` is a fresh object each
+  // read, so keying the effect on it refires ciLookup after every resolve.
+  const statusReady = status !== undefined;
   const run = async (
     action: (current: () => boolean) => Promise<void>,
     detail = false,
@@ -454,7 +495,12 @@ function CiSourcePanel({
   };
   const refresh = (continuation: string | null = null) =>
     run(async (current) => {
-      const next = await ciLookup(source.target, head, continuation, !continuation ? source.last?.run.id : undefined);
+      const next = await ciLookup(
+        source.target,
+        head,
+        continuation,
+        !continuation ? source.last?.run.id : undefined,
+      );
       if (!current()) return;
       setPage(next);
       const unchanged =
@@ -464,7 +510,9 @@ function CiSourcePanel({
             value.id === selected.id && value.revision === selected.revision,
         );
       if (!selected && !continuation && autoDetails) {
-        const initial = next.items.find(value => value.id === source.last?.run.id) ?? next.items.find(ciMatches);
+        const initial =
+          next.items.find((value) => value.id === source.last?.run.id) ??
+          next.items.find(ciMatches);
         if (initial) await readSelection(initial, current);
       } else if (!unchanged) {
         setSelected(undefined);
@@ -483,9 +531,11 @@ function CiSourcePanel({
     pending.current = false;
     if (sameAccount) {
       setBusy(true);
-      scheduleInitialLoad(() => refresh(), () => generation.current === id);
-    }
-    else if (status) {
+      scheduleInitialLoad(
+        () => refresh(),
+        () => generation.current === id,
+      );
+    } else if (statusReady) {
       setPage(undefined);
       setSelected(undefined);
       setJobs(undefined);
@@ -494,30 +544,35 @@ function CiSourcePanel({
       setSkip(0);
       setDetailError("");
       setBusy(false);
-      setError("Reconnect the mapped Azure organization/account to read this source.");
+      setError(
+        "Reconnect the mapped Azure organization/account to read this source.",
+      );
     }
     return () => {
       if (generation.current === id) generation.current++;
     };
-  }, [sameAccount, status, refreshVersion]);
+  }, [sameAccount, statusReady, refreshVersion]);
   const readSelection = async (value: CiRun, current: () => boolean) => {
-      const checked = await ciRead<CiRun>(source.target, head, value, "summary");
-      if (!current()) return;
-      setSelected(checked);
-      setJobs(undefined);
-      setJob(undefined);
-      setLog(undefined);
-      setSkip(0);
-      setDetailError("");
-      onSave({ run: checked, commit: head.commit, checkedAt: Date.now() });
-      try {
-        const data = await ciRead<CiJobs>(source.target, head, checked, "jobs", { skip: 0 });
-        if (current()) setJobs(data);
-      } catch (error) {
-        if (current()) setDetailError(failure(error));
-      }
+    const checked = await ciRead<CiRun>(source.target, head, value, "summary");
+    if (!current()) return;
+    setSelected(checked);
+    setJobs(undefined);
+    setJob(undefined);
+    setLog(undefined);
+    setSkip(0);
+    setDetailError("");
+    onSave({ run: checked, commit: head.commit, checkedAt: Date.now() });
+    try {
+      const data = await ciRead<CiJobs>(source.target, head, checked, "jobs", {
+        skip: 0,
+      });
+      if (current()) setJobs(data);
+    } catch (error) {
+      if (current()) setDetailError(failure(error));
+    }
   };
-  const select = (value: CiRun) => void run(current => readSelection(value, current));
+  const select = (value: CiRun) =>
+    void run((current) => readSelection(value, current));
   const loadJobs = (skip = 0) =>
     void run(async (current) => {
       if (!selected) return;
@@ -567,8 +622,12 @@ function CiSourcePanel({
         repair: draft?.evidence,
         onRefreshEvidence,
         onPrepared: onHandoff,
-        context:
-          draft ? { ...draft.context, instruction: repairInstruction ?? draft.context.instruction } : ciLogContext(source, head, selected, job, checked),
+        context: draft
+          ? {
+              ...draft.context,
+              instruction: repairInstruction ?? draft.context.instruction,
+            }
+          : ciLogContext(source, head, selected, job, checked),
         cwd: head.cwd,
         sourceSessionId: source.session,
         requireDestinationSelection: !source.session,
@@ -584,11 +643,8 @@ function CiSourcePanel({
       <h3 className="font-medium">
         {source.definitionName} · {source.projectName}
       </h3>
-      <details>
-        <summary className="cursor-pointer text-content/50">
-          Pipeline mapping and account
-        </summary>
-        <p className="break-all text-content/50">
+      <ReviewDetails summary="Pipeline mapping and account">
+        <p>
           {source.target.site} · account {source.target.accountId}
           <br />
           Definition {source.target.definition} · {source.target.repositoryType}
@@ -596,19 +652,27 @@ function CiSourcePanel({
           <br />
           {source.remote}
         </p>
-        {!embedded ? <button className={button} disabled={busy} onClick={onRemove}>
-          Disconnect pipeline
-        </button> : null}
-      </details>
+        {!embedded ? (
+          <button className={reviewDanger} disabled={busy} onClick={onRemove}>
+            Disconnect pipeline
+          </button>
+        ) : null}
+      </ReviewDetails>
       <div className="flex flex-wrap gap-1">
         <button
           className={button}
           disabled={busy || !sameAccount}
           onClick={() => refresh()}
         >
+          {busy ? (
+            <Loader className="size-3.5 animate-spin" strokeWidth={1.75} />
+          ) : (
+            <RefreshCw className="size-3.5" strokeWidth={1.75} />
+          )}
           Refresh runs
         </button>
         <button className={button} onClick={() => external()}>
+          <ExternalLink className="size-3.5" strokeWidth={1.75} />
           Open pipeline in Azure
         </button>
         <button
@@ -631,15 +695,17 @@ function CiSourcePanel({
           Watch failures
         </button>
       </div>
-      {busy || !status ? (
-        <p role="status" className="text-content/50">
-          Loading selected CI evidence…
-        </p>
+      {!status ? (
+        <ReviewStatus>Checking Azure Pipelines…</ReviewStatus>
+      ) : busy && !page ? (
+        <ReviewStatus>Loading runs…</ReviewStatus>
       ) : null}
       {error ? (
         <div>
-          <p role="alert" className="break-words">{error}</p>
-          <button className={button} onClick={onReconnect}>Connection settings</button>
+          <ReviewError>{error}</ReviewError>
+          <button className={button} onClick={onReconnect}>
+            Connection settings
+          </button>
         </div>
       ) : null}
       {page && !page.items.some(ciMatches) ? (
@@ -656,8 +722,12 @@ function CiSourcePanel({
           onClick={() => select(value)}
         >
           <span className="block">
-            Run {value.id} · {value.number} ·{" "}
-            {ciState(value.status, value.result)}
+            Run {value.number} ·{" "}
+            <span
+              className={reviewToneText[ciTone(value.status, value.result)]}
+            >
+              {ciState(value.status, value.result)}
+            </span>
           </span>
           <span className="block break-words text-content/50">
             {ciMatchLabel(value)} ·{" "}
@@ -677,25 +747,41 @@ function CiSourcePanel({
       {selected ? (
         <div className="space-y-2 border-t border-content/10 pt-2">
           <p>
-            Selected run {selected.id} ·{" "}
-            {ciState(selected.status, selected.result)} ·{" "}
-            {ciMatchLabel(selected)}
+            Selected run {selected.number} ·{" "}
+            <span
+              className={
+                reviewToneText[ciTone(selected.status, selected.result)]
+              }
+            >
+              {ciState(selected.status, selected.result)}
+            </span>{" "}
+            · {ciMatchLabel(selected)}
           </p>
-          <button className={button} onClick={() => external(selected.id)}>
-            Open run in Azure
-          </button>
-          <button
-            className={button}
-            disabled={busy || !sameAccount}
-            onClick={() => loadJobs()}
-          >
-            Load jobs
-          </button>
-          {detailError ? (
-            <p role="alert" className="break-words">
-              {detailError}
-            </p>
-          ) : null}
+          <div className="flex flex-wrap gap-1">
+            <button className={button} onClick={() => external(selected.id)}>
+              <ExternalLink className="size-3.5" strokeWidth={1.75} />
+              Open run in Azure
+            </button>
+            {jobs ? (
+              <button
+                className={button}
+                disabled={busy || !sameAccount}
+                onClick={() => loadJobs()}
+              >
+                <RefreshCw className="size-3.5" strokeWidth={1.75} />
+                Refresh jobs
+              </button>
+            ) : !busy ? (
+              <button
+                className={button}
+                disabled={!sameAccount}
+                onClick={() => loadJobs()}
+              >
+                Load jobs
+              </button>
+            ) : null}
+          </div>
+          {detailError ? <ReviewError>{detailError}</ReviewError> : null}
           {jobs?.items.map((value) => (
             <div
               key={`${value.id}:${value.attempt}`}
@@ -704,8 +790,12 @@ function CiSourcePanel({
               <p className="break-words">
                 {value.parentName ? `${value.parentName} / ` : ""}
                 {value.name} · {value.type} ·{" "}
-                {ciState(value.state, value.result)} · attempt{" "}
-                {value.attempt ?? "unknown"}
+                <span
+                  className={reviewToneText[ciTone(value.state, value.result)]}
+                >
+                  {ciState(value.state, value.result)}
+                </span>{" "}
+                · attempt {value.attempt ?? "unknown"}
               </p>
               {value.previousAttempts?.length ? (
                 <p className="text-content/50">
@@ -716,13 +806,17 @@ function CiSourcePanel({
                   · open in Azure for historical logs
                 </p>
               ) : null}
-              {value.logId && value.attempt ? <button
-                className={button}
-                disabled={busy || !sameAccount}
-                onClick={() => loadLog(value)}
-              >
-                Load log · {value.name}
-              </button> : <p className="text-content/50">No log available</p>}
+              {value.logId && value.attempt ? (
+                <button
+                  className={button}
+                  disabled={busy || !sameAccount}
+                  onClick={() => loadLog(value)}
+                >
+                  Load log · {value.name}
+                </button>
+              ) : (
+                <p className="text-content/50">No log available</p>
+              )}
             </div>
           ))}
           {jobs && skip > 0 ? (
@@ -746,7 +840,7 @@ function CiSourcePanel({
           {job && log ? (
             <section className="space-y-2">
               <h4>
-                {job.name} · attempt {log.attempt} · log {log.logId}
+                {job.name} · attempt {log.attempt}
               </h4>
               <p className="text-content/50">
                 Lines {log.startLine + 1}–{log.endLine + 1} of {log.lineCount}.
@@ -778,20 +872,22 @@ function CiSourcePanel({
                   </button>
                 ) : null}
                 <button
-                  className={button}
+                  className={reviewAction}
                   disabled={busy || !sameAccount || !ciMatches(selected)}
                   onClick={() => handoff()}
                 >
+                  <Bot className="size-3.5" strokeWidth={1.75} />
                   Send log to agent
                 </button>
                 {selected.result === "failed" &&
                 job.result === "failed" &&
                 ciMatches(selected) ? (
                   <button
-                    className={button}
+                    className={reviewAction}
                     disabled={busy || !sameAccount}
                     onClick={() => handoff(true)}
                   >
+                    <Bot className="size-3.5" strokeWidth={1.75} />
                     Fix CI
                   </button>
                 ) : null}

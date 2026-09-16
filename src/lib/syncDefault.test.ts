@@ -4,9 +4,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { ask, message } from "@tauri-apps/plugin-dialog";
 import {
   abortMerge,
+  acquireSyncSlot,
+  mergeResolutionSnapshot,
+  offerMergeResolution,
   opLabel,
   sendMergeConflictsToAgent,
   syncConfirmText,
+  syncTaskBranches,
   syncWithDefaultBranch,
 } from "./syncDefault";
 import { requestAgentContext } from "./agentContext";
@@ -141,9 +145,7 @@ it("runs fetch+merge after confirmation and reports merged commits", async () =>
 
 it("never runs the sync when the user declines the confirmation", async () => {
   vi.mocked(ask).mockResolvedValue(false);
-  mockInvoke((command) =>
-    command === "git_diff_index" ? cleanIndex : null,
-  );
+  mockInvoke((command) => (command === "git_diff_index" ? cleanIndex : null));
   const result = await syncWithDefaultBranch({ cwd: "repo" });
   expect(result).toBeUndefined();
   expect(invokedCommands()).not.toContain("git_sync_branch");
@@ -223,9 +225,7 @@ it("refuses before confirming without a remote or default branch", async () => {
   ]) {
     vi.mocked(invoke).mockClear();
     vi.mocked(message).mockClear();
-    mockInvoke((command) =>
-      command === "git_diff_index" ? index : null,
-    );
+    mockInvoke((command) => (command === "git_diff_index" ? index : null));
     const result = await syncWithDefaultBranch({ cwd: "/repo" });
     expect(result).toBeUndefined();
     expect(invokedCommands()).not.toContain("git_sync_branch");
@@ -241,7 +241,8 @@ it("surfaces a refused sync as a warning, not an error throw", async () => {
         outcome: "refused",
         branch: "",
         syncedWith: "",
-        reason: "3 uncommitted changes. Commit or stash before syncing — nothing is stashed automatically.",
+        reason:
+          "3 uncommitted changes. Commit or stash before syncing — nothing is stashed automatically.",
       });
     return null;
   });
@@ -273,10 +274,8 @@ it("reports an up-to-date branch without offering resolution", async () => {
 });
 
 it("offers the resolution flow when the merge stops with conflicts", async () => {
-  // ask#1 confirm sync → true; ask#2 send to agent → true.
-  vi.mocked(ask)
-    .mockResolvedValueOnce(true)
-    .mockResolvedValueOnce(true);
+  // ask#1 confirm sync → true; the in-app sheet then resolves "agent".
+  vi.mocked(ask).mockResolvedValueOnce(true);
   mockInvoke((command) => {
     if (command === "git_diff_index") return cleanIndex;
     if (command === "git_sync_branch")
@@ -287,25 +286,28 @@ it("offers the resolution flow when the merge stops with conflicts", async () =>
     if (command === "git_merge_context") return mergeContext({});
     return null;
   });
-  const result = await syncWithDefaultBranch({
+  const pending = syncWithDefaultBranch({
     cwd: "/repo",
     sessionId: "owner-1",
   });
+  await vi.waitFor(() => expect(mergeResolutionSnapshot().length).toBe(1));
+  const sheet = mergeResolutionSnapshot()[0]!;
+  expect(sheet.syncedWith).toBe("origin/main");
+  expect(sheet.conflicts).toEqual(["src/app.ts"]);
+  expect(sheet.sessionId).toBe("owner-1");
+  sheet.choose("agent");
+  const result = await pending;
   expect(result?.outcome).toBe("conflicted");
-  expect(lastAsk()).toContain("Merging origin/main");
-  expect(lastAsk()).toContain("src/app.ts");
+  expect(mergeResolutionSnapshot().length).toBe(0);
   expect(requestAgentContext).toHaveBeenCalledTimes(1);
-  expect(
-    vi.mocked(requestAgentContext).mock.calls[0][0]?.sourceSessionId,
-  ).toBe("owner-1");
+  expect(vi.mocked(requestAgentContext).mock.calls[0][0]?.sourceSessionId).toBe(
+    "owner-1",
+  );
 });
 
-it("aborts only after a second explicit confirm when send is declined", async () => {
-  // ask#1 confirm sync → true; ask#2 send → false; ask#3 abort → true.
-  vi.mocked(ask)
-    .mockResolvedValueOnce(true)
-    .mockResolvedValueOnce(false)
-    .mockResolvedValueOnce(true);
+it("aborts when the sheet chooses abort", async () => {
+  // ask#1 confirm sync → true; sheet → "abort".
+  vi.mocked(ask).mockResolvedValueOnce(true);
   const changed: (string | undefined)[] = [];
   const off = subscribeGitChanged((cwd) => changed.push(cwd));
   mockInvoke((command) => {
@@ -316,30 +318,50 @@ it("aborts only after a second explicit confirm when send is declined", async ()
     if (command === "git_merge_abort") return "aborted";
     return null;
   });
-  const result = await syncWithDefaultBranch({ cwd: "/repo" });
+  const pending = syncWithDefaultBranch({ cwd: "/repo" });
+  await vi.waitFor(() => expect(mergeResolutionSnapshot().length).toBe(1));
+  mergeResolutionSnapshot()[0]!.choose("abort");
+  const result = await pending;
   off();
   expect(result?.outcome).toBe("conflicted");
-  expect(lastAsk()).toContain("abort the merge");
   expect(invokedCommands()).toContain("git_merge_abort");
   expect(requestAgentContext).not.toHaveBeenCalled();
   // sync + abort notifications.
   expect(changed).toEqual(["/repo", "/repo"]);
 });
 
-it("keeps the conflicts when the user declines both send and abort", async () => {
-  vi.mocked(ask)
-    .mockResolvedValueOnce(true)
-    .mockResolvedValueOnce(false)
-    .mockResolvedValueOnce(false);
+it("keeps the conflicts when the sheet is dismissed (keep)", async () => {
+  vi.mocked(ask).mockResolvedValueOnce(true);
   mockInvoke((command) => {
     if (command === "git_diff_index") return cleanIndex;
     if (command === "git_sync_branch")
       return syncResult({ outcome: "conflicted", conflicts: ["a.ts"] });
     return null;
   });
-  await syncWithDefaultBranch({ cwd: "/repo" });
+  const pending = syncWithDefaultBranch({ cwd: "/repo" });
+  await vi.waitFor(() => expect(mergeResolutionSnapshot().length).toBe(1));
+  mergeResolutionSnapshot()[0]!.choose("keep");
+  await pending;
   expect(invokedCommands()).not.toContain("git_merge_abort");
   expect(requestAgentContext).not.toHaveBeenCalled();
+});
+
+it("a second offer for the same working copy resolves the first as keep", async () => {
+  mockInvoke((command) => {
+    if (command === "git_merge_context")
+      return mergeContext({ merging: false, op: "", conflicts: [] });
+    return null;
+  });
+  const first = offerMergeResolution({ cwd: "/repo" }, "origin/main", ["a.ts"]);
+  const second = offerMergeResolution({ cwd: "/repo" }, "origin/main", [
+    "b.ts",
+  ]);
+  // The first sheet was auto-resolved as keep; only the newest stays pending.
+  await vi.waitFor(() => expect(mergeResolutionSnapshot().length).toBe(1));
+  expect(mergeResolutionSnapshot()[0]!.conflicts).toEqual(["b.ts"]);
+  mergeResolutionSnapshot()[0]!.choose("keep");
+  await Promise.all([first, second]);
+  expect(mergeResolutionSnapshot().length).toBe(0);
 });
 
 it("sends live merge state — host, cwd, branch, incoming ref, paths, bounded diff — to the owning session", async () => {
@@ -415,7 +437,11 @@ it("reports an unknown incoming head instead of inventing a ref", async () => {
 it("routes to the destination picker when the working copy has no owner", async () => {
   mockInvoke((command) => {
     if (command === "git_merge_context")
-      return mergeContext({ conflicts: ["a.ts"], mergeHead: null, incomingRef: null });
+      return mergeContext({
+        conflicts: ["a.ts"],
+        mergeHead: null,
+        incomingRef: null,
+      });
     if (command === "git_diff_index") return cleanIndex;
     return null;
   });
@@ -524,14 +550,9 @@ it("shares one slot across spellings of the same working copy", async () => {
   await first;
 });
 
-it("keeps the slot held while the conflict resolution dialog is open", async () => {
-  let resolveSend: ((value: boolean) => void) | undefined;
-  // ask#1 confirm → true; ask#2 send → pending.
-  vi.mocked(ask)
-    .mockResolvedValueOnce(true)
-    .mockImplementationOnce(
-      () => new Promise((resolve) => (resolveSend = resolve)),
-    );
+it("keeps the slot held while the conflict resolution sheet is open", async () => {
+  // ask#1 confirm → true; the sheet then waits for a choice.
+  vi.mocked(ask).mockResolvedValueOnce(true);
   mockInvoke((command) => {
     if (command === "git_diff_index") return cleanIndex;
     if (command === "git_sync_branch")
@@ -540,15 +561,13 @@ it("keeps the slot held while the conflict resolution dialog is open", async () 
     return null;
   });
   const first = syncWithDefaultBranch({ cwd: "/repo" });
-  await vi.waitFor(() => expect(vi.mocked(ask)).toHaveBeenCalledTimes(2));
+  await vi.waitFor(() => expect(mergeResolutionSnapshot().length).toBe(1));
   // A second sync while the user is still deciding must refuse.
   expect(await syncWithDefaultBranch({ cwd: "/repo" })).toBeUndefined();
   expect(vi.mocked(message).mock.calls.at(-1)?.[0]).toContain(
     "already running",
   );
-  resolveSend?.(false);
-  // Declining send opens the keep/abort ask — answer "keep".
-  vi.mocked(ask).mockResolvedValueOnce(false);
+  mergeResolutionSnapshot()[0]!.choose("keep");
   await first;
 });
 
@@ -611,7 +630,7 @@ it("does not block syncs on other working copies", async () => {
 });
 
 it("propagates a failed context read out of the resolution flow", async () => {
-  vi.mocked(ask).mockResolvedValueOnce(true).mockResolvedValueOnce(true);
+  vi.mocked(ask).mockResolvedValueOnce(true);
   mockInvoke((command) => {
     if (command === "git_diff_index") return cleanIndex;
     if (command === "git_sync_branch")
@@ -619,9 +638,10 @@ it("propagates a failed context read out of the resolution flow", async () => {
     if (command === "git_merge_context") throw new Error("bridge down");
     return null;
   });
-  await expect(syncWithDefaultBranch({ cwd: "/repo" })).rejects.toThrow(
-    "bridge down",
-  );
+  const pending = syncWithDefaultBranch({ cwd: "/repo" });
+  await vi.waitFor(() => expect(mergeResolutionSnapshot().length).toBe(1));
+  mergeResolutionSnapshot()[0]!.choose("agent");
+  await expect(pending).rejects.toThrow("bridge down");
 });
 
 it("labels the abort confirm generically when the state read fails", async () => {
@@ -634,10 +654,10 @@ it("labels the abort confirm generically when the state read fails", async () =>
   expect(invokedCommands()).toContain("git_merge_abort");
 });
 
-it("says nothing is left to abort when the op ended between dialogs", async () => {
-  // ask#1 confirm sync → true; ask#2 send → false (resolve manually);
-  // then the merge ended — the abort ask must never appear.
-  vi.mocked(ask).mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+it("says nothing is left to abort when the op ended before the choice", async () => {
+  // ask#1 confirm sync → true; sheet → "abort"; but the merge ended
+  // meanwhile — the abort command must never run.
+  vi.mocked(ask).mockResolvedValueOnce(true);
   mockInvoke((command) => {
     if (command === "git_diff_index") return cleanIndex;
     if (command === "git_sync_branch")
@@ -646,18 +666,19 @@ it("says nothing is left to abort when the op ended between dialogs", async () =
       return mergeContext({ merging: false, op: "", conflicts: [] });
     return null;
   });
-  await syncWithDefaultBranch({ cwd: "/repo" });
+  const pending = syncWithDefaultBranch({ cwd: "/repo" });
+  await vi.waitFor(() => expect(mergeResolutionSnapshot().length).toBe(1));
+  mergeResolutionSnapshot()[0]!.choose("abort");
+  await pending;
   expect(vi.mocked(message).mock.calls.at(-1)?.[0]).toContain(
     "nothing to abort",
   );
   expect(invokedCommands()).not.toContain("git_merge_abort");
-  // Two asks happened — the third (keep/abort) never did.
-  expect(ask).toHaveBeenCalledTimes(2);
 });
 
 it("labels a capped conflict list instead of implying completeness", async () => {
   const many = Array.from({ length: 100 }, (_, i) => `src/f${i}.ts`);
-  vi.mocked(ask).mockResolvedValueOnce(true).mockResolvedValueOnce(true);
+  vi.mocked(ask).mockResolvedValueOnce(true);
   mockInvoke((command) => {
     if (command === "git_diff_index") return cleanIndex;
     if (command === "git_sync_branch")
@@ -666,7 +687,10 @@ it("labels a capped conflict list instead of implying completeness", async () =>
       return mergeContext({ conflicts: many });
     return null;
   });
-  await syncWithDefaultBranch({ cwd: "/repo" });
+  const pending = syncWithDefaultBranch({ cwd: "/repo" });
+  await vi.waitFor(() => expect(mergeResolutionSnapshot().length).toBe(1));
+  mergeResolutionSnapshot()[0]!.choose("agent");
+  await pending;
   const text = String(
     vi.mocked(requestAgentContext).mock.calls.at(-1)?.[0].context.entries[0]
       .text ?? "",
@@ -675,9 +699,9 @@ it("labels a capped conflict list instead of implying completeness", async () =>
 });
 
 it("tells the user when the operation ended before the context was sent", async () => {
-  // ask#1 confirm sync → true; ask#2 send → true; but the merge resolved
+  // ask#1 confirm sync → true; sheet → "agent"; but the merge resolved
   // meanwhile — git_merge_context reports nothing in progress.
-  vi.mocked(ask).mockResolvedValueOnce(true).mockResolvedValueOnce(true);
+  vi.mocked(ask).mockResolvedValueOnce(true);
   mockInvoke((command) => {
     if (command === "git_diff_index") return cleanIndex;
     if (command === "git_sync_branch")
@@ -686,10 +710,138 @@ it("tells the user when the operation ended before the context was sent", async 
       return mergeContext({ merging: false, op: "", conflicts: [] });
     return null;
   });
-  const result = await syncWithDefaultBranch({ cwd: "/repo" });
+  const pending = syncWithDefaultBranch({ cwd: "/repo" });
+  await vi.waitFor(() => expect(mergeResolutionSnapshot().length).toBe(1));
+  mergeResolutionSnapshot()[0]!.choose("agent");
+  const result = await pending;
   expect(result?.outcome).toBe("conflicted");
   expect(vi.mocked(message).mock.calls.at(-1)?.[0]).toContain(
     "no longer in progress",
   );
   expect(requestAgentContext).not.toHaveBeenCalled();
+});
+
+it("syncs every linked working copy and routes conflicts to their agents", async () => {
+  const outcomes: Record<string, Record<string, unknown>> = {
+    "/repo/a": { outcome: "merged", commits: ["one"], commitCount: 1 },
+    "/repo/b": { outcome: "up-to-date" },
+    "/repo/c": { outcome: "conflicted", conflicts: ["src/app.ts"] },
+  };
+  mockInvoke((command, raw) => {
+    const cwd = String((raw as Record<string, unknown>)?.cwd ?? "");
+    if (command === "git_diff_index") return cleanIndex;
+    if (command === "git_sync_branch") return syncResult(outcomes[cwd] ?? {});
+    if (command === "git_merge_context") return mergeContext({});
+    return null;
+  });
+  const snapshots: string[] = [];
+  const rows = await syncTaskBranches(
+    {
+      sessionIds: ["task-session"],
+      children: [
+        { workingCopy: "/repo/a", sessionIds: ["session-a"] },
+        { workingCopy: "/repo/b", sessionIds: ["session-b"] },
+        { workingCopy: "/repo/c", sessionIds: ["session-c"] },
+      ],
+    },
+    (next) => snapshots.push(next.map((row) => row.state).join(",")),
+  );
+  expect(rows.map((row) => row.state)).toEqual([
+    "merged",
+    "up-to-date",
+    "conflicts-sent",
+  ]);
+  expect(snapshots[0]).toBe("running,running,running");
+  // No per-copy confirmations — the bulk action states its scope up front.
+  expect(ask).not.toHaveBeenCalled();
+  const request = vi.mocked(requestAgentContext).mock.calls.at(-1)?.[0];
+  expect(request?.sourceSessionId).toBe("session-c");
+  expect(request?.requireDestinationSelection).toBe(false);
+  const text = request?.context.entries[0].text ?? "";
+  expect(text).toContain("incoming and the current changes");
+  expect(text).toContain("ask me questions");
+});
+
+it("reports sessionless conflicts without sending or opening the picker", async () => {
+  mockInvoke((command, raw) => {
+    const cwd = String((raw as Record<string, unknown>)?.cwd ?? "");
+    if (command === "git_diff_index") return cleanIndex;
+    if (command === "git_sync_branch")
+      return syncResult({
+        outcome: "conflicted",
+        conflicts: ["a.ts", "b.ts"],
+      });
+    if (command === "git_merge_context") return mergeContext({});
+    return cwd;
+  });
+  const rows = await syncTaskBranches({
+    children: [{ workingCopy: "/repo/a", sessionIds: [] }],
+  });
+  expect(rows[0]?.state).toBe("conflicts");
+  expect(rows[0]?.detail).toContain("2 conflicts");
+  expect(requestAgentContext).not.toHaveBeenCalled();
+});
+
+it("skips dirty, in-progress and slot-held copies while the rest sync", async () => {
+  const release = acquireSyncSlot("/repo/held")!;
+  mockInvoke((command, raw) => {
+    const cwd = String((raw as Record<string, unknown>)?.cwd ?? "");
+    if (command === "git_diff_index")
+      return cwd === "/repo/dirty"
+        ? {
+            ...cleanIndex,
+            files: [{ path: "a.ts", status: "M", kind: "unstaged" }],
+          }
+        : cwd === "/repo/merging"
+          ? { ...cleanIndex, opInProgress: true, op: "merge" }
+          : cleanIndex;
+    if (command === "git_sync_branch")
+      return syncResult({ outcome: "up-to-date" });
+    return null;
+  });
+  try {
+    const rows = await syncTaskBranches({
+      children: [
+        { workingCopy: "/repo/dirty", sessionIds: [] },
+        { workingCopy: "/repo/merging", sessionIds: [] },
+        { workingCopy: "/repo/held", sessionIds: [] },
+        { workingCopy: "/repo/clean", sessionIds: [] },
+      ],
+    });
+    expect(rows.map((row) => row.state)).toEqual([
+      "skipped",
+      "skipped",
+      "skipped",
+      "up-to-date",
+    ]);
+    expect(rows[0]?.detail).toContain("uncommitted");
+    expect(rows[1]?.detail).toContain("merge");
+    expect(rows[2]?.detail).toContain("already running");
+    // The held copy never reached the backend.
+    expect(
+      vi
+        .mocked(invoke)
+        .mock.calls.filter(
+          ([command, raw]) =>
+            command === "git_sync_branch" &&
+            (raw as Record<string, unknown>).cwd === "/repo/held",
+        ).length,
+    ).toBe(0);
+  } finally {
+    release();
+  }
+});
+
+it("surfaces a backend refusal as a skipped row, not a thrown error", async () => {
+  mockInvoke((command) => {
+    if (command === "git_diff_index") return cleanIndex;
+    if (command === "git_sync_branch")
+      return syncResult({ outcome: "refused", reason: "branch moved" });
+    return null;
+  });
+  const rows = await syncTaskBranches({
+    children: [{ workingCopy: "/repo/a", sessionIds: [] }],
+  });
+  expect(rows[0]?.state).toBe("skipped");
+  expect(rows[0]?.detail).toBe("branch moved");
 });

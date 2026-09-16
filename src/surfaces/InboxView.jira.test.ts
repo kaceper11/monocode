@@ -16,7 +16,7 @@ vi.mock("./AgentMarkdown", () => ({
 }));
 vi.mock("../chrome/WindowControls", () => ({ WindowControls: () => null }));
 
-it("retains the selected Jira ticket and explicit project through handoff and refresh failures", async () => {
+it("retains the selected Jira ticket through handoff and refresh failures", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const stored = new Map<string, string>([["monocode.inboxSource", "jira"]]);
   vi.stubGlobal("localStorage", {
@@ -108,11 +108,12 @@ it("retains the selected Jira ticket and explicit project through handoff and re
     );
     await click(button("Send to agent"));
     expect(document.querySelector('[role="dialog"]')).toBeNull();
+    // The item hands off unchanged — the task sheet owns project selection.
     expect(onStartTask).toHaveBeenCalledWith(
       expect.objectContaining({
         identifier: "ENG-41",
         site: "https://team.atlassian.net",
-        projectPath: "/local/project",
+        projectPath: "",
         repo: "",
       }),
       null,

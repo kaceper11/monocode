@@ -145,12 +145,14 @@ function ReviewNavigation(
       { onClick: () => setOpen(false), "aria-label": "Files" },
       "Files",
     ),
-    createElement(Activity, { mode: open ? "visible" : "hidden" },
+    createElement(
+      Activity,
+      { mode: open ? "visible" : "hidden" },
       createElement(AzurePrReview, {
-          ...props,
-          onClose: () => setOpen(false),
-          onReveal: () => setOpen(true),
-        }),
+        ...props,
+        onClose: () => setOpen(false),
+        onReveal: () => setOpen(true),
+      }),
     ),
   );
 }
@@ -224,9 +226,19 @@ it("finds and links a PR, isolates denied policies, pages threads, and hands off
             (args as Record<string, unknown>)?.section === "threads",
         ),
     ).toBe(true);
-    await click("Load policies");
-    expect(document.body.textContent).toContain("Policy read denied");
-    await click("Refresh comments");
+    await act(async () => {
+      const details = [...document.querySelectorAll("details")].find((el) =>
+        el.querySelector("summary")?.textContent?.includes("Files, policies"),
+      )!;
+      details.open = true;
+      details.dispatchEvent(new Event("toggle"));
+    });
+    await act(async () =>
+      vi.waitFor(() =>
+        expect(document.body.textContent).toContain("Policy read denied"),
+      ),
+    );
+    await click("Refresh PR");
     expect(document.body.textContent).not.toContain(
       "Only this selected review thread",
     );
@@ -264,7 +276,7 @@ it("blocks stale-revision handoff and keeps the association for refresh and acco
   window.addEventListener(PREPARE_AGENT_CONTEXT, handoff);
   try {
     await link();
-    await click("Refresh comments");
+    await click("Refresh PR");
     await expandThread();
     stale = true;
     await click("Send thread to agent");
@@ -387,7 +399,9 @@ it("automatically opens a unique branch match but lets the user choose among mul
   expect(document.querySelector("h3")?.textContent).toBe(
     "#13 Fix scoped review",
   );
-  expect(document.body.textContent).toContain("Refresh comments");
+  await act(async () =>
+    vi.waitFor(() => expect(document.body.textContent).toContain("Thread")),
+  );
   await cleanup();
   localStorage.setItem("monocode.azurePrAssociations.v1", "[]");
   discovered = [13, 14];
@@ -397,7 +411,7 @@ it("automatically opens a unique branch match but lets the user choose among mul
     expect(document.body.textContent).toContain(
       "Branch feature · remote origin",
     );
-    expect(document.body.textContent).not.toContain("Refresh comments");
+    expect(document.body.textContent).not.toContain("Address comments");
     await act(async () =>
       [...document.querySelectorAll("button")]
         .find((button) =>
@@ -426,19 +440,34 @@ it("automatically opens a unique branch match but lets the user choose among mul
   }
 });
 
-
 it("labels the page limit and allows repairing a thread beyond the first twenty", async () => {
   const original = vi.mocked(invoke).getMockImplementation()!;
   vi.mocked(invoke).mockImplementation(async (command, args) => {
-    if (command === "azure_ci_context") return {
-      cwd: "wsl://Ubuntu/work/repo", branch: "feature", commit: "source",
-      remotes: [{ name: "azure", url: "https://dev.azure.com/team/project/_git/repo" }],
-    };
-    if (command === "azure_pr_read" && (args as Record<string, unknown>).section === "threads") return {
-      items: Array.from({ length: 21 }, (_, index) => ({
-        id: index + 1, status: "active", comments: [{ id: 1, content: `Comment ${index + 1}` }],
-      })), revision: "source:target", nextSkip: null,
-    };
+    if (command === "azure_ci_context")
+      return {
+        cwd: "wsl://Ubuntu/work/repo",
+        branch: "feature",
+        commit: "source",
+        remotes: [
+          {
+            name: "azure",
+            url: "https://dev.azure.com/team/project/_git/repo",
+          },
+        ],
+      };
+    if (
+      command === "azure_pr_read" &&
+      (args as Record<string, unknown>).section === "threads"
+    )
+      return {
+        items: Array.from({ length: 21 }, (_, index) => ({
+          id: index + 1,
+          status: "active",
+          comments: [{ id: 1, content: `Comment ${index + 1}` }],
+        })),
+        revision: "source:target",
+        nextSkip: null,
+      };
     return original(command, args);
   });
   const cleanup = await setup();
@@ -446,59 +475,89 @@ it("labels the page limit and allows repairing a thread beyond the first twenty"
   window.addEventListener(PREPARE_AGENT_CONTEXT, handoff);
   try {
     await link();
-    await click("Refresh comments");
-    expect(document.body.textContent).toContain("Address comments · first 20 comments");
+    await click("Refresh PR");
+    expect(document.body.textContent).toContain(
+      "Address comments · first 20 comments",
+    );
     await act(async () => {
-      const details = [...document.querySelectorAll("details")].find((el) => el.querySelector("summary")?.textContent?.startsWith("Thread 21 "))!;
+      const details = [...document.querySelectorAll("details")].find((el) =>
+        el.querySelector("summary")?.textContent?.startsWith("Thread 21 "),
+      )!;
       details.open = true;
       details.dispatchEvent(new Event("toggle"));
     });
     await click("Address this comment");
-    await act(async () => vi.waitFor(() => expect(handoff).toHaveBeenCalledTimes(1)));
-    expect((handoff.mock.calls[0][0] as CustomEvent).detail.repair.threads.map((thread: { id: number }) => thread.id)).toEqual([21]);
+    await act(async () =>
+      vi.waitFor(() => expect(handoff).toHaveBeenCalledTimes(1)),
+    );
+    expect(
+      (handoff.mock.calls[0][0] as CustomEvent).detail.repair.threads.map(
+        (thread: { id: number }) => thread.id,
+      ),
+    ).toEqual([21]);
     await click("Files");
-    await act(async () => (handoff.mock.calls[0][0] as CustomEvent).detail.onRefreshEvidence("Preserve this instruction"));
+    await act(async () =>
+      (handoff.mock.calls[0][0] as CustomEvent).detail.onRefreshEvidence(
+        "Preserve this instruction",
+      ),
+    );
     await click("Address this comment");
-    await act(async () => vi.waitFor(() => expect(handoff).toHaveBeenCalledTimes(2)));
-    expect((handoff.mock.calls[1][0] as CustomEvent).detail.context.instruction).toBe("Preserve this instruction");
+    await act(async () =>
+      vi.waitFor(() => expect(handoff).toHaveBeenCalledTimes(2)),
+    );
+    expect(
+      (handoff.mock.calls[1][0] as CustomEvent).detail.context.instruction,
+    ).toBe("Preserve this instruction");
   } finally {
     window.removeEventListener(PREPARE_AGENT_CONTEXT, handoff);
     await cleanup();
   }
 });
 
-
 it("retains the expanded thread and scroll while pausing hidden review effects", async () => {
   const cleanup = await setup();
   try {
     await link();
-    await click("Refresh comments");
+    await click("Refresh PR");
     await expandThread();
     const panel = document.querySelector('[aria-label="Azure pull requests"]')!;
-    const thread = [...document.querySelectorAll("details")].find(el => el.querySelector("summary")?.textContent?.startsWith("Thread "))!;
+    const thread = [...document.querySelectorAll("details")].find((el) =>
+      el.querySelector("summary")?.textContent?.startsWith("Thread "),
+    )!;
     panel.scrollTop = 120;
     await click("Files");
     const count = vi.mocked(invoke).mock.calls.length;
     await act(async () => window.dispatchEvent(new Event(AZURE_CHANGE_EVENT)));
     expect(invoke).toHaveBeenCalledTimes(count);
     await click("Pull requests");
-    expect(document.querySelector('[aria-label="Azure pull requests"]')).toBe(panel);
+    expect(document.querySelector('[aria-label="Azure pull requests"]')).toBe(
+      panel,
+    );
     expect(panel.scrollTop).toBe(120);
     expect(thread.isConnected).toBe(true);
     expect(thread.open).toBe(true);
-    expect(document.body.textContent).toContain("Only this selected review thread");
-  } finally { await cleanup(); }
+    expect(document.body.textContent).toContain(
+      "Only this selected review thread",
+    );
+  } finally {
+    await cleanup();
+  }
 });
-
 
 it("ignores a pending thread response after hiding and reopening the review", async () => {
   const original = vi.mocked(invoke).getMockImplementation()!;
   let release!: () => void;
   let first = true;
   vi.mocked(invoke).mockImplementation(async (command, args) => {
-    if (first && command === "azure_pr_read" && (args as Record<string, unknown>).section === "threads") {
+    if (
+      first &&
+      command === "azure_pr_read" &&
+      (args as Record<string, unknown>).section === "threads"
+    ) {
       first = false;
-      await new Promise<void>(resolve => { release = resolve; });
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
       return { items: [], revision: "source:target", nextSkip: null };
     }
     return original(command, args);
@@ -508,30 +567,57 @@ it("ignores a pending thread response after hiding and reopening the review", as
     await link();
     await click("Files");
     await click("Pull requests");
-    await click("Refresh comments");
+    await click("Refresh PR");
     expect(document.body.textContent).toContain("Thread");
     await act(async () => release());
     expect(document.body.textContent).not.toContain("No review threads.");
     expect(document.body.textContent).toContain("Thread");
-  } finally { release?.(); await cleanup(); }
+  } finally {
+    release?.();
+    await cleanup();
+  }
 });
-
 
 it("opens an inline linking form and keeps entered values after Cancel", async () => {
   const cleanup = await setup();
   try {
     await click("Pull requests");
-    expect(document.querySelector('input[aria-label="Azure PR link or repository remote"]')).toBeNull();
+    expect(
+      document.querySelector(
+        'input[aria-label="Azure PR link or repository remote"]',
+      ),
+    ).toBeNull();
     await click("Link a PR");
-    const input = document.querySelector('input[aria-label="Azure PR link or repository remote"]') as HTMLInputElement;
+    const input = document.querySelector(
+      'input[aria-label="Azure PR link or repository remote"]',
+    ) as HTMLInputElement;
     await act(async () => {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "https://dev.azure.com/team/Project/_git/repo");
+      Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )!.set!.call(input, "https://dev.azure.com/team/Project/_git/repo");
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
     await click("Cancel");
-    expect(document.querySelector('input[aria-label="Azure PR link or repository remote"]')).toBeNull();
+    expect(
+      document.querySelector(
+        'input[aria-label="Azure PR link or repository remote"]',
+      ),
+    ).toBeNull();
     await click("Link a PR");
-    expect((document.querySelector('input[aria-label="Azure PR link or repository remote"]') as HTMLInputElement).value).toBe("https://dev.azure.com/team/Project/_git/repo");
-    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === "azure_pr_list")).toBe(false);
-  } finally { await cleanup(); }
+    expect(
+      (
+        document.querySelector(
+          'input[aria-label="Azure PR link or repository remote"]',
+        ) as HTMLInputElement
+      ).value,
+    ).toBe("https://dev.azure.com/team/Project/_git/repo");
+    expect(
+      vi
+        .mocked(invoke)
+        .mock.calls.some(([command]) => command === "azure_pr_list"),
+    ).toBe(false);
+  } finally {
+    await cleanup();
+  }
 });

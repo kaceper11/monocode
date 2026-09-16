@@ -267,22 +267,39 @@ function sanitize(value: unknown): Watcher | null {
   };
 }
 
+// Parsed rows are cached on the raw string — the engine tick, teardown
+// coverage scans and every ensure call would otherwise re-sanitize the same
+// blob.
+let watchersCacheRaw: string | null | undefined;
+let watchersCache: Watcher[] = [];
+
+function readWatchersRaw(): string | null {
+  try {
+    return localStorage.getItem(KEY);
+  } catch {
+    return null;
+  }
+}
+
 export function loadWatchers(): Watcher[] {
   try {
-    const raw = localStorage.getItem(KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
+    const raw = readWatchersRaw();
+    if (raw === watchersCacheRaw) return watchersCache;
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
     const out: Watcher[] = [];
-    const seen = new Set<string>();
-    for (const entry of parsed) {
-      const watcher = sanitize(entry);
-      if (!watcher || seen.has(watcher.id)) continue;
-      seen.add(watcher.id);
-      out.push(watcher);
-      if (out.length >= MAX_WATCHERS) break;
+    if (Array.isArray(parsed)) {
+      const seen = new Set<string>();
+      for (const entry of parsed) {
+        const watcher = sanitize(entry);
+        if (!watcher || seen.has(watcher.id)) continue;
+        seen.add(watcher.id);
+        out.push(watcher);
+        if (out.length >= MAX_WATCHERS) break;
+      }
     }
-    return out;
+    watchersCache = out;
+    watchersCacheRaw = raw;
+    return watchersCache;
   } catch {
     return [];
   }
@@ -290,7 +307,11 @@ export function loadWatchers(): Watcher[] {
 
 function writeWatchers(watchers: Watcher[]) {
   try {
-    localStorage.setItem(KEY, JSON.stringify(watchers));
+    const serialized = JSON.stringify(watchers);
+    localStorage.setItem(KEY, serialized);
+    // Seed the read cache with the copy just written — no echo re-parse.
+    watchersCache = watchers;
+    watchersCacheRaw = serialized;
   } catch {
     /* storage full or unavailable */
   }
@@ -300,11 +321,7 @@ function writeWatchers(watchers: Watcher[]) {
 }
 
 export function watchersSnapshot(): string | null {
-  try {
-    return localStorage.getItem(KEY);
-  } catch {
-    return null;
-  }
+  return readWatchersRaw();
 }
 
 export function subscribeWatchers(listener: () => void): () => void {

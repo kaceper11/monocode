@@ -354,7 +354,10 @@ export function gitRangeContext(
   cwd: string,
   base?: string,
 ): Promise<GitRangeContext> {
-  return invoke<GitRangeContext>("git_range_context", { cwd, base: base ?? null });
+  return invoke<GitRangeContext>("git_range_context", {
+    cwd,
+    base: base ?? null,
+  });
 }
 
 export type GitPr = {
@@ -377,7 +380,14 @@ export function gitPrCreate(
   head: string,
   draft = false,
 ): Promise<string> {
-  return invoke<string>("git_pr_create", { cwd, title, body, base, head, draft });
+  return invoke<string>("git_pr_create", {
+    cwd,
+    title,
+    body,
+    base,
+    head,
+    draft,
+  });
 }
 
 export function gitPrUpdate(
@@ -456,24 +466,58 @@ export function isCheckoutBlockedByChanges(message: string): boolean {
 
 /** Preserve the exact checkout and provider session when restoring old records. */
 export function restoreSessionCheckout<
-  T extends { cwd: string; branch?: string; worktreeCwd?: string; providerSessionId?: string },
+  T extends {
+    cwd: string;
+    branch?: string;
+    worktreeCwd?: string;
+    providerSessionId?: string;
+  },
 >(session: T): T {
   return session;
 }
 
 const GIT_CHANGED = "monocode-git-changed";
 
+// Paths already notified this tick. Batch mutations (a task launch creates
+// several worktrees in one repository) re-notify the same anchor for every
+// child; the first dispatch already tells listeners to reload, so repeats
+// in the same tick only multiply downstream probes. Dispatch stays
+// synchronous — callers rely on listeners having run by the next line.
+const notifiedThisTick = new Set<string>();
+let notifiedResetQueued = false;
+
 /** Tell git UIs (diff pane, branch picker) to reload after a local git mutation. */
 export function notifyGitChanged(cwd?: string) {
+  if (cwd !== undefined) {
+    const key = pathKey(cwd);
+    if (notifiedThisTick.has(key)) return;
+    notifiedThisTick.add(key);
+    if (!notifiedResetQueued) {
+      notifiedResetQueued = true;
+      queueMicrotask(() => {
+        notifiedThisTick.clear();
+        notifiedResetQueued = false;
+      });
+    }
+  }
   window.dispatchEvent(new CustomEvent(GIT_CHANGED, { detail: cwd }));
 }
 
-export function subscribeGitChanged(listener: (changedCwd?: string) => void, cwd?: string): () => void {
+export function subscribeGitChanged(
+  listener: (changedCwd?: string) => void,
+  cwd?: string,
+): () => void {
   const onChange = (event: Event) => {
     const changed = (event as CustomEvent<string | undefined>).detail;
     if (cwd && changed) {
-      const own = pathKey(cwd), target = pathKey(changed);
-      if (own !== target && !own.startsWith(`${target}/`) && !target.startsWith(`${own}/`)) return;
+      const own = pathKey(cwd),
+        target = pathKey(changed);
+      if (
+        own !== target &&
+        !own.startsWith(`${target}/`) &&
+        !target.startsWith(`${own}/`)
+      )
+        return;
     }
     listener(changed);
   };
@@ -510,10 +554,15 @@ export function revealPath(path: string): Promise<void> {
 }
 
 export function homeDir(cwd?: string): Promise<string> {
-  return cwd && wslLocation(cwd) ? invoke<string>("home_dir", { cwd }) : invoke<string>("home_dir");
+  return cwd && wslLocation(cwd)
+    ? invoke<string>("home_dir", { cwd })
+    : invoke<string>("home_dir");
 }
 
-export async function pickFolder(title = "Open project", defaultPath?: string): Promise<string | null> {
+export async function pickFolder(
+  title = "Open project",
+  defaultPath?: string,
+): Promise<string | null> {
   const selected = await open({
     directory: true,
     multiple: false,
@@ -524,20 +573,27 @@ export async function pickFolder(title = "Open project", defaultPath?: string): 
 }
 
 /** Multi-select variant of pickFolder — every chosen folder comes back. */
-export async function pickFolders(title = "Open project", defaultPath?: string): Promise<string[] | null> {
+export async function pickFolders(
+  title = "Open project",
+  defaultPath?: string,
+): Promise<string[] | null> {
   const selected = await open({
     directory: true,
     multiple: true,
     title,
     defaultPath,
   });
-  const paths = (Array.isArray(selected) ? selected : selected ? [selected] : [])
+  const paths = (
+    Array.isArray(selected) ? selected : selected ? [selected] : []
+  )
     .filter((path): path is string => Boolean(path))
     .map(slash);
   return paths.length ? paths : null;
 }
 
-export async function pickFiles(title = "Attach files"): Promise<string[] | null> {
+export async function pickFiles(
+  title = "Attach files",
+): Promise<string[] | null> {
   const selected = await open({
     multiple: true,
     directory: false,

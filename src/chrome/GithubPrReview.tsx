@@ -1,4 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  ReviewDetails,
+  ReviewError,
+  ReviewHeader,
+  ReviewPill,
+  ReviewShell,
+  ReviewStatus,
+  reviewAction,
+  reviewButton,
+  reviewField,
+  reviewDanger,
+  reviewToneText,
+  type ReviewTone,
+} from "./ReviewChrome";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -32,21 +46,57 @@ import { openWatchSheet } from "../lib/watchers";
 import type { UnifiedLine } from "../lib/unifiedDiff";
 import { RepairStatus } from "./RepairStatus";
 import { Popover } from "./Popover";
-import { X } from "./icons";
+import {
+  Bot,
+  Check,
+  ExternalLink,
+  FolderOpen,
+  Loader,
+  RefreshCw,
+  X,
+} from "./icons";
 import { InboxPrDiff } from "../surfaces/InboxPrDiff";
 import { AgentMarkdown } from "../surfaces/AgentMarkdown";
 import type { DiffCommentComposerTarget } from "../surfaces/DiffCommentComposer";
 import type { LineCommentComposer } from "../surfaces/UnifiedDiffView";
 
-const button =
-  "rounded-md px-2 py-1 text-[12px] text-content hover:bg-content/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-40";
-const field =
-  "w-full rounded-md border border-content/15 bg-content/5 px-2 py-1.5 text-[12px] text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent";
+const button = reviewButton;
 const message = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
 const isReviewThread = (comment: GithubWorkItemComment) =>
   comment.kind === "review_comment";
+
+/** GitHub's mergeStateStatus as a short label — the raw enum ("UNSTABLE",
+ * "HAS_HOOKS") reads as jargon next to the friendly state pill. */
+function mergeStateLabel(status: string): string {
+  const known: Record<string, string> = {
+    clean: "Ready to merge",
+    unstable: "Checks failing or pending",
+    blocked: "Merge blocked",
+    behind: "Behind base branch",
+    dirty: "Merge conflicts",
+    has_hooks: "Checks pending",
+  };
+  // "draft"/"unknown" map to nothing — the state pill already says Draft.
+  return known[status.trim().toLowerCase()] ?? "";
+}
+
+function mergeStateTone(status: string): ReviewTone | "" {
+  switch (status.trim().toLowerCase()) {
+    case "clean":
+      return "passing";
+    case "dirty":
+    case "blocked":
+      return "failing";
+    case "behind":
+    case "unstable":
+    case "has_hooks":
+      return "running";
+    default:
+      return "";
+  }
+}
 
 /** Same shape as the repair evidence scope — repo case is significant. */
 export function githubPrScope(repo: string, number: number): string {
@@ -126,6 +176,7 @@ function GithubPrPanel({
   const [repoError, setRepoError] = useState("");
   const [diff, setDiff] = useState<GithubPrDiff | null>(null);
   const [thread, setThread] = useState<GithubWorkItemThread | null>(null);
+  const [threadError, setThreadError] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [verified, setVerified] = useState(false);
@@ -145,6 +196,10 @@ function GithubPrPanel({
 
   useEffect(() => {
     mounted.current = true;
+    // An <Activity> hide interrupts in-flight actions; their finally blocks
+    // bail on the generation check, so re-arm the panel on re-show.
+    pending.current = false;
+    setBusy(false);
     return () => {
       mounted.current = false;
       // A dismissed panel must not leave a checkout clone running.
@@ -178,8 +233,16 @@ function GithubPrPanel({
       // resolves to a different repo must not show this PR's number.
       const resolved = (await githubRepo(cwd).catch(() => "")).trim();
       if (!current()) return;
-      if (boundRepo && resolved && resolved.toLowerCase() !== boundRepo.toLowerCase()) {
+      if (
+        boundRepo &&
+        resolved &&
+        resolved.toLowerCase() !== boundRepo.toLowerCase()
+      ) {
         setVerified(false);
+        setPr(null);
+        setDiff(null);
+        setThread(null);
+        setThreadError("");
         setRepoError(
           `This checkout resolves to ${resolved}; the PR is bound to ${boundRepo}. Open a checkout of that repository.`,
         );
@@ -187,14 +250,24 @@ function GithubPrPanel({
       }
       setRepoError("");
       if (resolved && resolved !== repo) setRepo(resolved);
+      // Discussions failing must not hide a healthy PR read — the threads
+      // section degrades to its own error instead.
+      let threadFailure = "";
       const [state, nextDiff, nextThread] = await Promise.all([
         githubPrState(cwd, number),
         githubPrDiff(cwd, number).catch(() => null),
-        githubWorkItemThread(cwd, "pr", number, { force: true }),
+        githubWorkItemThread(cwd, "pr", number, { force: true }).catch(
+          (error) => {
+            threadFailure = message(error);
+            return null;
+          },
+        ),
       ]);
       if (!current()) return;
       if (state.number !== number)
-        throw new Error("GitHub returned a different PR. Check the repository binding.");
+        throw new Error(
+          "GitHub returned a different PR. Check the repository binding.",
+        );
       // A new head moves the diff — pending line comments anchor to the head
       // they were drafted against, so drop them rather than submit stale.
       if (reviewedHead.current && reviewedHead.current !== state.headRefOid) {
@@ -204,6 +277,7 @@ function GithubPrPanel({
       setPr(state);
       setDiff(nextDiff);
       setThread(nextThread);
+      setThreadError(threadFailure);
       setVerified(true);
     });
 
@@ -224,14 +298,14 @@ function GithubPrPanel({
       : undefined;
 
   const sendEvidence = (
-      prepare: (
-        current: () => boolean,
-        signal: AbortSignal,
-      ) => Promise<{
-        evidence: RepairEvidence;
-        context: AgentContext;
-      }>,
-    ) =>
+    prepare: (
+      current: () => boolean,
+      signal: AbortSignal,
+    ) => Promise<{
+      evidence: RepairEvidence;
+      context: AgentContext;
+    }>,
+  ) =>
     run(async (current) => {
       const controller = new AbortController();
       preparation.current = controller;
@@ -269,7 +343,9 @@ function GithubPrPanel({
   const openWorktree = () =>
     run(async (current) => {
       if (!pr?.headRefOid)
-        throw new Error("Refresh the PR to read its head before preparing a checkout.");
+        throw new Error(
+          "Refresh the PR to read its head before preparing a checkout.",
+        );
       const path = await invoke<string>("github_pr_prepare_checkout", {
         cwd,
         repo,
@@ -305,18 +381,14 @@ function GithubPrPanel({
   );
 
   const removeReviewComment = useCallback((index: number) => {
-    setReviewComments((current) =>
-      current.filter((_, row) => row !== index),
-    );
+    setReviewComments((current) => current.filter((_, row) => row !== index));
   }, []);
 
   const submitReview = async (event: GithubReviewEvent, body: string) => {
     let submitted = false;
     await run(async (current) => {
       if (!pr?.headRefOid)
-        throw new Error(
-          "Refresh the PR to read its head before reviewing.",
-        );
+        throw new Error("Refresh the PR to read its head before reviewing.");
       const url = await githubSubmitReview(cwd, repo, number, {
         commitId: pr.headRefOid,
         event,
@@ -357,70 +429,94 @@ function GithubPrPanel({
   })();
 
   return (
-    <section
-      aria-label="GitHub pull request"
-      className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
-    >
-      <div className="mx-auto w-full max-w-3xl space-y-3 px-5 py-4 text-[12px]">
-        {!embedded ? (
-          <header className="flex items-center justify-between gap-3 border-b border-content/10 pb-3">
-            <h2 className="text-[13px] font-medium">Pull request</h2>
-            <span className="truncate text-content/50" title={cwd}>
-              {repo ? `${repo} · ` : ""}
-              {branch || "Repository checkout"}
-            </span>
-          </header>
-        ) : null}
-        {pr ? (
-          <section className="space-y-2">
-            {!embedded ? (
-              <h3 className="font-medium">
-                #{pr.number} {pr.title}
-              </h3>
-            ) : null}
-            <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-content/55">
-              <span className="rounded bg-content/5 px-1.5 py-0.5 text-[11px] text-content/75">
-                {pr.isDraft
-                  ? "Draft"
+    <ReviewShell label="GitHub pull request">
+      {!embedded ? (
+        <ReviewHeader
+          label="Pull request"
+          context={`${repo ? `${repo} · ` : ""}${branch || "Repository checkout"}`}
+          title={cwd}
+        />
+      ) : null}
+      {pr ? (
+        <section className="space-y-2">
+          {!embedded ? (
+            <h3 className="text-[14px] font-medium leading-snug">
+              #{pr.number} {pr.title}
+            </h3>
+          ) : null}
+          <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-content/55">
+            <ReviewPill
+              tone={
+                pr.isDraft
+                  ? "draft"
                   : pr.state.trim().toUpperCase() === "OPEN"
-                    ? "Open"
-                    : pr.state || "Unknown"}
-              </span>
-              {repo ? <span>{repo}</span> : null}
-              {githubReviewDecisionLabel(pr.reviewDecision) ? (
-                <span>{githubReviewDecisionLabel(pr.reviewDecision)}</span>
-              ) : null}
-              {pr.mergeStateStatus ? (
-                <span>Merge: {pr.mergeStateStatus.toLowerCase()}</span>
-              ) : null}
-              <span>{checksSummary}</span>
+                    ? "open"
+                    : pr.state.trim().toUpperCase() === "MERGED"
+                      ? "merged"
+                      : pr.state.trim().toUpperCase() === "CLOSED"
+                        ? "closed"
+                        : "neutral"
+              }
+            >
+              {pr.isDraft
+                ? "Draft"
+                : (
+                    {
+                      OPEN: "Open",
+                      MERGED: "Merged",
+                      CLOSED: "Closed",
+                    } as Record<string, string>
+                  )[pr.state.trim().toUpperCase()] ||
+                  pr.state ||
+                  "Unknown"}
+            </ReviewPill>
+            {embedded && repo ? <span>{repo}</span> : null}
+            <span
+              className="min-w-0 truncate"
+              title={`${pr.headRefName} → ${pr.baseRefName} · ${pr.headRefOid || "unknown revision"}`}
+            >
+              {pr.headRefName} → {pr.baseRefName}
+              {pr.headRefOid ? ` · ${pr.headRefOid.slice(0, 8)}` : ""}
+            </span>
+            {githubReviewDecisionLabel(pr.reviewDecision) ? (
               <span
-                className="min-w-0 truncate"
-                title={`${pr.headRefName} → ${pr.baseRefName}`}
+                className={
+                  pr.reviewDecision === "CHANGES_REQUESTED"
+                    ? "text-rose-400/90"
+                    : pr.reviewDecision === "APPROVED"
+                      ? "text-emerald-400/90"
+                      : undefined
+                }
               >
-                {pr.headRefName} → {pr.baseRefName}
+                {githubReviewDecisionLabel(pr.reviewDecision)}
               </span>
-            </p>
-            <details>
-              <summary className="cursor-pointer text-content/60">
-                Repository and revision
-              </summary>
-              <p className="break-all text-content/55">
-                Repository: {repo || "resolved from checkout"}
-                <br />
-                {pr.headRefName} → {pr.baseRefName}
-                <br />
-                Head revision: {pr.headRefOid || "unknown"}
-              </p>
-            </details>
-            <div className="flex flex-wrap gap-1">
-              <button
-                className={button}
-                disabled={busy}
-                onClick={() => void refresh()}
+            ) : null}
+            {mergeStateLabel(pr.mergeStateStatus) ? (
+              <span
+                className={
+                  reviewToneText[
+                    mergeStateTone(pr.mergeStateStatus) || "neutral"
+                  ]
+                }
               >
-                Refresh PR
-              </button>
+                {mergeStateLabel(pr.mergeStateStatus)}
+              </span>
+            ) : null}
+          </p>
+          <div className="flex flex-wrap gap-1">
+            <button
+              className={button}
+              disabled={busy}
+              onClick={() => void refresh()}
+            >
+              {busy ? (
+                <Loader className="size-3.5 animate-spin" strokeWidth={1.75} />
+              ) : (
+                <RefreshCw className="size-3.5" strokeWidth={1.75} />
+              )}
+              Refresh PR
+            </button>
+            {!embedded ? (
               <button
                 className={button}
                 onClick={() => {
@@ -429,84 +525,93 @@ function GithubPrPanel({
                   );
                 }}
               >
+                <ExternalLink className="size-3.5" strokeWidth={1.75} />
                 Open on GitHub
               </button>
+            ) : null}
+            <button
+              className={button}
+              disabled={busy || !open}
+              onClick={() => void openWorktree()}
+            >
+              <FolderOpen className="size-3.5" strokeWidth={1.75} />
+              Open in worktree
+            </button>
+            {open ? (
               <button
                 className={button}
-                disabled={busy || !open}
-                onClick={() => void openWorktree()}
+                onClick={() =>
+                  openWatchSheet({
+                    source: {
+                      kind: "github-pr",
+                      cwd,
+                      repo,
+                      number,
+                      ...(sourceSessionId
+                        ? { sessionId: sourceSessionId }
+                        : {}),
+                    },
+                    name: `Reviews · ${repo}#${number}`,
+                  })
+                }
               >
-                Open in worktree
-              </button>
-              {open ? (
-                <button
-                  className={button}
-                  onClick={() =>
-                    openWatchSheet({
-                      source: {
-                        kind: "github-pr",
-                        cwd,
-                        repo,
-                        number,
-                        ...(sourceSessionId
-                          ? { sessionId: sourceSessionId }
-                          : {}),
-                      },
-                      name: `Reviews · ${repo}#${number}`,
-                    })
-                  }
-                >
-                  Watch reviews
-                </button>
-              ) : null}
-            </div>
-            {busy && preparation.current ? (
-              <button
-                className={button}
-                onClick={() => preparation.current?.abort()}
-              >
-                Cancel preparation
+                Watch reviews
               </button>
             ) : null}
-          </section>
-        ) : null}
-        {repoError ? <p role="alert">{repoError}</p> : null}
-        {!verified && !repoError ? (
-          <p>{busy ? "Loading PR…" : "Could not read this PR. Retry with Refresh PR."}</p>
-        ) : null}
-        {verified && pr ? (
-          <RepairStatus scope={githubPrScope(repo, number)} cwd={cwd} />
-        ) : null}
-        {verified && pr ? (
-          <GithubPrSections
-            key={`${pr.headRefOid}:${repairRefresh}:${reviewNonce}`}
-            cwd={cwd}
-            number={number}
-            pr={pr}
-            diff={diff}
-            thread={thread}
-            threads={threads}
-            conversation={conversation}
-            unresolved={unresolved}
-            failing={failing}
-            busy={busy}
-            sendComments={sendComments}
-            sendChecks={sendChecks}
-            reviewComments={reviewComments}
-            reviewUrl={reviewUrl}
-            addReviewComment={addReviewComment}
-            removeReviewComment={removeReviewComment}
-            submitReview={submitReview}
-            onThreadRefresh={() => void refresh()}
-          />
-        ) : null}
-        {error ? (
-          <p role="alert" className="break-words">
-            {error}
-          </p>
-        ) : null}
-      </div>
-    </section>
+          </div>
+          {busy && preparation.current ? (
+            <button
+              className={button}
+              onClick={() => preparation.current?.abort()}
+            >
+              Cancel preparation
+            </button>
+          ) : null}
+        </section>
+      ) : null}
+      {repoError ? <ReviewError>{repoError}</ReviewError> : null}
+      {!verified && !repoError ? (
+        <div className="flex items-center gap-2">
+          <ReviewStatus>
+            {busy || !error ? "Loading PR…" : "Could not read this PR."}
+          </ReviewStatus>
+          {!busy && error ? (
+            <button className={button} onClick={() => void refresh()}>
+              Retry
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {verified && pr ? (
+        <RepairStatus scope={githubPrScope(repo, number)} cwd={cwd} />
+      ) : null}
+      {verified && pr ? (
+        <GithubPrSections
+          key={`${pr.headRefOid}:${repairRefresh}:${reviewNonce}`}
+          cwd={cwd}
+          number={number}
+          pr={pr}
+          diff={diff}
+          thread={thread}
+          threadError={threadError}
+          threads={threads}
+          conversation={conversation}
+          unresolved={unresolved}
+          failing={failing}
+          checksSummary={checksSummary}
+          busy={busy}
+          sendComments={sendComments}
+          sendChecks={sendChecks}
+          reviewComments={reviewComments}
+          reviewUrl={reviewUrl}
+          addReviewComment={addReviewComment}
+          removeReviewComment={removeReviewComment}
+          submitReview={submitReview}
+          onThreadRefresh={() => void refresh()}
+        />
+      ) : null}
+      {error ? <ReviewError>{error}</ReviewError> : null}
+    </ReviewShell>
   );
 }
 
@@ -516,10 +621,12 @@ function GithubPrSections({
   pr,
   diff,
   thread,
+  threadError,
   threads,
   conversation,
   unresolved,
   failing,
+  checksSummary,
   busy,
   sendComments,
   sendChecks,
@@ -535,10 +642,12 @@ function GithubPrSections({
   pr: GithubPrState;
   diff: GithubPrDiff | null;
   thread: GithubWorkItemThread | null;
+  threadError: string;
   threads: GithubWorkItemComment[];
   conversation: GithubWorkItemComment[];
   unresolved: GithubWorkItemComment[];
   failing: GithubPrState["checks"];
+  checksSummary: string;
   busy: boolean;
   sendComments: (comments: GithubWorkItemComment[]) => void;
   sendChecks: () => void;
@@ -566,24 +675,44 @@ function GithubPrSections({
     [addReviewComment],
   );
   return (
-    <div className="space-y-2">
-      {open && unresolved.length ? (
-        <button className={button} disabled={busy} onClick={() => sendComments(unresolved)}>
-          Address comments
-        </button>
+    <div className="space-y-3">
+      {open && (unresolved.length || failing.length) ? (
+        <div className="flex flex-wrap gap-1.5">
+          {unresolved.length ? (
+            <button
+              className={reviewAction}
+              disabled={busy}
+              onClick={() => sendComments(unresolved)}
+            >
+              <Bot className="size-3.5" strokeWidth={1.75} />
+              Address {unresolved.length} unresolved thread
+              {unresolved.length === 1 ? "" : "s"}
+            </button>
+          ) : null}
+          {failing.length ? (
+            <button
+              className={reviewAction}
+              disabled={busy}
+              onClick={sendChecks}
+            >
+              <Bot className="size-3.5" strokeWidth={1.75} />
+              Send failing checks to agent
+            </button>
+          ) : null}
+        </div>
       ) : null}
-      {open && failing.length ? (
-        <button className={button} disabled={busy} onClick={sendChecks}>
-          Send failing checks to agent
-        </button>
-      ) : null}
-      <details className="rounded-md border border-content/10 px-2 py-1">
-        <summary className="cursor-pointer text-content/60">
-          Checks ({pr.checks.length})
-        </summary>
-        {pr.checks.length === 0 ? (
-          <p className="pt-1 text-content/50">No checks on this PR head.</p>
-        ) : (
+      {pr.checks.length ? (
+        <ReviewDetails
+          bordered
+          summary={
+            <>
+              Checks ({pr.checks.length}) · {checksSummary}
+              {failing.length ? (
+                <span className="text-rose-400/90"> — needs attention</span>
+              ) : null}
+            </>
+          }
+        >
           <ul className="space-y-1 pt-1">
             {pr.checks.slice(0, 50).map((check, index) => (
               <li key={`${check.name}:${index}`} className="break-words">
@@ -599,12 +728,17 @@ function GithubPrSections({
                   {check.name} · {check.conclusion || check.status || "unknown"}
                 </span>
                 {check.outputTitle ? (
-                  <span className="text-content/50"> · {check.outputTitle}</span>
+                  <span className="text-content/50">
+                    {" "}
+                    · {check.outputTitle}
+                  </span>
                 ) : null}
                 {check.url ? (
                   <button
                     className={button}
-                    onClick={() => void openUrl(check.url).catch(() => undefined)}
+                    onClick={() =>
+                      void openUrl(check.url).catch(() => undefined)
+                    }
                   >
                     Open run
                   </button>
@@ -612,14 +746,53 @@ function GithubPrSections({
               </li>
             ))}
           </ul>
+        </ReviewDetails>
+      ) : null}
+      <section aria-label="Pull request diff">
+        {diff ? (
+          <InboxPrDiff
+            diff={diff}
+            // Drafts are local — keep the affordance mounted during refreshes
+            // so the diff does not re-render its gutter on every read.
+            lineCommentComposer={open ? commentComposer : undefined}
+          />
+        ) : (
+          <p className="flex items-center gap-2 text-content/50">
+            Diff unavailable.
+            <button className={button} onClick={onThreadRefresh}>
+              Retry
+            </button>
+          </p>
         )}
-      </details>
+      </section>
+      <section aria-label="Review threads" className="space-y-1.5">
+        <h4 className="text-[11px] font-medium uppercase tracking-wider text-content/45">
+          Review threads ({threads.length}
+          {thread?.truncated ? " · earlier omitted" : ""})
+        </h4>
+        {threadError ? <ReviewError>{threadError}</ReviewError> : null}
+        {threads.length === 0 && !threadError ? (
+          <p className="text-content/50">No review threads.</p>
+        ) : null}
+        {threads.map((comment) => (
+          <GithubReviewThread
+            key={comment.id}
+            cwd={cwd}
+            number={number}
+            comment={comment}
+            open={open}
+            busy={busy}
+            sendComments={sendComments}
+            onThreadRefresh={onThreadRefresh}
+          />
+        ))}
+      </section>
       {open ? (
         <section
           aria-label="Submit a review"
-          className="space-y-2 rounded-md border border-content/10 px-2 py-2"
+          className="space-y-2 rounded-md border border-content/10 px-3 py-2.5"
         >
-          <h4 className="text-content/60">
+          <h4 className="text-[11px] font-medium uppercase tracking-wider text-content/45">
             Review
             {reviewComments.length
               ? ` · ${reviewComments.length} line comment${reviewComments.length === 1 ? "" : "s"}`
@@ -665,7 +838,7 @@ function GithubPrSections({
           )}
           <textarea
             aria-label="Review summary"
-            className={field}
+            className={reviewField}
             rows={2}
             maxLength={64_000}
             placeholder="Review summary (optional)"
@@ -673,78 +846,57 @@ function GithubPrSections({
             disabled={busy}
             onChange={(event) => setReviewBody(event.target.value)}
           />
-          <div className="flex flex-wrap items-center gap-1">
+          <div className="flex flex-wrap items-center gap-1.5">
             <button
               className={button}
-              disabled={
-                busy || (!reviewBody.trim() && !reviewComments.length)
-              }
+              disabled={busy || (!reviewBody.trim() && !reviewComments.length)}
               onClick={() => void submitReview("COMMENT", reviewBody)}
             >
               Comment
             </button>
             <button
-              className={button}
+              className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[12px] text-emerald-300 hover:bg-emerald-400/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/60 disabled:opacity-40"
               disabled={busy || pr.isDraft}
-              title={pr.isDraft ? "Draft pull requests can't be approved" : undefined}
+              title={
+                pr.isDraft ? "Draft pull requests can't be approved" : undefined
+              }
               onClick={() => void submitReview("APPROVE", reviewBody)}
             >
+              <Check className="size-3.5" strokeWidth={1.75} />
               Approve
             </button>
             <button
-              className={button}
+              className={reviewDanger}
               disabled={busy}
               onClick={() => void submitReview("REQUEST_CHANGES", reviewBody)}
             >
               Request changes
             </button>
-            {reviewUrl ? (
+          </div>
+          {reviewUrl ? (
+            <p className="flex items-center gap-2 text-content/50">
+              <Check
+                className="size-3.5 text-emerald-400/90"
+                strokeWidth={1.75}
+              />
+              Review submitted.
               <button
                 className={button}
                 onClick={() => void openUrl(reviewUrl).catch(() => undefined)}
               >
-                Review submitted — open on GitHub
+                Open on GitHub
               </button>
-            ) : null}
-          </div>
+            </p>
+          ) : null}
         </section>
       ) : null}
-      <section aria-label="Pull request diff" className="space-y-1">
-        <h4 className="text-content/60">Changed files</h4>
-        {diff ? (
-          <InboxPrDiff
-            diff={diff}
-            lineCommentComposer={open && !busy ? commentComposer : undefined}
-          />
-        ) : (
-          <p className="text-content/50">Diff unavailable. Refresh PR to retry.</p>
-        )}
-      </section>
-      <section aria-label="Review threads" className="space-y-1">
-        <h4 className="text-content/60">
-          Review threads ({threads.length}
-          {thread?.truncated ? " · earlier threads omitted" : ""})
-        </h4>
-        {threads.length === 0 ? <p>No review threads.</p> : null}
-        {threads.map((comment) => (
-          <GithubReviewThread
-            key={comment.id}
-            cwd={cwd}
-            number={number}
-            comment={comment}
-            open={open}
-            busy={busy}
-            sendComments={sendComments}
-            onThreadRefresh={onThreadRefresh}
-          />
-        ))}
-      </section>
       {conversation.length ? (
-        <details className="border-t border-content/10 pt-2 text-content/60">
-          <summary className="cursor-pointer">
-            Conversation ({conversation.length})
-          </summary>
-          <div className="space-y-2 pt-2">
+        <ReviewDetails
+          lazy
+          summary={`Conversation (${conversation.length})`}
+          className="border-t border-content/10 pt-2"
+        >
+          <div className="space-y-2 pt-1">
             {conversation.slice(0, 50).map((comment) => (
               <div key={comment.id}>
                 <p className="text-content/55">
@@ -757,7 +909,7 @@ function GithubPrSections({
               </div>
             ))}
           </div>
-        </details>
+        </ReviewDetails>
       ) : null}
     </div>
   );
@@ -784,39 +936,79 @@ function GithubReviewThread({
   const [replying, setReplying] = useState(false);
   const [replyError, setReplyError] = useState("");
   const mounted = useRef(true);
+  const generation = useRef(0);
   useEffect(() => {
     mounted.current = true;
+    // Re-showing after an <Activity> hide must not keep a stale busy flag.
+    setReplying(false);
     return () => {
       mounted.current = false;
+      generation.current++;
     };
   }, []);
   const replies = (comment.replies ?? []).slice(0, 50);
   const reply = async () => {
     if (replying || !draft.trim()) return;
+    const id = generation.current;
+    const current = () => mounted.current && generation.current === id;
     setReplying(true);
     setReplyError("");
     try {
       await githubWorkItemComment(cwd, "pr", number, draft, {
         inReplyTo: comment.threadId,
       });
-      if (!mounted.current) return;
+      if (!current()) return;
       setDraft("");
       onThreadRefresh();
     } catch (error) {
-      if (mounted.current) setReplyError(message(error));
+      if (current()) setReplyError(message(error));
     } finally {
-      if (mounted.current) setReplying(false);
+      if (current()) setReplying(false);
     }
   };
+  const total = 1 + replies.length;
+  const excerpt = (comment.body.split("\n")[0] ?? "").slice(0, 100);
   return (
-    <details className="rounded-md border border-content/10 px-2 py-1">
-      <summary className="cursor-pointer break-words">
-        {comment.path || "Review thread"}
-        {comment.line != null ? `:${comment.line}` : ""} ·{" "}
-        {comment.resolved ? "Resolved" : "Unresolved"} · {1 + replies.length}{" "}
-        comments
-      </summary>
+    <ReviewDetails
+      bordered
+      lazy
+      summary={
+        <>
+          <span
+            className={`size-1.5 shrink-0 rounded-full ${
+              comment.resolved ? "bg-emerald-400/70" : "bg-amber-400/80"
+            }`}
+            title={comment.resolved ? "Resolved" : "Unresolved"}
+          />
+          <span className="min-w-0 flex-1 truncate">
+            <span className="text-content/80">{comment.author}</span>
+            {excerpt ? (
+              <span className="text-content/50"> — {excerpt}</span>
+            ) : null}
+          </span>
+          <span className="shrink-0 text-content/40">
+            {comment.path || "General"}
+            {comment.line != null ? `:${comment.line}` : ""} ·{" "}
+            <span
+              className={
+                comment.resolved ? "text-emerald-400/80" : "text-amber-400/90"
+              }
+            >
+              {comment.resolved ? "Resolved" : "Unresolved"}
+            </span>{" "}
+            · {total} comment
+            {total === 1 ? "" : "s"}
+          </span>
+        </>
+      }
+    >
       <div className="space-y-2 pt-2">
+        {(comment.replies ?? []).length > replies.length ? (
+          <p className="text-content/45">
+            Showing the first {replies.length} replies. Open on GitHub for the
+            rest.
+          </p>
+        ) : null}
         {[comment, ...replies].map((row) => (
           <div key={row.id}>
             <p className="text-content/55">{row.author}</p>
@@ -829,6 +1021,7 @@ function GithubReviewThread({
             disabled={busy}
             onClick={() => sendComments([comment])}
           >
+            <Bot className="size-3.5" strokeWidth={1.75} />
             Send thread to agent
           </button>
         ) : null}
@@ -836,7 +1029,7 @@ function GithubReviewThread({
           <div className="space-y-1">
             <textarea
               aria-label="Reply to review thread"
-              className={field}
+              className={reviewField}
               rows={2}
               maxLength={64_000}
               value={draft}
@@ -851,11 +1044,11 @@ function GithubReviewThread({
             >
               {replying ? "Replying…" : "Reply"}
             </button>
-            {replyError ? <p role="alert">{replyError}</p> : null}
+            {replyError ? <ReviewError>{replyError}</ReviewError> : null}
           </div>
         ) : null}
       </div>
-    </details>
+    </ReviewDetails>
   );
 }
 

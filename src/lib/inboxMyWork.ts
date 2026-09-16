@@ -16,7 +16,7 @@ import {
 import { basename, type GitPr } from "./fs";
 import type { InboxItem } from "./githubTasks";
 import { pathKey } from "./paths";
-import { repositoryDisplayName, type ProjectRecord } from "./projects";
+import { type ProjectRecord } from "./projects";
 import { sessionWorkCwd, type HarnessId, type LinkedWorkItem } from "./session";
 import type { SessionSummary } from "./sessionStore";
 import {
@@ -27,11 +27,15 @@ import {
 } from "./sessionWorkItem";
 import {
   childDeliveryRows,
-  taskSessionIds,
   type DeliveryStores,
 } from "./taskDelivery";
 import { taskPrRowKey, type TaskPrDraft } from "./taskPrs";
-import type { TaskChild, TaskWorkspace } from "./taskWorkspaces";
+import {
+  taskChildRepoName,
+  taskSessionIds,
+  type TaskChild,
+  type TaskWorkspace,
+} from "./taskWorkspaces";
 
 /**
  * Ticket → "my work" join (#my-work inbox slice). Everything here is a pure
@@ -85,6 +89,10 @@ export type InboxMyWorkPr = {
   /** CI bound to the producing checkout — Azure pipeline rows for either
    * provider, or GitHub check state derived from watcher attention. */
   ci?: { count: number; failing: boolean; running: boolean; label: string };
+  /** A GitHub check failure reached this PR through watcher attention —
+   * distinct from `ci` pipeline rollups so summaries don't double-count a
+   * pipeline already listed in `InboxMyWork.ci`. */
+  checksFailing?: boolean;
 };
 
 export type InboxMyWorkCi = {
@@ -200,6 +208,39 @@ type WorkAccumulator = {
   ci: InboxMyWorkCi[];
 };
 
+/** Normalized PR state across providers — GitHub OPEN/MERGED/CLOSED, Azure
+ * active/completed/abandoned, plus draft and reviewer-attention overlays. */
+export type InboxPrKind = "attention" | "open" | "draft" | "merged" | "closed";
+
+export function inboxPrKind(pr: InboxMyWorkPr): InboxPrKind {
+  const state = pr.state?.toLowerCase() ?? "";
+  if (state === "merged" || state === "completed") return "merged";
+  if (state === "closed" || state === "abandoned" || state === "declined")
+    return "closed";
+  if (pr.needsAttention) return "attention";
+  if (pr.draft) return "draft";
+  return "open";
+}
+
+/** Actionable first: reviewer attention, then failing checks, then open
+ * work; drafts and finished PRs sink to the bottom. Applied before the
+ * delivery cap so actionable rows can't be truncated away. */
+export function inboxPrRank(pr: InboxMyWorkPr): number {
+  const kind = inboxPrKind(pr);
+  if (kind === "attention") return 0;
+  if (pr.ci?.failing || pr.checksFailing) return 1;
+  if (kind === "open") return 2;
+  if (kind === "draft") return 3;
+  return kind === "merged" ? 4 : 5;
+}
+
+/** Failing and running pipelines before quiet ones — same pre-cap rule. */
+export function inboxCiRank(row: InboxMyWorkCi): number {
+  if (row.failing) return 0;
+  if (row.running) return 1;
+  return 2;
+}
+
 function ciRowState(row: CiSource): { state: string; failing: boolean; running: boolean } {
   const run = row.last?.run;
   if (!run || !ciMatches(run))
@@ -283,7 +324,8 @@ function mergeCiScope(
     running: current.running || ci.running,
     label:
       current.failing || ci.failing
-        ? "CI failing"
+        ? // A failing scope names itself ("Checks failing" vs "CI failing").
+          (ci.failing ? ci.label : "") || current.label || "CI failing"
         : current.running || ci.running
           ? "CI running"
           : current.label || ci.label,
@@ -455,7 +497,9 @@ function ciRow(source: CiSource): InboxMyWorkCi {
     url = undefined;
   }
   return {
-    key: `ci:${ciKey(source.target)}|${pathKey(source.cwd)}|${source.branch}|${source.session ?? ""}`,
+    // The session scope is metadata, not identity — the same pipeline saved
+    // under two sessions at one checkout+branch is one row.
+    key: `ci:${ciKey(source.target)}|${pathKey(source.cwd)}|${source.branch}`,
     provider: "azure",
     name: source.definitionName,
     projectName: source.projectName,
@@ -509,7 +553,9 @@ function joinChild(
   }
   for (const row of rows.prs) {
     const pr = addPr(acc, byKey, byLoose, azurePrRow(row));
-    if (!pr.sessionId) pr.sessionId = row.sourceSessionId ?? session?.id;
+    // A live session rooted at the checkout beats the recorded one — the
+    // saved id may be dead or have moved checkouts.
+    if (session) pr.sessionId = session.id;
     mergeCiScope(pr, scope, summary);
   }
   const github = input.githubPrFor?.(cwd, branch);
@@ -577,7 +623,9 @@ function joinSessionDelivery(
   }
   for (const row of prRows) {
     const pr = addPr(acc, byKey, byLoose, azurePrRow(row));
-    if (!pr.sessionId) pr.sessionId = session.id;
+    // The session this join ran under lives at the producing checkout —
+    // it beats a stale recorded session id.
+    pr.sessionId = session.id;
     mergeCiScope(pr, scope, summary);
   }
   const github = input.githubPrFor?.(cwd, branch);
@@ -640,6 +688,18 @@ const SESSION_STATE_RANK: Record<InboxMyWorkSession["state"], number> = {
   idle: 2,
   archived: 3,
 };
+
+/** Rank a raw session the same way the row's state will be computed —
+ * lets the cap keep waiting sessions without materializing the row. */
+function sessionRowRank(
+  input: InboxMyWorkInput,
+  sessionId: string,
+  archived: boolean | undefined,
+): number {
+  if (input.needsInputSessionIds?.has(sessionId)) return 0;
+  if (input.busySessionIds?.has(sessionId)) return 1;
+  return archived ? 3 : 2;
+}
 
 /**
  * The whole per-item join. `items` are the visible inbox rows; the returned
@@ -715,7 +775,14 @@ export function inboxMyWorkForItems(
       prs: [],
       ci: [],
     };
-    for (const session of related.slice(0, MAX_SESSION_ROWS)) {
+    // Rank before the cap — a waiting session past the limit must not lose
+    // its slot to an idle one that merely joined earlier.
+    const rankedRelated = [...related].sort(
+      (a, b) =>
+        sessionRowRank(input, a.id, a.archived) -
+        sessionRowRank(input, b.id, b.archived),
+    );
+    for (const session of rankedRelated.slice(0, MAX_SESSION_ROWS)) {
       const task = taskBySessionId.get(session.id);
       const state = input.needsInputSessionIds?.has(session.id)
         ? "waiting"
@@ -748,14 +815,7 @@ export function inboxMyWorkForItems(
       const project = projectsById.get(task.projectId);
       for (const child of task.children) {
         if (child.workingCopy) cwds.add(pathKey(child.workingCopy));
-        const repository = project?.repositories.find(
-          (entry) => entry.id === child.repositoryId,
-        );
-        const repoLabel = repository
-          ? repositoryDisplayName(repository)
-          : child.workingCopy
-            ? basename(child.workingCopy)
-            : child.repositoryId;
+        const repoLabel = taskChildRepoName(task, child, project);
         joinChild(
           acc,
           task,
@@ -828,6 +888,7 @@ export function inboxMyWorkForItems(
         `${action.repo.trim().toLowerCase()}|${action.number}`,
       );
       if (pr) {
+        pr.checksFailing = true;
         mergeCiScope(pr, `attn:${row.key}`, {
           count: 0,
           failing: true,
@@ -840,7 +901,10 @@ export function inboxMyWorkForItems(
     const sortedSessions = [...acc.sessions.values()].sort(
       (a, b) => SESSION_STATE_RANK[a.state] - SESSION_STATE_RANK[b.state],
     );
-    const prs: InboxMyWorkPr[] = acc.prs
+    // Actionable-first order before the cap — a reviewer-blocked or
+    // check-failing PR beyond the limit must survive, not join order.
+    const prs: InboxMyWorkPr[] = [...acc.prs]
+      .sort((a, b) => inboxPrRank(a) - inboxPrRank(b))
       .slice(0, MAX_DELIVERY_ROWS)
       .map(
         ({
@@ -850,7 +914,9 @@ export function inboxMyWorkForItems(
           ...pr
         }) => pr,
       );
-    const ci = acc.ci.slice(0, MAX_DELIVERY_ROWS);
+    const ci = [...acc.ci]
+      .sort((a, b) => inboxCiRank(a) - inboxCiRank(b))
+      .slice(0, MAX_DELIVERY_ROWS);
     const hasWork = Boolean(
       sortedSessions.length || prs.length || ci.length || bound.length,
     );

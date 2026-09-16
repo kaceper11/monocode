@@ -7,6 +7,7 @@ import {
   createTask,
   loadTaskWorkspaces,
   markTaskChildLaunching,
+  taskForSession,
   unmarkTaskChildLaunching,
   updateTask,
   updateTaskChild,
@@ -86,8 +87,7 @@ describe("TaskScopeChip", () => {
     await act(async () => {
       root.render(
         createElement(TaskScopeChip, {
-          sessionId: "task-session",
-          cwd: "/tmp/app-wt",
+          scope: taskForSession("task-session", "/tmp/app-wt"),
         }),
       );
     });
@@ -109,18 +109,22 @@ describe("TaskScopeChip", () => {
 
   it("shows a launching child as working, not as a dead Start button", async () => {
     const { taskId, secondId } = seedTask();
-    await act(async () => {
-      root.render(
-        createElement(TaskScopeChip, {
-          sessionId: "task-session",
-          cwd: "/tmp/app-wt",
-        }),
-      );
-    });
+    const rerender = async () => {
+      await act(async () => {
+        root.render(
+          createElement(TaskScopeChip, {
+            scope: taskForSession("task-session", "/tmp/app-wt"),
+          }),
+        );
+      });
+    };
+    await rerender();
     markTaskChildLaunching(taskId, secondId);
     await act(async () => {
       updateTaskChild(taskId, secondId, { launch: { state: "working" } });
     });
+    // The pane re-derives scope from the store on each write — mirror that.
+    await rerender();
     try {
       const chip = host.querySelector("button");
       await act(async () => {
@@ -186,8 +190,7 @@ describe("TaskScopeChip", () => {
     await act(async () => {
       root.render(
         createElement(TaskScopeChip, {
-          sessionId: "task-session",
-          cwd: "/tmp/app-wt",
+          scope: taskForSession("task-session", "/tmp/app-wt"),
         }),
       );
     });
@@ -212,7 +215,11 @@ describe("TaskScopeChip", () => {
   it("renders nothing for a session no task owns", async () => {
     seedTask();
     await act(async () => {
-      root.render(createElement(TaskScopeChip, { sessionId: "stray" }));
+      root.render(
+        createElement(TaskScopeChip, {
+          scope: taskForSession("stray", undefined),
+        }),
+      );
     });
     expect(host.innerHTML).toBe("");
     expect(loadTaskWorkspaces()).toHaveLength(1);

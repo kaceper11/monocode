@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -59,10 +60,12 @@ import {
 type Ref = { name: string; commit: string };
 
 type ChildDraftState = {
-  mode: "worktree" | "existing" | "later";
+  mode: "worktree" | "branch" | "existing" | "later";
   baseRef?: string;
   baseCommit?: string;
   branch?: string;
+  /** Full `refs/heads/…` ref of an existing local branch (mode "branch"). */
+  existingBranch?: string;
   /** True while the branch is the auto suggestion — re-suggested on rename. */
   branchAuto?: boolean;
   /** Display path — the Linux path for WSL repositories. */
@@ -75,10 +78,14 @@ type ChildDraftState = {
 };
 
 type Props = {
-  /** Resolved stored project — the sheet only opens with a real project id. */
-  projectId: string;
+  /** Project the sheet opens on; absent → the user picks one inside the
+   * sheet. Edit mode always uses the task's own project. */
+  projectId?: string;
   /** Present → edit mode: rename, retune children, add/remove repositories. */
   editingTaskId?: string;
+  /** Edit mode: open this child's working-copy draft straight into setup —
+   * the rail/chip "Set up" lands the user in the fields, not on the card. */
+  initialSetupChildId?: string;
   /** An inbox item the new task starts linked to. */
   initialTickets?: LinkedWorkItem[];
   initialName?: string;
@@ -89,16 +96,44 @@ type Props = {
   initialChildren?: TaskChildDraft[];
   onClose: () => void;
   onCreated?: (taskId: string) => void;
-  /** Fires after an edit persists — lets callers sync open task sessions. */
-  onEdited?: (task: TaskWorkspace) => void;
+  /** Fires after an edit persists — lets callers sync open task sessions.
+   * `changed` names children that need their (first) launch — newly added
+   * repositories plus existing children set up for the first time — and
+   * whether name/ticket/brief/responsibilities or the repository set moved
+   * (a live session's brief is stale after that). */
+  onEdited?: (
+    task: TaskWorkspace,
+    changed?: {
+      addedChildIds: string[];
+      setupChildIds: string[];
+      metaChanged: boolean;
+    },
+  ) => void;
 };
 
 const inputClass =
   "w-full rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-[13px] text-content outline-none ring-accent/40 focus:ring-1";
 
-const MODES: { value: ChildDraftState["mode"]; label: string }[] = [
-  { value: "worktree", label: "New worktree" },
-  { value: "existing", label: "Existing" },
+const MODES: {
+  value: ChildDraftState["mode"];
+  label: string;
+  hint: string;
+}[] = [
+  {
+    value: "worktree",
+    label: "New worktree",
+    hint: "Creates a new branch and a fresh working copy at the location below.",
+  },
+  {
+    value: "branch",
+    label: "Existing branch",
+    hint: "Checks out a local branch that has no working copy yet into a new worktree.",
+  },
+  {
+    value: "existing",
+    label: "Existing copy",
+    hint: "Uses a working copy already on disk — the task shares it, it is not created or removed.",
+  },
 ];
 
 const shortRef = (name: string) =>
@@ -113,6 +148,7 @@ const shortRef = (name: string) =>
 export function TaskCreateSheet({
   projectId,
   editingTaskId,
+  initialSetupChildId,
   initialTickets,
   initialName,
   initialBrief,
@@ -131,8 +167,6 @@ export function TaskCreateSheet({
     subscribeTaskWorkspaces,
     taskWorkspacesSnapshot,
   );
-  const project = projects.find((entry) => entry.id === projectId);
-
   const editingTask: TaskWorkspace | undefined = useMemo(
     () =>
       editingTaskId
@@ -141,6 +175,12 @@ export function TaskCreateSheet({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [editingTaskId, tasksRaw],
   );
+
+  /** Create-mode selection — the prop is only the initial value; switching
+   * projects resets the repository picks since ids are project-scoped. */
+  const [chosenProjectId, setChosenProjectId] = useState(projectId);
+  const activeProjectId = editingTask?.projectId ?? chosenProjectId;
+  const project = projects.find((entry) => entry.id === activeProjectId);
 
   const [name, setName] = useState(editingTask?.name ?? initialName ?? "");
   const [brief, setBrief] = useState(editingTask?.brief ?? initialBrief ?? "");
@@ -168,6 +208,9 @@ export function TaskCreateSheet({
           .map((child) => [child.id, child.responsibility ?? ""]),
       ),
   );
+  /** A draft for a repository that already has a child IS the "Set up" path —
+   * only `startSetup` creates one, so membership derives from drafts ∩
+   * existingByRepo rather than a second map that could drift. */
   const [drafts, setDrafts] = useState<Map<string, ChildDraftState>>(
     () =>
       new Map(
@@ -175,19 +218,38 @@ export function TaskCreateSheet({
           child.repositoryId,
           {
             mode:
-              child.mode === "worktree"
-                ? "worktree"
-                : child.mode === "later"
-                  ? "later"
-                  : "existing",
+              child.mode === "worktree" ||
+              child.mode === "branch" ||
+              child.mode === "later"
+                ? child.mode
+                : "existing",
             ...(child.workingCopy ? { existingPath: child.workingCopy } : {}),
+            // Draft paths are display paths — un-qualify a WSL host path.
+            ...(child.path
+              ? { path: wslLocation(child.path)?.path ?? child.path }
+              : {}),
+            ...(child.mode === "worktree"
+              ? {
+                  baseRef: child.baseRef,
+                  baseCommit: child.baseCommit,
+                  branch: child.branch,
+                }
+              : {}),
+            ...(child.mode === "branch"
+              ? {
+                  existingBranch: child.existingBranch,
+                  baseCommit: child.baseCommit,
+                }
+              : {}),
           } satisfies ChildDraftState,
         ]),
       ),
   );
   const [error, setError] = useState("");
   const refsCache = useRef(new Map<string, Ref[]>());
+  const refsInflight = useRef(new Set<string>());
   const [refsLoading, setRefsLoading] = useState<Set<string>>(new Set());
+  const [refsFailed, setRefsFailed] = useState<Set<string>>(new Set());
   const [refsTick, bumpRefs] = useState(0);
 
   const repositories = useMemo(
@@ -215,15 +277,25 @@ export function TaskCreateSheet({
   }, [repositories, families]);
 
   const loadRefs = useCallback((repo: ProjectRepository) => {
-    if (refsCache.current.has(repo.id)) return;
-    setRefsLoading((prev) => {
-      if (prev.has(repo.id)) return prev;
-      return new Set(prev).add(repo.id);
-    });
+    // In-flight lives in a ref — the loading state hasn't committed yet when
+    // two callers fire in the same tick, so it can't dedupe them.
+    if (refsCache.current.has(repo.id) || refsInflight.current.has(repo.id))
+      return;
+    refsInflight.current.add(repo.id);
+    setRefsLoading((prev) => new Set(prev).add(repo.id));
     void invoke<Ref[]>("git_worktree_refs", { cwd: repo.anchor })
-      .then((refs) => refsCache.current.set(repo.id, refs))
-      .catch(() => refsCache.current.set(repo.id, []))
+      .then((refs) => {
+        refsCache.current.set(repo.id, refs);
+        setRefsFailed((prev) => {
+          const next = new Set(prev);
+          next.delete(repo.id);
+          return next;
+        });
+      })
+      // A failed fetch is not cached — re-picking the mode retries it.
+      .catch(() => setRefsFailed((prev) => new Set(prev).add(repo.id)))
       .finally(() => {
+        refsInflight.current.delete(repo.id);
         setRefsLoading((prev) => {
           const next = new Set(prev);
           next.delete(repo.id);
@@ -366,6 +438,57 @@ export function TaskCreateSheet({
     });
   };
 
+  /** Re-opens the working-copy draft for a child saved without one. */
+  const startSetup = (repo: ProjectRepository, childId?: string) => {
+    const child = childId
+      ? editingTask?.children.find((entry) => entry.id === childId)
+      : existingByRepo.get(repo.id);
+    if (!child || child.workingCopy || child.repositoryId !== repo.id) return;
+    setError("");
+    setDrafts((prev) => {
+      if (prev.has(repo.id)) return prev;
+      const next = new Map(prev);
+      next.set(repo.id, {
+        ...defaultDraft(repo),
+        // Show the existing value — a blank field keeps it on save.
+        ...(child.responsibility
+          ? { responsibility: child.responsibility }
+          : {}),
+      });
+      return next;
+    });
+    loadRefs(repo);
+  };
+
+  /** Backs out of setup — the child stays in the task, still unconfigured. */
+  const cancelSetup = (repo: ProjectRepository) => {
+    setDrafts((prev) => {
+      const next = new Map(prev);
+      next.delete(repo.id);
+      return next;
+    });
+  };
+
+  // A "Set up" entry point (chip/details) drops straight into that child's
+  // working-copy draft once the project's repositories resolve.
+  const setupSeeded = useRef(false);
+  useEffect(() => {
+    if (setupSeeded.current || !initialSetupChildId || !editingTask) return;
+    const child = editingTask.children.find(
+      (entry) => entry.id === initialSetupChildId,
+    );
+    const repo = child
+      ? project?.repositories.find((entry) => entry.id === child.repositoryId)
+      : undefined;
+    // The sheet's setup rows are keyed by repository — a repo repeated across
+    // attempts resolves to the primary child; seeding any other child id
+    // would silently configure the wrong row, so skip instead.
+    if (!repo || existingByRepo.get(repo.id)?.id !== child?.id) return;
+    setupSeeded.current = true;
+    startSetup(repo, child?.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialSetupChildId, editingTask, project]);
+
   const applySet = (setId: string) => {
     const set = project?.sets.find((entry) => entry.id === setId);
     if (!set) return;
@@ -417,6 +540,16 @@ export function TaskCreateSheet({
       return next;
     });
 
+  /** Create mode only — repository ids are project-scoped, so a switch drops
+   * every selection and draft. */
+  const chooseProject = (id: string) => {
+    if (id === activeProjectId) return;
+    setChosenProjectId(id);
+    setSelected([]);
+    setDrafts(new Map());
+    setError("");
+  };
+
   /** Host-qualified working copy for a draft (WSL paths stay qualified). */
   const chosenPath = (
     repo: ProjectRepository,
@@ -424,83 +557,151 @@ export function TaskCreateSheet({
   ): string | undefined => {
     const family = familyForRepository(repo, families);
     if (draft.mode === "later") return undefined;
-    if (draft.mode === "worktree") {
+    if (draft.mode === "worktree" || draft.mode === "branch") {
       if (!draft.path) return undefined;
       const location = wslLocation(mainCheckout(repo, family));
-      return location ? wslPath(location.distribution, draft.path) : draft.path;
+      // wslPath throws on non-absolute input — a mid-typing path isn't a
+      // render error, it just isn't a valid choice yet.
+      try {
+        return location
+          ? wslPath(location.distribution, draft.path)
+          : draft.path;
+      } catch {
+        return undefined;
+      }
     }
     return draft.existingPath;
   };
 
   /** Concurrent-writer evidence for a chosen copy: sessions bound to it
-   * (family users) or children of other active tasks. */
+   * (family users) or children of other active tasks. Worktree/branch
+   * drafts count too — a fresh path can collide with an in-use worktree
+   * or another task's claimed copy. */
   const sharedWriters = (
     repo: ProjectRepository,
     draft: ChildDraftState,
   ): string[] => {
     const path = chosenPath(repo, draft);
-    if (!path || draft.mode === "worktree") return [];
+    if (!path) return [];
     const users = new Set<string>();
     const family = familyForRepository(repo, families);
     const copy = family?.worktrees.find(
       (entry) => pathKey(entry.path) === pathKey(path),
     );
     for (const user of copy?.users ?? []) users.add(user);
-    for (const claim of taskChildrenForWorkingCopy(path))
+    for (const claim of taskChildrenForWorkingCopy(
+      path,
+      loadTaskWorkspaces(),
+      editingTask?.id,
+    ))
       users.add(`task "${claim.task.name}"`);
     return [...users];
   };
 
-  const hostConflict = taskHostConflict([
-    ...(editingTask?.children ?? [])
-      .filter((child) => selected.includes(child.repositoryId))
-      .map((child) => child.workingCopy),
-    ...repositories
-      .filter((repo) => selected.includes(repo.id))
-      .map((repo) => {
-        const draft = drafts.get(repo.id);
-        return draft ? chosenPath(repo, draft) : undefined;
-      }),
-  ]);
+  const hostConflict = useMemo(
+    () =>
+      taskHostConflict([
+        ...(editingTask?.children ?? [])
+          .filter((child) => selected.includes(child.repositoryId))
+          .flatMap((child) => [
+            child.workingCopy,
+            repositories.find((repo) => repo.id === child.repositoryId)
+              ?.anchor,
+          ]),
+        ...repositories
+          .filter((repo) => selected.includes(repo.id))
+          .flatMap((repo) => {
+            const draft = drafts.get(repo.id);
+            // The anchor participates too: a typed `\\wsl$` location on a
+            // native repo must conflict here, not at launch.
+            return [draft ? chosenPath(repo, draft) : undefined, repo.anchor];
+          }),
+      ]),
+    // chosenPath reads `families`; task children feed nothing here.
+    [editingTask, selected, drafts, repositories, families],
+  );
+
+  // One scan per draft change — `sharedWriters` walks every task's children.
+  const writersByRepo = useMemo(
+    () =>
+      new Map(
+        repositories
+          .filter((repo) => selected.includes(repo.id) && drafts.has(repo.id))
+          .map((repo) => [
+            repo.id,
+            sharedWriters(repo, drafts.get(repo.id)!),
+          ]),
+      ),
+    [repositories, selected, drafts, families, tasksRaw],
+  );
 
   const blockedShared = repositories.filter((repo) => {
     const draft = drafts.get(repo.id);
     if (!draft || !selected.includes(repo.id)) return false;
-    return sharedWriters(repo, draft).length > 0 && !draft.sharedAccepted;
+    return (writersByRepo.get(repo.id)?.length ?? 0) > 0 && !draft.sharedAccepted;
   });
 
   const canSubmit =
+    Boolean(project) &&
     Boolean(name.trim()) &&
     selected.length > 0 &&
     !hostConflict &&
     blockedShared.length === 0;
 
+  const draftFor = (
+    repo: ProjectRepository,
+    draft: ChildDraftState,
+  ): TaskChildDraft => {
+    const path = chosenPath(repo, draft);
+    return {
+      repositoryId: repo.id,
+      mode: draft.mode,
+      ...(draft.mode === "worktree"
+        ? {
+            baseRef: draft.baseRef,
+            baseCommit: draft.baseCommit,
+            branch: draft.branch,
+            path,
+          }
+        : {}),
+      ...(draft.mode === "branch"
+        ? {
+            existingBranch: draft.existingBranch,
+            baseCommit: draft.baseCommit,
+            path,
+          }
+        : {}),
+      ...(draft.mode !== "worktree" && draft.mode !== "branch" && path
+        ? { workingCopy: path }
+        : {}),
+      ...(draft.responsibility?.trim()
+        ? { responsibility: draft.responsibility }
+        : {}),
+    };
+  };
+
   const buildDrafts = (): TaskChildDraft[] =>
     selected
       .map((repoId): TaskChildDraft | null => {
+        // Kept children carry no draft — ones being set up travel through
+        // `setups` instead so the existing child row is patched in place.
         if (existingByRepo.has(repoId)) return null;
         const repo = repositories.find((entry) => entry.id === repoId);
         const draft = drafts.get(repoId);
-        if (!repo || !draft) return null;
-        const path = chosenPath(repo, draft);
-        return {
-          repositoryId: repo.id,
-          mode: draft.mode,
-          ...(draft.mode === "worktree"
-            ? {
-                baseRef: draft.baseRef,
-                baseCommit: draft.baseCommit,
-                branch: draft.branch,
-                path,
-              }
-            : {}),
-          ...(draft.mode !== "worktree" && path ? { workingCopy: path } : {}),
-          ...(draft.responsibility?.trim()
-            ? { responsibility: draft.responsibility }
-            : {}),
-        } satisfies TaskChildDraft;
+        return repo && draft ? draftFor(repo, draft) : null;
       })
       .filter((entry): entry is TaskChildDraft => entry !== null);
+
+  /** Drafts targeting existing children — childId → draft. */
+  const buildSetups = (): Map<string, TaskChildDraft> => {
+    const out = new Map<string, TaskChildDraft>();
+    for (const [repoId, draft] of drafts) {
+      const child = existingByRepo.get(repoId);
+      const repo = repositories.find((entry) => entry.id === repoId);
+      if (child && repo) out.set(child.id, draftFor(repo, draft));
+    }
+    return out;
+  };
 
   const submit = () => {
     setError("");
@@ -516,6 +717,10 @@ export function TaskCreateSheet({
       if (editingTask) {
         // One atomic write: a failed add doesn't leave the rename or the
         // child removals half-saved.
+        const setupsByChild = buildSetups();
+        const previousIds = new Set(
+          editingTask.children.map((child) => child.id),
+        );
         const next = reviseTask(editingTask.id, {
           name,
           ticket: linked,
@@ -523,13 +728,32 @@ export function TaskCreateSheet({
           keepRepositoryIds: selected,
           responsibilities: childResp,
           additions: buildDrafts(),
+          setups: setupsByChild,
         });
-        onEdited?.(next);
+        onEdited?.(next, {
+          addedChildIds: next.children
+            .filter((child) => !previousIds.has(child.id))
+            .map((child) => child.id),
+          setupChildIds: [...setupsByChild.keys()],
+          metaChanged:
+            name.trim() !== editingTask.name ||
+            (brief.trim() || undefined) !== editingTask.brief ||
+            (linked?.url ?? "") !== (editingTask.ticket?.url ?? "") ||
+            editingTask.children.some(
+              (child) => !selected.includes(child.repositoryId),
+            ) ||
+            editingTask.children.some(
+              (child) =>
+                (childResp.get(child.id) ?? "").trim() !==
+                (child.responsibility ?? "").trim(),
+            ),
+        });
         onClose();
         return;
       }
+      if (!project) throw new Error("Choose a project for this task");
       const task = createTask({
-        projectId,
+        projectId: project.id,
         name,
         ...(linked ? { ticket: linked } : {}),
         brief,
@@ -569,6 +793,35 @@ export function TaskCreateSheet({
               />
             </div>
 
+            {!editingTask ? (
+              <div>
+                <p className="mb-1 text-[11px] text-content/50">Project</p>
+                <SearchablePick
+                  value={
+                    project
+                      ? (project.name ??
+                        (project.anchor ? basename(project.anchor) : "Project"))
+                      : undefined
+                  }
+                  placeholder="Choose a project…"
+                  searchPlaceholder="Search projects…"
+                  empty="No projects yet — add one from the sidebar first"
+                  icon="folder"
+                  options={projects.map((entry) => ({
+                    key: entry.id,
+                    label:
+                      entry.name ??
+                      (entry.anchor ? basename(entry.anchor) : "Project"),
+                    ...(entry.anchor
+                      ? { detail: prettyCwd(entry.anchor) }
+                      : {}),
+                  }))}
+                  onPick={chooseProject}
+                  ariaLabel="Task project"
+                />
+              </div>
+            ) : null}
+
             <div>
               <div className="mb-1 flex items-center justify-between">
                 <p className="text-[11px] text-content/50">Repositories</p>
@@ -600,7 +853,11 @@ export function TaskCreateSheet({
                   ))}
                 </div>
               ) : null}
-              {repositories.length === 0 ? (
+              {!project ? (
+                <p className="rounded-lg border border-content/10 px-2.5 py-2 text-[12px] text-content/45">
+                  Choose a project above to pick its repositories.
+                </p>
+              ) : repositories.length === 0 ? (
                 <p className="rounded-lg border border-content/10 px-2.5 py-2 text-[12px] text-content/45">
                   This project has no repositories yet. Add them from the
                   project menu → Project repositories…
@@ -646,7 +903,8 @@ export function TaskCreateSheet({
               const repo = repositories.find((entry) => entry.id === repoId);
               if (!repo) return null;
               const existing = existingByRepo.get(repoId);
-              if (existing) {
+              const inSetup = !!existing && drafts.has(repoId);
+              if (existing && !inSetup) {
                 return (
                   <ExistingChildCard
                     key={repoId}
@@ -659,6 +917,11 @@ export function TaskCreateSheet({
                         next.set(existing.id, value);
                         return next;
                       })
+                    }
+                    onSetup={
+                      existing.workingCopy
+                        ? undefined
+                        : () => startSetup(repo)
                     }
                     onRemove={() => selectRepository(repo, false)}
                   />
@@ -675,12 +938,58 @@ export function TaskCreateSheet({
                   family={familyForRepository(repo, families)}
                   refs={refsCache.current.get(repo.id)}
                   refsLoading={refsLoading.has(repo.id)}
-                  writers={sharedWriters(repo, draft)}
+                  refsFailed={refsFailed.has(repo.id)}
+                  writers={writersByRepo.get(repo.id) ?? []}
                   onChange={(patch) => updateDraft(repo.id, patch)}
                   onLoadRefs={() => loadRefs(repo)}
+                  onCancelSetup={
+                    existing ? () => cancelSetup(repo) : undefined
+                  }
                 />
               );
             })}
+
+            {/* Children whose repository left the project can't appear in the
+             * checklist — without these rows they'd be kept forever. */}
+            {editingTask?.children
+              .filter(
+                (child) =>
+                  !repositories.some(
+                    (repo) => repo.id === child.repositoryId,
+                  ),
+              )
+              .map((child) => (
+                <div
+                  key={child.id}
+                  className="flex items-center gap-2 rounded-lg border border-content/10 px-2 py-1.5"
+                >
+                  <CircleAlert
+                    className="size-3.5 shrink-0 text-amber-400"
+                    strokeWidth={1.75}
+                  />
+                  <span className="min-w-0 flex-1 truncate text-[12px] text-content/70">
+                    {child.workingCopy
+                      ? prettyCwd(child.workingCopy)
+                      : child.repositoryId}
+                    <span className="text-content/40">
+                      {" "}
+                      · repository no longer in this project
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    title="Remove this repository from the task"
+                    onClick={() =>
+                      setSelected((prev) =>
+                        prev.filter((id) => id !== child.repositoryId),
+                      )
+                    }
+                    className="shrink-0 rounded-md px-1.5 py-0.5 text-[10px] text-content/60 hover:bg-content/8 hover:text-content"
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
 
             <IssuePicker
               tickets={tickets}
@@ -744,9 +1053,11 @@ function ChildConfig({
   family,
   refs,
   refsLoading,
+  refsFailed,
   writers,
   onChange,
   onLoadRefs,
+  onCancelSetup,
 }: {
   repo: ProjectRepository;
   taskName: string;
@@ -754,14 +1065,32 @@ function ChildConfig({
   family: RepositoryFamily | undefined;
   refs: Ref[] | undefined;
   refsLoading: boolean;
+  refsFailed: boolean;
   writers: string[];
   onChange: (patch: Partial<ChildDraftState>) => void;
   onLoadRefs: () => void;
+  /** Setup of an existing unconfigured child — "Keep unconfigured" leaves the
+   * child in the task with no working copy instead of toggling modes. */
+  onCancelSetup?: () => void;
 }) {
   const location = wslLocation(repo.anchor);
   // The main checkout is one of the existing copies — no separate mode.
   const copies = (family?.worktrees ?? []).filter(
     (entry) => !entry.missing && !entry.prunable,
+  );
+  const mainPath = () =>
+    family?.worktrees.find((entry) => entry.main)?.path ??
+    family?.checkout ??
+    repo.anchor;
+  // Git refuses to check one branch out in two worktrees of the family, so
+  // only unattached local branches are attachable.
+  const attached = new Set(
+    (family?.worktrees ?? [])
+      .map((entry) => entry.branch)
+      .filter((name): name is string => Boolean(name)),
+  );
+  const freeBranches = (refs ?? []).filter(
+    (ref) => ref.name.startsWith("refs/heads/") && !attached.has(ref.name),
   );
 
   /** Branch + location defaults for a draft switching to worktree mode —
@@ -769,10 +1098,7 @@ function ChildConfig({
   const worktreeDefaults = (): Partial<ChildDraftState> => {
     if (draft.branch) return {};
     const branch = suggestTaskBranch(taskName || "task", refs ?? []);
-    const main =
-      family?.worktrees.find((entry) => entry.main)?.path ??
-      family?.checkout ??
-      repo.anchor;
+    const main = mainPath();
     const loc = wslLocation(main);
     return {
       branch,
@@ -787,6 +1113,23 @@ function ChildConfig({
     onChange(
       ref ? { baseRef: ref.name, baseCommit: ref.commit } : { baseRef: refName },
     );
+  };
+
+  /** Attaching an existing branch also picks its reviewed tip and suggests a
+   * sibling location while the user hasn't typed one. */
+  const pickBranch = (refName: string) => {
+    const ref = refs?.find((entry) => entry.name === refName);
+    const patch: Partial<ChildDraftState> = { existingBranch: refName };
+    if (ref) {
+      patch.baseCommit = ref.commit;
+      if (!draft.path || draft.pathAuto) {
+        const main = mainPath();
+        const loc = wslLocation(main);
+        patch.path = `${loc?.path ?? main}-${shortRef(ref.name).replace(/\//g, "-")}`;
+        patch.pathAuto = true;
+      }
+    }
+    onChange(patch);
   };
 
   return (
@@ -807,14 +1150,20 @@ function ChildConfig({
         <button
           type="button"
           onClick={() =>
-            onChange({
-              mode: draft.mode === "later" ? "worktree" : "later",
-              ...(draft.mode === "later" ? worktreeDefaults() : {}),
-            })
+            onCancelSetup
+              ? onCancelSetup()
+              : onChange({
+                  mode: draft.mode === "later" ? "worktree" : "later",
+                  ...(draft.mode === "later" ? worktreeDefaults() : {}),
+                })
           }
           className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-content/40 hover:bg-content/5 hover:text-content/70"
         >
-          {draft.mode === "later" ? "Set up now" : "Skip for now"}
+          {onCancelSetup
+            ? "Keep unconfigured"
+            : draft.mode === "later"
+              ? "Set up now"
+              : "Skip for now"}
         </button>
       </div>
 
@@ -822,10 +1171,14 @@ function ChildConfig({
         <div
           role="radiogroup"
           aria-label={`Working copy for ${repositoryDisplayName(repo)}`}
-          className="mb-2 grid grid-cols-2 gap-0.5 rounded-md border border-content/10 p-0.5 text-[11px]"
+          className="mb-2 grid grid-cols-3 gap-0.5 rounded-md border border-content/10 p-0.5 text-[11px]"
         >
           {MODES.map((option) => {
-            const disabled = option.value === "existing" && !copies.length;
+            // Branch attach needs the probed inventory — before it lands
+            // `attached` is empty and every checked-out branch looks free.
+            const disabled =
+              (option.value === "existing" && !copies.length) ||
+              (option.value === "branch" && !family);
             return (
               <button
                 key={option.value}
@@ -833,6 +1186,7 @@ function ChildConfig({
                 role="radio"
                 aria-checked={draft.mode === option.value}
                 disabled={disabled}
+                title={option.hint}
                 onClick={() => {
                   onChange({
                     mode: option.value,
@@ -840,7 +1194,8 @@ function ChildConfig({
                       ? worktreeDefaults()
                       : {}),
                   });
-                  if (option.value === "worktree") onLoadRefs();
+                  if (option.value === "worktree" || option.value === "branch")
+                    onLoadRefs();
                 }}
                 className={`rounded-[5px] px-1 py-1 disabled:opacity-40 ${
                   draft.mode === option.value
@@ -853,6 +1208,11 @@ function ChildConfig({
             );
           })}
         </div>
+      ) : null}
+      {draft.mode !== "later" ? (
+        <p className="-mt-1 mb-2 text-[10px] text-content/40">
+          {MODES.find((option) => option.value === draft.mode)?.hint}
+        </p>
       ) : null}
 
       {draft.mode === "worktree" ? (
@@ -870,9 +1230,11 @@ function ChildConfig({
               empty={
                 refsLoading
                   ? "Loading branches…"
-                  : refs?.length
-                    ? "No matching branches"
-                    : "No branches found"
+                  : refsFailed
+                    ? "Couldn't load branches — reselect the mode to retry"
+                    : refs?.length
+                      ? "No matching branches"
+                      : "No branches found"
               }
               icon="branch"
               options={(refs ?? []).map((ref) => ({
@@ -899,6 +1261,56 @@ function ChildConfig({
               aria-label={`Branch for ${repositoryDisplayName(repo)}`}
             />
           </label>
+          <label className="block">
+            <span className="mb-0.5 block text-[11px] text-content/50">
+              Location{location ? ` (inside ${location.distribution})` : ""}
+            </span>
+            <input
+              value={draft.path ?? ""}
+              onChange={(event) =>
+                onChange({
+                  path: event.target.value || undefined,
+                  pathAuto: false,
+                })
+              }
+              className={`${inputClass} py-1.5 font-mono text-[12px]`}
+              aria-label={`Location for ${repositoryDisplayName(repo)}`}
+            />
+          </label>
+        </div>
+      ) : null}
+
+      {draft.mode === "branch" ? (
+        <div className="flex flex-col gap-1.5">
+          <div className="block">
+            <span className="mb-0.5 block text-[11px] text-content/50">
+              Branch
+            </span>
+            <SearchablePick
+              value={
+                draft.existingBranch ? shortRef(draft.existingBranch) : undefined
+              }
+              placeholder={
+                refsLoading ? "Loading branches…" : "Choose a branch…"
+              }
+              searchPlaceholder="Search branches…"
+              empty={
+                refsLoading
+                  ? "Loading branches…"
+                  : refsFailed
+                    ? "Couldn't load branches — reselect the mode to retry"
+                    : "Every local branch already has a working copy"
+              }
+              icon="branch"
+              options={freeBranches.map((ref) => ({
+                key: ref.name,
+                label: shortRef(ref.name),
+                detail: ref.commit.slice(0, 10),
+              }))}
+              onPick={pickBranch}
+              ariaLabel={`Existing branch for ${repositoryDisplayName(repo)}`}
+            />
+          </div>
           <label className="block">
             <span className="mb-0.5 block text-[11px] text-content/50">
               Location{location ? ` (inside ${location.distribution})` : ""}
@@ -1002,19 +1414,22 @@ function ExistingChildCard({
   child,
   responsibility,
   onResponsibility,
+  onSetup,
   onRemove,
 }: {
   repo: ProjectRepository;
   child: TaskChild;
   responsibility: string;
   onResponsibility: (value: string) => void;
+  /** Present only for children saved without a working copy. */
+  onSetup?: () => void;
   onRemove: () => void;
 }) {
   const location = wslLocation(repo.anchor);
   const state = child.launch.state;
   const summary = child.workingCopy
     ? [child.branch, prettyCwd(child.workingCopy)].filter(Boolean).join(" · ")
-    : "Skipped — no working copy yet";
+    : "Not set up yet — no working copy";
   return (
     <section className="rounded-lg border border-content/10 p-2.5">
       <div className="mb-1.5 flex items-center gap-2">
@@ -1029,6 +1444,15 @@ function ExistingChildCard({
           <span className="shrink-0 rounded bg-content/8 px-1.5 py-0.5 text-[10px] text-content/55">
             WSL · {location.distribution}
           </span>
+        ) : null}
+        {onSetup ? (
+          <button
+            type="button"
+            onClick={onSetup}
+            className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-accent hover:bg-content/5"
+          >
+            Set up…
+          </button>
         ) : null}
         <button
           type="button"
@@ -1048,10 +1472,22 @@ function ExistingChildCard({
         ) : (
           <CircleAlert className="size-3 shrink-0 text-content/30" />
         )}
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-content/50">
+        <span
+          className="min-w-0 flex-1 truncate font-mono text-[11px] text-content/50"
+          title={summary}
+        >
           {summary}
         </span>
       </div>
+      {state === "failed" && child.launch.error ? (
+        <p
+          role="alert"
+          className="mb-2 truncate text-[11px] text-red-400/90"
+          title={child.launch.error}
+        >
+          {child.launch.error}
+        </p>
+      ) : null}
       <label className="block">
         <span className="mb-0.5 block text-[11px] text-content/50">
           Responsibility
@@ -1085,23 +1521,33 @@ function IssuePicker({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
+  const [loadNonce, setLoadNonce] = useState(0);
 
+  // One fetch per open — a rejected load must not loop: the error renders
+  // with an explicit Retry instead of retriggering the effect.
   useEffect(() => {
-    if (!open || items !== null || busy) return;
+    if (!open) return;
+    let live = true;
     setBusy(true);
     setError("");
     void listInboxItems(
       repositories.map((repo) => ({ path: repo.anchor })),
       { assignedToMe: false, state: "open", search: "" },
     )
-      .then((result) =>
-        setItems(
-          result.items.filter((item) => item.kind === "issue"),
-        ),
-      )
-      .catch((reason) => setError(String(reason)))
-      .finally(() => setBusy(false));
-  }, [open, items, busy, repositories]);
+      .then((result) => {
+        if (live)
+          setItems(result.items.filter((item) => item.kind === "issue"));
+      })
+      .catch((reason) => {
+        if (live) setError(String(reason));
+      })
+      .finally(() => {
+        if (live) setBusy(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [open, loadNonce, repositories]);
 
   const picked = new Set(tickets.map((ticket) => ticket.url));
   const query = search.trim().toLowerCase();
@@ -1192,28 +1638,42 @@ function IssuePicker({
                 Loading issues…
               </p>
             ) : error ? (
-              <p className="px-2 py-2 text-[11px] text-red-400">{error}</p>
-            ) : shown.length ? (
-              shown.map((item) => (
+              <p className="px-2 py-2 text-[11px] text-red-400">
+                {error}{" "}
                 <button
-                  key={item.url || `${item.provider}:${item.id}`}
                   type="button"
-                  onClick={() => toggle(item)}
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-content/5"
+                  onClick={() => setLoadNonce((nonce) => nonce + 1)}
+                  className="text-content/60 underline hover:text-content"
                 >
-                  <ContextCheckbox
-                    label={item.title}
-                    checked={picked.has(item.url)}
-                    onChange={() => toggle(item)}
-                  />
-                  <span className="min-w-0 flex-1 truncate text-[12px] text-content">
-                    {item.identifier ?? `#${item.number}`} {item.title}
-                  </span>
-                  <span className="shrink-0 truncate text-[10px] text-content/40">
-                    {item.repo || item.provider}
-                  </span>
+                  Retry
                 </button>
-              ))
+              </p>
+            ) : shown.length ? (
+              shown.map((item) => {
+                // Key the checkbox on the synthesized link, not the raw
+                // item — an issue without a url still toggles correctly.
+                const linked = linkedWorkItemFromInboxItem(item);
+                return (
+                  <button
+                    key={item.url || `${item.provider}:${item.id}`}
+                    type="button"
+                    onClick={() => toggle(item)}
+                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-content/5"
+                  >
+                    <ContextCheckbox
+                      label={item.title}
+                      checked={linked ? picked.has(linked.url) : false}
+                      onChange={() => toggle(item)}
+                    />
+                    <span className="min-w-0 flex-1 truncate text-[12px] text-content">
+                      {item.identifier ?? `#${item.number}`} {item.title}
+                    </span>
+                    <span className="shrink-0 truncate text-[10px] text-content/40">
+                      {item.repo || item.provider}
+                    </span>
+                  </button>
+                );
+              })
             ) : (
               <p className="px-2 py-2 text-[11px] text-content/45">
                 No open issues found
@@ -1251,7 +1711,10 @@ function SearchablePick({
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(0);
+  const listboxId = useId();
   const anchor = useRef<HTMLButtonElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const shown = options
     .filter((option) =>
       `${option.label} ${option.detail ?? ""}`
@@ -1259,6 +1722,35 @@ function SearchablePick({
         .includes(query.toLowerCase()),
     )
     .slice(0, 200);
+  const active = Math.min(activeIndex, Math.max(shown.length - 1, 0));
+  const pick = (key: string) => {
+    onPick(key);
+    setOpen(false);
+  };
+  const onSearchKey = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!shown.length) return;
+      const delta = event.key === "ArrowDown" ? 1 : -1;
+      const next = (active + delta + shown.length) % shown.length;
+      setActiveIndex(next);
+      listRef.current
+        ?.querySelector(`[data-index="${next}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      const option = shown[active];
+      if (option) pick(option.key);
+    } else if (event.key === "Home" || event.key === "End") {
+      event.preventDefault();
+      if (!shown.length) return;
+      const next = event.key === "Home" ? 0 : shown.length - 1;
+      setActiveIndex(next);
+      listRef.current
+        ?.querySelector(`[data-index="${next}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    }
+  };
   const Icon = icon === "folder" ? Folder : GitBranch;
   return (
     <>
@@ -1266,8 +1758,11 @@ function SearchablePick({
         ref={anchor}
         type="button"
         aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
         onClick={() => {
           setQuery("");
+          setActiveIndex(0);
           setOpen(true);
         }}
         className="flex w-full items-center gap-2 rounded-lg border border-content/10 bg-content/5 px-2.5 py-1.5 text-left text-[12px] outline-none ring-accent/40 focus:ring-1"
@@ -1298,21 +1793,39 @@ function SearchablePick({
               autoFocus
               className="min-w-0 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/40"
               aria-label={ariaLabel}
+              aria-controls={listboxId}
+              aria-activedescendant={
+                shown.length ? `${listboxId}-${active}` : undefined
+              }
+              role="combobox"
+              aria-expanded="true"
               placeholder={searchPlaceholder}
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => {
+                setQuery(event.target.value);
+                setActiveIndex(0);
+              }}
+              onKeyDown={onSearchKey}
             />
           </label>
-          <div className="max-h-56 overflow-y-auto overscroll-none px-1.5 py-1.5">
-            {shown.map((option) => (
+          <div
+            ref={listRef}
+            id={listboxId}
+            role="listbox"
+            aria-label={ariaLabel}
+            className="max-h-56 overflow-y-auto overscroll-none px-1.5 py-1.5"
+          >
+            {shown.map((option, index) => (
               <button
                 type="button"
                 key={option.key}
-                className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-content hover:bg-content/5"
-                onClick={() => {
-                  onPick(option.key);
-                  setOpen(false);
-                }}
+                id={`${listboxId}-${index}`}
+                data-index={index}
+                role="option"
+                aria-selected={index === active}
+                className={`flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-content hover:bg-content/5 ${index === active ? "bg-content/8" : ""}`}
+                onMouseEnter={() => setActiveIndex(index)}
+                onClick={() => pick(option.key)}
               >
                 <Icon
                   className="size-3.5 shrink-0 text-content/50"

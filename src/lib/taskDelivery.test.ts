@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   childDelivery,
   EMPTY_DELIVERY,
+  sessionDeliveryLinks,
+  taskDeliveryOverview,
   taskStatusSegments,
   type TaskChildDelivery,
 } from "./taskDelivery";
@@ -279,6 +281,71 @@ describe("childDelivery", () => {
   });
 });
 
+describe("taskDeliveryOverview", () => {
+  // The resolver mirrors the rail's peeks — each child's recorded branch.
+  const resolve = () => ({ branches: ["feat/x"] });
+
+  it("aggregates counts and prefers the attention PR target", () => {
+    saveAzurePr({}); // plain active PR on c1's checkout
+    saveAzurePr({ cwd: "/repo/b", votes: [-10], number: 77 }); // attention
+    const c1 = child({ id: "c1" });
+    const c2 = child({ id: "c2", workingCopy: "/repo/b" });
+    const overview = taskDeliveryOverview(task([c1, c2]), resolve);
+    expect(overview.prs).toBe(2);
+    expect(overview.prAttention).toBe(true);
+    expect(overview.prTarget).toEqual({
+      child: c2,
+      ref: { kind: "pr" },
+    });
+  });
+
+  it("uses the cached GitHub PR as the target when no Azure link exists", () => {
+    const c = child();
+    const overview = taskDeliveryOverview(task([c]), (entry) => ({
+      branches: ["feat/x"],
+      githubPr:
+        entry === c
+          ? { number: 5, title: "t", url: "u", state: "open" }
+          : null,
+    }));
+    expect(overview.prs).toBe(1);
+    expect(overview.prTarget).toEqual({
+      child: c,
+      ref: { kind: "pr", provider: "github", number: 5 },
+    });
+  });
+
+  it("targets the failing pipeline over an idle one", () => {
+    saveCi({}); // succeeded on c1
+    saveCi({ cwd: "/repo/b", result: "failed", definition: 8 });
+    const c1 = child({ id: "c1" });
+    const c2 = child({ id: "c2", workingCopy: "/repo/b" });
+    const overview = taskDeliveryOverview(task([c1, c2]), resolve);
+    expect(overview.ci).toBe(2);
+    expect(overview.ciFailing).toBe(true);
+    expect(overview.ciTarget).toEqual({
+      child: c2,
+      ref: { kind: "ci" },
+    });
+  });
+
+  it("skips children without a working copy", () => {
+    saveAzurePr({});
+    saveCi({ result: "failed" });
+    const c = child({ workingCopy: undefined });
+    const overview = taskDeliveryOverview(task([c]), resolve);
+    expect(overview).toEqual({
+      prs: 0,
+      ci: 0,
+      ciRunning: false,
+      prAttention: false,
+      ciFailing: false,
+      prTarget: undefined,
+      ciTarget: undefined,
+    });
+  });
+});
+
 describe("taskStatusSegments", () => {
   const noDelivery = new Map<string, TaskChildDelivery>();
 
@@ -393,5 +460,47 @@ describe("taskStatusSegments", () => {
         delivery,
       }),
     ).toEqual(["1 needs input", "CI failing", "1 failed", "1 working"]);
+  });
+});
+
+describe("sessionDeliveryLinks", () => {
+  it("scopes saved links to the given sessions plus unassigned rows", () => {
+    saveAzurePr({ session: "host" });
+    saveAzurePr({ session: "other", number: 77 });
+    saveAzurePr({ number: 78 }); // unassigned
+    const links = sessionDeliveryLinks({
+      cwd: "/repo/a",
+      branches: ["feat/x"],
+      sessionIds: ["host"],
+    });
+    expect(links.prs).toHaveLength(2);
+    expect(links.prs.map((row) => row.pr.pullRequestId)).not.toContain(77);
+    expect(links.prs.map((row) => row.pr.pullRequestId)).toContain(78);
+    expect(
+      links.prs.every(
+        (row) =>
+          row.sourceSessionId === undefined || row.sourceSessionId === "host",
+      ),
+    ).toBe(true);
+  });
+
+  it("matches links on a session's recorded branch when the live one moved", () => {
+    saveAzurePr({ branch: "feat/old", sourceRefName: "refs/heads/feat/old" });
+    const links = sessionDeliveryLinks({
+      cwd: "/repo/a",
+      branches: ["feat/x", "feat/old"],
+      sessionIds: ["host"],
+    });
+    expect(links.prs).toHaveLength(1);
+  });
+
+  it("returns nothing without a known branch", () => {
+    saveAzurePr({});
+    const links = sessionDeliveryLinks({
+      cwd: "/repo/a",
+      branches: [undefined],
+      sessionIds: ["host"],
+    });
+    expect(links.prs).toEqual([]);
   });
 });

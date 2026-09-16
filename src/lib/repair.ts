@@ -20,14 +20,17 @@ import {
   ciContext,
   ciKey,
   ciLogContext,
+  ciLookup,
   ciMatches,
   ciRead,
   type CiHead,
   type CiCheckout,
+  type CiJobs,
   type CiSource,
   type CiRun,
   type CiJob,
   type CiLog,
+  type CiTarget,
 } from "./azurePipelines";
 import {
   FAILING_CHECK_CONCLUSIONS,
@@ -409,6 +412,59 @@ export function ciRepair(
     context,
   };
 }
+
+/**
+ * "Fix CI" for an Azure Pipelines run — re-fetches the run, its jobs and the
+ * first failed job's log so the evidence is always fresh and the checkout's
+ * branch/commit is verified against the saved link. Shared by the attention
+ * queue and the task-details Fix action.
+ */
+export async function azureCiRepairDraft(input: {
+  target: CiTarget;
+  cwd: string;
+  branch: string;
+  remote: string;
+  runId: number;
+  definitionName: string;
+  sessionId?: string;
+}) {
+  const checkout = await ciContext(input.cwd);
+  if (checkout.branch !== input.branch)
+    throw new Error(
+      `Checkout is on ${checkout.branch || "detached HEAD"}, not ${input.branch}.`,
+    );
+  const head: CiHead = {
+    cwd: checkout.cwd,
+    branch: checkout.branch,
+    commit: checkout.commit,
+    remote: input.remote,
+  };
+  const page = await ciLookup(input.target, head, null, input.runId);
+  const run = page.items.find((entry) => entry.id === input.runId);
+  if (!run)
+    throw new Error("The run is no longer listed. Refresh the pipeline.");
+  const jobs = await ciRead<CiJobs>(input.target, head, run, "jobs");
+  const job = jobs.items.find(
+    (entry) => entry.result === "failed" && entry.attempt && entry.logId,
+  );
+  if (!job) throw new Error("No failed job with a log on this run.");
+  const log = await ciRead<CiLog>(input.target, head, run, "log", {
+    recordId: job.id,
+    attempt: job.attempt ?? undefined,
+    logId: job.logId ?? undefined,
+  });
+  const source: CiSource = {
+    target: input.target,
+    definitionName: input.definitionName,
+    projectName: page.projectName,
+    remote: input.remote,
+    cwd: input.cwd,
+    branch: input.branch,
+    ...(input.sessionId ? { session: input.sessionId } : {}),
+  };
+  return ciRepair(source, head, run, job, log);
+}
+
 /** owner/repo tail of a GitHub remote URL, e.g. "acme/app" from any
  * transport form (https, ssh, .git suffix). */
 const githubRepoSlug = (url: string) =>

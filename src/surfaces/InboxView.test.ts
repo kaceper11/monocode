@@ -31,7 +31,6 @@ function renderDetail(
     createElement(InboxDetail, {
       item: inboxItem,
       cwd: "/tmp/web",
-      projects: [],
       revision: 0,
       relatedSessions,
       onDiscuss: () => {},
@@ -75,7 +74,9 @@ describe("InboxDetail layout", () => {
     expect(header).toContain("Code");
   });
 
-  it("keeps the Linear project picker beside the pinned send action", () => {
+  it("keeps a Linear ticket's send action clean of the project picker", () => {
+    // Project selection moved into the new-task sheet — the detail header
+    // stays free of a picker even for provider tickets without a local path.
     const markup = renderDetail(
       item({
         provider: "linear",
@@ -90,11 +91,11 @@ describe("InboxDetail layout", () => {
     const header = markup.slice(headerIndex, scrollIndex);
 
     expect(header).toContain("Send to agent");
-    expect(header).toContain("Choose project");
+    expect(header).not.toContain("Choose project");
     expect(header).not.toContain("overflow-y-auto");
   });
 
-  it("shows why a remote GitLab item needs attention and asks for a workspace", () => {
+  it("shows why a remote GitLab item needs attention without a picker", () => {
     const markup = renderDetail(
       item({
         provider: "gitlab",
@@ -109,7 +110,8 @@ describe("InboxDetail layout", () => {
     const header = markup.slice(headerIndex, scrollIndex);
 
     expect(header).toContain("Mentioned you");
-    expect(header).toContain("Choose project");
+    expect(header).toContain("Send to agent");
+    expect(header).not.toContain("Choose project");
     expect(header).toContain("Open on GitLab");
   });
 

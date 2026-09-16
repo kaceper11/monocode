@@ -1,24 +1,25 @@
 import { canSteerHarnessSession } from "./lib/harness/registry";
-import { matchesActiveTurnModel, startSessionActivity } from "./lib/harness/apply";
+import {
+  matchesActiveTurnModel,
+  startSessionActivity,
+} from "./lib/harness/apply";
 import { queuedMessageOptions, retainQueuedFollowUp } from "./lib/messageQueue";
 import { sessionDecisionHarness } from "./lib/session";
 import { useSessionState } from "./hooks/useSessionState";
-import { githubDeliveryTarget, gitlabDeliveryTarget, GITLAB_CI_ON_MR, saveDeliveryProvider } from "./lib/deliveryProviders";
 import {
-  ciContext,
-  ciLookup,
-  ciRead,
-  type CiJobs,
-  type CiLog,
-  type CiSource,
-} from "./lib/azurePipelines";
+  githubDeliveryTarget,
+  gitlabDeliveryTarget,
+  GITLAB_CI_ON_MR,
+  saveDeliveryProvider,
+} from "./lib/deliveryProviders";
+import { ciContext } from "./lib/azurePipelines";
 import {
   readAzurePr,
   readAzurePrSection,
   type AzurePrAssociation,
   type AzurePrThread,
 } from "./lib/azureRepos";
-import { githubWorkItemThread } from "./lib/githubTasks";
+import { githubRepo, githubWorkItemThread } from "./lib/githubTasks";
 import {
   attentionStoreFromSnapshot,
   attentionSnapshot,
@@ -35,19 +36,23 @@ import {
   worktreeCleanupAttention,
 } from "./lib/attentionSources";
 import {
-  ciRepair,
+  azureCiRepairDraft,
   commentsRepair,
   githubCiRepair,
   githubCommentsRepair,
+  gitlabPipelineRepair,
   REPAIR_CHANGE,
   type RepairEvidence,
 } from "./lib/repair";
-import { startWatcherEngine, type WatcherEngineHooks } from "./lib/watcherEngine";
-import { startScheduleEngine, type ScheduleEngineHooks } from "./lib/scheduleEngine";
 import {
-  OPEN_WATCH_SHEET,
-  type WatchSheetRequest,
-} from "./lib/watchers";
+  startWatcherEngine,
+  type WatcherEngineHooks,
+} from "./lib/watcherEngine";
+import {
+  startScheduleEngine,
+  type ScheduleEngineHooks,
+} from "./lib/scheduleEngine";
+import { OPEN_WATCH_SHEET, type WatchSheetRequest } from "./lib/watchers";
 import {
   OPEN_SCHEDULE_SHEET,
   type ScheduleSheetRequest,
@@ -55,21 +60,37 @@ import {
 import { WatchSheet } from "./chrome/WatchSheet";
 import { ScheduleSheet } from "./chrome/ScheduleSheet";
 import { AttentionQueue } from "./chrome/AttentionQueue";
+import { MergeResolutionSheet } from "./chrome/MergeResolutionSheet";
+import { TaskSyncSheet } from "./chrome/TaskSyncSheet";
 import type { DeliveryTabSource } from "./lib/layout";
 import { RepairStatus } from "./chrome/RepairStatus";
-import { assertRepairOwner, repairOwnerError, reserveRepair, updateRepair, validateRepair, OPEN_REPAIR, repairRecords, type RepairDelivery, type RepairRecord } from "./lib/repair";
+import {
+  assertRepairOwner,
+  repairOwnerError,
+  reserveRepair,
+  updateRepair,
+  validateRepair,
+  OPEN_REPAIR,
+  repairRecords,
+  type RepairDelivery,
+  type RepairRecord,
+} from "./lib/repair";
 import {
   composeAgentContext,
   contextFromText,
   requestAgentContext,
   type AgentContext,
 } from "./lib/agentContext";
-import {
-  composeActionPrompt,
-  loadAgentActions,
-} from "./lib/agentActions";
+import { composeActionPrompt, loadAgentActions } from "./lib/agentActions";
 import { AgentContextPicker } from "./chrome/AgentContextPicker";
-import { PREPARE_AGENT_CONTEXT, removeContextItem, contextFromTicketDescriptions, linkTicketContext, prepareSessionContext, type AgentContextRequest } from "./lib/agentContext";
+import {
+  PREPARE_AGENT_CONTEXT,
+  removeContextItem,
+  contextFromTicketDescriptions,
+  linkTicketContext,
+  prepareSessionContext,
+  type AgentContextRequest,
+} from "./lib/agentContext";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -103,7 +124,11 @@ import {
 } from "./lib/appearance";
 import { HAS_NATIVE_GLASS, IS_MAC, IS_WIN } from "./lib/platform";
 import { WslProjectDialog } from "./chrome/WslProjectDialog";
-import { connectWslProject, invalidateWslDiscovery, wslDistributions } from "./lib/wsl";
+import {
+  connectWslProject,
+  invalidateWslDiscovery,
+  wslDistributions,
+} from "./lib/wsl";
 import { setWslStatus, wslStatusFor } from "./lib/wslStatus";
 import {
   applyUiScale,
@@ -129,10 +154,14 @@ import {
 } from "./lib/fs";
 import {
   acquireSyncSlot,
+  mergeResolutionSnapshot,
+  subscribeMergeResolutions,
   offerMergeResolution,
   syncHostLabel,
   syncPreflightRefusal,
+  syncTaskBranches,
   syncWithDefaultBranch,
+  type TaskBranchSyncRow,
 } from "./lib/syncDefault";
 import {
   invalidateProjectFiles,
@@ -237,10 +266,7 @@ import {
   confirmCloseTerminal,
   confirmCloseTerminals,
 } from "./lib/terminalClose";
-import {
-  terminalTabLabel,
-  type TerminalMetaPatch,
-} from "./lib/terminalTab";
+import { terminalTabLabel, type TerminalMetaPatch } from "./lib/terminalTab";
 import { footerTerminals } from "./lib/terminalResources";
 import {
   applyHarnessEvent,
@@ -334,15 +360,18 @@ import { removeProjectData } from "./lib/projectData";
 import { TaskCreateSheet } from "./chrome/TaskCreateSheet";
 import { TaskDetails } from "./chrome/TaskDetails";
 import { TaskPrSheet } from "./chrome/TaskPrSheet";
-import { Modal } from "./chrome/Modal";
+import { Modal, modalSwap } from "./chrome/Modal";
 import { WorktreePanel } from "./chrome/WorktreePicker";
 import {
   addTaskChildren,
   composeTaskPrompt,
   composeTaskSessionPrompt,
+  composeTaskUpdateNotice,
+  firstTaskSessionId,
   linkTicketToTask,
   loadTaskWorkspaces,
   OPEN_TASK_DETAILS,
+  OPEN_TASK_PRS,
   markTaskChildLaunching,
   preferredTaskChild,
   projectForTask,
@@ -350,13 +379,20 @@ import {
   recordTaskActiveChild,
   subscribeTaskWorkspaces,
   taskForSession,
-  taskWorkspacesSnapshot,
+  taskOwnedChildForWorkingCopy,
+  taskOwnsCheckout,
+  taskSessionIds,
+  linkTaskSession,
+  liveTaskSessionIds,
   unmarkTaskChildLaunching,
   updateTask,
   updateTaskChild,
+  type TaskChild,
   type TaskChildDraft,
   type TaskWorkspace,
 } from "./lib/taskWorkspaces";
+import { deleteTaskPrDraft } from "./lib/taskPrs";
+import type { TaskCiFix, TaskDeliveryRef } from "./lib/taskCi";
 import {
   ensureProjectForPath,
   familyForRepository,
@@ -371,11 +407,14 @@ import {
   type ProjectRecord,
 } from "./lib/projects";
 import {
+  familyHasCopy,
+  familyHasLiveCopy,
   getVerifiedFamilies,
   hiddenWorkingCopies,
   hiddenWorkingCopiesSnapshot,
   subscribeRepositoryFamilies,
   subscribeWorkingCopyPreferences,
+  type RepositoryFamily,
 } from "./lib/repositoryFamilies";
 import { probeRepositoryFamily } from "./hooks/useRepositoryFamilies";
 import {
@@ -549,6 +588,7 @@ import {
 } from "./lib/linkedWorkItemActivity";
 import {
   linkedWorkItemIdentityChanged,
+  linkedWorkItemUpdateKey,
   type LinkedSessionUpdate,
 } from "./lib/linkedSessionUpdates";
 import { fetchLinkedWorkItemThread } from "./lib/linkedWorkItemRefresh";
@@ -708,7 +748,11 @@ function withPlanBuildTarget(
   session: Session,
   target: PlanBuildTarget,
 ): Session {
-  const resolved = resolveModel(target.harness, target.model, sessionWorkCwd(session));
+  const resolved = resolveModel(
+    target.harness,
+    target.model,
+    sessionWorkCwd(session),
+  );
   const modelSettings = preferredModelSettings(resolved, session.modelSettings);
   const plan = planComposerSwitch(session, target.harness);
   const next = withHarnessChoice(
@@ -825,47 +869,46 @@ export default function App({
       : loadRecents(),
   );
   useEffect(
-    () => subscribeRemovedWorktree(({ path, replacement }) => {
-      setRecents(loadRecents());
-      setProjectCwd((current) =>
-        isEqualOrInside(current, path) ? replacement : current,
-      );
-      // The removed checkout's dock detaches: terminals spawned inside it
-      // were bound processes — stopped, or they blocked the removal. A
-      // terminal running elsewhere keeps running and moves to the
-      // replacement dock instead of losing its only UI.
-      setProjectTerminals((current) => {
-        let touched = false;
-        let survivors: FilePaneTab[] = [];
-        const docks = current.filter((dock) => {
-          if (!isEqualOrInside(dock.projectPath, path)) return true;
-          touched = true;
-          survivors = dock.pane.files.filter(
-            (file) =>
-              file.terminal &&
-              !!file.cwd &&
-              !isEqualOrInside(file.cwd, path),
+    () =>
+      subscribeRemovedWorktree(({ path, replacement }) => {
+        setRecents(loadRecents());
+        setProjectCwd((current) =>
+          isEqualOrInside(current, path) ? replacement : current,
+        );
+        // The removed checkout's dock detaches: terminals spawned inside it
+        // were bound processes — stopped, or they blocked the removal. A
+        // terminal running elsewhere keeps running and moves to the
+        // replacement dock instead of losing its only UI.
+        setProjectTerminals((current) => {
+          let touched = false;
+          let survivors: FilePaneTab[] = [];
+          const docks = current.filter((dock) => {
+            if (!isEqualOrInside(dock.projectPath, path)) return true;
+            touched = true;
+            survivors = dock.pane.files.filter(
+              (file) =>
+                file.terminal && !!file.cwd && !isEqualOrInside(file.cwd, path),
+            );
+            return false;
+          });
+          if (!touched) return current;
+          if (survivors.length === 0) return docks;
+          const index = docks.findIndex((dock) =>
+            sameProjectPath(dock.projectPath, replacement),
           );
-          return false;
+          if (index < 0) {
+            const [first, ...rest] = survivors;
+            let dock = createProjectTerminal(replacement, first);
+            for (const file of rest) dock = addTerminalToDock(dock, file);
+            return [...docks, dock];
+          }
+          docks[index] = survivors.reduce(
+            (dock, file) => addTerminalToDock(dock, file),
+            docks[index],
+          );
+          return docks;
         });
-        if (!touched) return current;
-        if (survivors.length === 0) return docks;
-        const index = docks.findIndex((dock) =>
-          sameProjectPath(dock.projectPath, replacement),
-        );
-        if (index < 0) {
-          const [first, ...rest] = survivors;
-          let dock = createProjectTerminal(replacement, first);
-          for (const file of rest) dock = addTerminalToDock(dock, file);
-          return [...docks, dock];
-        }
-        docks[index] = survivors.reduce(
-          (dock, file) => addTerminalToDock(dock, file),
-          docks[index],
-        );
-        return docks;
-      });
-    }),
+      }),
     [],
   );
   const [seed] = useState(() => {
@@ -937,9 +980,6 @@ export default function App({
   const [inboxConversationId, setInboxConversationId] = useState<string>();
   const [inboxConversationRevision, setInboxConversationRevision] = useState(0);
   const [inboxSelectionRevision, setInboxSelectionRevision] = useState(0);
-  useEffect(() => {
-    if (!inboxViewOpen) setInboxConversationId(undefined);
-  }, [inboxViewOpen]);
   const [inboxTarget, setInboxTarget] = useState<LinkedWorkItem | null>(null);
   const [inboxAskPortal, setInboxAskPortal] =
     useState<InboxSessionPortal | null>(null);
@@ -961,7 +1001,11 @@ export default function App({
     () => false,
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [wslOpening, setWslOpening] = useState<{ path: string; busy: boolean; error?: string } | null>(null);
+  const [wslOpening, setWslOpening] = useState<{
+    path: string;
+    busy: boolean;
+    error?: string;
+  } | null>(null);
   const wslOpenRequest = useRef<AbortController | null>(null);
   useEffect(() => () => wslOpenRequest.current?.abort(), []);
   useEffect(() => {
@@ -972,18 +1016,48 @@ export default function App({
     // Publish the probe only when nothing fresher landed meanwhile — a
     // connect started (or finished) during the probe outranks its result.
     const statusBefore = wslStatusFor(location.distribution);
-    void invoke<boolean>("wsl_connected", { distribution: location.distribution }).then((connected) => {
-      if (wslStatusFor(location.distribution) === statusBefore)
-        setWslStatus(location.distribution, {
-          state: connected ? "connected" : "disconnected",
-        });
-      if (!disposed && wslOpenRequest.current === openingAtStart && !connected) setWslOpening((current) => current ?? { path: projectCwd, busy: false, error: "Reconnect WSL to access this project. Windows execution will not be used." });
-    }).catch((error) => {
-      if (wslStatusFor(location.distribution) === statusBefore)
-        setWslStatus(location.distribution, { state: "error", error: String(error) });
-      if (!disposed && wslOpenRequest.current === openingAtStart) setWslOpening((current) => current ?? { path: projectCwd, busy: false, error: String(error) });
-    });
-    return () => { disposed = true; };
+    void invoke<boolean>("wsl_connected", {
+      distribution: location.distribution,
+    })
+      .then((connected) => {
+        if (wslStatusFor(location.distribution) === statusBefore)
+          setWslStatus(location.distribution, {
+            state: connected ? "connected" : "disconnected",
+          });
+        if (
+          !disposed &&
+          wslOpenRequest.current === openingAtStart &&
+          !connected
+        )
+          setWslOpening(
+            (current) =>
+              current ?? {
+                path: projectCwd,
+                busy: false,
+                error:
+                  "Reconnect WSL to access this project. Windows execution will not be used.",
+              },
+          );
+      })
+      .catch((error) => {
+        if (wslStatusFor(location.distribution) === statusBefore)
+          setWslStatus(location.distribution, {
+            state: "error",
+            error: String(error),
+          });
+        if (!disposed && wslOpenRequest.current === openingAtStart)
+          setWslOpening(
+            (current) =>
+              current ?? {
+                path: projectCwd,
+                busy: false,
+                error: String(error),
+              },
+          );
+      });
+    return () => {
+      disposed = true;
+    };
   }, [projectCwd]);
   const [updateNotice, setUpdateNotice] = useState(installedUpdate);
   const [whatsNewVersion, setWhatsNewVersion] = useState<string | null>(null);
@@ -1071,8 +1145,20 @@ export default function App({
             error: "WSL connection interrupted",
           });
           const path = projectCwdRef.current;
-          if (wslLocation(path)?.distribution.toLowerCase() === distribution.toLowerCase())
-            setWslOpening((current) => current?.busy ? current : { path, busy: false, error: "WSL connection interrupted. Reconnect, then inspect any in-flight action before retrying it." });
+          if (
+            wslLocation(path)?.distribution.toLowerCase() ===
+            distribution.toLowerCase()
+          )
+            setWslOpening((current) =>
+              current?.busy
+                ? current
+                : {
+                    path,
+                    busy: false,
+                    error:
+                      "WSL connection interrupted. Reconnect, then inspect any in-flight action before retrying it.",
+                  },
+            );
         })
         .catch(() => {
           if (wslStatusFor(distribution).state === "connecting") return;
@@ -1082,7 +1168,9 @@ export default function App({
           });
         });
     });
-    return () => { void unlisten.then((stop) => stop()); };
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
   }, []);
   projectCwdRef.current = projectCwd;
   const searchViewOpenRef = useRef(searchViewOpen);
@@ -1304,8 +1392,16 @@ export default function App({
     void refreshHarnessCatalogs(harnesses).then(() => {
       setSessions((prev) =>
         prev.map((session) => {
-          if (!isLiveHarness(session.harness) || wslLocation(sessionWorkCwd(session))) return session;
-          const resolved = resolveModel(session.harness, session.model, sessionWorkCwd(session));
+          if (
+            !isLiveHarness(session.harness) ||
+            wslLocation(sessionWorkCwd(session))
+          )
+            return session;
+          const resolved = resolveModel(
+            session.harness,
+            session.model,
+            sessionWorkCwd(session),
+          );
           const modelSettings = mergeModelSettings(
             resolved,
             session.modelSettings,
@@ -1335,7 +1431,11 @@ export default function App({
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
   const active =
     sessions.find((session) => session.id === activeTab?.focusedId) ??
-    sessions.find((session) => activeTab && session.id === focusedFileTab(activeTab)?.delivery?.sourceSessionId) ??
+    sessions.find(
+      (session) =>
+        activeTab &&
+        session.id === focusedFileTab(activeTab)?.delivery?.sourceSessionId,
+    ) ??
     sessions.find(
       (session) => activeTab && leafIds(activeTab.layout).includes(session.id),
     );
@@ -1346,35 +1446,29 @@ export default function App({
   );
   // Saved commands resolve their owning project at open: explicit id → rail
   // path → the active task's project → the current folder's project.
+  const activeTaskScope =
+    commandsMenu && active
+      ? taskForSession(active.id, sessionWorkCwd(active))
+      : null;
   const commandsProject = !commandsMenu
     ? undefined
     : commandsMenu.projectId
       ? projectsList.find((entry) => entry.id === commandsMenu.projectId)
       : commandsMenu.path
         ? projectForPath(commandsMenu.path)
-        : (() => {
-            const scope = active
-              ? taskForSession(active.id, sessionWorkCwd(active))
-              : null;
-            return (
-              (scope ? projectForTask(scope.task) : undefined) ??
-              projectForPath(projectCwd)
-            );
-          })();
+        : ((activeTaskScope
+            ? projectForTask(activeTaskScope.task)
+            : undefined) ?? projectForPath(projectCwd));
   const commandsTask = !commandsMenu
     ? null
     : commandsMenu.taskId
       ? (loadTaskWorkspaces().find(
           (entry) => entry.id === commandsMenu.taskId,
         ) ?? null)
-      : (() => {
-          const scope = active
-            ? taskForSession(active.id, sessionWorkCwd(active))
-            : null;
-          return scope && scope.task.projectId === commandsProject?.id
-            ? scope.task
-            : null;
-        })();
+      : activeTaskScope &&
+          activeTaskScope.task.projectId === commandsProject?.id
+        ? activeTaskScope.task
+        : null;
   // Reusable commands still need a folder when the rail entry is not a stored
   // project — the path the menu was opened on, else the current folder.
   const commandsFallbackCwd = commandsMenu?.path ?? projectCwd;
@@ -1516,6 +1610,16 @@ export default function App({
         ? liveAgentsFromSessions(sessions, unseenFinishedIds)
         : [],
     [liveAgentsEnabled, sessions, unseenFinishedIds],
+  );
+
+  // Stable across renders — the rail memoizes on this array, so it must not
+  // be rebuilt inline in JSX on every transcript write.
+  const busyProjectPaths = useMemo(
+    () =>
+      sessions.flatMap((session) =>
+        session.busy && session.cwd ? [session.cwd] : [],
+      ),
+    [sessions],
   );
 
   const hiddenApprovalToasts = useMemo(
@@ -1861,7 +1965,8 @@ export default function App({
   const activateTab = useCallback((id: string, paneId?: string) => {
     const tab = tabsRef.current.find((entry) => entry.id === id);
     const nextFocusedId =
-      tab && paneId &&
+      tab &&
+      paneId &&
       (leafIds(tab.layout).includes(paneId) ||
         tab.editorPanes.some((entry) => entry.id === paneId) ||
         (tab.terminalPanes ?? []).some((entry) => entry.id === paneId))
@@ -1916,7 +2021,8 @@ export default function App({
   const navLocation = useMemo<VisitLocation>(() => {
     if (settingsOpen) return { view: "settings" };
     if (searchViewOpen) return { view: "search" };
-    if (inboxViewOpen) return { view: "inbox" };
+    if (inboxViewOpen)
+      return { view: "inbox", conversation: inboxConversationId };
     if (notesViewOpen) return { view: "notes" };
     return {
       tab: activeTabId,
@@ -1927,6 +2033,7 @@ export default function App({
     settingsOpen,
     searchViewOpen,
     inboxViewOpen,
+    inboxConversationId,
     notesViewOpen,
     activeTabId,
     activeTab?.focusedId,
@@ -1934,6 +2041,9 @@ export default function App({
   ]);
   const navLocationRef = useRef(navLocation);
   navLocationRef.current = navLocation;
+  const selectHistorySessionRef = useRef<
+    ((sessionId: string) => Promise<void>) | null
+  >(null);
 
   useEffect(() => {
     const openIds = new Set(tabs.map((tab) => tab.id));
@@ -2030,19 +2140,24 @@ export default function App({
     setInboxViewOpen(false);
     setNotesViewOpen(false);
     const cwd = active?.cwd ?? sessionDefaults?.cwd ?? projectCwd;
+    // A session created inside a task-owned worktree is work on that task —
+    // attach it so task details, the scope chip and rail state all see it.
+    // Title and ticket match what ensureOpenSession's reconcile would write
+    // on reload, so the claim is consistent from the start.
+    const claim = taskOwnedChildForWorkingCopy(cwd);
     const session = newDefaultSession(cwd);
+    if (claim) {
+      session.title = claim.task.name;
+      session.linkedWorkItem = claim.task.ticket;
+      linkTaskSession(claim.task.id, session.id);
+    }
     const tab = newTab(session.id);
     setSessions((prev) => [...prev, session]);
     appendTab(tab, cwd);
     setActiveTabId(tab.id);
     setComposerFocused(true);
     return session.id;
-  }, [
-    active?.cwd,
-    appendTab,
-    sessionDefaults?.cwd,
-    projectCwd,
-  ]);
+  }, [active?.cwd, appendTab, sessionDefaults?.cwd, projectCwd]);
 
   const [inboxMounted, setInboxMounted] = useState(inboxViewOpen);
   useEffect(() => {
@@ -2058,10 +2173,12 @@ export default function App({
       }
       const source = sessionsRef.current.find(
         (session) =>
-          session.id === (request.sourceSessionId ?? activeSessionIdRef.current),
+          session.id ===
+          (request.sourceSessionId ?? activeSessionIdRef.current),
       );
       if (
-        request.prepareInSource && !request.repair &&
+        request.prepareInSource &&
+        !request.repair &&
         source &&
         (!request.cwd || sessionWorkCwd(source) === request.cwd)
       ) {
@@ -2084,7 +2201,8 @@ export default function App({
             ...request,
             sourceSessionId:
               request.sourceSessionId ??
-              (source && (!request.cwd || sessionWorkCwd(source) === request.cwd)
+              (source &&
+              (!request.cwd || sessionWorkCwd(source) === request.cwd)
                 ? source.id
                 : undefined),
           },
@@ -2099,8 +2217,13 @@ export default function App({
     destination: string | Session,
     signal?: AbortSignal,
   ): Promise<string> => {
-    const context = request.tickets ? await contextFromTicketDescriptions(request.tickets, signal) : request.context;
-    if (typeof destination === "string" && !sessionsRef.current.some(session => session.id === destination)) {
+    const context = request.tickets
+      ? await contextFromTicketDescriptions(request.tickets, signal)
+      : request.context;
+    if (
+      typeof destination === "string" &&
+      !sessionsRef.current.some((session) => session.id === destination)
+    ) {
       await ensureOpenSession(destination);
       signal?.throwIfAborted();
     }
@@ -2114,7 +2237,19 @@ export default function App({
     if (request.repair) {
       const error = repairOwnerError(target, request.repair);
       if (error) throw new Error(error);
-      const delivery: RepairDelivery = { id: crypto.randomUUID(), evidence: request.repair, context, owner: { id: target.id, harness: target.harness, model: target.model, cwd: sessionWorkCwd(target), runtimeMode: target.runtimeMode, providerSessionId: target.providerSessionId } };
+      const delivery: RepairDelivery = {
+        id: crypto.randomUUID(),
+        evidence: request.repair,
+        context,
+        owner: {
+          id: target.id,
+          harness: target.harness,
+          model: target.model,
+          cwd: sessionWorkCwd(target),
+          runtimeMode: target.runtimeMode,
+          providerSessionId: target.providerSessionId,
+        },
+      };
       signal?.throwIfAborted();
       reserveRepair(delivery, repairCheckingRef.current.has(target.id));
       if (!existing) {
@@ -2125,18 +2260,35 @@ export default function App({
         appendTab(tab, target.cwd);
         setActiveTabId(tab.id);
       }
-      const accepted = await onSubmit(target.id, composeAgentContext(context, ""), [], { repair: delivery, followUpBehavior: "queue", noteCard: undefined, handoffCard: undefined, signal });
-      if (!accepted) throw new Error(repairRecords().find(row => row.id === delivery.id)?.detail || "Repair was not delivered. Refresh evidence and retry.");
+      const accepted = await onSubmit(
+        target.id,
+        composeAgentContext(context, ""),
+        [],
+        {
+          repair: delivery,
+          followUpBehavior: "queue",
+          noteCard: undefined,
+          handoffCard: undefined,
+          signal,
+        },
+      );
+      if (!accepted)
+        throw new Error(
+          repairRecords().find((row) => row.id === delivery.id)?.detail ||
+            "Repair was not delivered. Refresh evidence and retry.",
+        );
       return target.id;
     }
-    const tickets = request.context.entries.every(entry => !!entry.ticket);
+    const tickets = request.context.entries.every((entry) => !!entry.ticket);
     const prepared =
       request.attachmentsOptional &&
       context.attachments.length &&
       !harnessSupportsAttachments(target.harness)
         ? { ...context, attachments: [] }
         : context;
-    let next = tickets ? linkTicketContext(target, prepared) : prepareSessionContext(target, prepared, true);
+    let next = tickets
+      ? linkTicketContext(target, prepared)
+      : prepareSessionContext(target, prepared, true);
     if (existing) {
       const updated = sessionsRef.current.map((session) =>
         session.id === next.id ? next : session,
@@ -2144,15 +2296,26 @@ export default function App({
       sessionsRef.current = updated;
       setSessions(updated);
     } else {
-      const created = next = { ...next, ...(tickets ? { title: request.context.entries.map(entry => entry.ticket!.identifier).join(", ") } : {}) };
+      const created = (next = {
+        ...next,
+        ...(tickets
+          ? {
+              title: request.context.entries
+                .map((entry) => entry.ticket!.identifier)
+                .join(", "),
+            }
+          : {}),
+      });
       const updated = [...sessionsRef.current, created];
       sessionsRef.current = updated;
       setSessions(updated);
       const tab = newTab(created.id);
       appendTab(tab, created.cwd);
       setActiveTabId(tab.id);
-      if (tickets) { setInboxViewOpen(true); setInboxConversationId(created.id); }
-      else setInboxViewOpen(false);
+      if (tickets) {
+        setInboxViewOpen(true);
+        setInboxConversationId(created.id);
+      } else setInboxViewOpen(false);
       setNotesViewOpen(false);
       setComposerFocused(true);
     }
@@ -2160,22 +2323,45 @@ export default function App({
     request.onPrepared?.();
     return next.id;
   };
-  const onToggleConversationTicket = async (sessionId: string, item: InboxItem, selected: boolean) => {
-    const session = sessionsRef.current.find(session => session.id === sessionId);
+  const onToggleConversationTicket = async (
+    sessionId: string,
+    item: InboxItem,
+    selected: boolean,
+  ) => {
+    const session = sessionsRef.current.find(
+      (session) => session.id === sessionId,
+    );
     const link = linkedWorkItemFromInboxItem(item);
-    if (!session || !link) throw new Error("Conversation or ticket is unavailable.");
-    const context = selected ? await contextFromTicketDescriptions([item]) : undefined;
-    const current = sessionsRef.current.find(entry => entry.id === sessionId);
+    if (!session || !link)
+      throw new Error("Conversation or ticket is unavailable.");
+    const context = selected
+      ? await contextFromTicketDescriptions([item])
+      : undefined;
+    const current = sessionsRef.current.find((entry) => entry.id === sessionId);
     if (!current) throw new Error("Conversation closed.");
-    const base = context ? linkTicketContext(current, context) : removeSessionWorkItem(current, link);
-    const next = linkedWorkItemIdentityChanged(current.linkedWorkItem, base.linkedWorkItem)
+    const base = context
+      ? linkTicketContext(current, context)
+      : removeSessionWorkItem(current, link);
+    const next = linkedWorkItemIdentityChanged(
+      current.linkedWorkItem,
+      base.linkedWorkItem,
+    )
       ? { ...base, linkedWorkItemUpdateCard: undefined }
       : base;
     if (!selected && next.contextDraft) {
-      const entries = next.contextDraft.entries.filter(entry => entry.workItem?.url !== link.url || entry.workItem?.account !== link.account);
-      next.contextDraft = entries.length || next.contextDraft.attachments.length ? { ...next.contextDraft, entries } : undefined;
+      const entries = next.contextDraft.entries.filter(
+        (entry) =>
+          entry.workItem?.url !== link.url ||
+          entry.workItem?.account !== link.account,
+      );
+      next.contextDraft =
+        entries.length || next.contextDraft.attachments.length
+          ? { ...next.contextDraft, entries }
+          : undefined;
     }
-    const updated = sessionsRef.current.map(session => session.id === sessionId ? next : session);
+    const updated = sessionsRef.current.map((session) =>
+      session.id === sessionId ? next : session,
+    );
     sessionsRef.current = updated;
     setSessions(updated);
     // Normal edits use the existing debounced session save, avoiding a full
@@ -2184,7 +2370,8 @@ export default function App({
     if (!shouldPersistSession(next)) {
       pendingPersist.current.delete(sessionId);
       const summary = await upsertSession(next, { allowEmpty: true });
-      if (summary && summary.cwd === sidebarCwdRef.current) setHistory(current => mergeProjectHistorySummary(current, summary));
+      if (summary && summary.cwd === sidebarCwdRef.current)
+        setHistory((current) => mergeProjectHistorySummary(current, summary));
     } else {
       pendingPersist.current.set(sessionId, next);
     }
@@ -2215,12 +2402,7 @@ export default function App({
       setActiveTabId(tab.id);
       setComposerFocused(true);
     },
-    [
-      active?.cwd,
-      appendTab,
-      sessionDefaults?.cwd,
-      projectCwd,
-    ],
+    [active?.cwd, appendTab, sessionDefaults?.cwd, projectCwd],
   );
 
   useEffect(() => {
@@ -2233,18 +2415,38 @@ export default function App({
     return () => window.removeEventListener(ADD_NOTE_TO_CHAT_EVENT, onAdd);
   }, [onAddNoteToChat]);
 
-  const onInboxCardDismiss = useCallback((sessionId: string, fileId?: string) => {
-    setSessions((prev) =>
-      prev.map((session) =>
-        session.id === sessionId && (session.inboxCard || session.contextDraft)
-          ? { ...session,
-              contextDraft: fileId === "__context__" ? undefined : fileId && session.contextDraft ? removeContextItem(session.contextDraft, fileId) : session.contextDraft,
-              inboxCard: fileId === "__context__" ? session.inboxCard : fileId && session.inboxCard ? { ...session.inboxCard, attachments: session.inboxCard.attachments?.filter(file => file.id !== fileId) } : undefined,
-            }
-          : session,
-      ),
-    );
-  }, []);
+  const onInboxCardDismiss = useCallback(
+    (sessionId: string, fileId?: string) => {
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.id === sessionId &&
+          (session.inboxCard || session.contextDraft)
+            ? {
+                ...session,
+                contextDraft:
+                  fileId === "__context__"
+                    ? undefined
+                    : fileId && session.contextDraft
+                      ? removeContextItem(session.contextDraft, fileId)
+                      : session.contextDraft,
+                inboxCard:
+                  fileId === "__context__"
+                    ? session.inboxCard
+                    : fileId && session.inboxCard
+                      ? {
+                          ...session.inboxCard,
+                          attachments: session.inboxCard.attachments?.filter(
+                            (file) => file.id !== fileId,
+                          ),
+                        }
+                      : undefined,
+              }
+            : session,
+        ),
+      );
+    },
+    [],
+  );
 
   const setLinkedWorkItemUpdateCard = useCallback(
     (
@@ -2298,9 +2500,7 @@ export default function App({
   const onSplit = useCallback(
     (dir: SplitDir) => {
       if (!activeTab) return;
-      const session = newDefaultSession(
-        sessionDefaults?.cwd ?? projectCwd,
-      );
+      const session = newDefaultSession(sessionDefaults?.cwd ?? projectCwd);
       setSessions((prev) => [...prev, session]);
       setTabs((prev) =>
         prev.map((t) => {
@@ -2387,7 +2587,14 @@ export default function App({
       );
       setComposerFocused(false);
     },
-    [active?.cwd, activeTab, appendTab, dismissOverlays, openProjectTerminal, projectCwd],
+    [
+      active?.cwd,
+      activeTab,
+      appendTab,
+      dismissOverlays,
+      openProjectTerminal,
+      projectCwd,
+    ],
   );
 
   const onNewTerminal = useCallback(() => {
@@ -2571,7 +2778,9 @@ export default function App({
             if (tab.diffFocused) {
               setTabs((prev) =>
                 prev.map((entry) =>
-                  entry.id === tab.id ? { ...entry, diffFocused: false } : entry,
+                  entry.id === tab.id
+                    ? { ...entry, diffFocused: false }
+                    : entry,
                 ),
               );
             }
@@ -3121,6 +3330,23 @@ export default function App({
   const applyVisitLocation = useCallback(
     (location: VisitLocation) => {
       const overlay = "view" in location ? location.view : undefined;
+      const conversation =
+        "view" in location && location.view === "inbox"
+          ? location.conversation
+          : undefined;
+      if (
+        conversation &&
+        !tabsRef.current.some((entry) =>
+          leafIds(entry.layout).includes(conversation),
+        )
+      ) {
+        // The embedded conversation portals through a live session leaf —
+        // re-place it when its pane was closed. `dismissOverlays` inside
+        // runs synchronously, before the setters below, so the inbox still
+        // ends up open.
+        void selectHistorySessionRef.current?.(conversation);
+      }
+      if (overlay === "inbox") setInboxConversationId(conversation);
       setInboxViewOpen(overlay === "inbox");
       setSearchViewOpen(overlay === "search");
       setSettingsOpen(overlay === "settings");
@@ -3188,7 +3414,7 @@ export default function App({
   const onFocusPane = useCallback(
     (paneId: string) => {
       setProjectTerminalFocused(false);
-      if (inboxAskPortal?.sessionId === paneId) {
+      if (inboxViewOpenRef.current && inboxAskPortal?.sessionId === paneId) {
         setComposerFocused(true);
         return;
       }
@@ -3261,13 +3487,25 @@ export default function App({
     [onOpenDiff],
   );
 
-  const onOpenDelivery = useCallback((cwd: string, delivery: DeliveryTabSource) => {
-    dismissOverlays();
-    setTabs(previous => previous.map(tab => tab.id === activeTabId
-      ? openEditorTab(tab, { id: crypto.randomUUID(), path: delivery.kind === "pr" ? "Pull requests" : "CI", cwd, delivery })
-      : tab));
-    setComposerFocused(false);
-  }, [activeTabId, dismissOverlays]);
+  const onOpenDelivery = useCallback(
+    (cwd: string, delivery: DeliveryTabSource) => {
+      dismissOverlays();
+      setTabs((previous) =>
+        previous.map((tab) =>
+          tab.id === activeTabId
+            ? openEditorTab(tab, {
+                id: crypto.randomUUID(),
+                path: delivery.kind === "pr" ? "Pull requests" : "CI",
+                cwd,
+                delivery,
+              })
+            : tab,
+        ),
+      );
+      setComposerFocused(false);
+    },
+    [activeTabId, dismissOverlays],
+  );
 
   /** Stack every working-tree change in one review, whatever the diff-view setting. */
   const onOpenAllChanges = useCallback(() => {
@@ -3448,21 +3686,40 @@ export default function App({
         return null;
       }
       const restored = await restoreSessionCheckout(loaded);
-      if (restored.providerSessionId && isLiveHarness(restored.harness)) {
+      // A persisted task session can predate the last rename/ticket edit —
+      // the edit sync only reaches sessions already in memory, so reconcile
+      // on load the same fields that sync writes.
+      const taskOwner = taskForSession(restored.id)?.task;
+      const synced =
+        taskOwner &&
+        (restored.title !== taskOwner.name ||
+          linkedWorkItemIdentityChanged(
+            restored.linkedWorkItem,
+            taskOwner.ticket,
+          ))
+          ? {
+              ...restored,
+              title: taskOwner.name,
+              linkedWorkItem: taskOwner.ticket,
+              linkedWorkItemUpdateCard: undefined,
+            }
+          : restored;
+      if (synced !== restored) void upsertSession(synced);
+      if (synced.providerSessionId && isLiveHarness(synced.harness)) {
         bindHarnessSession(
-          restored.harness,
-          restored.id,
-          restored.providerSessionId,
-          sessionWorkCwd(restored),
+          synced.harness,
+          synced.id,
+          synced.providerSessionId,
+          sessionWorkCwd(synced),
         );
       }
-      lastPersisted.current.set(restored.id, persistFingerprint(restored));
-      if (!sessionsRef.current.some((session) => session.id === restored.id)) {
-        const next = [...sessionsRef.current, restored];
+      lastPersisted.current.set(synced.id, persistFingerprint(synced));
+      if (!sessionsRef.current.some((session) => session.id === synced.id)) {
+        const next = [...sessionsRef.current, synced];
         sessionsRef.current = next;
         setSessions(next);
       }
-      return restored;
+      return synced;
     },
     [refreshHistory, sidebarCwd],
   );
@@ -3539,10 +3796,20 @@ export default function App({
   );
 
   const onAskInboxItem = useCallback(
-    (item: InboxItem, context?: import("./lib/githubTasks").InboxComposerCard): Promise<string> => {
+    (
+      item: InboxItem,
+      context?: import("./lib/githubTasks").InboxComposerCard,
+    ): Promise<string> => {
       const key = inboxAskKey(item);
       const pending = openingInboxSessions.current.get(key);
-      if (pending) return context ? Promise.reject(new Error("This conversation is opening. Try again when it is ready.")) : pending;
+      if (pending)
+        return context
+          ? Promise.reject(
+              new Error(
+                "This conversation is opening. Try again when it is ready.",
+              ),
+            )
+          : pending;
       const opening = (async () => {
         let session = sessionsRef.current.find(
           (entry) => entry.inboxAsk?.key === key,
@@ -3553,29 +3820,32 @@ export default function App({
             candidate && candidate !== "~"
               ? candidate
               : await invoke<string>("default_cwd");
-          const description = context ? undefined :
-            item.provider === "azure" ? (peekAzureDetails(item) ?? await azureDetails(item)).body : item.provider === "jira"
-              ? (peekJiraDetails(item) ?? (await jiraDetails(item))).body
-              : item.provider === "linear" && item.id
-                ? (
-                    peekLinearIssueDetails(item.id) ??
-                    (await linearIssueDetails(item.id))
-                  ).body
-                : item.provider === "gitlab" &&
-                    (item.kind === "issue" || item.kind === "pr")
+          const description = context
+            ? undefined
+            : item.provider === "azure"
+              ? (peekAzureDetails(item) ?? (await azureDetails(item))).body
+              : item.provider === "jira"
+                ? (peekJiraDetails(item) ?? (await jiraDetails(item))).body
+                : item.provider === "linear" && item.id
                   ? (
-                      peekGitlabWorkItemDetails(
-                        item.repo,
-                        item.kind,
-                        item.number,
-                      ) ??
-                      (await gitlabWorkItemDetails(
-                        item.repo,
-                        item.kind,
-                        item.number,
-                      ))
+                      peekLinearIssueDetails(item.id) ??
+                      (await linearIssueDetails(item.id))
                     ).body
-                  : undefined;
+                  : item.provider === "gitlab" &&
+                      (item.kind === "issue" || item.kind === "pr")
+                    ? (
+                        peekGitlabWorkItemDetails(
+                          item.repo,
+                          item.kind,
+                          item.number,
+                        ) ??
+                        (await gitlabWorkItemDetails(
+                          item.repo,
+                          item.kind,
+                          item.number,
+                        ))
+                      ).body
+                    : undefined;
           session = {
             ...newDefaultSession(cwd),
             title: `Ask · ${item.title}`,
@@ -3599,9 +3869,20 @@ export default function App({
           setSessions(sessionsRef.current);
         }
         if (context && session.inboxCard?.contextId !== context.contextId) {
-          if (session.inboxCard) throw new Error("This conversation already has staged context. Send or remove that card first, then try again.");
-          const updated = { ...session, inboxCard: context, inboxAsk: session.inboxAsk ? { ...session.inboxAsk, description: undefined } : undefined };
-          sessionsRef.current = sessionsRef.current.map(entry => entry.id === session.id ? updated : entry);
+          if (session.inboxCard)
+            throw new Error(
+              "This conversation already has staged context. Send or remove that card first, then try again.",
+            );
+          const updated = {
+            ...session,
+            inboxCard: context,
+            inboxAsk: session.inboxAsk
+              ? { ...session.inboxAsk, description: undefined }
+              : undefined,
+          };
+          sessionsRef.current = sessionsRef.current.map((entry) =>
+            entry.id === session.id ? updated : entry,
+          );
           setSessions(sessionsRef.current);
         }
         return session.id;
@@ -3693,6 +3974,7 @@ export default function App({
       revealLinkedSessionUpdate,
     ],
   );
+  selectHistorySessionRef.current = onSelectHistorySession;
 
   const openReminderSession = useCallback(
     async (sessionId: string) => {
@@ -3727,7 +4009,9 @@ export default function App({
   const sessionReminders = useSessionReminders(
     openReminderSession,
     ensureReminderSessionsSaved,
-    sessions.filter((session) => !session.inboxAsk).map((session) => session.id),
+    sessions
+      .filter((session) => !session.inboxAsk)
+      .map((session) => session.id),
   );
 
   const onPlaceSessionOnPane = useCallback(
@@ -3854,9 +4138,7 @@ export default function App({
             dirtyFiles: dirtyFilesRef.current,
           }),
           createReplacement: (latest) =>
-            newDefaultSession(
-              latest?.cwd ?? seed?.cwd ?? sidebarCwd,
-            ),
+            newDefaultSession(latest?.cwd ?? seed?.cwd ?? sidebarCwd),
           confirmClose: async (closedTabs) => {
             const files = filesInWorkspaceTabs(closedTabs);
             const unsaved = files.some(
@@ -4246,36 +4528,42 @@ export default function App({
     [activateTab, appendTab, onCwdChange, readProjectReturnMemory],
   );
 
-  const onSelectProject = useCallback((path: string) => {
-    // Group rows key on `project:<id>` — open their last member copy instead
-    // of treating the key as a folder.
-    if (isProjectRailKey(path)) {
-      const project = loadProjects().find(
-        (entry) => projectRailKey(entry.id) === path,
-      );
-      const target = project?.lastPath;
-      if (target && project && projectContainsPath(project, target)) {
-        onSelectProject(target);
+  const onSelectProject = useCallback(
+    (path: string) => {
+      // Group rows key on `project:<id>` — open their last member copy instead
+      // of treating the key as a folder.
+      if (isProjectRailKey(path)) {
+        const project = loadProjects().find(
+          (entry) => projectRailKey(entry.id) === path,
+        );
+        const target = project?.lastPath;
+        if (target && project && projectContainsPath(project, target)) {
+          onSelectProject(target);
+        }
+        return;
       }
-      return;
-    }
-    wslOpenRequest.current?.abort();
-    if (!wslLocation(path)) {
-      setWslOpening(null);
-      selectProject(path);
-      return;
-    }
-    const controller = new AbortController();
-    wslOpenRequest.current = controller;
-    setWslOpening({ path, busy: true });
-    void connectWslProject(path, controller.signal).then((canonical) => {
-      if (controller.signal.aborted) return;
-      setWslOpening(null);
-      selectProject(canonical);
-    }).catch((error) => {
-      if (!controller.signal.aborted) setWslOpening({ path, busy: false, error: String(error) });
-    });
-  }, [selectProject]);
+      wslOpenRequest.current?.abort();
+      if (!wslLocation(path)) {
+        setWslOpening(null);
+        selectProject(path);
+        return;
+      }
+      const controller = new AbortController();
+      wslOpenRequest.current = controller;
+      setWslOpening({ path, busy: true });
+      void connectWslProject(path, controller.signal)
+        .then((canonical) => {
+          if (controller.signal.aborted) return;
+          setWslOpening(null);
+          selectProject(canonical);
+        })
+        .catch((error) => {
+          if (!controller.signal.aborted)
+            setWslOpening({ path, busy: false, error: String(error) });
+        });
+    },
+    [selectProject],
+  );
 
   const [wslPickerOpen, setWslPickerOpen] = useState(false);
   useEffect(() => {
@@ -4598,7 +4886,9 @@ export default function App({
     });
     setTabs((prev) =>
       prev.map((entry) =>
-        entry.id === tab.id ? { ...entry, layout, focusedId, editorPanes } : entry,
+        entry.id === tab.id
+          ? { ...entry, layout, focusedId, editorPanes }
+          : entry,
       ),
     );
     setComposerFocused(
@@ -4612,8 +4902,7 @@ export default function App({
       onOpenBrowser(event.detail.url, event.detail.cwd, event.detail.paneId);
     };
     window.addEventListener(OPEN_BROWSER_EVENT, listener);
-    return () =>
-      window.removeEventListener(OPEN_BROWSER_EVENT, listener);
+    return () => window.removeEventListener(OPEN_BROWSER_EVENT, listener);
   }, [onOpenBrowser]);
 
   const onOpenPlan = useCallback(
@@ -4664,26 +4953,33 @@ export default function App({
     [],
   );
 
-  const onSelectFileSurface = useCallback((paneId: string, fileId: string) => {
-    const owner = tabsRef.current.find(tab => findSurfacePane(tab, paneId)?.pane.files.some(file => file.id === fileId));
-    if (!owner) return;
-    activateTab(owner.id);
-    setInboxViewOpen(false);
-    setTabs((prev) =>
-      prev.map((tab) => {
-        const found = findSurfacePane(tab, paneId);
-        if (!found) return tab;
-        return withSurfacePanes(
-          { ...tab, focusedId: paneId },
-          found.kind,
-          surfacePanes(tab, found.kind).map((pane) =>
-            pane.id === paneId ? { ...pane, activeFileId: fileId } : pane,
-          ),
-        );
-      }),
-    );
-    setComposerFocused(false);
-  }, [activateTab]);
+  const onSelectFileSurface = useCallback(
+    (paneId: string, fileId: string) => {
+      const owner = tabsRef.current.find((tab) =>
+        findSurfacePane(tab, paneId)?.pane.files.some(
+          (file) => file.id === fileId,
+        ),
+      );
+      if (!owner) return;
+      activateTab(owner.id);
+      setInboxViewOpen(false);
+      setTabs((prev) =>
+        prev.map((tab) => {
+          const found = findSurfacePane(tab, paneId);
+          if (!found) return tab;
+          return withSurfacePanes(
+            { ...tab, focusedId: paneId },
+            found.kind,
+            surfacePanes(tab, found.kind).map((pane) =>
+              pane.id === paneId ? { ...pane, activeFileId: fileId } : pane,
+            ),
+          );
+        }),
+      );
+      setComposerFocused(false);
+    },
+    [activateTab],
+  );
 
   const onModelChange = useCallback(
     (sessionId: string, harness: HarnessId, model: string) => {
@@ -4781,7 +5077,9 @@ export default function App({
       const submittedAt = performance.now();
       if (removingSessionIds.current.has(sessionId)) return false;
       let storedCurrent = sessionsRef.current.find((s) => s.id === sessionId);
-      const queuedRow = storedCurrent?.queuedMessages?.find(row => row.id === options?.queuedMessageId);
+      const queuedRow = storedCurrent?.queuedMessages?.find(
+        (row) => row.id === options?.queuedMessageId,
+      );
       const repair = options?.repair ?? queuedRow?.repair;
       const action = options?.action ?? queuedRow?.action;
       if (!storedCurrent) return false;
@@ -4791,19 +5089,33 @@ export default function App({
         try {
           options?.signal?.throwIfAborted();
           assertRepairOwner(repair, storedCurrent);
-          const record = repairRecords().find(row => row.id === repair.id);
-          if (!record || !["checking", "queued"].includes(record.state)) throw new Error("This repair was already attempted or cancelled. Remove it from the queue and refresh evidence.");
-          if (options?.followUpBehavior === "steer") throw new Error("Repair requests must start a separately tracked turn; use Queue for owner.");
+          const record = repairRecords().find((row) => row.id === repair.id);
+          if (!record || !["checking", "queued"].includes(record.state))
+            throw new Error(
+              "This repair was already attempted or cancelled. Remove it from the queue and refresh evidence.",
+            );
+          if (options?.followUpBehavior === "steer")
+            throw new Error(
+              "Repair requests must start a separately tracked turn; use Queue for owner.",
+            );
           await validateRepair(repair.evidence, repair.context);
           options?.signal?.throwIfAborted();
-          storedCurrent = sessionsRef.current.find(s => s.id === sessionId);
+          storedCurrent = sessionsRef.current.find((s) => s.id === sessionId);
           assertRepairOwner(repair, storedCurrent);
-          if (removingSessionIds.current.has(sessionId)) throw new Error("Conversation is being removed.");
+          if (removingSessionIds.current.has(sessionId))
+            throw new Error("Conversation is being removed.");
         } catch (error) {
           updateRepair(repair.id, "blocked", String(error));
-          if (options?.queuedMessageId) setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, queueStatus: "paused" } : s));
+          if (options?.queuedMessageId)
+            setSessions((prev) =>
+              prev.map((s) =>
+                s.id === sessionId ? { ...s, queueStatus: "paused" } : s,
+              ),
+            );
           return false;
-        } finally { repairCheckingRef.current.delete(sessionId); }
+        } finally {
+          repairCheckingRef.current.delete(sessionId);
+        }
       }
       if (!storedCurrent) return false;
       const setSubmissionSessions = setSessions;
@@ -4862,8 +5174,7 @@ export default function App({
                       action,
                     },
                   ],
-                  queueStatus:
-                    s.queueStatus === "paused" ? "paused" : "active",
+                  queueStatus: s.queueStatus === "paused" ? "paused" : "active",
                 }
               : s,
           ),
@@ -4872,7 +5183,11 @@ export default function App({
       }
       saveRecentModelChoice(current.harness, current.model);
       const workCwd = sessionWorkCwd(current);
-      const submittedText = repair ? composeAgentContext(repair.context, "") : intent === "build" ? "Build approved plan" : text;
+      const submittedText = repair
+        ? composeAgentContext(repair.context, "")
+        : intent === "build"
+          ? "Build approved plan"
+          : text;
       const rawCommand = isNativeCommandPrompt(submittedText, current.harness);
       const harnessText = rawCommand
         ? submittedText
@@ -4888,7 +5203,11 @@ export default function App({
           intent === "plan"
             ? "queue"
             : (options?.followUpBehavior ?? loadFollowUpBehavior());
-        if (followUpBehavior === "queue" || !matchesActiveTurnModel(current) || !canSteerHarnessSession(current.harness, sessionId)) {
+        if (
+          followUpBehavior === "queue" ||
+          !matchesActiveTurnModel(current) ||
+          !canSteerHarnessSession(current.harness, sessionId)
+        ) {
           if (options?.queuedMessageId) return false;
           setSubmissionSessions((prev) =>
             prev.map((s) =>
@@ -4918,7 +5237,12 @@ export default function App({
                 : s,
             ),
           );
-          if (repair) updateRepair(repair.id, "queued", "Queued for this agent; evidence will be checked again before delivery. App must remain open.");
+          if (repair)
+            updateRepair(
+              repair.id,
+              "queued",
+              "Queued for this agent; evidence will be checked again before delivery. App must remain open.",
+            );
           return true;
         }
         const visible = displayAttachments(attachments);
@@ -4937,21 +5261,33 @@ export default function App({
             if (options?.queuedMessageId) {
               next = dequeueQueuedMessage(next, options.queuedMessageId);
             }
-            const appended = appendSteerUser(next, submittedText, visible, cards);
+            const appended = appendSteerUser(
+              next,
+              submittedText,
+              visible,
+              cards,
+            );
             optimisticBlockId = appended.blocks[appended.blocks.length - 1]?.id;
             return appended;
           }),
         );
         const gen = turnGen.current.get(sessionId);
         const activityKey = `${sessionId}:${gen}`;
-        const pending = pendingSteersRef.current.get(activityKey) ?? new Set<Promise<void>>();
+        const pending =
+          pendingSteersRef.current.get(activityKey) ?? new Set<Promise<void>>();
         pendingSteersRef.current.set(activityKey, pending);
-        const stillOwned = () => turnGen.current.get(sessionId) === gen && !removingSessionIds.current.has(sessionId);
+        const stillOwned = () =>
+          turnGen.current.get(sessionId) === gen &&
+          !removingSessionIds.current.has(sessionId);
         const followUp = (async () => {
           try {
             const [prepared, prompt] = await Promise.all([
               prepareAttachments(attachments, workCwd),
-              preparePrompt(harnessText, { harness: current.harness, sessionId, cwd: workCwd }),
+              preparePrompt(harnessText, {
+                harness: current.harness,
+                sessionId,
+                cwd: workCwd,
+              }),
             ]);
             if (!stillOwned()) return;
             const input = {
@@ -4960,31 +5296,60 @@ export default function App({
               cwd: workCwd,
               model: current.model,
               modelSettings: current.modelSettings,
-              text: inboxAskPrompt(rawCommand ? undefined : current.inboxAsk, prompt),
+              text: inboxAskPrompt(
+                rawCommand ? undefined : current.inboxAsk,
+                prompt,
+              ),
               attachments: prepared,
             };
             if (canSteerHarnessSession(current.harness, sessionId)) {
               await steerHarnessTurn(input);
             } else {
               // No write happened. Let normal queue dispatch own the next turn.
-              setSessions((prev) => prev.map((s) => s.id === sessionId
-                ? retainQueuedFollowUp(s, {
-                    id: options?.queuedMessageId ?? crypto.randomUUID(), text, attachments,
-                    noteCard, handoffCard, intent, action,
-                  }, optimisticBlockId)
-                : s));
+              setSessions((prev) =>
+                prev.map((s) =>
+                  s.id === sessionId
+                    ? retainQueuedFollowUp(
+                        s,
+                        {
+                          id: options?.queuedMessageId ?? crypto.randomUUID(),
+                          text,
+                          attachments,
+                          noteCard,
+                          handoffCard,
+                          intent,
+                          action,
+                        },
+                        optimisticBlockId,
+                      )
+                    : s,
+                ),
+              );
             }
           } catch (error: unknown) {
             if (!stillOwned()) return;
-            const message = error instanceof Error ? error.message : `${current.harness} could not deliver the follow-up`;
+            const message =
+              error instanceof Error
+                ? error.message
+                : `${current.harness} could not deliver the follow-up`;
             // A rejected/uncertain steer is not proof the original turn stopped.
             // Keep its transcript evidence and require review before any replay.
-            setSessions((prev) => prev.map((s) => s.id === sessionId
-              ? retainQueuedFollowUp(s, {
-                  id: options?.queuedMessageId ?? crypto.randomUUID(), text, attachments,
-                  noteCard, handoffCard, intent, action, deliveryError: message,
-                })
-              : s));
+            setSessions((prev) =>
+              prev.map((s) =>
+                s.id === sessionId
+                  ? retainQueuedFollowUp(s, {
+                      id: options?.queuedMessageId ?? crypto.randomUUID(),
+                      text,
+                      attachments,
+                      noteCard,
+                      handoffCard,
+                      intent,
+                      action,
+                      deliveryError: message,
+                    })
+                  : s,
+              ),
+            );
           }
         })();
         pending.add(followUp);
@@ -4993,7 +5358,12 @@ export default function App({
 
       const gen = (turnGen.current.get(sessionId) ?? 0) + 1;
       turnGen.current.set(sessionId, gen);
-      const turnClock = beginTurnTiming(sessionId, current.harness, String(gen), submittedAt);
+      const turnClock = beginTurnTiming(
+        sessionId,
+        current.harness,
+        String(gen),
+        submittedAt,
+      );
       const isFirstTurn = current.blocks.length === 0;
       const placeholderTitle = canReplaceSessionTitle(
         current.title,
@@ -5269,7 +5639,11 @@ export default function App({
             }),
           ]);
           await checkpoint;
-          if (turnGen.current.get(sessionId) !== gen || removingSessionIds.current.has(sessionId)) return;
+          if (
+            turnGen.current.get(sessionId) !== gen ||
+            removingSessionIds.current.has(sessionId)
+          )
+            return;
           markTurn(sessionId, "checkpoint + prompt ready");
           const turnPrompt =
             intent === "plan" && !rawCommand ? planTurnPrompt(prompt) : prompt;
@@ -5278,9 +5652,20 @@ export default function App({
             : [];
           if (repair) {
             await validateRepair(repair.evidence, repair.context);
-            assertRepairOwner(repair, sessionsRef.current.find(s => s.id === sessionId));
-            if (turnGen.current.get(sessionId) !== gen || removingSessionIds.current.has(sessionId)) throw new Error("Repair was cancelled before delivery.");
-            updateRepair(repair.id, "running", "Request submitted to the selected agent. Completion does not mean CI passes or comments are resolved.");
+            assertRepairOwner(
+              repair,
+              sessionsRef.current.find((s) => s.id === sessionId),
+            );
+            if (
+              turnGen.current.get(sessionId) !== gen ||
+              removingSessionIds.current.has(sessionId)
+            )
+              throw new Error("Repair was cancelled before delivery.");
+            updateRepair(
+              repair.id,
+              "running",
+              "Request submitted to the selected agent. Completion does not mean CI passes or comments are resolved.",
+            );
           }
           markTurn(sessionId, "sendHarnessTurn begin");
           await sendHarnessTurn({
@@ -5320,7 +5705,15 @@ export default function App({
           }
           buildSucceeded = true;
         } catch (error: unknown) {
-          if (repair) updateRepair(repair.id, repairRecords().find(row => row.id === repair.id)?.state === "running" ? "uncertain" : "blocked", String(error));
+          if (repair)
+            updateRepair(
+              repair.id,
+              repairRecords().find((row) => row.id === repair.id)?.state ===
+                "running"
+                ? "uncertain"
+                : "blocked",
+              String(error),
+            );
           if (turnGen.current.get(sessionId) !== gen) return;
           if (wrap) revealHandoff(wrap.text);
           const message =
@@ -5343,12 +5736,24 @@ export default function App({
             for (const work of batch) pending.delete(work);
           }
           pendingSteersRef.current.delete(activityKey);
-          if (repair && turnGen.current.get(sessionId) !== gen) updateRepair(repair.id, "uncertain", "Turn interrupted. Inspect the conversation before allowing another request.");
+          if (repair && turnGen.current.get(sessionId) !== gen)
+            updateRepair(
+              repair.id,
+              "uncertain",
+              "Turn interrupted. Inspect the conversation before allowing another request.",
+            );
           if (turnGen.current.get(sessionId) !== gen) {
             endTurnTiming(sessionId, "turn replaced", turnClock);
             return;
           }
-          if (repair && buildSucceeded) updateRepair(repair.id, providerFailureSeen ? "uncertain" : "completed", providerFailureSeen ? "Provider reported a failure; inspect the conversation before retry." : "Agent turn completed. Verify the changes and provider results separately.");
+          if (repair && buildSucceeded)
+            updateRepair(
+              repair.id,
+              providerFailureSeen ? "uncertain" : "completed",
+              providerFailureSeen
+                ? "Provider reported a failure; inspect the conversation before retry."
+                : "Agent turn completed. Verify the changes and provider results separately.",
+            );
           flushHarnessEvents();
           // The busy→idle edge only needs the applied event batch. Checkpoint
           // durability is a pre-edit requirement, not a pre-idle one — later
@@ -5375,7 +5780,11 @@ export default function App({
             }),
           );
           scheduleHarnessFlush(() => {
-            endTurnTiming(sessionId, providerFailureSeen ? "turn failed" : "turn done", turnClock);
+            endTurnTiming(
+              sessionId,
+              providerFailureSeen ? "turn failed" : "turn done",
+              turnClock,
+            );
           });
           // A failed provider can leave its process alive with a dead event
           // stream or poisoned turn state. Park it now; the next prompt will
@@ -5386,7 +5795,10 @@ export default function App({
             );
           }
           await flushSessionCheckpoint(sessionId);
-          if (turnGen.current.get(sessionId) !== gen || removingSessionIds.current.has(sessionId)) {
+          if (
+            turnGen.current.get(sessionId) !== gen ||
+            removingSessionIds.current.has(sessionId)
+          ) {
             endTurnTiming(sessionId, "turn replaced", turnClock);
             return;
           }
@@ -5417,7 +5829,11 @@ export default function App({
   );
 
   useEffect(() => {
-    const open = (event: Event) => { const id = (event as CustomEvent<string>).detail; setInboxViewOpen(false); void onSelectHistorySession(id); };
+    const open = (event: Event) => {
+      const id = (event as CustomEvent<string>).detail;
+      setInboxViewOpen(false);
+      void onSelectHistorySession(id);
+    };
     window.addEventListener(OPEN_REPAIR, open);
     return () => window.removeEventListener(OPEN_REPAIR, open);
   }, [onSelectHistorySession]);
@@ -5436,11 +5852,10 @@ export default function App({
                 entry.id === tab.id
                   ? {
                       ...entry,
-                      terminalPanes: (entry.terminalPanes ?? []).map(
-                        (item) =>
-                          item.id === pane.id
-                            ? { ...item, activeFileId: process.id }
-                            : item,
+                      terminalPanes: (entry.terminalPanes ?? []).map((item) =>
+                        item.id === pane.id
+                          ? { ...item, activeFileId: process.id }
+                          : item,
                       ),
                     }
                   : entry,
@@ -5484,32 +5899,51 @@ export default function App({
   // The just-created highlight lifts once another task's session becomes
   // the rail's current task, or the task is archived/deleted. Focusing an
   // unrelated non-task session keeps it — it still marks your current task.
-  const taskStoreSnapshot = useSyncExternalStore(
-    subscribeTaskWorkspaces,
-    taskWorkspacesSnapshot,
-  );
+  // The store listener lives inside the effect — a root-level
+  // useSyncExternalStore would re-render the whole App on every task write.
   useEffect(() => {
     if (!focusTaskId) return;
-    const task = loadTaskWorkspaces().find(
-      (entry) => entry.id === focusTaskId && !entry.archived,
-    );
-    const activeTask = active?.id
-      ? taskForSession(active.id, sessionWorkCwd(active))
-      : undefined;
-    const navigated = active?.id !== focusTaskSessionRef.current;
-    if (!task || (navigated && activeTask && activeTask.task.id !== focusTaskId)) {
+    const clearIfGone = () => {
+      const task = loadTaskWorkspaces().find(
+        (entry) => entry.id === focusTaskId && !entry.archived,
+      );
+      if (task) return;
+      focusTaskSessionRef.current = undefined;
+      setFocusTaskId(undefined);
+    };
+    clearIfGone();
+    return subscribeTaskWorkspaces(clearIfGone);
+  }, [focusTaskId]);
+  useEffect(() => {
+    if (!focusTaskId || !active?.id) return;
+    const activeTask = taskForSession(active.id, sessionWorkCwd(active));
+    const navigated = active.id !== focusTaskSessionRef.current;
+    if (navigated && activeTask && activeTask.task.id !== focusTaskId) {
       focusTaskSessionRef.current = undefined;
       setFocusTaskId(undefined);
     }
-  }, [focusTaskId, active?.id, taskStoreSnapshot]);
+    // active?.id is the signal — the session object itself changes identity
+    // on every transcript write.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusTaskId, active?.id]);
   const [taskSheet, setTaskSheet] = useState<{
-    projectId: string;
+    /** Initial selection only — the sheet owns project picking. */
+    projectId?: string;
     editingTaskId?: string;
+    setupChildId?: string;
     initialTickets?: LinkedWorkItem[];
     initialName?: string;
     initialBrief?: string;
     initialChildren?: TaskChildDraft[];
+    /** Remount key — a retarget never inherits the previous form's state. */
+    nonce: number;
   } | null>(null);
+  const taskSheetNonce = useRef(0);
+  const openTaskSheet = useCallback(
+    (sheet: Omit<NonNullable<typeof taskSheet>, "nonce">) =>
+      setTaskSheet({ ...sheet, nonce: ++taskSheetNonce.current }),
+    [],
+  );
   const onNewTask = useCallback(
     (path: string, projectId?: string) => {
       const stored = projectId
@@ -5519,31 +5953,46 @@ export default function App({
       const project =
         stored ??
         ensureProjectForPath(path, getVerifiedFamilies().get(pathKey(path)));
-      setTaskSheet({ projectId: project.id });
+      openTaskSheet({ projectId: project.id });
     },
-    [],
+    [openTaskSheet],
   );
 
-  const onEditTask = useCallback((taskId: string) => {
-    const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-    if (task) setTaskSheet({ projectId: task.projectId, editingTaskId: taskId });
-  }, []);
+  const onEditTask = useCallback(
+    (taskId: string, childId?: string) => {
+      const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+      // Archived tasks are read-only — reviseTask refuses too; this keeps the
+      // sheet from ever opening on one.
+      if (task && !task.archived)
+        openTaskSheet({
+          projectId: task.projectId,
+          editingTaskId: taskId,
+          // A child id means "set that child up" — the sheet opens with its
+          // working-copy draft already expanded.
+          ...(childId ? { setupChildId: childId } : {}),
+        });
+    },
+    [openTaskSheet],
+  );
 
   const [taskPrSheetTaskId, setTaskPrSheetTaskId] = useState<string | null>(
     null,
   );
-  const onCreateTaskPrs = useCallback(
-    (taskId: string) => setTaskPrSheetTaskId(taskId),
-    [],
-  );
+  const onCreateTaskPrs = useCallback((taskId: string) => {
+    // Archived tasks are read-only — same guard as the OPEN_TASK_PRS event.
+    const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+    if (task && !task.archived) setTaskPrSheetTaskId(taskId);
+  }, []);
   useEffect(() => {
     const listener = (event: Event) => {
       const taskId = (event as CustomEvent<string>).detail;
-      if (typeof taskId === "string" && taskId) setTaskPrSheetTaskId(taskId);
+      if (typeof taskId !== "string" || !taskId) return;
+      // Archived tasks are read-only — no new delivery work starts on them.
+      const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+      if (task && !task.archived) setTaskPrSheetTaskId(taskId);
     };
-    window.addEventListener("monocode:open-task-prs", listener);
-    return () =>
-      window.removeEventListener("monocode:open-task-prs", listener);
+    window.addEventListener(OPEN_TASK_PRS, listener);
+    return () => window.removeEventListener(OPEN_TASK_PRS, listener);
   }, []);
 
   const [taskDetailsId, setTaskDetailsId] = useState<string | null>(null);
@@ -5577,6 +6026,19 @@ export default function App({
   const taskLaunchInflight = useRef(
     new Map<string, Promise<string | undefined>>(),
   );
+  /** Session creation serializes per task — child-scoped launches aren't
+   * covered by `taskLaunchInflight`, so two overlapping runs that both find
+   * no session would otherwise each create one and clobber the other's id. */
+  const taskSessionEnsure = useRef(
+    new Map<string, Promise<string | undefined>>(),
+  );
+  /** Brief sends in flight, keyed `taskIdsessionId` — `briefSentFor` is only
+   * persisted after the send resolves, so a second overlapping run (a
+   * child-scoped launch next to a full one) would send it twice. */
+  const taskBriefInflight = useRef(new Map<string, Promise<void>>());
+  /** Launch runs that already delivered the brief or a state-change notice —
+   * an edit's own "task was updated" notice must not repeat them. */
+  const taskLaunchDelivered = useRef(new WeakSet<Promise<unknown>>());
   /**
    * Prepares each unresolved child's working copy — creating the reviewed
    * worktree or re-verifying an existing one — then ensures the task's
@@ -5593,225 +6055,362 @@ export default function App({
         const inflight = taskLaunchInflight.current.get(taskId);
         if (inflight) return inflight;
       }
-      const run = (async (): Promise<string | undefined> => {
-      const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-      if (!task) return undefined;
-      const project = projectForTask(task);
-      for (const child of task.children) {
-        if (childIds && !childIds.includes(child.id)) continue;
-        const current = loadTaskWorkspaces()
-          .find((entry) => entry.id === taskId)
-          ?.children.find((entry) => entry.id === child.id);
-        if (!current) continue;
-        if (current.launch.state === "ready") continue;
-        if (!markTaskChildLaunching(taskId, child.id)) continue;
-        if (
-          !updateTaskChild(taskId, child.id, {
-            launch: { state: "working" },
-          })
-        ) {
-          unmarkTaskChildLaunching(taskId, child.id);
-          continue;
-        }
-        try {
-          const repo = project?.repositories.find(
-            (entry) => entry.id === child.repositoryId,
+      const step = async (): Promise<string | undefined> => {
+        const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+        // An archived task is done — launching it would create a session the
+        // task indexes deliberately ignore.
+        if (!task || task.archived) return undefined;
+        const project = projectForTask(task);
+        // Launch states at run start — a reused session gets an update notice
+        // when this run changes any of them (prepared, downgraded, reset).
+        const startStates = new Map(
+          task.children.map((child) => [child.id, child.launch.state]),
+        );
+        // Ready children claim a live checkout — re-probe once per repository
+        // so a worktree deleted behind the task's back doesn't stay green.
+        const probedAnchors = new Map<
+          string,
+          Promise<RepositoryFamily | null>
+        >();
+        const familyFor = (anchor: string) => {
+          let probe = probedAnchors.get(anchor);
+          if (!probe) {
+            probe = probeRepositoryFamily(anchor).catch(() => null);
+            probedAnchors.set(anchor, probe);
+          }
+          return probe;
+        };
+        for (const child of task.children) {
+          if (childIds && !childIds.includes(child.id)) continue;
+          const record = loadTaskWorkspaces().find(
+            (entry) => entry.id === taskId,
           );
-          // A legacy child may own a session already — retry just resubmits
-          // its brief; worktrees and sessions are never replayed. A deleted
-          // session is pruned off the child so the copy relaunches cleanly.
-          if (
-            current.sessionIds.length &&
-            (await taskSessionAlive(current.sessionIds[0]))
-          ) {
-            const sent = await onSubmit(
-              current.sessionIds[0],
-              composeTaskPrompt(task, child, repo),
+          // Removed or archived mid-run — stop preparing rather than writing
+          // launch state and a session onto a task that is now read-only.
+          if (!record || record.archived) return undefined;
+          const current = record.children.find(
+            (entry) => entry.id === child.id,
+          );
+          if (!current) continue;
+          if (current.launch.state === "ready") {
+            const target = current.workingCopy;
+            if (!target) continue;
+            const repo = project?.repositories.find(
+              (entry) => entry.id === current.repositoryId,
             );
-            // `onSubmit` returns undefined when the session can't take it
-            // (deleted mid-flight counts) — only `true` means delivered.
-            if (sent !== true)
-              throw new Error("The session did not accept the brief.");
+            // A child whose repository left the project still gets its copy
+            // re-checked — probe from the recorded path itself so a vanished
+            // checkout downgrades honestly instead of staying green.
+            const family = await familyFor(repo?.anchor ?? target);
+            const exists = family && familyHasLiveCopy(family, target);
+            if (family && !exists) {
+              if (taskOwnsCheckout(current))
+                // The task recreates its own worktree on retry.
+                updateTaskChild(taskId, child.id, {
+                  launch: {
+                    state: "failed",
+                    error:
+                      "Working copy is no longer on disk — retry prepares it again.",
+                  },
+                });
+              else {
+                // A shared copy that vanished can't be recreated — clear the
+                // dead path so the child lands back on "set up". Session ids
+                // rooted at it and its saved PR row die with the binding.
+                updateTaskChild(taskId, child.id, {
+                  workingCopy: undefined,
+                  sessionIds: [],
+                  launch: { state: "pending" },
+                });
+                deleteTaskPrDraft(taskId, child.id);
+              }
+            }
+            continue;
+          }
+          if (!markTaskChildLaunching(taskId, child.id)) continue;
+          if (
+            !updateTaskChild(taskId, child.id, {
+              launch: { state: "working" },
+            })
+          ) {
+            unmarkTaskChildLaunching(taskId, child.id);
+            continue;
+          }
+          try {
+            const repo = project?.repositories.find(
+              (entry) => entry.id === child.repositoryId,
+            );
+            // A legacy child may own a session already — retry just resubmits
+            // its brief; worktrees and sessions are never replayed. A deleted
+            // session is pruned off the child so the copy relaunches cleanly.
+            // The session is only a shortcut while the copy it was rooted at
+            // still exists — a vanished or rebound path falls through to real
+            // preparation instead of marking a dead checkout "ready".
+            const sessionCopyExists = !current.workingCopy
+              ? false
+              : await (async () => {
+                  const anchor = repo?.anchor ?? current.workingCopy!;
+                  const family = await familyFor(anchor);
+                  if (!family) return true; // unverifiable — resubmit stays safe
+                  return familyHasLiveCopy(family, current.workingCopy!);
+                })();
+            if (
+              current.sessionIds.length &&
+              sessionCopyExists &&
+              (await taskSessionAlive(current.sessionIds[0]))
+            ) {
+              // The pre-launch snapshot still carries the previous failure —
+              // resend a brief built from the in-flight record so it doesn't
+              // announce "Preparation failed" while succeeding.
+              const latest =
+                loadTaskWorkspaces()
+                  .find((entry) => entry.id === taskId)
+                  ?.children.find((entry) => entry.id === child.id) ?? current;
+              const sent = await onSubmit(
+                current.sessionIds[0],
+                composeTaskPrompt(task, latest, repo),
+              );
+              // `onSubmit` returns undefined when the session can't take it
+              // (deleted mid-flight counts) — only `true` means delivered.
+              if (sent !== true)
+                throw new Error("The session did not accept the brief.");
+              updateTaskChild(taskId, child.id, {
+                launch: { state: "ready" },
+              });
+              continue;
+            }
+            if (
+              (current.baseRef && current.baseCommit && current.branch) ||
+              (current.existingBranch &&
+                current.baseCommit &&
+                current.workingCopy)
+            ) {
+              // Creating in the project anchor would target the wrong
+              // repository — the member record is required.
+              if (!repo)
+                throw new Error(
+                  "This repository is no longer in the project; re-add it, then retry.",
+                );
+              const anchor = repo.anchor;
+              try {
+                if (current.existingBranch) {
+                  // Attaches the reviewed local branch — Git refuses when it
+                  // is already checked out in another worktree of the family.
+                  await invoke<string>("git_worktree_checkout", {
+                    cwd: anchor,
+                    branch: current.existingBranch,
+                    commit: current.baseCommit,
+                    // Host-qualified path — the backend resolves WSL internally.
+                    path: current.workingCopy,
+                  });
+                } else {
+                  await invoke<string>("git_worktree_create", {
+                    cwd: anchor,
+                    base: current.baseRef,
+                    commit: current.baseCommit,
+                    branch: current.branch,
+                    // Host-qualified path — the backend resolves WSL internally.
+                    path: current.workingCopy,
+                  });
+                }
+              } catch (error) {
+                // A partial earlier attempt may already have created the copy —
+                // re-probe and reuse it rather than failing on "already exists".
+                // Only a worktree on the reviewed branch at the reviewed commit
+                // counts; a foreign copy at the same path is not ours.
+                const expected =
+                  current.existingBranch ??
+                  (current.branch ? `refs/heads/${current.branch}` : undefined);
+                const family = await probeRepositoryFamily(anchor);
+                const exists = family?.worktrees.some(
+                  (entry) =>
+                    current.workingCopy &&
+                    pathKey(entry.path) === pathKey(current.workingCopy) &&
+                    !entry.missing &&
+                    entry.branch === expected &&
+                    entry.head === current.baseCommit,
+                );
+                if (!exists) throw error;
+              }
+              notifyGitChanged(anchor);
+              // The anchor's notification does not reach subscribers keyed by
+              // the new worktree path — refresh it so task-child views stop
+              // showing the pre-creation empty state.
+              if (current.workingCopy) notifyGitChanged(current.workingCopy);
+            } else if (current.workingCopy) {
+              // Existing/main copy: re-verify it still exists before starting a
+              // session at a path that may have been moved or deleted. Shares
+              // the launch's per-anchor probe cache — siblings in the same
+              // repository don't re-list worktrees.
+              const target = current.workingCopy;
+              const family = await familyFor(repo?.anchor ?? target);
+              // A probe failure isn't a missing copy — say the check itself
+              // failed so a retry isn't mistaken for deletion.
+              if (!family)
+                throw new Error("Couldn't verify the working copy — retry.");
+              if (!familyHasLiveCopy(family, target))
+                throw new Error(
+                  "Working copy is no longer on disk — choose a replacement or remove this repository from the task.",
+                );
+            } else {
+              // Prepare-later child — stays actionable with no copy.
+              updateTaskChild(taskId, child.id, {
+                launch: { state: "pending" },
+              });
+              continue;
+            }
             updateTaskChild(taskId, child.id, {
               launch: { state: "ready" },
             });
-            continue;
-          }
-          if (current.baseRef && current.baseCommit && current.branch) {
-            // Creating in the project anchor would target the wrong
-            // repository — the member record is required.
-            if (!repo)
-              throw new Error(
-                "This repository is no longer in the project; re-add it, then retry.",
-              );
-            const anchor = repo.anchor;
-            try {
-              await invoke<string>("git_worktree_create", {
-                cwd: anchor,
-                base: current.baseRef,
-                commit: current.baseCommit,
-                branch: current.branch,
-                // Host-qualified path — the backend resolves WSL internally.
-                path: current.workingCopy,
-              });
-            } catch (error) {
-              // A partial earlier attempt may already have created the copy —
-              // re-probe and reuse it rather than failing on "already exists".
-              const family = await probeRepositoryFamily(anchor);
-              const exists = family?.worktrees.some(
-                (entry) =>
-                  current.workingCopy &&
-                  pathKey(entry.path) === pathKey(current.workingCopy) &&
-                  !entry.missing,
-              );
-              if (!exists) throw error;
-            }
-            notifyGitChanged(anchor);
-            // The anchor's notification does not reach subscribers keyed by
-            // the new worktree path — refresh it so task-child views stop
-            // showing the pre-creation empty state.
-            if (current.workingCopy) notifyGitChanged(current.workingCopy);
-          } else if (current.workingCopy) {
-            // Existing/main copy: re-verify it still exists before starting a
-            // session at a path that may have been moved or deleted.
-            const target = current.workingCopy;
-            const family = await probeRepositoryFamily(
-              repo?.anchor ?? target,
-            );
-            const exists =
-              family &&
-              (pathKey(family.checkout) === pathKey(target) ||
-                family.worktrees.some(
-                  (entry) =>
-                    pathKey(entry.path) === pathKey(target) &&
-                    !entry.missing &&
-                    !entry.prunable,
-                ));
-            if (!exists)
-              throw new Error(
-                "Working copy is no longer on disk — choose a replacement or remove this repository from the task.",
-              );
-          } else {
-            // Prepare-later child — stays actionable with no copy.
+          } catch (error) {
             updateTaskChild(taskId, child.id, {
-              launch: { state: "pending" },
+              launch: { state: "failed", error: String(error) },
             });
-            continue;
+          } finally {
+            unmarkTaskChildLaunching(taskId, child.id);
           }
-          updateTaskChild(taskId, child.id, {
-            launch: { state: "ready" },
-          });
-        } catch (error) {
-          updateTaskChild(taskId, child.id, {
-            launch: { state: "failed", error: String(error) },
-          });
-        } finally {
-          unmarkTaskChildLaunching(taskId, child.id);
         }
-      }
-      // One session per task — rooted at the host child's working copy.
-      let fresh = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-      if (!fresh) return undefined;
-      const recordedTaskSession = (entry: TaskWorkspace) =>
-        entry.sessionIds?.[0] ??
-        entry.children.find((child) => child.sessionIds.length)
-          ?.sessionIds[0];
-      const recorded = recordedTaskSession(fresh);
-      // A deleted conversation is pruned and replaced, not reused.
-      let taskSessionId =
-        recorded && (await taskSessionAlive(recorded)) ? recorded : undefined;
-      // A child retry can overlap a full launch — the probe above awaits,
-      // so a concurrent run may have committed the session while this one
-      // saw the recorded id dead. Re-read before creating a duplicate.
-      if (!taskSessionId) {
-        const again = loadTaskWorkspaces().find(
-          (entry) => entry.id === taskId,
-        );
-        // The task itself may have been removed while the probe awaited.
-        if (!again) return undefined;
-        fresh = again;
-        const concurrent = recordedTaskSession(again);
-        if (
-          concurrent &&
-          concurrent !== recorded &&
-          (await taskSessionAlive(concurrent))
-        )
-          taskSessionId = concurrent;
-      }
-      if (taskSessionId) {
-        // Redeliver the shared brief when it never landed on this session —
-        // e.g. the first submit failed, or this session replaced a deleted
-        // one. Retries (`childIds`) only resubmit their own child briefs.
-        if (!childIds && fresh.briefSentFor !== taskSessionId) {
-          const sent = await onSubmit(
-            taskSessionId,
-            composeTaskSessionPrompt(fresh, project),
-          );
-          if (sent === true)
-            updateTask(taskId, (current) => ({
-              ...current,
-              briefSentFor: taskSessionId,
+        /** Creates the task's session when none is live — serialized through
+         * `taskSessionEnsure` so overlapping child-scoped runs can't each
+         * create one and clobber the winner's id. The brief is not sent here;
+         * the caller's brief-or-notice step covers new and reused sessions. */
+        const ensureTaskSessionLive = (): Promise<string | undefined> => {
+          const step = async (): Promise<string | undefined> => {
+            const current = loadTaskWorkspaces().find(
+              (entry) => entry.id === taskId,
+            );
+            if (!current || current.archived) return undefined;
+            const existing = firstTaskSessionId(current);
+            // A deleted conversation is pruned and replaced, not reused.
+            if (existing && (await taskSessionAlive(existing))) return existing;
+            // The session only exists once a child is verifiably ready —
+            // never rooted at a failed or not-yet-created working copy. The
+            // primary attempt's ready children win over a later attempt's.
+            const host =
+              current.children.find(
+                (entry) =>
+                  entry.id === current.lastActiveChildId &&
+                  entry.launch.state === "ready" &&
+                  entry.workingCopy,
+              ) ??
+              preferredTaskChild(
+                current,
+                (entry) =>
+                  entry.launch.state === "ready" && Boolean(entry.workingCopy),
+              );
+            if (!host?.workingCopy) return undefined;
+            const session = {
+              ...newDefaultSession(host.workingCopy),
+              title: current.name,
+              ...(current.ticket ? { linkedWorkItem: current.ticket } : {}),
+            };
+            const next = [...sessionsRef.current, session];
+            sessionsRef.current = next;
+            setSessions(next);
+            const tab = newTab(session.id);
+            appendTab(tab, host.workingCopy);
+            setRecents(rememberProject(host.workingCopy));
+            updateTask(taskId, (entry) => ({
+              ...entry,
+              // The launch conversation stays primary; sessions linked by
+              // location (created inside a task-owned worktree) keep their
+              // place in the list.
+              sessionIds: [
+                ...new Set([session.id, ...(entry.sessionIds ?? [])]),
+              ],
+              lastActiveChildId: host.id,
             }));
+            setActiveTabId(tab.id);
+            // Match every other session reveal: the spawn may land while an
+            // overlay or the project terminal holds focus.
+            dismissOverlays();
+            setProjectTerminalFocused(false);
+            setComposerFocused(true);
+            return session.id;
+          };
+          const pending = taskSessionEnsure.current.get(taskId);
+          const ensure = (pending ?? Promise.resolve(undefined)).then(
+            step,
+            step,
+          );
+          taskSessionEnsure.current.set(taskId, ensure);
+          const cleanup = () => {
+            if (taskSessionEnsure.current.get(taskId) === ensure)
+              taskSessionEnsure.current.delete(taskId);
+          };
+          void ensure.then(cleanup, cleanup);
+          return ensure;
+        };
+        // One session per task — rooted at a ready child's working copy.
+        let fresh = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+        // Removed or archived while the child probes awaited — nothing more
+        // may launch on it.
+        if (!fresh || fresh.archived) return undefined;
+        const recorded = firstTaskSessionId(fresh);
+        let taskSessionId =
+          recorded && (await taskSessionAlive(recorded)) ? recorded : undefined;
+        if (!taskSessionId) {
+          taskSessionId = await ensureTaskSessionLive();
+          fresh = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+        }
+        if (!fresh || !taskSessionId) return undefined;
+        // The shared brief goes to any session missing it — briefSentFor can
+        // point at a replaced conversation or stay unset after a failed
+        // first send, and a child-scoped run may be this session's only
+        // chance to learn what the task is. A session that already has the
+        // brief gets a compact notice of what this run changed.
+        const briefKey = `${taskId}${taskSessionId}`;
+        let brief = taskBriefInflight.current.get(briefKey);
+        if (!brief && fresh.briefSentFor !== taskSessionId) {
+          brief = (async () => {
+            const sent = await onSubmit(
+              taskSessionId,
+              composeTaskSessionPrompt(fresh, project),
+            );
+            // A failed send leaves briefSentFor unset so a later run resends.
+            if (sent === true)
+              updateTask(taskId, (current) => ({
+                ...current,
+                briefSentFor: taskSessionId,
+              }));
+          })();
+          taskBriefInflight.current.set(briefKey, brief);
+          const clear = () => {
+            if (taskBriefInflight.current.get(briefKey) === brief)
+              taskBriefInflight.current.delete(briefKey);
+          };
+          void brief.then(clear, clear);
+          // `run` is already initialized — this line executes after awaits.
+          taskLaunchDelivered.current.add(run);
+        }
+        if (brief) {
+          // This run or an overlapping one delivers the brief — it carries
+          // the latest task state, so no separate update notice follows it.
+          await brief;
+        } else if (
+          fresh.children.some(
+            (entry) => startStates.get(entry.id) !== entry.launch.state,
+          )
+        ) {
+          // The session already has the brief — tell it what this run
+          // changed (a prepared child, a copy that vanished). Covers every
+          // caller: retry, open-child launch, and a repeated Start task.
+          taskLaunchDelivered.current.add(run);
+          void onSubmit(taskSessionId, composeTaskUpdateNotice(fresh, project));
         }
         if (!childIds) void onSelectHistorySession(taskSessionId);
         return taskSessionId;
-      }
-      // The session only exists once a child is verifiably ready — never
-      // rooted at a failed or not-yet-created working copy. The primary
-      // attempt's ready children win over a later attempt's.
-      const host =
-        fresh.children.find(
-          (entry) =>
-            entry.id === fresh.lastActiveChildId &&
-            entry.launch.state === "ready" &&
-            entry.workingCopy,
-        ) ??
-        preferredTaskChild(
-          fresh,
-          (entry) => entry.launch.state === "ready" && Boolean(entry.workingCopy),
-        );
-      if (!host?.workingCopy) return undefined;
-      const session = {
-        ...newDefaultSession(host.workingCopy),
-        title: fresh.name,
-        ...(fresh.ticket ? { linkedWorkItem: fresh.ticket } : {}),
       };
-      const next = [...sessionsRef.current, session];
-      sessionsRef.current = next;
-      setSessions(next);
-      const tab = newTab(session.id);
-      appendTab(tab, host.workingCopy);
-      setRecents(rememberProject(host.workingCopy));
-      updateTask(taskId, (current) => ({
-        ...current,
-        sessionIds: [session.id],
-        lastActiveChildId: host.id,
-      }));
-      setActiveTabId(tab.id);
-      // Match every other session reveal: the spawn may land while an
-      // overlay or the project terminal holds focus.
-      dismissOverlays();
-      setProjectTerminalFocused(false);
-      setComposerFocused(true);
-      // The brief lands as the session's first message; a failed send is
-      // recorded by leaving briefSentFor unset so a later open resends it.
-      const sent = await onSubmit(
-        session.id,
-        composeTaskSessionPrompt(fresh, project),
-      );
-      if (sent === true)
-        updateTask(taskId, (current) => ({
-          ...current,
-          briefSentFor: session.id,
-        }));
-      return session.id;
-      })();
+      const run = step();
       if (!childIds) {
         taskLaunchInflight.current.set(taskId, run);
-        void run.finally(() => {
+        // then(cleanup, cleanup) — a bare `run.finally` would float a
+        // rejected promise nobody handles.
+        const cleanup = () => {
           if (taskLaunchInflight.current.get(taskId) === run)
             taskLaunchInflight.current.delete(taskId);
-        });
+        };
+        void run.then(cleanup, cleanup);
       }
       return run;
     },
@@ -5827,14 +6426,12 @@ export default function App({
   /** Sessions whose pending approval or question needs the user now. */
   const needsInputSessionIds = useMemo(
     () =>
-      new Set(
-        sessions.filter(sessionNeedsInput).map((session) => session.id),
-      ),
+      new Set(sessions.filter(sessionNeedsInput).map((session) => session.id)),
     [sessions],
   );
 
-  /** Opens one task child: its ordinary session, focused like any session
-   * pick. Children without a session fall back to their working copy. */
+  /** Retries one task child's launch. A reused session is told what changed
+   * by the launch run itself — no per-caller notice needed here. */
   const onRetryTaskChild = useCallback(
     (taskId: string, childId: string) => {
       void launchTaskChildren(taskId, [childId]);
@@ -5849,45 +6446,57 @@ export default function App({
       if (!task || !child) return;
       armTaskFocus(taskId);
       // The task's single session wins; a legacy child may own its own.
-      const sessionId = task.sessionIds?.[0] ?? child.sessionIds[0];
-      // Only re-attribute the active child when it actually owns the
-      // session we're opening — the shared task session stays rooted at
-      // its host's copy regardless of which child was clicked.
-      if (!task.sessionIds?.length && child.sessionIds.length)
-        recordTaskActiveChild(taskId, childId);
-      if (sessionId && (await taskSessionAlive(sessionId))) {
+      // A dead id falls through to the next candidate before giving up.
+      const candidates = [task.sessionIds?.[0], child.sessionIds[0]].filter(
+        (id): id is string => Boolean(id),
+      );
+      for (const sessionId of candidates) {
+        if (!(await taskSessionAlive(sessionId))) continue;
+        // Only re-attribute the active child when it actually owns the
+        // session we're opening — the shared task session stays rooted at
+        // its host's copy regardless of which child was clicked.
+        if (
+          !task.sessionIds?.includes(sessionId) &&
+          child.sessionIds.includes(sessionId)
+        )
+          recordTaskActiveChild(taskId, childId);
         await onSelectHistorySession(sessionId);
+        // A "ready" child may point at a copy deleted since launch — the
+        // child launch path re-probes it and downgrades honestly.
+        void launchTaskChildren(taskId, [childId]);
         return;
       }
-      // No usable session — prepare this child's copy; that also creates
-      // the task session when it becomes the host.
-      void launchTaskChildren(taskId, [childId]);
+      // No live session — dead or never recorded. Recreating one is a start,
+      // not an open: land on details where Start/Retry live.
+      setTaskDetailsId(taskId);
     },
-    [armTaskFocus, launchTaskChildren, onSelectHistorySession, taskSessionAlive],
+    [
+      armTaskFocus,
+      launchTaskChildren,
+      onSelectHistorySession,
+      taskSessionAlive,
+    ],
   );
 
-  /** Opens a task's last active child, or its first session-owning child. */
+  /** The task's live session when one exists — otherwise its details sheet.
+   * Opening a row never launches work: "Start task" is the explicit verb. */
   const onOpenTask = useCallback(
     (taskId: string) => {
       const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
       if (!task) return;
       armTaskFocus(taskId);
-      // The task's own session wins over per-child lookups — but a dead id
-      // (deleted conversation) must not dead-end the task: prune it and
-      // fall through to relaunch.
       if (task.sessionIds?.length) {
         void (async () => {
           if (await taskSessionAlive(task.sessionIds![0])) {
             void onSelectHistorySession(task.sessionIds![0]);
             return;
           }
-          void launchTaskChildren(taskId);
+          setTaskDetailsId(taskId);
         })();
         return;
       }
-      // No sessions yet — opening the task is what starts the work.
       if (!task.children.some((entry) => entry.sessionIds.length)) {
-        void launchTaskChildren(taskId);
+        setTaskDetailsId(taskId);
         return;
       }
       const child =
@@ -5900,7 +6509,43 @@ export default function App({
         task.children[0];
       if (child) void onOpenTaskChild(taskId, child.id);
     },
-    [armTaskFocus, launchTaskChildren, onOpenTaskChild, onSelectHistorySession, taskSessionAlive],
+    [armTaskFocus, onOpenTaskChild, onSelectHistorySession, taskSessionAlive],
+  );
+
+  /** Explicit launch — prepares every actionable child and starts the
+   * task's session. Kept separate from open so a row click never surprises. */
+  const onStartTask = useCallback(
+    (taskId: string) => {
+      armTaskFocus(taskId);
+      void launchTaskChildren(taskId);
+    },
+    [armTaskFocus, launchTaskChildren],
+  );
+
+  /** Another conversation for a task, rooted in a child's working copy.
+   * Linked explicitly (not via the location claim) so shared checkouts link
+   * too; title + ticket match what the claim/`ensureOpenSession` would set. */
+  const onNewTaskConversation = useCallback(
+    (taskId: string, childId: string) => {
+      const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+      const child = task?.children.find((entry) => entry.id === childId);
+      if (!task || task.archived || !child?.workingCopy) return;
+      const session = newDefaultSession(child.workingCopy);
+      session.title = task.name;
+      session.linkedWorkItem = task.ticket;
+      linkTaskSession(task.id, session.id);
+      const tab = newTab(session.id);
+      setSessions((prev) => [...prev, session]);
+      appendTab(tab, child.workingCopy);
+      setActiveTabId(tab.id);
+      setComposerFocused(true);
+      armTaskFocus(taskId);
+      // The sheet and whatever full surface it was opened over (inbox,
+      // search, …) would otherwise stay on top of the new conversation.
+      setTaskDetailsId(null);
+      dismissOverlays();
+    },
+    [appendTab, armTaskFocus, dismissOverlays],
   );
 
   /** Resolves the owning project for a send-to-task path without inventing
@@ -5911,8 +6556,7 @@ export default function App({
     if (!path || !looksLikeProject(path)) return undefined;
     const keyed = pathKey(path);
     let family = getVerifiedFamilies().get(keyed);
-    if (!family)
-      family = (await probeRepositoryFamily(path)) ?? undefined;
+    if (!family) family = (await probeRepositoryFamily(path)) ?? undefined;
     const existing = family
       ? findProjectByCommonDir(family.commonDir)?.project
       : loadProjects().find(
@@ -5931,37 +6575,35 @@ export default function App({
   const routeContextToTask = useCallback(
     async (request: AgentContextRequest) => {
       const done = () => request.onPrepared?.();
+      /** The project repository whose family inventory contains `path` —
+       * the anchor itself or any member worktree. */
+      const repoOwningPath = (
+        project: ProjectRecord | undefined,
+        path: string,
+      ) => {
+        const key = pathKey(path);
+        return project?.repositories.find((repo) => {
+          if (pathKey(repo.anchor) === key) return true;
+          const family = familyForRepository(repo, getVerifiedFamilies());
+          return family ? familyHasCopy(family, path) : false;
+        });
+      };
       if (request.newTask || !request.taskId) {
         const path =
           request.cwd || active?.cwd || sessionDefaults?.cwd || projectCwd;
+        // Unresolved context still opens the sheet — its project picker owns
+        // the choice the inbox used to ask for up front.
         const project = await ensureTaskProject(path);
-        if (!project) {
-          // Nothing to hang the task on — fall back to the context picker.
-          setContextRequest((current) => current ?? request);
-          return;
-        }
         // The changes live in request.cwd — that working copy becomes the
         // task's child so the work stays where the files already changed.
-        const families = getVerifiedFamilies();
-        const cwdKey = request.cwd ? pathKey(request.cwd) : "";
-        const changedRepo = cwdKey
-          ? project.repositories.find((repo) => {
-              if (pathKey(repo.anchor) === cwdKey) return true;
-              const family = familyForRepository(repo, families);
-              return (
-                family &&
-                (pathKey(family.checkout) === cwdKey ||
-                  family.worktrees.some(
-                    (entry) => pathKey(entry.path) === cwdKey,
-                  ))
-              );
-            })
+        const changedRepo = request.cwd
+          ? repoOwningPath(project, request.cwd)
           : undefined;
         const files = request.context.entries
           .map((entry) => `- ${entry.title}`)
           .join("\n");
-        setTaskSheet({
-          projectId: project.id,
+        openTaskSheet({
+          ...(project ? { projectId: project.id } : {}),
           ...(files
             ? {
                 initialBrief: `Selected changes${request.cwd ? ` in ${prettyCwd(request.cwd)}` : ""}:\n${files}`,
@@ -5995,24 +6637,11 @@ export default function App({
       // selected change actually lives.
       const taskProject = projectForTask(task);
       const changedRepo = request.cwd
-        ? taskProject?.repositories.find((repo) => {
-            const cwdKey = pathKey(request.cwd!);
-            if (pathKey(repo.anchor) === cwdKey) return true;
-            const family = familyForRepository(repo, getVerifiedFamilies());
-            return (
-              family &&
-              (pathKey(family.checkout) === cwdKey ||
-                family.worktrees.some(
-                  (entry) => pathKey(entry.path) === cwdKey,
-                ))
-            );
-          })
+        ? repoOwningPath(taskProject, request.cwd)
         : undefined;
       if (
         changedRepo &&
-        !task.children.some(
-          (child) => child.repositoryId === changedRepo.id,
-        )
+        !task.children.some((child) => child.repositoryId === changedRepo.id)
       ) {
         try {
           addTaskChildren(task.id, [
@@ -6042,31 +6671,50 @@ export default function App({
           };
         }
       }
-      let sessionId =
-        task.sessionIds?.[0] ??
-        task.children.find((entry) => entry.sessionIds.length)
-          ?.sessionIds[0];
+      let sessionId = firstTaskSessionId(task);
       // A deleted conversation id must not shadow a relaunch.
       if (sessionId && !(await taskSessionAlive(sessionId)))
         sessionId = undefined;
       // No session yet — the send starts the task, then stages the context.
-      if (!sessionId) sessionId = await launchTaskChildren(task.id);
       if (!sessionId) {
-        done();
+        try {
+          sessionId = await launchTaskChildren(task.id);
+        } catch (error) {
+          request.onFailed?.(String(error));
+          return;
+        }
+      }
+      if (!sessionId) {
+        // Nothing staged — keep the sender's selection so the send can be
+        // retried, and land on details where the failed/pending launch
+        // state explains why.
+        request.onFailed?.(
+          `"${task.name}" has no session — its working copies aren't ready yet.`,
+        );
+        setTaskDetailsId(task.id);
         return;
       }
-      const target = sessionsRef.current.find(
-        (session) => session.id === sessionId,
-      );
-      if (target) {
-        const next = prepareSessionContext(target, request.context, true);
-        const updated = sessionsRef.current.map((session) =>
-          session.id === next.id ? next : session,
+      try {
+        // Open first — a session that was only on disk loads into
+        // sessionsRef here, so staging before this call could silently drop
+        // the context.
+        await onSelectHistorySession(sessionId);
+        const target = sessionsRef.current.find(
+          (session) => session.id === sessionId,
         );
-        sessionsRef.current = updated;
-        setSessions(updated);
+        if (target) {
+          const next = prepareSessionContext(target, request.context, true);
+          const updated = sessionsRef.current.map((session) =>
+            session.id === next.id ? next : session,
+          );
+          sessionsRef.current = updated;
+          setSessions(updated);
+        }
+      } catch (error) {
+        // Same rule as a failed launch: keep the selection, say why.
+        request.onFailed?.(String(error));
+        return;
       }
-      await onSelectHistorySession(sessionId);
       done();
     },
     [
@@ -6074,6 +6722,7 @@ export default function App({
       ensureTaskProject,
       launchTaskChildren,
       onSelectHistorySession,
+      openTaskSheet,
       projectCwd,
       sessionDefaults?.cwd,
       taskSessionAlive,
@@ -6086,20 +6735,20 @@ export default function App({
    * existing task and open it, or open the create sheet with the item
    * pre-linked. `null` taskId means a new task. */
   const onStartItemToTask = useCallback(
-    async (item: InboxItem, taskId: string | null) => {
+    async (
+      item: InboxItem,
+      taskId: string | null,
+      opts?: { freshSession?: boolean },
+    ) => {
       const linked = linkedWorkItemFromInboxItem(item);
       if (taskId) {
+        const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
         if (linked) {
           linkTicketToTask(taskId, linked);
-          // Reflect the link on the task's existing session too — otherwise
-          // the issue never shows in that conversation's Issues row.
-          const task = loadTaskWorkspaces().find(
-            (entry) => entry.id === taskId,
-          );
-          const sessionIds = [
-            ...(task?.sessionIds ?? []),
-            ...(task?.children.flatMap((entry) => entry.sessionIds) ?? []),
-          ];
+          // Reflect the link on the task's existing sessions too — otherwise
+          // the issue never shows in those conversations' Issues rows.
+          const sessionIds =
+            task && !task.archived ? [...taskSessionIds(task)] : []; // archived: the link was dropped — don't touch its sessions
           if (sessionIds.length) {
             const next = sessionsRef.current.map((session) => {
               if (!sessionIds.includes(session.id)) return session;
@@ -6116,17 +6765,45 @@ export default function App({
           }
         }
         setInboxViewOpen(false);
-        onOpenTask(taskId);
+        // Fresh send — a new agent session in the task's working copy
+        // rather than its existing conversation(s). The active child wins;
+        // nothing prepared falls back to open's routing so the user can
+        // still set the copy up.
+        if (opts?.freshSession && task && !task.archived) {
+          const child =
+            task.children.find(
+              (entry) =>
+                entry.id === task.lastActiveChildId && entry.workingCopy,
+            ) ?? task.children.find((entry) => entry.workingCopy);
+          if (child) {
+            onNewTaskConversation(taskId, child.id);
+            return;
+          }
+        }
+        // Several conversations — land on the details picker instead of an
+        // arbitrary one; one or none keeps open's own routing. Resolvable =
+        // open sessions plus persisted history, matching the sheet's list.
+        if (
+          task &&
+          liveTaskSessionIds(
+            task,
+            new Set(
+              [...sessionsRef.current, ...history].map((session) => session.id),
+            ),
+          ).length > 1
+        )
+          setTaskDetailsId(taskId);
+        else onOpenTask(taskId);
         return;
       }
       const path =
         item.projectPath || active?.cwd || sessionDefaults?.cwd || projectCwd;
+      // The resolved project is only the sheet's initial selection — the
+      // picker inside the modal owns the final choice.
       const project = await ensureTaskProject(path);
-      if (!project)
-        throw new Error("Choose a local project before sending to an agent");
       setInboxViewOpen(false);
-      setTaskSheet({
-        projectId: project.id,
+      openTaskSheet({
+        ...(project ? { projectId: project.id } : {}),
         initialName: inboxItemTaskName(item),
         ...(linked ? { initialTickets: [linked] } : {}),
       });
@@ -6134,7 +6811,10 @@ export default function App({
     [
       active?.cwd,
       ensureTaskProject,
+      history,
+      onNewTaskConversation,
       onOpenTask,
+      openTaskSheet,
       projectCwd,
       sessionDefaults?.cwd,
     ],
@@ -6152,17 +6832,22 @@ export default function App({
         active?.cwd ||
         sessionDefaults?.cwd ||
         projectCwd;
+      // Initial selection only — the sheet's project picker owns the choice.
       const project = await ensureTaskProject(path);
-      if (!project)
-        throw new Error("Choose a local project before sending to an agent");
       setInboxViewOpen(false);
-      setTaskSheet({
-        projectId: project.id,
+      openTaskSheet({
+        ...(project ? { projectId: project.id } : {}),
         ...(items[0] ? { initialName: inboxItemTaskName(items[0]) } : {}),
         ...(linked.length ? { initialTickets: linked } : {}),
       });
     },
-    [active?.cwd, ensureTaskProject, projectCwd, sessionDefaults?.cwd],
+    [
+      active?.cwd,
+      ensureTaskProject,
+      openTaskSheet,
+      projectCwd,
+      sessionDefaults?.cwd,
+    ],
   );
 
   const onUpdatePlan = useCallback(
@@ -6248,7 +6933,10 @@ export default function App({
         continue;
       }
       if (
-        !canDispatchQueuedHead(session, repairCheckingRef.current.has(session.id)) ||
+        !canDispatchQueuedHead(
+          session,
+          repairCheckingRef.current.has(session.id),
+        ) ||
         queueDispatchingRef.current.has(session.id)
       ) {
         continue;
@@ -6269,11 +6957,19 @@ export default function App({
             !latest ||
             !head ||
             head.id !== next.id ||
-            !canDispatchQueuedHead(latest, repairCheckingRef.current.has(session.id))
+            !canDispatchQueuedHead(
+              latest,
+              repairCheckingRef.current.has(session.id),
+            )
           ) {
             return;
           }
-          onSubmit(session.id, head.text, head.attachments, queuedMessageOptions(head));
+          onSubmit(
+            session.id,
+            head.text,
+            head.attachments,
+            queuedMessageOptions(head),
+          );
         }, 0),
       );
     }
@@ -6285,8 +6981,15 @@ export default function App({
 
   const onDeleteQueuedMessage = useCallback(
     (sessionId: string, messageId: string) => {
-      const repair = sessionsRef.current.find(s => s.id === sessionId)?.queuedMessages?.find(row => row.id === messageId)?.repair;
-      if (repair) updateRepair(repair.id, "blocked", "Queued repair cancelled before delivery.");
+      const repair = sessionsRef.current
+        .find((s) => s.id === sessionId)
+        ?.queuedMessages?.find((row) => row.id === messageId)?.repair;
+      if (repair)
+        updateRepair(
+          repair.id,
+          "blocked",
+          "Queued repair cancelled before delivery.",
+        );
       setSessions((prev) =>
         prev.map((session) =>
           session.id === sessionId
@@ -6497,12 +7200,7 @@ export default function App({
         (session) => session.id === args.sourceSessionId,
       );
       const session = {
-        ...newSession(
-          args.harness,
-          args.cwd,
-          args.model,
-          source?.runtimeMode,
-        ),
+        ...newSession(args.harness, args.cwd, args.model, source?.runtimeMode),
         title: formatSessionTitle(args.harness, args.action.name),
       };
       openSessionBeside(args.sourceSessionId, session, args.cwd);
@@ -6581,131 +7279,131 @@ export default function App({
     target: { cwd: string },
     projectPath: string,
   ): Promise<string | undefined> => {
-      // The bound terminal can live in another project's dock — dedupe has
-      // to search everywhere, not just the visible dock.
-      let boundPath: string | undefined;
-      let bound: FilePaneTab | undefined;
-      for (const dock of projectTerminalsRef.current) {
-        const found = dock.pane.files.find(
-          (file) => file.command?.presetId === command.id,
-        );
-        if (found) {
-          boundPath = dock.projectPath;
-          bound = found;
-          break;
-        }
+    // The bound terminal can live in another project's dock — dedupe has
+    // to search everywhere, not just the visible dock.
+    let boundPath: string | undefined;
+    let bound: FilePaneTab | undefined;
+    for (const dock of projectTerminalsRef.current) {
+      const found = dock.pane.files.find(
+        (file) => file.command?.presetId === command.id,
+      );
+      if (found) {
+        boundPath = dock.projectPath;
+        bound = found;
+        break;
       }
-      if (bound && boundPath) {
-        // A terminal bound to a different project's dock can't be focused or
-        // re-fired from here — mutating it would run invisible work.
-        if (!sameProjectPath(boundPath, projectPath)) {
-          return `"${command.name}" is bound to a terminal in ${prettyCwd(boundPath)}.`;
-        }
-        const fileId = bound.id;
-        const dockPath = boundPath;
-        const focus = () => {
-          if (sameProjectPath(dockPath, projectPath)) focusProjectTerminal();
-        };
-        const reveal = (entry: ProjectTerminal) =>
-          withDockOpen(selectDockTerminal(entry, fileId), true);
-        // runId > launched means a launch is queued but the PTY write hasn't
-        // landed — treat as running so a fast second click can't double-fire.
-        // A failed run is over even when `launched` never landed, so it stays
-        // re-runnable instead of wedging the terminal.
-        const launchPending =
-          (bound.command?.runId ?? 0) > (bound.command?.launched ?? 0) &&
-          bound.command?.failed !== bound.command?.runId;
-        if (bound.foreground || launchPending) {
-          setProjectTerminals((prev) =>
-            mapProjectTerminal(prev, dockPath, reveal),
-          );
-          focus();
-          return;
-        }
-        // pty_spawn silently falls back to $HOME for a missing directory —
-        // check first so a stale worktree can't run elsewhere. Only a rerun
-        // or fresh launch pays the (possibly WSL) roundtrip.
-        const exists = await listDir(target.cwd)
-          .then(() => true)
-          .catch(() => false);
-        if (!exists) return `Directory not found: ${target.cwd}`;
-        if (!sameProjectPath(bound.cwd, target.cwd)) {
-          // The target moved (task worktree, repository or subdirectory
-          // changed) — a PTY can't change directory, so replace the terminal
-          // in its own dock.
-          const file: FilePaneTab = {
-            ...newTerminalFile(target.cwd, command.name),
-            command: {
-              presetId: command.id,
-              name: command.name,
-              text: command.command,
-              ...(command.steps?.length ? { steps: command.steps } : {}),
-              runId: 1,
-            },
-          };
-          setProjectTerminals((prev) =>
-            mapProjectTerminal(prev, dockPath, (entry) => ({
-              ...entry,
-              open: true,
-              pane: {
-                ...entry.pane,
-                files: entry.pane.files.map((item) =>
-                  item.id === fileId ? file : item,
-                ),
-                activeFileId: file.id,
-              },
-            })),
-          );
-          focus();
-          return;
-        }
-        // Same target — re-fire with the command's current text so edits are
-        // never replayed stale.
+    }
+    if (bound && boundPath) {
+      // A terminal bound to a different project's dock can't be focused or
+      // re-fired from here — mutating it would run invisible work.
+      if (!sameProjectPath(boundPath, projectPath)) {
+        return `"${command.name}" is bound to a terminal in ${prettyCwd(boundPath)}.`;
+      }
+      const fileId = bound.id;
+      const dockPath = boundPath;
+      const focus = () => {
+        if (sameProjectPath(dockPath, projectPath)) focusProjectTerminal();
+      };
+      const reveal = (entry: ProjectTerminal) =>
+        withDockOpen(selectDockTerminal(entry, fileId), true);
+      // runId > launched means a launch is queued but the PTY write hasn't
+      // landed — treat as running so a fast second click can't double-fire.
+      // A failed run is over even when `launched` never landed, so it stays
+      // re-runnable instead of wedging the terminal.
+      const launchPending =
+        (bound.command?.runId ?? 0) > (bound.command?.launched ?? 0) &&
+        bound.command?.failed !== bound.command?.runId;
+      if (bound.foreground || launchPending) {
         setProjectTerminals((prev) =>
-          mapProjectTerminal(prev, dockPath, (entry) =>
-            reveal(
-              patchDockTerminal(entry, fileId, {
-                // Tab label follows an edited command name.
-                title: command.name,
-                command: {
-                  name: command.name,
-                  text: command.command,
-                  // Explicit undefined clears keys a fresh run no longer has —
-                  // the meta merge keeps old keys otherwise.
-                  steps: command.steps?.length ? command.steps : undefined,
-                  failed: undefined,
-                  step: undefined,
-                  runId: (bound.command?.runId ?? 0) + 1,
-                },
-              }),
-            ),
-          ),
+          mapProjectTerminal(prev, dockPath, reveal),
         );
         focus();
         return;
       }
+      // pty_spawn silently falls back to $HOME for a missing directory —
+      // check first so a stale worktree can't run elsewhere. Only a rerun
+      // or fresh launch pays the (possibly WSL) roundtrip.
       const exists = await listDir(target.cwd)
         .then(() => true)
         .catch(() => false);
       if (!exists) return `Directory not found: ${target.cwd}`;
-      const file: FilePaneTab = {
-        ...newTerminalFile(target.cwd, command.name),
-        command: {
-          presetId: command.id,
-          name: command.name,
-          text: command.command,
-          ...(command.steps?.length ? { steps: command.steps } : {}),
-          runId: 1,
-        },
-      };
+      if (!sameProjectPath(bound.cwd, target.cwd)) {
+        // The target moved (task worktree, repository or subdirectory
+        // changed) — a PTY can't change directory, so replace the terminal
+        // in its own dock.
+        const file: FilePaneTab = {
+          ...newTerminalFile(target.cwd, command.name),
+          command: {
+            presetId: command.id,
+            name: command.name,
+            text: command.command,
+            ...(command.steps?.length ? { steps: command.steps } : {}),
+            runId: 1,
+          },
+        };
+        setProjectTerminals((prev) =>
+          mapProjectTerminal(prev, dockPath, (entry) => ({
+            ...entry,
+            open: true,
+            pane: {
+              ...entry.pane,
+              files: entry.pane.files.map((item) =>
+                item.id === fileId ? file : item,
+              ),
+              activeFileId: file.id,
+            },
+          })),
+        );
+        focus();
+        return;
+      }
+      // Same target — re-fire with the command's current text so edits are
+      // never replayed stale.
       setProjectTerminals((prev) =>
-        findProjectTerminal(prev, projectPath)
-          ? mapProjectTerminal(prev, projectPath, (entry) =>
-              addTerminalToDock(entry, file),
-            )
-          : [...prev, createProjectTerminal(projectPath, file)],
+        mapProjectTerminal(prev, dockPath, (entry) =>
+          reveal(
+            patchDockTerminal(entry, fileId, {
+              // Tab label follows an edited command name.
+              title: command.name,
+              command: {
+                name: command.name,
+                text: command.command,
+                // Explicit undefined clears keys a fresh run no longer has —
+                // the meta merge keeps old keys otherwise.
+                steps: command.steps?.length ? command.steps : undefined,
+                failed: undefined,
+                step: undefined,
+                runId: (bound.command?.runId ?? 0) + 1,
+              },
+            }),
+          ),
+        ),
       );
-      focusProjectTerminal();
+      focus();
+      return;
+    }
+    const exists = await listDir(target.cwd)
+      .then(() => true)
+      .catch(() => false);
+    if (!exists) return `Directory not found: ${target.cwd}`;
+    const file: FilePaneTab = {
+      ...newTerminalFile(target.cwd, command.name),
+      command: {
+        presetId: command.id,
+        name: command.name,
+        text: command.command,
+        ...(command.steps?.length ? { steps: command.steps } : {}),
+        runId: 1,
+      },
+    };
+    setProjectTerminals((prev) =>
+      findProjectTerminal(prev, projectPath)
+        ? mapProjectTerminal(prev, projectPath, (entry) =>
+            addTerminalToDock(entry, file),
+          )
+        : [...prev, createProjectTerminal(projectPath, file)],
+    );
+    focusProjectTerminal();
   };
 
   const onStopProjectCommand = useCallback((fileId: string) => {
@@ -6768,10 +7466,10 @@ export default function App({
       const workCwd = sessionWorkCwd(current);
       const started = sessionsRef.current.map((session) =>
         session.id === sessionId
-          ? applyHarnessEvent(
-              startSessionActivity(session),
-              { type: "status", text: "Compacting context…" },
-            )
+          ? applyHarnessEvent(startSessionActivity(session), {
+              type: "status",
+              text: "Compacting context…",
+            })
           : session,
       );
       sessionsRef.current = started;
@@ -6908,7 +7606,12 @@ export default function App({
     (sessionId: string, requestId: number, decision: ApprovalDecision) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
       if (!session) return;
-      respondHarnessApproval(sessionDecisionHarness(session), sessionId, requestId, decision);
+      respondHarnessApproval(
+        sessionDecisionHarness(session),
+        sessionId,
+        requestId,
+        decision,
+      );
     },
     [],
   );
@@ -6917,7 +7620,12 @@ export default function App({
     (sessionId: string, requestId: number, reply: UserQuestionReply) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
       if (!session) return;
-      respondHarnessQuestion(sessionDecisionHarness(session), sessionId, requestId, reply);
+      respondHarnessQuestion(
+        sessionDecisionHarness(session),
+        sessionId,
+        requestId,
+        reply,
+      );
     },
     [],
   );
@@ -6925,7 +7633,12 @@ export default function App({
   const onQuestionInteraction = useCallback(
     (sessionId: string, requestId: number) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
-      if (session) keepHarnessQuestionOpen(sessionDecisionHarness(session), sessionId, requestId);
+      if (session)
+        keepHarnessQuestionOpen(
+          sessionDecisionHarness(session),
+          sessionId,
+          requestId,
+        );
     },
     [],
   );
@@ -6987,6 +7700,18 @@ export default function App({
     linkedSessionUpdates,
   } = useInboxActivity(recents, sidebarCwd, sidebarHistory);
   linkedSessionUpdatesRef.current = linkedSessionUpdates;
+  // Item-keyed view of the same updates — task rows own tickets, not
+  // sessions, so their menus look updates up by the ticket's identity.
+  const linkedItemUpdates = useMemo(() => {
+    const map = new Map<string, LinkedSessionUpdate>();
+    for (const update of linkedSessionUpdates.values()) {
+      const key = linkedWorkItemUpdateKey(update.linked);
+      const existing = map.get(key);
+      if (!existing || update.updatedAt > existing.updatedAt)
+        map.set(key, update);
+    }
+    return map;
+  }, [linkedSessionUpdates]);
   const inboxRelatedSessions = useMemo(() => {
     const byId = new Map<string, SessionSummary>();
     for (const session of storedLinkedSessions) byId.set(session.id, session);
@@ -7007,6 +7732,10 @@ export default function App({
               runtimeMode: summary.runtimeMode,
               title: summary.title,
               cwd: summary.cwd,
+              // Live values win — a stored summary can hold a worktree the
+              // session left behind, which would misgroup related threads.
+              worktreeCwd: summary.worktreeCwd,
+              branch: summary.branch,
               linkedWorkItem: summary.linkedWorkItem,
             }
           : summary,
@@ -7079,19 +7808,34 @@ export default function App({
   }, []);
 
   const onOpenInbox = useCallback(() => {
+    // The remembered conversation portals through a live session leaf —
+    // re-place it when its pane was closed while the inbox was hidden. Its
+    // dismissOverlays runs synchronously before the setters below, so the
+    // inbox still ends up open.
+    if (
+      inboxConversationId &&
+      !tabsRef.current.some((entry) =>
+        leafIds(entry.layout).includes(inboxConversationId),
+      )
+    )
+      void onSelectHistorySession(inboxConversationId);
     dismissOverlays();
     setInboxTarget(null);
     setInboxViewOpen(true);
-  }, [dismissOverlays]);
+  }, [dismissOverlays, inboxConversationId, onSelectHistorySession]);
 
-  const onOpenLinkedWorkItem = useCallback((item: LinkedWorkItem) => {
-    dismissOverlays();
-    setInboxTarget({ ...item });
-    setInboxViewOpen(true);
-  }, [dismissOverlays]);
+  const onOpenLinkedWorkItem = useCallback(
+    (item: LinkedWorkItem) => {
+      dismissOverlays();
+      setInboxTarget({ ...item });
+      setInboxViewOpen(true);
+    },
+    [dismissOverlays],
+  );
 
   useEffect(() => {
-    const open = (event: Event) => onOpenLinkedWorkItem((event as CustomEvent<LinkedWorkItem>).detail);
+    const open = (event: Event) =>
+      onOpenLinkedWorkItem((event as CustomEvent<LinkedWorkItem>).detail);
     window.addEventListener(OPEN_INBOX_WORK_ITEM, open);
     return () => window.removeEventListener(OPEN_INBOX_WORK_ITEM, open);
   }, [onOpenLinkedWorkItem]);
@@ -7101,48 +7845,108 @@ export default function App({
     setInboxTarget(null);
   }, []);
 
-  const onOpenInboxDelivery = useCallback(async (sessionId: string, kind: "pr" | "ci", current: () => boolean, provider: "github" | "azure" | "gitlab", prUrl?: string, gitlabTarget?: { repo: string; number: number }) => {
-    const session = await ensureOpenSession(sessionId);
-    if (!current()) return;
-    if (!session || session.inboxAsk) throw new Error("Open a workspace conversation for this item before reviewing PRs or CI.");
-    const cwd = sessionWorkCwd(session);
-    const checkout = await ciContext(cwd);
-    if (!current()) return;
-    if (sessionWorkCwd(sessionsRef.current.find(value => value.id === sessionId) ?? session) !== cwd)
-      throw new Error("The conversation checkout changed. Open its review again.");
-    // Reject before saving — a dead CI choice must not persist.
-    if (provider === "gitlab" && kind === "ci") throw new Error(GITLAB_CI_ON_MR);
-    saveDeliveryProvider(cwd, checkout.branch, sessionId, kind, provider);
-    // GitLab delivery tabs bind to the inbox item's own MR identity when it
-    // carries one; otherwise to the open MR for the checkout's branch.
-    const target = provider === "github"
-      ? await githubDeliveryTarget(cwd, prUrl)
-      : provider === "gitlab"
-        ? (gitlabTarget ?? await gitlabDeliveryTarget(cwd, checkout.branch))
-        : undefined;
-    if (!current() || sessionWorkCwd(sessionsRef.current.find(value => value.id === sessionId) ?? session) !== cwd)
-      throw new Error("The conversation checkout changed. Open its review again.");
-    const existing = tabsRef.current.find(tab => leafIds(tab.layout).includes(sessionId));
-    const base = existing ?? newTab(sessionId);
-    const file = { id: crypto.randomUUID(), path: kind === "pr" ? "Pull requests" : "CI", cwd, delivery: { kind, branch: checkout.branch, sourceSessionId: sessionId, ...(provider === "github" || provider === "gitlab" ? { provider, repo: target!.repo, number: target!.number } : {}) } };
-    if (existing) {
-      setTabs(previous => previous.map(tab => tab.id === existing.id ? openEditorTab(tab, file) : tab));
-      activateTab(existing.id);
-    } else {
-      appendTab(openEditorTab(base, file), cwd);
-      setActiveTabId(base.id);
-    }
-    setInboxViewOpen(false);
-    setSidebarTab("changes");
-    setComposerFocused(false);
-  }, [ensureOpenSession, activateTab, appendTab]);
+  /** Mounts a delivery review tab (PR comments, checks, pipeline jobs) into
+   * the session's workspace tab — or a fresh workspace tab when the session
+   * isn't open anywhere. Shared by the inbox delivery opener and the task
+   * details' delivery rows. */
+  const mountDeliveryTab = useCallback(
+    (sessionId: string, cwd: string, delivery: DeliveryTabSource) => {
+      const existing = tabsRef.current.find((tab) =>
+        leafIds(tab.layout).includes(sessionId),
+      );
+      const base = existing ?? newTab(sessionId);
+      const file = {
+        id: crypto.randomUUID(),
+        path: delivery.kind === "pr" ? "Pull requests" : "CI",
+        cwd,
+        delivery,
+      };
+      if (existing) {
+        setTabs((previous) =>
+          previous.map((tab) =>
+            tab.id === existing.id ? openEditorTab(tab, file) : tab,
+          ),
+        );
+        activateTab(existing.id);
+      } else {
+        appendTab(openEditorTab(base, file), cwd);
+        setActiveTabId(base.id);
+      }
+      setSidebarTab("changes");
+      setComposerFocused(false);
+    },
+    [activateTab, appendTab],
+  );
+
+  const onOpenInboxDelivery = useCallback(
+    async (
+      sessionId: string,
+      kind: "pr" | "ci",
+      current: () => boolean,
+      provider: "github" | "azure" | "gitlab",
+      prUrl?: string,
+      gitlabTarget?: { repo: string; number: number },
+    ) => {
+      const session = await ensureOpenSession(sessionId);
+      if (!current()) return;
+      if (!session || session.inboxAsk)
+        throw new Error(
+          "Open a workspace conversation for this item before reviewing PRs or CI.",
+        );
+      const cwd = sessionWorkCwd(session);
+      const checkout = await ciContext(cwd);
+      if (!current()) return;
+      if (
+        sessionWorkCwd(
+          sessionsRef.current.find((value) => value.id === sessionId) ??
+            session,
+        ) !== cwd
+      )
+        throw new Error(
+          "The conversation checkout changed. Open its review again.",
+        );
+      // Reject before saving — a dead CI choice must not persist.
+      if (provider === "gitlab" && kind === "ci")
+        throw new Error(GITLAB_CI_ON_MR);
+      saveDeliveryProvider(cwd, checkout.branch, sessionId, kind, provider);
+      // GitLab delivery tabs bind to the inbox item's own MR identity when it
+      // carries one; otherwise to the open MR for the checkout's branch.
+      const target =
+        provider === "github"
+          ? await githubDeliveryTarget(cwd, prUrl, kind)
+          : provider === "gitlab"
+            ? (gitlabTarget ??
+              (await gitlabDeliveryTarget(cwd, checkout.branch)))
+            : undefined;
+      if (
+        !current() ||
+        sessionWorkCwd(
+          sessionsRef.current.find((value) => value.id === sessionId) ??
+            session,
+        ) !== cwd
+      )
+        throw new Error(
+          "The conversation checkout changed. Open its review again.",
+        );
+      mountDeliveryTab(sessionId, cwd, {
+        kind,
+        branch: checkout.branch,
+        sourceSessionId: sessionId,
+        ...(provider === "github" || provider === "gitlab"
+          ? { provider, repo: target!.repo, number: target!.number }
+          : {}),
+      });
+      setInboxViewOpen(false);
+    },
+    [ensureOpenSession, mountDeliveryTab],
+  );
 
   const onOpenInboxSession = useCallback(
     async (sessionId: string) => {
       await onSelectHistorySession(sessionId);
       setInboxViewOpen(true);
       setInboxConversationId(sessionId);
-      setInboxConversationRevision(value => value + 1);
+      setInboxConversationRevision((value) => value + 1);
       setComposerFocused(true);
     },
     [onSelectHistorySession],
@@ -7189,22 +7993,25 @@ export default function App({
 
   // --- Attention queue (#76) + watcher engine (#23) ---
 
-  const attentionRaw = useSyncExternalStore(subscribeAttention, attentionSnapshot);
+  const attentionRaw = useSyncExternalStore(
+    subscribeAttention,
+    attentionSnapshot,
+  );
+  const mergeResolutions = useSyncExternalStore(
+    subscribeMergeResolutions,
+    mergeResolutionSnapshot,
+  );
   const attentionStore = useMemo(
     () => attentionStoreFromSnapshot(attentionRaw),
     [attentionRaw],
   );
-  const repairRows = useSyncExternalStore(
-    (listener) => {
-      window.addEventListener(REPAIR_CHANGE, listener);
-      return () => window.removeEventListener(REPAIR_CHANGE, listener);
-    },
-    repairRecordsSafe,
-  );
+  const repairRows = useSyncExternalStore((listener) => {
+    window.addEventListener(REPAIR_CHANGE, listener);
+    return () => window.removeEventListener(REPAIR_CHANGE, listener);
+  }, repairRecordsSafe);
   // Family discovery publishes once per probed path — coalesce the startup
   // burst into one render the same way the rail does.
-  const [verifiedFamilies, setVerifiedFamilies] =
-    useState(getVerifiedFamilies);
+  const [verifiedFamilies, setVerifiedFamilies] = useState(getVerifiedFamilies);
   useEffect(() => {
     let timer = 0;
     const unsubscribe = subscribeRepositoryFamilies(() => {
@@ -7231,9 +8038,7 @@ export default function App({
   useEffect(() => {
     const open = (event: Event) => {
       setWorktreeManagerBusy(false);
-      setWorktreeManager(
-        (event as CustomEvent<WorktreeManagerRequest>).detail,
-      );
+      setWorktreeManager((event as CustomEvent<WorktreeManagerRequest>).detail);
     };
     window.addEventListener(OPEN_WORKTREE_MANAGER, open);
     return () => window.removeEventListener(OPEN_WORKTREE_MANAGER, open);
@@ -7250,6 +8055,12 @@ export default function App({
     }
     return [...byId.values()];
   }, [history, sessions]);
+  // Every resolvable conversation — open sessions plus persisted history.
+  // Task "N conversations" labels count these, never stale task records.
+  const liveSessionIds = useMemo(
+    () => new Set(allSessions.map((session) => session.id)),
+    [allSessions],
+  );
   const worktreeSessionActivity = useMemo(() => {
     const activity = new Map<string, number>();
     const touch = (cwd: string | undefined, at: number) => {
@@ -7339,6 +8150,126 @@ export default function App({
     [],
   );
 
+  /** The task conversation a checkout-scoped action belongs to: a session
+   * rooted in that working copy first (the fix lands where the files are),
+   * then the first live task conversation. Each id resolves once — the same
+   * load answers aliveness, the cwd match and the pruning. */
+  const taskActionSession = useCallback(
+    async (task: TaskWorkspace, cwd?: string): Promise<string | undefined> => {
+      const key = cwd ? pathKey(cwd) : undefined;
+      let first: string | undefined;
+      for (const id of taskSessionIds(task)) {
+        const session =
+          sessionsRef.current.find((entry) => entry.id === id) ??
+          (await getSession(id).catch(() => null));
+        if (!session) {
+          // Dead id — same pruning taskSessionAlive performs.
+          pruneTaskSession(id);
+          resolveVerifyForSession(id);
+          continue;
+        }
+        if (!first) first = id;
+        if (key && pathKey(sessionWorkCwd(session)) === key) return id;
+      }
+      return first;
+    },
+    [],
+  );
+
+  /** Task-details CI Fix — builds the repair draft through the same verified
+   * provider flows the attention queue uses, then aims it at the task's live
+   * conversation. With no live conversation the destination picker asks where
+   * the evidence should go. */
+  const onFixTaskCi = useCallback(
+    async (task: TaskWorkspace, fix: TaskCiFix) => {
+      try {
+        const sessionId = await taskActionSession(
+          task,
+          fix.kind === "azure" ? fix.source.cwd : fix.cwd,
+        );
+        const draft =
+          fix.kind === "azure"
+            ? await azureCiRepairDraft({
+                target: fix.source.target,
+                cwd: fix.source.cwd,
+                branch: fix.source.branch,
+                remote: fix.source.remote,
+                runId: fix.run.id,
+                definitionName: fix.source.definitionName,
+                sessionId,
+              })
+            : fix.kind === "github"
+              ? await githubCiRepair({
+                  cwd: fix.cwd,
+                  repo: fix.repo,
+                  number: fix.number,
+                })
+              : await gitlabPipelineRepair({
+                  cwd: fix.cwd,
+                  repo: fix.repo,
+                  number: fix.number,
+                });
+        dispatchRepairDraft(draft, sessionId);
+      } catch (error) {
+        await message(error instanceof Error ? error.message : String(error), {
+          title: task.name,
+          kind: "error",
+        });
+      }
+    },
+    [dispatchRepairDraft, taskActionSession],
+  );
+
+  /** Opens a details row's review surface — PR comments, checks, pipeline
+   * jobs — as a delivery tab inside the task's live conversation. The file
+   * binds the child's checkout (the PR/MR/run belongs to it) while the tab
+   * lands wherever that conversation lives. */
+  const onOpenTaskDelivery = useCallback(
+    async (task: TaskWorkspace, child: TaskChild, ref: TaskDeliveryRef) => {
+      try {
+        const sessionId = await taskActionSession(task, child.workingCopy);
+        if (!sessionId) {
+          await message(
+            "Start the task's conversation first — review tabs open inside it.",
+            { title: task.name, kind: "warning" },
+          );
+          return;
+        }
+        const session = await ensureOpenSession(sessionId);
+        if (!session || session.inboxAsk)
+          throw new Error("The task's conversation can't host review tabs.");
+        const cwd = child.workingCopy;
+        if (!cwd) return;
+        const checkout = await ciContext(cwd);
+        const repo =
+          ref.provider === "github" && !ref.repo
+            ? (await githubRepo(cwd)).trim()
+            : ref.repo;
+        // A provider row without a repo binding must not degrade into the
+        // Azure fallback — the review would open against the wrong provider.
+        if (ref.provider && !repo)
+          throw new Error(
+            `Couldn't resolve the ${ref.provider} remote for this checkout.`,
+          );
+        setTaskDetailsId(null);
+        mountDeliveryTab(sessionId, cwd, {
+          kind: ref.kind,
+          branch: checkout.branch,
+          sourceSessionId: sessionId,
+          ...(ref.provider && repo
+            ? { provider: ref.provider, repo, number: ref.number ?? 0 }
+            : {}),
+        });
+      } catch (error) {
+        await message(error instanceof Error ? error.message : String(error), {
+          title: task.name,
+          kind: "error",
+        });
+      }
+    },
+    [ensureOpenSession, mountDeliveryTab, taskActionSession],
+  );
+
   /** Fetch + merge/rebase the PR's base branch into the bound checkout.
    * Confirm-gated; conflicts stay in the tree and can be sent to the owning
    * agent or aborted explicitly. */
@@ -7402,13 +8333,23 @@ export default function App({
         if (
           !(await ask(
             `Fetch ${baseLabel} and merge it into ${branch}? The tree must be clean; conflicts stay in place for you to resolve. Nothing is pushed.${where}`,
-            { title: item.title, kind: "info", okLabel: "Merge", cancelLabel: "Rebase instead…" },
+            {
+              title: item.title,
+              kind: "info",
+              okLabel: "Merge",
+              cancelLabel: "Rebase instead…",
+            },
           ))
         ) {
           if (
             !(await ask(
               `Rebase ${branch} onto ${baseLabel}? Nothing is pushed.${where}`,
-              { title: item.title, kind: "info", okLabel: "Rebase", cancelLabel: "Cancel" },
+              {
+                title: item.title,
+                kind: "info",
+                okLabel: "Rebase",
+                cancelLabel: "Cancel",
+              },
             ))
           )
             return;
@@ -7477,6 +8418,24 @@ export default function App({
         kind: "warning",
       });
     }
+  }, []);
+
+  /** Bulk sync of a task's linked working copies — conflicts go straight to
+   * each copy's owning agent; the sheet streams per-copy outcomes. */
+  const [taskSync, setTaskSync] = useState<{
+    name: string;
+    rows: TaskBranchSyncRow[];
+  } | null>(null);
+  const onSyncTaskBranches = useCallback((taskId: string) => {
+    const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
+    if (!task || task.archived) return;
+    setTaskSync({ name: task.name, rows: [] });
+    void syncTaskBranches(task, (rows) =>
+      setTaskSync((current) =>
+        // Dismissed mid-run — keep working, don't reopen the sheet.
+        current ? { ...current, rows: [...rows] } : current,
+      ),
+    );
   }, []);
 
   const onAttentionAction = useCallback(
@@ -7576,57 +8535,8 @@ export default function App({
             return;
           }
           case "azure-ci-fix": {
-            const checkout = await ciContext(action.cwd);
-            if (checkout.branch !== action.branch)
-              throw new Error(
-                `Checkout is on ${checkout.branch || "detached HEAD"}, not ${action.branch}.`,
-              );
-            const head = {
-              cwd: checkout.cwd,
-              branch: checkout.branch,
-              commit: checkout.commit,
-              remote: action.remote,
-            };
-            const page = await ciLookup(
-              action.target,
-              head,
-              null,
-              action.runId,
-            );
-            const run = page.items.find((entry) => entry.id === action.runId);
-            if (!run)
-              throw new Error(
-                "The run is no longer listed. Refresh the pipeline.",
-              );
-            const jobs = await ciRead<CiJobs>(
-              action.target,
-              head,
-              run,
-              "jobs",
-            );
-            const job = jobs.items.find(
-              (entry) => entry.result === "failed" && entry.attempt && entry.logId,
-            );
-            if (!job)
-              throw new Error("No failed job with a log on this run.");
-            const log = await ciRead<CiLog>(action.target, head, run, "log", {
-              recordId: job.id,
-              attempt: job.attempt ?? undefined,
-              logId: job.logId ?? undefined,
-            });
-            const source: CiSource = {
-              target: action.target,
-              definitionName: action.definitionName,
-              projectName: page.projectName,
-              remote: action.remote,
-              cwd: action.cwd,
-              branch: action.branch,
-              ...(action.sessionId ? { session: action.sessionId } : {}),
-            };
-            dispatchRepairDraft(
-              ciRepair(source, head, run, job, log),
-              action.sessionId,
-            );
+            const draft = await azureCiRepairDraft(action);
+            dispatchRepairDraft(draft, action.sessionId);
             return;
           }
           case "github-ci-fix": {
@@ -7661,10 +8571,10 @@ export default function App({
             return;
         }
       } catch (error) {
-        await message(
-          error instanceof Error ? error.message : String(error),
-          { title: item.title, kind: "error" },
-        );
+        await message(error instanceof Error ? error.message : String(error), {
+          title: item.title,
+          kind: "error",
+        });
       }
     },
     [
@@ -7686,6 +8596,9 @@ export default function App({
     (item: AttentionItem) => dismissAttention(item.key, item.signature),
     [],
   );
+  const onAttentionDismissAll = useCallback((items: AttentionItem[]) => {
+    for (const item of items) dismissAttention(item.key, item.signature);
+  }, []);
 
   const [watchSheet, setWatchSheet] = useState<WatchSheetRequest | null>(null);
   useEffect(() => {
@@ -7695,7 +8608,8 @@ export default function App({
     return () => window.removeEventListener(OPEN_WATCH_SHEET, onOpen);
   }, []);
 
-  const [scheduleSheet, setScheduleSheet] = useState<ScheduleSheetRequest | null>(null);
+  const [scheduleSheet, setScheduleSheet] =
+    useState<ScheduleSheetRequest | null>(null);
   useEffect(() => {
     const onOpen = (event: Event) =>
       setScheduleSheet(
@@ -7768,8 +8682,7 @@ export default function App({
       // spawn a new conversation — the user chose that conversation.
       if (target.sessionId && !bound)
         return {
-          error:
-            "The bound conversation is gone — edit the watcher's target.",
+          error: "The bound conversation is gone — edit the watcher's target.",
         };
       if (bound && (bound.busy || sessionNeedsInput(bound)))
         return { skipped: "The bound agent is busy — run skipped." };
@@ -8341,7 +9254,11 @@ export default function App({
       listen("open_inbox", () => actions.current.onOpenInbox()),
       listen("open_notes", () => actions.current.onOpenNotes()),
       listen("open_browser", () => actions.current.onOpenBrowser()),
-      listen<{ section?: string }>("open_settings", ({ payload }) => actions.current.openSettings(isSettingsSectionId(payload?.section) ? payload.section : undefined)),
+      listen<{ section?: string }>("open_settings", ({ payload }) =>
+        actions.current.openSettings(
+          isSettingsSectionId(payload?.section) ? payload.section : undefined,
+        ),
+      ),
       listen("check_for_updates", () => {
         void runUpdateFlow(true);
       }),
@@ -8446,9 +9363,13 @@ export default function App({
     onQueuedMessageEditingChange,
     onSteerQueuedMessage,
     onResumeQueue,
-    onAddIssues: async (sessionId: string) => { await onOpenInboxSession(sessionId); setInboxSelectionRevision(value => value + 1); },
+    onAddIssues: async (sessionId: string) => {
+      await onOpenInboxSession(sessionId);
+      setInboxSelectionRevision((value) => value + 1);
+    },
     onOpenTaskChild,
     onRetryTaskChild,
+    onSetupTaskChild: onEditTask,
     needsInputSessionIds,
     onInboxCardDismiss,
     onNoteCardDismiss,
@@ -8483,6 +9404,7 @@ export default function App({
         onOpenFilesSearch={onFindInProject}
         searchFocusToken={searchFocusToken}
         sessions={sidebarHistory}
+        liveSessionIds={liveSessionIds}
         busySessionIds={busySessionIds}
         approvalSessionIds={approvalSessionIds}
         activeSessionId={active?.id}
@@ -8528,9 +9450,7 @@ export default function App({
         selectedCommitSha={activeTab ? selectedCommitSha(activeTab) : undefined}
         textHarness={pickTextHarness(active?.harness)}
         recents={recents}
-        busyProjectPaths={sessions.flatMap((session) =>
-          session.busy && session.cwd ? [session.cwd] : [],
-        )}
+        busyProjectPaths={busyProjectPaths}
         liveAgents={liveAgents}
         onSelectAgent={onOpenApprovalSession}
         onSelectProject={onSelectProject}
@@ -8538,10 +9458,14 @@ export default function App({
         onNewTask={onNewTask}
         onOpenCommands={onOpenCommands}
         onOpenTask={onOpenTask}
+        onStartTask={onStartTask}
         focusTaskId={focusTaskId}
         onEditTask={onEditTask}
         onCreateTaskPrs={onCreateTaskPrs}
+        onSyncTaskBranches={onSyncTaskBranches}
         needsInputSessionIds={needsInputSessionIds}
+        linkedItemUpdates={linkedItemUpdates}
+        onOpenTaskDelivery={onOpenTaskDelivery}
         onRemoveProject={onRemoveProject}
         onNew={onNew}
         openSessions={openProjectSessions}
@@ -8573,6 +9497,21 @@ export default function App({
         onDismissUpdate={() => setUpdateNotice(null)}
       />
 
+      {(() => {
+        const request = mergeResolutions[0];
+        return request ? (
+          <MergeResolutionSheet key={request.key} request={request} />
+        ) : null;
+      })()}
+
+      {taskSync ? (
+        <TaskSyncSheet
+          taskName={taskSync.name}
+          rows={taskSync.rows}
+          onClose={() => setTaskSync(null)}
+        />
+      ) : null}
+
       {queueAnchor ? (
         <AttentionQueue
           anchor={queueAnchor}
@@ -8586,6 +9525,7 @@ export default function App({
           }}
           onSnooze={onAttentionSnooze}
           onDismissItem={onAttentionDismissItem}
+          onDismissAll={onAttentionDismissAll}
           onOpenAutomations={() => openSettings("automations")}
         />
       ) : null}
@@ -8631,16 +9571,30 @@ export default function App({
           />
         </Modal>
       ) : null}
-      {wslPickerOpen && <WslProjectDialog cwd={projectCwd} onOpen={(paths) => { if (paths[0]) selectProject(paths[0]); }} onClose={() => setWslPickerOpen(false)} />}
+      {wslPickerOpen && (
+        <WslProjectDialog
+          cwd={projectCwd}
+          onOpen={(paths) => {
+            if (paths[0]) selectProject(paths[0]);
+          }}
+          onClose={() => setWslPickerOpen(false)}
+        />
+      )}
       {taskSheet && (
         <TaskCreateSheet
+          // A retarget (other task, other setup child, new send-to-task)
+          // remounts — form state must never leak between targets.
+          key={taskSheet.nonce}
           projectId={taskSheet.projectId}
           editingTaskId={taskSheet.editingTaskId}
+          initialSetupChildId={taskSheet.setupChildId}
           initialTickets={taskSheet.initialTickets}
           initialName={taskSheet.initialName}
           initialBrief={taskSheet.initialBrief}
           initialChildren={taskSheet.initialChildren}
           onCreated={(taskId) => {
+            // The sheet unmounts as Task Details mounts — same-commit swap.
+            modalSwap();
             onOpenTask(taskId);
             setProjectRailOpen((open) => {
               if (open) return open;
@@ -8648,32 +9602,66 @@ export default function App({
               return true;
             });
           }}
-          onEdited={(task) => {
+          onEdited={(task, changed) => {
             // A rename/ticket change should reach the conversation that
             // shows the task — otherwise history and pickers keep the
             // stale title and issue.
-            const ids = new Set([
-              ...(task.sessionIds ?? []),
-              ...task.children.flatMap((child) => child.sessionIds),
-            ]);
-            if (!ids.size) return;
-            const next = sessionsRef.current.map((session) =>
-              ids.has(session.id)
-                ? {
-                    ...session,
-                    title: task.name,
-                    linkedWorkItem: task.ticket,
-                    ...(linkedWorkItemIdentityChanged(
-                      session.linkedWorkItem,
-                      task.ticket,
-                    )
-                      ? { linkedWorkItemUpdateCard: undefined }
-                      : {}),
-                  }
-                : session,
+            const ids = taskSessionIds(task);
+            if (ids.size) {
+              const next = sessionsRef.current.map((session) =>
+                ids.has(session.id)
+                  ? {
+                      ...session,
+                      title: task.name,
+                      linkedWorkItem: task.ticket,
+                      ...(linkedWorkItemIdentityChanged(
+                        session.linkedWorkItem,
+                        task.ticket,
+                      )
+                        ? { linkedWorkItemUpdateCard: undefined }
+                        : {}),
+                    }
+                  : session,
+              );
+              sessionsRef.current = next;
+              setSessions(next);
+            }
+            // Repositories added or set up after launch need their launch —
+            // and a live session needs to hear the working-copy set changed.
+            const launchIds = [
+              ...(changed?.addedChildIds ?? []),
+              ...(changed?.setupChildIds ?? []),
+            ];
+            const priorSession = task.sessionIds?.[0];
+            const notifySession = () => {
+              const fresh = loadTaskWorkspaces().find(
+                (entry) => entry.id === task.id,
+              );
+              if (!fresh || !priorSession) return;
+              void onSubmit(
+                priorSession,
+                composeTaskUpdateNotice(fresh, projectForTask(fresh)),
+              );
+            };
+            if (launchIds.length) {
+              const launch = launchTaskChildren(task.id, launchIds);
+              void launch.then((sessionId) => {
+                if (sessionId !== priorSession) return;
+                // The launch already told the session — its brief send or
+                // state-change notice carries the post-edit task. A repeat
+                // "task was updated" would double it; only a launch that
+                // delivered nothing leaves the meta notice to post.
+                if (taskLaunchDelivered.current.has(launch)) return;
+                if (changed?.metaChanged) notifySession();
+              });
+              return;
+            }
+            // Name/ticket/brief/repo-set edits don't relaunch anything, but a
+            // live session still holds the old brief — tell it what changed.
+            if (!changed?.metaChanged || !priorSession) return;
+            void taskSessionAlive(priorSession).then(
+              (alive) => alive && notifySession(),
             );
-            sessionsRef.current = next;
-            setSessions(next);
           }}
           onClose={() => setTaskSheet(null)}
         />
@@ -8731,23 +9719,65 @@ export default function App({
       )}
       {taskDetailsId ? (
         <TaskDetails
+          // A retarget remounts — "Opening review…", the CI request set and
+          // the new-conversation picker must never leak between tasks.
+          key={taskDetailsId}
           taskId={taskDetailsId}
           sessions={allSessions}
+          needsInputIds={needsInputSessionIds}
+          busySessionIds={busySessionIds}
           onClose={() => setTaskDetailsId(null)}
           onOpenSession={(sessionId) => void onSelectHistorySession(sessionId)}
-          onOpenChild={(taskId, childId) => void onOpenTaskChild(taskId, childId)}
+          onOpenChild={(taskId, childId) =>
+            void onOpenTaskChild(taskId, childId)
+          }
+          onRetryChild={onRetryTaskChild}
+          onStart={onStartTask}
           onEdit={onEditTask}
+          onFixCi={onFixTaskCi}
+          onOpenDelivery={onOpenTaskDelivery}
+          onNewConversation={onNewTaskConversation}
+          onSyncBranches={onSyncTaskBranches}
         />
       ) : null}
       <div className="body-glass flex min-h-0 min-w-0 flex-1 flex-col">
         {wslOpening && (
-          <div role={wslOpening.error ? "alert" : "status"} className="flex shrink-0 items-center gap-3 border-b border-content/10 px-4 py-2 text-[12px]">
+          <div
+            role={wslOpening.error ? "alert" : "status"}
+            className="flex shrink-0 items-center gap-3 border-b border-content/10 px-4 py-2 text-[12px]"
+          >
             <div className="min-w-0 flex-1">
-              <p className="truncate text-content/75" title={prettyCwd(wslOpening.path)}>{prettyCwd(wslOpening.path)}</p>
-              <p className="text-content/50">{wslOpening.error || "Connecting to WSL…"}</p>
+              <p
+                className="truncate text-content/75"
+                title={prettyCwd(wslOpening.path)}
+              >
+                {prettyCwd(wslOpening.path)}
+              </p>
+              <p className="text-content/50">
+                {wslOpening.error || "Connecting to WSL…"}
+              </p>
             </div>
-            {!wslOpening.busy && <button className="rounded-md px-2 py-1 text-content/75 hover:bg-content/8" onClick={() => wslLocation(wslOpening.path) ? onSelectProject(wslOpening.path) : void pickWslProject()}>Retry</button>}
-            <button className="rounded-md px-2 py-1 text-content/60 hover:bg-content/8" onClick={() => { wslOpenRequest.current?.abort(); setWslOpening(null); }}>{wslOpening.busy ? "Cancel" : "Dismiss"}</button>
+            {!wslOpening.busy && (
+              <button
+                className="rounded-md px-2 py-1 text-content/75 hover:bg-content/8"
+                onClick={() =>
+                  wslLocation(wslOpening.path)
+                    ? onSelectProject(wslOpening.path)
+                    : void pickWslProject()
+                }
+              >
+                Retry
+              </button>
+            )}
+            <button
+              className="rounded-md px-2 py-1 text-content/60 hover:bg-content/8"
+              onClick={() => {
+                wslOpenRequest.current?.abort();
+                setWslOpening(null);
+              }}
+            >
+              {wslOpening.busy ? "Cancel" : "Dismiss"}
+            </button>
           </div>
         )}
         <div
@@ -8813,8 +9843,7 @@ export default function App({
             browserActive={browserOpen}
             projectTerminalActive={dockVisible}
             projectTerminalExists={
-              !!currentProjectDock &&
-              currentProjectDock.pane.files.length > 0
+              !!currentProjectDock && currentProjectDock.pane.files.length > 0
             }
             onOpenSettings={onOpenSettings}
             onOpenInbox={onOpenInbox}
@@ -8896,7 +9925,15 @@ export default function App({
                             !notesViewOpen &&
                             !settingsOpen
                           }
-                          sessionPortal={inboxViewOpen && tab.id === activeTabId ? inboxAskPortal ?? undefined : undefined}
+                          sessionPortal={
+                            inboxViewOpen &&
+                            inboxAskPortal &&
+                            leafIds(tab.layout).includes(
+                              inboxAskPortal.sessionId,
+                            )
+                              ? inboxAskPortal
+                              : undefined
+                          }
                           layout={tab.layout}
                           sessions={sessions}
                           editorPanes={[
@@ -8982,37 +10019,62 @@ export default function App({
               );
             })}
         </div>
-        {inboxMounted || inboxViewOpen ? <div hidden={!inboxViewOpen} className={inboxViewOpen ? "flex min-h-0 min-w-0 flex-1" : "hidden"}>
-          <InboxView
-            cwd={sidebarCwd}
+        {inboxMounted || inboxViewOpen ? (
+          <div
+            hidden={!inboxViewOpen}
+            className={inboxViewOpen ? "flex min-h-0 min-w-0 flex-1" : "hidden"}
+          >
+            <InboxView
+              cwd={sidebarCwd}
+              recents={recents}
+              besideRail={projectRailOpen}
+              onClose={onLeaveInbox}
+              onToggleSidebar={onToggleSidebar}
+              onStartTask={onStartItemToTask}
+              onOpenSettings={() => openSettings("inbox")}
+              onAsk={onAskInboxItem}
+              onAskRestart={onRestartInboxAsk}
+              onAskMount={setInboxAskPortal}
+              sessions={inboxRelatedSessions}
+              liveSessionIds={liveSessionIds}
+              onOpenSession={onOpenInboxSession}
+              onOpenDelivery={onOpenInboxDelivery}
+              busySessionIds={busySessionIds}
+              needsInputSessionIds={needsInputSessionIds}
+              attentionItems={attentionItems}
+              onAttentionAction={onAttentionAction}
+              target={inboxTarget}
+              visible={inboxViewOpen}
+              conversationId={inboxConversationId}
+              conversationRevision={inboxConversationRevision}
+              selectionRevision={inboxSelectionRevision}
+              onCloseConversation={() => setInboxConversationId(undefined)}
+              onToggleConversationTicket={onToggleConversationTicket}
+              onSendToTask={onSendItemsToTask}
+              onOpenIntegrations={onOpenInboxIntegrations}
+            />
+          </div>
+        ) : null}
+        {contextRequest ? (
+          <AgentContextPicker
+            request={contextRequest}
+            history={sidebarHistory}
+            sessions={sessions}
             recents={recents}
-            besideRail={projectRailOpen}
-            onClose={onLeaveInbox}
-            onToggleSidebar={onToggleSidebar}
-            onStartTask={onStartItemToTask}
-            onOpenSettings={() => openSettings("inbox")}
-            onAsk={onAskInboxItem}
-            onAskRestart={onRestartInboxAsk}
-            onAskMount={setInboxAskPortal}
-            sessions={inboxRelatedSessions}
-            onOpenSession={onOpenInboxSession}
-            onOpenDelivery={onOpenInboxDelivery}
-            busySessionIds={busySessionIds}
-            needsInputSessionIds={needsInputSessionIds}
-            attentionItems={attentionItems}
-            onAttentionAction={onAttentionAction}
-            target={inboxTarget}
-            visible={inboxViewOpen}
-            conversationId={inboxConversationId}
-            conversationRevision={inboxConversationRevision}
-            selectionRevision={inboxSelectionRevision}
-            onCloseConversation={() => setInboxConversationId(undefined)}
-            onToggleConversationTicket={onToggleConversationTicket}
-            onSendToTask={onSendItemsToTask}
-            onOpenIntegrations={onOpenInboxIntegrations}
+            onPrepare={prepareContextDestination}
+            onOpen={(id) => {
+              if (
+                contextRequest.context.entries.every((entry) => !!entry.ticket)
+              )
+                void onOpenInboxSession(id);
+              else {
+                setInboxViewOpen(false);
+                void onSelectHistorySession(id);
+              }
+            }}
+            onClose={() => setContextRequest(undefined)}
           />
-        </div> : null}
-        {contextRequest ? <AgentContextPicker request={contextRequest} history={sidebarHistory} sessions={sessions} recents={recents} onPrepare={prepareContextDestination} onOpen={id => { if (contextRequest.context.entries.every(entry => !!entry.ticket)) void onOpenInboxSession(id); else { setInboxViewOpen(false); void onSelectHistorySession(id); } }} onClose={() => setContextRequest(undefined)} /> : null}
+        ) : null}
         {notesViewOpen ? (
           <NotesView
             besideRail={projectRailOpen}

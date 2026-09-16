@@ -51,7 +51,27 @@ export function wslPath(distribution: string, path: string): string {
 }
 
 function trimSlash(path: string): string {
-  return slash(path).replace(/\/+$/, "") || "/";
+  const slashed = slash(path).replace(/\/+$/, "") || "/";
+  const parts = slashed.split("/");
+  // Elements ".." may never pop: "" for a POSIX root or the leading ""s +
+  // host of a //wsl.localhost/UNC path. A Windows drive is protected by the
+  // pop test below.
+  const floor =
+    parts[0] === "" && parts[1] === "" ? 3 : parts[0] === "" ? 1 : 0;
+  const out = parts.slice(0, floor);
+  for (const part of parts.slice(floor)) {
+    if (part === ".") continue;
+    if (part === "..") {
+      const last = out[out.length - 1];
+      if (out.length > floor && last !== ".." && !/^[A-Za-z]:$/.test(last))
+        out.pop();
+      // Relative paths keep leading hops; anchored paths can't escape root.
+      else if (!floor && (out.length === 0 || last === "..")) out.push(part);
+      continue;
+    }
+    out.push(part);
+  }
+  return out.join("/") || "/";
 }
 
 /** Stable comparison key for Windows paths without changing their display case. */

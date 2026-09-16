@@ -5,6 +5,7 @@ import { isEqualOrInside, pathKey, prettyCwd } from "../lib/paths";
 import { familyForRepository } from "../lib/projects";
 import {
   getVerifiedFamilies,
+  healthyFamilyMember,
   lastWorkingCopyUse,
   workingCopyAge,
   type RepositoryFamily,
@@ -31,7 +32,7 @@ import {
   type WorktreeSafety,
 } from "../lib/worktreeRemoval";
 import { probeRepositoryFamily } from "../hooks/useRepositoryFamilies";
-import { Modal } from "./Modal";
+import { Modal, modalSwap } from "./Modal";
 import { WorktreeRemovalBatch } from "./WorktreeRemovalBatch";
 import { Check, GitBranch, Trash2 } from "./icons";
 
@@ -49,20 +50,6 @@ type BatchState = {
   /** Probed family per target — the survivors list for fallback picking. */
   familyByPath: Map<string, RepositoryFamily>;
 };
-
-/** A healthy family member that can host the next preflight/remove call —
- * never a missing copy, a prunable registration or any batch target (a
- * sibling removed earlier in the sequence is already gone). */
-function healthyMember(
-  family: RepositoryFamily | undefined,
-  exclude: ReadonlySet<string>,
-): string | undefined {
-  const usable = (family?.worktrees ?? []).filter(
-    (entry) =>
-      !entry.missing && !entry.prunable && !exclude.has(pathKey(entry.path)),
-  );
-  return usable.find((entry) => entry.main)?.path ?? usable[0]?.path;
-}
 
 /** Task-children have no Git inventory entry until their family is probed —
  * the fabricated row only feeds preflight and skip-row display; the real
@@ -104,9 +91,17 @@ export function TaskWorktreesSheet({
   const project = task ? projectForTask(task) : undefined;
   const recents = loadRecents();
   const owned =
-    task?.children.filter(
-      (child) => taskOwnsCheckout(child) && child.workingCopy,
-    ) ?? [];
+    task?.children.filter((child) => {
+      if (!taskOwnsCheckout(child) || !child.workingCopy) return false;
+      // `pending` children only name an intended path — list one only when a
+      // probed family actually shows the copy (e.g. a crashed launch left it
+      // behind); `failed` children stay listed since their worktree may exist.
+      if (child.launch.state !== "pending") return true;
+      const key = pathKey(child.workingCopy);
+      return [...families.values()].some((family) =>
+        family.worktrees.some((entry) => pathKey(entry.path) === key),
+      );
+    }) ?? [];
   const inUse = (child: TaskChild) =>
     !!child.workingCopy && isEqualOrInside(cwd, child.workingCopy);
   const [checked, setChecked] = useState<ReadonlySet<string>>(
@@ -170,7 +165,7 @@ export function TaskWorktreesSheet({
       if (family) familyByPath.set(pathKey(path), family);
       contexts.set(
         pathKey(path),
-        healthyMember(family, targetKeys) ??
+        healthyFamilyMember(family, targetKeys) ??
           repo?.anchor ??
           family?.checkout ??
           path,
@@ -260,6 +255,7 @@ export function TaskWorktreesSheet({
   const reviewEntry = (skip: BulkSkip | { entry: RemovalEntry }) => {
     const { entry } = skip;
     const safety = "safety" in skip ? skip.safety : undefined;
+    modalSwap();
     onClose();
     openWorktreeManager({
       cwd: batch?.contexts.get(pathKey(entry.path)) ?? entry.path,
@@ -295,6 +291,20 @@ export function TaskWorktreesSheet({
           busy={busy}
           error={error}
           confirmLabel={`Remove ${batch.removable.length || ""} & delete task`}
+          // A multi-repo task can list identical branch names — the repo
+          // label disambiguates rows the confirm view would otherwise show
+          // as bare `branch · path`.
+          labelFor={(entry) => {
+            const child = task?.children.find(
+              (candidate) =>
+                candidate.workingCopy &&
+                pathKey(candidate.workingCopy) === pathKey(entry.path),
+            );
+            if (!child) return undefined;
+            return task
+              ? taskChildRepoLabel(task, child, project).split("/")[0]
+              : undefined;
+          }}
           onCancel={() => setBatch(null)}
           onConfirm={confirmCleanup}
           // Review during confirm would silently abandon the pending delete

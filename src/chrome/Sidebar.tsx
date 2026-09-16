@@ -2,11 +2,13 @@ import { prettyCwd } from "../lib/paths";
 import type { DeliveryTabSource } from "../lib/layout";
 import { sessionWorkItems } from "../lib/sessionWorkItem";
 import {
-  subscribeTaskWorkspaces,
   taskChildRepoLabel,
-  taskForSession,
-  taskWorkspacesSnapshot,
+  type TaskChild,
+  type TaskWorkspace,
 } from "../lib/taskWorkspaces";
+import type { TaskDeliveryRef } from "../lib/taskCi";
+import type { LinkedSessionUpdate } from "../lib/linkedSessionUpdates";
+import { useTaskScope, type TaskScope } from "../hooks/useTaskScope";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Archive,
@@ -49,7 +51,10 @@ import {
   type GitFileDiffKind,
   type GitHistoryCommit,
 } from "../lib/fs";
-import { getVerifiedFamilies, subscribeRepositoryFamilies } from "../lib/repositoryFamilies";
+import {
+  getVerifiedFamilies,
+  subscribeRepositoryFamilies,
+} from "../lib/repositoryFamilies";
 import { IS_MAC, MOD } from "../lib/platform";
 import { resolveModel } from "../lib/models";
 import { prettyParent, projectKey, projectName } from "../lib/paths";
@@ -196,6 +201,9 @@ type Props = {
   gitCwd?: string;
   open: boolean;
   sessions: SessionSummary[];
+  /** Every resolvable session id — `sessions` here is project-scoped, so
+   * task conversation counts must key off this full set instead. */
+  liveSessionIds?: ReadonlySet<string>;
   busySessionIds: Set<string>;
   approvalSessionIds: Set<string>;
   activeSessionId?: string;
@@ -265,11 +273,21 @@ type Props = {
     taskId?: string;
   }) => void;
   onOpenTask?: (taskId: string) => void;
+  onStartTask?: (taskId: string) => void;
   /** Just-created task — the rail's current task until a session takes over. */
   focusTaskId?: string;
   onEditTask?: (taskId: string) => void;
   onCreateTaskPrs?: (taskId: string) => void;
+  onSyncTaskBranches?: (taskId: string) => void;
   needsInputSessionIds?: ReadonlySet<string>;
+  /** Remote snapshots of linked tickets that changed — task menu status. */
+  linkedItemUpdates?: ReadonlyMap<string, LinkedSessionUpdate>;
+  /** Opens a task child's PR/CI review inside the task's conversation. */
+  onOpenTaskDelivery?: (
+    task: TaskWorkspace,
+    child: TaskChild,
+    ref: TaskDeliveryRef,
+  ) => void;
   onRemoveProject?: (path: string, options: { purgeData: boolean }) => void;
   onNew?: () => string | void;
   onNewTerminal?: () => void;
@@ -306,6 +324,7 @@ function SidebarComponent({
   gitCwd,
   open,
   sessions,
+  liveSessionIds,
   busySessionIds,
   approvalSessionIds,
   activeSessionId,
@@ -359,10 +378,14 @@ function SidebarComponent({
   onNewTask,
   onOpenCommands,
   onOpenTask,
+  onStartTask,
   focusTaskId,
   onEditTask,
   onCreateTaskPrs,
+  onSyncTaskBranches,
   needsInputSessionIds,
+  linkedItemUpdates,
+  onOpenTaskDelivery,
   onRemoveProject,
   onNew,
   onSearch,
@@ -1637,6 +1660,7 @@ function SidebarComponent({
               selectedPath={selectedDiffPath}
               selectedKind={selectedDiffKind}
               selectedSha={selectedCommitSha}
+              liveSessionIds={liveSessionIds}
               onOpenFile={
                 onOpenDiff ??
                 ((path) => onOpenFile(path, undefined, { exact: true }))
@@ -1760,10 +1784,15 @@ function SidebarComponent({
           onNewTask={onNewTask}
           onOpenCommands={onOpenCommands}
           onOpenTask={onOpenTask}
+          onStartTask={onStartTask}
           focusTaskId={focusTaskId}
           onEditTask={onEditTask}
           onCreateTaskPrs={onCreateTaskPrs}
+          onSyncTaskBranches={onSyncTaskBranches}
           needsInputSessionIds={needsInputSessionIds}
+          liveSessionIds={liveSessionIds}
+          linkedItemUpdates={linkedItemUpdates}
+          onOpenTaskDelivery={onOpenTaskDelivery}
           onRemoveProject={onRemoveProject}
           settingsOpen={settingsOpen}
           settingsSection={settingsSection}
@@ -2045,7 +2074,6 @@ function SidebarProjectPicker({
                   <Plus className="size-4 shrink-0" strokeWidth={1.75} />
                   <span>New project</span>
                 </button>
-
               </div>
             ) : null}
           </Popover>
@@ -2391,15 +2419,6 @@ function FolderRenameRow({
   );
 }
 
-type TaskScope = NonNullable<ReturnType<typeof taskForSession>>;
-
-/** Task scope for a session, live against the task store. `cwd` pins the
- * displayed host child to the copy the session actually runs in. */
-function useTaskScope(sessionId: string, cwd?: string) {
-  useSyncExternalStore(subscribeTaskWorkspaces, taskWorkspacesSnapshot);
-  return taskForSession(sessionId, cwd);
-}
-
 /** Task marker on a session card — the session belongs to a task rather
  * than a bare repository. */
 function SessionTaskChip({ scope }: { scope: TaskScope }) {
@@ -2492,7 +2511,8 @@ function SessionCard({
   const time = formatRelative(session.updatedAt, now);
   const model = compact
     ? null
-    : resolveModel(session.harness, session.model, sessionWorkCwd(session)).name;
+    : resolveModel(session.harness, session.model, sessionWorkCwd(session))
+        .name;
   const statusClass = needsApproval
     ? "text-amber-400"
     : busy
@@ -2532,7 +2552,7 @@ function SessionCard({
       className="size-1.5 shrink-0 rounded-full bg-accent"
     />
   ) : null;
-  const workItemBadge = sessionWorkItems(session).map(linkedWorkItem => (
+  const workItemBadge = sessionWorkItems(session).map((linkedWorkItem) => (
     <button
       type="button"
       key={`${linkedWorkItem.url}:${linkedWorkItem.account ?? ""}`}

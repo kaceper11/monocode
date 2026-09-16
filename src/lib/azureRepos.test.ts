@@ -461,6 +461,8 @@ it("lifts the watcher of an association the cap evicts", () => {
   const seeded = Array.from({ length: 100 }, (_, i) => ({
     ...association,
     target: { ...association.target, number: 100 + i },
+    // Validation requires pullRequestId to mirror the target number.
+    pr: { ...association.pr, pullRequestId: 100 + i },
     cwd: `/seeded/${i}`,
     sourceSessionId: `s${i}`,
   }));

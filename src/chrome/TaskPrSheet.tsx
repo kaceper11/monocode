@@ -8,7 +8,6 @@ import {
 } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
-  basename,
   gitPrBody,
   gitPrCheck,
   gitPrCreate,
@@ -61,14 +60,13 @@ import {
 import {
   loadTaskWorkspaces,
   projectForTask,
-  repositoryForChild,
   subscribeTaskWorkspaces,
+  taskChildRepoName,
   taskWorkspacesSnapshot,
   type TaskChild,
   type TaskWorkspace,
 } from "../lib/taskWorkspaces";
 import { watchGithubPrUrl } from "../lib/watchers";
-import { repositoryDisplayName } from "../lib/projects";
 import { useProjectBranchesState } from "../hooks/useProjectBranches";
 import { Modal } from "./Modal";
 import { Select } from "./Select";
@@ -91,6 +89,9 @@ type ExistingPr = {
   number?: number;
   /** The PR's actual target branch (short name). */
   base?: string;
+  /** Source branch the PR was found on — a later probe on a different
+   * branch must not keep it. */
+  branch?: string;
   azureTarget?: AzurePrTarget;
 };
 
@@ -190,15 +191,10 @@ export function TaskPrSheet({
     if (!task) return [];
     const project = projectForTask(task);
     return task.children.map((child) => {
-      const repo = repositoryForChild(task, child, project);
       return {
         child,
         cwd: child.workingCopy,
-        repoName: repo
-          ? repositoryDisplayName(repo)
-          : child.workingCopy
-            ? basename(child.workingCopy)
-            : "Repository",
+        repoName: taskChildRepoName(task, child, project),
         wsl: child.workingCopy ? wslLocation(child.workingCopy) : null,
       };
     });
@@ -217,7 +213,6 @@ export function TaskPrSheet({
       const draft = draftFor(row.child.id);
       return (
         draft?.target ||
-        row.child.mergeTarget ||
         runtime[row.child.id]?.check?.defaultBranch ||
         "main"
       );
@@ -277,7 +272,53 @@ export function TaskPrSheet({
         const check = await gitPrCheck(cwd, target);
         if (!fresh()) return;
         if (light) {
-          patchRow(id, { probing: false, check });
+          // Local-only recheck — but a recorded PR only blocks Create while
+          // it is still open on this branch. A branch switch drops it
+          // outright; a same-branch probe re-verifies it once so a PR
+          // merged or closed behind the sheet stops blocking without a
+          // manual Refresh.
+          const recorded = runtimeRef.current[id];
+          let existing = recorded?.existing;
+          if (
+            existing?.branch &&
+            check.branch &&
+            check.branch !== existing.branch
+          ) {
+            existing = undefined;
+          } else if (existing) {
+            if (
+              recorded?.existingProvider === "github" &&
+              gh?.authenticated
+            ) {
+              const pr = await gitPrStatus(cwd).catch(() => null);
+              if (!pr || pr.state !== "open") existing = undefined;
+            } else if (
+              recorded?.existingProvider === "azure" &&
+              existing.azureTarget &&
+              azure?.accountId &&
+              check.branch
+            ) {
+              try {
+                const page = await findAzurePrs(
+                  {
+                    ...existing.azureTarget,
+                    accountId: azure.accountId,
+                    number: 0,
+                  },
+                  check.branch,
+                  0,
+                );
+                const pr = page.items.find(
+                  (item) => item.status === "active",
+                );
+                if (!pr) existing = undefined;
+              } catch {
+                /* Transient — keep the recorded PR rather than unblock on a guess. */
+              }
+            }
+          }
+          if (!fresh()) return;
+          patchRow(id, { probing: false, check, existing });
           return;
         }
         const ctx = await ciContext(cwd).catch(() => null);
@@ -318,6 +359,7 @@ export function TaskPrSheet({
                   title: pr.title,
                   number: pr.pullRequestId,
                   base: pr.targetRefName.replace(/^refs\/heads\//, ""),
+                  branch: check.branch,
                   azureTarget: prTarget,
                 };
               }
@@ -337,6 +379,7 @@ export function TaskPrSheet({
               title: pr.title,
               number: pr.number,
               base: pr.base,
+              branch: check.branch,
             };
           }
         }
@@ -354,7 +397,6 @@ export function TaskPrSheet({
         if (
           allowRetarget &&
           !draft?.target &&
-          !row.child.mergeTarget &&
           check.defaultBranch &&
           target !== check.defaultBranch
         ) {
@@ -854,8 +896,7 @@ function TaskPrRow({
   const cwd = row.cwd;
   const branches = useProjectBranchesState(cwd ?? "", Boolean(cwd));
   const check = runtime?.check;
-  const target =
-    draft?.target || row.child.mergeTarget || check?.defaultBranch || "main";
+  const target = draft?.target || check?.defaultBranch || "main";
   const title = draft?.title || task.name;
   const body = draft?.body ?? "";
   const isDraft = draft?.draft === true;

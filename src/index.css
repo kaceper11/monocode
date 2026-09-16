@@ -1253,6 +1253,13 @@ header[data-tauri-drag-region] button {
   animation: modal-panel-in 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
+/* A modal swapped in for a just-closed one skips the entrance — replaying it
+   would flash the screen undimmed for a frame between the two backdrops. */
+.modal-swap .modal-backdrop,
+.modal-swap .modal-panel {
+  animation: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .modal-backdrop,
   .modal-panel {

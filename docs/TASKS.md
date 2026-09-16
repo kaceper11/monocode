@@ -22,7 +22,7 @@ embedded.
 - **Checkout** (`TaskChild`) — "repository R's share of attempt A lives at
   path P on branch B." Carries `repositoryId` + `attemptId`, the working-copy
   binding (`workingCopy`), creation inputs (`baseRef`/`baseCommit`/`branch`),
-  `mergeTarget`, `responsibility`, per-repo `sessionIds` and a `launch`
+  `responsibility`, per-repo `sessionIds` and a `launch`
   lifecycle (`pending`/`working`/`ready`/`failed`).
 - **Git worktree** — never a stored entity. It is filesystem state discovered
   through `git_repository_family` inventory and reconciled on refresh; a
@@ -31,7 +31,13 @@ embedded.
 - **Session** — first-class, referenced not owned. `session.cwd` equals one
   checkout's path; which list holds the id encodes scope — `task.sessionIds`
   for a conversation working across the whole task, `child.sessionIds` for a
-  repo-scoped worker.
+  repo-scoped worker. Sessions are also *claimed by location*: a session
+  created inside a task-owned checkout (`taskOwnsCheckout` — a worktree the
+  task made, not a borrowed copy) attaches to `task.sessionIds` via
+  `linkTaskSession`, and Task Details' conversation rollup additionally
+  lists live sessions rooted in those copies even when no link was
+  recorded. Borrowed `existing`/`main` copies never claim — sessions there
+  are not necessarily task work.
 
 There is deliberately no **Workspace** entity: a task's workspace is derived
 (the set of children's working copies), and `Workspace*` already names the
@@ -93,9 +99,11 @@ that touch disjoint repositories, keep today's output.
 - Delivery attribution (Azure PR associations, CI sources, PR drafts keyed
   `taskId:childId`) keys on the checkout's `cwd`+`branch`+session — attempts
   need no schema change there: recorded branches are enforced distinct per
-  repository and task-created worktrees get distinct paths. Two attempts can
-  still bind the *same borrowed* `existing` copy (same path); session ids
-  remain the disambiguator and `taskChildrenForWorkingCopy` reports both.
+  repository and task-created worktrees get distinct paths. Working-copy
+  paths are unique across all of a task's children — two attempts cannot
+  share even a borrowed `existing` copy (`assertUniqueChildBindings` throws,
+  sanitize drops the later claim), so `taskChildrenForWorkingCopy` only ever
+  reports multiple claims across *different* tasks.
 - "Add a repo mid-task" (`addTaskChildren`, `reviseTask`) targets a chosen
   attempt via the draft's `attemptId` (default primary); whether a new repo
   should materialize into every attempt is a product decision, not a model
@@ -135,12 +143,28 @@ that touch disjoint repositories, keep today's output.
   session-linked work items), per-repository working copies with launch
   state and delivery badges, saved PR links (Azure associations, the cached
   GitHub branch PR, `taskPrs` drafts/results) and CI sources, and the task's
-  conversations resolved against sidebar history. It renders saved/cached
-  state only — no Git or provider fetch — and external links are opened
-  after an http(s) check. Each prepared working-copy row carries a manage
-  chevron that closes the sheet and opens the shared worktree modal focused
-  on that copy (`OPEN_WORKTREE_MANAGER`); the same event backs the rail's
-  per-worktree menu and the attention queue's pre-checked cleanup.
+  conversations resolved against sidebar history — the launch session
+  (`sessionIds[0]`) is marked "primary" when more than one is listed, and
+  the rail menu reads "Open N conversations…" (opening this sheet) instead
+  of a singular label once a task has several. The CI section adds one
+  on-demand fetch per prepared working copy (`taskCi`) — GitHub check runs
+  on the branch PR's head, the GitLab head pipeline on its MR (the MR
+  itself shows under Pull requests even without a pipeline) — deduped
+  per checkout, branch-labelled, and never polled; saved Azure links need
+  no fetch. A failing, still-current row offers Fix, which rebuilds the
+  repair draft through the same verified provider flows as the attention
+  queue (`azureCiRepairDraft`, `githubCiRepair`, `gitlabPipelineRepair`)
+  and sends it to the task's live conversation or the destination picker.
+  Bound PR/MR/CI rows open the provider's review surface in-app — PR
+  comments, checks and pipeline jobs — as a delivery tab inside the task's
+  conversation workspace (`mountDeliveryTab`, shared with the inbox
+  delivery opener); the external link stays one icon click away. The
+  delivery binding itself (which provider a checkout reports against)
+  remains the Git Changes panel's job — details only reads and routes.
+  Each prepared working-copy row carries a manage chevron that closes the
+  sheet and opens the shared worktree modal focused on that copy
+  (`OPEN_WORKTREE_MANAGER`); the same event backs the rail's per-worktree
+  menu and the attention queue's pre-checked cleanup.
 
 ## Verification
 

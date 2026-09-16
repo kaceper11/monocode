@@ -519,3 +519,101 @@ it("drops pending line comments when the PR head moves", async () => {
     await cleanup();
   }
 });
+
+it("re-arms actions when a hidden tab is re-shown mid-request", async () => {
+  let release: (value: unknown) => void = () => undefined;
+  const gate = new Promise((resolve) => (release = resolve));
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  const cleanup = await setup();
+  try {
+    await click("Pull requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("#42 Fix scoped review");
+      }),
+    );
+    // Park a refresh on a state read it never finishes.
+    vi.mocked(invoke).mockImplementation(async (command, args) =>
+      command === "git_github_pr_state" ? gate : original(command, args),
+    );
+    await act(async () => button("Refresh PR").click());
+    await click("Files");
+    await click("Pull requests");
+    await act(async () => release(null));
+    // Without the re-arm, pending stays true and every action stays disabled.
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(button("Refresh PR").disabled).toBe(false);
+      }),
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+it("does not let a stale in-flight reply wipe state after a hide/re-show", async () => {
+  let release: (value: unknown) => void = () => undefined;
+  const gate = new Promise((resolve) => (release = resolve));
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  const cleanup = await setup();
+  try {
+    await click("Pull requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("Unresolved");
+      }),
+    );
+    await expandThread();
+    await typeText('textarea[aria-label="Reply to review thread"]', "first draft");
+    // Park the reply call while the tab hides and re-shows.
+    vi.mocked(invoke).mockImplementation(async (command, args) =>
+      command === "git_github_work_item_comment" ? gate : original(command, args),
+    );
+    await act(async () => button("Reply").click());
+    await click("Files");
+    await click("Pull requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("Unresolved");
+      }),
+    );
+    await expandThread();
+    await typeText('textarea[aria-label="Reply to review thread"]', "second draft");
+    await act(async () => release("https://github.com/acme/app/pull/42#x"));
+    // The stale completion must not clear the new draft or leave the thread
+    // stuck in a busy state.
+    const replyAfter = document.querySelector(
+      'textarea[aria-label="Reply to review thread"]',
+    ) as HTMLTextAreaElement;
+    expect(replyAfter.value).toBe("second draft");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(button("Reply").disabled).toBe(false);
+      }),
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+it("keeps the PR readable when discussions fail to load", async () => {
+  const original = vi.mocked(invoke).getMockImplementation()!;
+  const cleanup = await setup();
+  try {
+    vi.mocked(invoke).mockImplementation(async (command, args) =>
+      command === "git_github_work_item_thread"
+        ? Promise.reject(new Error("Discussions unavailable"))
+        : original(command, args),
+    );
+    await click("Pull requests");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("#42 Fix scoped review");
+      }),
+    );
+    expect(document.body.textContent).toContain("Discussions unavailable");
+    expect(document.body.textContent).not.toContain("No review threads.");
+  } finally {
+    await cleanup();
+  }
+});

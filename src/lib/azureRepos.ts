@@ -476,13 +476,18 @@ export const azurePrScope = (cwd: string, branch: string, session?: string) =>
   JSON.stringify([cwd, branch, session ?? null]);
 /** Every saved association, validated — one storage read for callers that
  * aggregate several scopes (e.g. a task's repository children). */
+// Validated rows keyed on the raw snapshot — task delivery badges call this
+// per child per row, so repeated parses of the same blob are the hot path.
+let associationsCacheRaw: string | undefined;
+let associationsCache: AzurePrAssociation[] = [];
+
 export function allAzurePrAssociations(): AzurePrAssociation[] {
   try {
-    const rows: unknown = JSON.parse(
-      localStorage.getItem(ASSOCIATIONS_KEY) ?? "[]",
-    );
+    const raw = localStorage.getItem(ASSOCIATIONS_KEY) ?? "[]";
+    if (raw === associationsCacheRaw) return associationsCache;
+    const rows: unknown = JSON.parse(raw);
     if (!Array.isArray(rows)) return [];
-    return rows
+    associationsCache = rows
       .slice(0, 100)
       .filter((value) => {
         try {
@@ -524,6 +529,8 @@ export function allAzurePrAssociations(): AzurePrAssociation[] {
           return false;
         }
       });
+    associationsCacheRaw = raw;
+    return associationsCache;
   } catch {
     return [];
   }
@@ -573,7 +580,12 @@ export function unbindAzurePrSession(sessionId: string) {
       seen.add(key);
       return true;
     });
-  localStorage.setItem(ASSOCIATIONS_KEY, JSON.stringify(next));
+  try {
+    localStorage.setItem(ASSOCIATIONS_KEY, JSON.stringify(next));
+  } catch {
+    /* Quota/denied storage — teardown must not abort on a dropped unbind. */
+    return;
+  }
   if (typeof window !== "undefined")
     window.dispatchEvent(new Event(AZURE_PR_ASSOCIATIONS_CHANGED));
 }
@@ -584,15 +596,9 @@ export function saveAzurePrAssociation(
   session?: string,
   removeTarget?: AzurePrTarget,
 ) {
-  let rows: AzurePrAssociation[] = [];
-  try {
-    const stored: unknown = JSON.parse(
-      localStorage.getItem(ASSOCIATIONS_KEY) ?? "[]",
-    );
-    if (Array.isArray(stored)) rows = stored;
-  } catch {
-    /* Recover only this feature's malformed data. */
-  }
+  // Merge against validated rows — a raw parse would keep malformed entries
+  // alive through every rewrite.
+  let rows = allAzurePrAssociations();
   // The in-scope rows this write can drop or replace — captured before
   // filtering so a departed link can lift its watcher below. A session-scoped
   // write also owns session-less rows at this checkout: they get adopted into
@@ -634,7 +640,12 @@ export function saveAzurePrAssociation(
       },
     });
   const kept = rows.slice(0, 100);
-  localStorage.setItem(ASSOCIATIONS_KEY, JSON.stringify(kept));
+  try {
+    localStorage.setItem(ASSOCIATIONS_KEY, JSON.stringify(kept));
+  } catch {
+    /* Quota/denied storage — report the drop, don't crash the handler. */
+    return;
+  }
   if (typeof window !== "undefined") window.dispatchEvent(new Event(AZURE_PR_ASSOCIATIONS_CHANGED));
   // A saved link owns a review watcher: registered on first link, lifted only
   // when no remaining row — in any session scope — still covers the delivery

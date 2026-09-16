@@ -21,6 +21,7 @@ export function WorktreeRemovalBatch({
   busy,
   error,
   confirmLabel,
+  labelFor,
   onCancel,
   onConfirm,
   onReview,
@@ -37,6 +38,9 @@ export function WorktreeRemovalBatch({
   /** Extra destructive framing, e.g. "Remove 3 & delete" — defaults to
    * "Remove N". */
   confirmLabel?: string;
+  /** Optional row context — e.g. the owning repository when a batch can
+   * span several — prefixed onto the branch·path line. */
+  labelFor?: (entry: RemovalEntry) => string | undefined;
   onCancel: () => void;
   onConfirm: () => void;
   /** Review handoff for skipped/failed rows — receives the full row so the
@@ -75,8 +79,12 @@ export function WorktreeRemovalBatch({
           {removable.map((safety) => (
             <p
               key={safety.entry.path}
+              title={prettyCwd(safety.entry.path)}
               className="truncate font-mono text-[11px] text-content/70"
             >
+              {labelFor?.(safety.entry)
+                ? `${labelFor(safety.entry)} · `
+                : ""}
               {safety.entry.branch?.replace("refs/heads/", "")} ·{" "}
               {prettyCwd(safety.entry.path)}
               {safety.entry.users.length
@@ -108,7 +116,11 @@ export function WorktreeRemovalBatch({
           {skipped.map((skip) => (
             <div key={skip.entry.path} className="flex items-center gap-2">
               <div className="min-w-0 flex-1">
-                <p className="truncate font-mono text-[11px] text-content/70">
+                <p
+                  title={prettyCwd(skip.entry.path)}
+                  className="truncate font-mono text-[11px] text-content/70"
+                >
+                  {labelFor?.(skip.entry) ? `${labelFor(skip.entry)} · ` : ""}
                   {skip.entry.branch?.replace("refs/heads/", "") ??
                     `Detached ${skip.entry.head.slice(0, 8)}`}
                 </p>
