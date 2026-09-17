@@ -2,7 +2,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { InboxItem } from "../lib/githubTasks";
-import type { SessionSummary } from "../lib/sessionStore";
+import type { InboxMyWork } from "../lib/inboxMyWork";
 import { InboxDetail } from "./InboxView";
 
 function item(overrides: Partial<InboxItem> = {}): InboxItem {
@@ -23,16 +23,13 @@ function item(overrides: Partial<InboxItem> = {}): InboxItem {
   };
 }
 
-function renderDetail(
-  inboxItem: InboxItem,
-  relatedSessions: SessionSummary[] = [],
-) {
+function renderDetail(inboxItem: InboxItem, myWork?: InboxMyWork) {
   return renderToStaticMarkup(
     createElement(InboxDetail, {
       item: inboxItem,
       cwd: "/tmp/web",
       revision: 0,
-      relatedSessions,
+      myWork,
       onDiscuss: () => {},
     }),
   );
@@ -114,25 +111,44 @@ describe("InboxDetail layout", () => {
     expect(header).toContain("Open on GitLab");
   });
 
-  it("keeps related threads in the pinned header", () => {
-    const markup = renderDetail(item(), [
-      {
-        id: "session-1",
-        cwd: "/tmp/web",
-        harness: "codex",
-        model: "gpt-5",
-        runtimeMode: "supervised",
-        title: "Review MonoCode Pull Request",
-        createdAt: 1,
-        updatedAt: 1,
-      },
-    ]);
+  it("keeps attached tasks and conversations in the pinned header", () => {
+    const markup = renderDetail(item(), {
+      tasks: [
+        {
+          id: "task-1",
+          name: "Review work",
+          sessions: 1,
+          status: [],
+          delivery: {
+            prs: 0,
+            prNeedsAttention: false,
+            ci: 0,
+            ciRunning: false,
+            ciFailing: false,
+          },
+        },
+      ],
+      sessions: [
+        {
+          sessionId: "session-1",
+          cwd: "/tmp/web",
+          harness: "codex",
+          state: "idle",
+          title: "Review MonoCode Pull Request",
+        },
+      ],
+      prs: [],
+      ci: [],
+      attention: [],
+      hasWork: true,
+    });
     const headerIndex = markup.indexOf("data-inbox-detail-header");
     const scrollIndex = markup.indexOf("data-inbox-detail-scroll");
     const header = markup.slice(headerIndex, scrollIndex);
     const body = markup.slice(scrollIndex);
 
-    expect(header).toContain("Related thread");
+    expect(header).toContain("Work on this item");
+    expect(header).toContain("Review work");
     expect(header).toContain("Review MonoCode Pull Request");
     expect(body).not.toContain("Review MonoCode Pull Request");
   });

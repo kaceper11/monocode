@@ -3,7 +3,7 @@ import { Activity, act, createElement, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { AzurePrReview } from "./AzurePrReview";
+import { AzurePrReview, voteSummary } from "./AzurePrReview";
 import { PREPARE_AGENT_CONTEXT } from "../lib/agentContext";
 import { AZURE_CHANGE_EVENT } from "../lib/azure";
 
@@ -123,6 +123,30 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+it("rolls the worst reviewer vote into the meta summary", () => {
+  const reviewer = (vote: number) => ({
+    id: `${vote}`,
+    displayName: "R",
+    vote,
+  });
+  expect(voteSummary([])).toBeNull();
+  expect(voteSummary([reviewer(-10)])).toMatchObject({
+    label: "Rejected",
+    tone: "failing",
+  });
+  // A waiting-for-author vote outranks approvals — worst vote wins.
+  expect(voteSummary([reviewer(10), reviewer(-5), reviewer(5)])).toMatchObject(
+    { label: "Waiting for author", tone: "running" },
+  );
+  expect(voteSummary([reviewer(10), reviewer(5)])).toMatchObject({
+    label: "2 approvals",
+    tone: "passing",
+  });
+  expect(voteSummary([reviewer(0), reviewer(0)])).toMatchObject({
+    label: "2 reviewers",
+  });
 });
 
 const button = (label: string) =>

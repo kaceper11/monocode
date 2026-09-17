@@ -4,18 +4,15 @@ import {
   ACTION_GHOST,
 } from "../chrome/inboxActions";
 import { AzureInboxDetail } from "../chrome/AzureInboxDetail";
-import { Select } from "../chrome/Select";
 
 import { contextTicketKey } from "../lib/agentContext";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   CheckCheck,
   Check,
-  ChevronDown,
   CircleDot,
   CircleX,
   ExternalLink,
-  GitBranch,
   GitCompare,
   GitMerge,
   GitPullRequest,
@@ -33,7 +30,6 @@ import {
   type IconComponent,
 } from "../chrome/icons";
 import {
-  Fragment,
   memo,
   useCallback,
   useEffect,
@@ -55,11 +51,8 @@ import {
   useInboxContext,
 } from "../chrome/InboxContextPicker";
 import { InboxRelated } from "../chrome/InboxRelated";
-import {
-  InboxMyWorkSection,
-  MyWorkBadges,
-  myWorkBadges,
-} from "../chrome/InboxMyWorkSection";
+import { MyWorkBadges, myWorkBadges } from "../chrome/InboxMyWorkSection";
+import { InboxTasksSection } from "../chrome/InboxTasksSection";
 import { inboxMyWorkForItems, type InboxMyWork } from "../lib/inboxMyWork";
 import type { AttentionItem } from "../lib/attention";
 import {
@@ -73,11 +66,6 @@ import {
   subscribeProjects,
 } from "../lib/projects";
 import { useDeliveryStores } from "../hooks/useDeliveryStores";
-import {
-  deliveryFromLinks,
-  sessionDeliveryLinks,
-  type TaskChildDelivery,
-} from "../lib/taskDelivery";
 import {
   diffStatsVersion,
   peekProjectDiffStats,
@@ -93,7 +81,6 @@ import { contextFromTickets, requestAgentContext } from "../lib/agentContext";
 import { ProjectLogoIcon } from "../chrome/ProjectLogoIcon";
 import { ProjectMascot } from "../chrome/ProjectMascot";
 import { OverlayNav } from "../chrome/TitleBar";
-import { Popover } from "../chrome/Popover";
 import {
   loadTaskWorkspaces,
   subscribeTaskWorkspaces,
@@ -156,7 +143,7 @@ import {
   type InboxFilters,
   type InboxSource,
 } from "../lib/inboxFilters";
-import { pathKey, projectKey, projectName } from "../lib/paths";
+import { projectKey, projectName } from "../lib/paths";
 import { IS_MAC } from "../lib/platform";
 import { type RecentProject } from "../lib/recents";
 import {
@@ -164,11 +151,7 @@ import {
   subscribeRepositoryFamilies,
   type RepositoryFamily,
 } from "../lib/repositoryFamilies";
-import {
-  sessionDisplayTitle,
-  sessionWorkCwd,
-  type LinkedWorkItem,
-} from "../lib/session";
+import { type LinkedWorkItem } from "../lib/session";
 import type { SessionSummary } from "../lib/sessionStore";
 import {
   inboxRelatedSessionCounts,
@@ -1769,7 +1752,6 @@ function InboxDetailBody({
       item={item}
       cwd={cwd}
       revision={revision}
-      relatedSessions={relatedSessions}
       viewingSessionId={viewingSessionId}
       onDiscuss={onDiscuss}
       onOpenSession={onOpenSession}
@@ -1820,6 +1802,16 @@ function inboxStatusMark(item: InboxItem): InboxStatusMark {
   };
 }
 
+/** Same kind wording on the card and the detail — providers differ in name
+ * (work item vs issue, MR vs PR), not in layout. */
+function inboxKindLabel(item: InboxItem): string {
+  if (item.kind === "ci") return "CI";
+  if (item.kind === "pr")
+    return item.provider === "gitlab" ? "Merge request" : "Pull request";
+  if (item.kind === "azure") return "Work item";
+  return "Issue";
+}
+
 const InboxCard = memo(function InboxCard({
   item,
   active,
@@ -1844,19 +1836,13 @@ const InboxCard = memo(function InboxCard({
 }) {
   useInboxSeenTick();
   const status = inboxStatusMark(item);
-  const kindLabel =
-    item.kind === "ci"
-      ? "CI"
-      : item.kind === "pr"
-        ? item.provider === "gitlab"
-          ? "Merge request"
-          : "Pull request"
-        : "Issue";
+  const kindLabel = inboxKindLabel(item);
   const time = formatRelativeTime(item.updatedAt);
   const name = projectLabel?.trim() || projectName(item.projectPath);
   const linear = item.provider === "linear";
   const jira = item.provider === "jira";
   const azure = item.provider === "azure";
+  const statusLabel = linear || jira || azure ? item.state : status.label;
   const source = azure
     ? `${item.site?.split("/").pop()} / ${item.projectName}`
     : jira
@@ -1879,7 +1865,7 @@ const InboxCard = memo(function InboxCard({
       type="button"
       title={item.title}
       aria-current={active ? "true" : undefined}
-      aria-label={`${jira || azure ? item.state : status.label} ${kindLabel.toLowerCase()} ${inboxItemRef(
+      aria-label={`${statusLabel} ${kindLabel.toLowerCase()} ${inboxItemRef(
         item,
       )}: ${item.title}${attentionLabel ? `, ${attentionLabel}` : ""}${unseen ? ", new" : ""}${relatedSessionCount > 0 ? `, ${relatedSessionCount} related ${relatedSessionCount === 1 ? "thread" : "threads"}` : ""}${work?.aria ? `, ${work.aria}` : ""}`}
       onClick={() => onSelect(item)}
@@ -1900,8 +1886,7 @@ const InboxCard = memo(function InboxCard({
             strokeWidth={1.75}
           />
           <span className="min-w-0 truncate text-[11px] text-content/50">
-            {jira || (azure && !item.delivery) ? "" : `${kindLabel} · `}
-            {inboxItemRef(item)}
+            {kindLabel} · {inboxItemRef(item)}
             {attentionLabel ? ` · ${attentionLabel}` : ""}
           </span>
         </span>
@@ -1946,7 +1931,7 @@ const InboxCard = memo(function InboxCard({
               className="size-3 shrink-0"
             />
           )}
-          {jira || azure ? (
+          {linear || jira || azure ? (
             <span className="max-w-[55%] truncate" title={item.state}>
               {item.state} ·
             </span>
@@ -1954,7 +1939,7 @@ const InboxCard = memo(function InboxCard({
           <span className="min-w-0 truncate">{source}</span>
         </span>
         <MyWorkBadges work={myWork} />
-        {!azure && item.labels.length > 0 ? (
+        {item.labels.length > 0 ? (
           <span className="flex min-w-0 shrink-0 items-center gap-1">
             {item.labels.slice(0, 2).map((label) => (
               <InboxLabel key={label.name} label={label} compact />
@@ -1970,7 +1955,6 @@ export function InboxDetail({
   item,
   cwd,
   revision,
-  relatedSessions,
   viewingSessionId,
   onDiscuss,
   onOpenSession,
@@ -1981,10 +1965,8 @@ export function InboxDetail({
   item: InboxItem;
   cwd: string;
   revision: number;
-  relatedSessions: readonly SessionSummary[];
-  /** Session currently embedded in the inbox conversation panel — when it
-   * shares the working copy it hosts the delivery tab so the review opens
-   * next to the conversation the user is actually looking at. */
+  /** Session the user is currently reading — it hosts its checkout's
+   * delivery cluster when several conversations share a working copy. */
   viewingSessionId?: string;
   onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
@@ -2000,141 +1982,6 @@ export function InboxDetail({
   onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
 }) {
   const detailLock = useLockOverscroll<HTMLDivElement>();
-  const [deliveryProviders, setDeliveryProviders] = useState<
-    Record<string, "github" | "azure" | "gitlab">
-  >(() => {
-    try {
-      const saved = JSON.parse(
-        localStorage.getItem("monocode.inboxDeliveryProviders.v2") || "{}",
-      );
-      return saved && typeof saved === "object" && !Array.isArray(saved)
-        ? (Object.fromEntries(
-            Object.entries(saved)
-              .filter(
-                ([, value]) =>
-                  value === "github" || value === "azure" || value === "gitlab",
-              )
-              .slice(-100),
-          ) as Record<string, "github" | "azure" | "gitlab">)
-        : {};
-    } catch {
-      return {};
-    }
-  });
-  const [choosingProviders, setChoosingProviders] = useState<string | null>(
-    null,
-  );
-  // Delivery is branch-scoped: a provider choice belongs to the working copy
-  // (normalized), not to one conversation or ticket that happened to send it.
-  const providerKey = (scope: string, kind: "pr" | "ci") =>
-    JSON.stringify([scope, kind]);
-  const deliveryProvider = (
-    scope: string,
-    kind: "pr" | "ci",
-    inferred?: "github" | "azure" | "gitlab",
-  ) => {
-    const saved = deliveryProviders[providerKey(scope, kind)] ?? inferred;
-    const provider =
-      saved === "github" || saved === "azure" || saved === "gitlab"
-        ? saved
-        : item.provider === "github" ||
-            item.provider === "azure" ||
-            item.provider === "gitlab"
-          ? item.provider
-          : undefined;
-    // GitLab pipelines ride the MR surface — never a standalone CI delivery.
-    return provider === "gitlab" && kind === "ci" ? undefined : provider;
-  };
-  const saveProvider = (scope: string, kind: "pr" | "ci", provider: string) => {
-    if (
-      provider !== "" &&
-      provider !== "github" &&
-      provider !== "azure" &&
-      provider !== "gitlab"
-    )
-      return;
-    const key = providerKey(scope, kind);
-    const next = Object.fromEntries(
-      [
-        ...Object.entries(deliveryProviders).filter(([entry]) => entry !== key),
-        ...(provider ? [[key, provider]] : []),
-      ].slice(-100),
-    );
-    try {
-      localStorage.setItem(
-        "monocode.inboxDeliveryProviders.v2",
-        JSON.stringify(next),
-      );
-      setDeliveryProviders(next);
-    } catch {
-      setDeliveryError("Could not save delivery providers. Try again.");
-    }
-  };
-  const [deliveryBusy, setDeliveryBusy] = useState(false);
-  const [deliveryError, setDeliveryError] = useState("");
-  const deliveryPending = useRef(false);
-  const deliveryMounted = useRef(true);
-  useEffect(() => {
-    deliveryMounted.current = true;
-    return () => {
-      deliveryMounted.current = false;
-    };
-  }, []);
-  const openDelivery = async (
-    sessionId: string,
-    scope: string,
-    kind: "pr" | "ci",
-    inferred?: "github" | "azure" | "gitlab",
-  ) => {
-    if (!onOpenDelivery || deliveryPending.current) return;
-    const provider = deliveryProvider(scope, kind, inferred);
-    if (!provider) {
-      setChoosingProviders(scope);
-      return;
-    }
-    deliveryPending.current = true;
-    setDeliveryBusy(true);
-    setDeliveryError("");
-    try {
-      await onOpenDelivery(
-        sessionId,
-        kind,
-        () => deliveryMounted.current,
-        provider,
-        item.provider === "github" && item.kind === "pr" ? item.url : undefined,
-        item.provider === "gitlab" && item.kind === "pr"
-          ? { repo: item.repo, number: item.number }
-          : undefined,
-      );
-    } catch (error) {
-      if (deliveryMounted.current)
-        setDeliveryError(
-          error instanceof Error ? error.message : String(error),
-        );
-    } finally {
-      deliveryPending.current = false;
-      if (deliveryMounted.current) setDeliveryBusy(false);
-    }
-  };
-  // Delivery is branch-scoped — threads in one working copy open the same
-  // PR/CI, so group them by normalized work cwd (worktree first), matching
-  // what a delivery open resolves. `relatedSessions` is fresh each render —
-  // no memo.
-  const threadGroups: {
-    key: string;
-    cwd: string;
-    sessions: SessionSummary[];
-  }[] = [];
-  for (const session of relatedSessions) {
-    const cwd = sessionWorkCwd(session);
-    const key = cwd ? pathKey(cwd) : "";
-    const group = key
-      ? threadGroups.find((entry) => entry.key === key)
-      : undefined;
-    if (group) group.sessions.push(session);
-    else threadGroups.push({ key, cwd, sessions: [session] });
-  }
-  const stores = useDeliveryStores();
   const linear = item.provider === "linear";
   const jira = item.provider === "jira";
   const azure = item.provider === "azure";
@@ -2502,15 +2349,7 @@ export function InboxDetail({
                 provider={item.provider}
                 className="size-3.5"
               />
-              {azure ? null : (
-                <span>
-                  {item.kind === "pr"
-                    ? gitlab
-                      ? "Merge request"
-                      : "Pull request"
-                    : "Issue"}
-                </span>
-              )}
+              <span>{inboxKindLabel(item)}</span>
               <span className="tabular-nums">{inboxItemRef(item)}</span>
               <span
                 className={`flex items-center gap-1 ${statusMark.className}`}
@@ -2591,193 +2430,19 @@ export function InboxDetail({
                 </>
               ) : null}
             </div>
-            {relatedSessions.length > 0 ? (
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="mr-0.5 inline-flex items-center gap-1 text-[11px] text-content/45">
-                  <MessageMultiple className="size-3.5" strokeWidth={1.75} />
-                  Related {relatedSessions.length === 1 ? "thread" : "threads"}
-                </span>
-                {threadGroups.map((group) => (
-                  <Fragment key={group.key || group.sessions[0].id}>
-                    {group.sessions.map((session) => (
-                      <RelatedThreadChip
-                        key={session.id}
-                        session={session}
-                        onOpen={() =>
-                          void Promise.resolve(
-                            onOpenSession?.(session.id),
-                          ).catch((reason) => setSendError(String(reason)))
-                        }
-                      />
-                    ))}
-                  </Fragment>
-                ))}
-                {choosingProviders
-                  ? (() => {
-                      const group = threadGroups.find(
-                        (entry) => entry.key === choosingProviders,
-                      );
-                      if (!group) return null;
-                      const title =
-                        peekProjectDiffStats(group.cwd)?.branch?.trim() ||
-                        projectName(group.cwd);
-                      return (
-                        <span className="flex w-full flex-wrap items-center gap-2 rounded-md border border-content/10 p-2">
-                          {(
-                            [
-                              ["pr", "PR provider"],
-                              ["ci", "CI provider"],
-                            ] as const
-                          ).map(([kind, label]) => (
-                            <span
-                              key={kind}
-                              className="text-[11px] text-content/60"
-                            >
-                              {label}
-                              <Select
-                                label={`${label} for ${title}`}
-                                value={
-                                  deliveryProviders[
-                                    providerKey(group.key, kind)
-                                  ] ?? ""
-                                }
-                                options={[
-                                  {
-                                    value: "",
-                                    label:
-                                      item.provider === "github" ||
-                                      item.provider === "azure" ||
-                                      item.provider === "gitlab"
-                                        ? "Use ticket provider"
-                                        : "Choose provider",
-                                  },
-                                  {
-                                    value: "github",
-                                    label:
-                                      kind === "pr"
-                                        ? "GitHub"
-                                        : "GitHub checks",
-                                  },
-                                  {
-                                    value: "azure",
-                                    label:
-                                      kind === "pr"
-                                        ? "Azure Repos"
-                                        : "Azure Pipelines",
-                                  },
-                                  ...(kind === "pr"
-                                    ? [{ value: "gitlab", label: "GitLab" }]
-                                    : []),
-                                ]}
-                                onChange={(value) =>
-                                  saveProvider(group.key, kind, value)
-                                }
-                              />
-                            </span>
-                          ))}
-                          <button
-                            type="button"
-                            className="px-2 py-1 text-[11px]"
-                            onClick={() => setChoosingProviders(null)}
-                          >
-                            Done
-                          </button>
-                        </span>
-                      );
-                    })()
-                  : null}
+            {myWork?.hasWork ? (
+              // Bounded — a busy item's task/conversation/queue list must
+              // never push the actions and tabs below off the pinned header.
+              <div className="max-h-56 overflow-y-auto overscroll-contain">
+                <InboxTasksSection
+                  item={item}
+                  work={myWork}
+                  viewingSessionId={viewingSessionId}
+                  onOpenSession={onOpenSession}
+                  onOpenDelivery={onOpenDelivery}
+                  onOpenAttention={onAttentionAction}
+                />
               </div>
-            ) : null}
-            {onOpenDelivery &&
-            threadGroups.some(
-              (group) =>
-                group.key &&
-                group.cwd !== "~" &&
-                group.sessions.some((entry) => !isAskThread(entry)),
-            ) ? (
-              <div className="space-y-0.5">
-                <span className="inline-flex items-center gap-1 px-1 text-[11px] text-content/45">
-                  <GitBranch className="size-3.5" strokeWidth={1.75} />
-                  Branches
-                </span>
-                {threadGroups.map((group) => {
-                  // "~" and cwd-less threads have no checkout to resolve against.
-                  if (!group.key || group.cwd === "~") return null;
-                  // The copy's delivery tab needs a workspace host — an ask
-                  // thread can't mount it; identity only picks where the review
-                  // opens, not which branch's PR/CI shows (that's the cwd's).
-                  const host =
-                    group.sessions.find(
-                      (entry) =>
-                        entry.id === viewingSessionId && !isAskThread(entry),
-                    ) ??
-                    group.sessions.find(
-                      (entry) => !entry.archived && !isAskThread(entry),
-                    ) ??
-                    group.sessions.find((entry) => !isAskThread(entry));
-                  if (!host) return null;
-                  const branch = peekProjectDiffStats(
-                    group.cwd,
-                  )?.branch?.trim();
-                  // Scope links to the host session — the opened surface filters
-                  // by its source session, so a wider count would over-promise.
-                  const links = sessionDeliveryLinks({
-                    cwd: group.cwd,
-                    branches: [
-                      branch,
-                      ...group.sessions.map((entry) => entry.branch),
-                    ],
-                    sessionIds: [host.id],
-                    githubPr: cachedBranchPr(group.cwd, branch),
-                    stores,
-                  });
-                  const delivery = deliveryFromLinks(links);
-                  // Saved pick → the provider that actually has links → ticket.
-                  const inferred = (kind: "pr" | "ci") =>
-                    kind === "pr"
-                      ? links.prs.length
-                        ? ("azure" as const)
-                        : links.githubPr
-                          ? ("github" as const)
-                          : undefined
-                      : links.ci.length
-                        ? ("azure" as const)
-                        : links.githubPr
-                          ? ("github" as const)
-                          : undefined;
-                  return (
-                    <BranchDeliveryRow
-                      key={group.key}
-                      cwd={group.cwd}
-                      branch={branch}
-                      delivery={delivery}
-                      busy={deliveryBusy}
-                      providerFor={(kind) =>
-                        deliveryProvider(group.key, kind, inferred(kind))
-                      }
-                      onOpen={(kind) =>
-                        void openDelivery(
-                          host.id,
-                          group.key,
-                          kind,
-                          inferred(kind),
-                        )
-                      }
-                      onChooseProviders={() => setChoosingProviders(group.key)}
-                    />
-                  );
-                })}
-              </div>
-            ) : null}
-            {deliveryBusy ? (
-              <p role="status" className="text-[11px] text-content/50">
-                Opening review…
-              </p>
-            ) : null}
-            {deliveryError ? (
-              <p role="alert" className="text-[12px] text-content/70">
-                {deliveryError}
-              </p>
             ) : null}
             <div className="flex flex-wrap items-center gap-2 pt-1">
               <button
@@ -2981,14 +2646,6 @@ export function InboxDetail({
                   attachments={galleryAttachments}
                 />
               ) : null}
-              {myWork?.hasWork ? (
-                <InboxMyWorkSection
-                  work={myWork}
-                  onOpenSession={onOpenSession}
-                  onOpenDelivery={onOpenDelivery}
-                  onOpenAttention={onAttentionAction}
-                />
-              ) : null}
               <InboxRelated
                 key={`related:${inboxItemKey(item)}:${revision}`}
                 item={item}
@@ -3113,197 +2770,3 @@ function labelColor(value: string): string | null {
   return `#${hex}`;
 }
 
-/** One related thread — a chip that opens the session. Delivery actions
- * live on the per-branch `BranchDeliveryRow` in the Branches section. */
-function RelatedThreadChip({
-  session,
-  onOpen,
-}: {
-  session: SessionSummary;
-  onOpen: () => void;
-}) {
-  const title = sessionDisplayTitle(session.title, session.harness);
-  return (
-    <span className="inline-flex items-stretch overflow-hidden rounded-md bg-content/5 text-[11px] text-content/70">
-      <button
-        type="button"
-        title={`Open thread: ${title}`}
-        onClick={onOpen}
-        className="inline-flex max-w-64 items-center gap-1 px-2 py-1 hover:bg-content/10 hover:text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
-      >
-        <span className="truncate">{title}</span>
-        {session.archived ? (
-          <span className="shrink-0 text-content/40">Archived</span>
-        ) : null}
-      </button>
-    </span>
-  );
-}
-
-/** Live `Session` objects flow through `SessionSummary` lists structurally —
- * an ask thread carries `inboxAsk` even though the summary type omits it. */
-const isAskThread = (session: SessionSummary) =>
-  "inboxAsk" in session && session.inboxAsk != null;
-
-/** A working-copy row in the item's branch overview: branch name, compact
- * PR/CI status badges (saved links + caches — no fetch), and a chevron menu
- * with the open/provider actions. */
-function BranchDeliveryRow({
-  cwd,
-  branch,
-  delivery,
-  busy,
-  providerFor,
-  onOpen,
-  onChooseProviders,
-}: {
-  cwd: string;
-  branch: string | undefined;
-  delivery: TaskChildDelivery;
-  busy: boolean;
-  providerFor: (kind: "pr" | "ci") => "github" | "azure" | "gitlab" | undefined;
-  onOpen: (kind: "pr" | "ci") => void;
-  onChooseProviders: () => void;
-}) {
-  const [menu, setMenu] = useState(false);
-  const anchor = useRef<HTMLButtonElement>(null);
-  const label = branch || projectName(cwd);
-  const providerName = (kind: "pr" | "ci") => {
-    const provider = providerFor(kind);
-    return provider === "github"
-      ? "GitHub"
-      : provider === "azure"
-        ? "Azure"
-        : provider === "gitlab"
-          ? "GitLab"
-          : undefined;
-  };
-  const open = (kind: "pr" | "ci") =>
-    providerFor(kind) ? onOpen(kind) : onChooseProviders();
-  const badge =
-    "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] leading-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent disabled:opacity-50";
-  const itemClass =
-    "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-content hover:bg-content/5 disabled:opacity-50";
-  return (
-    <div className="flex items-center gap-2 px-1 py-0.5">
-      <GitBranch
-        className="size-3.5 shrink-0 text-content/40"
-        strokeWidth={1.75}
-      />
-      <span
-        className="min-w-0 flex-1 truncate text-[12px] text-content/80"
-        title={cwd}
-      >
-        {label}
-        {branch ? (
-          <span className="text-content/40"> · {projectName(cwd)}</span>
-        ) : null}
-      </span>
-      {delivery.prs > 0 ? (
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => open("pr")}
-          aria-label={`${delivery.prs} pull request${delivery.prs > 1 ? "s" : ""} on ${label}${delivery.prNeedsAttention ? ", needs review" : ""}`}
-          title={`${delivery.prs} pull request${delivery.prs > 1 ? "s" : ""} on ${label}`}
-          className={`${badge} ${
-            delivery.prNeedsAttention
-              ? "border-red-400/40 text-red-300"
-              : "border-content/15 text-content/60 hover:text-content"
-          }`}
-        >
-          <GitPullRequest className="size-3" strokeWidth={1.75} />
-          {delivery.prs > 1 ? delivery.prs : "PR"}
-          {delivery.prNeedsAttention ? " · needs review" : ""}
-        </button>
-      ) : null}
-      {delivery.ci > 0 ? (
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => open("ci")}
-          aria-label={`${delivery.ci} pipeline${delivery.ci > 1 ? "s" : ""} on ${label}${delivery.ciFailing ? ", failing" : delivery.ciRunning ? ", running" : ""}`}
-          title={`${delivery.ci} pipeline${delivery.ci > 1 ? "s" : ""} on ${label}`}
-          className={`${badge} ${
-            delivery.ciFailing
-              ? "border-red-400/40 text-red-300"
-              : delivery.ciRunning
-                ? "border-amber-400/40 text-amber-300"
-                : "border-content/15 text-content/60 hover:text-content"
-          }`}
-        >
-          <Zap className="size-3" strokeWidth={1.75} />
-          {delivery.ci > 1 ? delivery.ci : "CI"}
-          {delivery.ciFailing
-            ? " · failing"
-            : delivery.ciRunning
-              ? " · running"
-              : ""}
-        </button>
-      ) : null}
-      <button
-        ref={anchor}
-        type="button"
-        title={`PRs and CI for ${label}`}
-        aria-label={`Delivery actions for ${label} in ${projectName(cwd)}`}
-        aria-haspopup="menu"
-        aria-expanded={menu}
-        onClick={() => setMenu(true)}
-        className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
-      >
-        <ChevronDown className="size-3.5" strokeWidth={1.75} />
-      </button>
-      {menu ? (
-        <Popover
-          anchor={anchor}
-          onDismiss={() => setMenu(false)}
-          role="menu"
-          aria-label={`Delivery for ${label || "branch"}`}
-          className="w-48 overflow-hidden"
-        >
-          <div className="px-1.5 py-1.5">
-            {(["pr", "ci"] as const).map((kind) => {
-              const provider = providerName(kind);
-              const kindLabel = kind === "pr" ? "PRs" : "CI";
-              return (
-                <button
-                  key={kind}
-                  type="button"
-                  role="menuitem"
-                  disabled={busy}
-                  title={
-                    provider
-                      ? `${kindLabel} · ${provider}`
-                      : `Pick a ${kindLabel} provider first`
-                  }
-                  onClick={() => {
-                    setMenu(false);
-                    open(kind);
-                  }}
-                  className={itemClass}
-                >
-                  {provider
-                    ? provider === "GitHub" && kind === "ci"
-                      ? "GitHub checks"
-                      : `${provider} ${kindLabel}`
-                    : `Choose ${kindLabel} provider`}
-                </button>
-              );
-            })}
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                setMenu(false);
-                onChooseProviders();
-              }}
-              className={itemClass}
-            >
-              Providers…
-            </button>
-          </div>
-        </Popover>
-      ) : null}
-    </div>
-  );
-}
