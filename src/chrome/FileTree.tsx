@@ -1,4 +1,5 @@
 import { prettyCwd } from "../lib/paths";
+import { ask } from "../lib/dialogs";
 import { contextFromFiles, requestAgentContext } from "../lib/agentContext";
 import {
   ChevronDown,
@@ -363,10 +364,11 @@ export const FileTree = memo(function FileTree({
     if (path === cwd) return;
     const isDir = isDirAt(cwd, path);
     const label = basename(path);
-    const ok = window.confirm(
+    const ok = await ask(
       isDir
         ? `Delete folder “${label}” and everything inside it?`
         : `Delete “${label}”?`,
+      { title: "MonoCode", kind: "warning", okLabel: "Delete" },
     );
     if (!ok) return;
     await deletePath(path);

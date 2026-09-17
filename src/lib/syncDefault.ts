@@ -1,4 +1,4 @@
-import { ask, message } from "@tauri-apps/plugin-dialog";
+import { ask, message } from "./dialogs";
 import {
   gitDiffIndex,
   gitMergeAbort,

@@ -36,8 +36,8 @@ import {
 import { projectsSnapshot, subscribeProjects } from "../lib/projects";
 import { pathKey, projectName } from "../lib/paths";
 import { Popover } from "./Popover";
-import { ContextCheckbox } from "./InboxContextPicker";
-import { ask } from "@tauri-apps/plugin-dialog";
+import { Checkbox } from "./controls";
+import { ask, message as showMessage } from "../lib/dialogs";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Bot,
@@ -125,8 +125,8 @@ import { useLockOverscroll } from "../hooks/useLockOverscroll";
 
 const GIT_POLL_MS = 2000;
 
-function confirmNative(message: string, okLabel?: string): Promise<boolean> {
-  return ask(message, {
+function confirmDanger(text: string, okLabel?: string): Promise<boolean | null> {
+  return ask(text, {
     title: "MonoCode",
     kind: "warning",
     ...(okLabel ? { okLabel } : {}),
@@ -1019,13 +1019,16 @@ function ChangedFiles({
   };
 
   const fail = (error: unknown) => {
-    window.alert(error instanceof Error ? error.message : String(error));
+    void showMessage(error instanceof Error ? error.message : String(error), {
+      title: "MonoCode",
+      kind: "error",
+    });
   };
 
   const confirmDefault = async (kind: "push" | "pr") => {
     if (!onDefault || !index?.branch) return true;
     const branch = index.branch;
-    return confirmNative(
+    return confirmDanger(
       kind === "pr"
         ? `Create a pull request from default branch "${branch}"?`
         : `Push to default branch "${branch}"?`,
@@ -1043,7 +1046,7 @@ function ChangedFiles({
         if (action === "discard") {
           const name = basename(file.relative);
           const untracked = file.status === "untracked";
-          const ok = await confirmNative(
+          const ok = await confirmDanger(
             untracked
               ? `Delete untracked file ${name}?`
               : `Discard changes in ${name}? This cannot be undone.`,
@@ -1079,7 +1082,7 @@ function ChangedFiles({
         if (n === 0) return;
         const only = unstaged[0];
         const untrackedOnly = n === 1 && only?.status === "untracked";
-        const ok = await confirmNative(
+        const ok = await confirmDanger(
           untrackedOnly
             ? `Delete untracked file ${basename(only.relative)}?`
             : n === 1 && only
@@ -2257,7 +2260,7 @@ const ChangeRow = memo(
           }`}
         >
           {selecting ? (
-            <ContextCheckbox
+            <Checkbox
               className=""
               label={`Select ${kind} ${file.relative}`}
               checked={contextChecked ?? false}

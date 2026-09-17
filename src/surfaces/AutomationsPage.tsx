@@ -1,5 +1,5 @@
 import { useMemo, useSyncExternalStore } from "react";
-import { ask } from "@tauri-apps/plugin-dialog";
+import { ask } from "../lib/dialogs";
 import {
   loadWatchers,
   openWatchSheet,

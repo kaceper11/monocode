@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { ask } from "@tauri-apps/plugin-dialog";
+import { ask } from "./dialogs";
 import { forgetHarnessSession, killAllChildren } from "./harness";
 import { newSession } from "./session";
 import { newTab } from "./layout";
@@ -16,7 +16,7 @@ import { reconcileProjectReturn } from "./projectReturn";
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({
+vi.mock("./dialogs", () => ({
   ask: vi.fn().mockResolvedValue(true),
 }));
 vi.mock("./windowTransferBootstrap", () => ({

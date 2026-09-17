@@ -44,7 +44,7 @@ import {
 import { linkedWorkItemFromInboxItem } from "../lib/sessionWorkItem";
 import type { LinkedWorkItem } from "../lib/session";
 import { pathKey, prettyCwd, wslLocation, wslPath } from "../lib/paths";
-import { ContextCheckbox } from "./InboxContextPicker";
+import { Checkbox } from "./controls";
 import { Modal } from "./Modal";
 import { Popover } from "./Popover";
 import {
@@ -874,7 +874,7 @@ export function TaskCreateSheet({
                           onClick={() => selectRepository(repo, !checked)}
                           className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left hover:bg-content/5"
                         >
-                          <ContextCheckbox
+                          <Checkbox
                             label={`Select ${repositoryDisplayName(repo)}`}
                             checked={checked}
                             onChange={() => selectRepository(repo, !checked)}
@@ -1374,7 +1374,7 @@ function ChildConfig({
 
       {writers.length > 0 ? (
         <label className="mt-2 flex items-start gap-2 rounded-lg border border-amber-400/30 bg-amber-400/10 px-2.5 py-2">
-          <ContextCheckbox
+          <Checkbox
             label={`Allow sharing this working copy in ${repositoryDisplayName(repo)}`}
             checked={draft.sharedAccepted ?? false}
             onChange={() =>
@@ -1660,7 +1660,7 @@ function IssuePicker({
                     onClick={() => toggle(item)}
                     className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-content/5"
                   >
-                    <ContextCheckbox
+                    <Checkbox
                       label={item.title}
                       checked={linked ? picked.has(linked.url) : false}
                       onChange={() => toggle(item)}

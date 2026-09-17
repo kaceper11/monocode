@@ -6,6 +6,7 @@ import {
 } from "@hugeicons/react";
 import Add01Icon from "@hugeicons/core-free-icons/Add01Icon";
 import AddSquareIcon from "@hugeicons/core-free-icons/AddSquareIcon";
+import Alert02Icon from "@hugeicons/core-free-icons/Alert02Icon";
 import AlertCircleIcon from "@hugeicons/core-free-icons/AlertCircleIcon";
 import AppWindowIcon from "@hugeicons/core-free-icons/AppWindowIcon";
 import Archive02Icon from "@hugeicons/core-free-icons/Archive02Icon";
@@ -56,6 +57,7 @@ import GitPullRequestIcon from "@hugeicons/core-free-icons/GitPullRequestIcon";
 import GlobeIcon from "@hugeicons/core-free-icons/GlobeIcon";
 import ImageAdd01Icon from "@hugeicons/core-free-icons/ImageAdd01Icon";
 import InboxIcon from "@hugeicons/core-free-icons/InboxIcon";
+import InformationCircleIcon from "@hugeicons/core-free-icons/InformationCircleIcon";
 import KeyboardIcon from "@hugeicons/core-free-icons/KeyboardIcon";
 import LanguagesIcon from "@hugeicons/core-free-icons/LanguagesIcon";
 import LayoutAlignRightIcon from "@hugeicons/core-free-icons/LayoutAlignRightIcon";
@@ -161,6 +163,7 @@ const StopIcon: IconSvgElement = [
 ];
 
 export const AlertCircle = wrap(AlertCircleIcon, "AlertCircle");
+export const TriangleAlert = wrap(Alert02Icon, "TriangleAlert");
 export const AppWindow = wrap(AppWindowIcon, "AppWindow");
 export const Archive = wrap(Archive02Icon, "Archive");
 export const ArrowDownCircle = wrap(CircleArrowDown01Icon, "ArrowDownCircle");
@@ -214,6 +217,7 @@ export const GripVertical = wrap(DragDropVerticalIcon, "GripVertical");
 export const Globe = wrap(GlobeIcon, "Globe");
 export const ImagePlus = wrap(ImageAdd01Icon, "ImagePlus");
 export const Inbox = wrap(InboxIcon, "Inbox");
+export const Info = wrap(InformationCircleIcon, "Info");
 export const Keyboard = wrap(KeyboardIcon, "Keyboard");
 export const Languages = wrap(LanguagesIcon, "Languages");
 export const ListBullet = wrap(LeftToRightListBulletIcon, "ListBullet");

@@ -49,8 +49,8 @@ import {
 } from "../chrome/InboxFiltersMenu";
 import { InboxConnectMenu } from "../chrome/InboxConnectMenu";
 import { InboxProviderMark } from "../chrome/InboxProviderMark";
+import { Checkbox } from "../chrome/controls";
 import {
-  ContextCheckbox,
   InboxContextPicker,
   useInboxContext,
 } from "../chrome/InboxContextPicker";
@@ -1500,7 +1500,7 @@ export function InboxView({
                   }
                 >
                   {selectingTickets ? (
-                    <ContextCheckbox
+                    <Checkbox
                       label={`Select ${item.provider} ${item.identifier || item.number} ${item.title}`}
                       checked={ticketSelected(item)}
                       disabled={

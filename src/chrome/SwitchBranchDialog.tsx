@@ -1,8 +1,8 @@
 import { Loader, WandSparkles } from "./icons";
 import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import { DIALOG_ACTION } from "./controls";
+import { Modal } from "./Modal";
 import { generateCommitMessage } from "../lib/harness";
-import { LAYER } from "../lib/layers";
 import { MOD } from "../lib/platform";
 
 type Busy = "stash" | "commit" | null;
@@ -29,6 +29,7 @@ export function SwitchBranchDialog({
   onCancel,
 }: Props) {
   const [message, setMessage] = useState("");
+  const [generateError, setGenerateError] = useState("");
   const [generating, setGenerating] = useState(false);
   const messageRef = useRef<HTMLTextAreaElement>(null);
   const trimmed = message.trim();
@@ -45,56 +46,38 @@ export function SwitchBranchDialog({
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }, [message]);
 
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (!busy && !generating) onCancel();
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [busy, generating, onCancel]);
-
   const generate = async () => {
     if (busy || generating) return;
     setGenerating(true);
+    setGenerateError("");
     try {
       setMessage(await generateCommitMessage(cwd));
     } catch (err) {
-      window.alert(err instanceof Error ? err.message : String(err));
+      setGenerateError(err instanceof Error ? err.message : String(err));
     } finally {
       setGenerating(false);
       messageRef.current?.focus();
     }
   };
 
-  return createPortal(
-    <div className="fixed inset-0" style={{ zIndex: LAYER.dialog }}>
-      <div
-        className="absolute inset-0 bg-black/30"
-        onMouseDown={() => {
-          if (!busy && !generating) onCancel();
-        }}
-      />
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-busy={Boolean(busy) || generating}
-        aria-label={creating ? `Create ${branch}` : `Switch to ${branch}`}
-        onMouseDown={(event) => event.stopPropagation()}
-        className="absolute left-1/2 top-[22%] flex w-[min(420px,calc(100vw-24px))] -translate-x-1/2 flex-col gap-3 rounded-lg border border-content/10 bg-content/5 p-4 shadow-xl backdrop-blur-xl"
-      >
-        <div className="flex flex-col gap-1">
-          <h2 className="text-[13px] font-medium leading-tight text-content">
-            Uncommitted changes
-          </h2>
-          <p className="text-[12px] leading-snug text-content/55">
-            {creating
-              ? `Creating “${branch}” would overwrite your local changes. Stash them for later, or commit them on this branch first.`
-              : `Switching to “${branch}” would overwrite your local changes. Stash them for later, or commit them on this branch first.`}
-          </p>
-        </div>
+  const close = () => {
+    if (!busy && !generating) onCancel();
+  };
+
+  return (
+    <Modal
+      title="Uncommitted changes"
+      size="sm"
+      trapFocus
+      onClose={close}
+      className="text-[13px]"
+    >
+      <div className="flex flex-col gap-3 px-4 pb-4 pt-1">
+        <p className="text-[12px] leading-snug text-content/55">
+          {creating
+            ? `Creating “${branch}” would overwrite your local changes. Stash them for later, or commit them on this branch first.`
+            : `Switching to “${branch}” would overwrite your local changes. Stash them for later, or commit them on this branch first.`}
+        </p>
 
         <div className="relative">
           <textarea
@@ -133,9 +116,12 @@ export function SwitchBranchDialog({
           </button>
         </div>
 
-        {error ? (
-          <p className="whitespace-pre-wrap text-[11px] leading-4 text-red-400/90">
-            {error}
+        {error || generateError ? (
+          <p
+            role="alert"
+            className="whitespace-pre-wrap text-[11px] leading-4 text-red-400/90"
+          >
+            {generateError || error}
           </p>
         ) : null}
 
@@ -144,7 +130,7 @@ export function SwitchBranchDialog({
             type="button"
             disabled={Boolean(busy) || generating}
             onClick={onCancel}
-            className="rounded-md px-3 py-1.5 text-[12px] text-content/70 hover:bg-content/8 hover:text-content disabled:opacity-40"
+            className={DIALOG_ACTION.ghost}
           >
             Cancel
           </button>
@@ -152,7 +138,7 @@ export function SwitchBranchDialog({
             type="button"
             disabled={!canCommit}
             onClick={() => onCommit(trimmed)}
-            className="inline-flex items-center gap-1.5 rounded-md bg-content/10 px-3 py-1.5 text-[12px] font-medium text-content hover:bg-content/15 disabled:opacity-40"
+            className={`inline-flex items-center gap-1.5 ${DIALOG_ACTION.tonal}`}
           >
             {busy === "commit" ? (
               <Loader className="size-3.5 animate-spin" strokeWidth={1.75} />
@@ -163,7 +149,7 @@ export function SwitchBranchDialog({
             type="button"
             disabled={Boolean(busy) || generating}
             onClick={onStash}
-            className="inline-flex items-center gap-1.5 rounded-md bg-content px-3 py-1.5 text-[12px] font-medium text-background-base hover:bg-content/80 disabled:opacity-40"
+            className={`inline-flex items-center gap-1.5 ${DIALOG_ACTION.primary}`}
           >
             {busy === "stash" ? (
               <Loader className="size-3.5 animate-spin" strokeWidth={1.75} />
@@ -172,7 +158,6 @@ export function SwitchBranchDialog({
           </button>
         </div>
       </div>
-    </div>,
-    document.body,
+    </Modal>
   );
 }

@@ -1,4 +1,5 @@
 import { Bot, Check, CircleAlert, Loader, Minus } from "./icons";
+import { DIALOG_ACTION } from "./controls";
 import { Modal } from "./Modal";
 import { prettyCwd } from "../lib/paths";
 import type { TaskBranchSyncRow } from "../lib/syncDefault";
@@ -18,7 +19,7 @@ const STATE_META: Record<
     tone: "text-emerald-400/90",
   },
   "up-to-date": {
-    icon: <Minus className="size-3.5" strokeWidth={1.75} />,
+    icon: <Check className="size-3.5" strokeWidth={1.75} />,
     text: "Up to date",
     tone: "text-content/45",
   },
@@ -55,44 +56,75 @@ export function TaskSyncSheet({
   rows: readonly TaskBranchSyncRow[];
   onClose: () => void;
 }) {
-  const running = rows.some((row) => row.state === "running");
+  const done = rows.filter((row) => row.state !== "running").length;
+  const attention = rows.filter(
+    (row) =>
+      row.state === "conflicts" ||
+      row.state === "failed" ||
+      row.state === "skipped",
+  ).length;
+  const running = done < rows.length;
+  const summary = running
+    ? `Syncing ${done} of ${rows.length}…`
+    : attention
+      ? `Done — ${attention} need${attention === 1 ? "s" : ""} attention`
+      : "Done";
   return (
     <Modal
       title="Sync with remote default"
-      description={`${taskName} · ${running ? "merging into each linked working copy" : "done"}`}
+      description={taskName}
       size="sm"
+      trapFocus
       onClose={onClose}
     >
-      <ul className="space-y-1.5 px-4 py-3">
+      <ul className="divide-y divide-content/5 px-4 py-2">
         {rows.map((row) => {
           const meta = STATE_META[row.state];
           return (
-            <li
-              key={row.cwd}
-              className="rounded-md border border-content/10 px-2.5 py-2"
-            >
-              <div className="flex items-center gap-2">
-                <span className={meta.tone}>{meta.icon}</span>
-                <span className="min-w-0 flex-1 truncate font-medium">
-                  {row.label}
-                </span>
-                <span className={`shrink-0 ${meta.tone}`}>{meta.text}</span>
-              </div>
-              <p className="mt-0.5 truncate text-content/40" title={row.cwd}>
-                {prettyCwd(row.cwd)}
-              </p>
-              {row.detail ? (
-                <p className="mt-0.5 break-words text-content/55">
-                  {row.detail}
+            <li key={row.cwd} className="flex items-start gap-2.5 py-2">
+              <span className={`mt-px shrink-0 ${meta.tone}`}>{meta.icon}</span>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-baseline gap-2">
+                  <span className="min-w-0 flex-1 truncate text-[13px] font-medium">
+                    {row.label}
+                  </span>
+                  <span
+                    className={`shrink-0 text-[11px] ${meta.tone}`}
+                  >
+                    {meta.text}
+                  </span>
+                </div>
+                <p
+                  className="truncate text-[11px] text-content/40"
+                  title={row.cwd}
+                >
+                  {prettyCwd(row.cwd)}
                 </p>
-              ) : null}
+                {row.detail ? (
+                  <p className="mt-0.5 break-words text-[11px] text-content/55">
+                    {row.detail}
+                  </p>
+                ) : null}
+              </div>
             </li>
           );
         })}
         {!rows.length ? (
-          <li className="text-content/45">No linked working copies to sync.</li>
+          <li className="py-2 text-content/45">
+            No linked working copies to sync.
+          </li>
         ) : null}
       </ul>
+      <div className="sticky bottom-0 flex items-center justify-between gap-2 border-t border-content/10 bg-background-base px-4 py-2.5">
+        <span className="text-[11px] text-content/45">{summary}</span>
+        <button
+          type="button"
+          onClick={onClose}
+          className={DIALOG_ACTION.tonal}
+        >
+          {running ? "Close" : "Done"}
+        </button>
+      </div>
     </Modal>
   );
 }

@@ -32,7 +32,8 @@ import {
   type Session,
 } from "../lib/session";
 import type { TaskWorkspace } from "../lib/taskWorkspaces";
-import { ContextCheckbox } from "./InboxContextPicker";
+import { Checkbox, Radio } from "./controls";
+import { ask } from "../lib/dialogs";
 import { Modal } from "./Modal";
 import { Select } from "./Select";
 import { SecondOpinionButton } from "./SecondOpinionButton";
@@ -223,7 +224,7 @@ export function AgentActionSheet({
                   key={source.kind}
                   className="flex items-start gap-2 text-[13px] text-content"
                 >
-                  <ContextCheckbox
+                  <Checkbox
                     label={ACTION_CONTEXT_LABEL[source.kind]}
                     checked={
                       source.available && selected.has(source.kind)
@@ -250,13 +251,13 @@ export function AgentActionSheet({
         <div>
           <span className={labelClass}>Destination</span>
           <div className="flex flex-col gap-1.5">
-            <label className="flex items-center gap-2 text-[13px] text-content">
-              <input
-                type="radio"
+            <label className="flex cursor-pointer items-center gap-2 text-[13px] text-content">
+              <Radio
+                label="Send to this conversation"
                 name={destinationName}
                 checked={destination === "session"}
                 onChange={() => setDestination("session")}
-                className="accent-accent"
+                className=""
               />
               <span className="min-w-0 flex-1 truncate">
                 This conversation
@@ -267,13 +268,13 @@ export function AgentActionSheet({
             </label>
             {onRunNew ? (
               <div className="flex items-center gap-2 text-[13px] text-content">
-                <label className="flex min-w-0 flex-1 items-center gap-2">
-                  <input
-                    type="radio"
+                <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2">
+                  <Radio
+                    label="Send to a new conversation"
                     name={destinationName}
                     checked={destination === "new"}
                     onChange={() => setDestination("new")}
-                    className="accent-accent"
+                    className=""
                   />
                   <span className="min-w-0 flex-1 truncate">
                     New conversation
@@ -461,7 +462,7 @@ export function AgentActionsSheet({
                     key={kind}
                     className="flex items-center gap-2 text-[13px] text-content"
                   >
-                    <ContextCheckbox
+                    <Checkbox
                       label={ACTION_CONTEXT_LABEL[kind]}
                       className="mt-0"
                       checked={editing.draft.context.includes(kind)}
@@ -597,8 +598,16 @@ export function AgentActionsSheet({
                     type="button"
                     aria-label={`Delete ${action.name}`}
                     onClick={() => {
-                      if (window.confirm(`Delete action “${action.name}”?`))
-                        deleteAgentAction(action.id);
+                      void (async () => {
+                        if (
+                          await ask(`Delete action “${action.name}”?`, {
+                            title: "MonoCode",
+                            kind: "warning",
+                            okLabel: "Delete",
+                          })
+                        )
+                          deleteAgentAction(action.id);
+                      })();
                     }}
                     className="grid size-6 place-items-center rounded-md text-content/50 hover:bg-content/10 hover:text-red-400"
                   >

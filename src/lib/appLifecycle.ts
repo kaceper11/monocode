@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { ask } from "@tauri-apps/plugin-dialog";
+import { ask } from "./dialogs";
 import {
   bindHarnessSession,
   forgetHarnessSession,
