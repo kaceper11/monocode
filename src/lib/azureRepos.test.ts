@@ -3,6 +3,7 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import {
   azurePrContext,
+  azureReviewAnchor,
   discoverAzurePrs,
   loadAzurePrAssociations,
   azurePrUrl,
@@ -14,11 +15,7 @@ import {
   unbindAzurePrSession,
   type AzurePrAssociation,
 } from "./azureRepos";
-import {
-  ensureDeliveryWatcher,
-  loadWatchers,
-  removeWatcher,
-} from "./watchers";
+import { ensureDeliveryWatcher, loadWatchers, removeWatcher } from "./watchers";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 beforeEach(() => {
@@ -315,12 +312,7 @@ it("discovers multiple story PRs before branch matches, deduplicates identity, a
 });
 
 it("auto-watches a newly linked PR and lifts the watcher on unlink", () => {
-  saveAzurePrAssociation(
-    association,
-    association.cwd,
-    "feature",
-    "session-a",
-  );
+  saveAzurePrAssociation(association, association.cwd, "feature", "session-a");
   const watchers = loadWatchers();
   expect(watchers).toHaveLength(1);
   expect(watchers[0].auto).toBe(true);
@@ -344,12 +336,7 @@ it("auto-watches a newly linked PR and lifts the watcher on unlink", () => {
 });
 
 it("does not resurrect a removed watcher on refresh; terminal status keeps it for the poll", () => {
-  saveAzurePrAssociation(
-    association,
-    association.cwd,
-    "feature",
-    "session-a",
-  );
+  saveAzurePrAssociation(association, association.cwd, "feature", "session-a");
   const watcher = loadWatchers()[0];
   removeWatcher(watcher.id);
   // A re-save of the same scope+target is a refresh — no resurrection.
@@ -543,7 +530,9 @@ it("adopts and unlinks a session-less row from a session scope", () => {
     "s1",
     association.target,
   );
-  expect(loadAzurePrAssociations(association.cwd, "feature", "s1")).toHaveLength(0);
+  expect(
+    loadAzurePrAssociations(association.cwd, "feature", "s1"),
+  ).toHaveLength(0);
   expect(loadWatchers()).toHaveLength(0);
 });
 
@@ -563,13 +552,47 @@ it("unbinds a deleted session from stored rows without unlinking", () => {
   unbindAzurePrSession("s1");
   let rows = loadAzurePrAssociations(association.cwd, "feature", "s2");
   expect(rows).toHaveLength(2);
-  expect(rows.map((row) => row.sourceSessionId)).toEqual([
-    "s2",
-    undefined,
-  ]);
+  expect(rows.map((row) => row.sourceSessionId)).toEqual(["s2", undefined]);
   // Unbinding the second owner collapses the session-less twins.
   unbindAzurePrSession("s2");
   rows = loadAzurePrAssociations(association.cwd, "feature");
   expect(rows).toHaveLength(1);
   expect(rows[0].sourceSessionId).toBeUndefined();
+});
+
+it("maps rendered diff lines onto Azure thread anchors", () => {
+  // Deleted lines anchor on the left (old) side; additions and context on the right.
+  expect(
+    azureReviewAnchor({
+      kind: "del",
+      text: "gone",
+      oldNumber: 7,
+      newNumber: null,
+    }),
+  ).toEqual({ line: 7, side: "left", offset: 4 });
+  expect(
+    azureReviewAnchor({
+      kind: "add",
+      text: "added",
+      oldNumber: null,
+      newNumber: 2,
+    }),
+  ).toEqual({ line: 2, side: "right", offset: 5 });
+  expect(
+    azureReviewAnchor({
+      kind: "context",
+      text: "kept",
+      oldNumber: 3,
+      newNumber: 3,
+    }),
+  ).toEqual({ line: 3, side: "right", offset: 4 });
+  // Hunk headers and numberless rows can't anchor a comment.
+  expect(
+    azureReviewAnchor({
+      kind: "hunk",
+      text: "@@ -1 +1 @@",
+      oldNumber: null,
+      newNumber: null,
+    }),
+  ).toBeNull();
 });

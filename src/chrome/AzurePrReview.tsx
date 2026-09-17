@@ -4,6 +4,7 @@ import {
   ReviewDetails,
   ReviewError,
   ReviewHeader,
+  ReviewLineComposer,
   ReviewPill,
   ReviewShell,
   ReviewStatus,
@@ -14,21 +15,36 @@ import {
   reviewToneText,
   type ReviewTone,
 } from "./ReviewChrome";
-import { Bot, ExternalLink, Loader, RefreshCw } from "./icons";
+import {
+  Bot,
+  Check,
+  ExternalLink,
+  FolderOpen,
+  Loader,
+  RefreshCw,
+  X,
+} from "./icons";
 import { AzureConnectionDetails } from "./AzureConnectionDetails";
 import type { LinkedWorkItem } from "../lib/session";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   AZURE_CHANGE_EVENT,
   azureConnected,
   type AzureStatus,
 } from "../lib/azure";
-import { contextFromText, requestAgentContext } from "../lib/agentContext";
+import { requestAgentContext } from "../lib/agentContext";
 import { taskDestinationForSession } from "../lib/taskWorkspaces";
 import { openWatchSheet } from "../lib/watchers";
-import { buildUnifiedFile, formatUnifiedHunk } from "../lib/unifiedDiff";
-import { UnifiedDiffView } from "../surfaces/UnifiedDiffView";
+import { notifyGitChanged } from "../lib/fs";
+import { openProjectPath } from "../lib/recents";
+import { buildUnifiedFile, type UnifiedLine } from "../lib/unifiedDiff";
+import {
+  UnifiedDiffView,
+  type LineCommentComposer,
+  type UnifiedDiffFileModel,
+} from "../surfaces/UnifiedDiffView";
 import {
   azurePrContext,
   discoverAzurePrs,
@@ -37,18 +53,25 @@ import {
   type AzurePrDiscoveryGroup,
   azurePrScope,
   azurePrUrl,
+  azurePrSubmitReview,
+  azurePrThreadComment,
+  azurePrThreadStatus,
+  azureReviewAnchor,
   findAzurePrs,
   loadAzurePrAssociation,
   parseAzurePrLocation,
   readAzurePr,
-  readAzurePrFile,
+  readAzurePrDiff,
   readAzurePrSection,
   saveAzurePrAssociation,
   type AzurePr,
   type AzurePrAssociation,
+  type AzurePrDiff,
   type AzurePrPage,
+  type AzurePrReviewEvent,
   type AzurePrTarget,
   type AzurePrThread,
+  type AzureReviewCommentDraft,
 } from "../lib/azureRepos";
 import { AgentMarkdown } from "../surfaces/AgentMarkdown";
 
@@ -168,6 +191,7 @@ function AzurePrPanel({
   const generation = useRef(0);
   const pending = useRef(false);
   const repairDraft = useRef<{ key: string; instruction: string } | null>(null);
+  const preparation = useRef<AbortController | null>(null);
   useEffect(() => {
     const refresh = () => {
       const run = ++generation.current;
@@ -188,6 +212,7 @@ function AzurePrPanel({
     window.addEventListener(AZURE_CHANGE_EVENT, refresh);
     return () => {
       generation.current++;
+      preparation.current?.abort();
       window.removeEventListener(AZURE_CHANGE_EVENT, refresh);
     };
   }, []);
@@ -307,6 +332,35 @@ function AzurePrPanel({
         setRefreshKey((key) => key + 1);
       }
     });
+  const openWorktree = () =>
+    run(async (current) => {
+      if (!association) return;
+      const requestId = crypto.randomUUID();
+      const controller = new AbortController();
+      controller.signal.addEventListener(
+        "abort",
+        () => {
+          void invoke("azure_pr_cancel_checkout", { requestId }).catch(
+            () => undefined,
+          );
+        },
+        { once: true },
+      );
+      preparation.current = controller;
+      try {
+        const path = await invoke<string>("azure_pr_prepare_checkout", {
+          cwd,
+          target: association.target,
+          expectedRevision: association.revision,
+          requestId,
+        });
+        if (!current() || controller.signal.aborted) return;
+        notifyGitChanged(cwd);
+        openProjectPath(path);
+      } finally {
+        if (preparation.current === controller) preparation.current = null;
+      }
+    });
   const connected = !!status?.connected && !!status.accountId;
   const sameAccount =
     !!association &&
@@ -317,10 +371,10 @@ function AzurePrPanel({
     // Read once on opening or reconnecting; saving the result must not poll.
   }, [status, repairRefresh]);
   return (
-    <ReviewShell label="Azure pull requests">
+    <ReviewShell label="Azure pull request">
       {!embedded ? (
         <ReviewHeader
-          label="Pull requests"
+          label="Pull request"
           context={`${association ? `${association.repositoryName} · ` : ""}${branch || "Detached checkout"}`}
           title={cwd}
         />
@@ -650,8 +704,7 @@ function AzurePrPanel({
               <span
                 className={
                   reviewToneText[
-                    azureMergeStateTone(association.pr.mergeStatus) ||
-                      "neutral"
+                    azureMergeStateTone(association.pr.mergeStatus) || "neutral"
                   ]
                 }
               >
@@ -690,6 +743,16 @@ function AzurePrPanel({
                 Choose another PR
               </button>
             ) : null}
+            <button
+              className={button}
+              disabled={
+                busy || !sameAccount || association.pr.status !== "active"
+              }
+              onClick={() => void openWorktree()}
+            >
+              <FolderOpen className="size-3.5" strokeWidth={1.75} />
+              Open in worktree
+            </button>
             {association.pr.status === "active" && sameAccount ? (
               <button
                 className={button}
@@ -714,6 +777,14 @@ function AzurePrPanel({
               </button>
             ) : null}
           </div>
+          {busy && preparation.current ? (
+            <button
+              className={button}
+              onClick={() => preparation.current?.abort()}
+            >
+              Cancel preparation
+            </button>
+          ) : null}
           {!sameAccount ? (
             <ReviewError>
               Reconnect the linked Azure account to read this PR, or choose
@@ -726,9 +797,15 @@ function AzurePrPanel({
                 : "Could not update this saved PR. Retry with Refresh PR."}
             </ReviewStatus>
           ) : null}
+          {sameAccount && verified ? (
+            <RepairStatus
+              scope={azurePrKey(association.target)}
+              cwd={association.cwd}
+            />
+          ) : null}
           {sameAccount ? (
             <fieldset disabled={!verified || busy} className="min-w-0">
-              <AzurePrDetails
+              <AzurePrSections
                 key={`${association.revision}:${azurePrKey(association.target)}`}
                 association={association}
                 verified={verified}
@@ -753,6 +830,7 @@ function AzurePrPanel({
                   onReveal?.();
                   setRepairRefresh((value) => value + 1);
                 }}
+                onChanged={() => void refresh()}
               />
             </fieldset>
           ) : null}
@@ -860,7 +938,43 @@ const threadStatusLabel = (status: string) =>
     }) as Record<string, string>
   )[status] ?? status;
 
-function AzurePrDetails({
+type CheckRow = {
+  id: number | string;
+  description?: string;
+  status?: string;
+  state?: string;
+  configuration?: { isBlocking?: boolean; type?: { displayName?: string } };
+  context?: { genre?: string; name?: string };
+};
+
+/** Azure status/policy verdicts onto the shared check tones. */
+function checkTone(value: string | undefined): ReviewTone {
+  switch ((value ?? "").trim().toLowerCase()) {
+    case "succeeded":
+    case "approved":
+      return "passing";
+    case "error":
+    case "failed":
+    case "rejected":
+    case "broken":
+      return "failing";
+    case "pending":
+    case "running":
+    case "queued":
+    case "notstarted":
+      return "running";
+    default:
+      return "neutral";
+  }
+}
+
+type LoadResult<T> = { page: T | null; error: string };
+const attempt = <T,>(promise: Promise<T>): Promise<LoadResult<T>> =>
+  promise
+    .then((page) => ({ page, error: "" }))
+    .catch((error: unknown) => ({ page: null, error: message(error) }));
+
+function AzurePrSections({
   association,
   verified,
   refreshKey = 0,
@@ -868,6 +982,7 @@ function AzurePrDetails({
   onHandoff,
   onRefreshEvidence,
   repairInstruction,
+  onChanged,
 }: {
   association: AzurePrAssociation;
   verified: boolean;
@@ -876,12 +991,25 @@ function AzurePrDetails({
   onHandoff: () => void;
   onRefreshEvidence: (instruction: string) => void;
   repairInstruction?: string;
+  onChanged: () => void;
 }) {
   const [threads, setThreads] = useState<AzurePrPage<AzurePrThread> | null>(
     null,
   );
+  const [threadError, setThreadError] = useState("");
+  const [diff, setDiff] = useState<AzurePrDiff | null>(null);
+  const [diffError, setDiffError] = useState("");
+  const [statuses, setStatuses] = useState<AzurePrPage<CheckRow> | null>(null);
+  const [statusError, setStatusError] = useState("");
+  const [policies, setPolicies] = useState<AzurePrPage<CheckRow> | null>(null);
+  const [policyError, setPolicyError] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [reviewComments, setReviewComments] = useState<
+    AzureReviewCommentDraft[]
+  >([]);
+  const [reviewBody, setReviewBody] = useState("");
+  const [submitted, setSubmitted] = useState(false);
   const selectionKey = JSON.stringify([
     association.cwd,
     association.sourceSessionId,
@@ -931,7 +1059,7 @@ function AzurePrDetails({
       }
     }
   };
-  const load = (skip = pageRef.current) =>
+  const loadThreads = (skip = pageRef.current) =>
     read(async (current) => {
       const next = await readAzurePrSection<AzurePrThread>(
         association.target,
@@ -942,7 +1070,48 @@ function AzurePrDetails({
       if (current()) {
         pageRef.current = skip;
         setThreads(next);
+        setThreadError("");
       }
+    });
+  const load = () =>
+    read(async (current) => {
+      // Each section degrades independently — a denied policy read must not
+      // hide a healthy diff, matching how the other providers isolate checks.
+      const [nextThreads, nextDiff, nextStatuses, nextPolicies] =
+        await Promise.all([
+          attempt(
+            readAzurePrSection<AzurePrThread>(
+              association.target,
+              association.revision,
+              "threads",
+              pageRef.current,
+            ),
+          ),
+          attempt(readAzurePrDiff(association.target, association.revision)),
+          attempt(
+            readAzurePrSection<CheckRow>(
+              association.target,
+              association.revision,
+              "statuses",
+            ),
+          ),
+          attempt(
+            readAzurePrSection<CheckRow>(
+              association.target,
+              association.revision,
+              "policies",
+            ),
+          ),
+        ]);
+      if (!current()) return;
+      setThreads(nextThreads.page);
+      setThreadError(nextThreads.error);
+      setDiff(nextDiff.page);
+      setDiffError(nextDiff.error);
+      setStatuses(nextStatuses.page);
+      setStatusError(nextStatuses.error);
+      setPolicies(nextPolicies.page);
+      setPolicyError(nextPolicies.error);
     });
   useEffect(() => {
     if (verified) void load();
@@ -1002,24 +1171,126 @@ function AzurePrDetails({
         onPrepared: onHandoff,
       });
     });
-  const unresolvedCount = threads?.items.filter(unresolvedThread).length ?? 0;
-  const sendableComments = (threads?.items ?? [])
+  const addReviewComment = useCallback(
+    (path: string, line: UnifiedLine, body: string) => {
+      const anchor = azureReviewAnchor(line);
+      if (!anchor) return;
+      setSubmitted(false);
+      setReviewComments((current) =>
+        [
+          ...current.filter(
+            (comment) =>
+              !(
+                comment.path === path &&
+                comment.line === anchor.line &&
+                comment.side === anchor.side
+              ),
+          ),
+          { path, ...anchor, body },
+        ].slice(-50),
+      );
+    },
+    [],
+  );
+  const removeReviewComment = useCallback((index: number) => {
+    setReviewComments((current) => current.filter((_, row) => row !== index));
+  }, []);
+  const submitReview = async (event: AzurePrReviewEvent) => {
+    let submittedOk = false;
+    await read(async (current) => {
+      await azurePrSubmitReview(association.target, association.revision, {
+        event,
+        body: reviewBody,
+        comments: reviewComments,
+      });
+      if (!current()) return;
+      setReviewComments([]);
+      setReviewBody("");
+      setSubmitted(true);
+      submittedOk = true;
+    });
+    // Votes and threads changed — refresh the panel summary and the sections.
+    if (submittedOk) onChanged();
+  };
+  const commentComposer = useCallback<LineCommentComposer>(
+    ({ path, target, onDismiss }) => (
+      <ReviewLineComposer
+        path={path}
+        target={target}
+        onAdd={(body) => {
+          addReviewComment(path, target.line, body);
+          onDismiss();
+        }}
+        onDismiss={onDismiss}
+      />
+    ),
+    [addReviewComment],
+  );
+  const open = association.pr.status === "active";
+  const liveThreads = (threads?.items ?? []).filter(
+    (thread) => !thread.isDeleted,
+  );
+  const reviewThreads = liveThreads.filter((thread) => thread.threadContext);
+  const conversation = liveThreads.filter((thread) => !thread.threadContext);
+  const unresolvedCount = liveThreads.filter(unresolvedThread).length;
+  const sendableComments = liveThreads
     .filter(unresolvedThread)
     .reduce(
       (count, thread) =>
         count + thread.comments.filter((comment) => !comment.isDeleted).length,
       0,
     );
-  const liveThreads = (threads?.items ?? []).filter(
-    (thread) => !thread.isDeleted,
+  const checkRows = [
+    ...(statuses?.items ?? []),
+    ...(policies?.items ?? []),
+  ].slice(0, 50);
+  const checksSummary = (() => {
+    const total = checkRows.length;
+    if (!total) return "No checks";
+    const failing = checkRows.filter(
+      (row) => checkTone(row.state ?? row.status) === "failing",
+    ).length;
+    const running = checkRows.filter(
+      (row) => checkTone(row.state ?? row.status) === "running",
+    ).length;
+    const parts = [`${total - failing - running}/${total} passing`];
+    if (failing) parts.push(`${failing} failing`);
+    if (running) parts.push(`${running} pending`);
+    return parts.join(" · ");
+  })();
+  const files = useMemo<UnifiedDiffFileModel[]>(
+    () =>
+      (diff?.items ?? []).map((item, index) => {
+        const built = item.error
+          ? null
+          : buildUnifiedFile(item.original ?? "", item.modified ?? "");
+        return {
+          id: `${index}:${item.path}`,
+          path: item.path,
+          label: item.originalPath
+            ? `${item.originalPath} → ${item.path}`
+            : item.path,
+          emptyMessage:
+            item.error ??
+            (built && built.lines.length === 0 ? "No textual diff" : undefined),
+          additions: built?.additions ?? 0,
+          deletions: built?.deletions ?? 0,
+          blocks: built?.blocks ?? [],
+          contextActions: false,
+        };
+      }),
+    [diff],
+  );
+  const totals = useMemo(
+    () => ({
+      additions: files.reduce((sum, file) => sum + file.additions, 0),
+      deletions: files.reduce((sum, file) => sum + file.deletions, 0),
+    }),
+    [files],
   );
   return (
     <div className="space-y-3">
-      <RepairStatus
-        scope={azurePrKey(association.target)}
-        cwd={association.cwd}
-      />
-      {association.pr.status === "active" && unresolvedCount > 0 ? (
+      {open && unresolvedCount > 0 ? (
         <div className="flex flex-wrap gap-1.5">
           <button
             className={reviewAction}
@@ -1035,172 +1306,139 @@ function AzurePrDetails({
       ) : null}
       {busy && (preparation.current || !threads) ? (
         <ReviewStatus>
-          {preparation.current ? "Preparing checkout…" : "Loading comments…"}
+          {preparation.current ? "Preparing checkout…" : "Loading PR details…"}
         </ReviewStatus>
       ) : null}
       {busy && preparation.current ? (
-        <button
-          className={button}
-          onClick={() => preparation.current?.abort()}
-        >
+        <button className={button} onClick={() => preparation.current?.abort()}>
           Cancel preparation
         </button>
       ) : null}
-      <ReviewDetails bordered lazy summary="Statuses and policies">
-        <AzureReviewSection
-          association={association}
-          section="policies"
-          onHandoff={onHandoff}
-        />
-        <AzureReviewSection
-          association={association}
-          section="statuses"
-          onHandoff={onHandoff}
-        />
-      </ReviewDetails>
+      {checkRows.length || statusError || policyError ? (
+        <ReviewDetails
+          bordered
+          summary={
+            <>
+              Checks ({checkRows.length}) · {checksSummary}
+              {checkRows.some(
+                (row) => checkTone(row.state ?? row.status) === "failing",
+              ) ? (
+                <span className="text-rose-400/90"> — needs attention</span>
+              ) : null}
+            </>
+          }
+        >
+          <p className="text-content/45">
+            Statuses and policies are provider evidence, not an independently
+            verified CI result.
+          </p>
+          {statusError ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <ReviewError>{statusError}</ReviewError>
+            </div>
+          ) : null}
+          {policyError ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <ReviewError>{policyError}</ReviewError>
+            </div>
+          ) : null}
+          <ul className="space-y-1 pt-1">
+            {checkRows.map((row, index) => (
+              <li
+                key={`${row.id ?? row.context?.name}:${index}`}
+                className="break-words"
+              >
+                <span
+                  className={reviewToneText[checkTone(row.state ?? row.status)]}
+                >
+                  {row.context
+                    ? [row.context.genre, row.context.name]
+                        .filter(Boolean)
+                        .join("/")
+                    : (row.configuration?.type?.displayName ?? row.id)}{" "}
+                  · {row.state ?? row.status ?? "unknown"}
+                </span>
+                {row.configuration?.isBlocking ? (
+                  <span className="text-content/50"> · required</span>
+                ) : null}
+                {row.description ? (
+                  <span className="text-content/50">
+                    {" "}
+                    · {row.description.slice(0, 2000)}
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </ReviewDetails>
+      ) : null}
       <section aria-label="Pull request diff">
-        <AzureReviewSection
-          association={association}
-          section="iterations"
-          onHandoff={onHandoff}
-        />
+        {diff ? (
+          <UnifiedDiffView
+            files={files}
+            truncated={diff.truncated}
+            totals={totals}
+            fill={false}
+            fileLayout="cards"
+            initialExpansion="first"
+            lineCommentComposer={open ? commentComposer : undefined}
+          />
+        ) : diffError ? (
+          <p className="flex items-center gap-2 text-content/50">
+            Diff unavailable. {diffError}
+            <button className={button} onClick={() => void load()}>
+              Retry
+            </button>
+          </p>
+        ) : (
+          <ReviewStatus>Loading diff…</ReviewStatus>
+        )}
       </section>
       <section aria-label="Review threads" className="space-y-1.5">
         <h4 className="text-[11px] font-medium uppercase tracking-wider text-content/45">
-          Review threads{threads ? ` (${liveThreads.length})` : ""}
+          Review threads{threads ? ` (${reviewThreads.length})` : ""}
         </h4>
-        {error ? (
+        {threadError ? (
           <div className="flex flex-wrap items-center gap-2">
-            <ReviewError>{error}</ReviewError>
+            <ReviewError>{threadError}</ReviewError>
             <button
               className={button}
               disabled={busy}
-              onClick={() => void load()}
+              onClick={() => void loadThreads()}
             >
               Retry
             </button>
           </div>
         ) : null}
-        {threads && liveThreads.length === 0 && !error ? (
+        {error ? <ReviewError>{error}</ReviewError> : null}
+        {threads && reviewThreads.length === 0 && !threadError ? (
           <p className="text-content/50">No review threads.</p>
         ) : null}
-        {liveThreads.map((thread) => {
-          const firstComment = thread.comments.find(
-            (comment) => !comment.isDeleted,
-          );
-          const path = thread.threadContext?.filePath;
-          const line = thread.threadContext?.rightFileStart?.line;
-          const excerpt = (firstComment?.content?.split("\n")[0] ?? "").slice(
-            0,
-            100,
-          );
-          const resolved = !unresolvedThread(thread);
-          const total = thread.comments.filter(
-            (comment) => !comment.isDeleted,
-          ).length;
-          return (
-            <ReviewDetails
-              key={thread.id}
-              bordered
-              lazy
-              open={expanded === thread.id}
-              onToggle={(event) => {
-                if (event.currentTarget.open) rememberThread(thread.id);
-                else if (expanded === thread.id) rememberThread(null);
-              }}
-              summary={
-                <>
-                  <span
-                    className={`size-1.5 shrink-0 rounded-full ${
-                      resolved ? "bg-emerald-400/70" : "bg-amber-400/80"
-                    }`}
-                    title={resolved ? "Resolved" : "Unresolved"}
-                  />
-                  <span className="min-w-0 flex-1 truncate">
-                    <span className="text-content/80">
-                      {firstComment?.author?.displayName ?? "Unknown author"}
-                    </span>
-                    {excerpt ? (
-                      <span className="text-content/50"> — {excerpt}</span>
-                    ) : null}
-                  </span>
-                  <span className="shrink-0 text-content/40">
-                    {path || "General"}
-                    {line != null ? `:${line}` : ""} ·{" "}
-                    <span
-                      className={
-                        resolved ? "text-emerald-400/80" : "text-amber-400/90"
-                      }
-                    >
-                      {resolved ? "Resolved" : "Unresolved"}
-                    </span>{" "}
-                    · {total} comment{total === 1 ? "" : "s"}
-                  </span>
-                </>
-              }
-            >
-              {expanded === thread.id ? (
-                <div className="space-y-2">
-                  <p className="text-content/45">
-                    {threadStatusLabel(thread.status)}
-                    {path
-                      ? ` · ${path}${line != null ? `:${line}` : ""}`
-                      : ""}{" "}
-                    · Iteration{" "}
-                    {thread.pullRequestThreadContext?.iterationContext
-                      ?.secondComparingIteration ?? "—"}
-                  </p>
-                  {thread.comments
-                    .filter((comment) => !comment.isDeleted)
-                    .slice(0, 50)
-                    .map((comment) => (
-                      <div key={comment.id}>
-                        <p className="text-content/55">
-                          {comment.author?.displayName ?? "Unknown author"}
-                        </p>
-                        <AgentMarkdown
-                          text={(comment.content ?? "").slice(0, 32_000)}
-                          cwd={association.cwd}
-                        />
-                        {association.pr.status === "active" &&
-                        unresolvedThread(thread) ? (
-                          <button
-                            className={button}
-                            disabled={busy}
-                            onClick={() =>
-                              void repairComments([thread], comment.id)
-                            }
-                          >
-                            Address this comment
-                          </button>
-                        ) : null}
-                      </div>
-                    ))}
-                  {thread.comments.length > 50 ? (
-                    <p className="text-content/45">
-                      Showing 50 comments. Open in Azure for the rest.
-                    </p>
-                  ) : null}
-                  <button
-                    className={reviewAction}
-                    disabled={busy}
-                    onClick={() => void send(thread)}
-                  >
-                    <Bot className="size-3.5" strokeWidth={1.75} />
-                    Send thread to agent
-                  </button>
-                </div>
-              ) : null}
-            </ReviewDetails>
-          );
-        })}
+        {reviewThreads.map((thread) => (
+          <AzureReviewThread
+            key={thread.id}
+            association={association}
+            thread={thread}
+            open={open}
+            expanded={expanded === thread.id}
+            onToggle={(opening) => rememberThread(opening ? thread.id : null)}
+            busy={busy}
+            sendThread={() => void send(thread)}
+            repairComment={(commentId) =>
+              void repairComments([thread], commentId)
+            }
+            onActed={() => void loadThreads()}
+          />
+        ))}
         {threads && (pageRef.current > 0 || threads.nextSkip != null) ? (
           <div className="flex flex-wrap gap-1">
             {pageRef.current > 0 ? (
               <button
                 className={button}
                 disabled={busy}
-                onClick={() => void load(Math.max(0, pageRef.current - 50))}
+                onClick={() =>
+                  void loadThreads(Math.max(0, pageRef.current - 50))
+                }
               >
                 Previous threads
               </button>
@@ -1209,7 +1447,7 @@ function AzurePrDetails({
               <button
                 className={button}
                 disabled={busy}
-                onClick={() => void load(threads.nextSkip!)}
+                onClick={() => void loadThreads(threads.nextSkip!)}
               >
                 Next threads
               </button>
@@ -1217,339 +1455,338 @@ function AzurePrDetails({
           </div>
         ) : null}
       </section>
+      {open ? (
+        <section
+          aria-label="Submit a review"
+          className="space-y-2 rounded-md border border-content/10 px-3 py-2.5"
+        >
+          <h4 className="text-[11px] font-medium uppercase tracking-wider text-content/45">
+            Review
+            {reviewComments.length
+              ? ` · ${reviewComments.length} line comment${reviewComments.length === 1 ? "" : "s"}`
+              : ""}
+          </h4>
+          {reviewComments.length ? (
+            <ul className="space-y-1">
+              {reviewComments.map((comment, index) => (
+                <li
+                  key={`${comment.path}:${comment.side}:${comment.line}`}
+                  className="flex items-start gap-1"
+                >
+                  <span
+                    className="min-w-0 flex-1 truncate text-content/70"
+                    title={`${comment.path}:${comment.line}\n${comment.body}`}
+                  >
+                    {comment.path}:{comment.line}
+                    {comment.side === "left" ? " (removed line)" : ""} ·{" "}
+                    {comment.body}
+                  </span>
+                  <button
+                    type="button"
+                    title="Remove comment"
+                    aria-label="Remove comment"
+                    onClick={() => removeReviewComment(index)}
+                    className="grid size-5 shrink-0 place-items-center rounded text-content/45 hover:bg-content/10 hover:text-content"
+                  >
+                    <X className="size-3" strokeWidth={1.75} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-content/50">
+              Comment on a diff line to include it in the review.
+            </p>
+          )}
+          <textarea
+            aria-label="Review summary"
+            className={reviewField}
+            rows={2}
+            maxLength={64_000}
+            placeholder="Review summary (optional)"
+            value={reviewBody}
+            disabled={busy}
+            onChange={(event) => setReviewBody(event.target.value)}
+          />
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              className={button}
+              disabled={busy || (!reviewBody.trim() && !reviewComments.length)}
+              onClick={() => void submitReview("comment")}
+            >
+              Comment
+            </button>
+            <button
+              className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[12px] text-emerald-300 hover:bg-emerald-400/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/60 disabled:opacity-40"
+              disabled={busy || !!association.pr.isDraft}
+              title={
+                association.pr.isDraft
+                  ? "Draft pull requests can't be approved"
+                  : undefined
+              }
+              onClick={() => void submitReview("approve")}
+            >
+              <Check className="size-3.5" strokeWidth={1.75} />
+              Approve
+            </button>
+            <button
+              className={reviewDanger}
+              disabled={busy}
+              onClick={() => void submitReview("reject")}
+            >
+              Request changes
+            </button>
+          </div>
+          {submitted ? (
+            <p className="flex items-center gap-2 text-content/50">
+              <Check
+                className="size-3.5 text-emerald-400/90"
+                strokeWidth={1.75}
+              />
+              Review submitted.
+              <button
+                className={button}
+                onClick={() =>
+                  void openUrl(azurePrUrl(association.target)).catch(
+                    () => undefined,
+                  )
+                }
+              >
+                Open in Azure
+              </button>
+            </p>
+          ) : null}
+        </section>
+      ) : null}
+      {conversation.length ? (
+        <ReviewDetails
+          lazy
+          summary={`Conversation (${conversation.length})`}
+          className="border-t border-content/10 pt-2"
+        >
+          <div className="space-y-2 pt-1">
+            {conversation.slice(0, 50).map((thread) => {
+              const comments = thread.comments
+                .filter((comment) => !comment.isDeleted)
+                .slice(0, 50);
+              return comments.map((comment) => (
+                <div key={`${thread.id}:${comment.id}`}>
+                  <p className="text-content/55">
+                    {comment.author?.displayName ?? "Unknown author"}
+                  </p>
+                  <AgentMarkdown
+                    text={(comment.content ?? "").slice(0, 32_000)}
+                    cwd={association.cwd}
+                  />
+                </div>
+              ));
+            })}
+          </div>
+        </ReviewDetails>
+      ) : null}
     </div>
   );
 }
 
-type ReviewRow = {
-  id: number | string;
-  description?: string;
-  status?: string;
-  state?: string;
-  sourceRefCommit?: { commitId: string };
-  targetRefCommit?: { commitId: string };
-  configuration?: { isBlocking?: boolean; type?: { displayName?: string } };
-  context?: { genre?: string; name?: string };
-  item?: { path: string };
-  originalPath?: string;
-  changeType?: string;
-};
-
-function AzureReviewSection({
+function AzureReviewThread({
   association,
-  section,
-  iteration = null,
-  onHandoff,
+  thread,
+  open,
+  expanded,
+  onToggle,
+  busy,
+  sendThread,
+  repairComment,
+  onActed,
 }: {
   association: AzurePrAssociation;
-  section: "iterations" | "policies" | "statuses" | "changes";
-  iteration?: number | null;
-  onHandoff: () => void;
+  thread: AzurePrThread;
+  open: boolean;
+  expanded: boolean;
+  onToggle: (opening: boolean) => void;
+  busy: boolean;
+  sendThread: () => void;
+  repairComment: (commentId: number) => void;
+  onActed: () => void;
 }) {
-  const [page, setPage] = useState<AzurePrPage<ReviewRow> | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [selectedIteration, setSelectedIteration] = useState<number | null>(
-    null,
-  );
-  const [pageSkip, setPageSkip] = useState(0);
-  const [filePath, setFilePath] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [acting, setActing] = useState<"reply" | "resolve" | "">("");
+  const [actionError, setActionError] = useState("");
+  const mounted = useRef(true);
   const generation = useRef(0);
-  const mounted = useRef(true),
-    pending = useRef(false);
   useEffect(() => {
     mounted.current = true;
-    pending.current = false;
-    setBusy(false);
-    void load();
+    // Re-showing after an <Activity> hide must not keep a stale busy flag.
+    setActing("");
     return () => {
       mounted.current = false;
       generation.current++;
     };
   }, []);
-  const label = {
-    iterations: "Iterations",
-    policies: "Policies",
-    statuses: "PR statuses",
-    changes: "Changed files",
-  }[section];
-  const load = async (skip = 0) => {
-    if (pending.current) return;
+  const act = async (
+    kind: "reply" | "resolve",
+    action: () => Promise<void>,
+  ) => {
+    if (acting || busy) return;
     const id = generation.current;
     const current = () => mounted.current && generation.current === id;
-    pending.current = true;
-    setBusy(true);
-    setError("");
+    setActing(kind);
+    setActionError("");
     try {
-      const next = await readAzurePrSection<ReviewRow>(
+      await action();
+      if (!current()) return;
+      if (kind === "reply") setDraft("");
+      onActed();
+    } catch (error) {
+      if (current()) setActionError(message(error));
+    } finally {
+      if (current()) setActing("");
+    }
+  };
+  const reply = () =>
+    act("reply", async () => {
+      if (!draft.trim()) return;
+      await azurePrThreadComment(
         association.target,
         association.revision,
-        section,
-        skip,
-        iteration,
+        thread.id,
+        draft,
       );
-      if (current()) {
-        setPage(next);
-        setPageSkip(skip);
-        setFilePath(null);
-      }
-    } catch (error) {
-      if (current()) setError(message(error));
-    } finally {
-      if (current()) {
-        pending.current = false;
-        setBusy(false);
-      }
-    }
-  };
+    });
+  const toggleResolve = () =>
+    act("resolve", async () => {
+      await azurePrThreadStatus(
+        association.target,
+        association.revision,
+        thread.id,
+        resolved ? "active" : "fixed",
+      );
+    });
+  const firstComment = thread.comments.find((comment) => !comment.isDeleted);
+  const path = thread.threadContext?.filePath;
+  const line = thread.threadContext?.rightFileStart?.line;
+  const excerpt = (firstComment?.content?.split("\n")[0] ?? "").slice(0, 100);
+  const resolved = !unresolvedThread(thread);
+  const comments = thread.comments.filter((comment) => !comment.isDeleted);
+  const total = comments.length;
   return (
-    <section className="space-y-1 border-t border-content/10 pt-2">
-      <div className="flex items-center justify-between gap-2">
-        <p className="font-medium">{label}</p>
-        {page ? (
-          <button
-            aria-label={`Refresh ${label.toLowerCase()}`}
-            className={button}
-            disabled={busy}
-            onClick={() => void load(pageSkip)}
-          >
-            {busy ? (
-              <Loader className="size-3.5 animate-spin" strokeWidth={1.75} />
-            ) : (
-              <RefreshCw className="size-3.5" strokeWidth={1.75} />
-            )}
-          </button>
-        ) : null}
-      </div>
-      {section === "policies" || section === "statuses" ? (
-        <p className="text-content/50">
-          {label} are provider evidence, not an independently verified CI
-          result.
+    <ReviewDetails
+      bordered
+      lazy
+      open={expanded}
+      onToggle={(event) => onToggle(event.currentTarget.open)}
+      summary={
+        <>
+          <span
+            className={`size-1.5 shrink-0 rounded-full ${
+              resolved ? "bg-emerald-400/70" : "bg-amber-400/80"
+            }`}
+            title={resolved ? "Resolved" : "Unresolved"}
+          />
+          <span className="min-w-0 flex-1 truncate">
+            <span className="text-content/80">
+              {firstComment?.author?.displayName ?? "Unknown author"}
+            </span>
+            {excerpt ? (
+              <span className="text-content/50"> — {excerpt}</span>
+            ) : null}
+          </span>
+          <span className="shrink-0 text-content/40">
+            {path || "General"}
+            {line != null ? `:${line}` : ""} ·{" "}
+            <span
+              className={resolved ? "text-emerald-400/80" : "text-amber-400/90"}
+            >
+              {resolved ? "Resolved" : "Unresolved"}
+            </span>{" "}
+            · {total} comment{total === 1 ? "" : "s"}
+          </span>
+        </>
+      }
+    >
+      <div className="space-y-2 pt-2">
+        <p className="text-content/45">
+          {threadStatusLabel(thread.status)}
+          {path ? ` · ${path}${line != null ? `:${line}` : ""}` : ""} ·
+          Iteration{" "}
+          {thread.pullRequestThreadContext?.iterationContext
+            ?.secondComparingIteration ?? "—"}
         </p>
-      ) : null}
-      {busy && !page ? (
-        <ReviewStatus>Loading {label.toLowerCase()}…</ReviewStatus>
-      ) : null}
-      {error ? (
-        <div className="flex flex-wrap items-center gap-2">
-          <ReviewError>{error}</ReviewError>
-          <button
-            className={button}
-            disabled={busy}
-            onClick={() => void load()}
-          >
-            Retry {label.toLowerCase()}
-          </button>
-        </div>
-      ) : null}
-      {page?.items.length === 0 ? (
-        <p className="text-content/45">No {label.toLowerCase()} returned.</p>
-      ) : null}
-      {page?.items.map((row, index) => (
-        <div
-          key={`${row.id ?? row.item?.path}:${index}`}
-          className="break-words px-2 py-1"
-        >
-          {section === "iterations" ? (
-            <button
-              className={`${button} w-full text-left`}
-              onClick={() => setSelectedIteration(Number(row.id))}
-            >
-              Iteration {row.id} ·{" "}
-              {row.sourceRefCommit?.commitId.slice(0, 8) ?? "unknown source"} →{" "}
-              {row.targetRefCommit?.commitId.slice(0, 8) ?? "unknown target"} ·
-              Show changes
-            </button>
-          ) : section === "changes" ? (
-            <button
-              className={`${button} w-full text-left`}
-              onClick={() => setFilePath(row.item?.path ?? null)}
-            >
-              {row.changeType} ·{" "}
-              {row.originalPath ? `${row.originalPath} → ` : ""}
-              {row.item?.path} · View diff
-            </button>
-          ) : (
-            <p>
-              {row.configuration?.type?.displayName ??
-                row.context?.name ??
-                row.id}{" "}
-              · {row.status ?? row.state ?? "unknown"}
-              {row.configuration?.isBlocking ? " · required" : ""}
+        {comments.slice(0, 50).map((comment) => (
+          <div key={comment.id}>
+            <p className="text-content/55">
+              {comment.author?.displayName ?? "Unknown author"}
             </p>
-          )}
-          {row.description ? (
-            <p className="text-content/55">{row.description.slice(0, 2000)}</p>
+            <AgentMarkdown
+              text={(comment.content ?? "").slice(0, 32_000)}
+              cwd={association.cwd}
+            />
+            {open && !resolved ? (
+              <button
+                className={button}
+                disabled={busy || !!acting}
+                onClick={() => repairComment(comment.id)}
+              >
+                Address this comment
+              </button>
+            ) : null}
+          </div>
+        ))}
+        {comments.length > 50 ? (
+          <p className="text-content/45">
+            Showing 50 comments. Open in Azure for the rest.
+          </p>
+        ) : null}
+        <div className="flex flex-wrap gap-1">
+          {open && !resolved ? (
+            <button
+              className={button}
+              disabled={busy || !!acting}
+              onClick={sendThread}
+            >
+              <Bot className="size-3.5" strokeWidth={1.75} />
+              Send thread to agent
+            </button>
+          ) : null}
+          {open ? (
+            <button
+              className={button}
+              disabled={busy || !!acting}
+              onClick={() => void toggleResolve()}
+            >
+              {acting === "resolve"
+                ? "Saving…"
+                : resolved
+                  ? "Unresolve"
+                  : "Resolve"}
+            </button>
           ) : null}
         </div>
-      ))}
-      {page && pageSkip > 0 ? (
-        <button
-          className={button}
-          disabled={busy}
-          onClick={() => void load(Math.max(0, pageSkip - 50))}
-        >
-          Previous {label.toLowerCase()}
-        </button>
-      ) : null}
-      {page?.nextSkip != null ? (
-        <button
-          className={button}
-          disabled={busy}
-          onClick={() => void load(page.nextSkip!)}
-        >
-          Next {label.toLowerCase()}
-        </button>
-      ) : null}
-      {selectedIteration != null ? (
-        <AzureReviewSection
-          key={selectedIteration}
-          association={association}
-          section="changes"
-          iteration={selectedIteration}
-          onHandoff={onHandoff}
-        />
-      ) : null}
-      {filePath && iteration ? (
-        <AzurePrFile
-          key={`${iteration}:${filePath}:${pageSkip}`}
-          association={association}
-          iteration={iteration}
-          path={filePath}
-          skip={pageSkip}
-          onHandoff={onHandoff}
-        />
-      ) : null}
-    </section>
-  );
-}
-
-function AzurePrFile({
-  association,
-  iteration,
-  path,
-  skip,
-  onHandoff,
-}: {
-  association: AzurePrAssociation;
-  iteration: number;
-  path: string;
-  skip: number;
-  onHandoff: () => void;
-}) {
-  const [file, setFile] = useState<Awaited<
-    ReturnType<typeof readAzurePrFile>
-  > | null>(null);
-  const [error, setError] = useState("");
-  const [retry, setRetry] = useState(0);
-  const [sending, setSending] = useState(false);
-  const generation = useRef(0);
-  const mounted = useRef(true),
-    pending = useRef(false);
-  useEffect(() => {
-    mounted.current = true;
-    pending.current = false;
-    setSending(false);
-    let cancelled = false;
-    setError("");
-    void readAzurePrFile(
-      association.target,
-      association.revision,
-      iteration,
-      path,
-      skip,
-    )
-      .then((file) => {
-        if (!cancelled) setFile(file);
-      })
-      .catch((error) => {
-        if (!cancelled) setError(message(error));
-      });
-    return () => {
-      cancelled = true;
-      mounted.current = false;
-      generation.current++;
-    };
-  }, [association.target, association.revision, iteration, path, skip, retry]);
-  const diff = useMemo(
-    () => (file ? buildUnifiedFile(file.original, file.modified) : null),
-    [file],
-  );
-  const send = async () => {
-    if (!file || !diff || pending.current) return;
-    const id = generation.current;
-    const current = () => mounted.current && generation.current === id;
-    pending.current = true;
-    setSending(true);
-    setError("");
-    try {
-      await readAzurePr(association.target, association.revision);
-      if (!current()) return;
-      const origin = `${azurePrUrl(association.target)} · account ${association.target.accountId} · checkout ${association.cwd} · session ${association.sourceSessionId ?? "not assigned"} · revision ${association.revision} · iteration ${iteration} · ${file.baseCommit} → ${file.sourceCommit}`;
-      const context = contextFromText(
-        `Azure PR #${association.target.number} · ${path}`,
-        formatUnifiedHunk(diff.lines),
-        origin,
-      );
-      context.entries[0].language = "diff";
-      requestAgentContext({
-        context,
-        cwd: association.cwd,
-        sourceSessionId: association.sourceSessionId,
-        onPrepared: onHandoff,
-      });
-    } catch (error) {
-      if (current()) setError(message(error));
-    } finally {
-      if (current()) {
-        pending.current = false;
-        setSending(false);
-      }
-    }
-  };
-  return (
-    <div className="space-y-2">
-      {error ? (
-        <div className="flex flex-wrap items-center gap-2">
-          <ReviewError>{error}</ReviewError>
-          <button
-            className={button}
-            onClick={() => setRetry((value) => value + 1)}
-          >
-            Retry file
-          </button>
-        </div>
-      ) : null}
-      {!file && !error ? <p>Loading selected file…</p> : null}
-      {file && diff ? (
-        <>
-          <p className="break-all text-content/50">
-            Iteration {iteration}: {file.baseCommit} → {file.sourceCommit}
-          </p>
-          <UnifiedDiffView
-            files={[
-              {
-                id: path,
-                path,
-                label: path,
-                blocks: diff.blocks,
-                additions: diff.additions,
-                deletions: diff.deletions,
-                contextActions: false,
-              },
-            ]}
-            fill={false}
-            fileLayout="cards"
-          />
-          <button
-            className={button}
-            disabled={sending}
-            onClick={() => void send()}
-          >
-            {sending ? "Checking revision…" : "Send file diff to agent"}
-          </button>
-        </>
-      ) : null}
-    </div>
+        {open ? (
+          <div className="space-y-1">
+            <textarea
+              aria-label="Reply to review thread"
+              className={reviewField}
+              rows={2}
+              maxLength={64_000}
+              value={draft}
+              disabled={acting === "reply"}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder="Reply inside this review thread…"
+            />
+            <button
+              className={button}
+              disabled={busy || !!acting || !draft.trim()}
+              onClick={() => void reply()}
+            >
+              {acting === "reply" ? "Replying…" : "Reply"}
+            </button>
+            {actionError ? <ReviewError>{actionError}</ReviewError> : null}
+          </div>
+        ) : actionError ? (
+          <ReviewError>{actionError}</ReviewError>
+        ) : null}
+      </div>
+    </ReviewDetails>
   );
 }

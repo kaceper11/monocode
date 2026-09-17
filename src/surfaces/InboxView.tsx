@@ -1,25 +1,22 @@
 import {
-  ACTION_FILLED,
   ACTION_OUTLINE,
   ACTION_GHOST,
 } from "../chrome/inboxActions";
 import { AzureInboxDetail } from "../chrome/AzureInboxDetail";
+import {
+  InboxDetailShell,
+  inboxKindLabel,
+  inboxStatusMark,
+} from "../chrome/InboxDetailShell";
 
 import { contextTicketKey } from "../lib/agentContext";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   CheckCheck,
   Check,
-  CircleDot,
-  CircleX,
   ExternalLink,
   GitCompare,
-  GitMerge,
-  GitPullRequest,
-  GitPullRequestClosed,
-  GitPullRequestDraft,
   Inbox,
-  MessageSquare,
   ListFilter,
   LoaderCircle,
   MessageMultiple,
@@ -27,7 +24,6 @@ import {
   RefreshCw,
   Search,
   Zap,
-  type IconComponent,
 } from "../chrome/icons";
 import {
   memo,
@@ -46,13 +42,9 @@ import {
 import { InboxConnectMenu } from "../chrome/InboxConnectMenu";
 import { InboxProviderMark } from "../chrome/InboxProviderMark";
 import { Checkbox } from "../chrome/controls";
-import {
-  InboxContextPicker,
-  useInboxContext,
-} from "../chrome/InboxContextPicker";
+import { useInboxContext } from "../chrome/InboxContextPicker";
 import { InboxRelated } from "../chrome/InboxRelated";
 import { MyWorkBadges, myWorkBadges } from "../chrome/InboxMyWorkSection";
-import { InboxTasksSection } from "../chrome/InboxTasksSection";
 import { inboxMyWorkForItems, type InboxMyWork } from "../lib/inboxMyWork";
 import type { AttentionItem } from "../lib/attention";
 import {
@@ -101,7 +93,6 @@ import {
   inboxFetchPaths,
   inboxItemKey,
   inboxItemRef,
-  inboxItemStatus,
   inboxListIsFresh,
   inboxProjectIdentities,
   inboxProjectsForRail,
@@ -327,33 +318,6 @@ function InboxSourceTab({
         />
         <span className="leading-none">{label}</span>
       </span>
-    </button>
-  );
-}
-
-function InboxDetailTab({
-  label,
-  selected,
-  onSelect,
-}: {
-  label: string;
-  selected: boolean;
-  onSelect: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={selected}
-      onClick={onSelect}
-      className={`relative flex h-9 items-center text-[12px] leading-none ${
-        selected ? "text-content" : "text-content/50 hover:text-content"
-      }`}
-    >
-      {label}
-      {selected ? (
-        <span className="absolute inset-x-0 bottom-0 h-0.5 bg-content" />
-      ) : null}
     </button>
   );
 }
@@ -1742,8 +1706,12 @@ function InboxDetailBody({
         cwd={cwd}
         projects={projects}
         relatedSessions={relatedSessions}
+        viewingSessionId={viewingSessionId}
         onOpenSession={onOpenSession}
+        onOpenDelivery={onOpenDelivery}
         onDiscuss={onDiscuss}
+        myWork={myWork}
+        onAttentionAction={onAttentionAction}
       />
     );
   return (
@@ -1760,56 +1728,6 @@ function InboxDetailBody({
       onAttentionAction={onAttentionAction}
     />
   );
-}
-
-type InboxStatusMark = {
-  Icon: IconComponent;
-  className: string;
-  label: string;
-};
-
-/** Status reads from the glyph first and the color second, so it survives color blindness. */
-function inboxStatusMark(item: InboxItem): InboxStatusMark {
-  const label = inboxItemStatus(item);
-  if (item.kind === "ci")
-    return {
-      Icon: CircleX,
-      className: "text-rose-400/90",
-      label: "Needs attention",
-    };
-  const pr = item.kind === "pr";
-  if (label === "Draft") {
-    return {
-      Icon: GitPullRequestDraft,
-      className: "text-content/50",
-      label,
-    };
-  }
-  if (label === "Merged") {
-    return { Icon: GitMerge, className: "text-violet-400/90", label };
-  }
-  if (label === "Closed") {
-    return {
-      Icon: pr ? GitPullRequestClosed : CircleX,
-      className: "text-rose-400/90",
-      label,
-    };
-  }
-  return {
-    Icon: pr ? GitPullRequest : CircleDot,
-    className: label === "Unknown" ? "text-content/50" : "text-emerald-400/90",
-    label,
-  };
-}
-
-/** Same kind wording on the card and the detail — providers differ in name
- * (work item vs issue, MR vs PR), not in layout. */
-function inboxKindLabel(item: InboxItem): string {
-  if (item.kind === "ci") return "CI";
-  if (item.kind === "pr")
-    return item.provider === "gitlab" ? "Merge request" : "Pull request";
-  if (item.kind === "azure") return "Work item";
-  return "Issue";
 }
 
 const InboxCard = memo(function InboxCard({
@@ -2047,12 +1965,7 @@ export function InboxDetail({
   const [posting, setPosting] = useState(false);
   const [postError, setPostError] = useState<string | null>(null);
   const context = useInboxContext(item);
-  const [sendError, setSendError] = useState("");
   const [retry, setRetry] = useState(0);
-  const status = ticket
-    ? item.state || inboxItemStatus(item)
-    : inboxItemStatus(item);
-  const statusMark = inboxStatusMark(item);
 
   const source = azure
     ? `${item.site?.split("/").pop()} / ${item.projectName}`
@@ -2337,38 +2250,18 @@ export function InboxDetail({
   };
 
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-col">
-      <div
-        data-inbox-detail-header
-        className="relative z-10 shrink-0 border-b border-content/10"
-      >
-        <div className="mx-auto flex w-full max-w-5xl flex-col gap-2.5 px-8 pt-5 pb-5">
-          <header className="flex flex-col gap-3">
-            <div className="flex items-center gap-2 text-[12px] text-content/50">
-              <InboxProviderMark
-                provider={item.provider}
-                className="size-3.5"
-              />
-              <span>{inboxKindLabel(item)}</span>
-              <span className="tabular-nums">{inboxItemRef(item)}</span>
-              <span
-                className={`flex items-center gap-1 ${statusMark.className}`}
-              >
-                <statusMark.Icon className="size-3.5" strokeWidth={1.75} />
-                {status}
-              </span>
-              {attentionLabel ? (
-                <span className="shrink-0 text-accent">{attentionLabel}</span>
-              ) : null}
-              {source ? <span className="truncate">{source}</span> : null}
-            </div>
-            <h1
-              title={item.title}
-              className="line-clamp-2 text-[20px] font-semibold leading-tight text-content"
-            >
-              {item.title}
-            </h1>
-            <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-[12px] text-content/50">
+    <InboxDetailShell
+      item={item}
+      cwd={cwd}
+      context={context}
+      attention={
+        attentionLabel ? (
+          <span className="shrink-0 text-accent">{attentionLabel}</span>
+        ) : null
+      }
+      source={source ? <span className="truncate">{source}</span> : null}
+      meta={
+        <>
               {authorName ? (
                 <InboxPerson
                   name={authorName}
@@ -2429,52 +2322,16 @@ export function InboxDetail({
                   <span className={reviewClass}>{reviewLabel}</span>
                 </>
               ) : null}
-            </div>
-            {myWork?.hasWork ? (
-              // Bounded — a busy item's task/conversation/queue list must
-              // never push the actions and tabs below off the pinned header.
-              <div className="max-h-56 overflow-y-auto overscroll-contain">
-                <InboxTasksSection
-                  item={item}
-                  work={myWork}
-                  viewingSessionId={viewingSessionId}
-                  onOpenSession={onOpenSession}
-                  onOpenDelivery={onOpenDelivery}
-                  onOpenAttention={onAttentionAction}
-                />
-              </div>
-            ) : null}
-            <div className="flex flex-wrap items-center gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => {
-                  setSendError("");
-                  try {
-                    requestAgentContext({
-                      inboxItems: [item],
-                      context: contextFromTickets([item]),
-                      cwd: item.projectPath || cwd || undefined,
-                      onFailed: (reason) => setSendError(reason),
-                    });
-                  } catch (reason) {
-                    setSendError(String(reason));
-                  }
-                }}
-                className={`${ACTION_FILLED} disabled:cursor-default disabled:opacity-40`}
-              >
-                Send to agent
-              </button>
-              <button
-                type="button"
-                disabled={context.busy}
-                onClick={() => {
-                  context.open();
-                }}
-                className={item.kind === "pr" ? ACTION_FILLED : ACTION_OUTLINE}
-              >
-                <MessageSquare className="size-3.5" strokeWidth={1.75} /> Ask
-                agent
-              </button>
+        </>
+      }
+      myWork={myWork}
+      viewingSessionId={viewingSessionId}
+      onOpenSession={onOpenSession}
+      onOpenDelivery={onOpenDelivery}
+      onOpenAttention={onAttentionAction}
+      onDiscuss={onDiscuss}
+      actions={
+        <>
               {isPr && (item.provider === "github" || gitlab) ? (
                 <button
                   type="button"
@@ -2524,55 +2381,44 @@ export function InboxDetail({
                           ? "Open on GitLab"
                           : "Open on GitHub"}
               </button>
-            </div>
-            {sendError ? (
-              <p role="alert" className="text-[12px] text-red-400">
-                {sendError}
-              </p>
-            ) : null}
-            <InboxContextPicker
-              context={context}
-              onConfirm={async (card) => {
-                await onDiscuss?.(card);
-              }}
-            />
-            {(jira || azure) && error && details ? (
-              <p role="status" className="text-[12px] text-content/50">
-                {error}{" "}
-                <button
-                  type="button"
-                  className={ACTION_GHOST}
-                  onClick={() => setRetry((value) => value + 1)}
-                >
-                  Retry
-                </button>
-              </p>
-            ) : null}
-          </header>
-          {isPr && (item.provider === "github" || gitlab) ? (
-            <div
-              role="tablist"
-              aria-label={
-                gitlab ? "Merge request sections" : "Pull request sections"
-              }
-              className="flex h-9 gap-4 items-stretch border-b border-content/10"
+        </>
+      }
+      error={
+        (jira || azure) && error && details ? (
+          <p role="status" className="text-[12px] text-content/50">
+            {error}{" "}
+            <button
+              type="button"
+              className={ACTION_GHOST}
+              onClick={() => setRetry((value) => value + 1)}
             >
-              <InboxDetailTab
-                label="Summary"
-                selected={tab === "summary"}
-                onSelect={() => setTab("summary")}
-              />
-              <InboxDetailTab
-                label="Code"
-                selected={tab === "code"}
-                onSelect={() => setTab("code")}
-              />
-            </div>
-          ) : (
-            <div className="border-t border-content/10" />
-          )}
-        </div>
-      </div>
+              Retry
+            </button>
+          </p>
+        ) : null
+      }
+      tabs={
+        isPr && (item.provider === "github" || gitlab)
+          ? {
+              ariaLabel: gitlab
+                ? "Merge request sections"
+                : "Pull request sections",
+              items: [
+                {
+                  label: "Summary",
+                  selected: tab === "summary",
+                  onSelect: () => setTab("summary"),
+                },
+                {
+                  label: "Code",
+                  selected: tab === "code",
+                  onSelect: () => setTab("code"),
+                },
+              ],
+            }
+          : undefined
+      }
+    >
       <div
         ref={detailLock}
         data-inbox-detail-scroll
@@ -2684,7 +2530,7 @@ export function InboxDetail({
           )}
         </div>
       </div>
-    </div>
+    </InboxDetailShell>
   );
 }
 

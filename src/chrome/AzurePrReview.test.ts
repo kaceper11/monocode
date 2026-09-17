@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { AzurePrReview, voteSummary } from "./AzurePrReview";
 import { PREPARE_AGENT_CONTEXT } from "../lib/agentContext";
+import { OPEN_PROJECT_PATH } from "../lib/recents";
 import { AZURE_CHANGE_EVENT } from "../lib/azure";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -94,6 +95,18 @@ beforeEach(() => {
             revision: stale ? "new-source:target" : "source:target",
           };
         if (args.section === "policies") throw new Error("Policy read denied");
+        if (args.section === "diff")
+          return {
+            items: [
+              {
+                path: "src/file.ts",
+                original: "line\n",
+                modified: "line\nadded\n",
+              },
+            ],
+            nextSkip: null,
+            revision: "source:target",
+          };
         if (args.section === "threads")
           return {
             items: [
@@ -118,6 +131,14 @@ beforeEach(() => {
           };
         return { items: [], nextSkip: null, revision: "source:target" };
       }
+      if (command === "azure_pr_thread_comment")
+        return { revision: "source:target" };
+      if (command === "azure_pr_thread_status")
+        return { revision: "source:target" };
+      if (command === "azure_pr_submit_review")
+        return { revision: "source:target" };
+      if (command === "azure_pr_prepare_checkout") return "/work/repo-pr-13";
+      if (command === "azure_pr_cancel_checkout") return null;
       throw new Error(`Unexpected command ${command}`);
     });
 });
@@ -137,9 +158,10 @@ it("rolls the worst reviewer vote into the meta summary", () => {
     tone: "failing",
   });
   // A waiting-for-author vote outranks approvals — worst vote wins.
-  expect(voteSummary([reviewer(10), reviewer(-5), reviewer(5)])).toMatchObject(
-    { label: "Waiting for author", tone: "running" },
-  );
+  expect(voteSummary([reviewer(10), reviewer(-5), reviewer(5)])).toMatchObject({
+    label: "Waiting for author",
+    tone: "running",
+  });
   expect(voteSummary([reviewer(10), reviewer(5)])).toMatchObject({
     label: "2 approvals",
     tone: "passing",
@@ -180,7 +202,7 @@ function ReviewNavigation(
     ),
   );
 }
-async function setup() {
+async function setup(props?: Partial<Parameters<typeof AzurePrReview>[0]>) {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
@@ -191,6 +213,7 @@ async function setup() {
         branch: "feature",
         sourceSessionId: "session-a",
         enabled: true,
+        ...props,
       }),
     ),
   );
@@ -252,7 +275,7 @@ it("finds and links a PR, isolates denied policies, pages threads, and hands off
     ).toBe(true);
     await act(async () => {
       const details = [...document.querySelectorAll("details")].find((el) =>
-        el.querySelector("summary")?.textContent?.includes("Statuses and policies"),
+        el.querySelector("summary")?.textContent?.includes("Checks ("),
       )!;
       details.open = true;
       details.dispatchEvent(new Event("toggle"));
@@ -420,9 +443,7 @@ it("automatically opens a unique branch match but lets the user choose among mul
     "#13 Fix scoped review",
   );
   await act(async () =>
-    vi.waitFor(() =>
-      expect(document.body.textContent).toContain("Unresolved"),
-    ),
+    vi.waitFor(() => expect(document.body.textContent).toContain("Unresolved")),
   );
   await cleanup();
   localStorage.setItem("monocode.azurePrAssociations.v1", "[]");
@@ -485,6 +506,7 @@ it("labels the page limit and allows repairing a thread beyond the first twenty"
         items: Array.from({ length: 21 }, (_, index) => ({
           id: index + 1,
           status: "active",
+          threadContext: { filePath: "/file.ts" },
           comments: [{ id: 1, content: `Comment ${index + 1}` }],
         })),
         revision: "source:target",
@@ -542,7 +564,7 @@ it("retains the expanded thread and scroll while pausing hidden review effects",
     await link();
     await click("Refresh PR");
     await expandThread();
-    const panel = document.querySelector('[aria-label="Azure pull requests"]')!;
+    const panel = document.querySelector('[aria-label="Azure pull request"]')!;
     const thread = [...document.querySelectorAll("details")].find((el) =>
       el.querySelector("summary")?.textContent?.includes("Unresolved"),
     )!;
@@ -552,7 +574,7 @@ it("retains the expanded thread and scroll while pausing hidden review effects",
     await act(async () => window.dispatchEvent(new Event(AZURE_CHANGE_EVENT)));
     expect(invoke).toHaveBeenCalledTimes(count);
     await click("Pull requests");
-    expect(document.querySelector('[aria-label="Azure pull requests"]')).toBe(
+    expect(document.querySelector('[aria-label="Azure pull request"]')).toBe(
       panel,
     );
     expect(panel.scrollTop).toBe(120);
@@ -600,6 +622,166 @@ it("ignores a pending thread response after hiding and reopening the review", as
     );
   } finally {
     release?.();
+    await cleanup();
+  }
+});
+
+async function typeText(selector: string, text: string) {
+  const input = document.querySelector(selector) as HTMLTextAreaElement;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )!.set!.call(input, text);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+async function addLineComment(label: string, text: string) {
+  const gutter = document.querySelector(
+    `[aria-label="${label}"]`,
+  ) as HTMLButtonElement;
+  expect(gutter).not.toBeNull();
+  await act(async () => gutter.click());
+  await typeText('[role="dialog"] textarea', text);
+  await click("Add to review");
+}
+
+it("renders the aggregated diff and submits a pinned inline review", async () => {
+  const cleanup = await setup();
+  try {
+    await link();
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(
+          document.querySelector('[aria-label="Submit a review"]'),
+        ).not.toBeNull();
+      }),
+    );
+    expect(document.body.textContent).toContain("src/file.ts");
+    await addLineComment("Comment on line 2", "Nit inline");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("Review · 1 line comment");
+      }),
+    );
+    await click("Request changes");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(
+          vi.mocked(invoke).mock.calls.some(
+            ([command, args]) =>
+              command === "azure_pr_submit_review" &&
+              (args as Record<string, unknown>).expectedRevision ===
+                "source:target" &&
+              (args as Record<string, unknown>).event === "reject" &&
+              JSON.stringify((args as Record<string, unknown>).comments) ===
+                JSON.stringify([
+                  {
+                    path: "src/file.ts",
+                    line: 2,
+                    side: "right",
+                    offset: 5,
+                    body: "Nit inline",
+                  },
+                ]),
+          ),
+        ).toBe(true);
+      }),
+    );
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(document.body.textContent).toContain("Review submitted.");
+      }),
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+it("replies inside a thread and resolves it on the viewed revision", async () => {
+  // A separate session scope resets the module-level remembered thread page —
+  // earlier tests paged to thread 43 under the shared scope.
+  const cleanup = await setup({ sourceSessionId: "session-reply" });
+  try {
+    await link();
+    await act(async () =>
+      vi.waitFor(() =>
+        expect(document.body.textContent).toContain("Unresolved"),
+      ),
+    );
+    await expandThread();
+    await typeText('textarea[aria-label="Reply to review thread"]', "On it");
+    await click("Reply");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(
+          vi
+            .mocked(invoke)
+            .mock.calls.some(
+              ([command, args]) =>
+                command === "azure_pr_thread_comment" &&
+                (args as Record<string, unknown>).threadId === 42 &&
+                (args as Record<string, unknown>).expectedRevision ===
+                  "source:target" &&
+                (args as Record<string, unknown>).body === "On it",
+            ),
+        ).toBe(true);
+      }),
+    );
+    await click("Resolve");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(
+          vi
+            .mocked(invoke)
+            .mock.calls.some(
+              ([command, args]) =>
+                command === "azure_pr_thread_status" &&
+                (args as Record<string, unknown>).threadId === 42 &&
+                (args as Record<string, unknown>).expectedRevision ===
+                  "source:target" &&
+                (args as Record<string, unknown>).status === "fixed",
+            ),
+        ).toBe(true);
+      }),
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+it("opens a worktree pinned to the linked revision", async () => {
+  const cleanup = await setup();
+  const opened = vi.fn();
+  window.addEventListener(OPEN_PROJECT_PATH, opened);
+  try {
+    await link();
+    await act(async () =>
+      vi.waitFor(() =>
+        expect(document.body.textContent).toContain("Open in worktree"),
+      ),
+    );
+    await click("Open in worktree");
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(
+          vi
+            .mocked(invoke)
+            .mock.calls.some(
+              ([command, args]) =>
+                command === "azure_pr_prepare_checkout" &&
+                (args as Record<string, unknown>).expectedRevision ===
+                  "source:target",
+            ),
+        ).toBe(true);
+      }),
+    );
+    await act(async () =>
+      vi.waitFor(() => expect(opened).toHaveBeenCalledTimes(1)),
+    );
+  } finally {
+    window.removeEventListener(OPEN_PROJECT_PATH, opened);
     await cleanup();
   }
 });

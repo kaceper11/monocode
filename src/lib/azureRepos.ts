@@ -6,6 +6,7 @@ import { sessionWorkItems } from "./sessionWorkItem";
 import { pathKey } from "./paths";
 import { ensureDeliveryWatcher, unwatchAzurePrDelivery } from "./watchers";
 import type { AzureStatus } from "./azure";
+import type { UnifiedLine } from "./unifiedDiff";
 
 export type AzurePrTarget = {
   site: string;
@@ -46,7 +47,7 @@ export type AzurePrPage<T> = {
   revision: string;
 };
 export type AzurePrSection =
-  "threads" | "workitems" | "iterations" | "changes" | "policies" | "statuses";
+  "threads" | "iterations" | "changes" | "policies" | "statuses" | "workitems";
 export type AzurePrThread = {
   id: number;
   status: string;
@@ -66,6 +67,7 @@ export type AzurePrThread = {
     id: number;
     content?: string;
     isDeleted?: boolean;
+    publishedDate?: string;
     author?: { displayName: string };
   }[];
 };
@@ -409,29 +411,111 @@ export function readAzurePrSection<T>(
     skip,
   });
 }
-export function readAzurePrFile(
+export type AzurePrDiffItem = {
+  path: string;
+  originalPath?: string | null;
+  changeType?: string;
+  /** Anchors inline review threads to this change. */
+  changeTrackingId?: number;
+  original?: string;
+  modified?: string;
+  /** Content unavailable for this file (binary, oversized, read failure). */
+  error?: string;
+};
+export type AzurePrDiff = {
+  items: AzurePrDiffItem[];
+  nextSkip: null;
+  revision: string;
+  iteration?: number;
+  truncated?: boolean;
+};
+/** The aggregated base → latest-iteration diff — same shape GitHub/GitLab
+ * render from one patch. */
+export function readAzurePrDiff(target: AzurePrTarget, revision: string) {
+  return invoke<AzurePrDiff>("azure_pr_read", {
+    target,
+    section: "diff",
+    expectedRevision: revision,
+    iteration: null,
+    skip: 0,
+  });
+}
+
+export type AzurePrReviewEvent = "comment" | "approve" | "reject";
+
+/** One pending inline comment — the anchor Azure's thread API expects. */
+export type AzureReviewCommentDraft = {
+  path: string;
+  line: number;
+  side: "left" | "right";
+  /** Characters the comment spans — Azure positions are offset ranges. */
+  offset: number;
+  body: string;
+};
+
+/** A rendered diff line's Azure anchor: deletions anchor on the left side,
+ * additions and context lines on the right. Hunk headers can't anchor. */
+export function azureReviewAnchor(
+  line: UnifiedLine,
+): Pick<AzureReviewCommentDraft, "line" | "side" | "offset"> | null {
+  const offset = Math.max(1, line.text.length);
+  if (line.kind === "del") {
+    return line.oldNumber == null
+      ? null
+      : { line: line.oldNumber, side: "left", offset };
+  }
+  return line.newNumber == null
+    ? null
+    : { line: line.newNumber, side: "right", offset };
+}
+
+export function azurePrThreadComment(
   target: AzurePrTarget,
   revision: string,
-  iteration: number,
-  filePath: string,
-  skip: number,
+  threadId: number,
+  body: string,
 ) {
-  return invoke<{
-    path: string;
-    originalPath: string;
-    original: string;
-    modified: string;
-    sourceCommit: string;
-    baseCommit: string;
-    iteration: number;
-    revision: string;
-  }>("azure_pr_read", {
+  return invoke<{ revision: string }>("azure_pr_thread_comment", {
     target,
-    section: "file",
     expectedRevision: revision,
-    iteration,
-    filePath,
-    skip,
+    threadId,
+    body,
+  });
+}
+
+export function azurePrThreadStatus(
+  target: AzurePrTarget,
+  revision: string,
+  threadId: number,
+  status: "active" | "fixed",
+) {
+  return invoke<{ revision: string }>("azure_pr_thread_status", {
+    target,
+    expectedRevision: revision,
+    threadId,
+    status,
+  });
+}
+
+/**
+ * Submit a review — the event, pending inline comments and summary body,
+ * pinned to the revision the reviewer saw (like the GitHub review submit).
+ */
+export function azurePrSubmitReview(
+  target: AzurePrTarget,
+  revision: string,
+  review: {
+    event: AzurePrReviewEvent;
+    body: string;
+    comments: AzureReviewCommentDraft[];
+  },
+) {
+  return invoke<{ revision: string }>("azure_pr_submit_review", {
+    target,
+    expectedRevision: revision,
+    event: review.event,
+    body: review.body,
+    comments: review.comments,
   });
 }
 
@@ -487,48 +571,46 @@ export function allAzurePrAssociations(): AzurePrAssociation[] {
     if (raw === associationsCacheRaw) return associationsCache;
     const rows: unknown = JSON.parse(raw);
     if (!Array.isArray(rows)) return [];
-    associationsCache = rows
-      .slice(0, 100)
-      .filter((value) => {
-        try {
-          if (
-            !value ||
-            !value.target ||
-            typeof value.target.accountId !== "string" ||
-            typeof value.revision !== "string" ||
-            ![
-              value.account,
-              value.projectName,
-              value.repositoryName,
-              value.target.site,
-              value.target.project,
-              value.target.repository,
-            ].every((field) => typeof field === "string") ||
-            !Number.isInteger(value.target.number) ||
-            !value.pr ||
-            ![
-              value.pr.title,
-              value.pr.status,
-              value.pr.sourceRefName,
-              value.pr.targetRefName,
-            ].every((field) => typeof field === "string") ||
-            value.pr.pullRequestId !== value.target.number ||
-            !Array.isArray(value.pr.reviewers) ||
-            !value.pr.reviewers.every(
-              (reviewer: AzurePr["reviewers"][number]) =>
-                reviewer &&
-                typeof reviewer.displayName === "string" &&
-                typeof reviewer.id === "string" &&
-                Number.isFinite(reviewer.vote),
-            )
+    associationsCache = rows.slice(0, 100).filter((value) => {
+      try {
+        if (
+          !value ||
+          !value.target ||
+          typeof value.target.accountId !== "string" ||
+          typeof value.revision !== "string" ||
+          ![
+            value.account,
+            value.projectName,
+            value.repositoryName,
+            value.target.site,
+            value.target.project,
+            value.target.repository,
+          ].every((field) => typeof field === "string") ||
+          !Number.isInteger(value.target.number) ||
+          !value.pr ||
+          ![
+            value.pr.title,
+            value.pr.status,
+            value.pr.sourceRefName,
+            value.pr.targetRefName,
+          ].every((field) => typeof field === "string") ||
+          value.pr.pullRequestId !== value.target.number ||
+          !Array.isArray(value.pr.reviewers) ||
+          !value.pr.reviewers.every(
+            (reviewer: AzurePr["reviewers"][number]) =>
+              reviewer &&
+              typeof reviewer.displayName === "string" &&
+              typeof reviewer.id === "string" &&
+              Number.isFinite(reviewer.vote),
           )
-            return false;
-          azurePrUrl(value.target);
-          return true;
-        } catch {
+        )
           return false;
-        }
-      });
+        azurePrUrl(value.target);
+        return true;
+      } catch {
+        return false;
+      }
+    });
     associationsCacheRaw = raw;
     return associationsCache;
   } catch {
@@ -646,7 +728,8 @@ export function saveAzurePrAssociation(
     /* Quota/denied storage — report the drop, don't crash the handler. */
     return;
   }
-  if (typeof window !== "undefined") window.dispatchEvent(new Event(AZURE_PR_ASSOCIATIONS_CHANGED));
+  if (typeof window !== "undefined")
+    window.dispatchEvent(new Event(AZURE_PR_ASSOCIATIONS_CHANGED));
   // A saved link owns a review watcher: registered on first link, lifted only
   // when no remaining row — in any session scope — still covers the delivery
   // at this checkout+branch. Switching the displayed PR keeps the old link's

@@ -526,8 +526,13 @@ pub enum PrSection {
     Changes,
     Policies,
     Statuses,
-    File,
+    Diff,
 }
+
+/// A review diff renders whole files, so the aggregated section is bounded
+/// like the shared transport — 50 files, ~4 MB of embedded text total.
+const DIFF_FILE_LIMIT: usize = 50;
+const DIFF_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Each on-demand section fails independently. Snapshot reads verify both sides of the read.
 #[tauri::command]
@@ -537,7 +542,6 @@ pub async fn azure_pr_read(
     section: PrSection,
     expected_revision: Option<String>,
     iteration: Option<u32>,
-    file_path: Option<String>,
     skip: u32,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -562,25 +566,28 @@ pub async fn azure_pr_read(
             return Err("PR revision changed. Refresh before selecting or sending context.".into());
         }
         let mut result = match section {
-            PrSection::File => {
+            PrSection::Diff => {
                 if pr.get("forkSource").is_some_and(|fork| !fork.is_null()) {
-                    return Err("Fork file content is available in Azure. Cross-repository content is not substituted.".into());
+                    return Err("Fork diffs are available in Azure. Cross-repository content is not substituted.".into());
                 }
-                let iteration = iteration.filter(|id| *id > 0).ok_or("Choose a PR iteration")?;
-                let selected = file_path.as_deref().filter(|path| !path.is_empty() && path.len() <= 4096).ok_or("Choose a changed file")?;
-                let changes = get(&config, &format!("{path}/iterations/{iteration}/changes"), &[
-                    ("$top", PAGE_SIZE.to_string()), ("$skip", skip.to_string()), ("$compareTo", "0".into()),
-                ])?;
-                let change = changes["changeEntries"].as_array().and_then(|rows| rows.iter().take(PAGE_SIZE).find(|row| row["item"]["path"] == selected)).ok_or("File is no longer in the selected change page. Refresh changes.")?;
-                let commits = get(&config, &format!("{path}/iterations/{iteration}"), &[])?;
-                let kind = text(change, "changeType")?.to_ascii_lowercase();
+                // The review diff is base → latest iteration — the same view
+                // the other providers render with a single patch.
+                let iterations = get(&config, &format!("{path}/iterations"), &[])?;
+                let latest = iterations["value"]
+                    .as_array()
+                    .and_then(|rows| rows.iter().filter_map(|row| row["id"].as_u64()).max())
+                    .ok_or("Azure returned a PR without iterations")?;
+                let commits = get(&config, &format!("{path}/iterations/{latest}"), &[])?;
                 let source = text(&commits["sourceRefCommit"], "commitId")?;
                 let base = text(&commits["commonRefCommit"], "commitId")?;
-                let old_path = change["originalPath"].as_str().or(change["sourceServerItem"].as_str()).unwrap_or(selected);
+                let (changes, truncated) = pr_changes(&config, &path, latest, DIFF_FILE_LIMIT)?;
                 let repo_path = repository_path(&target.project, &target.repository)?;
-                let original = if kind.split(',').any(|flag| flag.trim() == "add") { String::new() } else { file_text(&config, &repo_path, old_path, base)? };
-                let modified = if kind.split(',').any(|flag| flag.trim() == "delete") { String::new() } else { file_text(&config, &repo_path, selected, source)? };
-                json!({"path":selected,"originalPath":old_path,"original":original,"modified":modified,"sourceCommit":source,"baseCommit":base,"iteration":iteration})
+                json!({
+                    "items": diff_items(&config, &repo_path, &changes, source, base),
+                    "nextSkip": Value::Null,
+                    "iteration": latest,
+                    "truncated": truncated,
+                })
             }
             PrSection::Summary => {
                 let mut summary = summary(&pr)?;
@@ -713,6 +720,403 @@ fn preview_text(item: &Value) -> Result<String, String> {
         );
     }
     Ok(content.into())
+}
+
+/// Every change in an iteration, paged through `nextSkip`, bounded by `limit`.
+/// The second return marks omitted entries so the caller can say the diff is
+/// partial instead of silently dropping files.
+fn pr_changes(
+    config: &AzureConfig,
+    path: &str,
+    iteration: u64,
+    limit: usize,
+) -> Result<(Vec<Value>, bool), String> {
+    let mut items: Vec<Value> = Vec::new();
+    let mut truncated = false;
+    let mut skip = 0u64;
+    loop {
+        let response = get(
+            config,
+            &format!("{path}/iterations/{iteration}/changes"),
+            &[
+                ("$top", PAGE_SIZE.to_string()),
+                ("$skip", skip.to_string()),
+                ("$compareTo", "0".into()),
+            ],
+        )?;
+        let entries = response["changeEntries"]
+            .as_array()
+            .ok_or("Azure returned an invalid PR change list")?;
+        for entry in entries {
+            if items.len() < limit {
+                items.push(entry.clone());
+            } else {
+                truncated = true;
+            }
+        }
+        if truncated {
+            break;
+        }
+        match response["nextSkip"].as_u64().filter(|next| *next > skip) {
+            Some(next) if next <= 10_000 => skip = next,
+            Some(_) => {
+                truncated = true;
+                break;
+            }
+            None => break,
+        }
+    }
+    Ok((items, truncated))
+}
+
+/// One change entry → both file texts. Content failures land in `error` so a
+/// single binary or oversized file cannot fail the whole diff.
+fn diff_item(
+    config: &AzureConfig,
+    repository: &str,
+    change: &Value,
+    source: &str,
+    base: &str,
+    budget: &std::sync::atomic::AtomicUsize,
+) -> Value {
+    let path = change["item"]["path"].as_str().unwrap_or("");
+    if path.is_empty() || path.len() > 4096 {
+        return json!({"path":path,"error":"Azure returned a change without a valid path."});
+    }
+    let kind = change["changeType"]
+        .as_str()
+        .unwrap_or("edit")
+        .to_ascii_lowercase();
+    let old_path = change["originalPath"]
+        .as_str()
+        .or(change["sourceServerItem"].as_str())
+        .unwrap_or(path);
+    let added = kind.split(',').any(|flag| flag.trim() == "add");
+    let deleted = kind.split(',').any(|flag| flag.trim() == "delete");
+    let mut item = json!({
+        "path": path,
+        "originalPath": if old_path == path { Value::Null } else { json!(old_path) },
+        "changeType": change["changeType"].as_str().unwrap_or("edit"),
+        "changeTrackingId": change["changeTrackingId"].as_u64(),
+    });
+    let mut error: Option<String> = None;
+    for (version, target_path, slot) in [(base, old_path, "original"), (source, path, "modified")] {
+        if (slot == "original" && added) || (slot == "modified" && deleted) {
+            continue;
+        }
+        if budget.load(std::sync::atomic::Ordering::Relaxed) >= DIFF_BYTES_LIMIT {
+            error = Some("File text omitted — the diff exceeds the preview limit.".into());
+            break;
+        }
+        match file_text(config, repository, target_path, version) {
+            Ok(content) => {
+                budget.fetch_add(content.len(), std::sync::atomic::Ordering::Relaxed);
+                item[slot] = json!(content);
+            }
+            Err(reason) => error = Some(reason),
+        }
+    }
+    if let Some(reason) = error {
+        item["error"] = json!(reason);
+    }
+    item
+}
+
+/// File text reads are independent, so a small worker pool keeps a 50-file
+/// diff close to one round trip instead of a hundred sequential ones.
+fn diff_items(
+    config: &AzureConfig,
+    repository: &str,
+    changes: &[Value],
+    source: &str,
+    base: &str,
+) -> Vec<Value> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let next = AtomicUsize::new(0);
+    let budget = AtomicUsize::new(0);
+    let rows: Vec<Mutex<Option<Value>>> = changes.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= changes.len() {
+                    break;
+                }
+                *rows[index].lock().unwrap() = Some(diff_item(
+                    config,
+                    repository,
+                    &changes[index],
+                    source,
+                    base,
+                    &budget,
+                ));
+            });
+        }
+    });
+    rows.into_iter()
+        .map(|row| {
+            row.into_inner()
+                .unwrap_or_default()
+                .unwrap_or_else(|| json!({"error":"File read was interrupted."}))
+        })
+        .collect()
+}
+
+/// Pre-write verification shared by every PR mutation — identity, the exact
+/// revision the user saw, and the active state all pinned before any write.
+fn verified_active_pr(
+    config: &AzureConfig,
+    target: &PrTarget,
+    expected_revision: &str,
+) -> Result<String, String> {
+    if target.number == 0 {
+        return Err("Choose a PR first".into());
+    }
+    checked_account(config, &target.account_id)?;
+    if !config.has_capability("Repos") {
+        return Err(
+            "The Azure connection has no Repos access. Reconnect with Code (Read & Write).".into(),
+        );
+    }
+    let path = format!(
+        "{}/pullRequests/{}",
+        repository_path(&target.project, &target.repository)?,
+        target.number
+    );
+    let pr = get(config, &path, &[])?;
+    verify_pr(&pr, &target.project, &target.repository, target.number)?;
+    if revision(&pr)? != expected_revision {
+        return Err("PR revision changed. Refresh before writing.".into());
+    }
+    if pr["status"] != "active" {
+        return Err("The PR is no longer active. Refresh before writing.".into());
+    }
+    Ok(path)
+}
+
+/// A write is confirmed against a fresh read — a moved revision or a switched
+/// account must not be reported as a successful mutation of the seen PR.
+fn recheck_active_pr(
+    app: &AppHandle,
+    target: &PrTarget,
+    path: &str,
+    expected_revision: &str,
+) -> Result<(), String> {
+    let config = require_config(app, &target.site)?;
+    checked_account(&config, &target.account_id)?;
+    let pr = get(&config, path, &[])?;
+    verify_pr(&pr, &target.project, &target.repository, target.number)?;
+    if revision(&pr)? != expected_revision {
+        return Err("PR revision changed during the write. Refresh and retry.".into());
+    }
+    Ok(())
+}
+
+/// Reply inside an existing pull-request thread.
+#[tauri::command]
+pub async fn azure_pr_thread_comment(
+    app: AppHandle,
+    target: PrTarget,
+    expected_revision: String,
+    thread_id: u32,
+    body: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if thread_id == 0 {
+            return Err("Choose a review thread first".into());
+        }
+        let body: String = body.trim().chars().take(64_000).collect();
+        if body.is_empty() {
+            return Err("Enter a reply first".into());
+        }
+        let config = require_config(&app, &target.site)?;
+        let path = verified_active_pr(&config, &target, &expected_revision)?;
+        request_method(
+            &config,
+            "POST",
+            &format!("{path}/threads/{thread_id}/comments"),
+            &[("api-version", "7.1".into())],
+            Some(json!({"content":body,"parentCommentId":0,"commentType":"text"})),
+        )
+        .map_err(|error| write_denied(&error))?;
+        recheck_active_pr(&app, &target, &path, &expected_revision)?;
+        Ok(json!({"revision":expected_revision}))
+    })
+    .await
+    .map_err(|_| "Azure PR reply task failed")?
+}
+
+/// Change a thread's status — resolve ("fixed", "wontFix", "byDesign",
+/// "closed") or reopen ("active", "pending").
+#[tauri::command]
+pub async fn azure_pr_thread_status(
+    app: AppHandle,
+    target: PrTarget,
+    expected_revision: String,
+    thread_id: u32,
+    status: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if thread_id == 0 {
+            return Err("Choose a review thread first".into());
+        }
+        if ![
+            "active", "pending", "fixed", "wontFix", "closed", "byDesign",
+        ]
+        .contains(&status.as_str())
+        {
+            return Err("Unsupported thread status".into());
+        }
+        let config = require_config(&app, &target.site)?;
+        let path = verified_active_pr(&config, &target, &expected_revision)?;
+        request_method(
+            &config,
+            "PATCH",
+            &format!("{path}/threads/{thread_id}"),
+            &[("api-version", "7.1".into())],
+            Some(json!({"status":status})),
+        )
+        .map_err(|error| write_denied(&error))?;
+        recheck_active_pr(&app, &target, &path, &expected_revision)?;
+        Ok(json!({"revision":expected_revision}))
+    })
+    .await
+    .map_err(|_| "Azure PR thread update task failed")?
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewComment {
+    path: String,
+    line: u32,
+    /// "left" anchors on the removed side, "right" on the new side.
+    side: String,
+    /// Line length the comment spans — Azure positions are offset ranges.
+    offset: u32,
+    body: String,
+}
+
+/// Submit a review: inline file threads first, then the summary comment, then
+/// the vote — a failure leaves context behind instead of a bare vote.
+#[tauri::command]
+pub async fn azure_pr_submit_review(
+    app: AppHandle,
+    target: PrTarget,
+    expected_revision: String,
+    event: String,
+    body: String,
+    comments: Vec<ReviewComment>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let vote = match event.as_str() {
+            "comment" => None,
+            "approve" => Some(10),
+            "reject" => Some(-10),
+            _ => return Err("Unsupported review event".into()),
+        };
+        let body: String = body.trim().chars().take(64_000).collect();
+        if comments.len() > 50 {
+            return Err("Azure accepts at most 50 line comments per review".into());
+        }
+        for comment in &comments {
+            if comment.path.is_empty()
+                || comment.path.len() > 4096
+                || comment.path.chars().any(char::is_control)
+            {
+                return Err("A line comment lost its file. Refresh and draft it again.".into());
+            }
+            if comment.line == 0 {
+                return Err("A line comment lost its line. Refresh and draft it again.".into());
+            }
+            if !["left", "right"].contains(&comment.side.as_str()) {
+                return Err("Unsupported comment side".into());
+            }
+            if comment.body.trim().is_empty() || comment.body.chars().count() > 64_000 {
+                return Err("A line comment is empty or too long".into());
+            }
+        }
+        if comments.is_empty() && body.is_empty() && vote.is_none() {
+            return Err("Nothing to submit".into());
+        }
+        let config = require_config(&app, &target.site)?;
+        let path = verified_active_pr(&config, &target, &expected_revision)?;
+        if !comments.is_empty() {
+            let iterations = get(&config, &format!("{path}/iterations"), &[])?;
+            let latest = iterations["value"]
+                .as_array()
+                .and_then(|rows| rows.iter().filter_map(|row| row["id"].as_u64()).max())
+                .ok_or("Azure returned a PR without iterations")?;
+            // Anchoring needs the full change list even past the display cap.
+            let (changes, _) = pr_changes(&config, &path, latest, 500)?;
+            let tracking = |path: &str| {
+                changes
+                    .iter()
+                    .find(|change| change["item"]["path"] == path)
+                    .and_then(|change| change["changeTrackingId"].as_u64())
+            };
+            for comment in &comments {
+                let change_id = tracking(&comment.path).ok_or_else(|| {
+                    format!(
+                        "{} is not in the PR's latest changes. Refresh and draft it again.",
+                        comment.path
+                    )
+                })?;
+                let start = json!({"line":comment.line,"offset":1});
+                let end = json!({"line":comment.line,"offset":comment.offset.max(1) + 1});
+                let thread_context = if comment.side == "left" {
+                    json!({"filePath":comment.path,"leftFileStart":start,"leftFileEnd":end})
+                } else {
+                    json!({"filePath":comment.path,"rightFileStart":start,"rightFileEnd":end})
+                };
+                request_method(
+                    &config,
+                    "POST",
+                    &format!("{path}/threads"),
+                    &[("api-version", "7.1".into())],
+                    Some(json!({
+                        "comments":[{"parentCommentId":0,"content":comment.body,"commentType":"text"}],
+                        "status":"active",
+                        "threadContext":thread_context,
+                        "pullRequestThreadContext":{
+                            "changeTrackingId":change_id,
+                            // first == second compares the common commit to the
+                            // latest iteration — the aggregated diff's view.
+                            "iterationContext":{"firstComparingIteration":latest,"secondComparingIteration":latest}
+                        }
+                    })),
+                )
+                .map_err(|error| write_denied(&error))?;
+            }
+        }
+        if !body.is_empty() {
+            request_method(
+                &config,
+                "POST",
+                &format!("{path}/threads"),
+                &[("api-version", "7.1".into())],
+                Some(json!({
+                    "comments":[{"parentCommentId":0,"content":body,"commentType":"text"}],
+                    "status":"active"
+                })),
+            )
+            .map_err(|error| write_denied(&error))?;
+        }
+        if let Some(vote) = vote {
+            request_method(
+                &config,
+                "PUT",
+                &format!("{path}/reviewers/{}", component(&config.account_id)),
+                &[("api-version", "7.1".into())],
+                Some(json!({"id":config.account_id,"vote":vote})),
+            )
+            .map_err(|error| write_denied(&error))?;
+        }
+        recheck_active_pr(&app, &target, &path, &expected_revision)?;
+        Ok(json!({"revision":expected_revision}))
+    })
+    .await
+    .map_err(|_| "Azure PR review task failed")?
 }
 
 #[cfg(test)]

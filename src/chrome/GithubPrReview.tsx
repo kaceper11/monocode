@@ -3,6 +3,7 @@ import {
   ReviewDetails,
   ReviewError,
   ReviewHeader,
+  ReviewLineComposer,
   ReviewPill,
   ReviewShell,
   ReviewStatus,
@@ -40,13 +41,11 @@ import {
 } from "../lib/repair";
 import { requestAgentContext, type AgentContext } from "../lib/agentContext";
 import { taskDestinationForSession } from "../lib/taskWorkspaces";
-import { diffCommentLocation } from "../lib/diffComment";
 import { notifyGitChanged } from "../lib/fs";
 import { openProjectPath } from "../lib/recents";
 import { openWatchSheet } from "../lib/watchers";
 import type { UnifiedLine } from "../lib/unifiedDiff";
 import { RepairStatus } from "./RepairStatus";
-import { Popover } from "./Popover";
 import {
   Bot,
   Check,
@@ -58,7 +57,6 @@ import {
 } from "./icons";
 import { InboxPrDiff } from "../surfaces/InboxPrDiff";
 import { AgentMarkdown } from "../surfaces/AgentMarkdown";
-import type { DiffCommentComposerTarget } from "../surfaces/DiffCommentComposer";
 import type { LineCommentComposer } from "../surfaces/UnifiedDiffView";
 
 const button = reviewButton;
@@ -663,7 +661,7 @@ function GithubPrSections({
   const [reviewBody, setReviewBody] = useState("");
   const commentComposer = useCallback<LineCommentComposer>(
     ({ path, target, onDismiss }) => (
-      <PrReviewLineComposer
+      <ReviewLineComposer
         path={path}
         target={target}
         onAdd={(body) => {
@@ -1050,93 +1048,5 @@ function GithubReviewThread({
         ) : null}
       </div>
     </ReviewDetails>
-  );
-}
-
-/** Gutter popover that drafts one inline comment into the pending review —
- *  submitted together with the review event, not posted immediately. */
-function PrReviewLineComposer({
-  path,
-  target,
-  onAdd,
-  onDismiss,
-}: {
-  path: string;
-  target: DiffCommentComposerTarget;
-  onAdd: (body: string) => void;
-  onDismiss: () => void;
-}) {
-  const [comment, setComment] = useState("");
-  const location = diffCommentLocation({ path, line: target.line });
-  const add = () => {
-    const body = comment.trim();
-    if (!body) return;
-    onAdd(body);
-  };
-  return (
-    <Popover
-      anchor={target.anchor}
-      side="right"
-      align="start"
-      gap={6}
-      width={360}
-      onDismiss={onDismiss}
-      role="dialog"
-      aria-label={`Comment on ${location}`}
-      className="overflow-hidden"
-    >
-      <form
-        onSubmit={(event) => {
-          event.preventDefault();
-          add();
-        }}
-      >
-        <div className="flex items-center gap-2 border-b border-content/10 px-3 py-2">
-          <span
-            className="min-w-0 flex-1 truncate font-mono text-[11px] text-content/55"
-            title={location}
-          >
-            {location}
-          </span>
-          <button
-            type="button"
-            title="Cancel comment"
-            aria-label="Cancel comment"
-            onClick={onDismiss}
-            className="grid size-5 shrink-0 place-items-center rounded text-content/45 hover:bg-content/10 hover:text-content"
-          >
-            <X className="size-3" strokeWidth={1.75} />
-          </button>
-        </div>
-        <textarea
-          autoFocus
-          rows={3}
-          maxLength={64_000}
-          value={comment}
-          onChange={(event) => setComment(event.target.value)}
-          onKeyDown={(event) => {
-            if (
-              event.key === "Enter" &&
-              (event.metaKey || event.ctrlKey) &&
-              comment.trim()
-            ) {
-              event.preventDefault();
-              add();
-            }
-          }}
-          placeholder="Comment on this line…"
-          className="block max-h-40 min-h-20 w-full resize-y bg-transparent px-3 py-2 text-[13px] leading-5 text-content outline-none placeholder:text-content/35"
-        />
-        <div className="flex items-center justify-end gap-1 border-t border-content/10 p-1.5">
-          <button
-            type="submit"
-            disabled={!comment.trim()}
-            className="inline-flex h-7 items-center gap-1.5 rounded-lg bg-content/10 px-2.5 text-[12px] font-medium text-content hover:bg-content/15 disabled:cursor-default disabled:opacity-40"
-          >
-            Add to review
-          </button>
-        </div>
-      </form>
-    </Popover>
   );
 }
