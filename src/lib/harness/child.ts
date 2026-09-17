@@ -279,6 +279,7 @@ export async function spawnChild(
   command: string,
   args: string[],
   cwd: string,
+  account?: { provider: "claude" | "codex"; id: string },
 ): Promise<void> {
   const generation = ++nextGeneration;
   childGeneration.set(sessionId, generation);
@@ -298,6 +299,7 @@ export async function spawnChild(
       command,
       args,
       cwd,
+      account,
     });
   } catch (error) {
     if (childGeneration.get(sessionId) === generation)

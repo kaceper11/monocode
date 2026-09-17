@@ -151,6 +151,8 @@ export function applyHarnessEvent(
           window: event.window,
         }),
       };
+    case "turn.metrics":
+      return mergeTurnMetrics(session, event);
     case "tasks.updated":
       return upsertTaskList(session, event);
     case "plan":
@@ -160,6 +162,7 @@ export function applyHarnessEvent(
         id: crypto.randomUUID(),
         role: "system",
         text: event.message,
+        notice: "error",
       });
     case "session.providerBound":
       return { ...session, providerSessionId: event.providerSessionId };
@@ -193,9 +196,54 @@ export function applyHarnessEvent(
     }
     case "status":
       return appendStatus(session, event.text);
+    case "interjection":
+      // A visible boundary the user must not miss, so unlike status it never
+      // deduplicates and never reads as turn lifecycle.
+      return appendBlock(session, {
+        id: crypto.randomUUID(),
+        role: "system",
+        text: event.text,
+        interjection: {
+          customType: event.customType,
+          ...(event.severity ? { severity: event.severity } : {}),
+        },
+      });
     default:
       return session;
   }
+}
+
+function mergeTurnMetrics(
+  session: Session,
+  event: Extract<HarnessEvent, { type: "turn.metrics" }>,
+): Session {
+  let userIndex = -1;
+  for (let index = session.blocks.length - 1; index >= 0; index -= 1) {
+    if (session.blocks[index].role === "user") {
+      userIndex = index;
+      break;
+    }
+  }
+  if (userIndex < 0) return session;
+
+  const current = session.blocks[userIndex];
+  const metrics = {
+    ...(current.turnMetrics ?? {}),
+    ...(event.inputTokens != null ? { inputTokens: event.inputTokens } : {}),
+    ...(event.outputTokens != null ? { outputTokens: event.outputTokens } : {}),
+    ...(event.cacheReadTokens != null
+      ? { cacheReadTokens: event.cacheReadTokens }
+      : {}),
+    ...(event.cacheWriteTokens != null
+      ? { cacheWriteTokens: event.cacheWriteTokens }
+      : {}),
+    ...(event.cacheHitPercent != null
+      ? { cacheHitPercent: event.cacheHitPercent }
+      : {}),
+  };
+  const blocks = session.blocks.slice();
+  blocks[userIndex] = { ...current, turnMetrics: metrics };
+  return { ...session, blocks };
 }
 
 function upsertPlan(
@@ -369,6 +417,7 @@ type UserTurnExtra = {
   secondOpinion?: Block["secondOpinion"];
   noteCard?: Block["noteCard"];
   action?: Block["action"];
+  internal?: boolean;
 };
 
 function userTurnFields(extra?: UserTurnExtra) {
@@ -376,6 +425,7 @@ function userTurnFields(extra?: UserTurnExtra) {
     ...(extra?.secondOpinion ? { secondOpinion: extra.secondOpinion } : {}),
     ...(extra?.noteCard ? { noteCard: extra.noteCard } : {}),
     ...(extra?.action ? { action: extra.action } : {}),
+    ...(extra?.internal ? { internal: true } : {}),
   };
 }
 
@@ -559,6 +609,16 @@ export function promoteLastAssistantToPlan(
 
 function stopBlockProgress(block: Block): Block {
   let stopped = block.streaming ? { ...block, streaming: false } : block;
+  if (stopped.orchestration?.status === "planning") {
+    stopped = {
+      ...stopped,
+      orchestration: {
+        ...stopped.orchestration,
+        status: "invalid",
+        error: "Planning was interrupted. Generate the assignments again.",
+      },
+    };
+  }
   if (stopped.role === "plan" && stopped.plan?.status === "streaming") {
     stopped = {
       ...stopped,
@@ -622,12 +682,15 @@ function appendStatus(session: Session, text: string): Session {
 }
 
 function appendBlock(session: Session, block: Block): Session {
-  const blocks = sealLastStream(session.blocks);
+  const blocks =
+    block.role === "system" && !block.interjection
+      ? [...session.blocks]
+      : sealLastStream(session.blocks);
   blocks.push(block);
   return { ...session, blocks };
 }
 
-/** Append to the latest block only when it is the same role; never splice into an earlier one. */
+/** Only ordinary status rows leave an open prose stream intact. */
 function patchStreaming(
   session: Session,
   role: "assistant" | "reasoning",
@@ -635,12 +698,14 @@ function patchStreaming(
   streaming: boolean,
 ): Session {
   if (!text && role === "reasoning") return session;
-  const last = session.blocks[session.blocks.length - 1];
-  if (last?.role === role) {
+  let index = session.blocks.length - 1;
+  while (index >= 0 && session.blocks[index].role === "system" && !session.blocks[index].interjection) index--;
+  const last = session.blocks[index];
+  if (last?.role === role && (index === session.blocks.length - 1 || last.streaming)) {
     const nextText = joinStreamText(last.text, text);
     if (nextText === last.text && last.streaming === streaming) return session;
     const blocks = session.blocks.slice();
-    blocks[blocks.length - 1] = {
+    blocks[index] = {
       ...last,
       text: nextText,
       streaming,
@@ -1009,7 +1074,9 @@ function findToolIndex(
 }
 
 function sealLastStream(blocks: Block[]): Block[] {
-  const last = blocks[blocks.length - 1];
+  let index = blocks.length - 1;
+  while (index >= 0 && blocks[index].role === "system" && !blocks[index].interjection) index--;
+  const last = blocks[index];
   if (
     !last?.streaming ||
     (last.role !== "assistant" && last.role !== "reasoning")
@@ -1017,7 +1084,7 @@ function sealLastStream(blocks: Block[]): Block[] {
     return blocks.slice();
   }
   const next = blocks.slice();
-  next[next.length - 1] = { ...last, streaming: false };
+  next[index] = { ...last, streaming: false };
   return next;
 }
 

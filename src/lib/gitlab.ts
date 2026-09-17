@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { recordInboxSelfActivity } from "./inboxSelfActivity";
 import { normalizeProjectPath } from "./recents";
 
 export type GitlabKind = "issue" | "pr";
@@ -275,6 +276,7 @@ export async function gitlabWorkItemComment(
   threadInflight.delete(key);
   // A top-level note on an MR lands as a new individual_note discussion.
   if (kind === "pr") invalidateDiscussions(repo, number);
+  recordInboxSelfActivity({ provider: "gitlab", kind, repo, number });
   return url;
 }
 

@@ -6,6 +6,7 @@ import { normalizeProjectPath } from "./recents";
 import { deleteSession, listSessionsByProject } from "./sessionStore";
 import { clearTabGroupSettings } from "./tabGroups";
 import { pruneTaskSession } from "./taskWorkspaces";
+import { removeProjectGroupAssignment } from "./projectGroups";
 
 /** Saved chats filed under this project, so the confirm prompt can count them. */
 export async function projectSessionCount(path: string): Promise<number> {
@@ -29,4 +30,5 @@ export async function removeProjectData(path: string): Promise<void> {
   await clearProjectChatBackground(key).catch(() => undefined);
   clearProjectChatBackgroundSetting(key);
   clearTabGroupSettings(key);
+  removeProjectGroupAssignment(normalized);
 }

@@ -1223,8 +1223,8 @@ fn start_screenshot<R: Runtime>(
 ) -> Result<(), String> {
     use webview2_com::CapturePreviewCompletedHandler;
     use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG;
-    use windows::Win32::System::Com::{IStream, STREAM_SEEK_SET};
-    use windows::Win32::UI::Shell::SHCreateMemStream;
+    use windows61::Win32::System::Com::{IStream, STREAM_SEEK_SET};
+    use windows61::Win32::UI::Shell::SHCreateMemStream;
 
     unsafe fn read_stream(stream: &IStream) -> Option<Vec<u8>> {
         stream.Seek(0, STREAM_SEEK_SET, None).ok()?;

@@ -1,4 +1,5 @@
 import type { HarnessId, RuntimeMode } from "../session";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { GeneratedSessionTitle } from "../sessionTitle";
 import type { PrContent } from "../gitText";
 import { hasLiveCatalog } from "../models";
@@ -16,6 +17,7 @@ export type TitleInput = {
   sessionId: string;
   cwd: string;
   message: string;
+  providerAccountId?: string;
 };
 
 /**
@@ -67,7 +69,12 @@ export type HarnessAdapter = {
   /** Drop resume state and kill the child (delete, harness switch, idle detach). */
   forgetSession(sessionId: string): Promise<void>;
   /** Seed resume state from a restored MonoCode session. */
-  bindSession(threadId: string, providerSessionId: string, cwd: string): void;
+  bindSession(
+    threadId: string,
+    providerSessionId: string,
+    cwd: string,
+    providerAccountId?: string,
+  ): void;
   /** Refresh the model catalog overlay when supported. */
   refreshCatalog?(cwd?: string): Promise<void>;
   /** Optional LLM tab title for the first turn. */
@@ -176,7 +183,20 @@ export async function sendHarnessTurn(
   if (!adapter.live) {
     throw new Error(`${input.harness} is not connected yet`);
   }
-  await runHarnessOperation(input.harness, input.sessionId, () => adapter.sendTurn(input));
+  await runHarnessOperation(input.harness, input.sessionId, async () => {
+    const controlled = typeof isTauri === "function" && isTauri();
+    if (controlled)
+      await invoke("control_authorize_turn", {
+        sessionId: input.sessionId,
+        cwd: input.cwd,
+      });
+    try {
+      await adapter.sendTurn(input);
+    } finally {
+      if (controlled)
+        await invoke("control_turn_finished", { sessionId: input.sessionId });
+    }
+  });
 }
 
 /**
@@ -303,8 +323,14 @@ export function bindHarnessSession(
   threadId: string,
   providerSessionId: string,
   cwd: string,
+  providerAccountId?: string,
 ): void {
-  getHarness(harness)?.bindSession(threadId, providerSessionId, cwd);
+  getHarness(harness)?.bindSession(
+    threadId,
+    providerSessionId,
+    cwd,
+    providerAccountId,
+  );
 }
 
 /**

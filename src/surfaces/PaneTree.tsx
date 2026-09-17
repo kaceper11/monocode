@@ -8,7 +8,13 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { setGrabbing, suppressTextSelection } from "../lib/drag";
-import { paneDropFromPoint, useExternalPaneDrop } from "../lib/paneDrop";
+import {
+  paneDropFromPoint,
+  setExternalTitleTabDrop,
+  titleTabDropFromPoint,
+  useExternalPaneDrop,
+  type TitleTabDropPosition,
+} from "../lib/paneDrop";
 import type { ApprovalDecision, UserQuestionReply } from "../lib/harness";
 import type { EditorNavigationTarget } from "../lib/search";
 import {
@@ -29,10 +35,12 @@ import {
   type Attachment,
   type Block,
   type HarnessId,
+  type LinkedWorkItem,
+  type ModelTarget,
   type PlanBuildTarget,
   type RuntimeMode,
   type Session,
-  type TurnIntent,
+  type ComposerTurnOptions,
 } from "../lib/session";
 import { FilePane } from "./FilePane";
 import { SessionPane } from "./SessionPane";
@@ -72,7 +80,7 @@ type Shared = {
     sessionId: string,
     text: string,
     attachments: Attachment[],
-    options?: { intent?: TurnIntent },
+    options?: ComposerTurnOptions,
   ) => boolean | Promise<boolean>;
   onStop: (sessionId: string) => void;
   onCompactContext: (sessionId: string) => boolean;
@@ -95,8 +103,12 @@ type Shared = {
   onSetupTaskChild?: (taskId: string, childId: string) => void;
   needsInputSessionIds?: ReadonlySet<string>;
   onInboxCardDismiss?: (sessionId: string, fileId?: string) => void;
+  onLinkedWorkItemUpdateCardDismiss?: (sessionId: string) => void;
   onNoteCardDismiss?: (sessionId: string) => void;
   onHandoffCardDismiss?: (sessionId: string) => void;
+  onOpenLinkedWorkItem?: (item: LinkedWorkItem, sessionId: string) => void;
+  onArchiveSession?: (sessionId: string, archived: boolean) => Promise<boolean>;
+  onDeleteSession?: (sessionId: string) => Promise<boolean>;
   onApproval: (
     sessionId: string,
     requestId: number,
@@ -123,17 +135,16 @@ type Shared = {
   ) => void;
   onSecondOpinion?: (
     sessionId: string,
-    harness: HarnessId,
+    target: ModelTarget,
     turn: Block[],
-    model: string,
   ) => void;
-  onHandoff?: (
-    sessionId: string,
-    harness: HarnessId,
-    turn: Block[],
-    model: string,
-  ) => void;
+  onHandoff?: (sessionId: string, target: ModelTarget, turn: Block[]) => void;
   onMovePane: (fromId: string, toId: string, edge: PaneEdge) => void;
+  onDetachPane: (
+    paneId: string,
+    targetTabId: string,
+    position: TitleTabDropPosition,
+  ) => void;
   onNewTerminal: (sessionId: string) => void;
   onTerminalMetaChange?: (fileId: string, patch: TerminalMetaPatch) => void;
   onBrowserMetaChange?: (fileId: string, patch: BrowserMetaPatch) => void;
@@ -265,8 +276,12 @@ function PaneTreeComponent({
   onSetupTaskChild,
   needsInputSessionIds,
   onInboxCardDismiss,
+  onLinkedWorkItemUpdateCardDismiss,
   onNoteCardDismiss,
   onHandoffCardDismiss,
+  onOpenLinkedWorkItem,
+  onArchiveSession,
+  onDeleteSession,
   onApproval,
   onQuestionReply,
   onQuestionInteraction,
@@ -279,6 +294,7 @@ function PaneTreeComponent({
   onSecondOpinion,
   onHandoff,
   onMovePane,
+  onDetachPane,
   onNewTerminal,
   onTerminalMetaChange,
   onBrowserMetaChange,
@@ -293,6 +309,8 @@ function PaneTreeComponent({
   const drop = paneDrag ?? externalDrop;
   const onMovePaneRef = useRef(onMovePane);
   onMovePaneRef.current = onMovePane;
+  const onDetachPaneRef = useRef(onDetachPane);
+  onDetachPaneRef.current = onDetachPane;
   const onFocusRef = useRef(onFocus);
   onFocusRef.current = onFocus;
 
@@ -395,6 +413,12 @@ function PaneTreeComponent({
           onFocusRef.current(fromId);
           setPaneDrag({ fromId, overId: null, edge: "left" });
         }
+        const titleTab = titleTabDropFromPoint(ev.clientX, ev.clientY);
+        setExternalTitleTabDrop(titleTab ? { fromId, ...titleTab } : null);
+        if (titleTab) {
+          setPaneDrag({ fromId, overId: null, edge: "left" });
+          return;
+        }
         const over = paneDropFromPoint(ev.clientX, ev.clientY);
         if (!over || over.id === fromId) {
           setPaneDrag({
@@ -422,12 +446,22 @@ function PaneTreeComponent({
         restoreSelection();
         setGrabbing(false);
         setPaneDrag(null);
+        setExternalTitleTabDrop(null);
         try {
           handle.releasePointerCapture(pointerId);
         } catch {
           /* already released */
         }
         if (!active || !commit) return;
+        const titleTab = titleTabDropFromPoint(lastX, lastY);
+        if (titleTab) {
+          onDetachPaneRef.current(
+            fromId,
+            titleTab.targetTabId,
+            titleTab.position,
+          );
+          return;
+        }
         const over = paneDropFromPoint(lastX, lastY);
         if (over && over.id !== fromId) {
           onMovePaneRef.current(fromId, over.id, over.edge);
@@ -545,8 +579,14 @@ function PaneTreeComponent({
                 onSetupTaskChild={onSetupTaskChild}
                 needsInputSessionIds={needsInputSessionIds}
                 onInboxCardDismiss={onInboxCardDismiss}
+                onLinkedWorkItemUpdateCardDismiss={
+                  onLinkedWorkItemUpdateCardDismiss
+                }
                 onNoteCardDismiss={onNoteCardDismiss}
                 onHandoffCardDismiss={onHandoffCardDismiss}
+                onOpenLinkedWorkItem={onOpenLinkedWorkItem}
+                onArchiveSession={onArchiveSession}
+                onDeleteSession={onDeleteSession}
                 onApproval={onApproval}
                 onQuestionReply={onQuestionReply}
                 onQuestionInteraction={onQuestionInteraction}
@@ -644,8 +684,8 @@ function Sash({
       aria-valuenow={Math.round(boundary * 100)}
       className={
         row
-          ? "absolute z-10 w-px bg-content/10"
-          : "absolute z-10 h-px bg-content/10"
+          ? "absolute z-10 w-px bg-stroke"
+          : "absolute z-10 h-px bg-stroke"
       }
       style={
         row

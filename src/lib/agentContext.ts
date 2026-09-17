@@ -222,8 +222,13 @@ export async function contextFromTicketDescriptions(
             ));
         } else {
           details =
-            peekGithubWorkItemDetails(item.projectPath, kind, item.number) ??
-            (await githubWorkItemDetails(item.projectPath, kind, item.number));
+            peekGithubWorkItemDetails(item.repo, kind, item.number) ??
+            (await githubWorkItemDetails(
+              item.projectPath,
+              item.repo,
+              kind,
+              item.number,
+            ));
         }
         signal?.throwIfAborted();
         const body = details.body || "No description provided.";

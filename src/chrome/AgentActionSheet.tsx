@@ -291,7 +291,7 @@ export function AgentActionSheet({
                     includeCurrent
                     title={`${HARNESS_TITLE[target.harness]}${target.model ? ` · ${target.model}` : ""}`}
                     menuLabel="Run this action with"
-                    onPick={(harness, model) => setTarget({ harness, model })}
+                    onPick={(target) => setTarget(target)}
                   />
                 ) : null}
               </div>

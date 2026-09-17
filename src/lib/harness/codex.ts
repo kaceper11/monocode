@@ -69,6 +69,7 @@ type Live = {
   rpc: JsonRpcClient;
   threadId: string;
   cwd: string;
+  providerAccountId?: string;
   runtimeMode: RuntimeMode;
   planning: boolean;
   onEvent: (event: HarnessEvent) => void;
@@ -105,6 +106,7 @@ type Live = {
 type Resume = {
   threadId: string;
   cwd: string;
+  providerAccountId?: string;
 };
 
 const liveByThread = new Map<string, Live>();
@@ -389,10 +391,15 @@ export function bindCodexSession(
   threadId: string,
   providerSessionId: string,
   cwd: string,
+  providerAccountId?: string,
 ): void {
   const providerThreadId = providerSessionId.trim();
   if (!threadId || !providerThreadId || !cwd.trim()) return;
-  resumeByThread.set(threadId, { threadId: providerThreadId, cwd });
+  resumeByThread.set(threadId, {
+    threadId: providerThreadId,
+    cwd,
+    providerAccountId,
+  });
 }
 
 /** In-flight cold starts: a prewarm and a send share one spawn. */
@@ -430,7 +437,12 @@ export async function prewarmCodexSession(
 
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   const existing = liveByThread.get(input.sessionId);
-  if (existing && existing.cwd === input.cwd) {
+  if (
+    existing &&
+    existing.cwd === input.cwd &&
+    existing.providerAccountId === input.providerAccountId
+  ) {
+    existing.onEvent = input.onEvent;
     return existing;
   }
   if (existing) {
@@ -458,8 +470,15 @@ async function startLive(
     if (startup.cancelled) throw START_CANCELLED;
   };
   const resume = resumeByThread.get(input.sessionId);
-  const canResume = resume != null && resume.cwd === input.cwd;
-  if (resume && resume.cwd !== input.cwd) {
+  const canResume =
+    resume != null &&
+    resume.cwd === input.cwd &&
+    resume.providerAccountId === input.providerAccountId;
+  if (
+    resume &&
+    (resume.cwd !== input.cwd ||
+      resume.providerAccountId !== input.providerAccountId)
+  ) {
     resumeByThread.delete(input.sessionId);
   }
 
@@ -539,7 +558,10 @@ async function startLive(
   );
 
   try {
-    await spawnChild(input.sessionId, path, ["app-server"], input.cwd);
+    await spawnChild(input.sessionId, path, ["app-server"], input.cwd, {
+      provider: "codex",
+      id: input.providerAccountId ?? "default",
+    });
     assertStarting();
     markTurn(input.sessionId, "codex spawned");
     await rpc.request("initialize", {
@@ -573,6 +595,7 @@ async function startLive(
           ...buildThreadStartParams({
             cwd: input.cwd,
             runtimeMode: input.runtimeMode,
+            controlsAgents: input.controlsAgents,
             model,
             serviceTier,
           }),
@@ -594,6 +617,7 @@ async function startLive(
         buildThreadStartParams({
           cwd: input.cwd,
           runtimeMode: input.runtimeMode,
+          controlsAgents: input.controlsAgents,
           model,
           serviceTier,
         }),
@@ -612,6 +636,7 @@ async function startLive(
       rpc,
       threadId,
       cwd: input.cwd,
+      providerAccountId: input.providerAccountId,
       runtimeMode: input.runtimeMode,
       planning: input.intent === "plan",
       onEvent: input.onEvent,
@@ -643,6 +668,7 @@ async function startLive(
     resumeByThread.set(input.sessionId, {
       threadId,
       cwd: input.cwd,
+      providerAccountId: input.providerAccountId,
     });
     live.onEvent({
       type: "session.providerBound",
@@ -701,6 +727,7 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
   const params = buildTurnStartParams({
     threadId: live.threadId,
     runtimeMode: input.runtimeMode,
+    controlsAgents: input.controlsAgents,
     prompt: input.text.trim() || undefined,
     attachments: input.attachments,
     model,

@@ -213,7 +213,7 @@ it("links multiple tickets and stages their context without sending a prompt", (
 
 
 it("includes every selected issue description in the next agent message", async () => {
-  const items = [1, 2].map(number => ({ ...ticket, provider: "github", kind: "issue", projectPath: "/source", number, title: `Issue ${number}`, url: `https://github.com/team/repo/issues/${number}` }) as InboxItem);
+  const items = [1, 2].map(number => ({ ...ticket, provider: "github", kind: "issue", projectPath: "/source", repo: "team/repo", number, title: `Issue ${number}`, url: `https://github.com/team/repo/issues/${number}` }) as InboxItem);
   vi.mocked(invoke).mockImplementation(async (_command, args) => ({ body: `Acceptance for issue ${(args as { number: number }).number}`, author: "author" }));
   const context = await contextFromTicketDescriptions(items);
   const prepared = linkTicketContext(session, context);
@@ -222,7 +222,7 @@ it("includes every selected issue description in the next agent message", async 
     expect(message).toContain(`Issue ${number}`);
     expect(message).toContain(`https://github.com/team/repo/issues/${number}`);
     expect(message).toContain(`Acceptance for issue ${number}`);
-    expect(invoke).toHaveBeenCalledWith("git_github_work_item_details", { cwd: "/source", kind: "issue", number });
+    expect(invoke).toHaveBeenCalledWith("git_github_work_item_details", { cwd: "/source", repo: "team/repo", kind: "issue", number });
   }
   expect(message).toContain("untrusted context");
   const remaining = removeContextItem(context, context.entries[0].id)!;

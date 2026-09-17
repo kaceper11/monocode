@@ -4,6 +4,7 @@ import type {
   TaskListItem,
   ToolPreview,
   TurnIntent,
+  TurnMetrics,
 } from "../session";
 import {
   attachmentPath,
@@ -11,12 +12,14 @@ import {
   isVisionImage,
   normalizeImageMime,
 } from "../attachments";
+import { displayPath } from "../paths";
 import { normalizeTaskListStatus } from "../taskList";
 import {
   composeToolTitle,
   extractToolPreview,
   formatAgentType,
 } from "./preview";
+import { formatShellIntent, inferShellIntent } from "./shellIntent";
 import { streamTextDelta } from "./streamText";
 import type { HarnessEvent } from "./types";
 
@@ -26,12 +29,36 @@ export type CodexThreadConfig = {
   sandbox: "read-only" | "workspace-write" | "danger-full-access";
   approvalsReviewer: "user" | "auto_review";
   sandboxPolicy:
-    | { type: "readOnly" }
-    | { type: "workspaceWrite" }
+    | { type: "readOnly"; networkAccess?: boolean }
+    | { type: "workspaceWrite"; networkAccess?: boolean }
     | { type: "dangerFullAccess" };
 };
 
-export function runtimeModeToCodexConfig(mode: RuntimeMode): CodexThreadConfig {
+/**
+ * `readOnly` and `workspaceWrite` both default to networkAccess: false, which
+ * blocks loopback too. An orchestration lead has to reach the control CLI's
+ * socket, so it opts in; every other session keeps the default.
+ */
+function withNetwork(
+  config: CodexThreadConfig,
+  controlsAgents?: boolean,
+): CodexThreadConfig {
+  if (!controlsAgents || config.sandboxPolicy.type === "dangerFullAccess")
+    return config;
+  return {
+    ...config,
+    sandboxPolicy: { ...config.sandboxPolicy, networkAccess: true },
+  };
+}
+
+export function runtimeModeToCodexConfig(
+  mode: RuntimeMode,
+  controlsAgents?: boolean,
+): CodexThreadConfig {
+  return withNetwork(baseCodexConfig(mode), controlsAgents);
+}
+
+function baseCodexConfig(mode: RuntimeMode): CodexThreadConfig {
   switch (mode) {
     case "supervised":
       return {
@@ -69,14 +96,19 @@ export function runtimeModeToCodexConfig(mode: RuntimeMode): CodexThreadConfig {
 export function buildThreadStartParams(input: {
   cwd: string;
   runtimeMode: RuntimeMode;
+  controlsAgents?: boolean;
   model?: string;
   serviceTier?: string;
 }): Record<string, unknown> {
-  const config = runtimeModeToCodexConfig(input.runtimeMode);
+  const config = runtimeModeToCodexConfig(
+    input.runtimeMode,
+    input.controlsAgents,
+  );
   return {
     cwd: input.cwd,
     approvalPolicy: config.approvalPolicy,
     sandbox: config.sandbox,
+    sandboxPolicy: config.sandboxPolicy,
     approvalsReviewer: config.approvalsReviewer,
     ...(input.model ? { model: input.model } : {}),
     ...(input.serviceTier
@@ -101,6 +133,7 @@ export function buildTurnSteerParams(input: {
 export function buildTurnStartParams(input: {
   threadId: string;
   runtimeMode: RuntimeMode;
+  controlsAgents?: boolean;
   prompt?: string;
   attachments?: Attachment[];
   model?: string;
@@ -108,15 +141,21 @@ export function buildTurnStartParams(input: {
   serviceTier?: string;
   intent?: TurnIntent;
 }): Record<string, unknown> {
-  const runtimeConfig = runtimeModeToCodexConfig(input.runtimeMode);
+  const runtimeConfig = runtimeModeToCodexConfig(
+    input.runtimeMode,
+    input.controlsAgents,
+  );
   const config: CodexThreadConfig =
     input.intent === "plan"
-      ? {
-          approvalPolicy: "never",
-          sandbox: "read-only",
-          approvalsReviewer: runtimeConfig.approvalsReviewer,
-          sandboxPolicy: { type: "readOnly" },
-        }
+      ? withNetwork(
+          {
+            approvalPolicy: "never",
+            sandbox: "read-only",
+            approvalsReviewer: runtimeConfig.approvalsReviewer,
+            sandboxPolicy: { type: "readOnly" },
+          },
+          input.controlsAgents,
+        )
       : runtimeConfig;
   return {
     threadId: input.threadId,
@@ -400,14 +439,38 @@ function mapTokenUsage(rec: Record<string, unknown>): MappedCodexNotification {
   if (!last) return { events: [] };
   const used = numberField(last, "totalTokens");
   const window = numberField(usage, "modelContextWindow");
-  if (!used && !window) return { events: [] };
+  const inputTokens = numberField(last, "inputTokens");
+  const cacheReadTokens = numberField(last, "cachedInputTokens");
+  const cacheWriteTokens = numberField(last, "cacheWriteInputTokens");
+  const outputTokens = numberField(last, "outputTokens");
+  const cacheReported =
+    "cachedInputTokens" in last || "cacheWriteInputTokens" in last;
+  const metrics: TurnMetrics = {
+    ...(inputTokens ? { inputTokens } : {}),
+    ...(outputTokens ? { outputTokens } : {}),
+    ...(cacheReadTokens ? { cacheReadTokens } : {}),
+    ...(cacheWriteTokens ? { cacheWriteTokens } : {}),
+    ...(cacheReported && inputTokens > 0
+      ? {
+          cacheHitPercent:
+            (cacheReadTokens / (inputTokens + cacheWriteTokens)) * 100,
+        }
+      : {}),
+  };
+  const hasMetrics = Object.keys(metrics).length > 0;
+  if (!used && !window && !hasMetrics) return { events: [] };
   return {
     events: [
-      {
-        type: "context",
-        ...(used > 0 ? { used } : {}),
-        ...(window > 0 ? { window } : {}),
-      },
+      ...(used || window
+        ? [
+            {
+              type: "context" as const,
+              ...(used > 0 ? { used } : {}),
+              ...(window > 0 ? { window } : {}),
+            },
+          ]
+        : []),
+      ...(hasMetrics ? [{ type: "turn.metrics" as const, ...metrics }] : []),
     ],
   };
 }
@@ -567,26 +630,26 @@ function mapToolItem(
     const status = mapItemStatus(stringField(item, "status"), completed);
     const output =
       stringField(item, "aggregatedOutput") ?? stringField(item, "output");
-    const preview: ToolPreview | undefined = undefined;
+    const presentation = codexCommandPresentation(item, command);
     const eventType = completed ? "tool.updated" : "tool.started";
     if (eventType === "tool.started") {
       return {
         type: "tool.started",
         callId,
-        title: command,
+        title: presentation.title,
         kind: "execute",
         status,
-        preview,
+        preview: presentation.preview,
       };
     }
     return {
       type: "tool.updated",
       callId,
-      title: command,
+      title: presentation.title,
       kind: "execute",
       status,
       ...(output ? { detail: output } : {}),
-      preview,
+      preview: presentation.preview,
     };
   }
 
@@ -672,14 +735,93 @@ function mapToolItem(
   return null;
 }
 
+/** Prefer Codex's own best-effort command parsing, then our legacy fallback. */
+function codexCommandPresentation(
+  item: Record<string, unknown>,
+  command: string,
+): { title: string; preview?: ToolPreview } {
+  const cwd = stringField(item, "cwd");
+  const actions = Array.isArray(item.commandActions)
+    ? item.commandActions.flatMap((value) => {
+        const action = asRecord(value);
+        return action ? [action] : [];
+      })
+    : [];
+
+  // The last meaningful stage usually describes the pipeline's visible goal
+  // (`cat file | grep term` is a Find), while unknown filters are ignored.
+  for (let index = actions.length - 1; index >= 0; index -= 1) {
+    const action = actions[index];
+    const type = stringField(action, "type");
+    const path = stringField(action, "path");
+    const shownPath = path ? displayPath(path, cwd) : undefined;
+    if (type === "search") {
+      const query = stringField(action, "query");
+      if (!query) continue;
+      return {
+        title: `Find ${query}`,
+        preview: shellCommandPreview(command, path, query),
+      };
+    }
+    if (type === "read" && path) {
+      return {
+        title: `Read ${shownPath}`,
+        preview: shellCommandPreview(command, path),
+      };
+    }
+    if (type === "listFiles") {
+      return {
+        title: shownPath ? `List ${shownPath}` : "List",
+        preview: shellCommandPreview(command, path),
+      };
+    }
+  }
+
+  const inferred = inferShellIntent(command);
+  if (!inferred) return { title: command };
+  const path = inferred.path;
+  const shownPath = path ? displayPath(path, cwd) : undefined;
+  return {
+    title: formatShellIntent(inferred, shownPath, inferred.query) ?? command,
+    preview: shellCommandPreview(
+      command,
+      path,
+      inferred.query,
+      inferred.startLine,
+    ),
+  };
+}
+
+function shellCommandPreview(
+  command: string,
+  path?: string,
+  query?: string,
+  startLine?: number,
+): ToolPreview {
+  return {
+    kind: "shell",
+    title: command,
+    ...(path
+      ? {
+          path,
+          fileName: path
+            .replace(/[/\\]+$/, "")
+            .split(/[/\\]/)
+            .pop(),
+        }
+      : {}),
+    ...(query ? { query } : {}),
+    ...(startLine ? { startLine } : {}),
+  };
+}
+
 function mapSubAgentActivity(
   item: Record<string, unknown>,
   callId: string,
   completed: boolean,
 ): HarnessEvent {
   const kind = (stringField(item, "kind") ?? "").toLowerCase();
-  const path =
-    stringField(item, "agentPath") ?? stringField(item, "agent_path");
+  const path = stringField(item, "agentPath") ?? stringField(item, "agent_path");
   const leaf = path?.split(/[/\\]/).filter(Boolean).pop();
   const title = leaf ? `${formatAgentType(leaf)} subagent` : "Subagent";
   if (kind === "interrupted") {
@@ -911,7 +1053,8 @@ export function mapCodexSubagentSteps(
 
 /** The first line of a spawn's prompt, short enough to sit on a row. */
 function agentBrief(item: Record<string, unknown>): string | undefined {
-  const path = stringField(item, "agentPath") ?? stringField(item, "agent_path");
+  const path =
+    stringField(item, "agentPath") ?? stringField(item, "agent_path");
   const leaf = path?.split(/[/\\]/).filter(Boolean).pop();
   if (leaf) return `${formatAgentType(leaf)} subagent`;
   const prompt = stringField(item, "prompt");
@@ -1069,15 +1212,21 @@ export function mapApprovalRequest(
     const command = stringField(rec, "command") ?? "Shell";
     const callId = stringField(rec, "itemId");
     const reason = stringField(rec, "reason");
+    const presentation = codexCommandPresentation(rec, command);
+    const readable = presentation.title !== command;
     return {
       kind: "command",
       event: {
         type: "approval.requested",
         requestId,
-        title: reason ? `${command} — ${reason}` : command,
+        title: readable
+          ? presentation.title
+          : reason
+            ? `${command} — ${reason}`
+            : command,
         kind: "execute",
         callId,
-        preview: undefined,
+        preview: presentation.preview,
       },
     };
   }

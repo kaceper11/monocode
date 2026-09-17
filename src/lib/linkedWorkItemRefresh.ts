@@ -299,9 +299,8 @@ export async function fetchLinkedWorkItemThread(
       return { ...thread, commits: [] };
     }
     default:
-      return githubWorkItemThread(cwd, linked.kind, linked.number, {
+      return githubWorkItemThread(cwd, linked.repo, linked.kind, linked.number, {
         force: true,
-        repo: linked.repo,
       });
   }
 }

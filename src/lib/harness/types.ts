@@ -1,10 +1,12 @@
 import type {
   AgentStepKind,
   Attachment,
+  InterjectionMeta,
   RuntimeMode,
   TaskListItem,
   ToolPreview,
   TurnIntent,
+  TurnMetrics,
 } from "../session";
 import type { UserQuestion } from "../userQuestion";
 
@@ -21,6 +23,7 @@ export type HarnessEvent =
       modelSettings?: Record<string, string>;
     }
   | { type: "status"; text: string }
+  | ({ type: "interjection"; text: string } & InterjectionMeta)
   | { type: "message.delta"; text: string }
   | { type: "message.completed" }
   | { type: "reasoning.delta"; text: string }
@@ -117,7 +120,9 @@ export type HarnessEvent =
       streaming?: boolean;
     }
   /** Context-window level after the harness's latest request. */
-  | { type: "context"; used?: number; window?: number };
+  | { type: "context"; used?: number; window?: number }
+  /** Provider token accounting for the active user turn. */
+  | ({ type: "turn.metrics" } & TurnMetrics);
 
 export type ApprovalDecision = "allow" | "deny";
 
@@ -126,8 +131,15 @@ export type HarnessSessionInput = {
   cwd: string;
   model: string;
   modelSettings?: Record<string, string>;
+  providerAccountId?: string;
   runtimeMode: RuntimeMode;
   intent?: TurnIntent;
+  /**
+   * This session drives MonoCode's control CLI, which reaches the app over
+   * loopback. Sandboxes deny network by default, so a lead that cannot open
+   * that socket cannot supervise its agents at all.
+   */
+  controlsAgents?: boolean;
   onEvent: (event: HarnessEvent) => void;
 };
 

@@ -85,7 +85,7 @@ const ticketItem = (
 async function pollGithubItems(
   source: Extract<WatcherSource, { kind: "github-items" }>,
 ): Promise<WatcherPoll> {
-  const items = await listGithubWorkItems(source.cwd, {
+  const items = await listGithubWorkItems(source.cwd, source.repo, {
     kind: source.itemKind,
     assignedToMe: true,
     state: "open",
@@ -116,7 +116,9 @@ async function pollGithubPr(
     githubPrState(source.cwd, source.number),
     // The thread cache has no TTL — force a fresh read or comment detection
     // freezes after the first poll.
-    githubWorkItemThread(source.cwd, "pr", source.number, { force: true }),
+    githubWorkItemThread(source.cwd, source.repo, "pr", source.number, {
+      force: true,
+    }),
   ]);
   // `gh` resolves the PR through the checkout's current remote — a repointed
   // remote would read an unrelated PR number and could fake a `done`.

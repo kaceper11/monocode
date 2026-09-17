@@ -12,13 +12,20 @@ type Props = {
   diff: GithubPrDiff;
   /** Remote review surfaces route line comments into their own review flow. */
   lineCommentComposer?: LineCommentComposer;
+  /** When true, show the whole file (no fold rows). */
+  fullFile?: boolean;
 };
 
-export function InboxPrDiff({ diff, lineCommentComposer }: Props) {
+export function InboxPrDiff({
+  diff,
+  lineCommentComposer,
+  fullFile = false,
+}: Props) {
   const files = useMemo(() => {
     const parsed = mergePrDiff(diff.files, parsePrPatch(diff.patch));
-    return parsed.map((file) => toModel(file, diff.truncated));
-  }, [diff]);
+    const context = fullFile ? Number.POSITIVE_INFINITY : undefined;
+    return parsed.map((file) => toModel(file, diff.truncated, context));
+  }, [diff, fullFile]);
 
   return (
     <UnifiedDiffView
@@ -33,7 +40,11 @@ export function InboxPrDiff({ diff, lineCommentComposer }: Props) {
   );
 }
 
-function toModel(file: PrDiffFile, truncated: boolean): UnifiedDiffFileModel {
+function toModel(
+  file: PrDiffFile,
+  truncated: boolean,
+  context?: number,
+): UnifiedDiffFileModel {
   const lines = file.lines.map(toUnifiedLine);
   return {
     id: file.path,
@@ -54,7 +65,7 @@ function toModel(file: PrDiffFile, truncated: boolean): UnifiedDiffFileModel {
     // Remote diff — chat-bound hunk/line actions lose the PR binding, so the
     // owning review surface provides the comment flow instead.
     contextActions: false,
-    blocks: blocksFromLines(lines),
+    blocks: blocksFromLines(lines, context),
   };
 }
 

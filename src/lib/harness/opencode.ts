@@ -1,5 +1,5 @@
 import { modelContextWindow, nativeModelId } from "../models";
-import type { RuntimeMode } from "../session";
+import type { RuntimeMode, TurnMetrics } from "../session";
 import { taskListFromToolInput } from "../taskList";
 import {
   execChild,
@@ -13,6 +13,7 @@ import {
 import {
   OpenCodeClient,
   OpenCodeHttpError,
+  type OpenCodeMessage,
   type OpenCodeSession,
 } from "./opencodeClient";
 import {
@@ -21,6 +22,7 @@ import {
   buildOpenCodePermissionRules,
   compareSemver,
   contextUsedFromMessageInfo,
+  turnMetricsFromMessageInfo,
   detailFromToolPart,
   eventSessionId,
   isOpenCodeNotFound,
@@ -36,7 +38,7 @@ import {
   sessionErrorMessage,
   stringField,
   textDeltaEvent,
-  toOpenCodeFileParts,
+  toOpenCodePromptParts,
   toOpenCodePermissionReply,
   toolKindFromName,
   type OpenCodePart,
@@ -105,6 +107,7 @@ type Live = {
   completedSubagents: Set<string>;
   emittedTextByPartId: Map<string, string>;
   messageRoleById: Map<string, "user" | "assistant" | "hidden">;
+  turnMetricsByMessageId: Map<string, TurnMetrics>;
   cancelled: boolean;
   cancelVersion: number;
   muteUpdates: boolean;
@@ -250,12 +253,7 @@ export async function steerOpenCodeTurn(input: SteerTurnInput): Promise<void> {
     );
   }
 
-  const parts = [
-    ...(input.text.trim()
-      ? [{ type: "text" as const, text: input.text.trim() }]
-      : []),
-    ...toOpenCodeFileParts(input.attachments),
-  ];
+  const parts = toOpenCodePromptParts(input.text, input.attachments);
   if (parts.length === 0) return;
 
   await live.client.promptAsync({
@@ -548,6 +546,12 @@ async function prepareLive(
       cwd: input.cwd,
     });
     signal.throwIfAborted();
+    if (canResume) {
+      await repairUnsupportedFileTurn(client, resolved.session.id).catch(
+        (error: unknown) =>
+          console.debug("[monocode] opencode attachment recovery", error),
+      );
+    }
 
     const live: Live = {
       client,
@@ -575,6 +579,7 @@ async function prepareLive(
       completedSubagents: new Set(),
       emittedTextByPartId: new Map(),
       messageRoleById: new Map(),
+      turnMetricsByMessageId: new Map(),
       cancelled: false,
       cancelVersion: 0,
       muteUpdates: false,
@@ -702,12 +707,7 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
       "OpenCode models use provider/model ids. Wait for the catalog to load, then pick a model.",
     );
   }
-  const parts = [
-    ...(input.text.trim()
-      ? [{ type: "text" as const, text: input.text.trim() }]
-      : []),
-    ...toOpenCodeFileParts(input.attachments),
-  ];
+  const parts = toOpenCodePromptParts(input.text, input.attachments);
   if (parts.length === 0) return;
 
   const turnPromise = new Promise<void>((resolve, reject) => {
@@ -715,6 +715,7 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
     live.turnFailed = reject;
   });
   live.activeTurn = true;
+  live.turnMetricsByMessageId.clear();
   settlePendingTurn(live);
 
   try {
@@ -891,7 +892,6 @@ async function handleEvent(
         stringField(properties, "toolCallId") ??
         stringField(metadata, "callID") ??
         stringField(metadata, "toolCallId");
-      const uiId = live.nextApprovalUiId++;
       const kind = toolKindFromName(permission);
       const preview =
         previewFromToolPart({
@@ -934,6 +934,11 @@ async function handleEvent(
         );
         break;
       }
+      if (live.runtimeMode === "full-access") {
+        await live.client.replyPermission(id, "once");
+        break;
+      }
+      const uiId = live.nextApprovalUiId++;
       const pending = waitApproval(live, uiId, id, permission);
       if (callId) {
         live.onEvent({
@@ -1033,6 +1038,39 @@ export function openCodeAgentForTurn(input: {
  */
 function emitContext(live: Live, info: Record<string, unknown> | null): void {
   const used = contextUsedFromMessageInfo(info);
+  const metrics = turnMetricsFromMessageInfo(info);
+  const messageId = stringField(info, "id");
+  if (metrics && messageId) live.turnMetricsByMessageId.set(messageId, metrics);
+  if (metrics && !messageId) {
+    live.onEvent({ type: "turn.metrics", ...metrics });
+  }
+  const aggregate = [
+    ...live.turnMetricsByMessageId.values(),
+  ].reduce<TurnMetrics>(
+    (total, current) => ({
+      inputTokens: (total.inputTokens ?? 0) + (current.inputTokens ?? 0),
+      outputTokens: (total.outputTokens ?? 0) + (current.outputTokens ?? 0),
+      cacheReadTokens:
+        (total.cacheReadTokens ?? 0) + (current.cacheReadTokens ?? 0),
+      cacheWriteTokens:
+        (total.cacheWriteTokens ?? 0) + (current.cacheWriteTokens ?? 0),
+    }),
+    {},
+  );
+  const aggregateInput =
+    (aggregate.inputTokens ?? 0) +
+    (aggregate.cacheReadTokens ?? 0) +
+    (aggregate.cacheWriteTokens ?? 0);
+  const hasAggregate = Object.values(aggregate).some(
+    (value) => typeof value === "number" && value > 0,
+  );
+  if (hasAggregate) {
+    aggregate.cacheHitPercent =
+      aggregateInput > 0
+        ? ((aggregate.cacheReadTokens ?? 0) / aggregateInput) * 100
+        : undefined;
+    live.onEvent({ type: "turn.metrics", ...aggregate });
+  }
   if (used === undefined) return;
   const providerID = stringField(info, "providerID");
   const modelID = stringField(info, "modelID");
@@ -1509,6 +1547,69 @@ function isHttpNotFound(error: unknown): boolean {
 }
 
 const versionCheckedPaths = new Set<string>();
+
+/**
+ * A rejected native file remains in OpenCode's durable history and can make
+ * every later prompt fail while converting that history for the provider.
+ * Revert the original attachment turn before resuming; OpenCode removes the
+ * reverted tail when the next prompt starts.
+ */
+async function repairUnsupportedFileTurn(
+  client: OpenCodeClient,
+  sessionID: string,
+): Promise<void> {
+  const messages = await client.getMessages(sessionID);
+  if (!Array.isArray(messages)) return;
+  const byId = new Map<string, OpenCodeMessage>();
+  for (const message of messages) {
+    const id = stringField(asRecord(message.info), "id");
+    if (id) byId.set(id, message);
+  }
+  const failures = messages
+    .map((message) => {
+      const info = asRecord(message.info);
+      if (stringField(info, "role") !== "assistant") return null;
+      const mime = unsupportedFileMediaType(info?.error);
+      const parentID = stringField(info, "parentID");
+      if (!mime || !parentID) return null;
+      const parent = byId.get(parentID);
+      const hasRejectedFile = (parent?.parts ?? []).some((part) => {
+        const record = asRecord(part);
+        return (
+          stringField(record, "type") === "file" &&
+          stringField(record, "mime")?.toLowerCase() === mime
+        );
+      });
+      if (!hasRejectedFile) return null;
+      const time = asRecord(info?.time)?.created;
+      return { messageID: parentID, created: time };
+    })
+    .filter(
+      (failure): failure is { messageID: string; created: number } =>
+        failure !== null,
+    )
+    .filter(({ created }) =>
+      messages.every((message) => {
+        const info = asRecord(message.info);
+        if (stringField(info, "role") !== "assistant" || info?.error) {
+          return true;
+        }
+        const time = asRecord(info?.time)?.created;
+        return typeof time !== "number" || time <= created;
+      }),
+    )
+    .sort((left, right) => left.created - right.created);
+  const first = failures[0];
+  if (first) await client.revertSession(sessionID, first.messageID);
+}
+
+function unsupportedFileMediaType(error: unknown): string | undefined {
+  const message = sessionErrorMessage(error);
+  if (!/functionality not supported/i.test(message)) return undefined;
+  return message
+    .match(/file part media type\s+([^\s'"`]+)/i)?.[1]
+    ?.toLowerCase();
+}
 
 async function assertOpenCodeVersion(path: string, cwd: string): Promise<void> {
   if (versionCheckedPaths.has(path)) return;

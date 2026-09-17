@@ -25,32 +25,34 @@ pub fn dispatch(app: &AppHandle, id: &str) {
         | "open_model_picker" | "open_settings" | "check_for_updates" => {
             let _ = app.emit(id, ());
         }
+        // Zoom, find, browser and Close All Tabs commands target one window:
+        // a broadcast would make every window act on a single menu click.
         "zoom_in" | "zoom_out" | "zoom_reset" | "find" | "browser_reload" | "browser_focus_url"
-        | "browser_devtools" => {
-            // Zoom, find and browser commands target one window: a
-            // broadcast would make every window increment the shared scale
-            // setting or open its find bar off a single menu click.
-            let mut windows: Vec<_> = app.webview_windows().into_values().collect();
-            windows.sort_by(|a, b| a.label().cmp(b.label()));
-            let target = windows
-                .iter()
-                .find(|window| window.is_focused().unwrap_or(false))
-                .or_else(|| {
-                    windows
-                        .iter()
-                        .find(|window| window.is_visible().unwrap_or(false))
-                })
-                .or(windows.first());
-            match target {
-                Some(window) => {
-                    let _ = app.emit_to(window.label(), id, ());
-                }
-                None => {
-                    let _ = app.emit(id, ());
-                }
-            }
-        }
+        | "browser_devtools" | "close_all_tabs" => emit_to_focused(app, id),
         _ => {}
+    }
+}
+
+/// Emit `id` to the focused window, falling back to a visible one, then any.
+fn emit_to_focused(app: &AppHandle, id: &str) {
+    let mut windows: Vec<_> = app.webview_windows().into_values().collect();
+    windows.sort_by(|a, b| a.label().cmp(b.label()));
+    let target = windows
+        .iter()
+        .find(|window| window.is_focused().unwrap_or(false))
+        .or_else(|| {
+            windows
+                .iter()
+                .find(|window| window.is_visible().unwrap_or(false))
+        })
+        .or(windows.first());
+    match target {
+        Some(window) => {
+            let _ = app.emit_to(window.label(), id, ());
+        }
+        None => {
+            let _ = app.emit(id, ());
+        }
     }
 }
 
@@ -98,6 +100,9 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .build(app)?;
     let close_other_tabs = MenuItemBuilder::with_id("close_other_tabs", "Close Other Tabs")
         .accelerator("CmdOrCtrl+Alt+T")
+        .build(app)?;
+    let close_all_tabs = MenuItemBuilder::with_id("close_all_tabs", "Close All Tabs")
+        .accelerator("CmdOrCtrl+Shift+W")
         .build(app)?;
     let next_tab = MenuItemBuilder::with_id("next_tab", "Next Tab")
         .accelerator("CmdOrCtrl+Shift+]")
@@ -184,6 +189,7 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&split_down)
         .item(&close_tab)
         .item(&close_other_tabs)
+        .item(&close_all_tabs)
         .separator()
         .item(&prev_tab)
         .item(&next_tab)

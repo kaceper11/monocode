@@ -254,8 +254,8 @@ function GithubPrPanel({
       let threadFailure = "";
       const [state, nextDiff, nextThread] = await Promise.all([
         githubPrState(cwd, number),
-        githubPrDiff(cwd, number).catch(() => null),
-        githubWorkItemThread(cwd, "pr", number, { force: true }).catch(
+        githubPrDiff(cwd, repo, number).catch(() => null),
+        githubWorkItemThread(cwd, repo, "pr", number, { force: true }).catch(
           (error) => {
             threadFailure = message(error);
             return null;
@@ -588,6 +588,7 @@ function GithubPrPanel({
         <GithubPrSections
           key={`${pr.headRefOid}:${repairRefresh}:${reviewNonce}`}
           cwd={cwd}
+          repo={repo}
           number={number}
           pr={pr}
           diff={diff}
@@ -616,6 +617,7 @@ function GithubPrPanel({
 
 function GithubPrSections({
   cwd,
+  repo,
   number,
   pr,
   diff,
@@ -637,6 +639,7 @@ function GithubPrSections({
   onThreadRefresh,
 }: {
   cwd: string;
+  repo: string;
   number: number;
   pr: GithubPrState;
   diff: GithubPrDiff | null;
@@ -777,6 +780,7 @@ function GithubPrSections({
           <GithubReviewThread
             key={comment.id}
             cwd={cwd}
+            repo={repo}
             number={number}
             comment={comment}
             open={open}
@@ -916,6 +920,7 @@ function GithubPrSections({
 
 function GithubReviewThread({
   cwd,
+  repo,
   number,
   comment,
   open,
@@ -924,6 +929,7 @@ function GithubReviewThread({
   onThreadRefresh,
 }: {
   cwd: string;
+  repo: string;
   number: number;
   comment: GithubWorkItemComment;
   open: boolean;
@@ -953,7 +959,7 @@ function GithubReviewThread({
     setReplying(true);
     setReplyError("");
     try {
-      await githubWorkItemComment(cwd, "pr", number, draft, {
+      await githubWorkItemComment(cwd, repo, "pr", number, draft, {
         inReplyTo: comment.threadId,
       });
       if (!current()) return;

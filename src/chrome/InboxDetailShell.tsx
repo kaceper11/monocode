@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useState, type ReactNode, type Ref } from "react";
 import {
   CircleDot,
   CircleX,
@@ -101,6 +101,13 @@ export function InboxDetailShell({
   extra,
   error,
   tabs,
+  /** Narrow side-panel layout: pin a compact identity row and let the
+   * whole header scroll with the body. */
+  panel = false,
+  /** Trailing action in the pinned panel identity row (external link). */
+  panelAction,
+  /** Overscroll-lock ref for the panel scroll region. */
+  scrollRef,
   children,
 }: {
   item: InboxItem;
@@ -132,37 +139,71 @@ export function InboxDetailShell({
   /** Detail-level error row rendered under the actions. */
   error?: ReactNode;
   tabs?: { ariaLabel: string; items: InboxDetailTabItem[] };
+  panel?: boolean;
+  panelAction?: ReactNode;
+  scrollRef?: Ref<HTMLDivElement>;
   children?: ReactNode;
 }) {
   const [sendError, setSendError] = useState("");
   const statusMark = inboxStatusMark(item);
+  const identityRow = (
+    <div
+      data-inbox-detail-identity
+      data-inbox-detail-fixed-header={panel ? "" : undefined}
+      className={`flex min-w-0 items-center gap-2 text-[12px] text-content/50 ${
+        panel ? "h-9 shrink-0 border-b border-stroke px-4 pr-[34px]" : ""
+      }`}
+    >
+      <InboxProviderMark
+        provider={item.provider}
+        className="size-3.5 shrink-0"
+      />
+      <span className="shrink-0">{inboxKindLabel(item)}</span>
+      <span className="shrink-0 tabular-nums">{inboxItemRef(item)}</span>
+      <span
+        className={`flex shrink-0 items-center gap-1 ${statusMark.className}`}
+      >
+        <statusMark.Icon className="size-3.5" strokeWidth={1.75} />
+        {statusMark.label}
+      </span>
+      {attention}
+      {source}
+      {panel ? <span className="ml-auto shrink-0">{panelAction}</span> : null}
+    </div>
+  );
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
+      {panel ? identityRow : null}
       <div
-        data-inbox-detail-header
-        className="relative z-10 shrink-0 border-b border-content/10"
+        ref={panel ? scrollRef : undefined}
+        data-inbox-detail-scroll={panel ? "" : undefined}
+        className={
+          panel
+            ? "min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-none"
+            : "contents"
+        }
       >
-        <div className="mx-auto flex w-full max-w-5xl flex-col gap-2.5 px-8 pt-5 pb-5">
-          <header className="flex flex-col gap-3">
-            <div className="flex items-center gap-2 text-[12px] text-content/50">
-              <InboxProviderMark provider={item.provider} className="size-3.5" />
-              <span>{inboxKindLabel(item)}</span>
-              <span className="tabular-nums">{inboxItemRef(item)}</span>
-              <span
-                className={`flex items-center gap-1 ${statusMark.className}`}
+        <div
+          data-inbox-detail-header
+          className={`relative border-b border-content/10 ${
+            panel ? "" : "z-10 shrink-0"
+          }`}
+        >
+          <div
+            className={`mx-auto flex w-full max-w-5xl flex-col ${
+              panel ? "gap-2 px-4 pt-4 pb-4" : "gap-2.5 px-8 pt-5 pb-5"
+            }`}
+          >
+            <header className={`flex flex-col ${panel ? "gap-2" : "gap-3"}`}>
+              {panel ? null : identityRow}
+              <h1
+                title={item.title}
+                className={`line-clamp-2 font-semibold leading-tight text-content ${
+                  panel ? "text-[18px]" : "text-[20px]"
+                }`}
               >
-                <statusMark.Icon className="size-3.5" strokeWidth={1.75} />
-                {statusMark.label}
-              </span>
-              {attention}
-              {source}
-            </div>
-            <h1
-              title={item.title}
-              className="line-clamp-2 text-[20px] font-semibold leading-tight text-content"
-            >
-              {item.title}
-            </h1>
+                {item.title}
+              </h1>
             {meta ? (
               <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-[12px] text-content/50">
                 {meta}
@@ -247,9 +288,10 @@ export function InboxDetailShell({
           ) : (
             <div className="border-t border-content/10" />
           )}
+          </div>
         </div>
+        {children}
       </div>
-      {children}
     </div>
   );
 }

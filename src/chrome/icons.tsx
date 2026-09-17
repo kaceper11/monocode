@@ -22,8 +22,10 @@ import AiIdeaIcon from "@hugeicons/core-free-icons/AiIdeaIcon";
 import Cancel01Icon from "@hugeicons/core-free-icons/Cancel01Icon";
 import Camera01Icon from "@hugeicons/core-free-icons/Camera01Icon";
 import CaseSensitiveIcon from "@hugeicons/core-free-icons/CaseSensitiveIcon";
+import CheckmarkCircle02Icon from "@hugeicons/core-free-icons/CheckmarkCircle02Icon";
 import CircleArrowDown01Icon from "@hugeicons/core-free-icons/CircleArrowDown01Icon";
 import CancelCircleIcon from "@hugeicons/core-free-icons/CancelCircleIcon";
+import ChartBreakoutSquareIcon from "@hugeicons/core-free-icons/ChartBreakoutSquareIcon";
 import CircleDashedIcon from "@hugeicons/core-free-icons/CircleDashedIcon";
 import CircleDotIcon from "@hugeicons/core-free-icons/CircleDotIcon";
 import CloudUploadIcon from "@hugeicons/core-free-icons/CloudUploadIcon";
@@ -55,9 +57,11 @@ import GitPullRequestClosedIcon from "@hugeicons/core-free-icons/GitPullRequestC
 import GitPullRequestDraftIcon from "@hugeicons/core-free-icons/GitPullRequestDraftIcon";
 import GitPullRequestIcon from "@hugeicons/core-free-icons/GitPullRequestIcon";
 import GlobeIcon from "@hugeicons/core-free-icons/GlobeIcon";
+import HelpCircleIcon from "@hugeicons/core-free-icons/HelpCircleIcon";
 import ImageAdd01Icon from "@hugeicons/core-free-icons/ImageAdd01Icon";
 import InboxIcon from "@hugeicons/core-free-icons/InboxIcon";
 import InformationCircleIcon from "@hugeicons/core-free-icons/InformationCircleIcon";
+import NotificationOff01Icon from "@hugeicons/core-free-icons/NotificationOff01Icon";
 import KeyboardIcon from "@hugeicons/core-free-icons/KeyboardIcon";
 import LanguagesIcon from "@hugeicons/core-free-icons/LanguagesIcon";
 import LayoutAlignRightIcon from "@hugeicons/core-free-icons/LayoutAlignRightIcon";
@@ -88,6 +92,7 @@ import ReplaceIcon from "@hugeicons/core-free-icons/ReplaceIcon";
 import RotateCcwIcon from "@hugeicons/core-free-icons/RotateCcwIcon";
 import Search01Icon from "@hugeicons/core-free-icons/Search01Icon";
 import Settings01Icon from "@hugeicons/core-free-icons/Settings01Icon";
+import Share02Icon from "@hugeicons/core-free-icons/Share02Icon";
 import SidebarRight01Icon from "@hugeicons/core-free-icons/SidebarRight01Icon";
 import SparklesIcon from "@hugeicons/core-free-icons/SparklesIcon";
 import SquareIcon from "@hugeicons/core-free-icons/SquareIcon";
@@ -175,6 +180,7 @@ export const Camera = wrap(Camera01Icon, "Camera");
 export const CaseSensitive = wrap(CaseSensitiveIcon, "CaseSensitive");
 export const Check = wrap(Tick02Icon, "Check");
 export const CheckCheck = wrap(TickDouble02Icon, "CheckCheck");
+export const CheckCircle = wrap(CheckmarkCircle02Icon, "CheckCircle");
 export const ChevronDown = wrap(ArrowDown01Icon, "ChevronDown");
 export const ChevronLeft = wrap(ArrowLeft01Icon, "ChevronLeft");
 export const ChevronRight = wrap(ArrowRight01Icon, "ChevronRight");
@@ -183,6 +189,7 @@ export const ChevronUp = wrap(ArrowUp01Icon, "ChevronUp");
 export const CircleAlert = wrap(AlertCircleIcon, "CircleAlert");
 export const CircleDashed = wrap(CircleDashedIcon, "CircleDashed");
 export const CircleDot = wrap(CircleDotIcon, "CircleDot");
+export const CircleHelp = wrap(HelpCircleIcon, "CircleHelp");
 export const CircleX = wrap(CancelCircleIcon, "CircleX");
 export const CloudUpload = wrap(CloudUploadIcon, "CloudUpload");
 export const Clock = wrap(Clock01Icon, "Clock");
@@ -201,6 +208,10 @@ export const EyeOff = wrap(EyeOffIcon, "EyeOff");
 export const FolderPlus = wrap(FolderAddIcon, "FolderPlus");
 export const FolderTree = wrap(FolderTreeIcon, "FolderTree");
 export const Gauge = wrap(GaugeIcon, "Gauge");
+export const ChartBreakoutSquare = wrap(
+  ChartBreakoutSquareIcon,
+  "ChartBreakoutSquare",
+);
 export const GitBranch = wrap(GitBranchIcon, "GitBranch");
 export const GitCompare = wrap(GitCompareIcon, "GitCompare");
 export const GitMerge = wrap(GitMergeIcon, "GitMerge");
@@ -218,6 +229,7 @@ export const Globe = wrap(GlobeIcon, "Globe");
 export const ImagePlus = wrap(ImageAdd01Icon, "ImagePlus");
 export const Inbox = wrap(InboxIcon, "Inbox");
 export const Info = wrap(InformationCircleIcon, "Info");
+export const BellOff = wrap(NotificationOff01Icon, "BellOff");
 export const Keyboard = wrap(KeyboardIcon, "Keyboard");
 export const Languages = wrap(LanguagesIcon, "Languages");
 export const ListBullet = wrap(LeftToRightListBulletIcon, "ListBullet");
@@ -255,6 +267,7 @@ export const Replace = wrap(ReplaceIcon, "Replace");
 export const RotateCcw = wrap(RotateCcwIcon, "RotateCcw");
 export const Search = wrap(Search01Icon, "Search");
 export const Settings = wrap(Settings01Icon, "Settings");
+export const Share = wrap(Share02Icon, "Share");
 export const SlidersHorizontal = wrap(
   PreferenceHorizontalIcon,
   "SlidersHorizontal",

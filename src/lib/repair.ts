@@ -896,6 +896,7 @@ export async function validateRepair(
       );
     const thread = await githubWorkItemThread(
       evidence.head.cwd,
+      evidence.repo,
       "pr",
       evidence.number,
       { force: true },

@@ -11,6 +11,7 @@ import {
 import { SurfaceTabs } from "../chrome/SurfaceTabs";
 import {
   isBrowserTab,
+  isAgentTab,
   isChangesTab,
   isCommitTab,
   isPlanTab,
@@ -31,6 +32,7 @@ import { Play, Plus } from "../chrome/icons";
 import { requestBrowserOpen } from "../lib/browser";
 import { BuildTargetButton } from "../chrome/SecondOpinionButton";
 import { loadDiffViewer, subscribeDiffViewer } from "../lib/settings";
+import { AgentTabView } from "./AgentTabView";
 import { MarkdownPreview } from "./AgentMarkdown";
 import { BinaryFileView } from "./BinaryFileView";
 import { BrowserView } from "./BrowserView";
@@ -187,6 +189,15 @@ function FilePaneComponent({
                       enabled onReveal={() => onSelectFile(pane.id, file.id)} onClose={() => onCloseFile(pane.id, file.id)} />
                     : <AzureCiReview cwd={file.cwd} branch={file.delivery.branch} sourceSessionId={file.delivery.sourceSessionId} enabled onReveal={() => onSelectFile(pane.id, file.id)} onClose={() => onCloseFile(pane.id, file.id)} />}
                 </div></Activity>
+              ) : isAgentTab(file) ? (
+                <AgentTabView
+                  title={file.path}
+                  session={sessions.find(
+                    (entry) => entry.id === file.agent.sessionId,
+                  )}
+                  visible={file.id === pane.activeFileId}
+                  onOpenFile={onOpenFile}
+                />
               ) : isPlanTab(file) ? (
                 <PlanSurface
                   file={file}
@@ -274,7 +285,11 @@ export const FilePane = memo(FilePaneComponent, (previous, next) => {
   }
 
   for (const file of next.pane.files) {
-    const sessionId = file.plan?.sessionId ?? file.delivery?.sourceSessionId;
+    // Plans, delivery reviews and agent tabs all read a live session object.
+    const sessionId =
+      file.plan?.sessionId ??
+      file.delivery?.sourceSessionId ??
+      file.agent?.sessionId;
     if (!sessionId) continue;
     const before = previous.sessions.find(
       (session) => session.id === sessionId,
@@ -365,9 +380,10 @@ function PlanSurface({
                 cwd={file.cwd}
                 from={session.harness}
                 model={session.model}
+                settings={session.modelSettings}
                 disabled={buildDisabled}
-                onPick={(harness, model) =>
-                  onBuildPlan(plan.sessionId, block.id, { harness, model })
+                onPick={(target) =>
+                  onBuildPlan(plan.sessionId, block.id, target)
                 }
               />
             ) : null}

@@ -1472,7 +1472,7 @@ def run(argv, cwd, input_bytes=None, timeout=25):
         if argv[1] == 'api':
             assert argv[-1] == 'body=@-'
             return 0, b'{"data":{"addPullRequestReviewThreadReply":{"comment":{"url":"https://example.invalid/reply"}}}}', b''
-        assert argv == ['gh', 'issue', 'comment', '22', '--body-file', '-']
+        assert argv == ['gh', 'issue', 'comment', '22', '--repo', 'fixture/repo', '--body-file', '-']
         return 0, b'https://example.invalid/comment', b''
     if sys.platform == 'darwin' and argv[0] == 'mv':
         assert argv[:4] == ['mv', '--no-clobber', '--no-target-directory', '--']
@@ -1590,6 +1590,7 @@ def run(argv, cwd, input_bytes=None, timeout=25):
         assert_eq!(
             block_on(fs::git_github_work_item_comment(
                 root.identity(),
+                "fixture/repo".into(),
                 "issue".into(),
                 22,
                 "Literal ż body".into(),
@@ -1601,6 +1602,7 @@ def run(argv, cwd, input_bytes=None, timeout=25):
         assert_eq!(
             block_on(fs::git_github_work_item_comment(
                 root.identity(),
+                "fixture/repo".into(),
                 "pr".into(),
                 22,
                 "Literal ż body".into(),

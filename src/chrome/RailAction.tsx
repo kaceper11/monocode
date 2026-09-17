@@ -5,6 +5,7 @@ type Props = {
   label: string;
   icon: IconComponent;
   onClick?: (event: MouseEvent<HTMLButtonElement>) => void;
+  onOpenContextMenu?: (x: number, y: number) => void;
   active?: boolean;
   badge?: number;
   dot?: boolean;
@@ -16,6 +17,7 @@ export function RailAction({
   label,
   icon: Icon,
   onClick,
+  onOpenContextMenu,
   active = false,
   badge,
   dot = false,
@@ -26,11 +28,35 @@ export function RailAction({
     <button
       type="button"
       onClick={onClick}
+      onContextMenu={
+        onOpenContextMenu
+          ? (event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onOpenContextMenu(event.clientX, event.clientY);
+            }
+          : undefined
+      }
+      onKeyDown={
+        onOpenContextMenu
+          ? (event) => {
+              if (
+                event.key !== "ContextMenu" &&
+                !(event.shiftKey && event.key === "F10")
+              )
+                return;
+              event.preventDefault();
+              event.stopPropagation();
+              const rect = event.currentTarget.getBoundingClientRect();
+              onOpenContextMenu(rect.left, rect.bottom);
+            }
+          : undefined
+      }
       disabled={!onClick}
       aria-label={ariaLabel ?? label}
       className={`relative flex w-full items-center gap-2 rounded-md px-2 h-8  text-left ${
         active
-          ? "bg-content/10 text-content"
+          ? "bg-selection text-content"
           : "text-content/50 hover:bg-content/10 hover:text-content"
       } disabled:cursor-default disabled:opacity-40`}
     >
@@ -83,7 +109,7 @@ export function RailSearch({
       aria-label={ariaLabel ?? label}
       className={`relative flex w-full items-center gap-2 rounded-md border border-content/8 px-1.5 shadow-sm h-8 text-left ${
         active
-          ? "bg-content/10 text-content"
+          ? "bg-selection text-content"
           : "text-content/50 hover:bg-content/10 hover:text-content"
       } disabled:cursor-default disabled:opacity-40`}
     >

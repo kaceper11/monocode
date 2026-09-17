@@ -131,7 +131,7 @@ describe("github-pr adapter", () => {
 
   it("forces a fresh thread read — the cache has no TTL", async () => {
     await pollWatcherSource(WATCHER);
-    expect(workItemThread).toHaveBeenCalledWith("/repo", "pr", 42, {
+    expect(workItemThread).toHaveBeenCalledWith("/repo", "acme/app", "pr", 42, {
       force: true,
     });
   });

@@ -71,7 +71,11 @@ const waitFor = async (pred: () => boolean, label: string) => {
 
 async function startTurn(
   sessionId: string,
-  options: { runtimeMode?: RuntimeMode; intent?: TurnIntent } = {},
+  options: {
+    runtimeMode?: RuntimeMode;
+    intent?: TurnIntent;
+    providerAccountId?: string;
+  } = {},
 ) {
   const events: HarnessEvent[] = [];
   const turn = sendClaudeTurn({
@@ -81,6 +85,7 @@ async function startTurn(
     modelSettings: {},
     runtimeMode: options.runtimeMode ?? "supervised",
     intent: options.intent,
+    providerAccountId: options.providerAccountId,
     text: "explore the codebase",
     attachments: [],
     onEvent: (event) => events.push(event),
@@ -123,8 +128,10 @@ afterEach(async () => {
 });
 
 describe("claude model switching", () => {
-  it("restarts with the new model while resuming the provider conversation", async () => {
-    const first = await startTurn("s1");
+  it("restarts a named account with the new model while resuming the provider conversation", async () => {
+    const first = await startTurn("s1", {
+      providerAccountId: "account-work",
+    });
     emit({ type: "result", subtype: "success", session_id: "sess_1" });
     await first.turn;
 
@@ -137,6 +144,7 @@ describe("claude model switching", () => {
       model: "claude:opus-5",
       modelSettings: {},
       runtimeMode: "supervised",
+      providerAccountId: "account-work",
       text: "what did I ask before?",
       attachments: [],
       onEvent: () => undefined,

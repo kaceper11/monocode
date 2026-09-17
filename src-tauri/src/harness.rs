@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::dirs_home;
@@ -20,6 +20,15 @@ const STDERR_EVENT: &str = "harness-stderr";
 const EXIT_EVENT: &str = "harness-exit";
 const SSE_EVENT: &str = "harness-sse";
 const SSE_END_EVENT: &str = "harness-sse-end";
+
+const DEFAULT_PROVIDER_ACCOUNT_ID: &str = "default";
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessAccount {
+    provider: String,
+    id: String,
+}
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -558,6 +567,7 @@ pub fn harness_free_port() -> Result<u16, String> {
 /// login-shell read. Callers await this before writing to the child. Kill can
 /// still race the fork, so a cancelled spawn must not reinsert the child.
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub fn harness_spawn(
     app: AppHandle,
     host: State<'_, HarnessHost>,
@@ -566,6 +576,7 @@ pub fn harness_spawn(
     args: Vec<String>,
     cwd: String,
     generation: u64,
+    account: Option<HarnessAccount>,
 ) -> Result<u32, String> {
     let location = crate::wsl::location(&cwd)?;
     let _worktree_guard = crate::fs::worktrees::LIFECYCLE
@@ -598,6 +609,9 @@ pub fn harness_spawn(
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_provider_account(&app, &mut cmd, account.as_ref())?;
+
+    crate::control::configure_child(&app, &session_id, &mut cmd);
 
     let mut child =
         spawn_managed(&mut cmd).map_err(|e| format!("Failed to start {command}: {e}"))?;
@@ -775,6 +789,74 @@ fn native_agent_cwd(line: String) -> Result<String, String> {
         changed = true;
     }
     Ok(if changed { message.to_string() } else { line })
+}
+
+pub(crate) fn provider_account_dir(
+    app: &AppHandle,
+    provider: &str,
+    account_id: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(account_id) = account_id.filter(|id| *id != DEFAULT_PROVIDER_ACCOUNT_ID) else {
+        return Ok(None);
+    };
+    if provider != "claude" && provider != "codex" {
+        return Err("Provider account profiles are only supported for Claude and Codex".into());
+    }
+    if account_id.is_empty()
+        || account_id.len() > 80
+        || !account_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("Invalid provider account id".into());
+    }
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("provider-accounts")
+        .join(provider)
+        .join(account_id);
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        format!(
+            "Could not create the {provider} account directory {}: {error}",
+            dir.display()
+        )
+    })?;
+    Ok(Some(dir))
+}
+
+fn apply_provider_account(
+    app: &AppHandle,
+    cmd: &mut Command,
+    account: Option<&HarnessAccount>,
+) -> Result<(), String> {
+    let Some(account) = account else {
+        return Ok(());
+    };
+    let Some(dir) = provider_account_dir(app, &account.provider, Some(&account.id))? else {
+        return Ok(());
+    };
+    match account.provider.as_str() {
+        "claude" => {
+            // Claude scopes both its ordinary config and its macOS Keychain
+            // credential to these exact strings. Setting both keeps profiles
+            // isolated on every supported platform.
+            cmd.env("CLAUDE_CONFIG_DIR", &dir)
+                .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", &dir)
+                .env_remove("ANTHROPIC_API_KEY")
+                .env_remove("ANTHROPIC_AUTH_TOKEN")
+                .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+        }
+        "codex" => {
+            cmd.env("CODEX_HOME", &dir)
+                .env_remove("OPENAI_API_KEY")
+                .env_remove("CODEX_API_KEY")
+                .env_remove("CODEX_ACCESS_TOKEN");
+        }
+        _ => unreachable!("provider_account_dir validates the provider"),
+    }
+    Ok(())
 }
 
 #[tauri::command(async)]
@@ -1753,6 +1835,7 @@ fn resolve_codex() -> Option<PathBuf> {
 
     if let Some(home) = &home {
         candidates.push(home.join(".local/bin/codex"));
+        candidates.push(home.join(".bun/bin/codex"));
         candidates.push(home.join(".npm-global/bin/codex"));
         candidates.push(home.join(".cargo/bin/codex"));
         candidates.push(home.join("n/bin/codex"));

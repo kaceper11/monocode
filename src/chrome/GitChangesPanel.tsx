@@ -110,6 +110,7 @@ import {
   type GitPr,
 } from "../lib/fs";
 import type { HarnessId } from "../lib/session";
+import { recordInboxSelfActivity } from "../lib/inboxSelfActivity";
 import {
   loadChangesView,
   saveChangesView,
@@ -348,7 +349,7 @@ export function GitChangesPanel({
       ref={paneRef}
       className="flex h-full min-h-0 flex-1 flex-col overflow-hidden"
     >
-      <header className="flex h-9 shrink-0 items-center gap-2 border-b border-content/10 px-3">
+      <header className="flex h-9 shrink-0 items-center gap-2 border-b border-stroke px-3">
         <span className="text-[12px] font-medium text-content">Changes</span>
         {index?.branch ? (
           <span className="ml-auto flex min-w-0 items-center gap-1 text-[11px] text-content/50">
@@ -483,7 +484,7 @@ export function GitChangesPanel({
         />
       ) : null}
       <div
-        className={`shrink-0 overflow-hidden border-t border-content/10 ${
+        className={`shrink-0 overflow-hidden border-t border-stroke ${
           graphExpanded ? "min-h-0" : "h-7"
         }`}
         style={graphExpanded ? { height: graphHeight } : undefined}
@@ -1025,6 +1026,16 @@ function ChangedFiles({
     });
   };
 
+  const recordPrActivity = (number = pr?.number) => {
+    if (!number) return;
+    recordInboxSelfActivity({
+      provider: "github",
+      kind: "pr",
+      number,
+      projectPath: cwd,
+    });
+  };
+
   const confirmDefault = async (kind: "push" | "pr") => {
     if (!onDefault || !index?.branch) return true;
     const branch = index.branch;
@@ -1131,7 +1142,10 @@ function ChangedFiles({
         return;
       }
       await gitCommit(cwd, message);
-      if (push || createPr) await gitPush(cwd);
+      if (push || createPr) {
+        await gitPush(cwd);
+        recordPrActivity();
+      }
       setMessage("");
       mutated();
       if (createPr) {
@@ -1148,9 +1162,11 @@ function ChangedFiles({
 
   const sync = async () => {
     if (!index || !(canSync || canPublish)) return;
+    const pushesCommits = index.ahead > 0;
     setBusy("sync");
     try {
       await gitSync(cwd);
+      if (pushesCommits) recordPrActivity();
       mutated(undefined, undefined, true);
       reloadPr();
     } catch (error) {
@@ -1223,6 +1239,8 @@ function ChangedFiles({
       content.head,
     );
     watchGithubPrUrl(cwd, url.trim(), sourceSessionId);
+    const number = Number(/\/pull\/(\d+)(?:[/?#]|$)/.exec(url)?.[1]);
+    if (Number.isInteger(number) && number > 0) recordPrActivity(number);
     await openUrl(url.trim());
   };
 
@@ -1311,7 +1329,7 @@ function ChangedFiles({
     <aside
       className={`relative flex min-h-0 min-w-0 flex-col ${fill ? "flex-1" : "shrink-0"}`}
     >
-      <div className="shrink-0 border-b border-content/10 p-2">
+      <div className="shrink-0 border-b border-stroke p-2">
         <div className="relative">
           <textarea
             ref={messageRef}
@@ -2255,7 +2273,7 @@ const ChangeRow = memo(
             contextChecked
               ? "bg-accent/10 text-content"
               : active
-                ? "bg-content/10 text-content"
+                ? "bg-selection text-content"
                 : "text-content hover:bg-content/5"
           }`}
         >

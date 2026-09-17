@@ -2,6 +2,7 @@ import { listAzureDelivery, type AzureInboxDelivery } from "./azureInbox";
 import { invoke } from "@tauri-apps/api/core";
 import { atlassianCapable, jiraConnected, listJiraIssues, jiraFilterCacheKey } from "./jira";
 import { azureConnected, listAzureItems, azureFilterCacheKey } from "./azure";
+import { clearKnownInboxItems } from "./inboxSeen";
 import {
   linearConnected,
   linearTeamIdsForFetch,
@@ -40,9 +41,12 @@ import {
   type RepositoryFamily,
 } from "./repositoryFamilies";
 import { loadTabGroupLabels, resolveTabGroupLabel } from "./tabGroups";
+import { recordInboxSelfActivity } from "./inboxSelfActivity";
 import type { UnifiedLine } from "./unifiedDiff";
 
 export type GithubTaskKind = "issue" | "pr";
+export type GithubPrAction =
+  "merge" | "squash" | "rebase" | "draft" | "ready" | "close" | "reopen";
 export type InboxKind = GithubTaskKind | "ci" | "linear" | "jira" | "azure";
 
 export type GithubLabel = {
@@ -62,6 +66,7 @@ export type GithubWorkItem = {
   title: string;
   url: string;
   state: string;
+  createdAt?: string;
   updatedAt: string;
   labels: GithubLabel[];
   assignees: GithubAssignee[];
@@ -185,6 +190,7 @@ let inboxListCache: InboxListCache | null = null;
 let inboxGeneration = 0;
 const inboxListInflight = new Map<string, Promise<InboxListResult>>();
 const repoByPath = new Map<string, string>();
+const repositoriesByPath = new Map<string, string[]>();
 const workItemByKey = new Map<string, GithubWorkItem>();
 const workItemInflight = new Map<string, Promise<GithubWorkItem>>();
 const detailsByKey = new Map<string, GithubWorkItemDetails>();
@@ -195,9 +201,11 @@ const prDiffInflight = new Map<string, Promise<GithubPrDiff>>();
 
 export function clearInboxCache() {
   inboxGeneration++;
+  clearKnownInboxItems();
   inboxListCache = null;
   inboxListInflight.clear();
   repoByPath.clear();
+  repositoriesByPath.clear();
   workItemByKey.clear();
   workItemInflight.clear();
   detailsByKey.clear();
@@ -256,17 +264,36 @@ export async function githubRepo(cwd: string): Promise<string> {
   const key = normalizeProjectPath(cwd);
   const cached = repoByPath.get(key);
   if (cached !== undefined) return cached;
+  const repositories = repositoriesByPath.get(key);
+  if (repositories?.[0]) return repositories[0];
   const repo = await invoke<string>("git_github_repo", { cwd });
   repoByPath.set(key, repo);
   return repo;
 }
 
+export async function githubRepositories(cwd: string): Promise<string[]> {
+  const key = normalizeProjectPath(cwd);
+  const cached = repositoriesByPath.get(key);
+  if (cached) return cached;
+  const repositories = await invoke<string[]>("git_github_repositories", {
+    cwd,
+  });
+  if (repositories.length === 0) {
+    throw new Error("GitHub did not return a repository");
+  }
+  repositoriesByPath.set(key, repositories);
+  repoByPath.set(key, repositories[0]!);
+  return repositories;
+}
+
 export function listGithubWorkItems(
   cwd: string,
+  repo: string,
   query: GithubWorkItemQuery,
 ): Promise<GithubWorkItem[]> {
   return invoke<GithubWorkItem[]>("git_github_work_items", {
     cwd,
+    repo,
     kind: query.kind,
     assignedToMe: query.assignedToMe,
     state: query.state,
@@ -281,6 +308,14 @@ function workItemLookupKey(
   number: number,
 ): string {
   return `${repo.trim().toLowerCase()}:${kind}:${number}`;
+}
+
+export function peekGithubWorkItem(
+  repo: string,
+  kind: GithubTaskKind,
+  number: number,
+): GithubWorkItem | null {
+  return workItemByKey.get(workItemLookupKey(repo, kind, number)) ?? null;
 }
 
 /** Fetch one exact item after targeted Inbox navigation misses its list cache. */
@@ -378,51 +413,51 @@ export function formatRelativeTime(
 }
 
 export function detailsCacheKey(
-  cwd: string,
+  repo: string,
   kind: GithubTaskKind,
   number: number,
 ): string {
-  return `${normalizeProjectPath(cwd)}:${kind}:${number}`;
+  return workItemLookupKey(repo, kind, number);
 }
 
 export function peekGithubWorkItemDetails(
-  cwd: string,
+  repo: string,
   kind: GithubTaskKind,
   number: number,
 ): GithubWorkItemDetails | null {
-  return detailsByKey.get(detailsCacheKey(cwd, kind, number)) ?? null;
+  return detailsByKey.get(detailsCacheKey(repo, kind, number)) ?? null;
 }
 
 export async function githubWorkItemDetails(
   cwd: string,
+  repo: string,
   kind: GithubTaskKind,
   number: number,
 ): Promise<GithubWorkItemDetails> {
   const details = await invoke<GithubWorkItemDetails>(
     "git_github_work_item_details",
-    { cwd, kind, number },
+    { cwd, repo, kind, number },
   );
-  detailsByKey.set(detailsCacheKey(cwd, kind, number), details);
+  detailsByKey.set(detailsCacheKey(repo, kind, number), details);
   return details;
 }
 
 export function peekGithubWorkItemThread(
-  cwd: string,
+  repo: string,
   kind: GithubTaskKind,
   number: number,
 ): GithubWorkItemThread | null {
-  return threadByKey.get(detailsCacheKey(cwd, kind, number)) ?? null;
+  return threadByKey.get(detailsCacheKey(repo, kind, number)) ?? null;
 }
 
 export async function githubWorkItemThread(
   cwd: string,
+  repo: string,
   kind: GithubTaskKind,
   number: number,
   options?: { force?: boolean; repo?: string },
 ): Promise<GithubWorkItemThread> {
-  const key = options?.repo
-    ? `${detailsCacheKey(cwd, kind, number)}:${options.repo.trim().toLowerCase()}`
-    : detailsCacheKey(cwd, kind, number);
+  const key = detailsCacheKey(repo, kind, number);
   if (options?.force) {
     threadByKey.delete(key);
     threadInflight.delete(key);
@@ -431,7 +466,7 @@ export async function githubWorkItemThread(
   if (pending) return pending;
   const promise = invoke<GithubWorkItemThread>("git_github_work_item_thread", {
     cwd,
-    repo: options?.repo ?? "",
+    repo,
     kind,
     number,
   })
@@ -448,6 +483,7 @@ export async function githubWorkItemThread(
 
 export async function githubWorkItemComment(
   cwd: string,
+  repo: string,
   kind: GithubTaskKind,
   number: number,
   body: string,
@@ -455,14 +491,16 @@ export async function githubWorkItemComment(
 ): Promise<string> {
   const url = await invoke<string>("git_github_work_item_comment", {
     cwd,
+    repo,
     kind,
     number,
     body: body.trim(),
     inReplyTo: options?.inReplyTo?.trim() ?? "",
   });
-  const key = detailsCacheKey(cwd, kind, number);
+  const key = detailsCacheKey(repo, kind, number);
   threadByKey.delete(key);
   threadInflight.delete(key);
+  recordInboxSelfActivity({ provider: "github", kind, number, repo });
   return url;
 }
 
@@ -511,6 +549,38 @@ export function githubPrState(
   number: number,
 ): Promise<GithubPrState> {
   return invoke<GithubPrState>("git_github_pr_state", { cwd, number });
+}
+
+/** Run a state-changing pull request action and return GitHub's fresh PR state. */
+export async function githubPrAction(
+  cwd: string,
+  repo: string,
+  number: number,
+  action: GithubPrAction,
+): Promise<GithubWorkItem> {
+  const item = await invoke<GithubWorkItem>("git_github_pr_action", {
+    cwd,
+    repo,
+    number,
+    action,
+  });
+  const key = workItemLookupKey(repo, "pr", number);
+  workItemByKey.set(key, item);
+  if (inboxListCache) {
+    inboxListCache = {
+      ...inboxListCache,
+      items: inboxListCache.items.map((cached) =>
+        cached.provider === "github" &&
+        cached.kind === "pr" &&
+        cached.repo.toLowerCase() === repo.trim().toLowerCase() &&
+        cached.number === number
+          ? { ...cached, ...item }
+          : cached,
+      ),
+    };
+  }
+  recordInboxSelfActivity({ provider: "github", kind: "pr", repo, number });
+  return item;
 }
 
 export function githubReviewDecisionLabel(decision: string): string {
@@ -576,25 +646,38 @@ export function gitlabAttentionLabel(reason: string): string {
   }
 }
 
-export function prDiffCacheKey(cwd: string, number: number): string {
-  return `${normalizeProjectPath(cwd)}:pr:${number}`;
+export function prDiffCacheKey(
+  repo: string,
+  number: number,
+  fullContext = false,
+): string {
+  return `${repo.trim().toLowerCase()}:pr:${number}${fullContext ? ":full" : ""}`;
 }
 
 export function peekGithubPrDiff(
-  cwd: string,
+  repo: string,
   number: number,
+  fullContext = false,
 ): GithubPrDiff | null {
-  return prDiffByKey.get(prDiffCacheKey(cwd, number)) ?? null;
+  return prDiffByKey.get(prDiffCacheKey(repo, number, fullContext)) ?? null;
 }
 
 export async function githubPrDiff(
   cwd: string,
+  repo: string,
   number: number,
+  options?: { fullContext?: boolean },
 ): Promise<GithubPrDiff> {
-  const key = prDiffCacheKey(cwd, number);
+  const fullContext = options?.fullContext === true;
+  const key = prDiffCacheKey(repo, number, fullContext);
   const pending = prDiffInflight.get(key);
   if (pending) return pending;
-  const promise = invoke<GithubPrDiff>("git_github_pr_diff", { cwd, number })
+  const promise = invoke<GithubPrDiff>("git_github_pr_diff", {
+    cwd,
+    repo,
+    number,
+    fullContext,
+  })
     .then((diff) => {
       prDiffByKey.set(key, diff);
       return diff;
@@ -691,22 +774,18 @@ async function fetchInboxItems(
 ): Promise<InboxListResult> {
   const unique = uniqueInboxProjects(projects);
   const preferredPaths = unique.map((project) => project.path);
-  const resolved = await Promise.all(
-    unique.map(async (project) => {
-      try {
-        return {
-          path: project.path,
-          repo: (await githubRepo(project.path)).trim(),
-        };
-      } catch {
-        return { path: project.path, repo: "" };
-      }
-    }),
+  const discovery = await Promise.allSettled(
+    unique.map((project) => githubRepositories(project.path)),
+  );
+  const resolved = discovery.flatMap((result, index) =>
+    result.status === "fulfilled"
+      ? result.value.map((repo) => ({ path: unique[index]!.path, repo }))
+      : [],
   );
   const grouped = groupProjectsByRepo(resolved);
   const githubJobs = grouped.flatMap((project) =>
     (["issue", "pr"] as const).map(async (kind) => {
-      const items = await listGithubWorkItems(project.path, {
+      const items = await listGithubWorkItems(project.path, project.repo, {
         ...query,
         kind,
       });
@@ -718,12 +797,15 @@ async function fetchInboxItems(
       }));
     }),
   );
+  const discoveryFailures = discovery.filter(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
   const github = collectInboxResults(
-    await Promise.allSettled(githubJobs),
+    [...(await Promise.allSettled(githubJobs)), ...discoveryFailures],
     preferredPaths,
   );
   const errors: InboxProviderErrors = {};
-  if (github.error && grouped.length > 0) errors.github = github.error;
+  if (github.error && unique.length > 0) errors.github = github.error;
 
   let linearItems: InboxItem[] = [];
   try {

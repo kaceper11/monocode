@@ -1,6 +1,7 @@
 import { markTurnInterrupted, type ResumedWorkspace } from "./inFlight";
 import {
   closeLeaf,
+  isAgentTab,
   isTerminalTab,
   leafIds,
   newTab,
@@ -43,6 +44,7 @@ export type WorkspaceSessionStub = {
   runtimeMode: RuntimeMode;
   title: string;
   providerSessionId?: string;
+  providerAccountId?: string;
   branch?: string;
   worktreeCwd?: string;
 };
@@ -65,7 +67,7 @@ export function collectWorkspaceSnapshot(
   projectTerminals: ProjectTerminalDock[] = [],
 ): WorkspaceSnapshot {
   const snapshot = withoutInboxSessions({
-    tabs: tabs.map(sanitizeTab).filter((tab): tab is WorkspaceTab => tab != null),
+    tabs: withoutAgentTabs(tabs).map(sanitizeTab).filter((tab): tab is WorkspaceTab => tab != null),
     sessions: sessions.map(sessionStub).filter((stub): stub is WorkspaceSessionStub => stub != null),
     activeTabId,
     projectCwd: projectCwd.trim() || "~",
@@ -111,6 +113,36 @@ function parseProjectReturnTargets(raw: unknown): ProjectReturnMemory {
     memory.set(pathKey(projectPath), remembered.trim());
   }
   return memory;
+}
+
+/**
+ * Agent tabs watch a live worker, and a run does not outlive the window that
+ * started it. Dropping them in `sanitizeFile` would strand an empty pane and
+ * cost the whole workspace tab on restore, so the pane is closed here instead.
+ */
+function withoutAgentTabs(tabs: WorkspaceTab[]): WorkspaceTab[] {
+  return tabs.flatMap(tab => {
+    if (!tab.editorPanes.some(pane => pane.files.some(isAgentTab))) return [tab];
+    let remaining: WorkspaceTab | null = tab;
+    const panes: EditorPane[] = [];
+    for (const pane of tab.editorPanes) {
+      const files = pane.files.filter(file => !isAgentTab(file));
+      if (files.length === pane.files.length) {
+        panes.push(pane);
+      } else if (files.length === 0) {
+        remaining = remaining && closeLeaf(remaining, pane.id);
+      } else {
+        panes.push({
+          ...pane,
+          files,
+          activeFileId: files.some(file => file.id === pane.activeFileId)
+            ? pane.activeFileId
+            : files[0].id,
+        });
+      }
+    }
+    return remaining ? [{ ...remaining, editorPanes: panes }] : [];
+  });
 }
 
 /** Also removes tabs saved by the earlier, persistent Inbox implementation. */
@@ -283,6 +315,9 @@ function sessionStub(session: Session): WorkspaceSessionStub | null {
     ...(session.providerSessionId
       ? { providerSessionId: session.providerSessionId }
       : {}),
+    ...(session.providerAccountId
+      ? { providerAccountId: session.providerAccountId }
+      : {}),
     ...(session.branch ? { branch: session.branch } : {}),
     ...(session.worktreeCwd ? { worktreeCwd: session.worktreeCwd } : {}),
   };
@@ -303,6 +338,9 @@ function sessionFromStub(stub: WorkspaceSessionStub): Session {
     ...(stub.inboxAsk ? { inboxAsk: stub.inboxAsk } : {}),
     ...(stub.providerSessionId
       ? { providerSessionId: stub.providerSessionId }
+      : {}),
+    ...(stub.providerAccountId
+      ? { providerAccountId: stub.providerAccountId }
       : {}),
     ...(stub.branch ? { branch: stub.branch } : {}),
     ...(stub.worktreeCwd ? { worktreeCwd: stub.worktreeCwd } : {}),
@@ -339,6 +377,10 @@ function sanitizeStub(raw: unknown): WorkspaceSessionStub | null {
       ? { inboxAsk: value.inboxAsk as InboxAskContext } : {}),
     ...(typeof value.providerSessionId === "string" && value.providerSessionId
       ? { providerSessionId: value.providerSessionId }
+      : {}),
+    ...(typeof value.providerAccountId === "string" &&
+    /^[A-Za-z0-9_-]+$/.test(value.providerAccountId)
+      ? { providerAccountId: value.providerAccountId }
       : {}),
     ...(typeof value.branch === "string" && value.branch.trim()
       ? { branch: value.branch.trim() }

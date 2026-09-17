@@ -18,6 +18,7 @@ import {
   assistantToolUses,
   contextFromResult,
   contextUsedFromAssistant,
+  turnMetricsFromResult,
   buildClaudeSpawnArgs,
   buildClaudeUserMessage,
   buildControlRequest,
@@ -115,6 +116,7 @@ type LiveAgentTask = {
 type Live = {
   cwd: string;
   claudeSessionId: string;
+  providerAccountId?: string;
   runtimeMode: RuntimeMode;
   planning: boolean;
   /** Last permission mode acknowledged by the CLI. */
@@ -151,6 +153,7 @@ type Live = {
 type Resume = {
   sessionId: string;
   cwd: string;
+  providerAccountId?: string;
 };
 
 const INIT_TIMEOUT_MS = 8_000;
@@ -515,10 +518,11 @@ export function bindClaudeSession(
   threadId: string,
   providerSessionId: string,
   cwd: string,
+  providerAccountId?: string,
 ): void {
   const sessionId = providerSessionId.trim();
   if (!threadId || !sessionId || !cwd.trim()) return;
-  resumeByThread.set(threadId, { sessionId, cwd });
+  resumeByThread.set(threadId, { sessionId, cwd, providerAccountId });
 }
 
 async function ensureLive(
@@ -546,8 +550,15 @@ async function ensureLive(
   }
 
   const resume = resumeByThread.get(input.sessionId);
-  const canResume = resume != null && resume.cwd === input.cwd;
-  if (resume && resume.cwd !== input.cwd) {
+  const canResume =
+    resume != null &&
+    resume.cwd === input.cwd &&
+    resume.providerAccountId === input.providerAccountId;
+  if (
+    resume &&
+    (resume.cwd !== input.cwd ||
+      resume.providerAccountId !== input.providerAccountId)
+  ) {
     resumeByThread.delete(input.sessionId);
   }
 
@@ -567,6 +578,7 @@ async function ensureLive(
   const live: Live = {
     cwd: input.cwd,
     claudeSessionId,
+    providerAccountId: input.providerAccountId,
     runtimeMode: input.runtimeMode,
     planning,
     pushedMode: launch.permissionMode ?? "default",
@@ -642,6 +654,7 @@ async function ensureLive(
       path,
       buildClaudeSpawnArgs(launch),
       input.cwd,
+      { provider: "claude", id: input.providerAccountId ?? "default" },
     );
     signal.throwIfAborted();
     markTurn(input.sessionId, "claude spawned");
@@ -650,6 +663,7 @@ async function ensureLive(
     resumeByThread.set(input.sessionId, {
       sessionId: claudeSessionId,
       cwd: input.cwd,
+      providerAccountId: input.providerAccountId,
     });
 
     await writeJson(
@@ -782,6 +796,7 @@ function handleLine(sessionId: string, live: Live, line: string): void {
     resumeByThread.set(sessionId, {
       sessionId: sessionIdFromLine,
       cwd: live.cwd,
+      providerAccountId: live.providerAccountId,
     });
     live.onEvent({
       type: "session.providerBound",
@@ -997,6 +1012,8 @@ function handleResult(live: Live, rec: Record<string, unknown>): void {
     const context = contextFromResult(rec);
     if (context) live.onEvent({ type: "context", ...context });
   }
+  const metrics = turnMetricsFromResult(rec);
+  if (metrics) live.onEvent({ type: "turn.metrics", ...metrics });
 
   const result = turnStatusFromResult(rec);
   if (result.status === "failed" && result.error && !live.cancelled) {
@@ -1592,14 +1609,14 @@ function writeJson(
 }
 
 function settingsKeyFor(input: HarnessSessionInput): string {
-  return claudeSettingsKey({
+  return `${input.providerAccountId ?? "default"}:${claudeSettingsKey({
     model: nativeModelId(input.model, input.cwd),
     effort: input.modelSettings?.effort,
     fast: input.modelSettings?.fast,
     thinking: input.modelSettings?.thinking,
     context: input.modelSettings?.context,
     hooks: loadClaudeHooks(),
-  });
+  })}`;
 }
 
 function launchOptions(

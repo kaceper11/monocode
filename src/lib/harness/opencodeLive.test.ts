@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { newSession } from "../session";
+import { newSession, type RuntimeMode } from "../session";
 import { applyHarnessEvent } from "./apply";
 
 let onStdout: ((line: string) => void) | undefined;
 let onExit: ((code: number | null) => void) | undefined;
 let onSseEvent: ((event: Record<string, unknown>) => void) | undefined;
 let onSseEnd: ((error?: string) => void) | undefined;
+let sessionMessages: unknown[] = [];
 const spawnChild = vi.fn(async () => {
   onStdout?.("opencode server listening on http://127.0.0.1:4096");
 });
@@ -25,6 +26,12 @@ const harnessHttp = vi.fn(
         status: 200,
         body: JSON.stringify({ id: "session_1", directory: "/repo" }),
       };
+    }
+    if (
+      input.method === "GET" &&
+      url.pathname === "/session/session_1/message"
+    ) {
+      return { status: 200, body: JSON.stringify(sessionMessages) };
     }
     return { status: 204, body: "" };
   },
@@ -61,6 +68,7 @@ vi.mock("./child", () => ({
 const {
   __openCodeTestReset,
   __openCodeRetainedState,
+  bindOpenCodeSession,
   canSteerOpenCodeSession,
   forgetOpenCodeSession,
   setOpenCodeBinaryResolver,
@@ -81,12 +89,15 @@ const waitFor = async (predicate: () => boolean, label: string) => {
   throw new Error(`timed out waiting for ${label}`);
 };
 
-function turn(events: HarnessEvent[]) {
+function turn(
+  events: HarnessEvent[],
+  options: { runtimeMode?: RuntimeMode } = {},
+) {
   return sendOpenCodeTurn({
     sessionId: "opencode-live",
     cwd: "/repo",
     model: "opencode:openrouter/anthropic/claude-sonnet-4.6",
-    runtimeMode: "supervised",
+    runtimeMode: options.runtimeMode ?? "supervised",
     text: "delegate the investigation",
     attachments: [],
     onEvent: (event) => events.push(event),
@@ -138,6 +149,7 @@ beforeEach(() => {
   onExit = undefined;
   onSseEvent = undefined;
   onSseEnd = undefined;
+  sessionMessages = [];
   spawnChild.mockClear();
   killChild.mockClear();
   harnessHttp.mockClear();
@@ -226,6 +238,130 @@ describe("OpenCode subagent trails", () => {
 });
 
 describe("OpenCode event stream recovery", () => {
+  it("reverts a rejected file turn before continuing a resumed session", async () => {
+    sessionMessages = [
+      {
+        info: {
+          id: "message_bad_file",
+          sessionID: "session_1",
+          role: "user",
+          time: { created: 1 },
+        },
+        parts: [
+          {
+            type: "file",
+            mime: "application/octet-stream",
+            filename: "Info.plist",
+          },
+        ],
+      },
+      {
+        info: {
+          id: "message_bad_reply",
+          parentID: "message_bad_file",
+          sessionID: "session_1",
+          role: "assistant",
+          time: { created: 2 },
+          error: {
+            data: {
+              message:
+                "'file part media type application/octet-stream' functionality not supported.",
+            },
+          },
+        },
+        parts: [],
+      },
+    ];
+    bindOpenCodeSession("opencode-live", "session_1", "/repo");
+
+    const events: HarnessEvent[] = [];
+    const done = turn(events);
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.some(([input]) =>
+          input.url.includes("/session/session_1/revert"),
+        ),
+      "attachment turn recovery",
+    );
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.some(([input]) =>
+          input.url.includes("/prompt_async"),
+        ),
+      "resumed prompt",
+    );
+
+    const revertIndex = harnessHttp.mock.calls.findIndex(([input]) =>
+      input.url.includes("/session/session_1/revert"),
+    );
+    const promptIndex = harnessHttp.mock.calls.findIndex(([input]) =>
+      input.url.includes("/prompt_async"),
+    );
+    expect(revertIndex).toBeGreaterThanOrEqual(0);
+    expect(promptIndex).toBeGreaterThan(revertIndex);
+    expect(harnessHttp.mock.calls[revertIndex]?.[0]).toMatchObject({
+      method: "POST",
+      body: JSON.stringify({ messageID: "message_bad_file" }),
+    });
+
+    idle();
+    await done;
+    expect(events).toContainEqual({ type: "message.completed" });
+  });
+
+  it("preserves history when a later assistant turn succeeded", async () => {
+    sessionMessages = [
+      {
+        info: {
+          id: "message_bad_file",
+          role: "user",
+          time: { created: 1 },
+        },
+        parts: [{ type: "file", mime: "application/octet-stream" }],
+      },
+      {
+        info: {
+          id: "message_bad_reply",
+          parentID: "message_bad_file",
+          role: "assistant",
+          time: { created: 2 },
+          error: {
+            data: {
+              message:
+                "'file part media type application/octet-stream' functionality not supported.",
+            },
+          },
+        },
+        parts: [],
+      },
+      {
+        info: {
+          id: "message_recovered_reply",
+          role: "assistant",
+          time: { created: 3 },
+        },
+        parts: [{ type: "text", text: "Recovered" }],
+      },
+    ];
+    bindOpenCodeSession("opencode-live", "session_1", "/repo");
+
+    const events: HarnessEvent[] = [];
+    const done = turn(events);
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.some(([input]) =>
+          input.url.includes("/prompt_async"),
+        ),
+      "resumed prompt",
+    );
+    expect(
+      harnessHttp.mock.calls.some(([input]) => input.url.includes("/revert")),
+    ).toBe(false);
+
+    idle();
+    await done;
+  });
+
   it("fails a cleanly-ended stream and reconnects on the next turn", async () => {
     const firstEvents: HarnessEvent[] = [];
     const first = turn(firstEvents);
@@ -564,6 +700,72 @@ describe("OpenCode runtime mode changes", () => {
 
     idle();
     await done;
+  });
+});
+
+describe("OpenCode access modes", () => {
+  it("updates a live session when access changes and auto-allows residual full-access prompts", async () => {
+    const events: HarnessEvent[] = [];
+    const first = turn(events);
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.some(([input]) =>
+          input.url.includes("/prompt_async"),
+        ),
+      "first prompt",
+    );
+    idle();
+    await first;
+
+    const second = turn(events, { runtimeMode: "full-access" });
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.some(
+          ([input]) =>
+            input.method === "PATCH" &&
+            new URL(input.url).pathname === "/session/session_1",
+        ),
+      "permission update",
+    );
+    expect(harnessHttp).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "PATCH",
+        url: "http://127.0.0.1:4096/session/session_1?directory=%2Frepo",
+        body: JSON.stringify({
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        }),
+      }),
+    );
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.filter(([input]) =>
+          input.url.includes("/prompt_async"),
+        ).length === 2,
+      "second prompt",
+    );
+
+    askPermission("session_1", "permission_residual");
+    await waitFor(
+      () =>
+        harnessHttp.mock.calls.some(
+          ([input]) =>
+            new URL(input.url).pathname ===
+            "/permission/permission_residual/reply",
+        ),
+      "automatic full-access reply",
+    );
+    expect(harnessHttp).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ reply: "once" }),
+      }),
+    );
+    expect(
+      events.some((event) => event.type === "approval.requested"),
+    ).toBe(false);
+
+    idle();
+    await second;
   });
 });
 

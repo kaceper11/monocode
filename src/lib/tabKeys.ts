@@ -3,6 +3,7 @@
  *   New tab             cmd-t
  *   Close other tabs    cmd-opt-t
  *   Close tab           cmd-w
+ *   Close all tabs      shift-cmd-w
  *   Split pane right    cmd-d
  *   Split pane down     shift-cmd-d
  *   Next tab            shift-cmd-}
@@ -34,6 +35,7 @@ import type { FocusDir } from "./layout";
 export type TabCommand =
   | "new"
   | "close-others"
+  | "close-all"
   | "close"
   | "next"
   | "prev"
@@ -89,6 +91,7 @@ export function tabCommand(e: KeyboardEvent): TabCommand | null {
     if (e.key === "ArrowRight") return "next-project";
     if (key === "d") return "split-down";
     if (key === "b") return "open-browser";
+    if (key === "w") return "close-all";
     return null;
   }
 
