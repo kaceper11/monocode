@@ -36,6 +36,7 @@ import {
 import { taskPrRowKey, type TaskPrDraft } from "./taskPrs";
 import {
   taskChildRepoName,
+  taskOwnsCheckout,
   taskSessionIds,
   type TaskChild,
   type TaskWorkspace,
@@ -136,7 +137,8 @@ export type InboxMyWorkCi = {
 export type InboxMyWorkTask = {
   id: string;
   name: string;
-  /** Sessions the task owns that are still in the caller's live list. */
+  /** Conversations `TaskDetails` would list — recorded sessions that
+   * resolve live plus unlinked sessions rooted at task-owned checkouts. */
   sessions: number;
   /** Most-actionable-first status phrases ("1 needs input", "CI failing"). */
   status: string[];
@@ -909,12 +911,30 @@ export function inboxMyWorkForItems(
         delivery.ciRunning ||= child.ciRunning;
         delivery.ciFailing ||= child.ciFailing;
       }
+      const ownedIds = taskSessionIds(task);
+      const recorded = [...ownedIds].filter((id) =>
+        liveSessionIds.has(id),
+      ).length;
+      // TaskDetails also lists unlinked sessions rooted at task-owned
+      // checkouts — count them so the row's "N conversations" agrees with
+      // what the details sheet shows.
+      const ownedPaths = new Set(
+        task.children
+          .filter((child) => child.workingCopy && taskOwnsCheckout(child))
+          .map((child) => pathKey(child.workingCopy!)),
+      );
+      let extras = 0;
+      for (const session of sessions) {
+        if (ownedIds.has(session.id)) continue;
+        if (!ownedPaths.has(pathKey(sessionWorkCwd(session)))) continue;
+        const owner = taskBySessionId.get(session.id);
+        if (owner && owner.id !== task.id) continue;
+        extras++;
+      }
       taskRows.push({
         id: task.id,
         name: task.name,
-        sessions: [...taskSessionIds(task)].filter((id) =>
-          liveSessionIds.has(id),
-        ).length,
+        sessions: recorded + extras,
         status: taskStatusSegments(task, {
           busySessionIds: input.busySessionIds,
           needsInputIds: input.needsInputSessionIds,

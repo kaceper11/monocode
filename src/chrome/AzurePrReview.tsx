@@ -630,10 +630,13 @@ function AzurePrPanel({
             </span>
             <span
               className="min-w-0 truncate"
-              title={`${association.pr.sourceRefName} → ${association.pr.targetRefName}`}
+              title={`${association.pr.sourceRefName} → ${association.pr.targetRefName} · ${association.pr.lastMergeSourceCommit?.commitId || "unknown revision"}`}
             >
               {association.pr.sourceRefName.replace(/^refs\/heads\//, "")} →{" "}
               {association.pr.targetRefName.replace(/^refs\/heads\//, "")}
+              {association.pr.lastMergeSourceCommit?.commitId
+                ? ` · ${association.pr.lastMergeSourceCommit.commitId.slice(0, 8)}`
+                : ""}
             </span>
             {(() => {
               const summary = voteSummary(association.pr.reviewers);
@@ -643,6 +646,18 @@ function AzurePrPanel({
                 </span>
               ) : null;
             })()}
+            {azureMergeStateLabel(association.pr.mergeStatus) ? (
+              <span
+                className={
+                  reviewToneText[
+                    azureMergeStateTone(association.pr.mergeStatus) ||
+                      "neutral"
+                  ]
+                }
+              >
+                {azureMergeStateLabel(association.pr.mergeStatus)}
+              </span>
+            ) : null}
           </p>
           <div className="flex flex-wrap gap-1">
             <button
@@ -711,28 +726,6 @@ function AzurePrPanel({
                 : "Could not update this saved PR. Retry with Refresh PR."}
             </ReviewStatus>
           ) : null}
-          <ReviewDetails summary="Account and revisions">
-            <p className="break-all">
-              Account: {association.account} ({association.target.accountId})
-              <br />
-              Repository: {association.target.repository}
-              <br />
-              Source / target revision: {association.revision}
-            </p>
-          </ReviewDetails>
-          <ReviewDetails
-            summary={`Reviewers (${association.pr.reviewers.length})`}
-          >
-            <p>
-              {association.pr.reviewers
-                .slice(0, 50)
-                .map(
-                  (reviewer) =>
-                    `${reviewer.displayName}: ${vote(reviewer.vote)}${reviewer.isRequired ? " (required)" : ""}`,
-                )
-                .join("; ") || "None listed"}
-            </p>
-          </ReviewDetails>
           {sameAccount ? (
             <fieldset disabled={!verified || busy} className="min-w-0">
               <AzurePrDetails
@@ -763,10 +756,61 @@ function AzurePrPanel({
               />
             </fieldset>
           ) : null}
+          <ReviewDetails summary="Account and revisions">
+            <p className="break-all">
+              Account: {association.account} ({association.target.accountId})
+              <br />
+              Repository: {association.target.repository}
+              <br />
+              Source / target revision: {association.revision}
+            </p>
+          </ReviewDetails>
+          <ReviewDetails
+            summary={`Reviewers (${association.pr.reviewers.length})`}
+          >
+            <p>
+              {association.pr.reviewers
+                .slice(0, 50)
+                .map(
+                  (reviewer) =>
+                    `${reviewer.displayName}: ${vote(reviewer.vote)}${reviewer.isRequired ? " (required)" : ""}`,
+                )
+                .join("; ") || "None listed"}
+            </p>
+          </ReviewDetails>
         </section>
       ) : null}
     </ReviewShell>
   );
+}
+
+/** Azure `mergeStatus` as a short label — the same slot GitHub gives its
+ * mergeStateStatus. `notSet`/`notApplicable`/`multiple` say nothing useful
+ * next to the state pill, so they render nothing. */
+function azureMergeStateLabel(status: string | undefined): string {
+  const known: Record<string, string> = {
+    succeeded: "Ready to merge",
+    conflicts: "Merge conflicts",
+    rejectedbypolicy: "Merge blocked by policy",
+    queued: "Merge queued",
+    failure: "Merge check failed",
+  };
+  return known[(status ?? "").trim().toLowerCase()] ?? "";
+}
+
+function azureMergeStateTone(status: string | undefined): ReviewTone | "" {
+  switch ((status ?? "").trim().toLowerCase()) {
+    case "succeeded":
+      return "passing";
+    case "conflicts":
+    case "rejectedbypolicy":
+    case "failure":
+      return "failing";
+    case "queued":
+      return "running";
+    default:
+      return "";
+  }
 }
 
 function vote(value: number) {
@@ -983,7 +1027,8 @@ function AzurePrDetails({
             onClick={() => void repairComments()}
           >
             <Bot className="size-3.5" strokeWidth={1.75} />
-            Address comments
+            Address {unresolvedCount} unresolved thread
+            {unresolvedCount === 1 ? "" : "s"}
             {sendableComments > 20 ? " · first 20 comments" : ""}
           </button>
         </div>
@@ -1001,12 +1046,7 @@ function AzurePrDetails({
           Cancel preparation
         </button>
       ) : null}
-      <ReviewDetails lazy summary="Files, policies and statuses">
-        <AzureReviewSection
-          association={association}
-          section="iterations"
-          onHandoff={onHandoff}
-        />
+      <ReviewDetails bordered lazy summary="Statuses and policies">
         <AzureReviewSection
           association={association}
           section="policies"
@@ -1018,6 +1058,13 @@ function AzurePrDetails({
           onHandoff={onHandoff}
         />
       </ReviewDetails>
+      <section aria-label="Pull request diff">
+        <AzureReviewSection
+          association={association}
+          section="iterations"
+          onHandoff={onHandoff}
+        />
+      </section>
       <section aria-label="Review threads" className="space-y-1.5">
         <h4 className="text-[11px] font-medium uppercase tracking-wider text-content/45">
           Review threads{threads ? ` (${liveThreads.length})` : ""}
@@ -1041,17 +1088,21 @@ function AzurePrDetails({
           const firstComment = thread.comments.find(
             (comment) => !comment.isDeleted,
           );
-          const location = thread.threadContext?.filePath
-            ? `${thread.threadContext.filePath.split("/").pop()}${
-                thread.threadContext.rightFileStart?.line != null
-                  ? `:${thread.threadContext.rightFileStart.line}`
-                  : ""
-              }`
-            : null;
+          const path = thread.threadContext?.filePath;
+          const line = thread.threadContext?.rightFileStart?.line;
+          const excerpt = (firstComment?.content?.split("\n")[0] ?? "").slice(
+            0,
+            100,
+          );
+          const resolved = !unresolvedThread(thread);
+          const total = thread.comments.filter(
+            (comment) => !comment.isDeleted,
+          ).length;
           return (
             <ReviewDetails
               key={thread.id}
               bordered
+              lazy
               open={expanded === thread.id}
               onToggle={(event) => {
                 if (event.currentTarget.open) rememberThread(thread.id);
@@ -1061,31 +1112,29 @@ function AzurePrDetails({
                 <>
                   <span
                     className={`size-1.5 shrink-0 rounded-full ${
-                      unresolvedThread(thread)
-                        ? "bg-amber-400/80"
-                        : "bg-emerald-400/70"
+                      resolved ? "bg-emerald-400/70" : "bg-amber-400/80"
                     }`}
+                    title={resolved ? "Resolved" : "Unresolved"}
                   />
-                  <span className="min-w-0 truncate">
-                    Thread {thread.id} ·{" "}
+                  <span className="min-w-0 flex-1 truncate">
+                    <span className="text-content/80">
+                      {firstComment?.author?.displayName ?? "Unknown author"}
+                    </span>
+                    {excerpt ? (
+                      <span className="text-content/50"> — {excerpt}</span>
+                    ) : null}
+                  </span>
+                  <span className="shrink-0 text-content/40">
+                    {path || "General"}
+                    {line != null ? `:${line}` : ""} ·{" "}
                     <span
                       className={
-                        unresolvedThread(thread)
-                          ? "text-amber-400/90"
-                          : "text-emerald-400/80"
+                        resolved ? "text-emerald-400/80" : "text-amber-400/90"
                       }
                     >
-                      {threadStatusLabel(thread.status)}
-                    </span>
-                    {firstComment?.author?.displayName
-                      ? ` — ${firstComment.author.displayName}`
-                      : ""}
-                  </span>
-                  <span className="shrink-0 text-content/45">
-                    {location ?? "General discussion"} ·{" "}
-                    {thread.comments.filter((comment) => !comment.isDeleted)
-                      .length || "No"}{" "}
-                    comments
+                      {resolved ? "Resolved" : "Unresolved"}
+                    </span>{" "}
+                    · {total} comment{total === 1 ? "" : "s"}
                   </span>
                 </>
               }
@@ -1094,7 +1143,10 @@ function AzurePrDetails({
                 <div className="space-y-2">
                   <p className="text-content/45">
                     {threadStatusLabel(thread.status)}
-                    {location ? ` · ${location}` : ""} · Iteration{" "}
+                    {path
+                      ? ` · ${path}${line != null ? `:${line}` : ""}`
+                      : ""}{" "}
+                    · Iteration{" "}
                     {thread.pullRequestThreadContext?.iterationContext
                       ?.secondComparingIteration ?? "—"}
                   </p>

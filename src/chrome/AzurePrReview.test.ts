@@ -227,7 +227,7 @@ async function link() {
 async function expandThread() {
   await act(async () => {
     const details = [...document.querySelectorAll("details")].find((details) =>
-      details.querySelector("summary")?.textContent?.startsWith("Thread "),
+      details.querySelector("summary")?.textContent?.includes("Unresolved"),
     )!;
     details.open = true;
     details.dispatchEvent(new Event("toggle"));
@@ -252,7 +252,7 @@ it("finds and links a PR, isolates denied policies, pages threads, and hands off
     ).toBe(true);
     await act(async () => {
       const details = [...document.querySelectorAll("details")].find((el) =>
-        el.querySelector("summary")?.textContent?.includes("Files, policies"),
+        el.querySelector("summary")?.textContent?.includes("Statuses and policies"),
       )!;
       details.open = true;
       details.dispatchEvent(new Event("toggle"));
@@ -263,15 +263,11 @@ it("finds and links a PR, isolates denied policies, pages threads, and hands off
       ),
     );
     await click("Refresh PR");
-    expect(document.body.textContent).not.toContain(
-      "Only this selected review thread",
-    );
+    expect(document.body.textContent).not.toContain("Send thread to agent");
     await expandThread();
-    expect(document.body.textContent).toContain(
-      "Only this selected review thread",
-    );
+    expect(document.body.textContent).toContain("Send thread to agent");
     await click("Next threads");
-    expect(document.body.textContent).toContain("Thread 43");
+    expect(button("Previous threads")).toBeTruthy();
     await expandThread();
     await act(async () => {
       const send = button("Send thread to agent");
@@ -424,7 +420,9 @@ it("automatically opens a unique branch match but lets the user choose among mul
     "#13 Fix scoped review",
   );
   await act(async () =>
-    vi.waitFor(() => expect(document.body.textContent).toContain("Thread")),
+    vi.waitFor(() =>
+      expect(document.body.textContent).toContain("Unresolved"),
+    ),
   );
   await cleanup();
   localStorage.setItem("monocode.azurePrAssociations.v1", "[]");
@@ -435,7 +433,7 @@ it("automatically opens a unique branch match but lets the user choose among mul
     expect(document.body.textContent).toContain(
       "Branch feature · remote origin",
     );
-    expect(document.body.textContent).not.toContain("Address comments");
+    expect(document.body.textContent).not.toContain("unresolved thread");
     await act(async () =>
       [...document.querySelectorAll("button")]
         .find((button) =>
@@ -501,11 +499,11 @@ it("labels the page limit and allows repairing a thread beyond the first twenty"
     await link();
     await click("Refresh PR");
     expect(document.body.textContent).toContain(
-      "Address comments · first 20 comments",
+      "Address 21 unresolved threads · first 20 comments",
     );
     await act(async () => {
       const details = [...document.querySelectorAll("details")].find((el) =>
-        el.querySelector("summary")?.textContent?.startsWith("Thread 21 "),
+        el.querySelector("summary")?.textContent?.includes("Comment 21"),
       )!;
       details.open = true;
       details.dispatchEvent(new Event("toggle"));
@@ -546,7 +544,7 @@ it("retains the expanded thread and scroll while pausing hidden review effects",
     await expandThread();
     const panel = document.querySelector('[aria-label="Azure pull requests"]')!;
     const thread = [...document.querySelectorAll("details")].find((el) =>
-      el.querySelector("summary")?.textContent?.startsWith("Thread "),
+      el.querySelector("summary")?.textContent?.includes("Unresolved"),
     )!;
     panel.scrollTop = 120;
     await click("Files");
@@ -592,10 +590,14 @@ it("ignores a pending thread response after hiding and reopening the review", as
     await click("Files");
     await click("Pull requests");
     await click("Refresh PR");
-    expect(document.body.textContent).toContain("Thread");
+    expect(document.body.textContent).toContain(
+      "Only this selected review thread",
+    );
     await act(async () => release());
     expect(document.body.textContent).not.toContain("No review threads.");
-    expect(document.body.textContent).toContain("Thread");
+    expect(document.body.textContent).toContain(
+      "Only this selected review thread",
+    );
   } finally {
     release?.();
     await cleanup();

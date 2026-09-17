@@ -324,6 +324,57 @@ describe("inboxMyWorkForItems", () => {
     expect(work.prs[0].coveredByTask).toBe(true);
   });
 
+  it("counts unlinked sessions at task-owned checkouts like TaskDetails", () => {
+    const bound = task({
+      ticket: {
+        kind: "issue",
+        repo: "acme/app",
+        number: 1,
+        url: "https://github.com/acme/app/issues/1",
+      },
+      sessionIds: ["s-task"],
+      children: [
+        child({ workingCopy: "/wt", branch: "feat", baseRef: "main" }),
+      ],
+    });
+    const work = inboxMyWorkForItems([githubTicket], {
+      sessions: [
+        session({ id: "s-task", cwd: "/wt" }),
+        // Rooted at the owned worktree but never recorded on the task —
+        // TaskDetails sweeps it into its conversation list, so the row
+        // count must include it too.
+        session({ id: "s-extra", cwd: "/wt" }),
+        session({ id: "s-elsewhere", cwd: "/other" }),
+      ],
+      tasks: [bound],
+    }).get(githubTicket)!;
+    expect(work.tasks[0].sessions).toBe(2);
+  });
+
+  it("does not count an unlinked session another task owns", () => {
+    const bound = task({
+      ticket: {
+        kind: "issue",
+        repo: "acme/app",
+        number: 1,
+        url: "https://github.com/acme/app/issues/1",
+      },
+      sessionIds: ["s-task"],
+      children: [
+        child({ workingCopy: "/wt", branch: "feat", baseRef: "main" }),
+      ],
+    });
+    const other = task({ id: "t2", sessionIds: ["s-extra"] });
+    const work = inboxMyWorkForItems([githubTicket], {
+      sessions: [
+        session({ id: "s-task", cwd: "/wt" }),
+        session({ id: "s-extra", cwd: "/wt" }),
+      ],
+      tasks: [bound, other],
+    }).get(githubTicket)!;
+    expect(work.tasks[0].sessions).toBe(1);
+  });
+
   it("attaches a task through a related session it owns", () => {
     const linked = session({ id: "s-task", cwd: "/wt", linkedWorkItem: githubLink });
     const owned = task({ sessionIds: ["s-task"], children: [] });
