@@ -22,7 +22,7 @@ vi.mock("./GitHistoryGraph", () => ({
   saveGraphPanelHeight: () => {},
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({
+vi.mock("../lib/dialogs", () => ({
   ask: vi.fn(async () => true),
   message: vi.fn(async () => undefined),
 }));

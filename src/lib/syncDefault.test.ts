@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { beforeEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { ask, message } from "@tauri-apps/plugin-dialog";
+import { ask, message } from "./dialogs";
 import {
   abortMerge,
   acquireSyncSlot,
@@ -17,7 +17,7 @@ import { requestAgentContext } from "./agentContext";
 import { subscribeGitChanged, type GitDiffIndex } from "./fs";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({
+vi.mock("./dialogs", () => ({
   ask: vi.fn(async () => true),
   message: vi.fn(async () => undefined),
 }));

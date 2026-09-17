@@ -1,8 +1,9 @@
 import {
-  ContextCheckbox,
   ContextSelectionSections,
   useInboxContext,
 } from "./InboxContextPicker";
+import { Checkbox } from "./controls";
+import { Select } from "./Select";
 import type { SessionSummary } from "../lib/sessionStore";
 import {
   useEffect,
@@ -389,7 +390,7 @@ export function AgentContextPicker({
               Context per ticket
             </p>
             <label className="flex cursor-pointer items-center gap-2.5">
-              <ContextCheckbox
+              <Checkbox
                 className=""
                 label="Include descriptions"
                 checked={batch.description}
@@ -399,28 +400,26 @@ export function AgentContextPicker({
               />
               <span>Description</span>
             </label>
-            <label className="flex items-center gap-2.5">
+            <div className="flex items-center gap-2.5">
               <span className="text-content/60">Recent comments each</span>
-              <select
-                aria-label="Recent comments per ticket"
-                value={batch.comments}
-                onChange={(event) =>
+              <Select
+                label="Recent comments each"
+                value={String(batch.comments)}
+                options={[0, 1, 3, 5, 10].map((count) => ({
+                  value: String(count),
+                  label: count === 0 ? "None" : String(count),
+                }))}
+                disabled={pending}
+                onChange={(value) =>
                   setBatch({
                     ...batch,
-                    comments: Number(event.target.value),
+                    comments: Number(value),
                   })
                 }
-                className="rounded-md border border-content/10 bg-transparent px-1.5 py-0.5 outline-accent"
-              >
-                {[0, 1, 3, 5, 10].map((count) => (
-                  <option key={count} value={count}>
-                    {count === 0 ? "None" : count}
-                  </option>
-                ))}
-              </select>
-            </label>
+              />
+            </div>
             <label className="flex cursor-pointer items-center gap-2.5">
-              <ContextCheckbox
+              <Checkbox
                 className=""
                 label="Include files"
                 checked={batch.files}
@@ -440,8 +439,8 @@ export function AgentContextPicker({
           <div className="max-h-52 overflow-auto rounded-md border border-content/10">{request.context.entries.map(entry => {
             const comment = request.repair?.kind === "comments" ? request.repair.threads.find(thread => thread.entry === entry.id)?.comment : request.repair?.kind === "github-comments" || request.repair?.kind === "gitlab-comments" ? request.repair.comments.find(row => row.entry === entry.id) : undefined;
             return <div key={entry.id} className="flex items-start gap-2 border-b border-content/5 p-2.5 last:border-0">
-              <ContextCheckbox label={entry.title} disabled={pending} checked={selected.includes(entry.id)} onChange={() => setSelected(ids => ids.includes(entry.id) ? ids.filter(id => id !== entry.id) : [...ids, entry.id])} />
-              <div className="min-w-0 flex-1"><label className="block text-content/70">{comment ? `${comment.author} · comment ${comment.id}` : entry.title}</label>
+              <Checkbox label={entry.title} disabled={pending} checked={selected.includes(entry.id)} onChange={() => setSelected(ids => ids.includes(entry.id) ? ids.filter(id => id !== entry.id) : [...ids, entry.id])} />
+              <div className="min-w-0 flex-1"><span className="block text-content/70">{comment ? `${comment.author} · comment ${comment.id}` : entry.title}</span>
                 {comment?.file ? <p className="truncate text-[11px] text-content/40" title={comment.file}>{comment.file}{comment.line ? `:${comment.line}` : ""}</p> : null}
                 <p className="mt-1 whitespace-pre-wrap break-words text-content/85 line-clamp-3">{comment?.text ?? entry.text.slice(0, 500)}</p>
                 <details className="mt-1 text-[11px] text-content/45"><summary className="cursor-pointer">Context</summary><pre className="mt-1 whitespace-pre-wrap break-words font-sans">{entry.text}</pre></details>

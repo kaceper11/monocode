@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ContextCheckbox } from "./InboxContextPicker";
+import { Checkbox } from "./controls";
 import { InboxProviderMark } from "./InboxProviderMark";
 import { ChevronRight, LoaderCircle } from "./icons";
 import { inboxItemStatus, type InboxItem } from "../lib/githubTasks";
@@ -146,7 +146,7 @@ export function InboxRelated({ item }: { item: InboxItem }) {
                     className="flex min-w-0 items-center gap-2 rounded-md px-1 py-1"
                   >
                     {selectable(edge) ? (
-                      <ContextCheckbox
+                      <Checkbox
                         className=""
                         label={`Include ${edge.ref}`}
                         disabled={

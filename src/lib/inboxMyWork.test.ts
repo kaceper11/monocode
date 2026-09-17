@@ -287,6 +287,57 @@ describe("inboxMyWorkForItems", () => {
     expect(work.prs[0].ci).toMatchObject({ failing: true, count: 1 });
   });
 
+  it("lists the ticket-bound task as a task row with its delivery rollup", () => {
+    const bound = task({
+      ticket: {
+        kind: "issue",
+        repo: "acme/app",
+        number: 1,
+        url: "https://github.com/acme/app/issues/1",
+      },
+      sessionIds: ["s-task"],
+      children: [child({ workingCopy: "/wt", branch: "feat" })],
+    });
+    const work = inboxMyWorkForItems([githubTicket], {
+      sessions: [
+        session({ id: "s-task", cwd: "/wt", linkedWorkItem: githubLink }),
+      ],
+      tasks: [bound],
+      stores: { prs: [azureAssoc({})], ci: [ciSource({})] },
+      branchForCwd: () => "feat",
+    }).get(githubTicket)!;
+    expect(work.tasks).toHaveLength(1);
+    expect(work.tasks[0]).toMatchObject({
+      id: "t1",
+      name: "Deliver the thing",
+      sessions: 1,
+    });
+    expect(work.tasks[0].delivery).toMatchObject({
+      prs: 1,
+      ci: 1,
+      ciFailing: true,
+    });
+    expect(work.sessions[0]).toMatchObject({
+      taskId: "t1",
+      coveredByTask: true,
+    });
+    expect(work.prs[0].coveredByTask).toBe(true);
+  });
+
+  it("attaches a task through a related session it owns", () => {
+    const linked = session({ id: "s-task", cwd: "/wt", linkedWorkItem: githubLink });
+    const owned = task({ sessionIds: ["s-task"], children: [] });
+    const work = inboxMyWorkForItems([githubTicket], {
+      sessions: [linked],
+      tasks: [owned],
+    }).get(githubTicket)!;
+    expect(work.tasks.map((row) => row.id)).toEqual(["t1"]);
+    // No children cover the session's checkout — the conversation keeps its
+    // own row and delivery path instead of folding into the task.
+    expect(work.sessions[0]).toMatchObject({ taskId: "t1" });
+    expect(work.sessions[0].coveredByTask).toBeUndefined();
+  });
+
   it("joins task delivery through a session's owning task even without a task ticket", () => {
     const linked = session({ id: "s-task", cwd: "/wt", linkedWorkItem: githubLink });
     const owned = task({
@@ -301,7 +352,68 @@ describe("inboxMyWorkForItems", () => {
     }).get(githubTicket)!;
     expect(work.prs).toHaveLength(1);
     expect(work.prs[0].provider).toBe("azure");
-    expect(work.sessions[0].taskName).toBe("Deliver the thing");
+    expect(work.sessions[0]).toMatchObject({
+      taskId: "t1",
+      coveredByTask: true,
+    });
+  });
+
+  it("keeps a task-owned session at an uncovered checkout visible", () => {
+    // The task's children cover "/wt" but the session works from "/main" —
+    // its saved links join under the session scope so it must not fold away.
+    const linked = session({
+      id: "s-task",
+      cwd: "/main",
+      branch: "feat",
+      linkedWorkItem: githubLink,
+    });
+    const owned = task({
+      sessionIds: ["s-task"],
+      children: [child({ workingCopy: "/wt", branch: "feat" })],
+    });
+    const work = inboxMyWorkForItems([githubTicket], {
+      sessions: [linked],
+      tasks: [owned],
+      stores: {
+        prs: [azureAssoc({ cwd: "/main", sourceSessionId: "s-task" })],
+        ci: [],
+      },
+      branchForCwd: () => "feat",
+    }).get(githubTicket)!;
+    expect(work.sessions[0]).toMatchObject({ taskId: "t1" });
+    expect(work.sessions[0].coveredByTask).toBeUndefined();
+    expect(work.prs).toHaveLength(1);
+    expect(work.prs[0].coveredByTask).toBeUndefined();
+    expect(work.prs[0].sessionId).toBe("s-task");
+  });
+
+  it("folded task sessions don't spend conversation row slots", () => {
+    const ownedSessions = Array.from({ length: 13 }, (_, i) =>
+      session({
+        id: `s-owned-${i}`,
+        cwd: "/wt",
+        linkedWorkItem: githubLink,
+      }),
+    );
+    const loose = session({
+      id: "s-loose",
+      cwd: "/main",
+      linkedWorkItem: githubLink,
+    });
+    const owned = task({
+      sessionIds: ownedSessions.map((entry) => entry.id),
+      children: [child({ workingCopy: "/wt" })],
+    });
+    const work = inboxMyWorkForItems([githubTicket], {
+      sessions: [...ownedSessions, loose],
+      tasks: [owned],
+    }).get(githubTicket)!;
+    // Thirteen folded rows plus the one rendered loose conversation — the
+    // loose row survives because covered sessions don't consume the cap.
+    expect(work.sessions).toHaveLength(14);
+    expect(
+      work.sessions.find((entry) => entry.sessionId === "s-loose"),
+    ).toBeTruthy();
   });
 
   it("keeps identical PR numbers in different repositories distinct", () => {

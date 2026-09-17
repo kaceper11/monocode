@@ -11,6 +11,8 @@ import {
   reviewButton,
   reviewField,
   reviewDanger,
+  reviewToneText,
+  type ReviewTone,
 } from "./ReviewChrome";
 import { Bot, ExternalLink, Loader, RefreshCw } from "./icons";
 import { AzureConnectionDetails } from "./AzureConnectionDetails";
@@ -356,11 +358,6 @@ function AzurePrPanel({
           ) : null}
         </p>
       ) : null}
-      {!embedded && !choosing && association ? (
-        <button className={button} onClick={() => setChoosing(true)}>
-          Choose another PR
-        </button>
-      ) : null}
       {choosing ? (
         <section className="space-y-2" aria-label="Related Azure PRs">
           <div className="flex items-center justify-between gap-2">
@@ -596,9 +593,9 @@ function AzurePrPanel({
         </div>
       ) : null}
       {association && !choosing ? (
-        <section className="space-y-2 border-t border-content/10 pt-3">
+        <section className="space-y-2">
           {!embedded ? (
-            <h3 className="font-medium">
+            <h3 className="text-[14px] font-medium leading-snug">
               #{association.pr.pullRequestId} {association.pr.title}
             </h3>
           ) : null}
@@ -638,16 +635,15 @@ function AzurePrPanel({
               {association.pr.sourceRefName.replace(/^refs\/heads\//, "")} →{" "}
               {association.pr.targetRefName.replace(/^refs\/heads\//, "")}
             </span>
+            {(() => {
+              const summary = voteSummary(association.pr.reviewers);
+              return summary ? (
+                <span className={reviewToneText[summary.tone]}>
+                  {summary.label}
+                </span>
+              ) : null;
+            })()}
           </p>
-          <ReviewDetails summary="Account and revisions">
-            <p className="break-all">
-              Account: {association.account} ({association.target.accountId})
-              <br />
-              Repository: {association.target.repository}
-              <br />
-              Source / target revision: {association.revision}
-            </p>
-          </ReviewDetails>
           <div className="flex flex-wrap gap-1">
             <button
               className={button}
@@ -674,6 +670,34 @@ function AzurePrPanel({
                 Open in Azure
               </button>
             ) : null}
+            {!embedded ? (
+              <button className={button} onClick={() => setChoosing(true)}>
+                Choose another PR
+              </button>
+            ) : null}
+            {association.pr.status === "active" && sameAccount ? (
+              <button
+                className={button}
+                onClick={() =>
+                  openWatchSheet({
+                    source: {
+                      kind: "azure-pr",
+                      target: association.target,
+                      projectName: association.projectName,
+                      repositoryName: association.repositoryName,
+                      cwd: association.cwd,
+                      branch: association.branch,
+                      ...(association.sourceSessionId
+                        ? { sessionId: association.sourceSessionId }
+                        : {}),
+                    },
+                    name: `Reviews · ${association.repositoryName} !${association.target.number}`,
+                  })
+                }
+              >
+                Watch reviews
+              </button>
+            ) : null}
           </div>
           {!sameAccount ? (
             <ReviewError>
@@ -687,6 +711,15 @@ function AzurePrPanel({
                 : "Could not update this saved PR. Retry with Refresh PR."}
             </ReviewStatus>
           ) : null}
+          <ReviewDetails summary="Account and revisions">
+            <p className="break-all">
+              Account: {association.account} ({association.target.accountId})
+              <br />
+              Repository: {association.target.repository}
+              <br />
+              Source / target revision: {association.revision}
+            </p>
+          </ReviewDetails>
           <ReviewDetails
             summary={`Reviewers (${association.pr.reviewers.length})`}
           >
@@ -748,6 +781,27 @@ function vote(value: number) {
       } as Record<number, string>
     )[value] ?? `unknown vote (${value})`
   );
+}
+
+/** Worst-vote rollup for the meta line — the same slot where GitHub shows
+ * its reviewDecision. The full per-reviewer list stays in the disclosure. */
+export function voteSummary(
+  reviewers: AzurePr["reviewers"],
+): { label: string; tone: ReviewTone } | null {
+  if (!reviewers.length) return null;
+  const worst = Math.min(...reviewers.map((reviewer) => reviewer.vote));
+  if (worst <= -10) return { label: "Rejected", tone: "failing" };
+  if (worst <= -5) return { label: "Waiting for author", tone: "running" };
+  const approvals = reviewers.filter((reviewer) => reviewer.vote > 0).length;
+  if (approvals)
+    return {
+      label: `${approvals} approval${approvals === 1 ? "" : "s"}`,
+      tone: "passing",
+    };
+  return {
+    label: `${reviewers.length} reviewer${reviewers.length === 1 ? "" : "s"}`,
+    tone: "neutral",
+  };
 }
 
 const threadStatusLabel = (status: string) =>
@@ -912,79 +966,78 @@ function AzurePrDetails({
         count + thread.comments.filter((comment) => !comment.isDeleted).length,
       0,
     );
+  const liveThreads = (threads?.items ?? []).filter(
+    (thread) => !thread.isDeleted,
+  );
   return (
-    <div className="space-y-2">
+    <div className="space-y-3">
       <RepairStatus
         scope={azurePrKey(association.target)}
         cwd={association.cwd}
       />
       {association.pr.status === "active" && unresolvedCount > 0 ? (
-        <button
-          className={reviewAction}
-          disabled={busy}
-          onClick={() => void repairComments()}
-        >
-          <Bot className="size-3.5" strokeWidth={1.75} />
-          Address comments
-          {sendableComments > 20 ? " · first 20 comments" : ""}
-        </button>
+        <div className="flex flex-wrap gap-1.5">
+          <button
+            className={reviewAction}
+            disabled={busy}
+            onClick={() => void repairComments()}
+          >
+            <Bot className="size-3.5" strokeWidth={1.75} />
+            Address comments
+            {sendableComments > 20 ? " · first 20 comments" : ""}
+          </button>
+        </div>
       ) : null}
       {busy && (preparation.current || !threads) ? (
         <ReviewStatus>
           {preparation.current ? "Preparing checkout…" : "Loading comments…"}
         </ReviewStatus>
       ) : null}
-      <div className="flex flex-wrap gap-1">
-        {association.pr.status === "active" ? (
-          <button
-            className={button}
-            onClick={() =>
-              openWatchSheet({
-                source: {
-                  kind: "azure-pr",
-                  target: association.target,
-                  projectName: association.projectName,
-                  repositoryName: association.repositoryName,
-                  cwd: association.cwd,
-                  branch: association.branch,
-                  ...(association.sourceSessionId
-                    ? { sessionId: association.sourceSessionId }
-                    : {}),
-                },
-                name: `Reviews · ${association.repositoryName} !${association.target.number}`,
-              })
-            }
-          >
-            Watch reviews
-          </button>
-        ) : null}
-        {busy && preparation.current ? (
-          <button
-            className={button}
-            onClick={() => preparation.current?.abort()}
-          >
-            Cancel preparation
-          </button>
-        ) : null}
-      </div>
-      {error ? (
-        <div className="flex flex-wrap items-center gap-2">
-          <ReviewError>{error}</ReviewError>
-          <button
-            className={button}
-            disabled={busy}
-            onClick={() => void load()}
-          >
-            Retry
-          </button>
-        </div>
+      {busy && preparation.current ? (
+        <button
+          className={button}
+          onClick={() => preparation.current?.abort()}
+        >
+          Cancel preparation
+        </button>
       ) : null}
-      {threads?.items.length === 0 ? (
-        <p className="text-content/45">No review threads.</p>
-      ) : null}
-      {threads?.items
-        .filter((thread) => !thread.isDeleted)
-        .map((thread) => {
+      <ReviewDetails lazy summary="Files, policies and statuses">
+        <AzureReviewSection
+          association={association}
+          section="iterations"
+          onHandoff={onHandoff}
+        />
+        <AzureReviewSection
+          association={association}
+          section="policies"
+          onHandoff={onHandoff}
+        />
+        <AzureReviewSection
+          association={association}
+          section="statuses"
+          onHandoff={onHandoff}
+        />
+      </ReviewDetails>
+      <section aria-label="Review threads" className="space-y-1.5">
+        <h4 className="text-[11px] font-medium uppercase tracking-wider text-content/45">
+          Review threads{threads ? ` (${liveThreads.length})` : ""}
+        </h4>
+        {error ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <ReviewError>{error}</ReviewError>
+            <button
+              className={button}
+              disabled={busy}
+              onClick={() => void load()}
+            >
+              Retry
+            </button>
+          </div>
+        ) : null}
+        {threads && liveThreads.length === 0 && !error ? (
+          <p className="text-content/50">No review threads.</p>
+        ) : null}
+        {liveThreads.map((thread) => {
           const firstComment = thread.comments.find(
             (comment) => !comment.isDeleted,
           );
@@ -1089,45 +1142,29 @@ function AzurePrDetails({
             </ReviewDetails>
           );
         })}
-      {threads && (pageRef.current > 0 || threads.nextSkip != null) ? (
-        <div className="flex flex-wrap gap-1">
-          {pageRef.current > 0 ? (
-            <button
-              className={button}
-              disabled={busy}
-              onClick={() => void load(Math.max(0, pageRef.current - 50))}
-            >
-              Previous threads
-            </button>
-          ) : null}
-          {threads.nextSkip != null ? (
-            <button
-              className={button}
-              disabled={busy}
-              onClick={() => void load(threads.nextSkip!)}
-            >
-              Next threads
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-      <ReviewDetails lazy summary="Files, policies and statuses">
-        <AzureReviewSection
-          association={association}
-          section="iterations"
-          onHandoff={onHandoff}
-        />
-        <AzureReviewSection
-          association={association}
-          section="policies"
-          onHandoff={onHandoff}
-        />
-        <AzureReviewSection
-          association={association}
-          section="statuses"
-          onHandoff={onHandoff}
-        />
-      </ReviewDetails>
+        {threads && (pageRef.current > 0 || threads.nextSkip != null) ? (
+          <div className="flex flex-wrap gap-1">
+            {pageRef.current > 0 ? (
+              <button
+                className={button}
+                disabled={busy}
+                onClick={() => void load(Math.max(0, pageRef.current - 50))}
+              >
+                Previous threads
+              </button>
+            ) : null}
+            {threads.nextSkip != null ? (
+              <button
+                className={button}
+                disabled={busy}
+                onClick={() => void load(threads.nextSkip!)}
+              >
+                Next threads
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
     </div>
   );
 }

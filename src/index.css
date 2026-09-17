@@ -1388,8 +1388,7 @@ button:not(:disabled):not([aria-disabled="true"]),
 a[href],
 summary,
 [role="button"]:not([aria-disabled="true"]),
-[role="menuitem"]:not([aria-disabled="true"]),
-input:is([type="checkbox"], [type="radio"]):not(:disabled) {
+[role="menuitem"]:not([aria-disabled="true"]) {
   cursor: pointer;
 }
 

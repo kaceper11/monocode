@@ -178,27 +178,8 @@ function deliveryLinksFor(
 }
 
 /**
- * Delivery links saved against one child checkout — the active/open subset
- * {@link childDelivery} counts by.
- */
-export function childDeliveryRows(
-  task: TaskWorkspace,
-  child: TaskChild,
-  branches: readonly (string | null | undefined)[],
-  stores: DeliveryStores = deliveryStores(),
-): { prs: AzurePrAssociation[]; ci: CiSource[] } {
-  const links = childDeliveryLinks(task, child, branches, null, stores);
-  return {
-    prs: links.prs.filter(
-      (row) => row.pr.status.toLowerCase() === "active",
-    ),
-    ci: links.ci,
-  };
-}
-
-/**
  * Delivery links saved against one child checkout — counts and attention
- * flags over {@link childDeliveryRows} plus the caller's cached GitHub PR.
+ * flags over {@link childDeliveryLinks} plus the caller's cached GitHub PR.
  */
 export function childDelivery(
   task: TaskWorkspace,

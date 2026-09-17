@@ -47,7 +47,7 @@ import {
   saveTabGroupLabel,
 } from "../lib/tabGroups";
 import type { RepositoryFamily } from "../lib/repositoryFamilies";
-import { ContextCheckbox } from "./InboxContextPicker";
+import { Checkbox } from "./controls";
 import { Modal } from "./Modal";
 import { WslProjectDialog } from "./WslProjectDialog";
 import {
@@ -627,7 +627,7 @@ export function ProjectRepositories({
                     key={repo.id || key}
                     className="flex items-center gap-2 rounded-lg px-1.5 py-1.5 hover:bg-content/5"
                   >
-                    <ContextCheckbox
+                    <Checkbox
                       label={`Select ${name}`}
                       checked={selection.has(key)}
                       onChange={() =>

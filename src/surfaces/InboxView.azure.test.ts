@@ -171,7 +171,7 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
     );
     await click(
       container.querySelector(
-        '[aria-label^="Custom review issue Bug 141: Ticket 141"]',
+        '[aria-label^="Custom review work item Bug 141: Ticket 141"]',
       )!,
     );
     expect(container.querySelector('[aria-label="Conversation"]')).toBeNull();
@@ -182,7 +182,7 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
     ).toHaveLength(1);
     await click(
       container.querySelector(
-        '[aria-label^="Custom review issue Bug 141: Ticket 141"]',
+        '[aria-label^="Custom review work item Bug 141: Ticket 141"]',
       )!,
     );
     expect(container.querySelector('[aria-label="Conversation"]')).toBeNull();
@@ -436,7 +436,7 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
     expect(isCurrent?.()).toBe(true);
     await click(
       container.querySelector(
-        '[aria-label="Custom review issue Bug 142: Ticket 142"]',
+        '[aria-label="Custom review work item Bug 142: Ticket 142"]',
       )!,
     );
     expect(isCurrent?.()).toBe(false);
@@ -444,7 +444,7 @@ it("keeps Azure identity and selected context through Ask, Send and retry", asyn
     expect(container.querySelector("h1")?.textContent).toBe("Ticket 142");
     await click(
       container.querySelector(
-        '[aria-label^="Custom review issue Bug 141: Ticket 141"]',
+        '[aria-label^="Custom review work item Bug 141: Ticket 141"]',
       )!,
     );
 
@@ -676,13 +676,33 @@ it("hosts a delivery tab on the conversation being viewed, not the first related
           },
           cwd: "/work/repo",
           revision: 0,
-          relatedSessions: [session("session-a"), session("session-b")],
           viewingSessionId: "session-b",
+          myWork: {
+            tasks: [],
+            sessions: [session("session-a"), session("session-b")].map(
+              (row) => ({
+                sessionId: row.id,
+                title: row.title,
+                harness: row.harness,
+                cwd: row.cwd,
+                branch: row.branch,
+                state: "idle" as const,
+              }),
+            ),
+            prs: [],
+            ci: [],
+            attention: [],
+            hasWork: true,
+          },
           onOpenDelivery,
         }),
       ),
     );
-    const badge = container.querySelector(
+    const hostRow = [
+      ...container.querySelectorAll("button"),
+    ].find((el) => el.title === "Open conversation: session-b")
+      ?.parentElement;
+    const badge = hostRow?.querySelector(
       '[aria-label^="1 pull request on"]',
     ) as HTMLElement | null;
     expect(badge).not.toBeNull();

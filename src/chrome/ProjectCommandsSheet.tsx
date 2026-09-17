@@ -31,7 +31,8 @@ import {
   subscribeReusableCommands,
   type ReusableCommand,
 } from "../lib/projectCommands";
-import { ContextCheckbox } from "./InboxContextPicker";
+import { Checkbox } from "./controls";
+import { ask } from "../lib/dialogs";
 import { Modal } from "./Modal";
 import { Select } from "./Select";
 import { gitDiffIndex } from "../lib/fs";
@@ -268,10 +269,19 @@ export function ProjectCommandsSheet({
               },
             }),
           () => {
-            if (!window.confirm(`Delete command “${command.name}”?`)) return;
-            if (scope === "project")
-              deleteProjectCommand(project.id, command.id);
-            else deleteReusableCommand(command.id);
+            void (async () => {
+              if (
+                !(await ask(`Delete command “${command.name}”?`, {
+                  title: "MonoCode",
+                  kind: "warning",
+                  okLabel: "Delete",
+                }))
+              )
+                return;
+              if (scope === "project")
+                deleteProjectCommand(project.id, command.id);
+              else deleteReusableCommand(command.id);
+            })();
           },
           command.name,
         )}
@@ -328,7 +338,7 @@ export function ProjectCommandsSheet({
               <>
                 <div>
                   <label className="flex items-center gap-2 text-[13px] text-content">
-                    <ContextCheckbox
+                    <Checkbox
                       label="Run as sequential steps"
                       className="mt-0"
                       checked={!!editingCommand.draft.steps}
@@ -555,7 +565,7 @@ export function ProjectCommandsSheet({
                       key={command.id}
                       className="flex items-center gap-2 text-[13px] text-content"
                     >
-                      <ContextCheckbox
+                      <Checkbox
                         label={command.name}
                         className="mt-0"
                         checked={
@@ -839,8 +849,16 @@ export function ProjectCommandsSheet({
                             },
                           }),
                         () => {
-                          if (window.confirm(`Delete group “${group.name}”?`))
-                            deleteProjectCommandGroup(project.id, group.id);
+                          void (async () => {
+                            if (
+                              await ask(`Delete group “${group.name}”?`, {
+                                title: "MonoCode",
+                                kind: "warning",
+                                okLabel: "Delete",
+                              })
+                            )
+                              deleteProjectCommandGroup(project.id, group.id);
+                          })();
                         },
                         group.name,
                       )}

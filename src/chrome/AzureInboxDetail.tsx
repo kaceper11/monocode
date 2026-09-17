@@ -1,6 +1,7 @@
 import { InboxContextPicker, useInboxContext } from "./InboxContextPicker";
 import { ACTION_FILLED, ACTION_OUTLINE, ACTION_GHOST } from "./inboxActions";
-import { MessageSquare, ExternalLink } from "./icons";
+import { GitCompare, MessageSquare, ExternalLink } from "./icons";
+import { InboxProviderMark } from "./InboxProviderMark";
 import type { SessionSummary } from "../lib/sessionStore";
 import { Select } from "./Select";
 import { useEffect, useRef, useState } from "react";
@@ -21,6 +22,7 @@ import {
 } from "../lib/azurePipelines";
 import { saveDeliveryProvider } from "../lib/deliveryProviders";
 import type { InboxItem, InboxComposerCard } from "../lib/githubTasks";
+import { formatRelativeTime } from "../lib/githubTasks";
 import { contextFromTickets, requestAgentContext } from "../lib/agentContext";
 import { CwdPicker } from "./CwdPicker";
 import { AzurePrReview } from "./AzurePrReview";
@@ -225,180 +227,219 @@ export function AzureInboxDetail({
       }
     }
   };
+  const branch = delivery.branch.replace(/^refs\/heads\//, "");
+  const target = delivery.targetBranch?.replace(/^refs\/heads\//, "");
+  const time = formatRelativeTime(item.updatedAt);
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="space-y-3 border-b border-content/10 p-4 text-[12px] text-content/65">
-        <div className="text-[11px]">
-          {delivery.kind === "pr" ? "Azure Repos" : "Azure Pipelines"} ·{" "}
-          {item.site?.split("/").pop()} / {item.projectName} · {item.repo}
-        </div>
-        <h2 className="text-[15px] font-medium text-content">{item.title}</h2>
-        <p>
-          {item.identifier} · {item.state} · {delivery.author}
-        </p>
-        <p className="break-all">
-          {delivery.branch.replace(/^refs\/heads\//, "")}
-          {delivery.targetBranch
-            ? ` → ${delivery.targetBranch.replace(/^refs\/heads\//, "")}`
-            : ""}{" "}
-          · {delivery.commit.slice(0, 8)}
-        </p>
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            className={ACTION_FILLED}
-            onClick={() => {
-              try {
-                requestAgentContext({
-                  inboxItems: [item],
-                  context: contextFromTickets([item]),
-                  cwd: item.projectPath || cwd || undefined,
-                  onFailed: (reason) => setError(reason),
-                });
-              } catch (reason) {
-                setError(String(reason));
-              }
-            }}
-          >
-            Send to agent
-          </button>
-          <button
-            className={ACTION_OUTLINE}
-            disabled={context.busy}
-            onClick={() => context.open()}
-          >
-            <MessageSquare className="size-3.5" strokeWidth={1.75} />
-            Ask agent
-          </button>
-          {!ready ? (
-            <>
+    <div className="flex h-full min-h-0 min-w-0 flex-col">
+      <div className="relative z-10 shrink-0 border-b border-content/10">
+        <div className="mx-auto flex w-full max-w-5xl flex-col gap-2.5 px-8 pt-5 pb-5">
+          <header className="flex flex-col gap-3">
+            <div className="flex items-center gap-2 text-[12px] text-content/50">
+              <InboxProviderMark provider="azure" className="size-3.5" />
+              <span>{delivery.kind === "pr" ? "Pull request" : "CI"}</span>
+              <span className="tabular-nums">{item.identifier}</span>
+              <span>{item.state}</span>
+              <span className="truncate">
+                {item.site?.split("/").pop()} / {item.projectName} · {item.repo}
+              </span>
+            </div>
+            <h1
+              title={item.title}
+              className="line-clamp-2 text-[20px] font-semibold leading-tight text-content"
+            >
+              {item.title}
+            </h1>
+            <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-[12px] text-content/50">
+              {delivery.author ? (
+                <span className="min-w-0 truncate">{delivery.author}</span>
+              ) : null}
+              {branch ? (
+                <>
+                  {delivery.author ? <span aria-hidden>·</span> : null}
+                  <span className="inline-flex min-w-0 items-center gap-1">
+                    <GitCompare
+                      className="size-3 shrink-0"
+                      strokeWidth={1.75}
+                    />
+                    <span className="min-w-0 truncate">
+                      {target ? `${target} ← ${branch}` : branch}
+                    </span>
+                  </span>
+                </>
+              ) : null}
+              {delivery.author || branch ? (
+                <span aria-hidden>·</span>
+              ) : null}
+              <span className="tabular-nums">
+                {delivery.commit.slice(0, 8)}
+              </span>
+              {time ? (
+                <>
+                  <span aria-hidden>·</span>
+                  <span>Updated {time}</span>
+                </>
+              ) : null}
+            </div>
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              <button
+                className={ACTION_FILLED}
+                onClick={() => {
+                  try {
+                    requestAgentContext({
+                      inboxItems: [item],
+                      context: contextFromTickets([item]),
+                      cwd: item.projectPath || cwd || undefined,
+                      onFailed: (reason) => setError(reason),
+                    });
+                  } catch (reason) {
+                    setError(String(reason));
+                  }
+                }}
+              >
+                Send to agent
+              </button>
               <button
                 className={ACTION_OUTLINE}
-                disabled={busy || !folder || folder === "~"}
-                onClick={() => void review()}
+                disabled={context.busy}
+                onClick={() => context.open()}
               >
-                {busy
-                  ? "Opening…"
-                  : delivery.kind === "pr"
-                    ? "Review PR"
-                    : "Review CI"}
+                <MessageSquare className="size-3.5" strokeWidth={1.75} />
+                Ask agent
               </button>
-            </>
-          ) : (
-            <button className={button} onClick={() => setReady(undefined)}>
-              Change checkout
-            </button>
-          )}
-          <button
-            className={ACTION_GHOST}
-            onClick={() =>
-              void openUrl(item.url).catch((e) => setError(String(e)))
-            }
-          >
-            <ExternalLink className="size-3.5" strokeWidth={1.75} />
-            Open in Azure
-          </button>
-        </div>
-        {!ready ? (
-          <div className="flex items-center gap-2 text-[11px]">
-            <span>Review checkout</span>
-            <CwdPicker
-              cwd={folder}
-              enabled={!busy}
-              placement="below"
-              recents={projects.map((project) => ({ ...project, openedAt: 0 }))}
-              onCwdChange={(value) => {
-                if (!pending.current) {
-                  generation.current++;
-                  setFolder(value);
-                  setRemotes([]);
-                  setRemote("");
-                  setError("");
+              {!ready ? (
+                <button
+                  className={ACTION_OUTLINE}
+                  disabled={busy || !folder || folder === "~"}
+                  onClick={() => void review()}
+                >
+                  {busy
+                    ? "Opening…"
+                    : delivery.kind === "pr"
+                      ? "Review PR"
+                      : "Review CI"}
+                </button>
+              ) : (
+                <button
+                  className={ACTION_OUTLINE}
+                  onClick={() => setReady(undefined)}
+                >
+                  Change checkout
+                </button>
+              )}
+              <button
+                className={ACTION_GHOST}
+                onClick={() =>
+                  void openUrl(item.url).catch((e) => setError(String(e)))
                 }
-              }}
-            />
-          </div>
-        ) : null}
-        {!ready && remotes.length > 1 ? (
-          <Select
-            label="Pipeline repository remote"
-            value={remote}
-            disabled={busy}
-            options={[
-              { value: "", label: "Choose remote" },
-              ...remotes.map((value) => ({
-                value: value.url,
-                label: `${value.name} · ${value.url}`,
-              })),
-            ]}
-            onChange={setRemote}
-          />
-        ) : null}
-        {delivery.kind === "pr" ? (
-          <div className="text-[11px]">
-            <button
-              className={button}
-              disabled={busy}
-              onClick={() => void loadStories()}
-            >
-              Related stories
-            </button>
-            {stories ? (
-              stories.length ? (
-                stories.map((id) => (
+              >
+                <ExternalLink className="size-3.5" strokeWidth={1.75} />
+                Open in Azure
+              </button>
+            </div>
+            {!ready ? (
+              <div className="flex items-center gap-2 text-[11px] text-content/60">
+                <span>Review checkout</span>
+                <CwdPicker
+                  cwd={folder}
+                  enabled={!busy}
+                  placement="below"
+                  recents={projects.map((project) => ({
+                    ...project,
+                    openedAt: 0,
+                  }))}
+                  onCwdChange={(value) => {
+                    if (!pending.current) {
+                      generation.current++;
+                      setFolder(value);
+                      setRemotes([]);
+                      setRemote("");
+                      setError("");
+                    }
+                  }}
+                />
+                <span className="text-content/40">
+                  Opening review does not change its files.
+                </span>
+              </div>
+            ) : null}
+            {!ready && remotes.length > 1 ? (
+              <Select
+                label="Pipeline repository remote"
+                value={remote}
+                disabled={busy}
+                options={[
+                  { value: "", label: "Choose remote" },
+                  ...remotes.map((value) => ({
+                    value: value.url,
+                    label: `${value.name} · ${value.url}`,
+                  })),
+                ]}
+                onChange={setRemote}
+              />
+            ) : null}
+            {delivery.kind === "pr" ? (
+              <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                <button
+                  className={button}
+                  disabled={busy}
+                  onClick={() => void loadStories()}
+                >
+                  Related stories
+                </button>
+                {stories ? (
+                  stories.length ? (
+                    stories.map((id) => (
+                      <button
+                        key={id}
+                        className={button}
+                        onClick={() =>
+                          void openUrl(
+                            `${item.site}/${encodeURIComponent(delivery.project)}/_workitems/edit/${id}`,
+                          ).catch((e) => setError(String(e)))
+                        }
+                      >
+                        #{id} ↗
+                      </button>
+                    ))
+                  ) : (
+                    <span className="text-content/45">No linked stories</span>
+                  )
+                ) : null}
+              </div>
+            ) : null}
+            {relatedSessions.length ? (
+              <div className="flex flex-wrap items-center gap-2 text-[11px] text-content/60">
+                <span>Related conversations</span>
+                {relatedSessions.map((session) => (
                   <button
-                    key={id}
+                    key={session.id}
                     className={button}
                     onClick={() =>
-                      void openUrl(
-                        `${item.site}/${encodeURIComponent(delivery.project)}/_workitems/edit/${id}`,
+                      void Promise.resolve(
+                        onOpenSession?.(session.id),
                       ).catch((e) => setError(String(e)))
                     }
                   >
-                    #{id} ↗
+                    {session.title || "Conversation"}
                   </button>
-                ))
-              ) : (
-                <span>No linked stories</span>
-              )
+                ))}
+              </div>
             ) : null}
-          </div>
-        ) : null}
-        {!ready ? (
-          <p className="text-[11px] text-content/45">
-            Review uses this working copy. Opening review does not change its
-            files.
-          </p>
-        ) : null}
-        {relatedSessions.length ? (
-          <div className="text-[11px]">
-            Related conversations{" "}
-            {relatedSessions.map((session) => (
-              <button
-                key={session.id}
-                className={button}
-                onClick={() =>
-                  void Promise.resolve(onOpenSession?.(session.id)).catch((e) =>
-                    setError(String(e)),
-                  )
-                }
-              >
-                {session.title || "Conversation"}
-              </button>
-            ))}
-          </div>
-        ) : null}
-        {error ? (
-          <p role="alert" className="text-red-400">
-            {error}
-          </p>
-        ) : null}
+            {error ? (
+              <p role="alert" className="text-[12px] text-red-400">
+                {error}
+              </p>
+            ) : null}
+            <InboxContextPicker
+              context={context}
+              onConfirm={async (card) => {
+                await onDiscuss?.(card);
+              }}
+            />
+          </header>
+        </div>
       </div>
-      <InboxContextPicker
-        context={context}
-        onConfirm={async (card) => {
-          await onDiscuss?.(card);
-        }}
-      />
       {ready ? (
         <div className="min-h-0 flex-1">
           {delivery.kind === "pr" ? (

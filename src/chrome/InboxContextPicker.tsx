@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Modal } from "./Modal";
 import { InboxProviderMark } from "./InboxProviderMark";
-import { Check, ChevronRight } from "./icons";
+import { Checkbox } from "./controls";
+import { ChevronRight } from "./icons";
 import { AgentMarkdown } from "../surfaces/AgentMarkdown";
 import type { InboxComposerCard, InboxItem } from "../lib/githubTasks";
 import {
@@ -13,39 +14,6 @@ import {
   type ContextDocument,
   type ContextSelection,
 } from "../lib/inboxContext";
-
-export function ContextCheckbox({
-  label,
-  checked,
-  disabled,
-  onChange,
-  className,
-}: {
-  label: string;
-  checked: boolean;
-  disabled?: boolean;
-  onChange: () => void;
-  /** Overrides the default `mt-0.5` used to align with multi-line rows. */
-  className?: string;
-}) {
-  return (
-    <span
-      className={`relative inline-flex size-4 shrink-0 ${className ?? "mt-0.5"}`}
-    >
-      <input
-        type="checkbox"
-        aria-label={label}
-        checked={checked}
-        disabled={disabled}
-        onChange={onChange}
-        className="peer absolute inset-0 z-10 size-4 cursor-pointer opacity-0 disabled:cursor-default"
-      />
-      <span className="pointer-events-none flex size-4 items-center justify-center rounded border border-content/25 text-transparent peer-checked:border-content/60 peer-checked:bg-content/10 peer-checked:text-content peer-focus-visible:ring-2 peer-focus-visible:ring-accent peer-disabled:opacity-35">
-        <Check className="size-3" strokeWidth={2} />
-      </span>
-    </span>
-  );
-}
 
 export function useInboxContext(item: InboxItem) {
   const [document, setDocument] = useState<ContextDocument>();
@@ -179,7 +147,8 @@ export function ContextSelectionSections({
   return (
     <>
       <label className="flex cursor-pointer items-center gap-3 rounded-lg border border-content/10 p-3 hover:bg-content/5">
-        <ContextCheckbox
+        <Checkbox
+          className="mt-0"
           label="Include description"
           checked={draft.description}
           onChange={() =>
@@ -220,7 +189,7 @@ export function ContextSelectionSections({
         <div className="border-t border-content/10 p-3">
           {document?.comments.map((comment) => (
             <div key={comment.id} className="mb-2 flex items-start gap-2">
-              <ContextCheckbox
+              <Checkbox
                 label={`Include comment by ${comment.author}`}
                 checked={draft.comments.includes(comment.id)}
                 onChange={() => toggle("comments", comment.id)}
@@ -288,7 +257,7 @@ export function ContextSelectionSections({
           {document?.files.map((file) => (
             <div key={file.id} className="mb-2">
               <div className="flex items-start gap-2">
-                <ContextCheckbox
+                <Checkbox
                   label={`Include ${file.name}`}
                   disabled={
                     !!file.unavailable ||

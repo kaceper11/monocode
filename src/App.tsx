@@ -61,6 +61,7 @@ import { WatchSheet } from "./chrome/WatchSheet";
 import { ScheduleSheet } from "./chrome/ScheduleSheet";
 import { AttentionQueue } from "./chrome/AttentionQueue";
 import { MergeResolutionSheet } from "./chrome/MergeResolutionSheet";
+import { AppDialogs } from "./chrome/AppDialogs";
 import { TaskSyncSheet } from "./chrome/TaskSyncSheet";
 import type { DeliveryTabSource } from "./lib/layout";
 import { RepairStatus } from "./chrome/RepairStatus";
@@ -96,7 +97,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ask, message } from "@tauri-apps/plugin-dialog";
+import { ask, message } from "./lib/dialogs";
 import {
   useCallback,
   useEffect,
@@ -798,9 +799,9 @@ function filesInWorkspaceTabs(tabs: readonly WorkspaceTab[]): FilePaneTab[] {
   ]);
 }
 
-/** Native sheet. `window.confirm` is swallowed when a macOS menu accelerator fires. */
-function confirmDiscardUnsaved(message: string): Promise<boolean> {
-  return ask(message, { title: "MonoCode", kind: "warning" });
+/** In-app confirm. `window.confirm` is swallowed when a macOS menu accelerator fires. */
+function confirmDiscardUnsaved(text: string): Promise<boolean | null> {
+  return ask(text, { title: "MonoCode", kind: "warning" });
 }
 
 function titleTabsEqual(a: TitleTab[], b: TitleTab[]): boolean {
@@ -4129,7 +4130,11 @@ export default function App({
       if (
         mode === "delete" &&
         !skipDeleteConfirm &&
-        !window.confirm(`Delete “${label}”?`)
+        !(await ask(`Delete “${label}”?`, {
+          title: "MonoCode",
+          kind: "warning",
+          okLabel: "Delete",
+        }))
       )
         return false;
 
@@ -4370,9 +4375,10 @@ export default function App({
     async (sessionIds: readonly string[]) => {
       if (sessionIds.length === 0) return;
       if (
-        !window.confirm(
+        !(await ask(
           `Delete ${sessionIds.length} selected conversations? This can’t be undone.`,
-        )
+          { title: "MonoCode", kind: "warning", okLabel: "Delete" },
+        ))
       )
         return;
       for (const sessionId of sessionIds) {
@@ -8505,17 +8511,19 @@ export default function App({
           : `the ${index.remote ?? "remote"} default branch`;
         const where = `\n\nWorking copy: ${action.cwd}\nHost: ${syncHostLabel(action.cwd)}`;
         let mode: "merge" | "rebase" = "merge";
-        if (
-          !(await ask(
-            `Fetch ${baseLabel} and merge it into ${branch}? The tree must be clean; conflicts stay in place for you to resolve. Nothing is pushed.${where}`,
-            {
-              title: item.title,
-              kind: "info",
-              okLabel: "Merge",
-              cancelLabel: "Rebase instead…",
-            },
-          ))
-        ) {
+        const merge = await ask(
+          `Fetch ${baseLabel} and merge it into ${branch}? The tree must be clean; conflicts stay in place for you to resolve. Nothing is pushed.${where}`,
+          {
+            title: item.title,
+            kind: "info",
+            okLabel: "Merge",
+            cancelLabel: "Rebase instead…",
+          },
+        );
+        // Esc/backdrop/X abort outright — only the "Rebase instead…" action
+        // leads to the rebase prompt.
+        if (merge === null) return;
+        if (!merge) {
           if (
             !(await ask(
               `Rebase ${branch} onto ${baseLabel}? Nothing is pushed.${where}`,
@@ -9683,6 +9691,8 @@ export default function App({
           <MergeResolutionSheet key={request.key} request={request} />
         ) : null;
       })()}
+
+      <AppDialogs />
 
       {taskSync ? (
         <TaskSyncSheet

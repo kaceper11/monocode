@@ -29,6 +29,14 @@ const WIDTH: Record<ModalSize, string> = {
   lg: "w-[min(680px,calc(100vw-24px))]",
 };
 
+/** Small dialogs are utility prompts — a compact title fits their scale;
+ * sheet-sized dialogs keep the display title. */
+const TITLE: Record<ModalSize, string> = {
+  sm: "text-base",
+  md: "text-2xl",
+  lg: "text-2xl",
+};
+
 const TOP: Record<ModalSize, string> = {
   sm: "top-[22%]",
   md: "top-[10%]",
@@ -76,6 +84,18 @@ export function ModalPanel({
     if (dialog?.contains(document.activeElement)) return;
     closeRef.current?.focus();
   }, []);
+
+  // Read at render time, before any child's autoFocus runs: the element that
+  // opened the dialog. Closing returns focus there instead of stranding it on
+  // <body> — keyboard flows (e.g. FileTree's Delete key) keep their place.
+  const [focusReturn] = useState(() => document.activeElement);
+  useEffect(
+    () => () => {
+      if (focusReturn instanceof HTMLElement && focusReturn.isConnected)
+        focusReturn.focus({ preventScroll: true });
+    },
+    [focusReturn],
+  );
 
   useEffect(() => {
     if (!trapFocus) return;
@@ -140,13 +160,14 @@ export function ModalPanel({
           <div className="min-w-0 flex-1 pt-0.5">
             <h2
               id={titleId}
-              className="text-2xl font-semibold leading-tight text-content"
+              className={`${TITLE[size]} font-semibold leading-tight text-content`}
             >
               {title}
             </h2>
             {description ? (
               <p
                 id={descriptionId}
+                title={description}
                 className="mt-0.5 truncate text-[12px] leading-snug text-content/50"
               >
                 {description}

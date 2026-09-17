@@ -11,7 +11,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@tauri-apps/api/app", () => ({ getVersion: mocks.getVersion }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({
+vi.mock("./dialogs", () => ({
   ask: vi.fn(),
   message: mocks.message,
 }));

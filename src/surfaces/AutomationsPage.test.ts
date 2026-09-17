@@ -15,7 +15,7 @@ import {
 } from "../lib/projects";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ ask: vi.fn() }));
+vi.mock("../lib/dialogs", () => ({ ask: vi.fn() }));
 
 const CWD = "/repo";
 const family = {

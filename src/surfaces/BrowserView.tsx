@@ -1,5 +1,5 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ask } from "@tauri-apps/plugin-dialog";
+import { ask } from "../lib/dialogs";
 import {
   CheckMenuItem,
   Menu,

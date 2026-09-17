@@ -9,6 +9,7 @@ import {
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Copy, Eye, FolderOpen, RefreshCw, Search, X } from "../chrome/icons";
 import { CreateSkillForm } from "../chrome/SkillPicker";
+import { Toggle } from "../chrome/Toggle";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import {
   MarkdownModeToggle,
@@ -340,18 +341,11 @@ export function SkillsPage({
                           <span className="w-20 shrink-0 truncate text-right font-sans text-[11px] text-content/40">
                             {skill.source}
                           </span>
-                          <button
-                            type="button"
-                            role="switch"
-                            aria-label={`Include ${skill.name} in MonoCode catalog`}
-                            aria-checked={!disabled}
-                            onClick={() => onToggle(skill.path, disabled)}
-                            className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${disabled ? "bg-content/20" : "bg-accent"}`}
-                          >
-                            <span
-                              className={`absolute top-0.5 size-4 rounded-full bg-white transition-[left] ${disabled ? "left-0.5" : "left-4.5"}`}
-                            />
-                          </button>
+                          <Toggle
+                            label={`Include ${skill.name} in MonoCode catalog`}
+                            on={!disabled}
+                            onChange={(on) => onToggle(skill.path, on)}
+                          />
                         </div>
                         {skill.description ? (
                           <p

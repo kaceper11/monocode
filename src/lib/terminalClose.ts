@@ -1,4 +1,4 @@
-import { ask } from "@tauri-apps/plugin-dialog";
+import { ask } from "./dialogs";
 import type { FilePaneTab } from "./layout";
 import { getPtyStatus } from "./pty";
 import { terminalTabLabel } from "./terminalTab";
@@ -29,10 +29,11 @@ export async function confirmCloseTerminal(file: FilePaneTab): Promise<boolean> 
   if (running.length === 0) return true;
   const { process } = running[0];
   const label = terminalTabLabel(file);
-  return ask(
+  // A bare dismiss answers "don't close" — same as Cancel.
+  return (await ask(
     `"${process}" is still running in ${label}. Close this terminal anyway?`,
     { title: "MonoCode", kind: "warning" },
-  );
+  )) ?? false;
 }
 
 /** Confirm closing terminals that still have a foreground process. */
@@ -41,16 +42,16 @@ export async function confirmCloseTerminals(files: FilePaneTab[]): Promise<boole
   if (running.length === 0) return true;
   if (running.length === 1) {
     const { file, process } = running[0];
-    return ask(
+    return (await ask(
       `"${process}" is still running in ${terminalTabLabel(file)}. Close this terminal anyway?`,
       { title: "MonoCode", kind: "warning" },
-    );
+    )) ?? false;
   }
   const lines = running
     .map(({ file, process }) => `• ${terminalTabLabel(file)} (${process})`)
     .join("\n");
-  return ask(
+  return (await ask(
     `These terminals are still running:\n${lines}\n\nClose them anyway?`,
     { title: "MonoCode", kind: "warning" },
-  );
+  )) ?? false;
 }

@@ -18,6 +18,7 @@ import {
 } from "../chrome/icons";
 import { HarnessIcon } from "../chrome/HarnessIcon";
 import { Toggle } from "../chrome/Toggle";
+import { ask } from "../lib/dialogs";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import { copyText } from "../lib/clipboard";
 import {
@@ -159,24 +160,33 @@ export function ExtensionsPage({
   };
 
   const onRemove = (remove: RemoveRef, label: string): void => {
-    const message =
+    const text =
       remove.format === "file"
         ? `Remove ${remove.file}? It is renamed to ${remove.file}.monocode-bak so you can restore it.`
         : `Remove ${label} from ${remove.file}? A backup is kept as ${remove.file}.monocode-bak.`;
-    if (!window.confirm(message)) return;
-    const key = removeKey(remove);
-    setPending((keys) => new Set(keys).add(key));
-    setBusyFiles((files) => new Set(files).add(remove.file));
-    setActionError(null);
-    void agentConfigRemove(cwd, remove)
-      .then(() => setReload((value) => value + 1))
-      .catch((err: unknown) => {
-        mutationFailed(
-          key,
-          remove.file,
-          `Could not remove it: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      });
+    void (async () => {
+      if (
+        !(await ask(text, {
+          title: "MonoCode",
+          kind: "warning",
+          okLabel: "Remove",
+        }))
+      )
+        return;
+      const key = removeKey(remove);
+      setPending((keys) => new Set(keys).add(key));
+      setBusyFiles((files) => new Set(files).add(remove.file));
+      setActionError(null);
+      void agentConfigRemove(cwd, remove)
+        .then(() => setReload((value) => value + 1))
+        .catch((err: unknown) => {
+          mutationFailed(
+            key,
+            remove.file,
+            `Could not remove it: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+    })();
   };
 
   const onReveal = (path: string): void => {

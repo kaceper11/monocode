@@ -26,8 +26,12 @@ import {
   sessionWorkItems,
 } from "./sessionWorkItem";
 import {
-  childDeliveryRows,
+  childDeliveryLinks,
+  deliveryFromLinks,
+  EMPTY_DELIVERY,
+  taskStatusSegments,
   type DeliveryStores,
+  type TaskChildDelivery,
 } from "./taskDelivery";
 import { taskPrRowKey, type TaskPrDraft } from "./taskPrs";
 import {
@@ -56,10 +60,19 @@ export type InboxMyWorkSession = {
   title: string;
   harness: HarnessId;
   cwd: string;
+  /** Recorded head branch — session delivery links scope to it. */
+  branch?: string;
+  /** Inbox ask threads can't host a delivery tab — no PR/CI actions. */
+  ask?: boolean;
   /** waiting > working > archived > idle — live ids come from App's sets. */
   state: "waiting" | "working" | "archived" | "idle";
   /** Owning task when the session belongs to one. */
-  taskName?: string;
+  taskId?: string;
+  /** The owning task's children already cover this session's checkout — the
+   * conversation folds into the task row and spends no list slot. Sessions
+   * a task owns at a checkout it doesn't cover stay visible so their saved
+   * delivery links keep an open path. */
+  coveredByTask?: boolean;
 };
 
 export type InboxMyWorkPr = {
@@ -86,6 +99,9 @@ export type InboxMyWorkPr = {
   sessionId?: string;
   cwd?: string;
   branch?: string;
+  /** Joined through an attached task's child — the task row's delivery
+   * rollup already covers it. */
+  coveredByTask?: boolean;
   /** CI bound to the producing checkout — Azure pipeline rows for either
    * provider, or GitHub check state derived from watcher attention. */
   ci?: { count: number; failing: boolean; running: boolean; label: string };
@@ -109,9 +125,28 @@ export type InboxMyWorkCi = {
   sessionId?: string;
   cwd: string;
   branch: string;
+  /** Joined through an attached task's child — the task row's delivery
+   * rollup already covers it. */
+  coveredByTask?: boolean;
+};
+
+/** A task attached to the inbox item — directly (ticket link) or through a
+ * related session it owns. The row is the inbox's entry point into
+ * `TaskDetails`, which owns the task's tickets, conversations, PRs and CI. */
+export type InboxMyWorkTask = {
+  id: string;
+  name: string;
+  /** Sessions the task owns that are still in the caller's live list. */
+  sessions: number;
+  /** Most-actionable-first status phrases ("1 needs input", "CI failing"). */
+  status: string[];
+  /** PR/CI rollup across the task's children with a working copy. */
+  delivery: TaskChildDelivery;
 };
 
 export type InboxMyWork = {
+  /** Tasks attached to the item — the detail pane's primary content. */
+  tasks: InboxMyWorkTask[];
   sessions: InboxMyWorkSession[];
   prs: InboxMyWorkPr[];
   ci: InboxMyWorkCi[];
@@ -210,9 +245,9 @@ type WorkAccumulator = {
 
 /** Normalized PR state across providers — GitHub OPEN/MERGED/CLOSED, Azure
  * active/completed/abandoned, plus draft and reviewer-attention overlays. */
-export type InboxPrKind = "attention" | "open" | "draft" | "merged" | "closed";
+type InboxPrKind = "attention" | "open" | "draft" | "merged" | "closed";
 
-export function inboxPrKind(pr: InboxMyWorkPr): InboxPrKind {
+function inboxPrKind(pr: InboxMyWorkPr): InboxPrKind {
   const state = pr.state?.toLowerCase() ?? "";
   if (state === "merged" || state === "completed") return "merged";
   if (state === "closed" || state === "abandoned" || state === "declined")
@@ -225,7 +260,7 @@ export function inboxPrKind(pr: InboxMyWorkPr): InboxPrKind {
 /** Actionable first: reviewer attention, then failing checks, then open
  * work; drafts and finished PRs sink to the bottom. Applied before the
  * delivery cap so actionable rows can't be truncated away. */
-export function inboxPrRank(pr: InboxMyWorkPr): number {
+function inboxPrRank(pr: InboxMyWorkPr): number {
   const kind = inboxPrKind(pr);
   if (kind === "attention") return 0;
   if (pr.ci?.failing || pr.checksFailing) return 1;
@@ -235,7 +270,7 @@ export function inboxPrRank(pr: InboxMyWorkPr): number {
 }
 
 /** Failing and running pipelines before quiet ones — same pre-cap rule. */
-export function inboxCiRank(row: InboxMyWorkCi): number {
+function inboxCiRank(row: InboxMyWorkCi): number {
   if (row.failing) return 0;
   if (row.running) return 1;
   return 2;
@@ -353,6 +388,20 @@ function ciSummary(rows: readonly CiSource[]): {
     running,
     label: failing ? "CI failing" : running ? "CI running" : last,
   };
+}
+
+/** The owning task's children already cover this session's checkout — the
+ * task child join sees the same saved links, so the session folds into the
+ * task row and skips its own delivery pass. */
+function taskCoversSessionCheckout(
+  task: TaskWorkspace | undefined,
+  session: SessionSummary,
+): boolean {
+  if (!task) return false;
+  const cwd = pathKey(sessionWorkCwd(session));
+  return task.children.some(
+    (child) => child.workingCopy && pathKey(child.workingCopy) === cwd,
+  );
 }
 
 /** Session rooted at a checkout — any known session whose delivery view can
@@ -515,7 +564,8 @@ function ciRow(source: CiSource): InboxMyWorkCi {
 }
 
 /** Child-level join: PR drafts/results + saved Azure links + cached GitHub
- * PR for one task child checkout. */
+ * PR for one task child checkout. Returns the child's delivery rollup so the
+ * caller can aggregate the owning task's row from the same link scan. */
 function joinChild(
   acc: WorkAccumulator,
   task: TaskWorkspace,
@@ -528,19 +578,20 @@ function joinChild(
   prsByCwd: Map<string, AzurePrAssociation[]>,
   ciByCwd: Map<string, CiSource[]>,
   sessionsByCwd: Map<string, SessionSummary[]>,
-) {
+): TaskChildDelivery {
   const cwd = child.workingCopy;
-  if (!cwd) return;
+  if (!cwd) return EMPTY_DELIVERY;
   const branch = input.branchForCwd?.(cwd) ?? child.branch;
-  const rows = childDeliveryRows(
-    task,
-    child,
-    [branch, child.branch],
-    {
-      prs: prsByCwd.get(pathKey(cwd)) ?? [],
-      ci: ciByCwd.get(pathKey(cwd)) ?? [],
-    },
-  );
+  const github = input.githubPrFor?.(cwd, branch);
+  const links = childDeliveryLinks(task, child, [branch, child.branch], github, {
+    prs: prsByCwd.get(pathKey(cwd)) ?? [],
+    ci: ciByCwd.get(pathKey(cwd)) ?? [],
+  });
+  const rows = {
+    prs: links.prs.filter((row) => row.pr.status.toLowerCase() === "active"),
+    ci: links.ci,
+  };
+  const delivery = deliveryFromLinks(links);
   const session = sessionAtCwd(sessionsByCwd, cwd);
   const scope = `task:${task.id}:${child.id}`;
   const summary = ciSummary(rows.ci);
@@ -549,6 +600,7 @@ function joinChild(
     if (ciSeen.has(record.key)) continue;
     ciSeen.add(record.key);
     if (!record.sessionId) record.sessionId = session?.id;
+    record.coveredByTask = true;
     acc.ci.push(record);
   }
   for (const row of rows.prs) {
@@ -556,9 +608,9 @@ function joinChild(
     // A live session rooted at the checkout beats the recorded one — the
     // saved id may be dead or have moved checkouts.
     if (session) pr.sessionId = session.id;
+    pr.coveredByTask = true;
     mergeCiScope(pr, scope, summary);
   }
-  const github = input.githubPrFor?.(cwd, branch);
   if (github && github.state.toLowerCase() === "open") {
     const pr = addPr(
       acc,
@@ -567,6 +619,7 @@ function joinChild(
       githubPrRow(github, cwd, branch, repoLabel),
     );
     if (!pr.sessionId) pr.sessionId = session?.id;
+    pr.coveredByTask = true;
     mergeCiScope(pr, scope, summary);
   }
   const draft = input.prDrafts?.[taskPrRowKey(task.id, child.id)];
@@ -576,8 +629,10 @@ function joinChild(
     if (!drafted.branch) drafted.branch = branch ?? child.branch;
     const pr = addPr(acc, byKey, byLoose, drafted);
     if (!pr.sessionId) pr.sessionId = session?.id;
+    pr.coveredByTask = true;
     mergeCiScope(pr, scope, summary);
   }
+  return delivery;
 }
 
 /** Session-scope join: a linked session working a ticket directly (no task)
@@ -776,14 +831,21 @@ export function inboxMyWorkForItems(
       ci: [],
     };
     // Rank before the cap — a waiting session past the limit must not lose
-    // its slot to an idle one that merely joined earlier.
+    // its slot to an idle one that merely joined earlier. Sessions folded
+    // into a task row don't render, so they don't spend a slot either.
     const rankedRelated = [...related].sort(
       (a, b) =>
         sessionRowRank(input, a.id, a.archived) -
         sessionRowRank(input, b.id, b.archived),
     );
-    for (const session of rankedRelated.slice(0, MAX_SESSION_ROWS)) {
+    let rendered = 0;
+    for (const session of rankedRelated) {
       const task = taskBySessionId.get(session.id);
+      const covered = taskCoversSessionCheckout(task, session);
+      if (!covered) {
+        if (rendered >= MAX_SESSION_ROWS) continue;
+        rendered++;
+      }
       const state = input.needsInputSessionIds?.has(session.id)
         ? "waiting"
         : input.busySessionIds?.has(session.id)
@@ -796,8 +858,13 @@ export function inboxMyWorkForItems(
         title: session.title,
         harness: session.harness,
         cwd: sessionWorkCwd(session),
+        branch: session.branch,
+        // Live `Session` objects reach this list structurally — the summary
+        // type omits `inboxAsk`, but ask threads still carry it.
+        ask: "inboxAsk" in session && session.inboxAsk != null,
         state,
-        taskName: task?.name,
+        taskId: task?.id,
+        coveredByTask: covered || undefined,
       });
     }
     for (const session of related) acc.sessionIds.add(session.id);
@@ -811,12 +878,15 @@ export function inboxMyWorkForItems(
     const ciSeen = new Set<string>();
     const cwds = new Set(acc.sessionCwdKeys);
 
+    const liveSessionIds = new Set(sessions.map((session) => session.id));
+    const taskRows: InboxMyWorkTask[] = [];
     for (const task of itemTasks) {
       const project = projectsById.get(task.projectId);
+      const deliveryByChild = new Map<string, TaskChildDelivery>();
       for (const child of task.children) {
         if (child.workingCopy) cwds.add(pathKey(child.workingCopy));
         const repoLabel = taskChildRepoName(task, child, project);
-        joinChild(
+        const delivery = joinChild(
           acc,
           task,
           child,
@@ -829,20 +899,34 @@ export function inboxMyWorkForItems(
           ciByCwd,
           sessionsByCwd,
         );
+        if (child.workingCopy) deliveryByChild.set(child.id, delivery);
       }
+      const delivery = { ...EMPTY_DELIVERY };
+      for (const child of deliveryByChild.values()) {
+        delivery.prs += child.prs;
+        delivery.ci += child.ci;
+        delivery.prNeedsAttention ||= child.prNeedsAttention;
+        delivery.ciRunning ||= child.ciRunning;
+        delivery.ciFailing ||= child.ciFailing;
+      }
+      taskRows.push({
+        id: task.id,
+        name: task.name,
+        sessions: [...taskSessionIds(task)].filter((id) =>
+          liveSessionIds.has(id),
+        ).length,
+        status: taskStatusSegments(task, {
+          busySessionIds: input.busySessionIds,
+          needsInputIds: input.needsInputSessionIds,
+          delivery: deliveryByChild,
+        }),
+        delivery,
+      });
     }
     for (const session of related) {
       // Sessions whose owning task already covered their checkout skip the
       // session-scope pass — the task child join saw the same links.
-      const owned = taskBySessionId.get(session.id);
-      if (
-        owned &&
-        owned.children.some(
-          (child) =>
-            child.workingCopy &&
-            pathKey(child.workingCopy) === pathKey(sessionWorkCwd(session)),
-        )
-      )
+      if (taskCoversSessionCheckout(taskBySessionId.get(session.id), session))
         continue;
       const repo =
         session.repo ?? (basename(sessionWorkCwd(session)) || sessionWorkCwd(session));
@@ -918,10 +1002,15 @@ export function inboxMyWorkForItems(
       .sort((a, b) => inboxCiRank(a) - inboxCiRank(b))
       .slice(0, MAX_DELIVERY_ROWS);
     const hasWork = Boolean(
-      sortedSessions.length || prs.length || ci.length || bound.length,
+      taskRows.length ||
+        sortedSessions.length ||
+        prs.length ||
+        ci.length ||
+        bound.length,
     );
     if (!hasWork) continue;
     out.set(item, {
+      tasks: taskRows,
       sessions: sortedSessions,
       prs,
       ci,

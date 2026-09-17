@@ -69,6 +69,7 @@ import {
 import { watchGithubPrUrl } from "../lib/watchers";
 import { useProjectBranchesState } from "../hooks/useProjectBranches";
 import { Modal } from "./Modal";
+import { Checkbox } from "./controls";
 import { Select } from "./Select";
 import {
   Check,
@@ -1012,12 +1013,12 @@ function TaskPrRow({
               onChange={onProvider}
             />
             <label className="flex items-center gap-1.5 text-content/60">
-              <input
-                type="checkbox"
+              <Checkbox
+                label="Draft pull request"
                 checked={isDraft}
                 disabled={creating || Boolean(result)}
-                onChange={(event) => onDraft(event.target.checked)}
-                className="size-3.5 accent-current"
+                onChange={() => onDraft(!isDraft)}
+                className=""
               />
               Draft
             </label>

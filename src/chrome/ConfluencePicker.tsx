@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ContextCheckbox } from "./InboxContextPicker";
+import { Checkbox } from "./controls";
 import { Modal } from "./Modal";
 import { Select } from "./Select";
 import { AgentMarkdown } from "../surfaces/AgentMarkdown";
@@ -336,7 +336,7 @@ export function ConfluencePicker({
                 return (
                   <div key={page.id} className="border-b border-content/5 last:border-0">
                     <div className="flex items-center gap-2 px-2 py-1.5">
-                      <ContextCheckbox
+                      <Checkbox
                         className=""
                         label={`Select ${page.title}`}
                         checked={!!chosen}
@@ -405,7 +405,7 @@ export function ConfluencePicker({
                                     key={section.id}
                                     className="flex cursor-pointer items-center gap-2 text-[12px] text-content/75"
                                   >
-                                    <ContextCheckbox
+                                    <Checkbox
                                       className=""
                                       label={`Include section ${section.title}`}
                                       checked={
