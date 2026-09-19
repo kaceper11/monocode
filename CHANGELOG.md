@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [0.3.1] - 2026-09-19
+
+### Changed
+
+- Align the core application with upstream MonoCode through c4acf48, including current worktree, orchestration, account and composer improvements.
+- Retain WSL, Azure Boards/Repos/Pipelines, Jira, Confluence and Devin/Muse/Copilot through shared workflows and provider adapters.
+- Keep the browser side panel, Keep Awake, saved project commands, lightning-bolt Actions prompts, terminal resources and dictation; retire the fork's duplicate task and automation surfaces while preserving stored legacy data.
+
+### Fixed
+
+- Make Actions, dictation and Confluence available before the first message; show Confluence in the add menu only when its Jira connection is available.
+- Preserve upstream worker-stop calls and correct terminal browser links after wide characters or across wrapped lines.
+- Fix the Windows browser screenshot allocation-error return so Windows builds compile.
+
+
 ## [0.1.51] - 2026-09-18
 
 ### Added

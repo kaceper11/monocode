@@ -1470,7 +1470,7 @@ fn start_screenshot(
             Some(stream) => stream,
             None => {
                 let _ = tx.send(None);
-                return;
+                return Err("Could not allocate the browser screenshot stream".into());
             }
         };
         let captured = stream.clone();
