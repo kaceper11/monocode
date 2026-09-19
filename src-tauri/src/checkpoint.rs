@@ -125,6 +125,7 @@ impl CheckpointStore {
         write_manifest(
             &dir,
             &Manifest {
+                mode_format: 1,
                 cwd: root.to_string_lossy().into_owned(),
                 files,
                 touched: BTreeSet::new(),
@@ -248,6 +249,121 @@ impl CheckpointStore {
             &manifest,
             &foreign_touched,
         ))
+    }
+
+    fn apply(
+        &self,
+        session_id: &str,
+        from_cwd: &str,
+        to_cwd: &str,
+    ) -> Result<CheckpointApplyResult, String> {
+        let from_host = wsl::location(from_cwd)?.map(|v| v.distribution.to_lowercase());
+        let to_host = wsl::location(to_cwd)?.map(|v| v.distribution.to_lowercase());
+        if from_host != to_host {
+            return Err("Worker and lead checkouts must use the same execution host".into());
+        }
+        let manifest = self
+            .load_matching(session_id, from_cwd)?
+            .ok_or("This worker has no recoverable change checkpoint")?;
+        let from_root = project_root(from_cwd)?;
+        let to_root = project_root(to_cwd)?;
+        if same_cwd(from_cwd, to_cwd) {
+            return Err("An isolated worker cannot be integrated into itself".into());
+        }
+        if git_head(&from_root)? != git_head(&to_root)? {
+            return Err(
+                "The worker or lead branch moved while this task was running. The worker worktree was kept for manual review."
+                    .into(),
+            );
+        }
+        let dir = self.session_dir(session_id);
+        let changed = verified_worker_delta(&dir, &from_root, &manifest)?;
+
+        // Preflight every path before writing any of them. A retry may see a
+        // mixture of before/after states if the app stopped during a previous
+        // application; both are safe and make this operation idempotent.
+        let mut already_applied = 0;
+        for relative in &changed {
+            if path_contains_symlink(&to_root, relative) {
+                return Err(format!(
+                    "Cannot integrate {relative}: the target path contains a symbolic link. The worker worktree was kept."
+                ));
+            }
+            let before = manifest
+                .files
+                .get(relative)
+                .copied()
+                .ok_or_else(|| format!("Missing original snapshot for {relative}"))?;
+            let after = manifest
+                .after
+                .get(relative)
+                .copied()
+                .ok_or_else(|| format!("Missing worker snapshot for {relative}"))?;
+            let target = worktree_snapshot(&to_root, relative, manifest.mode_format == 1);
+            let before_state = stored_snapshot(
+                &dir,
+                relative,
+                before,
+                false,
+                from_cwd,
+                manifest.mode_format == 1,
+            );
+            let after_state = stored_snapshot(
+                &dir,
+                relative,
+                after,
+                true,
+                from_cwd,
+                manifest.mode_format == 1,
+            );
+            if target == after_state {
+                already_applied += 1;
+            } else if target != before_state {
+                return Err(format!(
+                    "Cannot integrate {relative}: the lead checkout changed since this worker started. The worker worktree was kept."
+                ));
+            }
+        }
+
+        for relative in &changed {
+            let after = manifest.after.get(relative).copied().unwrap();
+            let target = worktree_snapshot(&to_root, relative, manifest.mode_format == 1);
+            let after_state = stored_snapshot(
+                &dir,
+                relative,
+                after,
+                true,
+                from_cwd,
+                manifest.mode_format == 1,
+            );
+            if target != after_state {
+                write_state(&to_root, relative, after_state.0, after_state.1)?;
+            }
+        }
+        Ok(CheckpointApplyResult {
+            files: changed,
+            already_applied,
+        })
+    }
+
+    fn cleanup_safe(&self, session_id: &str, cwd: &str) -> Result<bool, String> {
+        let Some(manifest) = self.load_matching(session_id, cwd)? else {
+            return Ok(false);
+        };
+        let root = project_root(cwd)?;
+        Ok(
+            verified_worker_delta(&self.session_dir(session_id), &root, &manifest)
+                .map(|changed| changed.is_empty())
+                .unwrap_or(false),
+        )
+    }
+
+    fn forget(&self, session_id: &str) -> Result<(), String> {
+        let dir = self.session_dir(session_id);
+        if dir.exists() {
+            std::fs::remove_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     fn file_diff(
@@ -439,6 +555,9 @@ impl CheckpointStore {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct Manifest {
+    /// Legacy native blobs used the app's creation mode, not the source mode.
+    #[serde(default)]
+    mode_format: u8,
     cwd: String,
     files: BTreeMap<String, SnapshotKind>,
     #[serde(default)]
@@ -513,6 +632,13 @@ pub struct CheckpointFileDiff {
     pub current: String,
     pub binary: bool,
     pub too_large: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointApplyResult {
+    pub files: Vec<String>,
+    pub already_applied: usize,
 }
 
 pub fn init(app: &AppHandle) -> Result<(), String> {
@@ -599,6 +725,55 @@ pub async fn session_checkpoint_status(
 }
 
 #[tauri::command]
+pub async fn session_checkpoint_apply(
+    store: State<'_, CheckpointStore>,
+    session_id: String,
+    from_cwd: String,
+    to_cwd: String,
+) -> Result<CheckpointApplyResult, String> {
+    validate_id(&session_id, "session")?;
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.exclusive(&session_id, &from_cwd, |store| {
+            store.apply(&session_id, &from_cwd, &to_cwd)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn session_checkpoint_cleanup_safe(
+    store: State<'_, CheckpointStore>,
+    session_id: String,
+    cwd: String,
+) -> Result<bool, String> {
+    validate_id(&session_id, "session")?;
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.exclusive(&session_id, &cwd, |store| {
+            store.cleanup_safe(&session_id, &cwd)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn session_checkpoint_forget(
+    store: State<'_, CheckpointStore>,
+    session_id: String,
+) -> Result<(), String> {
+    validate_id(&session_id, "session")?;
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        store.exclusive(&session_id, "", |store| store.forget(&session_id))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn session_checkpoint_file_diff(
     store: State<'_, CheckpointStore>,
     session_id: String,
@@ -650,6 +825,237 @@ pub async fn session_checkpoint_keep(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Reconstruct the worker-owned delta and reject anything that was not
+/// captured at a structured tool boundary. This is stricter than the review
+/// UI because cleanup must never discard an ambiguous edit.
+fn verified_worker_delta(
+    dir: &Path,
+    root: &Path,
+    manifest: &Manifest,
+) -> Result<Vec<String>, String> {
+    if manifest.mode_format != 1 {
+        return Err(
+            "This checkpoint predates file-mode tracking; the worker was kept for manual review"
+                .into(),
+        );
+    }
+    if !manifest.diverged.is_empty() {
+        return Err(format!(
+            "Cannot safely integrate files that changed outside the worker: {}",
+            manifest
+                .diverged
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let current_dirty: BTreeSet<String> = git_diff_files_for(root)
+        .files
+        .into_iter()
+        .map(|file| file.relative)
+        .collect();
+    if let Some(relative) = current_dirty
+        .iter()
+        .find(|relative| !manifest.files.contains_key(*relative))
+    {
+        return Err(format!(
+            "Cannot safely integrate {relative}: its change was not captured for this worker. The worker worktree was kept."
+        ));
+    }
+
+    let mut changed = Vec::new();
+    for (relative, before) in &manifest.files {
+        if path_contains_symlink(root, relative) {
+            return Err(format!(
+                "Cannot safely integrate {relative}: the worker path contains a symbolic link. The worker worktree was kept."
+            ));
+        }
+        if *before == SnapshotKind::Skipped {
+            return Err(format!(
+                "Cannot safely integrate {relative}: this file type or size cannot be checkpointed. The worker worktree was kept."
+            ));
+        }
+        let before_state = stored_snapshot(
+            dir,
+            relative,
+            *before,
+            false,
+            &manifest.cwd,
+            manifest.mode_format == 1,
+        );
+        if matches!(before_state.0, FileState::Skipped) {
+            return Err(format!("Cannot read original checkpoint for {relative}; the worker was kept for manual review"));
+        }
+        if manifest.touched.contains(relative) {
+            if !manifest.prepared.contains(relative) {
+                return Err(format!(
+                    "Cannot safely integrate {relative}: its pre-edit state was not captured. The worker worktree was kept."
+                ));
+            }
+            let after = manifest
+                .after
+                .get(relative)
+                .copied()
+                .ok_or_else(|| format!("Missing worker snapshot for {relative}"))?;
+            if after == SnapshotKind::Skipped {
+                return Err(format!(
+                    "Cannot safely integrate {relative}: this file type or size cannot be checkpointed. The worker worktree was kept."
+                ));
+            }
+            let after_state = stored_snapshot(
+                dir,
+                relative,
+                after,
+                true,
+                &manifest.cwd,
+                manifest.mode_format == 1,
+            );
+            if matches!(after_state.0, FileState::Skipped) {
+                return Err(format!("Cannot read worker checkpoint for {relative}; the worker was kept for manual review"));
+            }
+            if worktree_snapshot(root, relative, manifest.mode_format == 1) != after_state {
+                return Err(format!(
+                    "Cannot safely integrate {relative}: it changed after the worker checkpoint. The worker worktree was kept."
+                ));
+            }
+            if before_state != after_state {
+                changed.push(relative.clone());
+            }
+        } else if worktree_snapshot(root, relative, manifest.mode_format == 1) != before_state {
+            return Err(format!(
+                "Cannot safely integrate {relative}: its change was not attributed to this worker. The worker worktree was kept."
+            ));
+        }
+    }
+    changed.sort();
+    Ok(changed)
+}
+
+fn write_state(
+    root: &Path,
+    relative: &str,
+    state: FileState,
+    mode: Option<u32>,
+) -> Result<(), String> {
+    let relative = resolve_repo_path(root, relative)?;
+    if path_contains_symlink(root, &relative) {
+        return Err(format!("Cannot write through symbolic link {relative}"));
+    }
+    match state {
+        FileState::Contents(bytes) => {
+            if let Some(location) = wsl::path_location(&host_path(root, &relative))? {
+                let root_location =
+                    wsl::path_location(root)?.ok_or("Missing WSL checkpoint root")?;
+                return wsl::request(
+                    &location,
+                    "restore_bytes",
+                    json!({
+                        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                        "checkpointRoot": root_location.path, "mode": mode,
+                    }),
+                );
+            }
+            let path = root.join(relative);
+            write_worktree(&path, &bytes)?;
+            set_file_mode(&path, mode)
+        }
+        FileState::Missing => remove_worktree(root, &relative),
+        FileState::Skipped => Err(format!("Cannot write unsupported file {relative}")),
+    }
+}
+
+fn stored_snapshot(
+    dir: &Path,
+    relative: &str,
+    kind: SnapshotKind,
+    after: bool,
+    cwd: &str,
+    modes_known: bool,
+) -> (FileState, Option<u32>) {
+    let blob_root = if after {
+        dir.join("after")
+    } else {
+        dir.join("files")
+    };
+    (
+        read_snapshot_at(&blob_root, relative, kind, cwd),
+        if modes_known {
+            snapshot_mode(&blob_root, relative, kind, cwd)
+        } else {
+            None
+        },
+    )
+}
+
+fn worktree_snapshot(root: &Path, relative: &str, modes_known: bool) -> (FileState, Option<u32>) {
+    if !modes_known {
+        return (read_worktree(root, relative), None);
+    }
+    match wsl::path_location(&host_path(root, relative)) {
+        Ok(Some(location)) => {
+            return read_wsl_snapshot(&location).unwrap_or((FileState::Skipped, None))
+        }
+        Err(_) => return (FileState::Skipped, None),
+        Ok(None) => {}
+    }
+    (
+        read_worktree(root, relative),
+        file_mode(&root.join(relative)),
+    )
+}
+
+fn path_contains_symlink(root: &Path, relative: &str) -> bool {
+    match wsl::path_location(root) {
+        Ok(Some(location)) => {
+            return wsl::request(
+                &location,
+                "checkpoint_symlink",
+                json!({"relative": relative}),
+            )
+            .unwrap_or(true)
+        }
+        Err(_) => return true,
+        Ok(None) => {}
+    }
+    let mut current = root.to_path_buf();
+    for part in relative.split('/') {
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+fn git_head(root: &Path) -> Result<Vec<u8>, String> {
+    if let Some(location) = wsl::path_location(root)? {
+        let output = wsl::git(&location, &["rev-parse", "--verify", "HEAD"], None)?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        return Ok(output.stdout);
+    }
+    let mut command = Command::new("git");
+    crate::hide_window_console(&mut command);
+    let output = command
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(output.stdout)
 }
 
 fn diff_from_manifest(
@@ -724,8 +1130,21 @@ fn session_snapshot_differs(dir: &Path, manifest: &Manifest, relative: &str) -> 
     let before = manifest.files.get(relative).copied()?;
     let after = manifest.after.get(relative).copied()?;
     Some(
-        read_snapshot(dir, relative, before, &manifest.cwd)
-            != read_after_snapshot(dir, relative, after, &manifest.cwd),
+        stored_snapshot(
+            dir,
+            relative,
+            before,
+            false,
+            &manifest.cwd,
+            manifest.mode_format == 1,
+        ) != stored_snapshot(
+            dir,
+            relative,
+            after,
+            true,
+            &manifest.cwd,
+            manifest.mode_format == 1,
+        ),
     )
 }
 
@@ -741,7 +1160,6 @@ fn stats_from_status(status: &CheckpointStatus) -> GitDiffStats {
         files: status.files.len() as i64,
         additions,
         deletions,
-        branch: None,
     }
 }
 
@@ -762,7 +1180,15 @@ fn file_differs(
     match manifest.files.get(relative) {
         Some(SnapshotKind::Skipped) => false,
         Some(kind) => {
-            read_worktree(root, relative) != read_snapshot(dir, relative, *kind, &manifest.cwd)
+            worktree_snapshot(root, relative, manifest.mode_format == 1)
+                != stored_snapshot(
+                    dir,
+                    relative,
+                    *kind,
+                    false,
+                    &manifest.cwd,
+                    manifest.mode_format == 1,
+                )
         }
         None => {
             git_dirty.contains(relative)
@@ -889,7 +1315,15 @@ fn after_matches_worktree(dir: &Path, root: &Path, manifest: &Manifest, relative
     let Some(kind) = manifest.after.get(relative).copied() else {
         return false;
     };
-    read_worktree(root, relative) == read_after_snapshot(dir, relative, kind, &manifest.cwd)
+    worktree_snapshot(root, relative, manifest.mode_format == 1)
+        == stored_snapshot(
+            dir,
+            relative,
+            kind,
+            true,
+            &manifest.cwd,
+            manifest.mode_format == 1,
+        )
 }
 
 fn release_path(manifest: &mut Manifest, relative: &str) {
@@ -906,7 +1340,7 @@ fn restore_one(dir: &Path, root: &Path, manifest: &Manifest, relative: &str) -> 
     let relative = resolve_repo_path(root, relative)?;
     match manifest.files.get(&relative) {
         Some(SnapshotKind::Skipped) => Ok(()),
-        Some(kind) => restore_snapshot(dir, root, &relative, *kind),
+        Some(kind) => restore_snapshot(dir, root, &relative, *kind, manifest.mode_format == 1),
         None => revert_new_change(root, &relative),
     }
 }
@@ -916,7 +1350,11 @@ fn restore_snapshot(
     root: &Path,
     relative: &str,
     kind: SnapshotKind,
+    modes_known: bool,
 ) -> Result<(), String> {
+    if kind != SnapshotKind::Skipped && path_contains_symlink(root, relative) {
+        return Err(format!("Cannot restore through symbolic link {relative}"));
+    }
     match kind {
         SnapshotKind::Skipped => Ok(()),
         SnapshotKind::Missing => {
@@ -924,11 +1362,20 @@ fn restore_snapshot(
             remove_worktree(root, relative)
         }
         SnapshotKind::Contents => {
-            let bytes = match read_snapshot(dir, relative, kind, &root.to_string_lossy()) {
-                FileState::Contents(bytes) => bytes,
-                _ => return Ok(()),
-            };
-            write_worktree(&host_path(root, relative), &bytes)?;
+            let (state, mode) = stored_snapshot(
+                dir,
+                relative,
+                kind,
+                false,
+                &root.to_string_lossy(),
+                modes_known,
+            );
+            if !matches!(state, FileState::Contents(_)) {
+                return Err(
+                    "The checkpoint contents are unavailable; the current file was kept".into(),
+                );
+            }
+            write_state(root, relative, state, mode)?;
             let _ = git_checked(root, &["reset", "-q", "HEAD", "--", relative]);
             Ok(())
         }
@@ -969,7 +1416,9 @@ fn snapshot_after_file(dir: &Path, root: &Path, relative: &str) -> Result<Snapsh
 fn snapshot_file_at(blob_root: &Path, root: &Path, relative: &str) -> Result<SnapshotKind, String> {
     let abs = host_path(root, relative);
     if let Some(location) = wsl::path_location(&abs)? {
-        let (kind, bytes) = match read_wsl_state(&location)? {
+        let snapshot = read_wsl_snapshot(&location)?;
+        let mode = snapshot.1;
+        let (kind, bytes) = match snapshot.0 {
             FileState::Missing => (SnapshotKind::Missing, Vec::new()),
             FileState::Contents(bytes) => (SnapshotKind::Contents, bytes),
             FileState::Skipped => return Ok(SnapshotKind::Skipped),
@@ -978,21 +1427,29 @@ fn snapshot_file_at(blob_root: &Path, root: &Path, relative: &str) -> Result<Sna
         if let Some(parent) = blob.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        std::fs::write(blob, bytes).map_err(|e| e.to_string())?;
+        std::fs::write(&blob, bytes).map_err(|e| e.to_string())?;
+        std::fs::write(
+            blob.with_extension("mode"),
+            serde_json::to_vec(&mode).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
         return Ok(kind);
     }
-    if !abs.exists() {
-        let blob = state_blob_path(blob_root, relative, false)?;
-        if let Some(parent) = blob.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let meta = match std::fs::symlink_metadata(&abs) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let blob = state_blob_path(blob_root, relative, false)?;
+            if let Some(parent) = blob.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(blob, []).map_err(|e| e.to_string())?;
+            return Ok(SnapshotKind::Missing);
         }
-        std::fs::write(blob, []).map_err(|e| e.to_string())?;
-        return Ok(SnapshotKind::Missing);
-    }
-    if !abs.is_file() {
+        Err(error) => return Err(error.to_string()),
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
         return Ok(SnapshotKind::Skipped);
     }
-    let meta = std::fs::metadata(&abs).map_err(|e| e.to_string())?;
     if meta.len() > MAX_TEXT_FILE_BYTES {
         return Ok(SnapshotKind::Skipped);
     }
@@ -1002,7 +1459,54 @@ fn snapshot_file_at(blob_root: &Path, root: &Path, relative: &str) -> Result<Sna
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(&blob, bytes).map_err(|e| e.to_string())?;
+    set_file_mode(&blob, file_mode(&abs))?;
     Ok(SnapshotKind::Contents)
+}
+
+#[cfg(unix)]
+fn file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.is_file() && !meta.file_type().is_symlink())
+        .map(|meta| meta.permissions().mode() & 0o777)
+}
+
+#[cfg(not(unix))]
+fn file_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn set_file_mode(path: &Path, mode: Option<u32>) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(mode) = mode {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_file_mode(_path: &Path, _mode: Option<u32>) -> Result<(), String> {
+    Ok(())
+}
+
+fn snapshot_mode(blob_root: &Path, relative: &str, kind: SnapshotKind, cwd: &str) -> Option<u32> {
+    if kind != SnapshotKind::Contents {
+        return None;
+    }
+    if wsl::location(cwd).ok().flatten().is_some() {
+        let path = state_blob_path(blob_root, relative, true).ok()?;
+        return std::fs::read(path.with_extension("mode"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Option<u32>>(&bytes).ok())
+            .flatten()
+            .filter(|mode| *mode <= 0o777);
+    }
+    state_blob_path(blob_root, relative, false)
+        .ok()
+        .and_then(|path| file_mode(&path))
 }
 
 fn read_snapshot(dir: &Path, relative: &str, kind: SnapshotKind, cwd: &str) -> FileState {
@@ -1026,18 +1530,22 @@ fn read_snapshot_at(blob_root: &Path, relative: &str, kind: SnapshotKind, cwd: &
         .and_then(|path| std::fs::read(path).ok())
         {
             Some(bytes) => FileState::Contents(bytes),
-            None => FileState::Missing,
+            None => FileState::Skipped,
         },
     }
 }
 
 fn read_wsl_state(location: &wsl::Location) -> Result<FileState, String> {
-    let value: serde_json::Value = wsl::request(location, "diff_file", json!({}))?;
+    read_wsl_snapshot(location).map(|value| value.0)
+}
+
+fn read_wsl_snapshot(location: &wsl::Location) -> Result<(FileState, Option<u32>), String> {
+    let value: serde_json::Value = wsl::request(location, "checkpoint_file", json!({}))?;
     if value["exists"] == false {
-        return Ok(FileState::Missing);
+        return Ok((FileState::Missing, None));
     }
     if value["isFile"] != true || value["tooLarge"] == true {
-        return Ok(FileState::Skipped);
+        return Ok((FileState::Skipped, None));
     }
     base64::engine::general_purpose::STANDARD
         .decode(
@@ -1045,7 +1553,15 @@ fn read_wsl_state(location: &wsl::Location) -> Result<FileState, String> {
                 .as_str()
                 .ok_or("Missing checkpoint contents")?,
         )
-        .map(FileState::Contents)
+        .map(|bytes| {
+            (
+                FileState::Contents(bytes),
+                value["mode"]
+                    .as_u64()
+                    .filter(|mode| *mode <= 0o777)
+                    .map(|mode| mode as u32),
+            )
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -1165,7 +1681,10 @@ fn project_root(cwd: &str) -> Result<PathBuf, String> {
         return Err("cwd is required".into());
     }
     if let Some(location) = wsl::location(trimmed)? {
-        return wsl::path_request(&location, "canonical_directory", json!({})).map(PathBuf::from);
+        // Validate on the guest, but retain the chosen cwd as native checkpoints
+        // do. Canonicalizing only this side breaks symlink cwd/tool identities.
+        wsl::path_request(&location, "canonical_directory", json!({}))?;
+        return Ok(PathBuf::from(location.identity()));
     }
     let root = expand_home(trimmed);
     if !root.is_dir() {
@@ -1419,6 +1938,32 @@ pub(crate) mod tests {
     pub(crate) fn verify_wsl_round_trip(cwd: &str) {
         let (_dir, store) = store();
         let root = project_root(cwd).unwrap();
+        // A chosen symlink cwd must retain its baseline and accept absolute
+        // tool paths in that same namespace, just like native checkpoints.
+        let location = wsl::location(cwd).unwrap().unwrap();
+        let alias = PathBuf::from(&location.path).join("checkpoint-alias");
+        std::os::unix::fs::symlink(&location.path, &alias).unwrap();
+        let alias_cwd = location
+            .with_path(&alias.to_string_lossy())
+            .unwrap()
+            .identity();
+        let alias_file = alias.join("alias-baseline.txt");
+        std::fs::write(&alias_file, "before\n").unwrap();
+        store.ensure("alias", &alias_cwd).unwrap();
+        let tool_path = alias_file.to_string_lossy().into_owned();
+        store
+            .prepare("alias", &alias_cwd, std::slice::from_ref(&tool_path))
+            .unwrap();
+        std::fs::write(&alias_file, "after\n").unwrap();
+        store.capture("alias", &alias_cwd, &[tool_path]).unwrap();
+        store.ensure("alias", &alias_cwd).unwrap();
+        let diff = store
+            .file_diff("alias", &alias_cwd, "alias-baseline.txt")
+            .unwrap();
+        assert_eq!(diff.original, "before\n");
+        assert_eq!(diff.current, "after\n");
+        std::fs::remove_file(alias_file).unwrap();
+        std::fs::remove_file(alias).unwrap();
         let file = "Renamed ü.txt";
         write_worktree(&host_path(&root, file), b"user-dirty\n").unwrap();
         store.ensure("wsl", cwd).unwrap();
@@ -1950,6 +2495,313 @@ pub(crate) mod tests {
         assert_eq!(s1.additions, 1);
         assert_eq!(s1.deletions, 0);
         assert_eq!(relatives(&store.status("s1", &cwd).unwrap()), vec!["a.txt"]);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn verify_wsl_integration(cwd: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let host = wsl::location(cwd).unwrap().unwrap();
+        let source = PathBuf::from(&host.path).join("checkpoint-apply-source");
+        let target = PathBuf::from(&host.path).join("checkpoint-apply-target");
+        std::fs::create_dir(&source).unwrap();
+        assert!(init_git_commit(
+            &source,
+            &[
+                ("script.sh", "head\n"),
+                ("mode.sh", "same\n"),
+                ("deleted.txt", "head\n")
+            ]
+        ));
+        assert!(git(
+            &source,
+            &["clone", source.to_str().unwrap(), target.to_str().unwrap()]
+        ));
+        std::fs::write(source.join("script.sh"), "baseline\n").unwrap();
+        std::fs::write(target.join("script.sh"), "baseline\n").unwrap();
+        let from = host.with_path(source.to_str().unwrap()).unwrap().identity();
+        let to = host.with_path(target.to_str().unwrap()).unwrap().identity();
+        let (_dir, store) = store();
+        store.ensure("guest-worker", &from).unwrap();
+        assert!(store.cleanup_safe("guest-worker", &from).unwrap());
+        let files = vec!["script.sh".into(), "mode.sh".into(), "deleted.txt".into()];
+        store.prepare("guest-worker", &from, &files).unwrap();
+        std::fs::write(source.join("script.sh"), "worker result\n").unwrap();
+        for file in ["script.sh", "mode.sh"] {
+            std::fs::set_permissions(source.join(file), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        std::fs::remove_file(source.join("deleted.txt")).unwrap();
+        store.capture("guest-worker", &from, &files).unwrap();
+        assert!(!store.cleanup_safe("guest-worker", &from).unwrap());
+        assert!(store
+            .status("guest-worker", &from)
+            .unwrap()
+            .files
+            .iter()
+            .any(|file| file.relative == "mode.sh" && file.undoable));
+        assert_eq!(
+            store.apply("guest-worker", &from, &to).unwrap().files.len(),
+            3
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("script.sh")).unwrap(),
+            "worker result\n"
+        );
+        assert!(!target.join("deleted.txt").exists());
+        for file in ["script.sh", "mode.sh"] {
+            assert_eq!(
+                std::fs::metadata(target.join(file))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
+        assert_eq!(
+            store
+                .apply("guest-worker", &from, &to)
+                .unwrap()
+                .already_applied,
+            3
+        );
+        let outside = PathBuf::from(&host.path).join("outside-checkpoint.txt");
+        std::fs::write(&outside, "untouched").unwrap();
+        std::fs::remove_file(target.join("script.sh")).unwrap();
+        std::os::unix::fs::symlink(&outside, target.join("script.sh")).unwrap();
+        assert!(store
+            .apply("guest-worker", &from, &to)
+            .unwrap_err()
+            .contains("symbolic link"));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+        let other = wsl::Location::new("OtherDistribution", source.to_str().unwrap()).unwrap();
+        assert!(store
+            .apply("guest-worker", &from, &other.identity())
+            .unwrap_err()
+            .contains("same execution host"));
+        crate::worktrees::tests::verify_wsl_seeded(&from);
+        store.undo("guest-worker", &from, Some("mode.sh")).unwrap();
+        assert_eq!(
+            std::fs::metadata(source.join("mode.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        std::fs::remove_file(source.join("script.sh")).unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("script.sh")).unwrap();
+        assert!(restore_snapshot(
+            &store.session_dir("guest-worker"),
+            Path::new(&from),
+            "script.sh",
+            SnapshotKind::Contents,
+            true
+        )
+        .is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_checkpoint_modes_are_not_inferred_from_blob_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        for legacy in [true, false] {
+            let source = tmp("mode-compatibility");
+            assert!(init_git_commit(&source.0, &[("script.sh", "head\n")]));
+            let file = source.0.join("script.sh");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let from = source.0.to_string_lossy().into_owned();
+            let (_dir, store) = store();
+            store.ensure("compat", &from).unwrap();
+            store
+                .prepare("compat", &from, &["script.sh".into()])
+                .unwrap();
+            let dir = store.session_dir("compat");
+            if legacy {
+                let path = dir.join("manifest.json");
+                let mut saved: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                saved.as_object_mut().unwrap().remove("modeFormat");
+                std::fs::write(path, serde_json::to_vec(&saved).unwrap()).unwrap();
+                // Old builds created ordinary 0644 blobs for executable files.
+                std::fs::set_permissions(
+                    dir.join("files/script.sh"),
+                    std::fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+            } else {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            std::fs::write(&file, "worker\n").unwrap();
+            store
+                .capture("compat", &from, &["script.sh".into()])
+                .unwrap();
+            assert!(store
+                .status("compat", &from)
+                .unwrap()
+                .files
+                .iter()
+                .any(|file| file.undoable));
+            if legacy {
+                assert!(!store.cleanup_safe("compat", &from).unwrap());
+            }
+            store.undo("compat", &from, Some("script.sh")).unwrap();
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "head\n");
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_mode_only_review_undo_and_symlink_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+        let source = tmp("mode-review");
+        assert!(init_git_commit(&source.0, &[("script.sh", "head\n")]));
+        let from = source.0.to_string_lossy().into_owned();
+        let (_dir, store) = store();
+        store.ensure("mode", &from).unwrap();
+        store.prepare("mode", &from, &["script.sh".into()]).unwrap();
+        std::fs::set_permissions(
+            source.0.join("script.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        store.capture("mode", &from, &["script.sh".into()]).unwrap();
+        assert!(store
+            .status("mode", &from)
+            .unwrap()
+            .files
+            .iter()
+            .any(|file| file.relative == "script.sh" && file.undoable));
+        store.undo("mode", &from, Some("script.sh")).unwrap();
+        assert_eq!(
+            std::fs::metadata(source.0.join("script.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        store.prepare("mode", &from, &["script.sh".into()]).unwrap();
+        let outside = source.0.join("outside");
+        std::fs::write(&outside, "untouched").unwrap();
+        std::fs::remove_file(source.0.join("script.sh")).unwrap();
+        std::os::unix::fs::symlink(&outside, source.0.join("script.sh")).unwrap();
+        assert!(restore_snapshot(
+            &store.session_dir("mode"),
+            &source.0,
+            "script.sh",
+            SnapshotKind::Contents,
+            true
+        )
+        .is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+    }
+
+    #[test]
+    fn isolated_worker_delta_applies_idempotently_to_matching_baseline() {
+        let source = tmp("apply-source");
+        let target = tmp("apply-target");
+        if !init_git_commit(&source.0, &[("a.txt", "head\n")]) {
+            return;
+        }
+        let source_path = source.0.to_string_lossy().into_owned();
+        let target_path = target.0.to_string_lossy().into_owned();
+        if !git(&source.0, &["clone", &source_path, &target_path]) {
+            return;
+        }
+        std::fs::write(source.0.join("a.txt"), "user baseline\n").unwrap();
+        std::fs::write(target.0.join("a.txt"), "user baseline\n").unwrap();
+        let from = source.0.to_string_lossy().into_owned();
+        let to = target.0.to_string_lossy().into_owned();
+        let (_root, store) = store();
+
+        store.ensure("worker", &from).unwrap();
+        assert!(store.cleanup_safe("worker", &from).unwrap());
+        store.prepare("worker", &from, &["a.txt".into()]).unwrap();
+        std::fs::write(source.0.join("a.txt"), "worker result\n").unwrap();
+        store.capture("worker", &from, &["a.txt".into()]).unwrap();
+        assert!(!store.cleanup_safe("worker", &from).unwrap());
+
+        let applied = store.apply("worker", &from, &to).unwrap();
+        assert_eq!(applied.files, ["a.txt"]);
+        assert_eq!(applied.already_applied, 0);
+        assert_eq!(
+            std::fs::read_to_string(target.0.join("a.txt")).unwrap(),
+            "worker result\n"
+        );
+        let retried = store.apply("worker", &from, &to).unwrap();
+        assert_eq!(retried.already_applied, 1);
+    }
+
+    #[test]
+    fn missing_checkpoint_contents_never_become_an_absent_baseline() {
+        for blob in ["files/a.txt", "after/a.txt"] {
+            let source = tmp("missing-blob-source");
+            let target = tmp("missing-blob-target");
+            assert!(init_git_commit(&source.0, &[("a.txt", "head\n")]));
+            let from = source.0.to_string_lossy().into_owned();
+            let to = target.0.to_string_lossy().into_owned();
+            assert!(git(&source.0, &["clone", &from, &to]));
+            let (_root, store) = store();
+            store.ensure("worker", &from).unwrap();
+            store.prepare("worker", &from, &["a.txt".into()]).unwrap();
+            std::fs::write(source.0.join("a.txt"), "worker\n").unwrap();
+            store.capture("worker", &from, &["a.txt".into()]).unwrap();
+            std::fs::remove_file(store.session_dir("worker").join(blob)).unwrap();
+            std::fs::remove_file(target.0.join("a.txt")).unwrap();
+            assert!(store.apply("worker", &from, &to).is_err());
+            assert!(!target.0.join("a.txt").exists());
+            assert_eq!(
+                std::fs::read_to_string(source.0.join("a.txt")).unwrap(),
+                "worker\n"
+            );
+            assert!(!store.cleanup_safe("worker", &from).unwrap());
+        }
+    }
+
+    #[test]
+    fn isolated_worker_integration_keeps_both_sides_on_conflict_or_unknown_edit() {
+        let source = tmp("apply-conflict-source");
+        let target = tmp("apply-conflict-target");
+        if !init_git_commit(&source.0, &[("a.txt", "head\n")]) {
+            return;
+        }
+        let source_path = source.0.to_string_lossy().into_owned();
+        let target_path = target.0.to_string_lossy().into_owned();
+        if !git(&source.0, &["clone", &source_path, &target_path]) {
+            return;
+        }
+        let from = source.0.to_string_lossy().into_owned();
+        let to = target.0.to_string_lossy().into_owned();
+        let (_root, store) = store();
+        store.ensure("worker", &from).unwrap();
+        store.prepare("worker", &from, &["a.txt".into()]).unwrap();
+        std::fs::write(source.0.join("a.txt"), "worker\n").unwrap();
+        store.capture("worker", &from, &["a.txt".into()]).unwrap();
+        std::fs::write(target.0.join("a.txt"), "lead changed\n").unwrap();
+
+        let conflict = store.apply("worker", &from, &to).unwrap_err();
+        assert!(conflict.contains("lead checkout changed"));
+        assert_eq!(
+            std::fs::read_to_string(source.0.join("a.txt")).unwrap(),
+            "worker\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.0.join("a.txt")).unwrap(),
+            "lead changed\n"
+        );
+
+        std::fs::write(source.0.join("unreported.txt"), "unknown\n").unwrap();
+        assert!(!store.cleanup_safe("worker", &from).unwrap());
+        assert!(store
+            .apply("worker", &from, &to)
+            .unwrap_err()
+            .contains("not captured"));
     }
 
     #[test]

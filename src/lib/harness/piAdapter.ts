@@ -12,8 +12,6 @@ import { refreshPiCatalog } from "./piCatalog";
 import { generatePiSessionTitle } from "./piTitle";
 import { warmupPiText } from "./piText";
 import { registerHarness, type HarnessAdapter } from "./registry";
-import { canSteerSession, respondQuestion } from "./piFamily";
-import { PI_FLAVOR } from "./piFlavor";
 import { discoverPiSkills } from "./piSkills";
 
 export const piAdapter: HarnessAdapter = {
@@ -23,8 +21,6 @@ export const piAdapter: HarnessAdapter = {
   sendTurn: sendPiTurn,
   compactContext: compactPiContext,
   steerTurn: steerPiTurn,
-  canSteerSession: (id) => canSteerSession(PI_FLAVOR, id),
-  respondQuestion: (id, requestId, reply) => respondQuestion(PI_FLAVOR, id, requestId, reply),
   cancelTurn: cancelPiTurn,
   respondApproval: respondPiApproval,
   stopSession: stopPiSession,

@@ -3,7 +3,10 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashSet, fs, io::Read, path::PathBuf, time::Duration};
-use tauri::{AppHandle, Manager, Url};
+use tauri::{AppHandle, Emitter, Manager, Url};
+
+static CONFIG_WRITES: crate::integration_config::ConfigWrites =
+    crate::integration_config::ConfigWrites::new();
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct AzureConfig {
@@ -113,6 +116,13 @@ pub(crate) fn require_config(app: &AppHandle, site: &str) -> Result<AzureConfig,
         return Err("Azure connection changed. Refresh and retry.".into());
     }
     Ok(config)
+}
+
+fn require_account(config: &AzureConfig, expected: &str) -> Result<(), String> {
+    if expected.is_empty() || expected != config.account_id {
+        return Err("The Azure account changed. Refresh and reselect the item.".into());
+    }
+    Ok(())
 }
 
 fn http_error(status: u16) -> String {
@@ -251,14 +261,12 @@ pub async fn azure_set_config(
     project: String,
     token: String,
 ) -> Result<Value, String> {
+    let generation = CONFIG_WRITES.begin()?;
     tauri::async_runtime::spawn_blocking(move || {
         let path = config_path(&app)?;
         if token.is_empty() {
-            match fs::remove_file(path) {
-                Ok(()) => (),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                Err(_) => return Err("Cannot disconnect Azure DevOps".into()),
-            }
+            CONFIG_WRITES.commit(generation, &path, None)?;
+            let _ = app.emit("monocode:azure-change", ());
             return azure_status(app);
         }
         if token.trim().is_empty() || token.len() > 4096 || token.chars().any(char::is_control) {
@@ -317,15 +325,9 @@ pub async fn azure_set_config(
         if config.capabilities.is_empty() {
             return Err("Azure account authenticated, but no read capability was verified. Check the project and grant Work Items (Read) for Boards Code (Read) for Repos, or Build (Read) for Pipelines. Existing connection was preserved.".into());
         }
-        fs::create_dir_all(path.parent().ok_or("Cannot locate Azure settings")?)
-            .map_err(|_| "Cannot create Azure settings")?;
-        let temporary = path.with_extension("tmp");
-        crate::gitlab::write_secret_file(
-            &temporary,
-            &serde_json::to_string(&config).map_err(|_| "Cannot encode Azure settings")?,
-        )
-        .map_err(|_| "Cannot save Azure settings")?;
-        fs::rename(temporary, path).map_err(|_| "Cannot save Azure settings")?;
+        let raw = serde_json::to_string(&config).map_err(|_| "Cannot encode Azure settings")?;
+        CONFIG_WRITES.commit(generation, &path, Some(&raw))?;
+        let _ = app.emit("monocode:azure-change", ());
         Ok(config.status())
     })
     .await
@@ -349,12 +351,14 @@ fn query_ids(result: &Value) -> Result<Vec<u64>, String> {
 pub async fn azure_list_items(
     app: AppHandle,
     site: String,
+    account_id: String,
     project: String,
     query: String,
     assigned: bool,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
+        require_account(&config, &account_id)?;
         let project = project_path(&project)?;
         let query_result = if query.is_empty() {
             let predicate = if assigned { " AND [System.AssignedTo] = @Me" } else { "" };
@@ -364,11 +368,15 @@ pub async fn azure_list_items(
             request(&config, &format!("{project}/_apis/wit/wiql/{query}"), &[("api-version", "7.1".into()), ("$top", "100".into())], None)?
         };
         let ids = query_ids(&query_result)?;
-        if ids.is_empty() { return Ok(json!({"site":config.site,"items":[]})); }
+        if ids.is_empty() {
+            require_account(&require_config(&app, &site)?, &account_id)?;
+            return Ok(json!({"site":config.site,"items":[]}));
+        }
         let batch = request(&config, "_apis/wit/workitemsbatch", &version(), Some(json!({"ids":ids,"fields":["System.Id","System.Title","System.State","System.WorkItemType","System.TeamProject","System.ChangedDate","System.Tags","System.AssignedTo"],"errorPolicy":"Fail"})))?;
         let mut items = batch["value"].as_array().ok_or("Azure returned an invalid work-item batch")?.clone();
         items.truncate(100);
         attach_state_categories(&config, &mut items);
+        require_account(&require_config(&app, &site)?, &account_id)?;
         Ok(json!({"site":config.site,"items":items}))
     }).await.map_err(|_| "Azure list task failed")?
 }
@@ -553,12 +561,14 @@ fn flatten_queries(rows: &[Value], depth: usize, result: &mut Vec<Value>) {
 pub async fn azure_options(
     app: AppHandle,
     site: String,
+    account_id: String,
     project: String,
     queries: bool,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
-        if queries {
+        require_account(&config, &account_id)?;
+        let result = if queries {
             let page = request(
                 &config,
                 &format!("{}/_apis/wit/queries", project_path(&project)?),
@@ -575,7 +585,7 @@ pub async fn azure_options(
                 0,
                 &mut result,
             );
-            Ok(json!(result))
+            json!(result)
         } else {
             // ponytail: bounded first 100 projects; direct project entry in Settings handles larger organizations.
             let page = request(
@@ -584,14 +594,16 @@ pub async fn azure_options(
                 &[("api-version", "7.1".into()), ("$top", "100".into())],
                 None,
             )?;
-            Ok(json!(page["value"]
+            json!(page["value"]
                 .as_array()
                 .ok_or("Invalid Azure project list")?
                 .iter()
                 .take(100)
                 .map(|p| json!({"id":p["name"],"name":p["name"]}))
-                .collect::<Vec<_>>()))
-        }
+                .collect::<Vec<_>>())
+        };
+        require_account(&require_config(&app, &site)?, &account_id)?;
+        Ok(result)
     })
     .await
     .map_err(|_| "Azure options task failed")?
@@ -673,13 +685,15 @@ fn comment_pages(
 pub async fn azure_item_content(
     app: AppHandle,
     site: String,
+    account_id: String,
     id: String,
     discussion: bool,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
+        require_account(&config, &account_id)?;
         let item = item(&config, &id)?;
-        if discussion {
+        let result = if discussion {
             let mut discussion = comments(
                 &config,
                 item["fields"]["System.TeamProject"]
@@ -695,144 +709,30 @@ pub async fn azure_item_content(
                     .as_array()
                     .ok_or("Invalid Azure comments")?
             ));
-            Ok(discussion)
+            discussion
         } else {
             let mut item = item;
             item["attachments"] = json!(attachments(&config, &item, &[]));
-            Ok(item)
-        }
+            item
+        };
+        require_account(&require_config(&app, &site)?, &account_id)?;
+        Ok(result)
     })
     .await
     .map_err(|_| "Azure details task failed")?
-}
-
-/// Only work-item links become relations; attachments, hyperlinks and
-/// artifacts are already shown elsewhere in the detail pane.
-fn relation_target_id(site: &str, url: &str) -> Option<u64> {
-    // Azure echoes the organization segment verbatim; compare it loosely.
-    // `get` avoids panicking when `site.len()` lands inside a multi-byte char.
-    let head = url.get(..site.len())?;
-    if !head.eq_ignore_ascii_case(site) || url.as_bytes().get(site.len()) != Some(&b'/') {
-        return None;
-    }
-    let rest = &url[site.len() + 1..];
-    let (path, id) = rest.rsplit_once('/')?;
-    if !path.to_ascii_lowercase().ends_with("_apis/wit/workitems") {
-        return None;
-    }
-    let id: u64 = id.parse().ok()?;
-    (id > 0).then_some(id)
-}
-
-fn relation_key(rel: &str, name: &str) -> String {
-    match rel {
-        "System.LinkTypes.Hierarchy-Reverse" => "parent".into(),
-        "System.LinkTypes.Hierarchy-Forward" => "children".into(),
-        "System.LinkTypes.Related" => "related".into(),
-        "System.LinkTypes.Duplicate-Forward" | "System.LinkTypes.Duplicate-Reverse" => {
-            "duplicate".into()
-        }
-        _ => {
-            let name = name.trim();
-            if name.is_empty() {
-                rel.to_string()
-            } else {
-                name.to_ascii_lowercase()
-            }
-        }
-    }
-}
-
-#[tauri::command]
-pub async fn azure_item_relations(
-    app: AppHandle,
-    site: String,
-    id: String,
-) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let config = require_config(&app, &site)?;
-        let source = item(&config, &id)?;
-        let mut edges = Vec::new();
-        let mut ids = Vec::new();
-        let mut seen = HashSet::new();
-        let mut truncated = false;
-        if let Some(relations) = source["relations"].as_array() {
-            truncated = relations.len() > 50;
-            for relation in relations.iter().take(50) {
-                let rel = relation["rel"].as_str().unwrap_or_default();
-                if !rel.starts_with("System.LinkTypes.") {
-                    continue;
-                }
-                let Some(target) =
-                    relation_target_id(&config.site, relation["url"].as_str().unwrap_or_default())
-                else {
-                    continue;
-                };
-                let name = relation["attributes"]["name"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim();
-                let name = if name.is_empty() { "related" } else { name };
-                edges.push((target, relation_key(rel, name), name));
-                if seen.insert(target) {
-                    ids.push(target);
-                }
-            }
-        }
-        // Unreadable or deleted targets stay identifiable without fabricating
-        // titles: `errorPolicy: omit` drops them from the batch.
-        let mut by_id = std::collections::HashMap::new();
-        if !ids.is_empty() {
-            let batch = request(
-                &config,
-                "_apis/wit/workitemsbatch",
-                &version(),
-                Some(json!({
-                    "ids": ids,
-                    "fields": ["System.Id","System.Title","System.State","System.WorkItemType","System.TeamProject","System.ChangedDate","System.Tags","System.AssignedTo"],
-                    "errorPolicy": "omit"
-                })),
-            )?;
-            let mut rows: Vec<Value> = batch["value"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .take(200)
-                .cloned()
-                .collect();
-            attach_state_categories(&config, &mut rows);
-            for row in rows {
-                if let Some(id) = row["id"].as_u64() {
-                    by_id.insert(id, row);
-                }
-            }
-        }
-        Ok(json!({
-            "edges": edges
-                .iter()
-                .map(|(target, key, name)| json!({
-                    "key": key,
-                    "label": name,
-                    "ref": format!("#{target}"),
-                    "item": by_id.get(target).cloned().unwrap_or(Value::Null),
-                }))
-                .collect::<Vec<_>>(),
-            "truncated": truncated,
-        }))
-    })
-    .await
-    .map_err(|_| "Azure relations task failed")?
 }
 
 #[tauri::command]
 pub async fn azure_image(
     app: AppHandle,
     site: String,
+    account_id: String,
     id: String,
     attachment_id: String,
 ) -> Result<tauri::ipc::Response, String> {
     let bytes = tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
+        require_account(&config, &account_id)?;
         let item = item(&config, &id)?;
         let mut files = attachments(&config, &item, &[]);
         if !files.iter().any(|f| f["id"] == attachment_id) {
@@ -845,7 +745,8 @@ pub async fn azure_image(
         if response.status() != 200 { return Err("Azure image was redirected or unavailable".to_string()); }
         let mut bytes = Vec::new();
         response.into_reader().take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|_| "Cannot read Azure image")?;
-        if bytes.len() > 2 * 1024 * 1024 || crate::inbox_context::image_mime(&bytes).is_none() { return Err("Image exceeds the 2 MiB preview limit or uses an unsupported format. Open it in Azure DevOps.".into()); }
+        if bytes.len() > 2 * 1024 * 1024 || crate::inbox_media::image_mime(&bytes).is_none() { return Err("Image exceeds the 2 MiB preview limit or uses an unsupported format. Open it in Azure DevOps.".into()); }
+        require_account(&require_config(&app, &site)?, &account_id)?;
         Ok(bytes)
     }).await.map_err(|_| "Azure image task failed")??;
     Ok(tauri::ipc::Response::new(bytes))
@@ -854,6 +755,20 @@ pub async fn azure_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_item_reads_require_the_displayed_account() {
+        let config: AzureConfig = serde_json::from_value(json!({
+            "site": "https://dev.azure.com/team", "project": "Project",
+            "account": "Same Name", "account_id": "account-a", "token": "test-only"
+        }))
+        .unwrap();
+        assert!(require_account(&config, "account-a").is_ok());
+        for foreign in ["", "Same Name", "account-b"] {
+            assert!(require_account(&config, foreign).is_err());
+        }
+    }
+
     #[test]
     fn existing_connections_keep_boards_and_repos_capabilities_are_explicit() {
         let old = json!({"site":"https://dev.azure.com/team","project":"Project","account":"Ada","account_id":"ada","token":"secret"});
@@ -864,46 +779,6 @@ mod tests {
         let repos: AzureConfig = serde_json::from_value(current).unwrap();
         assert_eq!(repos.status()["capabilities"], json!(["Repos"]));
         assert!(!repos.status().to_string().contains("secret"));
-    }
-
-    #[test]
-    fn relation_targets_stay_in_the_connected_org() {
-        let site = "https://dev.azure.com/team";
-        assert_eq!(
-            relation_target_id(
-                site,
-                "https://dev.azure.com/team/94b15380/_apis/wit/workItems/42"
-            ),
-            Some(42)
-        );
-        for url in [
-            "https://dev.azure.com/other/94b15380/_apis/wit/workItems/42",
-            "https://dev.azure.com/team/94b15380/_apis/wit/attachments/42",
-            "https://dev.azure.com/team/_apis/wit/workItems/abc",
-            "not a url",
-        ] {
-            assert_eq!(relation_target_id(site, url), None);
-        }
-        assert_eq!(
-            relation_key("System.LinkTypes.Hierarchy-Reverse", "Parent"),
-            "parent"
-        );
-        assert_eq!(
-            relation_key("System.LinkTypes.Hierarchy-Forward", "Child"),
-            "children"
-        );
-        assert_eq!(
-            relation_key("System.LinkTypes.Related", "Related"),
-            "related"
-        );
-        assert_eq!(
-            relation_key("System.LinkTypes.Duplicate-Forward", "Duplicate"),
-            "duplicate"
-        );
-        assert_eq!(
-            relation_key("System.LinkTypes.Dependency-Forward", "Successor"),
-            "successor"
-        );
     }
 
     #[test]

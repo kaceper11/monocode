@@ -1,22 +1,73 @@
 //! Untrusted page preview hosted in a native child webview per browser tab.
 //!
-//! Security boundary: the page is remote content — Tauri already rejects
-//! every invoke from a non-local origin, and `on_navigation` additionally
-//! refuses the app's own origin so a page can never become "local". Only
-//! http(s) is allowed; popups, downloads and external protocols are denied
-//! explicitly and surfaced to the tab as events.
+//! Archived browser capabilities adapted to a browser-owned raw Wry child.
+//! The child has no Tauri protocols, initialization or command dispatcher.
+//!
+//! Remote pages have no app protocol or command dispatcher. Their sole IPC
+//! message is a notification that this browser pane received focus; it grants
+//! no filesystem, credential, agent, clipboard or other app access. Navigation
+//! to app origins is refused, and popups/downloads are reported but denied.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{
-    utils::config::Color,
-    webview::{DownloadEvent, NewWindowResponse, PageLoadEvent, WebviewBuilder},
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Rect, Runtime, Url, WebviewUrl,
-    Window,
-};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use tauri::{utils::config::Color, AppHandle, Emitter, Manager, Runtime, Url, Window};
+use wry::{NewWindowResponse, PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder};
+
+struct BrowserInstance {
+    view: WebView,
+    alive: Rc<Cell<bool>>,
+    // Drop the view before its persistent engine context, on the UI thread.
+    _context: WebContext,
+}
+impl Drop for BrowserInstance {
+    fn drop(&mut self) {
+        self.alive.set(false);
+    }
+}
+thread_local! {
+    static VIEWS: RefCell<HashMap<String, BrowserInstance>> = RefCell::default();
+    #[cfg(target_os = "linux")]
+    static CONTAINERS: RefCell<HashMap<String, gtk::Fixed>> = RefCell::default();
+}
+
+async fn on_ui<T: Send + 'static>(
+    window: Window,
+    task: impl FnOnce(Window) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let owner = window.clone();
+    window
+        .run_on_main_thread(move || {
+            let _ = tx.send(task(owner));
+        })
+        .map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || rx.recv())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?
+}
+
+async fn with_view<T: Send + 'static>(
+    window: Window,
+    label: String,
+    task: impl FnOnce(&WebView) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    on_ui(window, move |window| {
+        VIEWS.with(|views| {
+            let views = views.borrow();
+            let instance = views
+                .get(&history_key(window.label(), &label))
+                .ok_or("Browser tab is no longer open")?;
+            task(&instance.view)
+        })
+    })
+    .await
+}
 
 pub const EVENT: &str = "monocode:browser";
 const MAX_HISTORY: usize = 64;
@@ -24,8 +75,7 @@ const MAX_URL_LEN: usize = 8192;
 const MAX_LABEL_LEN: usize = 120;
 const MAX_TITLE_LEN: usize = 200;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
-/// Hosts where Tauri serves local content: navigating there would make the
-/// page "local" and hand it invoke authority.
+/// App-owned origins are excluded even though this raw child has no app IPC.
 const LOCAL_HOSTS: [&str; 2] = ["tauri.localhost", "asset.localhost"];
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Rust-side bounds on untrusted page output — the page decides what the
@@ -46,11 +96,10 @@ const MAX_SCREENSHOT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Page-local console ring buffer plus an opt-in interaction trail.
 /// Injected before any page script runs; it writes into the page's own
-/// context only — nothing calls back into the app, so the security
-/// boundary is unchanged. The trail is gated by `__monocodeRec` (toggled
-/// via `browser_set_recording`) and both flag and trail persist in
-/// sessionStorage, so same-origin navigations keep recording while a
-/// different origin can neither read the steps nor keep the session.
+/// context only. Focus/recorder-ready notifications carry no page data.
+/// The trail is gated by `__monocodeRec` (toggled
+/// via `browser_set_recording`). Only the trail persists in sessionStorage;
+/// the app must acknowledge continuation after navigation or BFCache restore.
 const PAGE_TAP_SCRIPT: &str = r#"(() => {
   // wry injects init scripts into subframes on Windows; the trail lives in
   // sessionStorage, which same-origin iframes share — restrict everything
@@ -163,56 +212,83 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
       return true;
     }
   };
-  let trail = [];
-  try {
-    const saved = JSON.parse(sessionStorage.getItem(TRAIL_KEY) || "[]");
-    if (Array.isArray(saved)) {
-      trail = saved.filter(
+  const readTrail = () => {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(TRAIL_KEY) || "[]");
+      if (Array.isArray(saved)) return saved.filter(
         (e) =>
           e &&
           typeof e.text === "string" &&
           typeof e.at === "number" &&
           isFinite(e.at),
-      );
-    }
-  } catch (e) {}
+      ).slice(-TRAIL_CAP);
+    } catch (e) {}
+    return [];
+  };
+  let trail = readTrail();
+  const continuationHint = () => {
+    try { return sessionStorage.getItem(REC_KEY) === "1"; } catch (e) { return false; }
+  };
+  let awaitingResume = continuationHint();
+  let pending = [];
   const saveTrail = () => {
     try {
       sessionStorage.setItem(TRAIL_KEY, JSON.stringify(trail.slice(-TRAIL_CAP)));
     } catch (e) {}
   };
-  try {
-    window.__monocodeRec = sessionStorage.getItem(REC_KEY) === "1";
-  } catch (e) {
-    window.__monocodeRec = false;
-  }
+  // Never revive a stale origin's recording flag after Back or a new mount.
+  window.__monocodeRec = false;
   const step = (text) => {
     try {
-      if (!window.__monocodeRec) return;
-      trail.push({ at: Date.now(), text: String(text).slice(0, 240) });
-      if (trail.length > TRAIL_CAP) trail.splice(0, trail.length - TRAIL_CAP);
-      saveTrail();
+      if (!window.__monocodeRec && !awaitingResume) return;
+      // A prior opt-in is only a hint. Early redacted steps stay in a bounded
+      // private buffer, never persisted/captured until the owner authorizes
+      // same-origin continuation. A stop or fresh recording discards them.
+      const target = window.__monocodeRec ? trail : pending;
+      target.push({ at: Date.now(), text: String(text).slice(0, 240) });
+      if (target.length > TRAIL_CAP) target.splice(0, target.length - TRAIL_CAP);
+      if (window.__monocodeRec) saveTrail();
     } catch (e) {}
   };
   let lastNav = cleanUrl(location.href);
   // The record toggle: a fresh session clears the previous trail and opens
   // on the current page; stopping just drops the flag — the finished trail
-  // stays readable until the next session or the webview dies. Idempotent:
-  // the app re-asserts the flag after loads in case the webview was
-  // recreated, and that must not wipe the trail on a plain reload.
-  window.__monocodeSetRec = (on) => {
+  // stays readable until the next session or the webview dies. The app may
+  // resume a same-origin document without clearing this session's trail.
+  window.__monocodeSetRec = (on, resume = false) => {
     on = !!on;
+    if (!on || !resume) pending.length = 0;
+    awaitingResume = false;
+    try { sessionStorage.setItem(REC_KEY, on ? "1" : "0"); } catch (e) {}
     if (on === window.__monocodeRec) return;
     window.__monocodeRec = on;
-    try {
-      sessionStorage.setItem(REC_KEY, on ? "1" : "0");
-    } catch (e) {}
     if (on) {
-      trail.length = 0;
+      if (!resume) trail.length = 0;
       lastNav = cleanUrl(location.href);
-      step("Opened " + lastNav);
+      if (resume && pending.length) {
+        trail.push(...pending);
+        pending.length = 0;
+        if (trail.length > TRAIL_CAP) trail.splice(0, trail.length - TRAIL_CAP);
+        saveTrail();
+      } else {
+        step("Opened " + lastNav);
+      }
     }
   };
+  // BFCache can restore this document without re-running initialization.
+  const ready = () => { try { window.ipc.postMessage("recording-ready"); } catch (e) {} };
+  window.addEventListener("pagehide", () => {
+    window.__monocodeRec = false;
+    awaitingResume = false;
+    pending.length = 0;
+  });
+  window.addEventListener("pageshow", event => {
+    if (!event.persisted) return;
+    trail.splice(0, trail.length, ...readTrail());
+    awaitingResume = continuationHint();
+    step("Opened " + cleanUrl(location.href));
+    ready();
+  });
   window.__monocodeLabel = label;
   window.__monocodeTrail = trail;
   // Clicking a <label> forwards a synthesized click to its control — the
@@ -335,6 +411,7 @@ const PAGE_TAP_SCRIPT: &str = r#"(() => {
   }
   // A mid-session page load belongs to the trail too.
   step("Opened " + lastNav);
+  ready();
 })()"#;
 
 /// Bounded visible-DOM + console read. wry serializes the completion
@@ -641,31 +718,21 @@ fn dedicated_store_supported() -> bool {
 /// Run an eval whose JSON return value is needed. Async like
 /// `browser_probe`: the completion callback arrives on the main thread, so
 /// blocking inside a synchronous command deadlocks on Windows.
-async fn eval_json<R: Runtime>(view: &tauri::Webview<R>, script: String) -> Result<String, String> {
+async fn eval_json(window: Window, label: String, script: String) -> Result<String, String> {
     let (tx, rx) = std::sync::mpsc::channel();
-    view.eval_with_callback(script, move |result| {
-        let _ = tx.send(result);
+    with_view(window, label, move |view| {
+        view.evaluate_script_with_callback(&script, move |result| {
+            let _ = tx.send(result);
+        })
+        .map_err(|e| e.to_string())
     })
-    .map_err(|error| error.to_string())?;
+    .await?;
     tauri::async_runtime::spawn_blocking(move || {
         rx.recv_timeout(PROBE_TIMEOUT)
-            .map_err(|_| "The page didn't answer".to_string())
+            .map_err(|_| "The page did not answer".to_string())
     })
     .await
-    .map_err(|error| error.to_string())?
-}
-
-fn find_webview<R: Runtime>(window: &Window<R>, label: &str) -> Result<tauri::Webview<R>, String> {
-    // The window's own shell webview shares this namespace — a bad label
-    // must never resolve to it (browser_close would destroy the app UI).
-    if label == window.label() {
-        return Err("Invalid browser label".into());
-    }
-    window
-        .webviews()
-        .into_iter()
-        .find(|view| view.label() == label)
-        .ok_or_else(|| "Browser tab is no longer open".to_string())
+    .map_err(|e| e.to_string())?
 }
 
 /// Close webviews and drop history for a window going away. Registered once
@@ -696,6 +763,22 @@ fn hook_window_close<R: Runtime>(app: &AppHandle<R>, window: &Window<R>) {
             .unwrap()
             .retain(|entry| !entry.starts_with(&prefix));
         state.hooked.lock().unwrap().remove(&key);
+        let removed: Vec<_> = VIEWS.with(|views| {
+            let mut views = views.borrow_mut();
+            let keys: Vec<_> = views
+                .keys()
+                .filter(|entry| entry.starts_with(&prefix))
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .filter_map(|entry| views.remove(&entry))
+                .collect()
+        });
+        drop(removed);
+        #[cfg(target_os = "linux")]
+        CONTAINERS.with(|containers| {
+            containers.borrow_mut().remove(&key);
+        });
     });
 }
 
@@ -706,6 +789,37 @@ pub struct BrowserBounds {
     y: f64,
     width: f64,
     height: f64,
+    viewport_width: f64,
+}
+
+impl BrowserBounds {
+    fn rect(&self, size: tauri::PhysicalSize<u32>) -> Result<Rect, String> {
+        if ![self.x, self.y, self.width, self.height, self.viewport_width]
+            .iter()
+            .all(|v| v.is_finite())
+            || self.x < 0.0
+            || self.y < 0.0
+            || self.width <= 0.0
+            || self.height <= 0.0
+            || self.viewport_width <= 0.0
+            || size.width == 0
+            || size.height == 0
+        {
+            return Err("Invalid browser bounds".into());
+        }
+        // Includes the app WebView zoom as well as the OS scale factor.
+        let scale = f64::from(size.width) / self.viewport_width;
+        let x = (self.x * scale).min(f64::from(size.width.saturating_sub(1)));
+        let y = (self.y * scale).min(f64::from(size.height.saturating_sub(1)));
+        Ok(Rect {
+            position: tauri::PhysicalPosition::new(x, y).into(),
+            size: tauri::PhysicalSize::new(
+                (self.width * scale).min(f64::from(size.width) - x),
+                (self.height * scale).min(f64::from(size.height) - y),
+            )
+            .into(),
+        })
+    }
 }
 
 /// Async like `browser_probe`: Tauri documents that creating a webview in a
@@ -721,305 +835,392 @@ pub async fn browser_open(
     background: Option<Color>,
     persist: Option<bool>,
 ) -> Result<(), String> {
-    if !valid_label(&label) {
-        return Err("Invalid browser label".into());
-    }
-    let parsed = Url::parse(&url).map_err(|_| "Enter a valid URL".to_string())?;
-    let origin = app_origin(&window);
-    allowed_url(&parsed, origin.as_deref())?;
-
-    let window_label = window.label().to_string();
-    let key = history_key(&window_label, &label);
-    let persist = persist.unwrap_or(true);
-
-    // Idempotent open: a stale webview under the same label is replaced.
-    if let Ok(existing) = find_webview(&window, &label) {
-        let _ = existing.close();
-    }
-
-    let state = app.state::<BrowserState>();
-    state
-        .history
-        .lock()
-        .unwrap()
-        .insert(key.clone(), History::new(parsed.as_str()));
-
-    let nav_app = app.clone();
-    let nav_window = window_label.clone();
-    let nav_label = label.clone();
-    let nav_origin = origin.clone();
-    let page_origin = origin.clone();
-    let new_window_app = app.clone();
-    let new_window_window = window_label.clone();
-    let new_window_label = label.clone();
-    let page_load_app = app.clone();
-    let page_load_window = window_label.clone();
-    let page_load_label = label.clone();
-    let title_app = app.clone();
-    let title_window = window_label.clone();
-    let download_app = app.clone();
-    let download_window = window_label.clone();
-    let download_label = label.clone();
-
-    // `mut` only where a data store gets configured — mobile never does.
-    #[allow(unused_mut)]
-    let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed.clone()))
-        // Persisted tabs keep cookies/site data in the browser profile so
-        // dev logins survive webview recreation and app restarts; a tab
-        // marked private stays on the throwaway store.
-        .incognito(!persist)
-        .devtools(true)
-        .focused(false)
-        // The pane's own background — WKWebView paints it during the
-        // process swap on every cross-site navigation, so matching the
-        // theme turns a white strobe into an invisible handoff.
-        .background_color(background.unwrap_or(Color(255, 255, 255, 255)))
-        .initialization_script(PAGE_TAP_SCRIPT)
-        .on_navigation(move |url| {
-            // Policy gate only. WKWebView reports subframe navigations here
-            // too and wry does not pass targetFrame, so this callback can't
-            // tell a main-frame commit from an iframe — history and the
-            // address bar update live in on_page_load, which is main-frame
-            // only. about:/blob:/data: are allowed for the pervasive
-            // srcdoc/blank iframe cases; they never gain invoke authority.
-            let verdict = match url.scheme() {
-                "http" | "https" => allowed_url(url, nav_origin.as_deref()),
-                "about" | "blob" | "data" => Ok(()),
-                scheme => Err(format!("{scheme}: links aren't allowed in Browser")),
-            };
-            if let Err(reason) = verdict {
-                emit(
-                    &nav_app,
-                    &nav_label,
-                    &nav_window,
-                    BrowserNotice {
-                        kind: "blocked",
-                        url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
-                        reason: Some(reason),
-                        ..BrowserNotice::empty()
-                    },
-                );
-                return false;
-            }
-            true
-        })
-        .on_new_window(move |url, _features| {
-            if matches!(url.scheme(), "http" | "https") {
-                emit(
-                    &new_window_app,
-                    &new_window_label,
-                    &new_window_window,
-                    BrowserNotice {
-                        kind: "popup",
-                        url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
-                        ..BrowserNotice::empty()
-                    },
-                );
-            }
-            NewWindowResponse::Deny
-        })
-        .on_page_load(move |webview, payload| {
-            // Page-load events are main-frame only on both engines, so this
-            // is where the committed URL is recorded and reported. Started
-            // carries the requested URL (early bar feedback); Finished
-            // carries the post-redirect URL and earns the history slot.
-            let url = payload.url();
-            let committed = matches!(url.scheme(), "http" | "https")
-                && allowed_url(url, page_origin.as_deref()).is_ok();
-            let (can_back, can_forward) = {
-                let state = page_load_app.state::<BrowserState>();
-                let key = history_key(&page_load_window, &page_load_label);
-                let mut guard = state.history.lock().unwrap();
-                match payload.event() {
-                    PageLoadEvent::Finished if committed => guard
-                        .get_mut(&key)
-                        .map(|history| {
-                            history.push(url.as_str());
-                            (history.can_back(), history.can_forward())
-                        })
-                        .unwrap_or((false, false)),
-                    _ => guard
-                        .get(&key)
-                        .map(|history| (history.can_back(), history.can_forward()))
-                        .unwrap_or((false, false)),
-                }
-            };
-            if committed {
-                emit(
-                    &page_load_app,
-                    webview.label(),
-                    &page_load_window,
-                    BrowserNotice {
-                        kind: "navigate",
-                        url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
-                        can_back,
-                        can_forward,
-                        ..BrowserNotice::empty()
-                    },
-                );
-            }
-            emit(
-                &page_load_app,
-                webview.label(),
-                &page_load_window,
-                BrowserNotice {
-                    kind: match payload.event() {
-                        PageLoadEvent::Started => "load-started",
-                        PageLoadEvent::Finished => "load-finished",
-                    },
-                    url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
-                    can_back,
-                    can_forward,
-                    ..BrowserNotice::empty()
-                },
-            );
-        })
-        .on_document_title_changed(move |webview, title| {
-            emit(
-                &title_app,
-                webview.label(),
-                &title_window,
-                BrowserNotice {
-                    kind: "title",
-                    title: Some(title.chars().take(MAX_TITLE_LEN).collect()),
-                    ..BrowserNotice::empty()
-                },
-            );
-        })
-        .on_download(move |_webview, event| {
-            if let DownloadEvent::Requested { url, .. } = event {
-                emit(
-                    &download_app,
-                    &download_label,
-                    &download_window,
-                    BrowserNotice {
-                        kind: "download",
-                        url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
-                        reason: Some("Downloads are not allowed in Browser".into()),
-                        ..BrowserNotice::empty()
-                    },
-                );
-            }
-            false
-        });
-
-    // A persisted tab needs its own data store, not the app shell's:
-    // WebView2/WebKitGTK take a data directory; WKWebView takes a named
-    // store (macOS 14+). `dedicated` must only be set when that store was
-    // actually applied — `browser_clear_data` trusts the flag, and the
-    // fallback (default store/shared WebContext) also holds the app's own
-    // storage. (On old WebView2 runtimes wry silently ignores `incognito`,
-    // so a "private" tab may still persist — never promise otherwise.)
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
-    let dedicated = {
-        let mut applied = false;
-        if persist {
-            if let Ok(dir) = app
-                .path()
-                .app_local_data_dir()
-                .map(|dir| dir.join("browser"))
-            {
-                let _ = std::fs::create_dir_all(&dir);
-                builder = builder.data_directory(dir);
-                applied = true;
-            }
+    on_ui(window, move |window| {
+        if !valid_label(&label) || label == window.label() {
+            return Err("Invalid browser label".into());
         }
-        applied
-    };
-    #[cfg(target_os = "macos")]
-    let dedicated = persist && dedicated_store_supported();
-    #[cfg(target_os = "macos")]
-    if dedicated {
-        builder = builder.data_store_identifier(BROWSER_STORE_ID);
-    }
-    // Mobile: no dedicated store exists — `incognito` still applies, but
-    // there is nothing `browser_clear_data` may safely wipe.
-    #[cfg(any(target_os = "ios", target_os = "android"))]
-    let dedicated = false;
-    {
+        let parsed = Url::parse(&url).map_err(|_| "Enter a valid URL".to_string())?;
+        let origin = app_origin(&window);
+        allowed_url(&parsed, origin.as_deref())?;
+
+        let window_label = window.label().to_string();
+        let key = history_key(&window_label, &label);
+        let persist = persist.unwrap_or(true);
+
+        // Idempotent open: a stale webview under the same label is replaced.
+        let previous = VIEWS.with(|views| views.borrow_mut().remove(&key));
+        drop(previous);
+
         let state = app.state::<BrowserState>();
-        let mut dedicated_keys = state.dedicated.lock().unwrap();
-        if dedicated {
-            dedicated_keys.insert(key.clone());
-        } else {
-            dedicated_keys.remove(&key);
+        state
+            .history
+            .lock()
+            .unwrap()
+            .insert(key.clone(), History::new(parsed.as_str()));
+
+        let alive = Rc::new(Cell::new(true));
+        let cleanup_alive = alive.clone();
+        let cleanup_key = key.clone();
+        let created = (|| -> Result<(), String> {
+            let focus_alive = alive.clone();
+            let nav_alive = alive.clone();
+            let popup_alive = alive.clone();
+            let load_alive = alive.clone();
+            let title_alive = alive.clone();
+            let download_alive = alive.clone();
+            let focus_app = app.clone();
+            let focus_window = window_label.clone();
+            let focus_label = label.clone();
+            let nav_app = app.clone();
+            let nav_window = window_label.clone();
+            let nav_label = label.clone();
+            let nav_origin = origin.clone();
+            let page_origin = origin.clone();
+            let new_window_app = app.clone();
+            let new_window_window = window_label.clone();
+            let new_window_label = label.clone();
+            let page_load_app = app.clone();
+            let page_load_window = window_label.clone();
+            let page_load_label = label.clone();
+            let title_app = app.clone();
+            let title_window = window_label.clone();
+            let title_label = label.clone();
+            let download_app = app.clone();
+            let download_window = window_label.clone();
+            let download_label = label.clone();
+
+            let data_dir = if persist {
+                let dir = app
+                    .path()
+                    .app_local_data_dir()
+                    .map_err(|e| e.to_string())?
+                    .join("browser");
+                #[cfg(not(target_os = "macos"))]
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                Some(dir)
+            } else {
+                None
+            };
+            let mut context = WebContext::new(data_dir);
+            #[allow(unused_mut)]
+            let mut builder = WebViewBuilder::new_with_web_context(&mut context)
+                .with_url(parsed.as_str())
+                .with_bounds(bounds.rect(window.inner_size().map_err(|e| e.to_string())?)?)
+                .with_incognito(!persist)
+                .with_devtools(true)
+                .with_focused(false)
+                .with_background_color(background.unwrap_or(Color(255, 255, 255, 255)).into())
+                .with_initialization_script(PAGE_TAP_SCRIPT)
+                .with_initialization_script(
+                    r#"(() => {
+          if (window.top !== window) return;
+          const notify = event => { if (event.isTrusted) window.ipc.postMessage('focus'); };
+          window.addEventListener('pointerdown', notify, true);
+          window.addEventListener('focusin', notify, true);
+        })()"#,
+                )
+                .with_ipc_handler(move |request| {
+                    // Page-controlled notification, never a command or authorization.
+                    if focus_alive.get()
+                        && matches!(request.body().as_str(), "focus" | "recording-ready")
+                    {
+                        emit(
+                            &focus_app,
+                            &focus_label,
+                            &focus_window,
+                            BrowserNotice {
+                                kind: if request.body() == "focus" {
+                                    "focus"
+                                } else {
+                                    "recording-ready"
+                                },
+                                ..BrowserNotice::empty()
+                            },
+                        );
+                    }
+                })
+                .with_navigation_handler(move |value| {
+                    if !nav_alive.get() {
+                        return false;
+                    }
+                    let Ok(url) = Url::parse(&value) else {
+                        return false;
+                    };
+                    // Policy gate only. WKWebView reports subframe navigations here
+                    // too and wry does not pass targetFrame, so this callback can't
+                    // tell a main-frame commit from an iframe — history and the
+                    // address bar update live in on_page_load, which is main-frame
+                    // only. about:/blob:/data: are allowed for the pervasive
+                    // srcdoc/blank iframe cases; they never gain invoke authority.
+                    let verdict = match url.scheme() {
+                        "http" | "https" => allowed_url(&url, nav_origin.as_deref()),
+                        "about" | "blob" | "data" => Ok(()),
+                        scheme => Err(format!("{scheme}: links aren't allowed in Browser")),
+                    };
+                    if let Err(reason) = verdict {
+                        emit(
+                            &nav_app,
+                            &nav_label,
+                            &nav_window,
+                            BrowserNotice {
+                                kind: "blocked",
+                                url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
+                                reason: Some(reason),
+                                ..BrowserNotice::empty()
+                            },
+                        );
+                        return false;
+                    }
+                    true
+                })
+                .with_new_window_req_handler(move |value, _features| {
+                    if !popup_alive.get() {
+                        return NewWindowResponse::Deny;
+                    }
+                    let Ok(url) = Url::parse(&value) else {
+                        return NewWindowResponse::Deny;
+                    };
+                    if matches!(url.scheme(), "http" | "https") {
+                        emit(
+                            &new_window_app,
+                            &new_window_label,
+                            &new_window_window,
+                            BrowserNotice {
+                                kind: "popup",
+                                url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
+                                ..BrowserNotice::empty()
+                            },
+                        );
+                    }
+                    NewWindowResponse::Deny
+                })
+                .with_on_page_load_handler(move |event, value| {
+                    if !load_alive.get() {
+                        return;
+                    }
+                    // Page-load events are main-frame only on both engines, so this
+                    // is where the committed URL is recorded and reported. Started
+                    // carries the requested URL (early bar feedback); Finished
+                    // carries the post-redirect URL and earns the history slot.
+                    let Ok(url) = Url::parse(&value) else {
+                        return;
+                    };
+                    let committed = matches!(url.scheme(), "http" | "https")
+                        && allowed_url(&url, page_origin.as_deref()).is_ok();
+                    let (can_back, can_forward) = {
+                        let state = page_load_app.state::<BrowserState>();
+                        let key = history_key(&page_load_window, &page_load_label);
+                        let mut guard = state.history.lock().unwrap();
+                        match event {
+                            PageLoadEvent::Finished if committed => guard
+                                .get_mut(&key)
+                                .map(|history| {
+                                    history.push(url.as_str());
+                                    (history.can_back(), history.can_forward())
+                                })
+                                .unwrap_or((false, false)),
+                            _ => guard
+                                .get(&key)
+                                .map(|history| (history.can_back(), history.can_forward()))
+                                .unwrap_or((false, false)),
+                        }
+                    };
+                    if committed {
+                        emit(
+                            &page_load_app,
+                            &page_load_label,
+                            &page_load_window,
+                            BrowserNotice {
+                                kind: "navigate",
+                                url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
+                                can_back,
+                                can_forward,
+                                ..BrowserNotice::empty()
+                            },
+                        );
+                    }
+                    emit(
+                        &page_load_app,
+                        &page_load_label,
+                        &page_load_window,
+                        BrowserNotice {
+                            kind: match event {
+                                PageLoadEvent::Started => "load-started",
+                                PageLoadEvent::Finished => "load-finished",
+                            },
+                            url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
+                            can_back,
+                            can_forward,
+                            ..BrowserNotice::empty()
+                        },
+                    );
+                })
+                .with_document_title_changed_handler(move |title| {
+                    if !title_alive.get() {
+                        return;
+                    }
+                    emit(
+                        &title_app,
+                        &title_label,
+                        &title_window,
+                        BrowserNotice {
+                            kind: "title",
+                            title: Some(title.chars().take(MAX_TITLE_LEN).collect()),
+                            ..BrowserNotice::empty()
+                        },
+                    );
+                })
+                .with_download_started_handler(move |url, _path| {
+                    if !download_alive.get() {
+                        return false;
+                    }
+                    {
+                        emit(
+                            &download_app,
+                            &download_label,
+                            &download_window,
+                            BrowserNotice {
+                                kind: "download",
+                                url: Some(url.as_str().chars().take(MAX_URL_LEN).collect()),
+                                reason: Some("Downloads are not allowed in Browser".into()),
+                                ..BrowserNotice::empty()
+                            },
+                        );
+                    }
+                    false
+                });
+
+            #[cfg(target_os = "macos")]
+            let dedicated = persist && dedicated_store_supported();
+            #[cfg(target_os = "macos")]
+            if dedicated {
+                use wry::WebViewBuilderExtDarwin;
+                builder = builder.with_data_store_identifier(BROWSER_STORE_ID);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let dedicated = persist;
+            if dedicated {
+                app.state::<BrowserState>()
+                    .dedicated
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone());
+            } else {
+                app.state::<BrowserState>()
+                    .dedicated
+                    .lock()
+                    .unwrap()
+                    .remove(&key);
+            }
+
+            hook_window_close(&app, &window);
+            #[cfg(not(target_os = "linux"))]
+            let view = builder.build_as_child(&window).map_err(|e| e.to_string())?;
+            #[cfg(target_os = "linux")]
+            let view = {
+                use wry::WebViewBuilderExtUnix;
+                builder
+                    .build_gtk(&browser_container(&window)?)
+                    .map_err(|e| e.to_string())?
+            };
+            VIEWS.with(|views| {
+                views.borrow_mut().insert(
+                    key,
+                    BrowserInstance {
+                        view,
+                        alive,
+                        _context: context,
+                    },
+                )
+            });
+            Ok(())
+        })();
+        if created.is_err() {
+            cleanup_alive.set(false);
+            state.history.lock().unwrap().remove(&cleanup_key);
+            state.dedicated.lock().unwrap().remove(&cleanup_key);
         }
-    }
-
-    hook_window_close(&app, &window);
-    window
-        .add_child(
-            builder,
-            LogicalPosition::new(bounds.x.max(0.0), bounds.y.max(0.0)),
-            LogicalSize::new(bounds.width.max(1.0), bounds.height.max(1.0)),
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(())
+        created
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn browser_close(window: Window, app: AppHandle, label: String) -> Result<(), String> {
-    if let Ok(view) = find_webview(&window, &label) {
-        let _ = view.close();
-    }
-    let state = app.state::<BrowserState>();
-    let key = history_key(window.label(), &label);
-    state.history.lock().unwrap().remove(&key);
-    state.dedicated.lock().unwrap().remove(&key);
-    Ok(())
+pub async fn browser_close(window: Window, app: AppHandle, label: String) -> Result<(), String> {
+    on_ui(window, move |window| {
+        let key = history_key(window.label(), &label);
+        let previous = VIEWS.with(|views| views.borrow_mut().remove(&key));
+        drop(previous);
+        let state = app.state::<BrowserState>();
+        state.history.lock().unwrap().remove(&key);
+        state.dedicated.lock().unwrap().remove(&key);
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn browser_navigate(window: Window, label: String, url: String) -> Result<(), String> {
-    let parsed = Url::parse(&url).map_err(|_| "Enter a valid URL".to_string())?;
+pub async fn browser_navigate(window: Window, label: String, url: String) -> Result<(), String> {
+    let parsed = Url::parse(&url).map_err(|_| "Enter a valid URL")?;
     allowed_url(&parsed, app_origin(&window).as_deref())?;
-    find_webview(&window, &label)?
-        .navigate(parsed)
-        .map_err(|error| error.to_string())
+    with_view(window, label, move |view| {
+        view.load_url(parsed.as_str()).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn browser_reload(window: Window, label: String) -> Result<(), String> {
-    find_webview(&window, &label)?
-        .reload()
-        .map_err(|error| error.to_string())
+pub async fn browser_reload(window: Window, label: String) -> Result<(), String> {
+    with_view(window, label, |view| {
+        view.reload().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn browser_go_back(window: Window, label: String) -> Result<(), String> {
-    find_webview(&window, &label)?
-        .eval("history.back()")
-        .map_err(|error| error.to_string())
+pub async fn browser_go_back(window: Window, label: String) -> Result<(), String> {
+    with_view(window, label, |view| {
+        view.evaluate_script("history.back()")
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn browser_go_forward(window: Window, label: String) -> Result<(), String> {
-    find_webview(&window, &label)?
-        .eval("history.forward()")
-        .map_err(|error| error.to_string())
+pub async fn browser_go_forward(window: Window, label: String) -> Result<(), String> {
+    with_view(window, label, |view| {
+        view.evaluate_script("history.forward()")
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn browser_set_bounds(
+pub async fn browser_set_bounds(
     window: Window,
     label: String,
     bounds: BrowserBounds,
 ) -> Result<(), String> {
-    find_webview(&window, &label)?
-        .set_bounds(Rect {
-            position: LogicalPosition::new(bounds.x.max(0.0), bounds.y.max(0.0)).into(),
-            size: LogicalSize::new(bounds.width.max(1.0), bounds.height.max(1.0)).into(),
-        })
-        .map_err(|error| error.to_string())
+    let rect = bounds.rect(window.inner_size().map_err(|e| e.to_string())?)?;
+    with_view(window, label, move |view| {
+        view.set_bounds(rect).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// The shell follows theme flips; an open webview's swap-flash color is
 /// only as fresh as its last update — cheap to keep in step.
 #[tauri::command]
-pub fn browser_set_background(window: Window, label: String, color: Color) -> Result<(), String> {
-    find_webview(&window, &label)?
-        .set_background_color(Some(color))
-        .map_err(|error| error.to_string())
+pub async fn browser_set_background(
+    window: Window,
+    label: String,
+    color: Color,
+) -> Result<(), String> {
+    with_view(window, label, move |view| {
+        view.set_background_color(color.into())
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Hiding a child webview suspends it — WKWebView stalls for a beat
@@ -1029,26 +1230,30 @@ pub fn browser_set_background(window: Window, label: String, color: Color) -> Re
 /// runs, and the next set_bounds puts it back instantly. `visible: true`
 /// is a no-op — the bounds sync that always follows restores position.
 #[tauri::command]
-pub fn browser_set_visible(window: Window, label: String, visible: bool) -> Result<(), String> {
+pub async fn browser_set_visible(
+    window: Window,
+    label: String,
+    visible: bool,
+) -> Result<(), String> {
     if visible {
         return Ok(());
     }
-    let view = find_webview(&window, &label)?;
-    let bounds = view.bounds().map_err(|error| error.to_string())?;
-    view.set_bounds(Rect {
-        position: tauri::PhysicalPosition::new(-32_768, 0).into(),
-        size: bounds.size,
+    with_view(window, label, |view| {
+        let bounds = view.bounds().map_err(|e| e.to_string())?;
+        view.set_bounds(Rect {
+            position: tauri::PhysicalPosition::new(-32_768, 0).into(),
+            size: bounds.size,
+        })
+        .map_err(|e| e.to_string())
     })
-    .map_err(|error| error.to_string())
+    .await
 }
 
 /// Flip the page-side steps recorder on or off; returns whether the page
 /// actually has the hook (a page where the init script can't run — e.g.
 /// still on its first load — silently has no flag otherwise, and the
-/// toolbar indicator would lie). The flag lives in the page's
-/// sessionStorage so a same-origin reload keeps recording; the app also
-/// re-asserts it after loads to heal a recreated webview — the page-side
-/// setter is idempotent so that re-assert never wipes the trail. Async
+/// toolbar indicator would lie). Bind the queued evaluation to the intended
+/// origin; a navigation must not turn a different page's recording on. Async
 /// for the same reason `browser_probe` is: the eval callback arrives on
 /// the main thread.
 #[tauri::command]
@@ -1056,13 +1261,21 @@ pub async fn browser_set_recording(
     window: Window,
     label: String,
     on: bool,
+    expected_origin: String,
+    resume: bool,
 ) -> Result<bool, String> {
-    let view = find_webview(&window, &label)?;
+    let origin = Url::parse(&expected_origin).map_err(|_| "Invalid recording origin")?;
+    if !matches!(origin.scheme(), "http" | "https")
+        || origin.origin().ascii_serialization() != expected_origin
+    {
+        return Err("Invalid recording origin".into());
+    }
+    let expected = serde_json::to_string(&expected_origin).map_err(|e| e.to_string())?;
     let raw = eval_json(
-        &view,
+        window,
+        label,
         format!(
-            "!!(window.__monocodeSetRec && (window.__monocodeSetRec({}), true))",
-            if on { "true" } else { "false" }
+            "!!(location.origin === {expected} && window.__monocodeSetRec && (window.__monocodeSetRec({on}, {resume}), true))"
         ),
     )
     .await
@@ -1079,9 +1292,9 @@ pub async fn browser_set_recording(
 /// reporting about:blank.
 #[tauri::command]
 pub async fn browser_probe(window: Window, label: String) -> Result<String, String> {
-    let view = find_webview(&window, &label)?;
     eval_json(
-        &view,
+        window,
+        label,
         "({href:location.href,title:document.title,readyState:document.readyState})".to_string(),
     )
     .await
@@ -1178,16 +1391,16 @@ fn clip_chars(value: &str, max: usize) -> String {
 /// Start the platform screenshot; completion arrives on `tx` as PNG bytes.
 /// Every platform variant either reports an error or guarantees a send.
 #[cfg(target_os = "macos")]
-fn start_screenshot<R: Runtime>(
-    view: &tauri::Webview<R>,
+fn start_screenshot(
+    view: &WebView,
     tx: std::sync::mpsc::Sender<Option<Vec<u8>>>,
 ) -> Result<(), String> {
     use block2::RcBlock;
     use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage};
     use objc2_foundation::{NSDictionary, NSError};
-    use objc2_web_kit::WKWebView;
+    use wry::WebViewExtMacOS;
 
-    view.with_webview(move |platform| {
+    {
         let block = RcBlock::new(move |image: *mut NSImage, error: *mut NSError| {
             let png = unsafe {
                 if image.is_null() || !error.is_null() {
@@ -1208,17 +1421,17 @@ fn start_screenshot<R: Runtime>(
             let _ = tx.send(png);
         });
         unsafe {
-            let webview: &WKWebView = &*platform.inner().cast();
-            webview.takeSnapshotWithConfiguration_completionHandler(None, &block);
+            view.webview()
+                .takeSnapshotWithConfiguration_completionHandler(None, &block);
         }
-    })
-    .map_err(|error| error.to_string())
+    }
+    Ok(())
 }
 
 /// WebView2's CapturePreview renders the viewport into a stream as PNG.
 #[cfg(windows)]
-fn start_screenshot<R: Runtime>(
-    view: &tauri::Webview<R>,
+fn start_screenshot(
+    view: &WebView,
     tx: std::sync::mpsc::Sender<Option<Vec<u8>>>,
 ) -> Result<(), String> {
     use webview2_com::CapturePreviewCompletedHandler;
@@ -1239,6 +1452,9 @@ fn start_screenshot<R: Runtime>(
             {
                 break;
             }
+            if out.len() + read as usize > MAX_SCREENSHOT_BYTES {
+                return None;
+            }
             out.extend_from_slice(&buf[..read as usize]);
         }
         if out.is_empty() {
@@ -1248,7 +1464,8 @@ fn start_screenshot<R: Runtime>(
         }
     }
 
-    view.with_webview(move |platform| unsafe {
+    use wry::WebViewExtWindows;
+    unsafe {
         let stream = match SHCreateMemStream(None) {
             Some(stream) => stream,
             None => {
@@ -1266,7 +1483,7 @@ fn start_screenshot<R: Runtime>(
             });
             Ok(())
         }));
-        let started = platform.controller().CoreWebView2().and_then(|webview| {
+        let started = view.controller().CoreWebView2().and_then(|webview| {
             webview.CapturePreview(
                 COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
                 &stream,
@@ -1277,14 +1494,14 @@ fn start_screenshot<R: Runtime>(
             // The capture never kicked off, so the handler won't run.
             let _ = tx.send(None);
         }
-    })
-    .map_err(|error| error.to_string())
+    }
+    Ok(())
 }
 
 /// No snapshot API wired up for this platform — text capture still works.
 #[cfg(not(any(target_os = "macos", windows)))]
-fn start_screenshot<R: Runtime>(
-    _view: &tauri::Webview<R>,
+fn start_screenshot(
+    _view: &WebView,
     tx: std::sync::mpsc::Sender<Option<Vec<u8>>>,
 ) -> Result<(), String> {
     let _ = tx.send(None);
@@ -1297,16 +1514,16 @@ fn start_screenshot<R: Runtime>(
 /// summary is an eval whose result is re-bounded here.
 #[tauri::command]
 pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCapture, String> {
-    let view = find_webview(&window, &label)?;
-
     let (page_tx, page_rx) = std::sync::mpsc::channel();
-    view.eval_with_callback(SUMMARY_SCRIPT, move |result| {
-        let _ = page_tx.send(result);
-    })
-    .map_err(|error| error.to_string())?;
-
     let (shot_tx, shot_rx) = std::sync::mpsc::channel();
-    let shot_detail = start_screenshot(&view, shot_tx).err();
+    let shot_detail = with_view(window, label, move |view| {
+        view.evaluate_script_with_callback(SUMMARY_SCRIPT, move |result| {
+            let _ = page_tx.send(result);
+        })
+        .map_err(|e| e.to_string())?;
+        Ok(start_screenshot(view, shot_tx).err())
+    })
+    .await?;
 
     let (summary, screenshot) = tauri::async_runtime::spawn_blocking(move || {
         // One deadline for both halves — a slow page must not make a
@@ -1322,9 +1539,13 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
     .await
     .map_err(|error| error.to_string())?;
 
-    let parsed = summary
-        .as_deref()
-        .map(|raw| serde_json::from_str::<PageSummary>(raw).ok());
+    let parsed = summary.as_deref().map(|raw| {
+        if raw.len() <= 256 * 1024 {
+            serde_json::from_str::<PageSummary>(raw).ok()
+        } else {
+            None
+        }
+    });
     let summary_ok = matches!(parsed, Some(Some(_)));
     let page = parsed.flatten().unwrap_or(PageSummary {
         url: None,
@@ -1371,7 +1592,12 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
         .unwrap_or_default()
         .into_iter()
         .map(|entry| BrowserStep {
-            at: entry.at.unwrap_or(0.0),
+            at: entry
+                .at
+                .filter(|value| {
+                    value.is_finite() && (0.0..=8_640_000_000_000_000.0).contains(value)
+                })
+                .unwrap_or(0.0),
             text: clip_chars(&entry.text.unwrap_or_default(), MAX_STEP_TEXT),
         })
         .collect::<Vec<_>>()
@@ -1409,6 +1635,7 @@ pub async fn browser_capture(window: Window, label: String) -> Result<BrowserCap
         (Some(bytes), _) if bytes.len() > MAX_SCREENSHOT_BYTES => {
             (None, Some("screenshot too large to attach".to_string()))
         }
+        (None, None) => (None, Some("Screenshot unavailable".to_string())),
         pair => pair,
     };
     let screenshot_b64 = screenshot.map(|bytes| {
@@ -1538,21 +1765,21 @@ const FIND_SCRIPT: &str = r#"(arg) => {
 /// Toggle (or set) the page inspector. In release builds this needs the
 /// `devtools` cargo feature — enabled in Cargo.toml.
 #[tauri::command]
-pub fn browser_devtools(window: Window, label: String, open: Option<bool>) -> Result<bool, String> {
-    let view = find_webview(&window, &label)?;
-    let next = match open {
-        Some(open) => open,
-        None => !view.is_devtools_open(),
-    };
-    if next {
-        view.open_devtools();
-    } else {
-        view.close_devtools();
-    }
-    // Report the requested state, not a re-query: WebView2's
-    // `is_devtools_open` is hardcoded false (close is a no-op too), and
-    // WKWebView's inspector visibility is async right after show.
-    Ok(next)
+pub async fn browser_devtools(
+    window: Window,
+    label: String,
+    open: Option<bool>,
+) -> Result<bool, String> {
+    with_view(window, label, move |view| {
+        let next = open.unwrap_or_else(|| !view.is_devtools_open());
+        if next {
+            view.open_devtools();
+        } else {
+            view.close_devtools();
+        }
+        Ok(next)
+    })
+    .await
 }
 
 /// Clear the browser profile's site data (cookies, storage). Only a tab
@@ -1560,20 +1787,25 @@ pub fn browser_devtools(window: Window, label: String, open: Option<bool>) -> Re
 /// tabs share the app shell's default data store, and clearing that would
 /// wipe app settings too.
 #[tauri::command]
-pub fn browser_clear_data(window: Window, app: AppHandle, label: String) -> Result<(), String> {
+pub async fn browser_clear_data(
+    window: Window,
+    app: AppHandle,
+    label: String,
+) -> Result<(), String> {
     let key = history_key(window.label(), &label);
-    let dedicated = app
-        .state::<BrowserState>()
-        .dedicated
-        .lock()
-        .unwrap()
-        .contains(&key);
-    if !dedicated {
-        return Err("Only a persistent browser tab has its own data to clear".into());
-    }
-    find_webview(&window, &label)?
-        .clear_all_browsing_data()
-        .map_err(|error| error.to_string())
+    with_view(window, label, move |view| {
+        if !app
+            .state::<BrowserState>()
+            .dedicated
+            .lock()
+            .unwrap()
+            .contains(&key)
+        {
+            return Err("Only a persistent browser tab has its own data to clear".into());
+        }
+        view.clear_all_browsing_data().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Copy a screenshot of the visible page to the system clipboard. Same
@@ -1584,9 +1816,8 @@ pub async fn browser_copy_screenshot(
     app: AppHandle,
     label: String,
 ) -> Result<(), String> {
-    let view = find_webview(&window, &label)?;
     let (tx, rx) = std::sync::mpsc::channel();
-    start_screenshot(&view, tx)?;
+    with_view(window, label, move |view| start_screenshot(view, tx)).await?;
     let png = tauri::async_runtime::spawn_blocking(move || {
         rx.recv_timeout(CAPTURE_TIMEOUT).ok().flatten()
     })
@@ -1619,7 +1850,6 @@ pub async fn browser_find(
     query: String,
     forward: Option<bool>,
 ) -> Result<BrowserFindResult, String> {
-    let view = find_webview(&window, &label)?;
     let arg = serde_json::json!({
         "query": query.chars().take(200).collect::<String>(),
         "forward": forward.unwrap_or(true),
@@ -1628,7 +1858,7 @@ pub async fn browser_find(
         .map_err(|error| error.to_string())?
         .replace('\u{2028}', "\\u2028")
         .replace('\u{2029}', "\\u2029");
-    let raw = eval_json(&view, format!("({FIND_SCRIPT})({arg})")).await?;
+    let raw = eval_json(window, label, format!("({FIND_SCRIPT})({arg})")).await?;
     #[derive(Deserialize)]
     struct PageFind {
         count: Option<usize>,
@@ -1644,4 +1874,117 @@ pub async fn browser_find(
         // Page-controlled value — clamp to the reported range.
         index: parsed.index.unwrap_or(-1).clamp(-1, count as i32 - 1),
     })
+}
+
+#[tauri::command]
+pub fn browser_read_clipboard(app: AppHandle) -> Result<String, String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    app.clipboard().read_text().map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn browser_container(window: &Window) -> Result<gtk::Fixed, String> {
+    use gtk::prelude::*;
+    CONTAINERS.with(|containers| {
+        if let Some(fixed) = containers.borrow().get(window.label()) {
+            return Ok(fixed.clone());
+        }
+        let vbox = window.default_vbox().map_err(|e| e.to_string())?;
+        let child = vbox
+            .children()
+            .into_iter()
+            .next()
+            .ok_or("Missing main webview")?;
+        vbox.remove(&child);
+        let overlay = gtk::Overlay::new();
+        overlay.add(&child);
+        let fixed = gtk::Fixed::new();
+        fixed.set_hexpand(true);
+        fixed.set_vexpand(true);
+        overlay.add_overlay(&fixed);
+        vbox.pack_start(&overlay, true, true, 0);
+        overlay.show_all();
+        containers
+            .borrow_mut()
+            .insert(window.label().to_string(), fixed.clone());
+        Ok(fixed)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_page_policy_excludes_app_origins_credentials_and_protocols() {
+        for value in [
+            "file:///tmp/private",
+            "tauri://localhost",
+            "https://tauri.localhost",
+            "http://asset.localhost",
+            "https://user:password@example.test",
+            "http://localhost:1420/path",
+        ] {
+            assert!(
+                allowed_url(&Url::parse(value).unwrap(), Some("http://localhost:1420")).is_err(),
+                "{value}"
+            );
+        }
+        for value in ["http://localhost:3000/app", "https://example.test"] {
+            assert!(
+                allowed_url(&Url::parse(value).unwrap(), Some("http://localhost:1420")).is_ok(),
+                "{value}"
+            );
+        }
+        assert_ne!(
+            history_key("main", "browser-1"),
+            history_key("second", "browser-1")
+        );
+        assert!(!valid_label("../main"));
+    }
+
+    #[test]
+    fn browser_bounds_follow_webview_zoom_and_stay_inside_the_window() {
+        let mut bounds = BrowserBounds {
+            x: 100.0,
+            y: 50.0,
+            width: 300.0,
+            height: 900.0,
+            viewport_width: 800.0,
+        };
+        let size = tauri::PhysicalSize::new(1600, 1200);
+        let rect = bounds.rect(size).unwrap();
+        assert_eq!(
+            rect.position.to_physical::<f64>(1.0),
+            tauri::PhysicalPosition::new(200.0, 100.0)
+        );
+        assert_eq!(
+            rect.size.to_physical::<f64>(1.0),
+            tauri::PhysicalSize::new(600.0, 1100.0)
+        );
+        bounds.x = f64::NAN;
+        assert!(bounds.rect(size).is_err());
+        bounds.x = -1.0;
+        assert!(bounds.rect(size).is_err());
+        bounds.x = 0.0;
+        bounds.viewport_width = 0.0;
+        assert!(bounds.rect(size).is_err());
+    }
+
+    #[test]
+    fn browser_history_is_bounded_and_follows_adjacent_back_and_forward_visits() {
+        let mut history = History::new("https://example.test/0");
+        for i in 1..100 {
+            history.push(&format!("https://example.test/{i}"));
+        }
+        assert_eq!(history.urls.len(), MAX_HISTORY);
+        assert!(history.can_back());
+        assert!(!history.can_forward());
+        history.push("https://example.test/98");
+        assert!(history.can_forward());
+        history.push("https://example.test/99");
+        assert!(!history.can_forward());
+        history.push("https://example.test/new");
+        assert_eq!(history.urls.len(), MAX_HISTORY);
+    }
 }

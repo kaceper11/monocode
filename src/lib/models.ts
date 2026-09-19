@@ -1,7 +1,7 @@
 import { copilotEffortSetting } from "./harness/copilotEffort";
 import { pathKey, wslLocation } from "./paths";
-import type { HarnessId, RuntimeMode } from "./session";
-import { DEFAULT_RUNTIME_MODE, HARNESSES, RUNTIME_MODES } from "./session";
+import type { HarnessId } from "./session";
+import { HARNESSES } from "./session";
 
 export type ModelSettingChoice = {
   value: string;
@@ -198,6 +198,12 @@ export const MODELS: AgentModel[] = [
     name: "GLM 5.2 Fast",
     nativeId: "zai/glm-5.2-fast",
   },
+  {
+    id: "hermes:default",
+    harness: "hermes",
+    name: "Configured model",
+    nativeId: "",
+  },
   // Devin advertises its real catalog over ACP at session start; this entry is
   // only the pre-probe placeholder that selects Devin's own default model.
   {
@@ -244,6 +250,7 @@ export const DEFAULT_MODEL_ID: Record<HarnessId, string> = {
   pi: "pi:default",
   omp: "omp:default",
   fx: "fx:zai/glm-5.2-fast",
+  hermes: "hermes:default",
   devin: "devin:default",
   copilot: "copilot:default",
   muse: "muse:default",
@@ -255,7 +262,6 @@ const HIDDEN_PICKER_PROVIDERS_KEY = "monocode.hiddenPickerProviders";
 const LAST_MODEL_KEY = "monocode.lastModel";
 const LAST_MODEL_SETTINGS_KEY = "monocode.lastModelSettings";
 const DEFAULT_MODELS_KEY = "monocode.defaultModels";
-const DEFAULT_RUNTIME_MODE_KEY = "monocode.defaultRuntimeMode";
 const RECENT_MODELS_KEY = "monocode.recentModels";
 const RECENT_MODEL_LIMIT = 6;
 
@@ -275,6 +281,7 @@ const HARNESS_ORDER: HarnessId[] = [
   "pi",
   "omp",
   "fx",
+  "hermes",
   "devin",
   "copilot",
   "muse",
@@ -297,9 +304,10 @@ function catalogScope(cwd?: string) {
   const key = modelCatalogKey(cwd);
   let scope = catalogs.get(key);
   if (!scope) {
-    if (catalogs.size >= 32) {
+    if (key !== "native" && catalogs.size - Number(catalogs.has("native")) >= 31) {
       const idle = [...catalogs].find(
-        ([, value]) => !Object.values(value).some((entry) => entry?.inflight),
+        ([key, value]) =>
+          key !== "native" && !Object.values(value).some((entry) => entry?.inflight),
       );
       if (!idle)
         throw new Error(
@@ -329,14 +337,14 @@ export function invalidateModelCatalogs(cwd: string) {
 export function refreshModelCatalog(
   harness: HarnessId,
   cwd: string | undefined,
-  discover: () => Promise<AgentModel[]>,
+  discover: (projectCwd?: string) => Promise<AgentModel[]>,
 ): Promise<void> {
   const scope = catalogScope(cwd);
   const entry = (scope[harness] ??= {});
   if (entry.inflight) return entry.inflight;
   entry.error = undefined;
   const pending = Promise.resolve()
-    .then(discover)
+    .then(() => discover(modelCatalogKey(cwd) === "native" ? undefined : cwd))
     .then((models) => {
       if (catalogs.get(modelCatalogKey(cwd)) !== scope) return;
       if (!models.length) throw new Error("The provider returned no models.");
@@ -493,12 +501,14 @@ export function resolveModel(
     // Ids persisted before variants were grouped into one model — a Devin
     // variant uid (e.g. `devin:claude-sonnet-5-medium`) lives on as one of the
     // group's setting option values.
-    const bySetting = available.find((model) =>
-      model.settings?.some((setting) =>
-        setting.options.some((option) => option.value === slug),
-      ),
-    );
-    if (bySetting) return bySetting;
+    if (harness === "devin") {
+      const bySetting = available.find((model) =>
+        model.settings?.some((setting) =>
+          setting.options.some((option) => option.value === slug),
+        ),
+      );
+      if (bySetting) return bySetting;
+    }
     const comparableSlug = comparableNativeId(harness, slug);
     const prefix = available.find((model) => {
       const native = model.nativeId ?? nativeIdFrom(model.id);
@@ -565,7 +575,21 @@ export function mergeModelSettings(
   return next;
 }
 
-const EFFORT_SETTING_IDS = new Set(["effort", "reasoning", "reasoningEffort"]);
+const EFFORT_SETTING_IDS = new Set([
+  "effort",
+  "reasoning",
+  "reasoningEffort",
+  // Pi and OMP expose their reasoning level as a `thinking` select.
+  "thinking",
+  // OpenCode exposes reasoning levels as `variant`; treat it as effort so the
+  // standalone effort control and dedup behave like Codex/Cursor/Grok.
+  "variant",
+]);
+
+/** True for the select setting ids that control reasoning effort. */
+export function isEffortSettingId(id: string): boolean {
+  return EFFORT_SETTING_IDS.has(id);
+}
 
 /** The select setting that controls reasoning effort for this model, if any. */
 export function modelEffortSetting(
@@ -629,9 +653,8 @@ export function saveLastModelSettings(
 export function encodeModelLaunchId(
   modelId: string,
   settings?: Record<string, string>,
-  cwd?: string,
 ): string {
-  const model = findModel(modelId, cwd);
+  const model = findModel(modelId);
   const native = nativeModelId(model ?? modelId);
   const defs = model?.settings ?? [];
   if (!native || defs.length === 0) return native;
@@ -838,27 +861,6 @@ export function defaultSessionChoice(cwd?: string): LastModelChoice {
   const last = loadLastModelChoice(cwd);
   const harness = last?.harness ?? "cursor";
   return { harness, model: preferredModelId(harness, cwd) };
-}
-
-/** Access mode new conversations start in; `supervised` until configured. */
-export function loadDefaultRuntimeMode(): RuntimeMode {
-  try {
-    const raw = localStorage.getItem(DEFAULT_RUNTIME_MODE_KEY);
-    if ((RUNTIME_MODES as string[]).includes(raw ?? "")) {
-      return raw as RuntimeMode;
-    }
-    return DEFAULT_RUNTIME_MODE;
-  } catch {
-    return DEFAULT_RUNTIME_MODE;
-  }
-}
-
-export function saveDefaultRuntimeMode(mode: RuntimeMode) {
-  try {
-    localStorage.setItem(DEFAULT_RUNTIME_MODE_KEY, mode);
-  } catch {
-    // private mode / quota
-  }
 }
 
 export function loadLastModelChoice(cwd?: string): LastModelChoice | null {

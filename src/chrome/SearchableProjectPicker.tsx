@@ -2,16 +2,11 @@ import {
   useEffect,
   useRef,
   useState,
-  useSyncExternalStore,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { useTabGroupLogos } from "../hooks/useTabGroupLogos";
 import { basename } from "../lib/fs";
-import { prettyCwd, prettyParent, projectKey, projectName } from "../lib/paths";
-import {
-  getVerifiedFamilies,
-  subscribeRepositoryFamilies,
-} from "../lib/repositoryFamilies";
+import { prettyParent, projectKey, projectName } from "../lib/paths";
 import {
   looksLikeProject,
   projectRailItems,
@@ -75,7 +70,6 @@ export function SearchableProjectPicker({
     : "Choose project";
   const logoPath = resolveTabGroupLogo(key, groupLogos);
   const color = resolveTabGroupColor(key, groupColors, groupCustomColors, seed);
-  useSyncExternalStore(subscribeRepositoryFamilies, getVerifiedFamilies);
   const railProjects = projectRailItems(recents, railCwd ?? cwd);
   const projects =
     inProject && !railProjects.some((item) => sameProjectPath(item.path, cwd))
@@ -94,7 +88,7 @@ export function SearchableProjectPicker({
           groupLabels,
           basename(item.path) || projectName(item.path),
         );
-        return `${itemLabel}\n${prettyCwd(item.path)}`
+        return `${itemLabel}\n${item.path}`
           .toLocaleLowerCase()
           .includes(normalizedQuery);
       })
@@ -158,7 +152,7 @@ export function SearchableProjectPicker({
     >
       <button
         type="button"
-        title={inProject ? prettyCwd(cwd) : undefined}
+        title={inProject ? cwd : undefined}
         aria-label={
           inProject
             ? `${action}, current project ${label}`
@@ -239,13 +233,11 @@ export function SearchableProjectPicker({
                 const current = sameProjectPath(item.path, cwd);
                 const itemKey = projectKey(item.path);
                 const itemSeed = projectName(item.path);
-                const itemLabel =
-                  item.project?.name ??
-                  resolveTabGroupLabel(
-                    itemKey,
-                    groupLabels,
-                    basename(item.path) || itemSeed,
-                  );
+                const itemLabel = resolveTabGroupLabel(
+                  itemKey,
+                  groupLabels,
+                  basename(item.path) || itemSeed,
+                );
                 const itemLogo = resolveTabGroupLogo(itemKey, groupLogos);
                 const itemColor = resolveTabGroupColor(
                   itemKey,
@@ -257,7 +249,7 @@ export function SearchableProjectPicker({
                   <button
                     key={item.path}
                     type="button"
-                    title={prettyCwd(item.path)}
+                    title={item.path}
                     onMouseEnter={() => setActive(index)}
                     onClick={() => pickProject(item.path)}
                     className={`flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left ${

@@ -1,18 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const sent: string[] = [];
-const resolveCodexBinary = vi.fn(async () => ({ path: "/fake/codex" }));
-const spawnChild = vi.fn(async () => undefined);
-const killChild = vi.fn(async () => undefined);
 let onLine: ((line: string) => void) | undefined;
 const writeChild = vi.fn(async (_id: string, line: string) => {
   sent.push(line);
 });
 
 vi.mock("./child", () => ({
-  resolveCodexBinary,
-  spawnChild,
-  killChild,
+  resolveCodexBinary: async () => ({ path: "/fake/codex" }),
+  spawnChild: async () => undefined,
+  killChild: async () => undefined,
   unwatchChild: () => undefined,
   watchChild: (_id: string, line: (l: string) => void) => {
     onLine = line;
@@ -28,18 +25,12 @@ const {
   respondCodexApproval,
   respondCodexQuestion,
   sendCodexTurn,
-  prewarmCodexSession,
-  canSteerCodexSession,
-  setCodexRuntimeMode,
   stopCodexSession,
   __codexTestReset,
-  __codexTestRetained,
 } = await import("./codex");
 import type { HarnessEvent } from "./types";
 import { newSession, type RuntimeMode, type TurnIntent } from "../session";
 import { applyHarnessEvent } from "./apply";
-
-const { modelsFor, resetHarnessModelOverlays } = await import("../models");
 
 function parse() {
   return sent.map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -69,17 +60,27 @@ async function startTurn(
     runtimeMode?: RuntimeMode;
     intent?: TurnIntent;
     resume?: boolean;
+    providerAccountId?: string;
+    resumeProviderAccountId?: string;
+    expectResume?: boolean;
     beforeThreadReply?: () => Promise<void>;
-    beforeTurnReply?: () => Promise<void>;
   } = {},
 ) {
   const events: HarnessEvent[] = [];
-  if (options.resume) bindCodexSession(sessionId, "thr_1", "/repo");
+  if (options.resume) {
+    bindCodexSession(
+      sessionId,
+      "thr_1",
+      "/repo",
+      options.resumeProviderAccountId,
+    );
+  }
   const turn = sendCodexTurn({
     sessionId,
     cwd: "/repo",
     model: "codex:gpt-5.4",
     modelSettings: {},
+    providerAccountId: options.providerAccountId,
     runtimeMode: options.runtimeMode ?? "supervised",
     intent: options.intent,
     text: "summarize the changelog",
@@ -92,7 +93,8 @@ async function startTurn(
     "initialize",
   );
   reply(parse().find((m) => m.method === "initialize")!.id as number, {});
-  const threadMethod = options.resume ? "thread/resume" : "thread/start";
+  const threadMethod =
+    (options.expectResume ?? options.resume) ? "thread/resume" : "thread/start";
   await waitFor(
     () => parse().some((m) => m.method === threadMethod),
     threadMethod,
@@ -106,7 +108,6 @@ async function startTurn(
     () => parse().some((m) => m.method === "turn/start"),
     "turn/start",
   );
-  await options.beforeTurnReply?.();
   reply(parse().find((m) => m.method === "turn/start")!.id as number, {
     turn: { id: "turn_1", status: "inProgress" },
   });
@@ -117,9 +118,6 @@ async function startTurn(
 describe("codex live turn sequence", () => {
   beforeEach(() => {
     sent.length = 0;
-    resolveCodexBinary.mockReset().mockResolvedValue({ path: "/fake/codex" });
-    spawnChild.mockClear();
-    killChild.mockClear();
     onLine = undefined;
     writeChild.mockClear();
   });
@@ -129,7 +127,6 @@ describe("codex live turn sequence", () => {
     vi.restoreAllMocks();
     await stopCodexSession("codex-live");
     __codexTestReset();
-    resetHarnessModelOverlays();
   });
 
   it("keeps retries and HTTP fallback out of a successful turn's transcript", async () => {
@@ -166,6 +163,37 @@ describe("codex live turn sequence", () => {
     expect(session.blocks).toMatchObject([
       { role: "assistant", text: "The answer", streaming: false },
     ]);
+  });
+
+  it("resumes a legacy thread when the missing account resolves to default", async () => {
+    const { turn } = await startTurn("codex-live", {
+      resume: true,
+      providerAccountId: "default",
+    });
+    expect(parse().some((message) => message.method === "thread/resume")).toBe(
+      true,
+    );
+    expect(parse().some((message) => message.method === "thread/start")).toBe(
+      false,
+    );
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
+  });
+
+  it("does not resume a legacy default thread under a named account", async () => {
+    const { turn } = await startTurn("codex-live", {
+      resume: true,
+      providerAccountId: "account-work",
+      expectResume: false,
+    });
+    expect(parse().some((message) => message.method === "thread/start")).toBe(
+      true,
+    );
+    expect(parse().some((message) => message.method === "thread/resume")).toBe(
+      false,
+    );
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
   });
 
   it("still surfaces a terminal failure after transport retries", async () => {
@@ -318,141 +346,6 @@ describe("codex live turn sequence", () => {
       await turn;
     },
   );
-
-  it("settles pending and new approvals when the mode loosens mid-turn", async () => {
-    const { events, turn } = await startTurn("codex-live");
-    onLine!(
-      JSON.stringify({
-        id: 91,
-        method: "item/fileChange/requestApproval",
-        params: { itemId: "edit_1", reason: "Update config" },
-      }),
-    );
-    onLine!(
-      JSON.stringify({
-        id: 92,
-        method: "item/commandExecution/requestApproval",
-        params: { itemId: "cmd_1", command: "git status --short" },
-      }),
-    );
-    await waitFor(
-      () =>
-        events.filter((e) => e.type === "approval.requested").length === 2,
-      "both approvals parked",
-    );
-
-    // auto-accept-edits covers the file change but not the command.
-    setCodexRuntimeMode("codex-live", "auto-accept-edits");
-    await waitFor(() => parse().some((m) => m.id === 91), "edit decision");
-    expect(parse().find((m) => m.id === 91)?.result).toEqual({
-      decision: "accept",
-    });
-    expect(parse().some((m) => m.id === 92)).toBe(false);
-
-    // full-access settles the command too, and new asks never reach the UI.
-    setCodexRuntimeMode("codex-live", "full-access");
-    await waitFor(() => parse().some((m) => m.id === 92), "command decision");
-    expect(parse().find((m) => m.id === 92)?.result).toEqual({
-      decision: "accept",
-    });
-    expect(
-      events.filter((e) => e.type === "approval.resolved"),
-    ).toHaveLength(2);
-
-    onLine!(
-      JSON.stringify({
-        id: 93,
-        method: "item/commandExecution/requestApproval",
-        params: { itemId: "cmd_2", command: "rm -rf build" },
-      }),
-    );
-    await waitFor(() => parse().some((m) => m.id === 93), "fresh ask");
-    expect(parse().find((m) => m.id === 93)?.result).toEqual({
-      decision: "accept",
-    });
-    expect(
-      events.filter((e) => e.type === "approval.requested"),
-    ).toHaveLength(2);
-
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await turn;
-  });
-
-  it("settles parked MCP consent when the mode loosens to full-access", async () => {
-    const { events, turn } = await startTurn("codex-live");
-    onLine!(
-      JSON.stringify({
-        id: 91,
-        method: "mcpServer/elicitation/request",
-        params: {
-          serverName: "example",
-          mode: "form",
-          message: "Read this source?",
-          requestedSchema: {
-            type: "object",
-            properties: { approved: { type: "boolean" } },
-            required: ["approved"],
-          },
-        },
-      }),
-    );
-    await waitFor(
-      () => events.some((e) => e.type === "approval.requested"),
-      "MCP approval UI",
-    );
-    expect(parse().some((m) => m.id === 91)).toBe(false);
-
-    setCodexRuntimeMode("codex-live", "full-access");
-    await waitFor(() => parse().some((m) => m.id === 91), "MCP response");
-    expect(parse().find((m) => m.id === 91)?.result).toMatchObject({
-      action: "accept",
-    });
-    expect(
-      events.some(
-        (e) => e.type === "approval.resolved" && e.decision === "allow",
-      ),
-    ).toBe(true);
-
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await turn;
-  });
-
-  it("resumes parking asks when the mode tightens mid-turn", async () => {
-    const { events, turn } = await startTurn("codex-live");
-    onLine!(
-      JSON.stringify({
-        id: 91,
-        method: "item/fileChange/requestApproval",
-        params: { itemId: "edit_1", reason: "Update config" },
-      }),
-    );
-    await waitFor(
-      () => events.some((e) => e.type === "approval.requested"),
-      "approval parked",
-    );
-
-    setCodexRuntimeMode("codex-live", "auto-accept-edits");
-    await waitFor(() => parse().some((m) => m.id === 91), "edit decision");
-
-    setCodexRuntimeMode("codex-live", "supervised");
-    onLine!(
-      JSON.stringify({
-        id: 92,
-        method: "item/fileChange/requestApproval",
-        params: { itemId: "edit_2", reason: "Update other file" },
-      }),
-    );
-    await waitFor(
-      () =>
-        events.filter((e) => e.type === "approval.requested").length === 2,
-      "fresh ask parks",
-    );
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(parse().some((m) => m.id === 92)).toBe(false);
-
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await turn;
-  });
 
   it("still waits for an explicit command decision in supervised mode", async () => {
     const { events, turn } = await startTurn("codex-live");
@@ -941,9 +834,14 @@ describe("codex live turn sequence", () => {
     await turn;
   });
 
-  it.each([false, true] as const)(
-    "auto-accepts MCP elicitation in Full Access, boolean=%s",
-    async (boolean) => {
+  it.each([
+    { decision: "allow", boolean: false },
+    { decision: "deny", boolean: false },
+    { decision: "allow", boolean: true },
+    { decision: "deny", boolean: true },
+  ] as const)(
+    "shows other MCP confirmation in Full Access and sends $decision, boolean=$boolean",
+    async ({ decision, boolean }) => {
       const { events, turn } = await startTurn("codex-live", {
         runtimeMode: "full-access",
       });
@@ -965,13 +863,18 @@ describe("codex live turn sequence", () => {
           },
         }),
       );
-      // Full access admits MCP consent the way the CLI's bypass mode does —
-      // accepted immediately, no approval UI.
+      await waitFor(
+        () => events.some((e) => e.type === "approval.requested"),
+        "MCP approval UI",
+      );
+      expect(parse().some((m) => m.id === 91)).toBe(false);
+      const approval = events.find((e) => e.type === "approval.requested")!;
+      respondCodexApproval("codex-live", approval.requestId, decision);
       await waitFor(() => parse().some((m) => m.id === 91), "MCP response");
-      expect(events.some((e) => e.type === "approval.requested")).toBe(false);
       expect(parse().find((m) => m.id === 91)?.result).toEqual({
-        action: "accept",
-        content: boolean ? { approved: true } : {},
+        action: decision === "allow" ? "accept" : "decline",
+        content:
+          decision === "allow" ? (boolean ? { approved: true } : {}) : null,
         _meta: null,
       });
       notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
@@ -979,7 +882,7 @@ describe("codex live turn sequence", () => {
     },
   );
 
-  it("auto-accepts computer-use app access in Full Access", async () => {
+  it("auto-approves computer-use app access in Full Access", async () => {
     const { events, turn } = await startTurn("codex-live", {
       runtimeMode: "full-access",
     });
@@ -1000,12 +903,12 @@ describe("codex live turn sequence", () => {
       }),
     );
     await waitFor(() => parse().some((m) => m.id === 91), "MCP response");
-    expect(events.some((e) => e.type === "approval.requested")).toBe(false);
     expect(parse().find((m) => m.id === 91)?.result).toEqual({
       action: "accept",
       content: {},
       _meta: null,
     });
+    expect(events.some((e) => e.type === "approval.requested")).toBe(false);
     notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
     await turn;
   });
@@ -1405,46 +1308,6 @@ describe("codex live turn sequence", () => {
     await turn;
   });
 
-  it("declines MCP elicitation during a plan turn without prompting", async () => {
-    const { events, turn } = await startTurn("codex-live", {
-      runtimeMode: "auto",
-      intent: "plan",
-    });
-    onLine!(
-      JSON.stringify({
-        id: 91,
-        method: "mcpServer/elicitation/request",
-        params: {
-          serverName: "example",
-          mode: "form",
-          message: "Read this source?",
-          requestedSchema: {
-            type: "object",
-            properties: { approved: { type: "boolean" } },
-            required: ["approved"],
-          },
-        },
-      }),
-    );
-    await waitFor(
-      () => parse().some((message) => message.id === 91),
-      "plan elicitation denial",
-    );
-    expect(events.some((event) => event.type === "approval.requested")).toBe(
-      false,
-    );
-    expect(parse().find((message) => message.id === 91)?.result).toEqual({
-      action: "decline",
-      content: null,
-      _meta: null,
-    });
-
-    notify("turn/completed", {
-      turn: { id: "turn_1", status: "completed" },
-    });
-    await turn;
-  });
-
   it("uses thread/compact/start and waits for its turn to complete", async () => {
     const { turn } = await startTurn("codex-live");
     notify("turn/completed", {
@@ -1486,247 +1349,6 @@ describe("codex live turn sequence", () => {
     });
     await compact;
     expect(settled).toBe(true);
-  });
-
-  it("warms the picker catalog from the session's own app-server", async () => {
-    const { turn } = await startTurn("codex-live");
-    // The session's initialize already paid for the process; account/read and
-    // model/list reuse that connection instead of spawning a probe.
-    await waitFor(
-      () => parse().some((m) => m.method === "account/read"),
-      "account/read",
-    );
-    reply(
-      parse().find((m) => m.method === "account/read")!.id as number,
-      { account: { type: "chatgpt" } },
-    );
-    await waitFor(
-      () => parse().some((m) => m.method === "model/list"),
-      "model/list",
-    );
-    reply(parse().find((m) => m.method === "model/list")!.id as number, {
-      data: [
-        {
-          id: "gpt-fixture",
-          displayName: "GPT Fixture",
-          supportedReasoningEfforts: ["low"],
-        },
-      ],
-    });
-    await waitFor(
-      () => modelsFor("codex").some((m) => m.nativeId === "gpt-fixture"),
-      "catalog models",
-    );
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await turn;
-  });
-
-  it("marks the catalog signed out when the session has no account", async () => {
-    const { modelCatalogError } = await import("../models");
-    const { turn } = await startTurn("codex-live");
-    await waitFor(
-      () => parse().some((m) => m.method === "account/read"),
-      "account/read",
-    );
-    reply(parse().find((m) => m.method === "account/read")!.id as number, {
-      requiresOpenaiAuth: true,
-    });
-    await waitFor(
-      () => modelCatalogError("codex") !== undefined,
-      "catalog auth error",
-    );
-    expect(modelCatalogError("codex")).toContain("not authenticated");
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await turn;
-  });
-
-  it("ignores an old terminal event after a follow-up starts", async () => {
-    const { turn } = await startTurn("codex-late");
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await turn;
-    const events: HarnessEvent[] = [];
-    const next = sendCodexTurn({ sessionId: "codex-late", cwd: "/repo", model: "codex:gpt-5.4", runtimeMode: "supervised", text: "next", onEvent: e => events.push(e) });
-    await waitFor(() => parse().filter(m => m.method === "turn/start").length === 2, "second turn");
-    const request = parse().filter(m => m.method === "turn/start").at(-1)!;
-    reply(request.id as number, { turn: { id: "turn_2" } });
-    notify("turn/started", { turn: { id: "turn_2" } });
-    let settled = false;
-    void next.then(() => { settled = true; });
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await new Promise(r => setTimeout(r, 0));
-    expect(settled).toBe(false);
-    expect(canSteerCodexSession("codex-late")).toBe(true);
-    expect(events.some(e => e.type === "message.completed")).toBe(false);
-    notify("turn/completed", { turn: { id: "turn_2", status: "completed" } });
-    await next;
-  });
-
-  it("falls back to the thread's model for the Default picker entry", async () => {
-    const events: HarnessEvent[] = [];
-    const turn = sendCodexTurn({
-      sessionId: "codex-live",
-      cwd: "/repo",
-      model: "codex:default",
-      modelSettings: {},
-      runtimeMode: "supervised",
-      text: "summarize the changelog",
-      attachments: [],
-      onEvent: (event) => events.push(event),
-    });
-    await waitFor(
-      () => parse().some((m) => m.method === "initialize"),
-      "initialize",
-    );
-    reply(parse().find((m) => m.method === "initialize")!.id as number, {});
-    await waitFor(
-      () => parse().some((m) => m.method === "thread/start"),
-      "thread/start",
-    );
-    const threadStart = parse().find((m) => m.method === "thread/start")!;
-    // The placeholder must not pin the new thread to an empty model id.
-    expect(threadStart.params).not.toHaveProperty("model");
-    reply(threadStart.id as number, {
-      thread: { id: "thr_1", model: "gpt-6-astra" },
-    });
-    await waitFor(
-      () => parse().some((m) => m.method === "turn/start"),
-      "turn/start",
-    );
-    const turnStart = parse().find((m) => m.method === "turn/start")!;
-    // Sending "" here is schema-valid but rejected by the server ("The ''
-    // model is not supported"); the thread's reported model is the fallback.
-    expect(turnStart.params).toMatchObject({
-      model: "gpt-6-astra",
-      collaborationMode: { settings: { model: "gpt-6-astra" } },
-    });
-    reply(turnStart.id as number, {
-      turn: { id: "turn_1", status: "inProgress" },
-    });
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await turn;
-  });
-
-  it("answers a server request that arrives while the session is binding", async () => {
-    const events: HarnessEvent[] = [];
-    const turn = sendCodexTurn({
-      sessionId: "codex-live",
-      cwd: "/repo",
-      model: "codex:gpt-5.4",
-      modelSettings: {},
-      runtimeMode: "supervised",
-      text: "summarize the changelog",
-      attachments: [],
-      onEvent: (event) => events.push(event),
-    });
-    await waitFor(
-      () => parse().some((m) => m.method === "initialize"),
-      "initialize",
-    );
-    reply(parse().find((m) => m.method === "initialize")!.id as number, {});
-    await waitFor(
-      () => parse().some((m) => m.method === "thread/start"),
-      "thread/start",
-    );
-    // A pending approval re-issued before the live record binds must not be
-    // left unanswered — the app-server holds the request open until replied.
-    onLine!(
-      JSON.stringify({
-        id: 77,
-        method: "item/commandExecution/requestApproval",
-        params: { itemId: "cmd_early", command: "git status" },
-      }),
-    );
-    reply(parse().find((m) => m.method === "thread/start")!.id as number, {
-      thread: { id: "thr_1" },
-    });
-    await waitFor(
-      () => events.some((e) => e.type === "approval.requested"),
-      "buffered approval",
-    );
-    const request = events.find((e) => e.type === "approval.requested")!;
-    if (request.type !== "approval.requested")
-      throw new Error("missing approval");
-    respondCodexApproval("codex-live", request.requestId, "deny");
-    await waitFor(() => parse().some((m) => m.id === 77), "buffered reply");
-    expect(parse().find((m) => m.id === 77)?.result).toEqual({
-      decision: "decline",
-    });
-    await waitFor(
-      () => parse().some((m) => m.method === "turn/start"),
-      "turn/start",
-    );
-    reply(parse().find((m) => m.method === "turn/start")!.id as number, {
-      turn: { id: "turn_1", status: "inProgress" },
-    });
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await turn;
-  });
-
-  it("seals a streamed message when the item completes without text", async () => {
-    const { events, turn } = await startTurn("codex-live");
-    notify("item/agentMessage/delta", { itemId: "m1", delta: "Done" });
-    // Completed items may carry no text when deltas already streamed; the
-    // streaming block must still seal rather than wait for turn/completed.
-    notify("item/completed", {
-      item: { id: "m1", type: "agentMessage" },
-    });
-    expect(events).toContainEqual({ type: "message.completed" });
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await turn;
-  });
-
-  it("unwraps a nested API error from turn/completed", async () => {
-    const { events, turn } = await startTurn("codex-live");
-    notify("turn/completed", {
-      turn: {
-        id: "turn_1",
-        status: "failed",
-        error: {
-          message:
-            '{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The model is not supported"}}',
-        },
-      },
-    });
-    expect(events).toContainEqual({
-      type: "session.error",
-      message: "The model is not supported",
-    });
-    await turn;
-  });
-
-  it("stopping while turn/start is in flight resolves quietly", async () => {
-    const events: HarnessEvent[] = [];
-    const turn = sendCodexTurn({
-      sessionId: "codex-live",
-      cwd: "/repo",
-      model: "codex:gpt-5.4",
-      modelSettings: {},
-      runtimeMode: "supervised",
-      text: "summarize the changelog",
-      attachments: [],
-      onEvent: (event) => events.push(event),
-    });
-    await waitFor(
-      () => parse().some((m) => m.method === "initialize"),
-      "initialize",
-    );
-    reply(parse().find((m) => m.method === "initialize")!.id as number, {});
-    await waitFor(
-      () => parse().some((m) => m.method === "thread/start"),
-      "thread/start",
-    );
-    reply(parse().find((m) => m.method === "thread/start")!.id as number, {
-      thread: { id: "thr_1" },
-    });
-    await waitFor(
-      () => parse().some((m) => m.method === "turn/start"),
-      "turn/start",
-    );
-    // Stop before the ack: close() rejects the in-flight request, and an
-    // intentional teardown must not surface as a send failure.
-    await stopCodexSession("codex-live");
-    await turn;
-    expect(events.some((e) => e.type === "session.error")).toBe(false);
   });
 });
 
@@ -2014,253 +1636,5 @@ describe("codex subagents", () => {
           event.text.includes("Child talking."),
       ),
     ).toBe(false);
-  });
-  it.each(["cancel", "remove"])("fences %s before binary resolution without spawning", async action => {
-    let resolve!: (result: { path: string }) => void;
-    resolveCodexBinary.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
-    const events: HarnessEvent[] = [];
-    const turn = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:default", runtimeMode: "supervised", text: "never run", onEvent: e => events.push(e) });
-    await waitFor(() => !!resolve, "binary resolution");
-    if (action === "cancel") await cancelCodexTurn("codex-live");
-    else await stopCodexSession("codex-live");
-    resolve({ path: "/fake/codex" });
-    await turn;
-    expect(spawnChild).not.toHaveBeenCalled();
-    expect(events).toEqual([]);
-  });
-
-  it("cancels a home-session warmup before it can spawn or dispatch a turn", async () => {
-    let resolve!: (result: { path: string }) => void;
-    resolveCodexBinary.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
-    const events: HarnessEvent[] = [];
-    const warmup = prewarmCodexSession({ sessionId: "codex-live", cwd: "~",
-      model: "codex:gpt-6-astra", modelSettings: { reasoningEffort: "medium" },
-      runtimeMode: "supervised", onEvent: e => events.push(e) });
-    await waitFor(() => !!resolve, "warmup binary resolution");
-    await cancelCodexTurn("codex-live");
-    resolve({ path: "/fake/codex" });
-    await warmup;
-    expect(spawnChild).not.toHaveBeenCalled();
-    expect(events).toEqual([]);
-    expect(parse().some(m => m.method === "turn/start")).toBe(false);
-  });
-
-  it("recycles the owned host when Stop races the turn/start acknowledgement", async () => {
-    const { events, turn } = await startTurn("codex-live", { beforeTurnReply: () => cancelCodexTurn("codex-live") });
-    await turn;
-    expect(killChild).toHaveBeenCalledOnce();
-    expect(canSteerCodexSession("codex-live")).toBe(false);
-    notify("item/agentMessage/delta", { itemId: "late", delta: "must stay hidden" });
-    expect(events.some(e => e.type === "message.delta")).toBe(false);
-    sent.length = 0;
-    const next = await startTurn("codex-live", { resume: true });
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await next.turn;
-  });
-
-  it.each(["assistant", "reasoning"])("deduplicates separate streamed %s items within one turn", async role => {
-    const { events, turn } = await startTurn("codex-live");
-    const deltaMethod = role === "assistant" ? "item/agentMessage/delta" : "item/reasoning/summaryTextDelta";
-    for (const [id, text] of [["first", "I will inspect the code."], ["second", "The bug is fixed."]]) {
-      notify(deltaMethod, { threadId: "thr_1", itemId: id, delta: text });
-      notify("item/completed", { threadId: "thr_1", item: { id, type: role === "assistant" ? "agentMessage" : "reasoning", text, summary: [text] } });
-    }
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await turn;
-    const type = role === "assistant" ? "message.delta" : "reasoning.delta";
-    expect(events.filter(e => e.type === type).map(e => "text" in e ? e.text : "")).toEqual(["I will inspect the code.", "The bug is fixed."]);
-  });
-
-  it("bounds child mappings and unmatched payloads across turns", async () => {
-    const { events, turn } = await startTurn("codex-live");
-    for (let i = 0; i < 300; i++) {
-      notify("item/started", { threadId: `unknown-${i}`, item: { id: "cmd", type: "commandExecution", command: "x".repeat(16000) } });
-      notify("item/completed", { threadId: "thr_1", item: { id: `spawn-${i}`, type: "subAgentActivity", kind: "started", agentThreadId: `child-${i}` } });
-    }
-    expect(__codexTestRetained("codex-live")).toMatchObject({ children: 128 });
-    expect(__codexTestRetained("codex-live").pending).toBeLessThanOrEqual(64);
-    expect(__codexTestRetained("codex-live").bytes).toBeLessThanOrEqual(1024 * 1024);
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await turn;
-    expect(__codexTestRetained("codex-live")).toMatchObject({ pending: 0, bytes: 0 });
-    notify("item/completed", { threadId: "thr_1", item: { id: "fresh-spawn", type: "subAgentActivity", kind: "started", agentThreadId: "fresh-child" } });
-    notify("item/completed", { threadId: "fresh-child", item: { id: "fresh-answer", type: "agentMessage", text: "latest child" } });
-    expect(events.some(e => e.type === "agent.step" && e.callId === "fresh-spawn" && e.text === "latest child")).toBe(true);
-    expect(__codexTestRetained("codex-live").children).toBe(128);
-  });
-
-  it("does not dispatch an already queued send after cancellation", async () => {
-    const { turn } = await startTurn("codex-live");
-    const queued = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:default", runtimeMode: "supervised", text: "queued", onEvent: () => undefined });
-    const cancel = cancelCodexTurn("codex-live");
-    await waitFor(() => parse().some(m => m.method === "turn/interrupt"), "interrupt");
-    reply(parse().find(m => m.method === "turn/interrupt")!.id as number, {});
-    await Promise.all([turn, queued, cancel]);
-    expect(parse().filter(m => m.method === "turn/start")).toHaveLength(1);
-  });
-
-  it("still reports a real startup error after cleanup", async () => {
-    const turn = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:default", runtimeMode: "supervised", text: "test", onEvent: () => undefined });
-    const rejected = expect(turn).rejects.toThrow("initialize denied");
-    await waitFor(() => parse().some(m => m.method === "initialize"), "initialize");
-    onLine!(JSON.stringify({ id: parse().find(m => m.method === "initialize")!.id, error: { code: -32602, message: "initialize denied" } }));
-    await rejected;
-    expect(killChild).toHaveBeenCalled();
-    expect(parse().some(m => m.method === "turn/start")).toBe(false);
-  });
-
-  it("cannot bind a session after removal during the handshake", async () => {
-    const events: HarnessEvent[] = [];
-    const turn = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:default", runtimeMode: "supervised", text: "never run", onEvent: e => events.push(e) });
-    await waitFor(() => parse().some(m => m.method === "initialize"), "initialize");
-    reply(parse().find(m => m.method === "initialize")!.id as number, {});
-    await waitFor(() => parse().some(m => m.method === "thread/start"), "thread start");
-    const start = parse().find(m => m.method === "thread/start")!;
-    await stopCodexSession("codex-live");
-    reply(start.id as number, { thread: { id: "removed" } });
-    await turn;
-    expect(events.some(e => e.type === "session.providerBound")).toBe(false);
-    expect(parse().some(m => m.method === "turn/start")).toBe(false);
-  });
-
-  it("allows a new send while a cancelled binary resolution is still pending", async () => {
-    let resolve!: (result: { path: string }) => void;
-    resolveCodexBinary.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
-    const original = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:default", runtimeMode: "supervised", text: "old", onEvent: () => undefined });
-    await waitFor(() => !!resolve, "old resolution");
-    await cancelCodexTurn("codex-live");
-    const next = await startTurn("codex-live");
-    resolve({ path: "/fake/codex" });
-    await original;
-    expect(spawnChild).toHaveBeenCalledOnce();
-    expect(canSteerCodexSession("codex-live")).toBe(true);
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await next.turn;
-  });
-
-
-  it.each(["rejected", "unanswered"])("retires the host after an %s interrupt and preserves resume", async outcome => {
-    const { turn } = await startTurn("codex-live");
-    vi.useFakeTimers();
-    try {
-      const cancel = cancelCodexTurn("codex-live");
-      if (outcome === "rejected") {
-        const request = parse().find(m => m.method === "turn/interrupt")!;
-        onLine!(JSON.stringify({ id: request.id, error: { code: -32603, message: "interrupt failed" } }));
-      } else {
-        await vi.advanceTimersByTimeAsync(15_001);
-      }
-      await cancel;
-      await turn;
-      expect(killChild).toHaveBeenCalledOnce();
-      expect(canSteerCodexSession("codex-live")).toBe(false);
-    } finally { vi.useRealTimers(); }
-    sent.length = 0;
-    const retry = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:gpt-5.4", runtimeMode: "supervised", text: "retry", onEvent: () => undefined });
-    await waitFor(() => parse().some(m => m.method === "initialize"), "initialize");
-    reply(parse().find(m => m.method === "initialize")!.id as number, {});
-    await waitFor(() => parse().some(m => m.method === "thread/resume"), "resume");
-    expect(parse().find(m => m.method === "thread/resume")!.params).toMatchObject({ threadId: "thr_1" });
-    await stopCodexSession("codex-live");
-    await retry;
-  });
-
-  it("does not let a late interrupt response stop a replacement host", async () => {
-    const old = await startTurn("codex-live");
-    const cancel = cancelCodexTurn("codex-live");
-    const request = parse().find(m => m.method === "turn/interrupt")!;
-    const oldLine = onLine!;
-    await stopCodexSession("codex-live");
-    await Promise.all([cancel, old.turn]);
-    sent.length = 0;
-    const next = await startTurn("codex-live", { resume: true });
-    oldLine(JSON.stringify({ id: request.id, error: { code: -32603, message: "late interrupt failure" } }));
-    await new Promise(r => setTimeout(r, 0));
-    expect(killChild).toHaveBeenCalledOnce();
-    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
-    await next.turn;
-  });
-
-  it("shares one resumed host for sends waiting on a failed interruption", async () => {
-    const old = await startTurn("codex-live");
-    const cancel = cancelCodexTurn("codex-live");
-    const input = { sessionId: "codex-live", cwd: "/repo", model: "codex:gpt-5.4", runtimeMode: "supervised" as const, text: "next", onEvent: () => undefined };
-    const first = sendCodexTurn(input);
-    const second = sendCodexTurn(input);
-    const request = parse().find(m => m.method === "turn/interrupt")!;
-    onLine!(JSON.stringify({ id: request.id, error: { code: -32603, message: "interrupt failed" } }));
-    await Promise.all([cancel, old.turn]);
-    await waitFor(() => parse().filter(m => m.method === "initialize").length === 2, "one new initialize");
-    reply(parse().filter(m => m.method === "initialize").at(-1)!.id as number, {});
-    await waitFor(() => parse().some(m => m.method === "thread/resume"), "resume");
-    reply(parse().find(m => m.method === "thread/resume")!.id as number, { thread: { id: "thr_1", model: "gpt-5.4" } });
-    for (const count of [2, 3]) {
-      await waitFor(() => parse().filter(m => m.method === "turn/start").length === count, "serialized send");
-      const turnId = `turn_${count}`;
-      reply(parse().filter(m => m.method === "turn/start").at(-1)!.id as number, { turn: { id: turnId } });
-      notify("turn/completed", { turn: { id: turnId, status: "completed" } });
-    }
-    await Promise.all([first, second]);
-    expect(spawnChild).toHaveBeenCalledTimes(2);
-  });
-  it("delayed stopped terminal cannot complete next admission", async () => {
-    const old = await startTurn("codex-live");
-    const cancel = cancelCodexTurn("codex-live");
-    reply(parse().find(m => m.method === "turn/interrupt")!.id as number, {});
-    await Promise.all([cancel, old.turn]);
-    const events: HarnessEvent[] = [];
-    const next = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:gpt-5.4", runtimeMode: "supervised", text: "new task", onEvent: e => events.push(e) });
-    const settled = vi.fn(); void next.then(settled);
-    await waitFor(() => parse().filter(m => m.method === "turn/start").length === 2, "new admission");
-    notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "interrupted" } });
-    reply(parse().filter(m => m.method === "turn/start").at(-1)!.id as number, { turn: { id: "turn_2" } });
-    await new Promise(r => setTimeout(r, 10));
-    expect(settled).not.toHaveBeenCalled();
-    notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_2", status: "completed" } });
-    await next;
-  });
-
-
-  it("ignores duplicate terminal events from several successfully stopped turns", async () => {
-    const first = await startTurn("codex-live");
-    const stopFirst = cancelCodexTurn("codex-live");
-    reply(parse().filter(m => m.method === "turn/interrupt").at(-1)!.id as number, {});
-    await Promise.all([stopFirst, first.turn]);
-    const input = { sessionId: "codex-live", cwd: "/repo", model: "codex:gpt-5.4", runtimeMode: "supervised" as const, text: "next", onEvent: () => undefined };
-    const second = sendCodexTurn(input);
-    await waitFor(() => parse().filter(m => m.method === "turn/start").length === 2, "second admission");
-    reply(parse().filter(m => m.method === "turn/start").at(-1)!.id as number, { turn: { id: "turn_2" } });
-    await new Promise(r => setTimeout(r, 0));
-    const stopSecond = cancelCodexTurn("codex-live");
-    reply(parse().filter(m => m.method === "turn/interrupt").at(-1)!.id as number, {});
-    await Promise.all([stopSecond, second]);
-    const third = sendCodexTurn(input);
-    const settled = vi.fn();
-    void third.then(settled);
-    await waitFor(() => parse().filter(m => m.method === "turn/start").length === 3, "third admission");
-    for (const id of ["turn_1", "turn_2", "turn_1"]) {
-      notify("turn/completed", { threadId: "thr_1", turn: { id, status: "interrupted" } });
-    }
-    reply(parse().filter(m => m.method === "turn/start").at(-1)!.id as number, { turn: { id: "turn_3" } });
-    await new Promise(r => setTimeout(r, 10));
-    expect(settled).not.toHaveBeenCalled();
-    expect(canSteerCodexSession("codex-live")).toBe(true);
-    notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_3", status: "completed" } });
-    await third;
-  });
-
-  it("bounds terminal identity retention during a long conversation", async () => {
-    const first = await startTurn("codex-live");
-    notify("turn/completed", { threadId: "thr_1", turn: { id: "turn_1", status: "completed" } });
-    await first.turn;
-    for (let index = 2; index <= 66; index++) {
-      const turn = sendCodexTurn({ sessionId: "codex-live", cwd: "/repo", model: "codex:gpt-5.4", runtimeMode: "supervised", text: "next", onEvent: () => undefined });
-      await waitFor(() => parse().filter(m => m.method === "turn/start").length === index, "turn admission");
-      const id = `turn_${index}`;
-      reply(parse().filter(m => m.method === "turn/start").at(-1)!.id as number, { turn: { id } });
-      notify("turn/completed", { threadId: "thr_1", turn: { id, status: "completed" } });
-      await turn;
-    }
-    expect(__codexTestRetained("codex-live").completedTurns).toBe(64);
   });
 });

@@ -1,10 +1,9 @@
-import type { MouseEvent } from "react";
 import type { IconComponent } from "./icons";
 
 type Props = {
   label: string;
   icon: IconComponent;
-  onClick?: (event: MouseEvent<HTMLButtonElement>) => void;
+  onClick?: () => void;
   onOpenContextMenu?: (x: number, y: number) => void;
   active?: boolean;
   badge?: number;

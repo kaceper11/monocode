@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, Default)]
 pub struct ProcStat {
-    pub cpu_pct: f32,
-    pub rss_bytes: u64,
+    pub cpu_pct: Option<f32>,
+    pub rss_bytes: Option<u64>,
     pub processes: u32,
     /// Tree has members besides the root shell — killing the workload
     /// keeps the terminal alive.
@@ -24,8 +24,9 @@ struct ProcRow {
     /// Cumulative CPU seconds — unix `cputime`, Windows FILETIME ticks/1e7.
     cpu_secs: f64,
     /// % of one core since the previous sample; filled by `apply_cpu_deltas`.
-    cpu: f32,
-    rss_bytes: u64,
+    cpu: Option<f32>,
+    rss_bytes: Option<u64>,
+    started: String,
     name: String,
 }
 
@@ -66,15 +67,29 @@ fn subtree(
 }
 
 fn aggregate(rows: &[ProcRow], members: Vec<usize>, root: u32) -> ProcStat {
-    let mut stat = ProcStat::default();
+    let mut stat = ProcStat {
+        cpu_pct: Some(0.0),
+        rss_bytes: Some(0),
+        ..ProcStat::default()
+    };
     let mut top: Option<(f32, u64, &str)> = None;
     for index in members {
         let row = &rows[index];
-        stat.cpu_pct += row.cpu;
-        stat.rss_bytes += row.rss_bytes;
+        stat.cpu_pct = stat
+            .cpu_pct
+            .zip(row.cpu)
+            .map(|(total, value)| total + value);
+        stat.rss_bytes = stat
+            .rss_bytes
+            .zip(row.rss_bytes)
+            .map(|(total, value)| total.saturating_add(value));
         stat.processes += 1;
         if row.pid != root {
-            let candidate = (row.cpu, row.rss_bytes, row.name.as_str());
+            let candidate = (
+                row.cpu.unwrap_or(0.0),
+                row.rss_bytes.unwrap_or(0),
+                row.name.as_str(),
+            );
             if top.is_none_or(|best| candidate > best) {
                 top = Some(candidate);
             }
@@ -85,26 +100,11 @@ fn aggregate(rows: &[ProcRow], members: Vec<usize>, root: u32) -> ProcStat {
     stat
 }
 
-/// Non-root pids in `root`'s tree — the workload `pty_kill_workload` stops.
-pub fn descendants(root: u32) -> Vec<u32> {
-    let Ok(rows) = snapshot() else {
-        return Vec::new();
-    };
-    let (index_of, children) = build_children(&rows);
-    subtree(&rows, &index_of, &children, root)
-        .into_iter()
-        .map(|index| rows[index].pid)
-        .filter(|pid| *pid != root)
-        .collect()
-}
-
-pub fn sample_trees(roots: &[u32]) -> HashMap<u32, ProcStat> {
+pub fn sample_trees(roots: &[u32]) -> Result<HashMap<u32, ProcStat>, String> {
     if roots.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
-    let Ok(mut rows) = snapshot() else {
-        return HashMap::new();
-    };
+    let mut rows = snapshot()?;
     let (index_of, children) = build_children(&rows);
     let member_sets: Vec<Vec<usize>> = roots
         .iter()
@@ -117,21 +117,23 @@ pub fn sample_trees(roots: &[u32]) -> HashMap<u32, ProcStat> {
         .collect();
     measure(&mut rows, &wanted);
     apply_cpu_deltas(&mut rows, &wanted);
-    roots
+    Ok(roots
         .iter()
         .zip(member_sets)
+        .filter(|(_, members)| !members.is_empty())
         .map(|(&root, members)| (root, aggregate(&rows, members, root)))
-        .collect()
+        .collect())
 }
 
 /// % of one core between samples — `cpu_secs` deltas over wall time,
-/// keyed by pid. Pid reuse shows as a negative delta and clamps to 0;
-/// first paint reports 0 until a second sample lands.
+/// keyed by PID and start identity. Unmeasured/first samples stay unknown;
+/// a reused PID never inherits the prior process CPU baseline.
 fn apply_cpu_deltas(rows: &mut [ProcRow], wanted: &HashSet<u32>) {
     use std::sync::Mutex;
     use std::time::Instant;
 
-    static PREV: Mutex<Option<HashMap<u32, (f64, Instant)>>> = Mutex::new(None);
+    type Baselines = HashMap<u32, (String, f64, Instant)>;
+    static PREV: Mutex<Option<Baselines>> = Mutex::new(None);
     let now = Instant::now();
     let mut prev = PREV.lock().unwrap_or_else(|e| e.into_inner());
     let previous = prev.get_or_insert_with(HashMap::new);
@@ -141,13 +143,23 @@ fn apply_cpu_deltas(rows: &mut [ProcRow], wanted: &HashSet<u32>) {
         if row.cpu_secs.is_nan() {
             continue;
         }
-        if let Some((prev_secs, prev_at)) = previous.get(&row.pid) {
+        if let Some((started, prev_secs, prev_at)) = previous.get(&row.pid) {
             let elapsed = now.duration_since(*prev_at).as_secs_f64();
-            row.cpu = cpu_delta_pct(*prev_secs, row.cpu_secs, elapsed);
+            if started == &row.started
+                && (0.001..60.0).contains(&elapsed)
+                && row.cpu_secs >= *prev_secs
+            {
+                row.cpu = Some(cpu_delta_pct(*prev_secs, row.cpu_secs, elapsed));
+            }
         }
-        previous.insert(row.pid, (row.cpu_secs, now));
+        previous.insert(row.pid, (row.started.clone(), row.cpu_secs, now));
     }
-    previous.retain(|pid, _| wanted.contains(pid));
+    // Separate windows sample different roots. Keep their recent baselines,
+    // bounded to one minute and 32k entries; this cache owns no background work.
+    previous.retain(|_, (_, _, at)| now.duration_since(*at).as_secs() < 60);
+    if previous.len() > 32_768 {
+        previous.clear();
+    }
 }
 
 /// CPU seconds burned per wall second since the last sample, as % of one
@@ -167,11 +179,15 @@ fn cpu_delta_pct(prev_secs: f64, cpu_secs: f64, elapsed: f64) -> f32 {
 fn snapshot() -> Result<Vec<ProcRow>, String> {
     // `comm` is the last column, so paths with spaces cannot skew the
     // numeric fields — LC_ALL keeps parsing identical in any locale.
-    let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,cputime=,rss=,comm="])
-        .env("LC_ALL", "C")
-        .output()
-        .map_err(|e| format!("Failed to sample processes: {e}"))?;
+    let mut command = std::process::Command::new("/bin/ps");
+    command
+        .args(["-axo", "pid=,ppid=,cputime=,rss=,lstart=,comm="])
+        .env("LC_ALL", "C");
+    let output = crate::bounded_process::output(
+        &mut command,
+        std::time::Duration::from_secs(3),
+        16 * 1024 * 1024,
+    )?;
     if !output.status.success() {
         return Err("Failed to sample processes".into());
     }
@@ -181,22 +197,29 @@ fn snapshot() -> Result<Vec<ProcRow>, String> {
 /// `[[dd-]hh:]mm:ss[.cc]` — BSD cputime lets minutes run past 60.
 #[cfg(unix)]
 fn parse_cputime(text: &str) -> Option<f64> {
+    let number = |value: &str| {
+        value
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
     let (days, rest) = match text.split_once('-') {
-        Some((d, r)) => (d.trim().parse::<f64>().ok()?, r),
+        Some((days, rest)) => (number(days)?, rest),
         None => (0.0, text),
     };
     let mut parts = rest.split(':').rev();
-    let mut total = parts.next()?.trim().parse::<f64>().ok()?;
+    let mut total = number(parts.next()?)?;
     if let Some(mins) = parts.next() {
-        total += mins.trim().parse::<f64>().unwrap_or(0.0) * 60.0;
+        total += number(mins)? * 60.0;
     }
     if let Some(hours) = parts.next() {
-        total += hours.trim().parse::<f64>().unwrap_or(0.0) * 3600.0;
+        total += number(hours)? * 3600.0;
     }
-    Some(total + days * 86400.0)
+    total += days * 86400.0;
+    (parts.next().is_none() && total.is_finite()).then_some(total)
 }
 
-/// `pid=,ppid=,cputime=,rss=,comm=` rows: `  417   415  0:03.20  84512 /usr/bin/vim`
+/// `pid=,ppid=,cputime=,rss=,comm=` rows: `  417   415  0:03.20  84512 Sat Sep 19 12:00:00 2026 /usr/bin/vim`
 #[cfg(unix)]
 fn parse_ps(text: &str) -> Vec<ProcRow> {
     let mut rows = Vec::new();
@@ -210,6 +233,7 @@ fn parse_ps(text: &str) -> Vec<ProcRow> {
         ) else {
             continue;
         };
+        let started = fields.by_ref().take(5).collect::<Vec<_>>().join(" ");
         let comm = fields.collect::<Vec<_>>().join(" ");
         if comm.is_empty() {
             continue;
@@ -220,8 +244,9 @@ fn parse_ps(text: &str) -> Vec<ProcRow> {
             pid,
             ppid,
             cpu_secs,
-            cpu: 0.0,
-            rss_bytes: rss.saturating_mul(1024),
+            cpu: None,
+            rss_bytes: Some(rss.saturating_mul(1024)),
+            started,
             name: name.to_string(),
         });
     }
@@ -266,8 +291,9 @@ fn snapshot() -> Result<Vec<ProcRow>, String> {
                 pid: entry.th32ProcessID,
                 ppid: entry.th32ParentProcessID,
                 cpu_secs: f64::NAN,
-                cpu: 0.0,
-                rss_bytes: 0,
+                cpu: None,
+                rss_bytes: None,
+                started: String::new(),
                 name: String::from_utf16_lossy(&entry.szExeFile[..end]),
             });
             ok = Process32NextW(snap.as_raw_handle(), &mut entry);
@@ -299,7 +325,7 @@ fn measure(rows: &mut [ProcRow], wanted: &HashSet<u32>) {
         counters.cb = std::mem::size_of_val(&counters) as u32;
         if unsafe { GetProcessMemoryInfo(handle.as_raw_handle(), &mut counters, counters.cb) } != 0
         {
-            row.rss_bytes = counters.WorkingSetSize as u64;
+            row.rss_bytes = Some(counters.WorkingSetSize as u64);
         }
         let (mut created, mut exited, mut kernel, mut user) = unsafe { std::mem::zeroed() };
         if unsafe {
@@ -315,6 +341,7 @@ fn measure(rows: &mut [ProcRow], wanted: &HashSet<u32>) {
             continue;
         }
         // FILETIME is 100ns — ticks/10M is CPU seconds used.
+        row.started = filetime(created).to_string();
         row.cpu_secs = filetime(kernel).saturating_add(filetime(user)) as f64 / 10_000_000.0;
     }
 }
@@ -341,8 +368,9 @@ mod tests {
             pid,
             ppid,
             cpu_secs: 0.0,
-            cpu,
-            rss_bytes: rss,
+            cpu: Some(cpu),
+            rss_bytes: Some(rss),
+            started: "test-start".into(),
             name: name.into(),
         }
     }
@@ -374,8 +402,8 @@ mod tests {
         let stat = aggregate(&rows, vec![0, 1, 2], 10);
         assert_eq!(stat.processes, 3);
         assert!(stat.workload);
-        assert!((stat.cpu_pct - 62.4).abs() < 0.001);
-        assert_eq!(stat.rss_bytes, 400_000);
+        assert!((stat.cpu_pct.unwrap() - 62.4).abs() < 0.001);
+        assert_eq!(stat.rss_bytes, Some(400_000));
         assert_eq!(stat.top.as_deref(), Some("esbuild"));
     }
 
@@ -391,16 +419,17 @@ mod tests {
     #[test]
     fn parse_ps_reads_fixed_columns() {
         let text =
-            "  417   415  0:03.20  84512 /usr/bin/vim\n    9     1  0:00.00   1204 zsh\nbad line\n";
+            "  417   415  0:03.20  84512 Sat Sep 19 12:00:00 2026 /usr/bin/vim\n    9     1  0:00.00   1204 Sat Sep 19 12:00:00 2026 zsh\nbad line\n";
         let rows = parse_ps(text);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].pid, 417);
         assert_eq!(rows[0].ppid, 415);
         assert!((rows[0].cpu_secs - 3.2).abs() < 0.001);
-        assert_eq!(rows[0].rss_bytes, 84512 * 1024);
+        assert_eq!(rows[0].rss_bytes, Some(84512 * 1024));
         assert_eq!(rows[0].name, "vim");
         // Paths with spaces are the last column — the basename survives.
-        let spaced = parse_ps("  5     1  0:00.00  1024 /Applications/My App/app");
+        let spaced =
+            parse_ps("  5     1  0:00.00  1024 Sat Sep 19 12:00:00 2026 /Applications/My App/app");
         assert_eq!(spaced[0].name, "app");
     }
 
@@ -415,6 +444,9 @@ mod tests {
             Some(2.0 * 86400.0 + 3.0 * 3600.0 + 245.5)
         );
         assert_eq!(parse_cputime("junk"), None);
+        for bad in ["nan", "-1", "1:bad:20", "1:2:3:4", "inf"] {
+            assert_eq!(parse_cputime(bad), None);
+        }
     }
 
     #[test]
@@ -436,5 +468,326 @@ mod tests {
         assert_eq!(cpu_delta_pct(10.0, 700.0, 600.0), 0.0);
         // Sub-millisecond intervals amplify scheduling jitter.
         assert_eq!(cpu_delta_pct(10.0, 10.1, 0.0005), 0.0);
+    }
+}
+
+/// Stop only the descendants captured by this request. The root shell remains
+/// alive. Revalidate both the mounted PTY and process birth before every signal.
+/// Unlike ordinary terminal close, this feature never schedules detached kills.
+pub fn stop_workload(
+    root: u32,
+    root_start: u64,
+    still_owned: impl Fn() -> bool,
+) -> Result<(), String> {
+    if root <= 1 || root == std::process::id() || !still_owned() {
+        return Err("Terminal identity changed; refresh before stopping".into());
+    }
+    if identity(root)? != Some(root_start) {
+        return Err("Terminal process identity changed; nothing was stopped".into());
+    }
+    let rows = snapshot()?;
+    let (index, children) = build_children(&rows);
+    let mut targets = Vec::new();
+    for i in subtree(&rows, &index, &children, root).into_iter().rev() {
+        let row = &rows[i];
+        if row.pid <= 1 || row.pid == root || row.pid == std::process::id() {
+            continue;
+        }
+        if let Some(started) = identity(row.pid)? {
+            targets.push((row.pid, started));
+        }
+    }
+    // Capture birth identities before a fresh membership check: a PID recycled
+    // outside this terminal between enumeration and capture is never signalled.
+    let fresh = snapshot()?;
+    let (index, children) = build_children(&fresh);
+    let current: HashSet<u32> = subtree(&fresh, &index, &children, root)
+        .into_iter()
+        .map(|i| fresh[i].pid)
+        .collect();
+    targets.retain(|(pid, _)| current.contains(pid));
+    let check_root = || -> Result<(), String> {
+        if !still_owned() || identity(root)? != Some(root_start) {
+            return Err("Terminal identity changed; no further processes were stopped".into());
+        }
+        Ok(())
+    };
+    for &(pid, started) in &targets {
+        check_root()?;
+        signal_identity(pid, started, false)?;
+    }
+    #[cfg(unix)]
+    if !targets.is_empty() {
+        // This command already runs off the UI thread; keep escalation in its
+        // bounded lifetime rather than leaving a timer with stale PID authority.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            targets.retain(|(pid, started)| identity(*pid).ok().flatten() == Some(*started));
+            if targets.is_empty() {
+                break;
+            }
+            check_root()?;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        for (pid, started) in targets {
+            check_root()?;
+            signal_identity(pid, started, true)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn identity(pid: u32) -> Result<Option<u64>, String> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if read != size {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
+            return Ok(None);
+        }
+        return Err(format!("Cannot verify process {pid}: {error}"));
+    }
+    Ok(Some(
+        info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn identity(pid: u32) -> Result<Option<u64>, String> {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(text) => text
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(19))
+            .and_then(|value| value.parse().ok())
+            .map(Some)
+            .ok_or_else(|| "Invalid process identity".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Cannot verify process {pid}: {error}")),
+    }
+}
+
+#[cfg(windows)]
+fn process_handle(
+    pid: u32,
+    terminate: bool,
+) -> Result<Option<std::os::windows::io::OwnedHandle>, String> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+    let access = PROCESS_QUERY_LIMITED_INFORMATION | if terminate { PROCESS_TERMINATE } else { 0 };
+    let raw = unsafe { OpenProcess(access, 0, pid) };
+    if raw.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(87) {
+            return Ok(None);
+        }
+        return Err(format!("Cannot verify process {pid}: {error}"));
+    }
+    Ok(Some(unsafe {
+        std::os::windows::io::OwnedHandle::from_raw_handle(raw)
+    }))
+}
+
+#[cfg(windows)]
+fn handle_identity(handle: &std::os::windows::io::OwnedHandle) -> Result<u64, String> {
+    use std::os::windows::io::AsRawHandle;
+    let (mut created, mut exited, mut kernel, mut user) = unsafe { std::mem::zeroed() };
+    if unsafe {
+        windows_sys::Win32::System::Threading::GetProcessTimes(
+            handle.as_raw_handle(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "Cannot verify process: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(filetime(created))
+}
+
+#[cfg(windows)]
+pub(super) fn identity(pid: u32) -> Result<Option<u64>, String> {
+    process_handle(pid, false)?
+        .as_ref()
+        .map(handle_identity)
+        .transpose()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+pub(super) fn identity(_pid: u32) -> Result<Option<u64>, String> {
+    Err("Safe process stopping is unavailable on this platform".into())
+}
+
+#[cfg(unix)]
+fn signal_identity(pid: u32, started: u64, hard: bool) -> Result<(), String> {
+    let number = if hard { libc::SIGKILL } else { libc::SIGTERM };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(format!("Cannot bind process for stopping: {error}"));
+        }
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        if identity(pid)? != Some(started) {
+            return Ok(());
+        }
+        if unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                number,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } == 0
+        {
+            return Ok(());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS has no pidfd: verify microsecond birth identity immediately
+        // before the signal. Do not carry PID-only authority across the delay.
+        if identity(pid)? != Some(started) {
+            return Ok(());
+        }
+        if unsafe { libc::kill(pid as i32, number) } == 0 {
+            return Ok(());
+        }
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(format!("Cannot stop process {pid}: {error}"))
+}
+
+#[cfg(windows)]
+fn signal_identity(pid: u32, started: u64, _hard: bool) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    let Some(handle) = process_handle(pid, true)? else {
+        return Ok(());
+    };
+    if handle_identity(&handle)? != started {
+        return Ok(());
+    }
+    if unsafe { windows_sys::Win32::System::Threading::TerminateProcess(handle.as_raw_handle(), 1) }
+        == 0
+    {
+        return Err(format!(
+            "Cannot stop process {pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn signal_identity(_pid: u32, _started: u64, _hard: bool) -> Result<(), String> {
+    Err("Safe process stopping is unavailable on this platform".into())
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod live_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct OwnedTestTree(Child);
+    impl Drop for OwnedTestTree {
+        fn drop(&mut self) {
+            // This exact child remains unreaped until cleanup, so the test's
+            // process-group ID cannot be recycled into a user-owned process.
+            unsafe {
+                libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn samples_and_stops_only_its_owned_workload_leaving_shell_alive() {
+        let mut tree = OwnedTestTree(
+            Command::new("/bin/sh")
+                .args(["-c", "sleep 30 & wait; read line"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let root = tree.0.id();
+        let started = identity(root).unwrap().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let stats = sample_trees(&[root]).unwrap();
+            if stats.get(&root).is_some_and(|row| row.processes >= 2) {
+                assert!(stats[&root].workload);
+                assert!(stats[&root].rss_bytes.unwrap() > 0);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture workload failed to start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stop_workload(root, started + 1, || true).is_err());
+        assert!(stop_workload(root, started, || false).is_err());
+        assert!(sample_trees(&[root]).unwrap()[&root].workload);
+        signal_identity(root, started + 1, true).unwrap();
+        assert!(tree.0.try_wait().unwrap().is_none());
+        stop_workload(root, started, || true).unwrap();
+        assert!(
+            tree.0.try_wait().unwrap().is_none(),
+            "root shell must survive workload stop"
+        );
+        assert_eq!(identity(root).unwrap(), Some(started));
+        assert!(!sample_trees(&[root]).unwrap()[&root].workload);
+    }
+
+    #[test]
+    fn unavailable_measurements_stay_unknown_and_reused_pid_does_not_inherit_cpu() {
+        let mut rows = vec![ProcRow {
+            pid: u32::MAX,
+            ppid: 0,
+            cpu_secs: 4.0,
+            cpu: None,
+            rss_bytes: None,
+            started: "old".into(),
+            name: "fixture".into(),
+        }];
+        let wanted = HashSet::from([u32::MAX]);
+        apply_cpu_deltas(&mut rows, &wanted);
+        assert_eq!(aggregate(&rows, vec![0], u32::MAX).cpu_pct, None);
+        assert_eq!(aggregate(&rows, vec![0], u32::MAX).rss_bytes, None);
+        rows[0].started = "replacement".into();
+        rows[0].cpu_secs = 400.0;
+        std::thread::sleep(Duration::from_millis(2));
+        apply_cpu_deltas(&mut rows, &wanted);
+        assert_eq!(rows[0].cpu, None);
     }
 }

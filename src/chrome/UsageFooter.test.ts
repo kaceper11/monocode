@@ -11,14 +11,15 @@ describe("UsageFooter terminal control", () => {
         terminals: [
           {
             id: "terminal-1",
-            title: "repo",
+            process: "npm",
             cwd: "/repo",
-            foreground: "npm",
+            label: "repo",
           },
         ],
-        onOpenTerminal: vi.fn(),
-        onCloseTerminal: vi.fn(),
+        terminalOpen: true,
+        onToggleTerminal: vi.fn(),
         onNewTerminal: vi.fn(),
+        onToggleBrowser: vi.fn(),
         onShowTerminal: vi.fn(),
         projectTerminalActive: true,
       }),
@@ -26,7 +27,9 @@ describe("UsageFooter terminal control", () => {
 
     expect(markup).toContain(">npm</span>");
     expect(markup).not.toContain(">Terminal</span>");
-    expect(markup.match(/<button/g)).toHaveLength(1);
+    expect(markup).toContain(">Browser</span>");
+    expect(markup).toContain('aria-label="Toggle browser panel"');
+    expect(markup.match(/<button/g)).toHaveLength(2);
   });
 
   it("keeps the generic terminal button when no process is running", () => {
@@ -34,10 +37,13 @@ describe("UsageFooter terminal control", () => {
       createElement(UsageFooter, {
         providers: [],
         onNewTerminal: vi.fn(),
+        onToggleBrowser: vi.fn(),
       }),
     );
 
     expect(markup).toContain(">Terminal</span>");
-    expect(markup.match(/<button/g)).toHaveLength(1);
+    expect(markup).toContain(">Browser</span>");
+    expect(markup).toContain('aria-label="Toggle browser panel"');
+    expect(markup.match(/<button/g)).toHaveLength(2);
   });
 });

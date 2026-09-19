@@ -6,6 +6,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { Check, ChevronDown } from "./icons";
+import { LAYER } from "../lib/layers";
 import { Popover } from "./Popover";
 
 /** Theme-aware dropdown for a Settings row: a trigger button opening a Popover listbox. Used instead of a native select, whose option popup is OS-rendered and unreadable in dark mode on Windows/Linux. */
@@ -15,8 +16,10 @@ export function Select({
   options,
   onChange,
   disabled = false,
+  dialog = false,
 }: {
   disabled?: boolean;
+  dialog?: boolean;
   label: string;
   value: string;
   options: { value: string; label: string; detail?: string }[];
@@ -116,6 +119,8 @@ export function Select({
       {open && !disabled ? (
         <Popover
           anchor={root}
+          layer={dialog ? LAYER.dialogPopover : undefined}
+          data-dialog-popover={dialog || undefined}
           side="bottom"
           align="end"
           width={280}

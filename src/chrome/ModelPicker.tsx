@@ -1,5 +1,14 @@
-import { Check, ChevronDown, ChevronRight, Gauge, Search, Star } from "./icons";
 import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Gauge,
+  Search,
+  Star,
+  Zap,
+} from "./icons";
+import {
+  Fragment,
   useEffect,
   useId,
   useMemo,
@@ -14,9 +23,11 @@ import {
   findModel,
   getModelSnapshot,
   getPickerVisibilitySnapshot,
+  isEffortSettingId,
   loadFavoriteModels,
   loadRecentModelChoices,
   modelCatalogError,
+  modelCatalogKey,
   modelsFor,
   resolveModel,
   saveFavoriteModels,
@@ -48,7 +59,8 @@ type Props = {
   harness: HarnessId;
   model: string;
   values: Record<string, string>;
-  hideEffort?: boolean;
+  /** Hide option rows from the menu when they render as pills beside the picker. */
+  hideSettings?: boolean;
   hotkeys?: boolean;
   cwd?: string;
   onChange: (harness: HarnessId, model: string) => void;
@@ -77,9 +89,13 @@ const SELF = "[data-model-picker]";
 const PROVIDER_TAB_SIZE = 32;
 const PROVIDER_TAB_GAP = 4;
 const PROVIDER_RAIL_PADDING = 12;
+// Keep upstream's menu height; the optional providers extend the scrollable rail.
+const BASE_PROVIDER_COUNT = HARNESSES.filter(
+  id => !["devin", "copilot", "muse"].includes(id),
+).length;
 const MODEL_MENU_HEIGHT =
-  (HARNESSES.length + 1) * PROVIDER_TAB_SIZE +
-  HARNESSES.length * PROVIDER_TAB_GAP +
+  (BASE_PROVIDER_COUNT + 1) * PROVIDER_TAB_SIZE +
+  BASE_PROVIDER_COUNT * PROVIDER_TAB_GAP +
   PROVIDER_RAIL_PADDING;
 const MODEL_MENU_FRAME_HEIGHT = MODEL_MENU_HEIGHT + 2;
 
@@ -88,16 +104,27 @@ const SETTING_ORDER = [
   "effort",
   "reasoning",
   "reasoningEffort",
+  "serviceTier",
   "thinking",
   "variant",
   "agent",
   "context",
 ];
 
-const EFFORT_SETTING_IDS = new Set(["effort", "reasoning", "reasoningEffort"]);
+/** Toolbar pill order: reasoning level first, then the remaining controls. */
+const PILL_ORDER = [
+  "effort",
+  "reasoning",
+  "reasoningEffort",
+  "variant",
+  "fast",
+  "thinking",
+  "serviceTier",
+  "context",
+];
 
 function isEffortSetting(setting: ModelSetting): boolean {
-  return EFFORT_SETTING_IDS.has(setting.id);
+  return isEffortSettingId(setting.id);
 }
 
 function effortSetting(model: AgentModel): ModelSetting | undefined {
@@ -107,15 +134,27 @@ function effortSetting(model: AgentModel): ModelSetting | undefined {
 }
 
 function pickerSettings(model: AgentModel): ModelSetting[] {
-  return [...(model.settings ?? [])]
-    .filter(
-      (setting) => !(model.harness === "opencode" && setting.id === "agent"),
-    )
-    .sort((a, b) => {
-      const ai = SETTING_ORDER.indexOf(a.id);
-      const bi = SETTING_ORDER.indexOf(b.id);
-      return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
-    });
+  return [...menuVisibleSettings(model)].sort((a, b) => {
+    const ai = SETTING_ORDER.indexOf(a.id);
+    const bi = SETTING_ORDER.indexOf(b.id);
+    return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
+  });
+}
+
+/** Settings without the OpenCode agent row, which never shows in the menu. */
+function menuVisibleSettings(model: AgentModel): ModelSetting[] {
+  return (model.settings ?? []).filter(
+    (setting) => !(model.harness === "opencode" && setting.id === "agent"),
+  );
+}
+
+/** Standalone toolbar pills, reasoning level first. */
+function pillSettings(model: AgentModel): ModelSetting[] {
+  return [...menuVisibleSettings(model)].sort((a, b) => {
+    const ai = PILL_ORDER.indexOf(a.id);
+    const bi = PILL_ORDER.indexOf(b.id);
+    return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
+  });
 }
 
 function settingLabel(setting: ModelSetting): string {
@@ -177,7 +216,7 @@ export function ModelPicker({
   harness,
   model,
   values,
-  hideEffort = false,
+  hideSettings = false,
   hotkeys = false,
   cwd,
   onChange,
@@ -226,10 +265,10 @@ export function ModelPicker({
   currentRef.current = current;
   const settings = useMemo(() => {
     void catalogVersion;
-    return pickerSettings(current).filter(
-      (setting) => !hideEffort || !isEffortSetting(setting),
-    );
-  }, [catalogVersion, current, hideEffort]);
+    // In beside-picker mode every option row renders as a toolbar pill, so the
+    // menu lists models only.
+    return hideSettings ? [] : pickerSettings(current);
+  }, [catalogVersion, current, hideSettings]);
   const entries = useMemo<MenuEntry[]>(
     () => [
       ...settings.map((setting) => ({
@@ -241,7 +280,9 @@ export function ModelPicker({
     [settings],
   );
 
-  const triggerEffortSetting = hideEffort ? undefined : effortSetting(current);
+  const triggerEffortSetting = hideSettings
+    ? undefined
+    : effortSetting(current);
   const triggerEffortLabel = triggerEffortSetting
     ? settingValueLabel(triggerEffortSetting, values)
     : undefined;
@@ -342,10 +383,14 @@ export function ModelPicker({
       ),
     );
     setActive(0);
-    setSubmenu(null);
+    // Beside-picker mode leaves only the Model row; open its list directly
+    // instead of making it one more hover step.
+    setSubmenu(hideSettings ? { kind: "models" } : null);
     setQuery("");
     setFavorites(loadFavoriteModels());
-  }, [open, current.harness, cwd]);
+  }, [open, current.harness, cwd, hideSettings]);
+
+  useEffect(() => { setRecentMenu(null); }, [cwd]);
 
   useEffect(() => {
     if (visibleTab === tab) return;
@@ -385,7 +430,7 @@ export function ModelPicker({
       if (target.closest(".monocode-terminal")) return true;
       return Boolean(
         target.closest(
-          "[data-file-picker], [data-branch-picker], [data-skill-picker], [data-mention-picker], [data-access-picker], [data-effort-picker]",
+          "[data-file-picker], [data-branch-picker], [data-skill-picker], [data-mention-picker], [data-access-picker], [data-model-control]",
         ),
       );
     };
@@ -424,7 +469,7 @@ export function ModelPicker({
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("open_model_picker", onMenu);
     };
-  }, [hotkeys]);
+  }, [hotkeys, cwd]);
 
   const setSetting = (setting: ModelSetting, value: string) => {
     onSettingsChange({ ...values, [setting.id]: value });
@@ -460,7 +505,7 @@ export function ModelPicker({
 
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [recentActive, recentMenu]);
+  }, [recentActive, recentMenu, cwd]);
 
   const pickSetting = (setting: ModelSetting, value: string) => {
     setSetting(setting, value);
@@ -580,7 +625,7 @@ export function ModelPicker({
         }`}
         aria-keyshortcuts={`${MOD}.`}
         aria-expanded={open || recentMenu != null}
-        aria-haspopup="menu"
+        aria-haspopup={hideSettings ? "dialog" : "menu"}
         onMouseDown={(event) => event.preventDefault()}
         onContextMenu={(event) => {
           event.preventDefault();
@@ -607,7 +652,29 @@ export function ModelPicker({
         />
       </button>
 
-      {open ? (
+      {open && hideSettings ? (
+        <ModelFlyout
+          anchor={button}
+          side="top"
+          autoFocusSearch
+          onDismiss={(reason) => dismiss(reason === "escape")}
+          harnesses={pickerHarnesses}
+          tab={visibleTab}
+          models={visibleModels}
+          currentId={current.id}
+          active={activeModel}
+          query={query}
+          favorites={favorites}
+          searchRef={search}
+          onQuery={setQuery}
+          onSelectTab={selectTab}
+          onActive={setActiveModel}
+          onPick={pickModel}
+          onToggleFavorite={toggleFavorite}
+        />
+      ) : null}
+
+      {open && !hideSettings ? (
         <>
           <Popover
             anchor={button}
@@ -618,7 +685,7 @@ export function ModelPicker({
             ignore={SELF}
             onDismiss={() => dismiss(false)}
             role="menu"
-            aria-label="Model and effort"
+            aria-label="Model and settings"
             tabIndex={-1}
             onKeyDown={onMenuKey}
             data-model-picker
@@ -873,7 +940,8 @@ export function ModelPicker({
   );
 }
 
-export function EffortPicker({
+export function ModelControlPills({
+  cwd,
   harness,
   model,
   values,
@@ -881,38 +949,131 @@ export function EffortPicker({
   onClose,
 }: Pick<
   Props,
-  "harness" | "model" | "values" | "onSettingsChange" | "onClose"
+  "harness" | "model" | "cwd" | "values" | "onSettingsChange" | "onClose"
 >) {
   const catalogVersion = useSyncExternalStore(
     subscribeModels,
     getModelSnapshot,
     getModelSnapshot,
   );
+  void catalogVersion;
+  const current = resolveModel(harness, model, cwd);
+  const pills = pillSettings(current);
+  const effort = pills.find(
+    (setting) => setting.kind === "select" && isEffortSetting(setting),
+  );
+  const groupedSettings = effort
+    ? pills.filter(
+        (setting) => setting.id === "fast" || setting.id === "serviceTier",
+      )
+    : [];
+  if (pills.length === 0) return null;
+  return (
+    <>
+      {pills.map((setting) => {
+        if (groupedSettings.some((grouped) => grouped.id === setting.id)) {
+          return null;
+        }
+        return setting.kind === "toggle" ? (
+          <TogglePill
+            key={setting.id}
+            setting={setting}
+            values={values}
+            onSettingsChange={onSettingsChange}
+          />
+        ) : (
+          <SelectPill
+            key={setting.id}
+            setting={setting}
+            values={values}
+            onSettingsChange={onSettingsChange}
+            onClose={onClose}
+            additionalSettings={
+              setting.id === effort?.id ? groupedSettings : undefined
+            }
+          />
+        );
+      })}
+    </>
+  );
+}
+
+function TogglePill({
+  setting,
+  values,
+  onSettingsChange,
+}: {
+  setting: ModelSetting;
+  values: Record<string, string>;
+  onSettingsChange: (settings: Record<string, string>) => void;
+}) {
+  const on = settingValue(setting, values) === "true";
+  return (
+    <button
+      type="button"
+      title={`${setting.label}: ${on ? "On" : "Off"}`}
+      aria-label={`${setting.label}: ${on ? "On" : "Off"}`}
+      aria-pressed={on}
+      data-model-control
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={() =>
+        onSettingsChange({ ...values, [setting.id]: on ? "false" : "true" })
+      }
+      className="flex h-6.5 max-w-28 items-center gap-1 rounded-md bg-selection px-1.5 text-content hover:bg-selection-hover"
+    >
+      <span
+        className={`min-w-0 truncate text-[11px] ${on ? "" : "text-content/50"}`}
+      >
+        {setting.label}
+      </span>
+    </button>
+  );
+}
+
+function SelectPill({
+  setting,
+  values,
+  onSettingsChange,
+  onClose,
+  additionalSettings,
+}: {
+  setting: ModelSetting;
+  values: Record<string, string>;
+  onSettingsChange: (settings: Record<string, string>) => void;
+  onClose?: () => void;
+  additionalSettings?: ModelSetting[];
+}) {
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const button = useRef<HTMLButtonElement>(null);
   const menuId = useId();
-  const current = resolveModel(harness, model);
-  void catalogVersion;
-  const setting = effortSetting(current);
-
-  if (!setting) return null;
 
   const value = settingValue(setting, values);
   const valueLabel = settingValueLabel(setting, values);
+  const label = settingLabel(setting);
+  const menuSettings = [setting, ...(additionalSettings ?? [])];
+  const grouped = menuSettings.length > 1;
+  const menuOptions = menuSettings.flatMap((menuSetting) =>
+    menuSetting.options.map((option) => ({ setting: menuSetting, option })),
+  );
+  const menuLabels = menuSettings.map(settingLabel);
+  const menuLabel =
+    menuLabels.length < 3
+      ? menuLabels.join(" and ")
+      : `${menuLabels.slice(0, -1).join(", ")}, and ${menuLabels[menuLabels.length - 1]}`;
   const dismiss = (restoreFocus: boolean) => {
     setOpen(false);
     if (restoreFocus) onClose?.();
   };
   const openPicker = () => {
-    const selectedIndex = setting.options.findIndex(
-      (option) => option.value === value,
+    const selectedIndex = menuOptions.findIndex(
+      (item) => item.setting.id === setting.id && item.option.value === value,
     );
     setActive(selectedIndex >= 0 ? selectedIndex : 0);
     setOpen(true);
   };
-  const pick = (optionValue: string) => {
-    onSettingsChange({ ...values, [setting.id]: optionValue });
+  const pick = (pickedSetting: ModelSetting, optionValue: string) => {
+    onSettingsChange({ ...values, [pickedSetting.id]: optionValue });
     dismiss(true);
   };
 
@@ -921,10 +1082,11 @@ export function EffortPicker({
       <button
         ref={button}
         type="button"
-        title={`Effort: ${valueLabel}`}
-        aria-label={`Effort: ${valueLabel}`}
+        title={`${label}: ${valueLabel}`}
+        aria-label={`${label}: ${valueLabel}`}
         aria-expanded={open}
         aria-haspopup="menu"
+        data-model-control
         onMouseDown={(event) => event.preventDefault()}
         onClick={() => (open ? dismiss(true) : openPicker())}
         className={`flex h-6.5 max-w-28 items-center gap-1 rounded-md px-1.5 ${
@@ -933,7 +1095,11 @@ export function EffortPicker({
             : "bg-selection text-content hover:bg-selection-hover"
         }`}
       >
-        <Gauge className="size-3.5 shrink-0" strokeWidth={1.75} />
+        {isEffortSetting(setting) ? (
+          <Gauge className="size-3.5 shrink-0" strokeWidth={1.75} />
+        ) : setting.id === "serviceTier" ? (
+          <Zap className="size-3.5 shrink-0" strokeWidth={1.75} />
+        ) : null}
         <span className="min-w-0 truncate text-[11px]">{valueLabel}</span>
         <ChevronDown
           className={`size-3 shrink-0 text-content/50 ${open ? "rotate-180" : ""}`}
@@ -949,7 +1115,7 @@ export function EffortPicker({
           autoFocus
           onDismiss={(reason) => dismiss(reason === "escape")}
           role="menu"
-          aria-label="Effort"
+          aria-label={menuLabel}
           aria-activedescendant={`${menuId}-${active}`}
           tabIndex={-1}
           onKeyDown={(event) => {
@@ -958,46 +1124,70 @@ export function EffortPicker({
               const direction = event.key === "ArrowDown" ? 1 : -1;
               setActive(
                 (index) =>
-                  (index + direction + setting.options.length) %
-                  setting.options.length,
+                  (index + direction + menuOptions.length) % menuOptions.length,
               );
               return;
             }
             if (event.key !== "Enter" && event.key !== " ") return;
             event.preventDefault();
-            const option = setting.options[active];
-            if (option) pick(option.value);
+            const item = menuOptions[active];
+            if (item) pick(item.setting, item.option.value);
           }}
-          data-effort-picker
+          data-model-control
           className="p-1 font-sans"
         >
-          {setting.options.map((option, index) => {
-            const selected = option.value === value;
-            const highlighted = index === active;
-            return (
-              <button
-                key={option.value}
-                id={`${menuId}-${index}`}
-                type="button"
-                role="menuitemradio"
-                aria-checked={selected}
-                onMouseDown={(event) => event.preventDefault()}
-                onMouseEnter={() => setActive(index)}
-                onClick={() => pick(option.value)}
-                className={`flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] text-content ${
-                  highlighted ? "bg-selection" : "hover:bg-content/5"
-                }`}
+          {menuSettings.map((menuSetting, groupIndex) => (
+            <Fragment key={menuSetting.id}>
+              {groupIndex > 0 ? (
+                <div role="separator" className="my-1 h-px bg-content/10" />
+              ) : null}
+              <div
+                role={grouped ? "group" : undefined}
+                aria-label={grouped ? settingLabel(menuSetting) : undefined}
               >
-                <span className="min-w-0 flex-1 truncate">{option.label}</span>
-                {selected ? (
-                  <Check
-                    className="size-3.5 shrink-0 text-content/50"
-                    strokeWidth={2}
-                  />
+                {grouped ? (
+                  <div className="px-2.5 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wide text-content/40">
+                    {settingLabel(menuSetting)}
+                  </div>
                 ) : null}
-              </button>
-            );
-          })}
+                {menuSetting.options.map((option) => {
+                  const index = menuOptions.findIndex(
+                    (item) =>
+                      item.setting.id === menuSetting.id &&
+                      item.option.value === option.value,
+                  );
+                  const selected =
+                    option.value === settingValue(menuSetting, values);
+                  const highlighted = index === active;
+                  return (
+                    <button
+                      key={option.value}
+                      id={`${menuId}-${index}`}
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={selected}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onMouseEnter={() => setActive(index)}
+                      onClick={() => pick(menuSetting, option.value)}
+                      className={`flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] text-content ${
+                        highlighted ? "bg-selection" : "hover:bg-content/5"
+                      }`}
+                    >
+                      <span className="min-w-0 flex-1 truncate">
+                        {option.label}
+                      </span>
+                      {selected ? (
+                        <Check
+                          className="size-3.5 shrink-0 text-content/50"
+                          strokeWidth={2}
+                        />
+                      ) : null}
+                    </button>
+                  );
+                })}
+              </div>
+            </Fragment>
+          ))}
         </Popover>
       ) : null}
     </>
@@ -1006,6 +1196,9 @@ export function EffortPicker({
 
 function ModelFlyout({
   anchor,
+  side = "right",
+  autoFocusSearch = false,
+  onDismiss,
   harnesses,
   cwd,
   tab,
@@ -1021,7 +1214,10 @@ function ModelFlyout({
   onPick,
   onToggleFavorite,
 }: {
-  anchor: HTMLButtonElement;
+  anchor: HTMLButtonElement | { current: HTMLButtonElement | null };
+  side?: "right" | "top";
+  autoFocusSearch?: boolean;
+  onDismiss?: (reason: "outside" | "escape") => void;
   harnesses: HarnessId[];
   cwd?: string;
   tab: ModelPickerTab;
@@ -1040,6 +1236,10 @@ function ModelFlyout({
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const activeRef = useRef<HTMLButtonElement>(null);
   const groups = modelGroups(tab, models);
+  const integrationHint = tab !== "favorites" && !query.trim() &&
+    (modelCatalogKey(cwd) !== "native" || ["devin", "copilot", "muse"].includes(tab))
+    ? modelCatalogError(tab, cwd) ?? harnessAuthHint(tab, cwd)
+    : undefined;
 
   useEffect(() => {
     activeRef.current?.scrollIntoView({ block: "nearest" });
@@ -1073,14 +1273,45 @@ function ModelFlyout({
   return (
     <Popover
       anchor={anchor}
-      side="right"
-      gap={SUBMENU_OVERLAP}
+      side={side}
+      gap={side === "right" ? SUBMENU_OVERLAP : undefined}
       width={MODEL_MENU_WIDTH}
       minHeight={MODEL_MENU_FRAME_HEIGHT}
       maxHeight={MODEL_MENU_FRAME_HEIGHT}
       layer={LAYER.submenu}
       role="dialog"
       aria-label="Models"
+      onDismiss={onDismiss}
+      onKeyDown={(event) => {
+        // Keyboard nav once focus leaves the search field (which stops its
+        // own keys). Scoped to the list so provider tabs keep their buttons.
+        if (
+          !(event.target instanceof Element) ||
+          !event.target.closest('[role="listbox"]')
+        ) {
+          return;
+        }
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          const direction = event.key === "ArrowDown" ? 1 : -1;
+          onActive(
+            Math.min(models.length - 1, Math.max(0, active + direction)),
+          );
+          return;
+        }
+        if (event.key !== "Enter") return;
+        // Favorite toggles keep native activation; model rows activate the
+        // highlighted option so Enter never fires on a stale focused row.
+        if (
+          event.target instanceof HTMLButtonElement &&
+          event.target.getAttribute("role") !== "option"
+        ) {
+          return;
+        }
+        event.preventDefault();
+        const item = models[active];
+        if (item) onPick(item);
+      }}
       data-model-picker
       style={{
         height: MODEL_MENU_HEIGHT,
@@ -1093,7 +1324,7 @@ function ModelFlyout({
         role="tablist"
         aria-label="Providers"
         aria-orientation="vertical"
-        className="flex w-11 shrink-0 flex-col items-center gap-1 border-r border-stroke p-1.5"
+        className="flex w-11 shrink-0 flex-col items-center gap-1 overflow-y-auto overscroll-contain border-r border-stroke p-1.5"
       >
         <ProviderTabButton
           title="Favorites"
@@ -1127,6 +1358,7 @@ function ModelFlyout({
             value={query}
             placeholder="Search models"
             aria-label="Search models"
+            autoFocus={autoFocusSearch}
             className="min-w-0 flex-1 bg-transparent text-[13px] text-content outline-none placeholder:text-content/40"
             onChange={(event) => onQuery(event.target.value)}
             onKeyDown={onSearchKey}
@@ -1145,17 +1377,11 @@ function ModelFlyout({
                 ? "No favorite models"
                 : tab !== "favorites" && !isHarnessAvailable(tab, cwd)
                   ? harnessUnavailableHint(tab, cwd)
-                  : tab !== "favorites" &&
-                      !query.trim() &&
-                      modelCatalogError(tab, cwd)
-                    ? modelCatalogError(tab, cwd)
-                    : tab !== "favorites" &&
-                        !query.trim() &&
-                        harnessAuthHint(tab, cwd)
-                      ? harnessAuthHint(tab, cwd)
-                      : tab === "codex" && !query.trim()
-                        ? "Loading Codex models…"
-                        : "No matching models"}
+                  : integrationHint
+                    ? integrationHint
+                    : tab === "codex" && !query.trim()
+                      ? "Loading Codex models…"
+                      : "No matching models"}
             </div>
           ) : (
             groups.map((group) => (
@@ -1174,6 +1400,10 @@ function ModelFlyout({
                   const highlighted = index === active;
                   const favorited = favorites.includes(item.id);
                   const disabled = !isHarnessAvailable(item.harness, cwd);
+                  // Favorites mix harnesses, so every row names its source.
+                  // Provider first (OpenCode Go vs OpenCode), else harness.
+                  const provenance =
+                    item.provider?.name ?? HARNESS_TITLE[item.harness];
                   return (
                     <div
                       key={item.id}
@@ -1191,11 +1421,7 @@ function ModelFlyout({
                         type="button"
                         role="option"
                         aria-selected={selected}
-                        aria-label={
-                          item.provider
-                            ? `${item.name}, ${item.provider.name}`
-                            : undefined
-                        }
+                        aria-label={`${item.name}, ${provenance}`}
                         disabled={disabled}
                         title={
                           disabled
@@ -1210,9 +1436,9 @@ function ModelFlyout({
                           {item.name}
                         </span>
                       </button>
-                      {tab === "favorites" && item.provider ? (
+                      {tab === "favorites" ? (
                         <span className="max-w-24 shrink-0 truncate text-[10px] text-content/40">
-                          {item.provider.name}
+                          {provenance}
                         </span>
                       ) : null}
                       <button

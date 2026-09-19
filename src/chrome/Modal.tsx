@@ -1,55 +1,20 @@
 import { X } from "./icons";
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
-import { LAYER, PopoverLayerOffset } from "../lib/layers";
+import { LAYER } from "../lib/layers";
 import { GlassBackdrop } from "./GlassBackdrop";
 
-export type ModalSize = "sm" | "md" | "lg";
-
-/** Open dialogs in mount order — only the topmost answers Escape, so Esc in a
- * nested dialog (e.g. the WSL picker inside a sheet) never tears down the
- * dialog underneath. */
-const openModals: symbol[] = [];
-
-/** Timestamp of the last close→open swap — set by the closing modal's click
- * handler, read by the next modal at render time. */
-let modalSwapAt = 0;
-const MODAL_SWAP_MS = 400;
-
-/** Call right before closing one modal to open another in the same gesture.
- * The replacement skips its entrance animation — replaying it would flash
- * the screen undimmed for a frame between the two backdrops. */
-export function modalSwap() {
-  modalSwapAt = Date.now();
-}
+export type ModalSize = "sm" | "md";
 
 const WIDTH: Record<ModalSize, string> = {
   sm: "w-[min(420px,calc(100vw-24px))]",
   md: "w-[min(560px,calc(100vw-24px))]",
-  lg: "w-[min(680px,calc(100vw-24px))]",
-};
-
-/** Small dialogs are utility prompts — a compact title fits their scale;
- * sheet-sized dialogs keep the display title. */
-const TITLE: Record<ModalSize, string> = {
-  sm: "text-base",
-  md: "text-2xl",
-  lg: "text-2xl",
 };
 
 const TOP: Record<ModalSize, string> = {
   sm: "top-[22%]",
   md: "top-[10%]",
-  lg: "top-[6%]",
-};
-
-/** Hard ceiling: top offset plus 24px of bottom breathing room, so no dialog
- * can grow past the viewport even when callers forget a max-height. */
-const MAX_H: Record<ModalSize, string> = {
-  sm: "max-h-[calc(78vh-24px)]",
-  md: "max-h-[calc(90vh-24px)]",
-  lg: "max-h-[calc(94vh-24px)]",
 };
 
 type Props = {
@@ -57,7 +22,6 @@ type Props = {
   title: string;
   description?: string;
   size?: ModalSize;
-  trapFocus?: boolean;
   /** Keeps the accessible title while letting focused content own the visual hierarchy. */
   minimalHeader?: boolean;
   /** Extra classes on the panel (fixed height, etc). */
@@ -70,7 +34,6 @@ export function ModalPanel({
   title,
   description,
   size = "md",
-  trapFocus = false,
   minimalHeader = false,
   className,
   children,
@@ -82,76 +45,29 @@ export function ModalPanel({
   const descriptionId = description ? `${uid}-desc` : undefined;
 
   useEffect(() => {
-    if (minimalHeader) return;
-    // A child's own autoFocus already claimed focus inside the dialog —
-    // don't steal it for the close button.
-    const dialog = closeRef.current?.closest('[role="dialog"]');
-    if (dialog?.contains(document.activeElement)) return;
-    closeRef.current?.focus();
+    if (!minimalHeader) closeRef.current?.focus();
   }, [minimalHeader]);
-
-  // Read at render time, before any child's autoFocus runs: the element that
-  // opened the dialog. Closing returns focus there instead of stranding it on
-  // <body> — keyboard flows (e.g. FileTree's Delete key) keep their place.
-  const [focusReturn] = useState(() => document.activeElement);
-  useEffect(
-    () => () => {
-      if (focusReturn instanceof HTMLElement && focusReturn.isConnected)
-        focusReturn.focus({ preventScroll: true });
-    },
-    [focusReturn],
-  );
-
-  useEffect(() => {
-    if (!trapFocus) return;
-    const contain = (event: KeyboardEvent) => {
-      if (event.key !== "Tab") return;
-      const controls = [
-        ...(closeRef.current
-          ?.closest('[role="dialog"]')
-          ?.querySelectorAll<HTMLElement>(
-            "button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), summary, a[href]",
-          ) ?? []),
-      ].filter((el) => el.getClientRects().length);
-      const first = controls[0],
-        last = controls[controls.length - 1];
-      if (
-        !controls.includes(document.activeElement as HTMLElement) ||
-        (event.shiftKey && document.activeElement === first) ||
-        (!event.shiftKey && document.activeElement === last)
-      ) {
-        event.preventDefault();
-        (event.shiftKey ? last : first)?.focus();
-      }
-    };
-    window.addEventListener("keydown", contain);
-    return () => window.removeEventListener("keydown", contain);
-  }, [trapFocus]);
-
-  const modalId = useRef(Symbol("modal")).current;
-  useEffect(() => {
-    openModals.push(modalId);
-    return () => {
-      const index = openModals.lastIndexOf(modalId);
-      if (index >= 0) openModals.splice(index, 1);
-    };
-  }, [modalId]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented) return;
-      if (openModals[openModals.length - 1] !== modalId) return;
+      if (
+        event.key !== "Escape" ||
+        event.defaultPrevented ||
+        (event.target instanceof Element &&
+          event.target.closest("[data-dialog-popover]"))
+      )
+        return;
       event.preventDefault();
       event.stopPropagation();
       onClose();
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, modalId]);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [onClose]);
 
   return (
     <div
-      className={`absolute left-1/2 ${TOP[size]} ${MAX_H[size]} ${WIDTH[size]} -translate-x-1/2 flex flex-col`}
+      className={`absolute left-1/2 ${TOP[size]} ${WIDTH[size]} -translate-x-1/2`}
     >
       <div
         role="dialog"
@@ -159,7 +75,7 @@ export function ModalPanel({
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
         onMouseDown={(event) => event.stopPropagation()}
-        className={`relative isolate flex flex-col overflow-hidden rounded-2xl border border-content/10 shadow-2xl ${className ?? ""}`}
+        className={`relative isolate flex flex-col overflow-hidden rounded-2xl border border-content/7 shadow-2xl ${className ?? ""}`}
       >
         <GlassBackdrop className="bg-background-base/55" />
         <div className="modal-panel relative z-[1] flex min-h-0 flex-1 flex-col">
@@ -175,14 +91,13 @@ export function ModalPanel({
             >
               <h2
                 id={titleId}
-                className={`${TITLE[size]} font-semibold leading-tight text-content`}
+                className="text-xl font-medium leading-tight text-content"
               >
                 {title}
               </h2>
               {description ? (
                 <p
                   id={descriptionId}
-                  title={description}
                   className="mt-0.5 truncate text-[12px] leading-snug text-content/50"
                 >
                   {description}
@@ -203,9 +118,7 @@ export function ModalPanel({
             ref={lockOverscroll}
             className="min-h-0 flex-1 overflow-y-auto overscroll-none"
           >
-            <PopoverLayerOffset value={LAYER.dialog + 1 - LAYER.popover}>
-              {children}
-            </PopoverLayerOffset>
+            {children}
           </div>
         </div>
       </div>
@@ -214,19 +127,8 @@ export function ModalPanel({
 }
 
 export function Modal(props: Props) {
-  // Read at render time — the marker was written synchronously by the closing
-  // modal's click handler, before this mount. Kept through render so a
-  // StrictMode double-read still sees it, then consumed on mount so no
-  // later, unrelated dialog can inherit it.
-  const [swap] = useState(() => Date.now() - modalSwapAt < MODAL_SWAP_MS);
-  useEffect(() => {
-    modalSwapAt = 0;
-  }, []);
   return createPortal(
-    <div
-      className={`fixed inset-0${swap ? " modal-swap" : ""}`}
-      style={{ zIndex: LAYER.dialog }}
-    >
+    <div className="fixed inset-0" style={{ zIndex: LAYER.dialog }}>
       <div
         className="modal-backdrop absolute inset-0 bg-black/40"
         onMouseDown={props.onClose}

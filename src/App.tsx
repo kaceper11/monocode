@@ -1,104 +1,24 @@
-import {
-  canSteerHarness,
-  canSteerHarnessSession,
-} from "./lib/harness/registry";
-import {
-  matchesActiveTurnModel,
-  startSessionActivity,
-} from "./lib/harness/apply";
-import { queuedMessageOptions, retainQueuedFollowUp } from "./lib/messageQueue";
-import { sessionDecisionHarness } from "./lib/session";
-import { useSessionState } from "./hooks/useSessionState";
-import {
-  githubDeliveryTarget,
-  gitlabDeliveryTarget,
-  GITLAB_CI_ON_MR,
-  saveDeliveryProvider,
-} from "./lib/deliveryProviders";
-import { ciContext } from "./lib/azurePipelines";
-import {
-  readAzurePr,
-  readAzurePrSection,
-  type AzurePrAssociation,
-  type AzurePrThread,
-} from "./lib/azureRepos";
-import { githubRepo, githubWorkItemThread } from "./lib/githubTasks";
-import {
-  attentionStoreFromSnapshot,
-  attentionSnapshot,
-  dismissAttention,
-  snoozeAttention,
-  subscribeAttention,
-  visibleAttention,
-  type AttentionAction,
-  type AttentionItem,
-} from "./lib/attention";
-import {
-  deriveLocalAttention,
-  railReachableFamilies,
-  worktreeCleanupAttention,
-} from "./lib/attentionSources";
-import {
-  azureCiRepairDraft,
-  commentsRepair,
-  githubCiRepair,
-  githubCommentsRepair,
-  gitlabPipelineRepair,
-  REPAIR_CHANGE,
-  type RepairEvidence,
-} from "./lib/repair";
-import {
-  startWatcherEngine,
-  type WatcherEngineHooks,
-} from "./lib/watcherEngine";
-import {
-  startScheduleEngine,
-  type ScheduleEngineHooks,
-} from "./lib/scheduleEngine";
-import { OPEN_WATCH_SHEET, type WatchSheetRequest } from "./lib/watchers";
-import {
-  OPEN_SCHEDULE_SHEET,
-  type ScheduleSheetRequest,
-} from "./lib/schedules";
-import { WatchSheet } from "./chrome/WatchSheet";
-import { ScheduleSheet } from "./chrome/ScheduleSheet";
-import { AttentionQueue } from "./chrome/AttentionQueue";
-import { MergeResolutionSheet } from "./chrome/MergeResolutionSheet";
-import { AppDialogs } from "./chrome/AppDialogs";
-import { TaskSyncSheet } from "./chrome/TaskSyncSheet";
-import type { DeliveryTabSource } from "./lib/layout";
-import { RepairStatus } from "./chrome/RepairStatus";
-import {
-  assertRepairOwner,
-  repairOwnerError,
-  reserveRepair,
-  updateRepair,
-  validateRepair,
-  OPEN_REPAIR,
-  repairRecords,
-  type RepairDelivery,
-  type RepairRecord,
-} from "./lib/repair";
-import {
-  composeAgentContext,
-  contextFromText,
-  requestAgentContext,
-  type AgentContext,
-} from "./lib/agentContext";
-import { composeActionPrompt, loadAgentActions } from "./lib/agentActions";
-import { AgentContextPicker } from "./chrome/AgentContextPicker";
-import {
-  PREPARE_AGENT_CONTEXT,
-  removeContextItem,
-  contextFromTicketDescriptions,
-  linkTicketContext,
-  prepareSessionContext,
-  type AgentContextRequest,
-  type AgentDestination,
-} from "./lib/agentContext";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { SavedCommandsControl } from "./chrome/SavedCommandsControl";
+import { prepareSavedCommandLaunch, type SavedCommandLaunch } from "./lib/savedCommandLaunch";
+import { pruneQueuedSavedCommands } from "./lib/savedCommandRun";
+import { useKeepAwake } from "./lib/keepAwake";
+import { LinkChoiceMenu } from "./chrome/LinkChoiceMenu";
+import { newBrowserTab, openBrowserTab, closeBrowserTabs, updateBrowserTab, type BrowserMetaPatch } from "./lib/browserWorkspace";
+import { OPEN_BROWSER_EVENT, requestBrowserCommand, isBrowserOpenRequest, normalizeBrowserUrl, rememberedBrowserUrl } from "./lib/browser";
+import { BROWSER_CONTEXT_ADDED } from "./lib/browserContext";
+import { inboxSessionDescription } from "./lib/inboxProvider";
+import { useWslProjects } from "./hooks/useWslProjects";
+import { WslProjectDialog, WslConnectionStatus } from "./chrome/WslProjectDialog";
+import { modelCatalogKey, nativeIdFrom } from "./lib/models";
+import { wslLocation } from "./lib/paths";
 import { invoke } from "@tauri-apps/api/core";
-import { orchestrator, type ControlOutcome } from "./lib/orchestration";
+import {
+  orchestrationCheckoutCwd,
+  orchestrationProjectCwd,
+  orchestrator,
+  workspaceIdentity,
+  type ControlOutcome,
+} from "./lib/orchestration";
 import { modelsFor } from "./lib/models";
 import { isHarnessAvailable } from "./lib/harness/availability";
 import {
@@ -126,7 +46,7 @@ import {
 import { flushSync } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ask, message } from "./lib/dialogs";
+import { ask, message } from "@tauri-apps/plugin-dialog";
 import {
   useCallback,
   useEffect,
@@ -138,14 +58,36 @@ import {
 } from "react";
 import { Sidebar } from "./chrome/Sidebar";
 import { ApprovalToasts } from "./chrome/ApprovalToasts";
-import { CheckToasts } from "./chrome/CheckToasts";
 import { WhatsNewDialog } from "./chrome/WhatsNewDialog";
 import { ProviderSignInDialog } from "./chrome/ProviderSignInDialog";
 import { TitleBar, type Tab as TitleTab } from "./chrome/TitleBar";
 import { MenuBar } from "./chrome/MenuBar";
 import { FilePicker } from "./chrome/FilePicker";
-import { LinkChoiceMenu } from "./chrome/LinkChoiceMenu";
+import {
+  DeleteSessionDialog,
+  type SessionDeleteChoice,
+} from "./chrome/DeleteSessionDialog";
+import {
+  assertWorktreeFilesClosed,
+  createOrchestrationWorktree,
+  createWorktree,
+  detachSessionWorktree,
+  checkWorktreeRemoval,
+  listWorktrees,
+  namedWorktreeBranch,
+  orchestrationWorktreeBranchName,
+  removeOrchestrationBranch,
+  removeOrchestrationWorktree,
+  removeWorktree,
+  renameWorktreeBranch,
+  sessionInWorktree,
+  temporaryWorktreeBranchName,
+  worktreeSessionIds,
+  type Worktree,
+} from "./lib/worktrees";
 import { UsageFooter } from "./chrome/UsageFooter";
+import { TerminalResourcesControl } from "./chrome/TerminalResourcesControl";
+import { footerTerminals } from "./lib/terminalResources";
 import { useProjectBranches } from "./hooks/useProjectBranches";
 import { useInboxActivity } from "./hooks/useInboxUnseen";
 import {
@@ -154,14 +96,7 @@ import {
   saveProjectRailOpen,
   type SidebarTabId,
 } from "./lib/appearance";
-import { HAS_NATIVE_GLASS, IS_MAC, IS_WIN } from "./lib/platform";
-import { WslProjectDialog } from "./chrome/WslProjectDialog";
-import {
-  connectWslProject,
-  invalidateWslDiscovery,
-  wslDistributions,
-} from "./lib/wsl";
-import { setWslStatus, wslStatusFor } from "./lib/wslStatus";
+import { HAS_NATIVE_GLASS, IS_MAC } from "./lib/platform";
 import {
   applyUiScale,
   loadUiScale,
@@ -175,26 +110,10 @@ import { runUpdateFlow } from "./lib/updater";
 import { displayAttachments, prepareAttachments } from "./lib/attachments";
 import {
   basename,
-  gitDiffIndex,
-  gitUpdateFromDefault,
-  listDir,
   notifyGitChanged,
-  pickFolder,
-  restoreSessionCheckout,
   type GitFileDiffKind,
   type GitHistoryCommit,
 } from "./lib/fs";
-import {
-  acquireSyncSlot,
-  mergeResolutionSnapshot,
-  subscribeMergeResolutions,
-  offerMergeResolution,
-  syncHostLabel,
-  syncPreflightRefusal,
-  syncTaskBranches,
-  syncWithDefaultBranch,
-  type TaskBranchSyncRow,
-} from "./lib/syncDefault";
 import {
   invalidateProjectFiles,
   prefetchProjectFiles,
@@ -216,7 +135,6 @@ import {
   leafIds,
   movePane,
   neighborLeafId,
-  newBrowserTab,
   newFileTab,
   newPlanTab,
   newTab,
@@ -236,10 +154,8 @@ import {
   siblingLeafId,
   splitPane,
   surfacePanes,
-  updateBrowserTab,
   updateTerminalTab,
   withSurfacePanes,
-  type BrowserMetaPatch,
   type EditorPane,
   type FilePaneTab,
   type FocusDir,
@@ -247,14 +163,6 @@ import {
   type SplitDir,
   type WorkspaceTab,
 } from "./lib/layout";
-import {
-  browserTabLabel,
-  isBrowserOpenRequest,
-  normalizeBrowserUrl,
-  OPEN_BROWSER_EVENT,
-  rememberedBrowserUrl,
-  requestBrowserCommand,
-} from "./lib/browser";
 import { releaseNotesForVersion, releaseNotesTitle } from "./lib/releaseNotes";
 import { mergeOrderedSubset, orderByIds } from "./lib/reorder";
 import {
@@ -265,7 +173,6 @@ import {
   findProjectTerminal,
   mapProjectTerminal,
   nextDockTerminalTitle,
-  patchDockTerminal,
   patchProjectTerminals,
   reorderDockTerminals,
   selectDockTerminal,
@@ -275,21 +182,6 @@ import {
   type DockSide,
   type ProjectTerminalDock as ProjectTerminal,
 } from "./lib/projectTerminal";
-import { writePty } from "./lib/pty";
-import {
-  OPEN_COMMANDS_SHEET,
-  resolveCommandTarget,
-  type CommandsSheetRequest,
-} from "./lib/projectCommands";
-import { ProjectCommandsMenu } from "./chrome/ProjectCommandsMenu";
-import { ProjectCommandsSheet } from "./chrome/ProjectCommandsSheet";
-import type { PopoverAnchor } from "./chrome/Popover";
-import {
-  OPEN_BOUND_PROCESS,
-  OPEN_WORKTREE_MANAGER,
-  type BoundProcess,
-  type WorktreeManagerRequest,
-} from "./lib/worktreeRemoval";
 import {
   applyGroupedReorder,
   insertTabBesideActive,
@@ -301,19 +193,23 @@ import {
   confirmCloseTerminal,
   confirmCloseTerminals,
 } from "./lib/terminalClose";
-import { terminalTabLabel, type TerminalMetaPatch } from "./lib/terminalTab";
-import { footerTerminals } from "./lib/terminalResources";
+import {
+  listRunningTerminals,
+  terminalTabLabel,
+  type TerminalMetaPatch,
+} from "./lib/terminalTab";
 import {
   applyHarnessEvent,
-  applyHarnessEvents,
   appendUser,
   appendSteerUser,
   bindHarnessSession,
   cancelHarnessTurn,
   canCompactHarnessContext,
+  canSteerHarness,
   compactHarnessContext,
   forgetHarnessSession,
   generateHarnessTitle,
+  generateHarnessBranchName,
   isLiveHarness,
   latestTurnNeedsHarnessLogin,
   probeHarnessAvailability,
@@ -322,10 +218,8 @@ import {
   promoteLastAssistantToPlan,
   respondHarnessApproval,
   respondHarnessQuestion,
-  setHarnessRuntimeMode,
   keepHarnessQuestionOpen,
   sendHarnessTurn,
-  prewarmHarness,
   steerHarnessTurn,
   startHarnessBridge,
   stopHarnessSession,
@@ -359,19 +253,20 @@ import { requestOutgoingHandoff } from "./lib/handoffTurn";
 import { isEditTool } from "./lib/harness/preview";
 import {
   beginSessionTurn,
+  applySessionCheckpoint,
   captureSessionCheckpoint,
+  forgetSessionCheckpoint,
   flushSessionCheckpoint,
   keepSessionChanges,
   notifyReviewChanged,
   prepareSessionCheckpoint,
+  sessionCheckpointCleanupSafe,
 } from "./lib/checkpoint";
 import { notifyDirsChanged } from "./lib/fileTree";
-import { nudgeWatchedFiles } from "./lib/fileWatch";
+import { invalidateWatchedFiles, nudgeWatchedFiles } from "./lib/fileWatch";
 import { type EditorNavigationTarget, type OpenFileFn } from "./lib/search";
 import {
   mergeModelSettings,
-  modelCatalogKey,
-  nativeIdFrom,
   preferredModelSettings,
   resolveModel,
   saveLastModelSettings,
@@ -390,72 +285,8 @@ import {
   projectName,
   rebasePath,
   resolveWorkspacePath,
-  wslLocation,
-  prettyCwd,
 } from "./lib/paths";
 import { removeProjectData } from "./lib/projectData";
-import { TaskCreateSheet } from "./chrome/TaskCreateSheet";
-import { TaskDetails } from "./chrome/TaskDetails";
-import { TaskPrSheet } from "./chrome/TaskPrSheet";
-import { Modal, modalSwap } from "./chrome/Modal";
-import { WorktreePanel } from "./chrome/WorktreePicker";
-import {
-  addTaskChildren,
-  composeTaskPrompt,
-  composeTaskSessionPrompt,
-  composeTaskUpdateNotice,
-  firstTaskSessionId,
-  linkTicketToTask,
-  loadTaskWorkspaces,
-  OPEN_TASK_DETAILS,
-  OPEN_TASK_PRS,
-  markTaskChildLaunching,
-  preferredTaskChild,
-  projectForTask,
-  pruneTaskSession,
-  recordTaskActiveChild,
-  subscribeTaskWorkspaces,
-  taskChildrenForWorkingCopy,
-  taskDestinationForSession,
-  taskForSession,
-  taskOwnedChildForWorkingCopy,
-  taskOwnsCheckout,
-  taskSessionIds,
-  linkTaskSession,
-  liveTaskSessionIds,
-  unmarkTaskChildLaunching,
-  updateTask,
-  updateTaskChild,
-  type TaskChild,
-  type TaskChildDraft,
-  type TaskWorkspace,
-} from "./lib/taskWorkspaces";
-import { deleteTaskPrDraft } from "./lib/taskPrs";
-import type { TaskCiFix, TaskDeliveryRef } from "./lib/taskCi";
-import {
-  ensureProjectForPath,
-  familyForRepository,
-  findProjectByCommonDir,
-  isProjectRailKey,
-  loadProjects,
-  projectContainsPath,
-  projectForPath,
-  projectRailKey,
-  projectsSnapshot,
-  subscribeProjects,
-  type ProjectRecord,
-} from "./lib/projects";
-import {
-  familyHasCopy,
-  familyHasLiveCopy,
-  getVerifiedFamilies,
-  hiddenWorkingCopies,
-  hiddenWorkingCopiesSnapshot,
-  subscribeRepositoryFamilies,
-  subscribeWorkingCopyPreferences,
-  type RepositoryFamily,
-} from "./lib/repositoryFamilies";
-import { probeRepositoryFamily } from "./hooks/useRepositoryFamilies";
 import {
   archiveProject,
   forgetProject,
@@ -463,11 +294,9 @@ import {
   loadRecents,
   looksLikeProject,
   normalizeProjectPath,
-  OPEN_PROJECT_PATH,
   projectRailItems,
   rememberProject,
   sameProjectPath,
-  subscribeRemovedWorktree,
 } from "./lib/recents";
 import {
   applyDetachPaneToTab,
@@ -475,30 +304,35 @@ import {
   applyPlaceSessionOnPane,
   filterTabsForProject,
   findOpenSessionTab,
+  openAddToChatSessionPane,
   planWorkspaceTabClose,
   workspaceTabCwd,
   focusedWorkspaceTabCwd,
 } from "./lib/workspaceTabGroups";
+import {
+  ADD_TO_CHAT_EVENT,
+  composerSeedForAddToChat,
+  type AddToChatRequest,
+} from "./lib/quoteDraft";
 import { runSessionRemoval } from "./lib/sessionRemoval";
 import {
   DEFAULT_PROVIDER_ACCOUNT_ID,
+  providerAccountExists,
   selectedProviderAccountId,
+  supportsProviderAccounts,
+  type ProviderAccountProvider,
 } from "./lib/providerAccounts";
-import type { RateLimitProvider } from "./lib/rateLimits";
 import {
-  DEFAULT_RUNTIME_MODE,
   HARNESSES,
   HARNESS_LABEL,
   HARNESS_TITLE,
   canReplaceSessionTitle,
   formatSessionTitle,
   sessionNeedsInput,
-  isBlankSession,
   newDefaultSession,
   newSession,
   sessionDisplayTitle,
   sessionWorkCwd,
-  harnessSupportsAttachments,
   titleFromPrompt,
   type Attachment,
   type Block,
@@ -511,8 +345,8 @@ import {
   type SecondOpinionMeta,
   type Session,
   type TurnIntent,
+  type WorkspaceMode,
 } from "./lib/session";
-import type { ActionRunRef } from "./lib/agentActions";
 
 import {
   canDispatchQueuedHead,
@@ -532,6 +366,7 @@ import {
   setSessionPinned,
   shouldPersistSession,
   upsertSession,
+  flushSessionWrites,
   type SessionSummary,
 } from "./lib/sessionStore";
 import { rememberLoadedSession } from "./lib/sessionCache";
@@ -541,13 +376,6 @@ import { hiddenApprovalNotices } from "./lib/approvalToast";
 import { useSessionReminders } from "./hooks/useSessionReminders";
 import { ReminderNotices } from "./chrome/ReminderNotices";
 import { nextUnseenFinishedSessions } from "./lib/sessionDone";
-import {
-  resolveVerifyForSession,
-  sendCheckToAgent,
-  setVerifyHooks,
-  suppressVerifyTurn,
-  verifyTurnFinished,
-} from "./lib/verify";
 import {
   loadNotificationsEnabled,
   NOTIFICATION_CLICK_EVENT,
@@ -571,20 +399,11 @@ import {
   emptyTabVisitHistory,
   pruneTabVisitHistory,
   recordTabVisit,
-  sameVisitLocation,
   tabVisitBack,
   tabVisitForward,
   type TabVisitHistory,
-  type VisitLocation,
 } from "./lib/tabVisitHistory";
 import { preparePrompt } from "./lib/promptPreparation";
-import {
-  beginTurnTiming,
-  endTurnTiming,
-  markFirstTurnEvent,
-  markTurnContentApplied,
-  markTurn,
-} from "./lib/turnTiming";
 import { warmNativeSkills, isNativeCommandPrompt } from "./lib/skills";
 import { nativeSkillContextForSession } from "./lib/sessionSkills";
 import {
@@ -617,49 +436,41 @@ import { SettingsView, type SettingsAnchor } from "./surfaces/SettingsView";
 import type { ConnectableInboxSource } from "./lib/inboxFilters";
 import { InboxView, LinkedWorkItemPanel } from "./surfaces/InboxView";
 import type { InboxSessionPortal } from "./surfaces/InboxDiscussionPanel";
+import { inboxProvider } from "./lib/inboxProvider";
 import { inboxAskKey, inboxAskPrompt } from "./lib/inboxAsk";
 import { NotesView } from "./surfaces/NotesView";
-import type { InboxItem } from "./lib/githubTasks";
 import {
-  addSessionWorkItems,
+  inboxComposerCard,
+  type InboxItem,
+} from "./lib/githubTasks";
+import {
+  bindLinkedWorkItemAccount,
   linkedWorkItemFromInboxItem,
-  OPEN_INBOX_WORK_ITEM,
-  removeSessionWorkItem,
   resolveLinkedWorkItem,
 } from "./lib/sessionWorkItem";
 import {
   completeLinkedWorkItemUpdateCard,
   failLinkedWorkItemUpdateCard,
+  linkedWorkItemActivityKey,
   pendingLinkedWorkItemUpdateCard,
   type LinkedWorkItemUpdateCard,
 } from "./lib/linkedWorkItemActivity";
-import {
-  linkedWorkItemIdentityChanged,
-  linkedWorkItemUpdateKey,
-  type LinkedSessionUpdate,
-} from "./lib/linkedSessionUpdates";
-import { fetchLinkedWorkItemThread } from "./lib/linkedWorkItemRefresh";
+import type { LinkedSessionUpdate } from "./lib/linkedSessionUpdates";
 import { markLinkedSessionUpdateSeen } from "./lib/linkedSessionSeen";
 import { linearIssueDetails, peekLinearIssueDetails } from "./lib/linear";
-import { jiraDetails, peekJiraDetails } from "./lib/jira";
-import { azureDetails, peekAzureDetails } from "./lib/azure";
-import { gitlabWorkItemDetails, peekGitlabWorkItemDetails } from "./lib/gitlab";
 import {
-  loadKeepAwakeEnabled,
+  loadCloseToTray,
   loadLiveAgentsEnabled,
   loadNotesEnabled,
   loadDiffViewer,
   loadFollowUpBehavior,
   loadSettingsSection,
-  isSettingsSectionId,
   saveSettingsSection,
-  subscribeKeepAwakeEnabled,
   subscribeLiveAgentsEnabled,
   subscribeNotesEnabled,
   type SettingsSectionId,
   type FollowUpBehavior,
 } from "./lib/settings";
-import { keepAwakeSessionIds, syncKeepAwake } from "./lib/keepAwake";
 import {
   handleEditorFindKey,
   openFindInActiveEditor,
@@ -680,6 +491,7 @@ import {
   shouldWriteInFlightSnapshot,
 } from "./lib/inFlight";
 import {
+  isBlankSession,
   planProjectReturn,
   reconcileProjectReturn,
   type ProjectReturnMemory,
@@ -692,9 +504,10 @@ import type { InstalledUpdate } from "./lib/updateNotice";
 import {
   bindResumedSessions,
   closeBusyWindow,
+  closeCurrentWindow,
+  confirmReload,
   hasInFlightSessions,
   hideCurrentWindow,
-  closeCurrentWindow,
   isAppQuitting,
   persistLiveTranscripts,
   persistQuitState,
@@ -762,13 +575,11 @@ function scheduleHarnessFlush(run: () => void): ScheduledFlush {
 function userTurnCards(
   noteCard: NoteComposerCard | undefined,
   secondOpinion?: SecondOpinionMeta,
-  action?: ActionRunRef,
 ) {
-  if (!noteCard && !secondOpinion && !action) return undefined;
+  if (!noteCard && !secondOpinion) return undefined;
   return {
     ...(secondOpinion ? { secondOpinion } : {}),
     ...(noteCard ? { noteCard: noteCardMeta(noteCard) } : {}),
-    ...(action ? { action } : {}),
   };
 }
 
@@ -803,11 +614,7 @@ function withPlanBuildTarget(
   session: Session,
   target: PlanBuildTarget,
 ): Session {
-  const resolved = resolveModel(
-    target.harness,
-    target.model,
-    sessionWorkCwd(session),
-  );
+  const resolved = resolveModel(target.harness, target.model);
   const modelSettings = mergeModelSettings(resolved, target.modelSettings);
   const plan = planComposerSwitch(session, target.harness);
   const next = withHarnessChoice(
@@ -853,9 +660,9 @@ function filesInWorkspaceTabs(tabs: readonly WorkspaceTab[]): FilePaneTab[] {
   ]);
 }
 
-/** In-app confirm. `window.confirm` is swallowed when a macOS menu accelerator fires. */
-function confirmDiscardUnsaved(text: string): Promise<boolean | null> {
-  return ask(text, { title: "MonoCode", kind: "warning" });
+/** Native sheet. `window.confirm` is swallowed when a macOS menu accelerator fires. */
+function confirmDiscardUnsaved(message: string): Promise<boolean> {
+  return ask(message, { title: "MonoCode", kind: "warning" });
 }
 
 function titleTabsEqual(a: TitleTab[], b: TitleTab[]): boolean {
@@ -887,22 +694,6 @@ function titleTabsEqual(a: TitleTab[], b: TitleTab[]): boolean {
 // Register capabilities before composer hooks choose their discovery strategy.
 registerBuiltinHarnesses();
 
-const EMPTY_REPAIRS: RepairRecord[] = [];
-/** repairRecords() throws on unreadable data — the queue must not. */
-function repairRecordsSafe(): RepairRecord[] {
-  try {
-    return repairRecords();
-  } catch {
-    return EMPTY_REPAIRS;
-  }
-}
-
-/** Prefill a task name from an inbox item: "ENG-41 Fix login redirect". */
-function inboxItemTaskName(item: InboxItem): string {
-  const ref = item.identifier?.trim() || `#${item.number}`;
-  return `${ref} ${item.title}`.trim();
-}
-
 export default function App({
   windowTransfer = null,
   resumed = null,
@@ -928,58 +719,23 @@ export default function App({
       ? rememberProject(resumed.projectCwd)
       : loadRecents(),
   );
-  useEffect(
-    () =>
-      subscribeRemovedWorktree(({ path, replacement }) => {
-        setRecents(loadRecents());
-        setProjectCwd((current) =>
-          isEqualOrInside(current, path) ? replacement : current,
-        );
-        // The removed checkout's dock detaches: terminals spawned inside it
-        // were bound processes — stopped, or they blocked the removal. A
-        // terminal running elsewhere keeps running and moves to the
-        // replacement dock instead of losing its only UI.
-        setProjectTerminals((current) => {
-          let touched = false;
-          let survivors: FilePaneTab[] = [];
-          const docks = current.filter((dock) => {
-            if (!isEqualOrInside(dock.projectPath, path)) return true;
-            touched = true;
-            survivors = dock.pane.files.filter(
-              (file) =>
-                file.terminal && !!file.cwd && !isEqualOrInside(file.cwd, path),
-            );
-            return false;
-          });
-          if (!touched) return current;
-          if (survivors.length === 0) return docks;
-          const index = docks.findIndex((dock) =>
-            sameProjectPath(dock.projectPath, replacement),
-          );
-          if (index < 0) {
-            const [first, ...rest] = survivors;
-            let dock = createProjectTerminal(replacement, first);
-            for (const file of rest) dock = addTerminalToDock(dock, file);
-            return [...docks, dock];
-          }
-          docks[index] = survivors.reduce(
-            (dock, file) => addTerminalToDock(dock, file),
-            docks[index],
-          );
-          return docks;
-        });
-      }),
-    [],
-  );
   const [seed] = useState(() => {
     const cwd = lastProjectPath() ?? "~";
     const session = newDefaultSession(cwd);
     const tab = newTab(session.id);
     return { session, tab };
   });
-  const [sessions, setSessions, sessionsRef] = useSessionState(
+  const [sessions, setSessions] = useState<Session[]>(
     () => windowTransfer?.sessions ?? resumed?.sessions ?? [seed.session],
   );
+  const [sessionDeleteDialog, setSessionDeleteDialog] = useState<{
+    title: string;
+    unusedWorktree: string;
+    resolve: (choice: SessionDeleteChoice) => void;
+  }>();
+  const switchingWorktrees = useRef(new Map<string, string>());
+  const removingWorktreePaths = useRef(new Set<string>());
+  const deleteConfirmationPending = useRef(false);
   const [tabs, setTabs] = useState<WorkspaceTab[]>(
     () => windowTransfer?.tabs ?? resumed?.tabs ?? [seed.tab],
   );
@@ -1000,6 +756,7 @@ export default function App({
       !!tab && resumed.sessions.some((session) => session.id === tab.focusedId)
     );
   });
+  const [composerFocusToken, setComposerFocusToken] = useState(0);
   /** Tab id -> project name, kept in sync with the rendered title tabs. */
   const tabProjectsRef = useRef(new Map<string, string>());
   const projectOfTab = useCallback(
@@ -1013,34 +770,11 @@ export default function App({
   const [sidebarTab, setSidebarTab] = useState<SidebarTabId>(
     () => loadSidebarTabOrder()[0] ?? "sessions",
   );
-  const [commandsMenu, setCommandsMenu] = useState<{
-    anchor: PopoverAnchor;
-    path?: string;
-    projectId?: string;
-    taskId?: string;
-  } | null>(null);
-  /** The project whose commands are being edited — and where to land. */
-  const [commandsSheet, setCommandsSheet] =
-    useState<CommandsSheetRequest | null>(null);
-  // The rail's own anchored overlays go stale when the visible folder
-  // changes — close them rather than leaving a floating menu behind.
-  useEffect(() => {
-    setCommandsMenu(null);
-    setCommandsSheet(null);
-  }, [projectCwd]);
-  // Live project list — the commands menu/sheet re-resolve on every store
-  // write instead of parsing localStorage each render.
-  const projectsRaw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
-  const projectsList = useMemo(() => loadProjects(), [projectsRaw]);
   const [filesSearchOpen, setFilesSearchOpen] = useState(false);
   const [searchFocusToken, setSearchFocusToken] = useState(0);
   const [searchViewOpen, setSearchViewOpen] = useState(false);
   const [searchViewFocusToken, setSearchViewFocusToken] = useState(0);
   const [inboxViewOpen, setInboxViewOpen] = useState(false);
-  const [inboxConversationId, setInboxConversationId] = useState<string>();
-  const [inboxConversationRevision, setInboxConversationRevision] = useState(0);
-  const [inboxSelectionRevision, setInboxSelectionRevision] = useState(0);
-  const [inboxTarget, setInboxTarget] = useState<LinkedWorkItem | null>(null);
   const [linkedWorkItemPanels, setLinkedWorkItemPanels] = useState<
     ReadonlyMap<string, LinkedWorkItemPanelState>
   >(() => new Map());
@@ -1082,70 +816,7 @@ export default function App({
     loadLiveAgentsEnabled,
     () => true,
   );
-  const keepAwakeEnabled = useSyncExternalStore(
-    subscribeKeepAwakeEnabled,
-    loadKeepAwakeEnabled,
-    () => false,
-  );
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [wslOpening, setWslOpening] = useState<{
-    path: string;
-    busy: boolean;
-    error?: string;
-  } | null>(null);
-  const wslOpenRequest = useRef<AbortController | null>(null);
-  useEffect(() => () => wslOpenRequest.current?.abort(), []);
-  useEffect(() => {
-    const location = wslLocation(projectCwd);
-    if (!location) return;
-    let disposed = false;
-    const openingAtStart = wslOpenRequest.current;
-    // Publish the probe only when nothing fresher landed meanwhile — a
-    // connect started (or finished) during the probe outranks its result.
-    const statusBefore = wslStatusFor(location.distribution);
-    void invoke<boolean>("wsl_connected", {
-      distribution: location.distribution,
-    })
-      .then((connected) => {
-        if (wslStatusFor(location.distribution) === statusBefore)
-          setWslStatus(location.distribution, {
-            state: connected ? "connected" : "disconnected",
-          });
-        if (
-          !disposed &&
-          wslOpenRequest.current === openingAtStart &&
-          !connected
-        )
-          setWslOpening(
-            (current) =>
-              current ?? {
-                path: projectCwd,
-                busy: false,
-                error:
-                  "Reconnect WSL to access this project. Windows execution will not be used.",
-              },
-          );
-      })
-      .catch((error) => {
-        if (wslStatusFor(location.distribution) === statusBefore)
-          setWslStatus(location.distribution, {
-            state: "error",
-            error: String(error),
-          });
-        if (!disposed && wslOpenRequest.current === openingAtStart)
-          setWslOpening(
-            (current) =>
-              current ?? {
-                path: projectCwd,
-                busy: false,
-                error: String(error),
-              },
-          );
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [projectCwd]);
   const [updateNotice, setUpdateNotice] = useState(installedUpdate);
   const [whatsNewVersion, setWhatsNewVersion] = useState<string | null>(null);
   const [providerSignInRequest, setProviderSignInRequest] = useState<{
@@ -1172,21 +843,17 @@ export default function App({
   const [settingsAnchor, setSettingsAnchor] = useState<SettingsAnchor | null>(
     null,
   );
-  const [notificationProjectPath, setNotificationProjectPath] = useState<string | null>(null);
-  const [notificationSettingsRequest, setNotificationSettingsRequest] = useState(0);
+  const [notificationProjectPath, setNotificationProjectPath] = useState<
+    string | null
+  >(null);
+  const [notificationSettingsRequest, setNotificationSettingsRequest] =
+    useState(0);
   const [editorNavigation, setEditorNavigation] =
     useState<EditorNavigationTarget | null>(null);
   const editorNavigationToken = useRef(0);
   const [filePickerOpen, setFilePickerOpen] = useState(false);
-  /** Workspace navigation (session/file/diff/terminal opens) dismisses the
-   * overlay surfaces so the target is never activated hidden behind them. */
-  const dismissOverlays = useCallback(() => {
-    setInboxViewOpen(false);
-    setSearchViewOpen(false);
-    setSettingsOpen(false);
-    setNotesViewOpen(false);
-    setFilePickerOpen(false);
-  }, []);
+  const [filePickerInitialQuery, setFilePickerInitialQuery] = useState("");
+  const [filePickerResetToken, setFilePickerResetToken] = useState(0);
   const [dirtyFiles, setDirtyFiles] = useState<Set<string>>(
     () => new Set(windowTransfer?.dirtyFileIds ?? []),
   );
@@ -1215,77 +882,30 @@ export default function App({
   /** Project whose listing failed, so the error cannot leak to another one. */
   const [historyErrorCwd, setHistoryErrorCwd] = useState<string | null>(null);
 
-  const repairCheckingRef = useRef(new Set<string>());
+  useKeepAwake(sessions);
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
   const linkedSessionUpdatesRef = useRef<
     ReadonlyMap<string, LinkedSessionUpdate>
   >(new Map());
-  const linkedWorkItemActivityFetches = useRef(new Map<string, number>());
+  const linkedWorkItemActivityFetches = useRef(new Map<string, string>());
   const queueDispatchingRef = useRef(new Set<string>());
-  const pendingSteersRef = useRef(new Map<string, Set<Promise<void>>>());
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
   const dirtyFilesRef = useRef(dirtyFiles);
   dirtyFilesRef.current = dirtyFiles;
   const projectTerminalsRef = useRef(projectTerminals);
   projectTerminalsRef.current = projectTerminals;
-  /** Saved-command ids with a launch still awaiting its cwd check — a fast
-   * second click must not queue a duplicate terminal. */
-  const commandLaunchRef = useRef(new Set<string>());
   const projectTerminalFocusedRef = useRef(projectTerminalFocused);
   projectTerminalFocusedRef.current = projectTerminalFocused;
   const activeTabIdRef = useRef(activeTabId);
   activeTabIdRef.current = activeTabId;
   const projectCwdRef = useRef(projectCwd);
-  useEffect(() => {
-    const unlisten = listen<string>("wsl:disconnected", (event) => {
-      const distribution = event.payload;
-      invalidateWslDiscovery(`//wsl.localhost/${distribution}/`);
-      // The emit fires for any failed request on the bridge's owner — a
-      // request holding a stale bridge can report after a fresh bridge
-      // already reconnected. Confirm before flagging the distro down.
-      void invoke<boolean>("wsl_connected", { distribution })
-        .then((alive) => {
-          // A connect in flight reports its own failure; don't pre-empt it.
-          if (alive || wslStatusFor(distribution).state === "connecting")
-            return;
-          setWslStatus(distribution, {
-            state: "disconnected",
-            error: "WSL connection interrupted",
-          });
-          const path = projectCwdRef.current;
-          if (
-            wslLocation(path)?.distribution.toLowerCase() ===
-            distribution.toLowerCase()
-          )
-            setWslOpening((current) =>
-              current?.busy
-                ? current
-                : {
-                    path,
-                    busy: false,
-                    error:
-                      "WSL connection interrupted. Reconnect, then inspect any in-flight action before retrying it.",
-                  },
-            );
-        })
-        .catch(() => {
-          if (wslStatusFor(distribution).state === "connecting") return;
-          setWslStatus(distribution, {
-            state: "disconnected",
-            error: "WSL connection interrupted",
-          });
-        });
-    });
-    return () => {
-      void unlisten.then((stop) => stop());
-    };
-  }, []);
   projectCwdRef.current = projectCwd;
   const searchViewOpenRef = useRef(searchViewOpen);
   searchViewOpenRef.current = searchViewOpen;
   const inboxViewOpenRef = useRef(inboxViewOpen);
   inboxViewOpenRef.current = inboxViewOpen;
-  const activeRef = useRef<Session | undefined>(undefined);
   const notesViewOpenRef = useRef(notesViewOpen);
   notesViewOpenRef.current = notesViewOpen;
   const settingsOpenRef = useRef(settingsOpen);
@@ -1316,7 +936,7 @@ export default function App({
     readProjectReturnMemory();
   }, [activeTabId, tabs, sessions, readProjectReturnMemory]);
 
-  const tabVisitRef = useRef(emptyTabVisitHistory({ tab: activeTabId }));
+  const tabVisitRef = useRef(emptyTabVisitHistory(activeTabId));
   const tabVisitFromHistoryRef = useRef(false);
   const [tabVisitNav, setTabVisitNav] = useState({
     canBack: false,
@@ -1369,11 +989,10 @@ export default function App({
     const prev = sessionsRef.current;
     const next = prev.map((session) => {
       const events = batches.get(session.id);
-      return events ? applyHarnessEvents(session, events) : session;
+      return events ? events.reduce(applyHarnessEvent, session) : session;
     });
     if (!next.some((session, index) => session !== prev[index])) return;
     sessionsRef.current = next;
-    for (const sessionId of batches.keys()) markTurnContentApplied(sessionId);
     syncDockBadge(next);
     setSessions(next);
   }, []);
@@ -1388,9 +1007,6 @@ export default function App({
 
       turnGen.current.set(sessionId, (turnGen.current.get(sessionId) ?? 0) + 1);
       flushHarnessEvents();
-      // Removal stops the turn — the busy→idle edge must not verify work
-      // that is being cancelled for archive/delete.
-      suppressVerifyTurn(open);
       await Promise.all(
         sessionChildHarnesses(open).map((harness) =>
           cancelHarnessTurn(harness, sessionId).catch(() => undefined),
@@ -1410,7 +1026,7 @@ export default function App({
       const prev = sessionsRef.current;
       const next = prev.map((session) =>
         session.id === sessionId
-          ? applyHarnessEvents(session, events)
+          ? events.reduce(applyHarnessEvent, session)
           : session,
       );
       if (!next.some((session, index) => session !== prev[index])) return;
@@ -1477,9 +1093,6 @@ export default function App({
 
   useEffect(() => {
     void probeHarnessAvailability();
-    // Warm the distribution probe so Add-project can skip the execution
-    // location dialog without waiting on wsl.exe when no WSL exists.
-    if (IS_WIN) void wslDistributions().catch(() => undefined);
     // Only the harnesses already in this window. Probing every installed CLI
     // at boot left unused agents (especially Pi) running in the background.
     // Each WSL session probes inside its own distribution; a WSL session must
@@ -1522,7 +1135,7 @@ export default function App({
           );
           // A legacy variant-level id (e.g. `devin:x-medium`) resolved to its
           // group — keep the level by stamping it into the reasoning setting.
-          if (resolved.id !== session.model) {
+          if (session.harness === "devin" && resolved.id !== session.model) {
             const legacy = nativeIdFrom(session.model);
             for (const setting of resolved.settings ?? []) {
               if (setting.options.some((option) => option.value === legacy)) {
@@ -1546,14 +1159,8 @@ export default function App({
   const active =
     sessions.find((session) => session.id === activeTab?.focusedId) ??
     sessions.find(
-      (session) =>
-        activeTab &&
-        session.id === focusedFileTab(activeTab)?.delivery?.sourceSessionId,
-    ) ??
-    sessions.find(
       (session) => activeTab && leafIds(activeTab.layout).includes(session.id),
     );
-  activeRef.current = active;
   const activeTabSessionIds = activeTab ? leafIds(activeTab.layout) : [];
   const activeLinkedWorkItemPanel = activeTab
     ? (linkedWorkItemPanels.get(activeTab.focusedId) ??
@@ -1577,49 +1184,62 @@ export default function App({
   }, [tabs]);
 
   const sessionDefaults = active ?? sessions[0];
-  const browserOpen = !!activeTab?.editorPanes.some((pane) =>
-    pane.files.some((file) => file.browser),
-  );
-  // Saved commands resolve their owning project at open: explicit id → rail
-  // path → the active task's project → the current folder's project.
-  const activeTaskScope =
-    commandsMenu && active
-      ? taskForSession(active.id, sessionWorkCwd(active))
-      : null;
-  const commandsProject = !commandsMenu
-    ? undefined
-    : commandsMenu.projectId
-      ? projectsList.find((entry) => entry.id === commandsMenu.projectId)
-      : commandsMenu.path
-        ? projectForPath(commandsMenu.path)
-        : ((activeTaskScope
-            ? projectForTask(activeTaskScope.task)
-            : undefined) ?? projectForPath(projectCwd));
-  const commandsTask = !commandsMenu
-    ? null
-    : commandsMenu.taskId
-      ? (loadTaskWorkspaces().find(
-          (entry) => entry.id === commandsMenu.taskId,
-        ) ?? null)
-      : activeTaskScope &&
-          activeTaskScope.task.projectId === commandsProject?.id
-        ? activeTaskScope.task
-        : null;
-  // Reusable commands still need a folder when the rail entry is not a stored
-  // project — the path the menu was opened on, else the current folder.
-  const commandsFallbackCwd = commandsMenu?.path ?? projectCwd;
-  // A command's bound terminal can live in any project's dock — the menu
-  // resolves running/failed state across all of them, not just the visible
-  // one, or a run bound elsewhere would look like a fresh Play button.
-  const boundCommandFiles = useMemo(() => {
-    const map = new Map<string, FilePaneTab>();
-    for (const dock of projectTerminals) {
-      for (const file of dock.pane.files) {
-        if (file.command?.presetId) map.set(file.command.presetId, file);
-      }
-    }
-    return map;
-  }, [projectTerminals]);
+
+  useEffect(() => {
+    const openSessionForAddToChat = (event: Event) => {
+      const detail = (event as CustomEvent<AddToChatRequest>).detail;
+      if (!detail?.text) return;
+
+      const currentTabs = tabsRef.current;
+      const currentSessions = sessionsRef.current;
+      const tab =
+        currentTabs.find((entry) => entry.id === activeTabIdRef.current) ??
+        currentTabs[0];
+      if (!tab) return;
+      const mountedSessionIds = new Set(
+        currentSessions.map((session) => session.id),
+      );
+      if (leafIds(tab.layout).some((id) => mountedSessionIds.has(id))) return;
+
+      const cwd =
+        focusedWorkspaceTabCwd(tab, currentSessions) ??
+        sessionDefaults?.cwd ??
+        projectCwdRef.current;
+      const composerSeed = composerSeedForAddToChat(detail.text, detail.mode);
+      if (!composerSeed) return;
+
+      const file = focusedFileTab(tab);
+      const session = {
+        ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
+        ...(file?.projectCwd ? { worktreeCwd: file.cwd } : {}),
+        composerSeed,
+      };
+      const openedTab = openAddToChatSessionPane({
+        tab,
+        sessions: currentSessions,
+        sessionId: session.id,
+      });
+      // A mounted session pane owns the normal add-to-chat path.
+      if (!openedTab) return;
+
+      const nextSessions = [...currentSessions, session];
+      const nextTabs = currentTabs.map((entry) =>
+        entry.id === tab.id ? openedTab : entry,
+      );
+      sessionsRef.current = nextSessions;
+      tabsRef.current = nextTabs;
+      setSessions(nextSessions);
+      setTabs(nextTabs);
+      setActiveTabId(tab.id);
+      setProjectTerminalFocused(false);
+      setComposerFocused(true);
+    };
+
+    window.addEventListener(ADD_TO_CHAT_EVENT, openSessionForAddToChat);
+    return () =>
+      window.removeEventListener(ADD_TO_CHAT_EVENT, openSessionForAddToChat);
+  }, [sessionDefaults?.cwd, sessionDefaults?.runtimeMode]);
+
   const activeSkillContext = active
     ? nativeSkillContextForSession(active)
     : null;
@@ -1630,10 +1250,9 @@ export default function App({
     warmNativeSkills(activeSkillContext);
   }, [activeSkillCwd, active?.id, active?.harness]);
 
+  const activeFile = activeTab ? focusedFileTab(activeTab) : undefined;
   const sidebarCwd =
-    active?.cwd ??
-    (activeTab ? focusedFileTab(activeTab)?.cwd : undefined) ??
-    projectCwd;
+    activeFile?.projectCwd ?? activeFile?.cwd ?? active?.cwd ?? projectCwd;
   const sidebarCwdRef = useRef(sidebarCwd);
   sidebarCwdRef.current = sidebarCwd;
   const sidebarCwdKey =
@@ -1646,7 +1265,16 @@ export default function App({
     sidebarCwdKey != null &&
     !loadedProjects.has(sidebarCwdKey) &&
     !historyFailed;
-  const gitCwd = active ? sessionWorkCwd(active) : sidebarCwd;
+  const gitCwd =
+    activeFile?.cwd ?? (active ? sessionWorkCwd(active) : sidebarCwd);
+  const gitCwdBranches = useProjectBranches(
+    gitCwd,
+    Boolean(gitCwd) && gitCwd !== "~",
+  );
+  const explorerRootLabel =
+    active?.worktreeCwd && sameProjectPath(gitCwd, sessionWorkCwd(active))
+      ? active.branch || gitCwdBranches?.current || undefined
+      : undefined;
   const gitCwdRef = useRef(gitCwd);
   gitCwdRef.current = gitCwd;
   const projectBranches = useProjectBranches(
@@ -1677,13 +1305,18 @@ export default function App({
    * until the picker happened to be opened. Idempotent: refreshHarnessCatalogs
    * dedupes via hasLiveCatalog and its inflight map. */
   const activeHarness = active?.harness;
+  const activeModelCwd = active ? sessionWorkCwd(active) : undefined;
   useEffect(() => {
     if (!activeHarness || !isLiveHarness(activeHarness)) return;
-    void refreshHarnessCatalogs([activeHarness]);
-  }, [activeHarness]);
+    void refreshHarnessCatalogs([activeHarness], activeModelCwd);
+  }, [activeHarness, activeModelCwd]);
 
   const usageProviders = useMemo(() => {
-    if (active?.harness === "claude" || active?.harness === "codex") {
+    if (
+      active?.harness === "claude" ||
+      active?.harness === "codex" ||
+      active?.harness === "opencode"
+    ) {
       return [active.harness];
     }
     return [];
@@ -1731,10 +1364,29 @@ export default function App({
       setProviderSignInRequest(null);
     }
   }, [active?.id, providerSignInRequest]);
-  const footerTerminalList = useMemo(
-    () => footerTerminals(projectTerminals, tabs, projectCwd),
-    [projectCwd, projectTerminals, tabs],
-  );
+  const resourceTerminals = useMemo(() => footerTerminals(projectTerminals, tabs, projectCwd), [projectTerminals, tabs, projectCwd]);
+  const runningTerminals = useMemo(() => {
+    const files: FilePaneTab[] = [];
+    const dock = findProjectTerminal(projectTerminals, projectCwd);
+    if (dock) files.push(...dock.pane.files);
+    for (const tab of tabs) {
+      for (const pane of tab.terminalPanes ?? []) {
+        files.push(...pane.files);
+      }
+    }
+    return listRunningTerminals(files);
+  }, [projectCwd, projectTerminals, tabs]);
+  const runningTerminalOpen = useMemo(() => {
+    const ids = new Set(runningTerminals.map((terminal) => terminal.id));
+    if (
+      currentProjectDock?.open &&
+      currentProjectDock.pane.files.some((file) => ids.has(file.id))
+    ) {
+      return true;
+    }
+    const focused = activeTab ? focusedFileTab(activeTab) : undefined;
+    return !!focused && ids.has(focused.id);
+  }, [activeTab, currentProjectDock, runningTerminals]);
 
   const nextApprovalSessionIds = useMemo(() => {
     const ids = new Set<string>();
@@ -1782,21 +1434,6 @@ export default function App({
   }
   const unseenFinishedIds = unseenFinishedRef.current;
 
-  // Checks on finish (#92): every busy→idle edge is a candidate turn-end.
-  // verify.ts claims the turn, resolves the project's check command and runs
-  // it headlessly; the outcome lands in the attention queue.
-  const verifyBusyRef = useRef(busySessionIds);
-  useEffect(() => {
-    const previous = verifyBusyRef.current;
-    verifyBusyRef.current = busySessionIds;
-    if (previous === busySessionIds) return;
-    for (const id of previous) {
-      if (busySessionIds.has(id)) continue;
-      const session = sessionsRef.current.find((row) => row.id === id);
-      if (session) verifyTurnFinished(session);
-    }
-  }, [busySessionIds]);
-
   const liveAgents = useMemo(
     () =>
       liveAgentsEnabled
@@ -1805,22 +1442,11 @@ export default function App({
     [liveAgentsEnabled, sessions, unseenFinishedIds],
   );
 
-  // Stable across renders — the rail memoizes on this array, so it must not
-  // be rebuilt inline in JSX on every transcript write.
-  const busyProjectPaths = useMemo(
-    () =>
-      sessions.flatMap((session) =>
-        session.busy && session.cwd ? [session.cwd] : [],
-      ),
-    [sessions],
-  );
-
   const hiddenApprovalToasts = useMemo(
     () => hiddenApprovalNotices(sessions, activeTabId, tabs, composerFocused),
     [sessions, activeTabId, tabs, composerFocused],
   );
   const [reminderNoticesHeight, setReminderNoticesHeight] = useState(0);
-  const [approvalToastsHeight, setApprovalToastsHeight] = useState(0);
 
   useEffect(() => {
     syncDockBadge(sessions);
@@ -1834,6 +1460,17 @@ export default function App({
         if (focused) {
           flushHarnessEvents();
           syncDockBadge(sessionsRef.current);
+          if (
+            document.activeElement === document.body &&
+            !projectTerminalFocusedRef.current &&
+            !searchViewOpenRef.current &&
+            !inboxViewOpenRef.current &&
+            !notesViewOpenRef.current &&
+            !settingsOpenRef.current
+          ) {
+            setComposerFocused(true);
+            setComposerFocusToken((token) => token + 1);
+          }
         }
       })
       .then((fn) => {
@@ -1868,12 +1505,14 @@ export default function App({
         // Listening here makes close our job. Letting the default path run
         // calls JS `window.destroy`, which Tauri denies without a permission.
         event.preventDefault();
+        const toTray = loadCloseToTray();
         if (hasInFlightSessions(sessionsRef.current)) {
           flushHarnessEvents();
-          if (!IS_MAC) {
+          if (!toTray && !IS_MAC) {
             void closeBusyWindow();
             return;
           }
+          // Not `persistQuitState`: that marks the live turns interrupted.
           void persistLiveTranscripts(sessionsRef.current);
           void hideCurrentWindow();
           return;
@@ -1887,7 +1526,7 @@ export default function App({
           "unload",
           projectTerminalsRef.current,
         ).finally(() => {
-          void closeCurrentWindow();
+          void (toTray ? hideCurrentWindow() : closeCurrentWindow());
         });
       })
       .then((fn) => {
@@ -1944,14 +1583,15 @@ export default function App({
   }, [inboxViewOpen]);
 
   useEffect(() => {
-    prefetchProjectFiles(sidebarCwd);
-  }, [sidebarCwd]);
+    prefetchProjectFiles(gitCwd);
+  }, [gitCwd]);
 
   const persistSession = useCallback((session: Session | undefined) => {
     if (
       !session ||
       !shouldPersistSession(session) ||
-      removingSessionIds.current.has(session.id)
+      removingSessionIds.current.has(session.id) ||
+      switchingWorktrees.current.has(session.id)
     )
       return;
     const fingerprint = persistFingerprint(session);
@@ -1970,7 +1610,11 @@ export default function App({
     const liveIds = new Set(sessions.map((session) => session.id));
     const visibleIds = openSessionIds(tabsRef.current);
     for (const session of sessions) {
-      if (removingSessionIds.current.has(session.id)) continue;
+      if (
+        removingSessionIds.current.has(session.id) ||
+        switchingWorktrees.current.has(session.id)
+      )
+        continue;
       if (observedSessions.current.get(session.id) === session) continue;
       observedSessions.current.set(session.id, session);
       const parked = !visibleIds.has(session.id);
@@ -2013,7 +1657,11 @@ export default function App({
       pendingPersist.current.clear();
       void Promise.all(
         dirty.map(async (session) => {
-          if (removingSessionIds.current.has(session.id)) return;
+          if (
+            removingSessionIds.current.has(session.id) ||
+            switchingWorktrees.current.has(session.id)
+          )
+            return;
           const fingerprint = persistFingerprint(session);
           if (lastPersisted.current.get(session.id) === fingerprint) return;
           const summary = await upsertSession(session).catch(() => null);
@@ -2029,18 +1677,6 @@ export default function App({
     }, 650);
     return () => window.clearTimeout(timer);
   }, [persistSession, sessions]);
-
-  // One idle-sleep assertion per runtime, owned by the backend. This window
-  // reports only sessions doing real execution; waiting/idle/finished work
-  // drops out, and a stale window cannot hold the machine awake alone.
-  // syncKeepAwake dedupes internally, so IPC only fires on real changes, and
-  // the block-scan is skipped entirely while the setting is off.
-  useEffect(() => {
-    syncKeepAwake(
-      keepAwakeEnabled,
-      keepAwakeEnabled ? keepAwakeSessionIds(sessions) : [],
-    );
-  }, [keepAwakeEnabled, sessions]);
 
   useEffect(() => {
     const refs = inFlightRefs(sessions, tabs);
@@ -2125,7 +1761,7 @@ export default function App({
     // Inbox owns these panes independently of project tabs. Keep their drafts
     // and attachments mounted when the panel closes or switches items.
     for (const session of sessions) {
-      if (session.inboxAsk || session.contextDraft) visibleIds.add(session.id);
+      if (session.inboxAsk) visibleIds.add(session.id);
     }
     // Internal workers stay attached to the lead, even while idle between
     // turns. They must not be discarded merely because they have no tab.
@@ -2228,98 +1864,16 @@ export default function App({
     );
   }, []);
 
-  /**
-   * What the user currently sees: the topmost overlay, otherwise the active
-   * tab and its focused leaf. Overlay priority matches `onRailBack`.
-   */
-  const navLocation = useMemo<VisitLocation>(() => {
-    if (settingsOpen) return { view: "settings" };
-    if (searchViewOpen) return { view: "search" };
-    if (inboxViewOpen)
-      return { view: "inbox", conversation: inboxConversationId };
-    if (notesViewOpen) return { view: "notes" };
-    return {
-      tab: activeTabId,
-      leaf: activeTab?.focusedId,
-      diff: !!activeTab?.diffFocused,
-    };
-  }, [
-    settingsOpen,
-    searchViewOpen,
-    inboxViewOpen,
-    inboxConversationId,
-    notesViewOpen,
-    activeTabId,
-    activeTab?.focusedId,
-    activeTab?.diffFocused,
-  ]);
-  const navLocationRef = useRef(navLocation);
-  navLocationRef.current = navLocation;
-  const selectHistorySessionRef = useRef<
-    ((sessionId: string) => Promise<void>) | null
-  >(null);
-
   useEffect(() => {
     const openIds = new Set(tabs.map((tab) => tab.id));
-    let next = pruneTabVisitHistory(tabVisitRef.current, openIds, navLocation);
+    let next = pruneTabVisitHistory(tabVisitRef.current, openIds, activeTabId);
     if (tabVisitFromHistoryRef.current) {
       tabVisitFromHistoryRef.current = false;
-    } else if (!sameVisitLocation(next.current, navLocation)) {
-      next = recordTabVisit(next, navLocation);
+    } else if (next.current !== activeTabId) {
+      next = recordTabVisit(next, activeTabId);
     }
-    commitTabVisit(pruneTabVisitHistory(next, openIds, navLocation));
-  }, [navLocation, commitTabVisit, tabs]);
-
-  /**
-   * Warm the focused session's provider ahead of a prompt so the next send
-   * does not pay spawn + resume on the keystroke. Events use the same sink as
-   * a real turn so `session.providerBound` still persists resume state; the
-   * adapter no-ops when a live child already serves the session.
-   */
-  const prewarmSession = useCallback(
-    (sessionId: string) => {
-      const session = sessionsRef.current.find((s) => s.id === sessionId);
-      if (
-        !session ||
-        session.busy ||
-        session.pendingSwitch ||
-        // Only bound (resumable) sessions warm: spawning a fresh provider
-        // session on a mere pane focus creates phantom provider threads.
-        !session.providerSessionId ||
-        !isLiveHarness(session.harness) ||
-        removingSessionIds.current.has(sessionId)
-      ) {
-        return;
-      }
-      const cwd = sessionWorkCwd(session);
-      if (!cwd) return;
-      void prewarmHarness({
-        harness: session.harness,
-        sessionId,
-        cwd,
-        model: session.model,
-        modelSettings: session.modelSettings,
-        runtimeMode: session.runtimeMode,
-        onEvent: (event) => {
-          if (removingSessionIds.current.has(sessionId)) return;
-          nudgeOpenEditors(event, cwd);
-          trackSessionEdits(sessionId, cwd, event);
-          enqueueHarnessEvent(sessionId, event);
-        },
-      }).catch(() => undefined);
-    },
-    [enqueueHarnessEvent],
-  );
-
-  // A bound-but-cold provider session is the expensive path: spawn, handshake,
-  // resume. Start it shortly after the session becomes visible so the first
-  // prompt lands on a warm host.
-  const prewarmTargetId = active?.providerSessionId ? active.id : undefined;
-  useEffect(() => {
-    if (!prewarmTargetId || active?.busy) return;
-    const timer = setTimeout(() => prewarmSession(prewarmTargetId), 250);
-    return () => clearTimeout(timer);
-  }, [prewarmTargetId, active?.busy, prewarmSession]);
+    commitTabVisit(pruneTabVisitHistory(next, openIds, activeTabId));
+  }, [activeTabId, commitTabVisit, tabs]);
 
   /** `cwd` scopes group inheritance: a tab from another project starts alone. */
   const appendTab = useCallback(
@@ -2338,7 +1892,7 @@ export default function App({
   );
 
   const onSelectProviderAccount = useCallback(
-    (provider: RateLimitProvider, accountId: string) => {
+    (provider: ProviderAccountProvider, accountId: string) => {
       if (!active || active.harness !== provider) return;
       const currentId = active.providerAccountId ?? DEFAULT_PROVIDER_ACCOUNT_ID;
       if (currentId === accountId) return;
@@ -2392,248 +1946,79 @@ export default function App({
     setInboxViewOpen(false);
     setNotesViewOpen(false);
     const cwd = active?.cwd ?? sessionDefaults?.cwd ?? projectCwd;
-    // A session created inside a task-owned worktree is work on that task —
-    // attach it so task details, the scope chip and rail state all see it.
-    // Title and ticket match what ensureOpenSession's reconcile would write
-    // on reload, so the claim is consistent from the start.
-    const claim = taskOwnedChildForWorkingCopy(cwd);
-    const session = newDefaultSession(cwd);
-    if (claim) {
-      session.title = claim.task.name;
-      session.linkedWorkItem = claim.task.ticket;
-      linkTaskSession(claim.task.id, session.id);
-    }
+    const session = newDefaultSession(cwd, sessionDefaults?.runtimeMode);
     const tab = newTab(session.id);
     setSessions((prev) => [...prev, session]);
     appendTab(tab, cwd);
     setActiveTabId(tab.id);
     setComposerFocused(true);
     return session.id;
-  }, [active?.cwd, appendTab, sessionDefaults?.cwd, projectCwd]);
+  }, [
+    active?.cwd,
+    appendTab,
+    sessionDefaults?.cwd,
+    sessionDefaults?.runtimeMode,
+    projectCwd,
+  ]);
 
-  const [inboxMounted, setInboxMounted] = useState(inboxViewOpen);
-  useEffect(() => {
-    if (inboxViewOpen) setInboxMounted(true);
-  }, [inboxViewOpen]);
-  const [contextRequest, setContextRequest] = useState<AgentContextRequest>();
-  /** Imperative mirror of `contextRequest` — the receive handler needs the
-   * occupied/free answer synchronously, before state lands. */
-  const contextRequestOpenRef = useRef(false);
-  useEffect(() => {
-    const receive = (event: Event) => {
-      const request = (event as CustomEvent<AgentContextRequest>).detail;
-      const destination = request.destination;
-      // Repairs always open the review picker — a destination there only
-      // preselects a task or conversation, it never skips the evidence step.
-      if (
-        !request.repair &&
-        (destination?.kind === "task" || destination?.kind === "new-task")
-      ) {
-        void routeContextToTaskRef
-          .current(request, destination)
-          .catch((error: unknown) =>
-            request.onFailed?.(
-              error instanceof Error ? error.message : String(error),
-            ),
-          );
-        return;
-      }
-      const source = sessionsRef.current.find(
-        (session) =>
-          session.id ===
-          (request.sourceSessionId ?? activeSessionIdRef.current),
-      );
-      if (!request.repair && destination?.kind === "session") {
-        void prepareContextDestinationRef
-          .current(request, destination)
-          .then((id) => {
-            if (id) void selectHistorySessionRef.current?.(id);
-          })
-          .catch((error) => request.onFailed?.(String(error)));
-        return;
-      }
-      if (
-        destination?.kind === "source" &&
-        !request.repair &&
-        source &&
-        (!request.cwd || sessionWorkCwd(source) === request.cwd)
-      ) {
-        try {
-          const next = prepareSessionContext(source, request.context, true);
-          const updated = sessionsRef.current.map((session) =>
-            session.id === next.id ? next : session,
-          );
-          sessionsRef.current = updated;
-          setSessions(updated);
-          request.onPrepared?.();
-          return;
-        } catch {
-          /* Keep the selection available in the review sheet. */
-        }
-      }
-      // One picker at a time — a second send would silently vanish, so
-      // tell the sender instead of dropping it.
-      if (contextRequestOpenRef.current) {
-        request.onFailed?.(
-          "Another send is already open — finish or cancel it first.",
-        );
-        return;
-      }
-      contextRequestOpenRef.current = true;
-      setContextRequest({
-        ...request,
-        sourceSessionId:
-          request.sourceSessionId ??
-          (source && (!request.cwd || sessionWorkCwd(source) === request.cwd)
-            ? source.id
-            : undefined),
-      });
-    };
-    window.addEventListener(PREPARE_AGENT_CONTEXT, receive);
-    return () => window.removeEventListener(PREPARE_AGENT_CONTEXT, receive);
-  }, []);
-
-  const prepareContextDestination = async (
-    request: AgentContextRequest,
-    destination: AgentDestination,
-    signal?: AbortSignal,
-  ): Promise<string> => {
-    // Task destinations resolve a conversation inside the task model —
-    // launching or creating one when needed — then run the same tail as a
-    // picked conversation.
-    if (destination.kind === "task" || destination.kind === "new-task")
-      return (
-        (await routeContextToTaskRef.current(request, destination, signal)) ??
-        ""
-      );
-    const context = request.context;
-    const sessionId =
-      destination.kind === "session"
-        ? destination.sessionId
-        : request.sourceSessionId;
-    if (!sessionId) throw new Error("Choose an agent conversation or a task.");
-    if (!sessionsRef.current.some((session) => session.id === sessionId)) {
-      await ensureOpenSession(sessionId);
-      signal?.throwIfAborted();
-    }
-    const target = sessionsRef.current.find(
-      (session) => session.id === sessionId,
-    );
-    signal?.throwIfAborted();
-    if (!target)
-      throw new Error("Conversation closed. Choose another destination.");
-    if (request.repair) {
-      const error = repairOwnerError(target, request.repair);
-      if (error) throw new Error(error);
-      const delivery: RepairDelivery = {
-        id: crypto.randomUUID(),
-        evidence: request.repair,
-        context,
-        owner: {
-          id: target.id,
-          harness: target.harness,
-          model: target.model,
-          cwd: sessionWorkCwd(target),
-          runtimeMode: target.runtimeMode,
-          providerSessionId: target.providerSessionId,
-        },
+  const onStartInboxItem = useCallback(
+    async (item: InboxItem, body?: string) => {
+      const start = (description?: string) => {
+        setInboxViewOpen(false);
+        setNotesViewOpen(false);
+        setSidebarTab("sessions");
+        const cwd =
+          item.projectPath || active?.cwd || sessionDefaults?.cwd || projectCwd;
+        const ref =
+          item.provider === "linear"
+            ? item.identifier?.trim() || `#${item.number}`
+            : `#${item.number}`;
+        const linkedWorkItem = linkedWorkItemFromInboxItem(item);
+        const session = {
+          ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
+          title: `${ref} ${item.title}`,
+          inboxCard: inboxComposerCard(item, description),
+          ...(linkedWorkItem ? { linkedWorkItem } : {}),
+        };
+        const tab = newTab(session.id);
+        setSessions((prev) => [...prev, session]);
+        appendTab(tab, cwd);
+        setActiveTabId(tab.id);
+        setComposerFocused(true);
       };
-      signal?.throwIfAborted();
-      reserveRepair(delivery, repairCheckingRef.current.has(target.id));
-      const accepted = await onSubmit(
-        target.id,
-        composeAgentContext(context, ""),
-        [],
-        {
-          repair: delivery,
-          followUpBehavior: "queue",
-          noteCard: undefined,
-          handoffCard: undefined,
-          signal,
-        },
-      );
-      if (!accepted)
-        throw new Error(
-          repairRecords().find((row) => row.id === delivery.id)?.detail ||
-            "Repair was not delivered. Refresh evidence and retry.",
-        );
-      request.onPrepared?.();
-      return target.id;
-    }
-    const prepared =
-      request.attachmentsOptional &&
-      context.attachments.length &&
-      !harnessSupportsAttachments(target.harness)
-        ? { ...context, attachments: [] }
-        : context;
-    // Any resolvable work item links onto the session — a mixed batch still
-    // stages every entry's context.
-    const next = context.entries.some((entry) => entry.workItem)
-      ? linkTicketContext(target, prepared)
-      : prepareSessionContext(target, prepared, true);
-    const updated = sessionsRef.current.map((session) =>
-      session.id === next.id ? next : session,
-    );
-    sessionsRef.current = updated;
-    setSessions(updated);
-    request.onPrepared?.();
-    return next.id;
-  };
-  const prepareContextDestinationRef = useRef(prepareContextDestination);
-  prepareContextDestinationRef.current = prepareContextDestination;
-  const onToggleConversationTicket = async (
-    sessionId: string,
-    item: InboxItem,
-    selected: boolean,
-  ) => {
-    const session = sessionsRef.current.find(
-      (session) => session.id === sessionId,
-    );
-    const link = linkedWorkItemFromInboxItem(item);
-    if (!session || !link)
-      throw new Error("Conversation or ticket is unavailable.");
-    const context = selected
-      ? await contextFromTicketDescriptions([item])
-      : undefined;
-    const current = sessionsRef.current.find((entry) => entry.id === sessionId);
-    if (!current) throw new Error("Conversation closed.");
-    const base = context
-      ? linkTicketContext(current, context)
-      : removeSessionWorkItem(current, link);
-    const next = linkedWorkItemIdentityChanged(
-      current.linkedWorkItem,
-      base.linkedWorkItem,
-    )
-      ? { ...base, linkedWorkItemUpdateCard: undefined }
-      : base;
-    if (!selected && next.contextDraft) {
-      const entries = next.contextDraft.entries.filter(
-        (entry) =>
-          entry.workItem?.url !== link.url ||
-          entry.workItem?.account !== link.account,
-      );
-      next.contextDraft =
-        entries.length || next.contextDraft.attachments.length
-          ? { ...next.contextDraft, entries }
-          : undefined;
-    }
-    const updated = sessionsRef.current.map((session) =>
-      session.id === sessionId ? next : session,
-    );
-    sessionsRef.current = updated;
-    setSessions(updated);
-    // Normal edits use the existing debounced session save, avoiding a full
-    // transcript serialization for every checkbox. Empty sessions need an
-    // explicit write because the autosave intentionally skips them.
-    if (!shouldPersistSession(next)) {
-      pendingPersist.current.delete(sessionId);
-      const summary = await upsertSession(next, { allowEmpty: true });
-      if (summary && summary.cwd === sidebarCwdRef.current)
-        setHistory((current) => mergeProjectHistorySummary(current, summary));
-    } else {
-      pendingPersist.current.set(sessionId, next);
-    }
-  };
+
+      if (item.provider === "azure" || item.provider === "jira") {
+        start(await inboxSessionDescription(item, body));
+        return;
+      }
+      if (item.provider !== "linear") {
+        start();
+        return;
+      }
+      if (!item.id) {
+        throw new Error("Missing Linear issue");
+      }
+      if (body !== undefined) {
+        start(body);
+        return;
+      }
+      const cached = peekLinearIssueDetails(item.id);
+      if (cached) {
+        start(cached.body);
+        return;
+      }
+      const details = await linearIssueDetails(item.id);
+      start(details.body);
+    },
+    [
+      active?.cwd,
+      appendTab,
+      sessionDefaults?.cwd,
+      sessionDefaults?.runtimeMode,
+      projectCwd,
+    ],
+  );
+
   const onAddNoteToChat = useCallback(
     (card: NoteComposerCard) => {
       if (!card.id) return;
@@ -2650,7 +2035,7 @@ export default function App({
         projectCwd;
       const title = card.title.trim();
       const session = {
-        ...newDefaultSession(cwd),
+        ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
         ...(title ? { title } : {}),
         noteCard: card,
       };
@@ -2660,7 +2045,13 @@ export default function App({
       setActiveTabId(tab.id);
       setComposerFocused(true);
     },
-    [active?.cwd, appendTab, sessionDefaults?.cwd, projectCwd],
+    [
+      active?.cwd,
+      appendTab,
+      sessionDefaults?.cwd,
+      sessionDefaults?.runtimeMode,
+      projectCwd,
+    ],
   );
 
   useEffect(() => {
@@ -2673,38 +2064,15 @@ export default function App({
     return () => window.removeEventListener(ADD_NOTE_TO_CHAT_EVENT, onAdd);
   }, [onAddNoteToChat]);
 
-  const onInboxCardDismiss = useCallback(
-    (sessionId: string, fileId?: string) => {
-      setSessions((prev) =>
-        prev.map((session) =>
-          session.id === sessionId &&
-          (session.inboxCard || session.contextDraft)
-            ? {
-                ...session,
-                contextDraft:
-                  fileId === "__context__"
-                    ? undefined
-                    : fileId && session.contextDraft
-                      ? removeContextItem(session.contextDraft, fileId)
-                      : session.contextDraft,
-                inboxCard:
-                  fileId === "__context__"
-                    ? session.inboxCard
-                    : fileId && session.inboxCard
-                      ? {
-                          ...session.inboxCard,
-                          attachments: session.inboxCard.attachments?.filter(
-                            (file) => file.id !== fileId,
-                          ),
-                        }
-                      : undefined,
-              }
-            : session,
-        ),
-      );
-    },
-    [],
-  );
+  const onInboxCardDismiss = useCallback((sessionId: string) => {
+    setSessions((prev) =>
+      prev.map((session) =>
+        session.id === sessionId && session.inboxCard
+          ? { ...session, inboxCard: undefined }
+          : session,
+      ),
+    );
+  }, []);
 
   const setLinkedWorkItemUpdateCard = useCallback(
     (
@@ -2758,7 +2126,10 @@ export default function App({
   const onSplit = useCallback(
     (dir: SplitDir) => {
       if (!activeTab) return;
-      const session = newDefaultSession(sessionDefaults?.cwd ?? projectCwd);
+      const session = newDefaultSession(
+        sessionDefaults?.cwd ?? projectCwd,
+        sessionDefaults?.runtimeMode,
+      );
       setSessions((prev) => [...prev, session]);
       setTabs((prev) =>
         prev.map((t) => {
@@ -2772,7 +2143,7 @@ export default function App({
       );
       setComposerFocused(true);
     },
-    [activeTab, projectCwd, sessionDefaults?.cwd],
+    [activeTab, projectCwd, sessionDefaults?.cwd, sessionDefaults?.runtimeMode],
   );
 
   const focusProjectTerminal = useCallback(() => {
@@ -2790,6 +2161,7 @@ export default function App({
         const file = newTerminalFile(
           workdir,
           existing ? nextDockTerminalTitle(existing, workdir) : undefined,
+          projectPath,
         );
         if (!existing) {
           return [...prev, createProjectTerminal(projectPath, file)];
@@ -2806,14 +2178,13 @@ export default function App({
 
   const onOpenTerminal = useCallback(
     (cwd: string, asWorkspaceTab = false, occupySessionId?: string) => {
-      dismissOverlays();
-      const workdir = cwd || active?.cwd || projectCwd;
+      const workdir = cwd || gitCwd;
       if (openProjectTerminal(workdir)) return;
 
       if (asWorkspaceTab || !activeTab) {
-        const file = newTerminalFile(workdir);
+        const file = newTerminalFile(workdir, undefined, sidebarCwd);
         const tab = newTerminalWorkspaceTab(file);
-        appendTab(tab, workdir);
+        appendTab(tab, sidebarCwd);
         setActiveTabId(tab.id);
         setComposerFocused(false);
         return;
@@ -2835,6 +2206,7 @@ export default function App({
       const file = newTerminalFile(
         workdir,
         nextTerminalTitle(activeTab, workdir),
+        sidebarCwd,
       );
       setTabs((prev) =>
         prev.map((tab) =>
@@ -2845,25 +2217,35 @@ export default function App({
       );
       setComposerFocused(false);
     },
-    [
-      active?.cwd,
-      activeTab,
-      appendTab,
-      dismissOverlays,
-      openProjectTerminal,
-      projectCwd,
-    ],
+    [gitCwd, activeTab, appendTab, openProjectTerminal, sidebarCwd],
   );
 
   const onNewTerminal = useCallback(() => {
-    onOpenTerminal(active?.cwd ?? projectCwd);
-  }, [active?.cwd, onOpenTerminal, projectCwd]);
+    onOpenTerminal(gitCwd);
+  }, [gitCwd, onOpenTerminal]);
+
+  const onShowProjectTerminal = useCallback(() => {
+    const dock = findProjectTerminal(projectTerminalsRef.current, projectCwd);
+    if (dock && dock.pane.files.length > 0) {
+      if (!dock.open) {
+        setProjectTerminals((prev) =>
+          mapProjectTerminal(prev, projectCwd, (entry) =>
+            withDockOpen(entry, true),
+          ),
+        );
+      }
+      focusProjectTerminal();
+      return;
+    }
+    onOpenTerminal(gitCwd);
+  }, [gitCwd, focusProjectTerminal, onOpenTerminal, projectCwd]);
 
   const onNewTerminalInSession = useCallback(
     (sessionId: string) => {
       const session = sessionsRef.current.find(
         (entry) => entry.id === sessionId,
       );
+      if (session?.worktreeRemoved) return;
       onOpenTerminal(
         session ? sessionWorkCwd(session) : projectCwd,
         false,
@@ -2877,7 +2259,7 @@ export default function App({
     if (!looksLikeProject(projectCwd)) return;
     const dock = findProjectTerminal(projectTerminalsRef.current, projectCwd);
     if (!dock) {
-      openProjectTerminal(active?.cwd ?? projectCwd);
+      openProjectTerminal(gitCwd);
       return;
     }
     const nextOpen = !dock.open;
@@ -2888,7 +2270,7 @@ export default function App({
     );
     if (nextOpen) focusProjectTerminal();
     else setProjectTerminalFocused(false);
-  }, [active?.cwd, focusProjectTerminal, openProjectTerminal, projectCwd]);
+  }, [gitCwd, focusProjectTerminal, openProjectTerminal, projectCwd]);
 
   const onHideProjectTerminal = useCallback(() => {
     setProjectTerminals((prev) =>
@@ -2996,30 +2378,26 @@ export default function App({
     [],
   );
 
-  const onBrowserMetaChange = useCallback(
-    (fileId: string, patch: BrowserMetaPatch) => {
-      setTabs((prev) =>
-        prev.map((tab) => updateBrowserTab(tab, fileId, patch)),
-      );
-    },
-    [],
-  );
-
-  /** Footer manager "go to terminal" — always selects and focuses the
-   * terminal; a no-op when it is already the visible one. */
-  const onShowTerminal = useCallback(
-    (fileId: string) => {
+  const onToggleRunningTerminal = useCallback(
+    (fileId: string, showOnly = false) => {
       const dock = projectTerminalsRef.current.find((entry) =>
         entry.pane.files.some((file) => file.id === fileId),
       );
       if (dock) {
-        if (!(dock.open && dock.pane.activeFileId === fileId)) {
+        if (dock.open && !showOnly) {
           setProjectTerminals((prev) =>
             mapProjectTerminal(prev, dock.projectPath, (entry) =>
-              withDockOpen(selectDockTerminal(entry, fileId), true),
+              withDockOpen(entry, false),
             ),
           );
+          setProjectTerminalFocused(false);
+          return;
         }
+        setProjectTerminals((prev) =>
+          mapProjectTerminal(prev, dock.projectPath, (entry) =>
+            withDockOpen(selectDockTerminal(entry, fileId), true),
+          ),
+        );
         focusProjectTerminal();
         return;
       }
@@ -3030,30 +2408,17 @@ export default function App({
             activeTabIdRef.current === tab.id &&
             tab.focusedId === pane.id &&
             pane.activeFileId === fileId;
-          if (showing) {
-            // Already selected — just reclaim focus from the dock or an
-            // open diff, both of which mask the terminal's focus.
-            if (tab.diffFocused) {
-              setTabs((prev) =>
-                prev.map((entry) =>
-                  entry.id === tab.id
-                    ? { ...entry, diffFocused: false }
-                    : entry,
-                ),
-              );
-            }
+          if (showing && !showOnly) {
+            setComposerFocused(true);
             setProjectTerminalFocused(false);
-            setComposerFocused(false);
             return;
           }
-          // activateTab (not bare setActiveTabId) so a terminal pane in
-          // another project's tab also switches the sidebar/dock project.
-          activateTab(tab.id, pane.id);
+          setActiveTabId(tab.id);
           setTabs((prev) =>
             prev.map((entry) => {
               if (entry.id !== tab.id) return entry;
               return withSurfacePanes(
-                entry,
+                { ...entry, focusedId: pane.id },
                 "terminal",
                 (entry.terminalPanes ?? []).map((item) =>
                   item.id === pane.id
@@ -3064,16 +2429,38 @@ export default function App({
             }),
           );
           setProjectTerminalFocused(false);
+          setComposerFocused(false);
           return;
         }
       }
     },
-    [activateTab, focusProjectTerminal],
+    [focusProjectTerminal],
   );
 
+  const onLaunchSavedCommands = useCallback((request: SavedCommandLaunch) => {
+    const current = { projectCwd: projectCwdRef.current, worktreeCwd: gitCwdRef.current };
+    if (!looksLikeProject(current.projectCwd)) throw new Error("Choose a project before running saved commands.");
+    const launch = prepareSavedCommandLaunch(request, current);
+    setProjectTerminals(prev => {
+      let next = prev;
+      for (const file of launch.files) {
+        next = findProjectTerminal(next, current.projectCwd)
+          ? mapProjectTerminal(next, current.projectCwd, dock => addTerminalToDock(dock, file))
+          : [...next, createProjectTerminal(current.projectCwd, file)];
+      }
+      return next;
+    });
+    if (launch.files.some(file => file.id === launch.focusId)) focusProjectTerminal();
+    else onToggleRunningTerminal(launch.focusId, true);
+  }, [focusProjectTerminal, onToggleRunningTerminal]);
+
+  useEffect(() => {
+    pruneQueuedSavedCommands(id => projectTerminals.some(dock => dock.pane.files.some(file => file.id === id)) || tabs.some(tab => [...tab.editorPanes, ...(tab.terminalPanes ?? [])].some(pane => pane.files.some(file => file.id === id))));
+  }, [projectTerminals, tabs]);
+
   const onNewTerminalTab = useCallback(() => {
-    onOpenTerminal(active?.cwd ?? projectCwd, true);
-  }, [active?.cwd, onOpenTerminal, projectCwd]);
+    onOpenTerminal(gitCwd, true);
+  }, [gitCwd, onOpenTerminal]);
 
   const onCloseTab = useCallback(
     (id: string, opts?: { confirmedTerminalIds?: string[] }) => {
@@ -3266,7 +2653,14 @@ export default function App({
               );
               return;
             }
-            const session = newDefaultSession(file.cwd || projectCwd);
+            const seed = sessionsRef.current[0];
+            const session = newSession(
+              seed?.harness ?? "claude",
+              file.cwd || projectCwd,
+              seed?.model,
+              seed?.runtimeMode,
+              seed?.modelSettings,
+            );
             setSessions((prev) => [...prev, session]);
             setTabs((prev) =>
               prev.map((entry) =>
@@ -3336,29 +2730,6 @@ export default function App({
       })();
     },
     [activeTabId, onCloseTab, projectCwd, tabCloseScope],
-  );
-
-  /** Close button in the footer terminal manager — routes to the same
-   * confirm-and-remove path the dock/pane close buttons use. */
-  const onCloseFooterTerminal = useCallback(
-    (fileId: string) => {
-      const dock = projectTerminalsRef.current.find((entry) =>
-        entry.pane.files.some((file) => file.id === fileId),
-      );
-      if (dock) {
-        onCloseProjectTerminal(fileId);
-        return;
-      }
-      for (const tab of tabsRef.current) {
-        for (const pane of tab.terminalPanes ?? []) {
-          if (pane.files.some((file) => file.id === fileId)) {
-            onCloseFile(pane.id, fileId);
-            return;
-          }
-        }
-      }
-    },
-    [onCloseFile, onCloseProjectTerminal],
   );
 
   const onCloseOtherFiles = useCallback((paneId: string, fileId: string) => {
@@ -3723,79 +3094,33 @@ export default function App({
     }
   }, [activateTab, activeTabId, deckProjectTabs]);
 
-  /** Restore a recorded location: the right overlay, or tab + focused leaf. */
-  const applyVisitLocation = useCallback(
-    (location: VisitLocation) => {
-      const overlay = "view" in location ? location.view : undefined;
-      const conversation =
-        "view" in location && location.view === "inbox"
-          ? location.conversation
-          : undefined;
-      if (
-        conversation &&
-        !tabsRef.current.some((entry) =>
-          leafIds(entry.layout).includes(conversation),
-        )
-      ) {
-        // The embedded conversation portals through a live session leaf —
-        // re-place it when its pane was closed. `dismissOverlays` inside
-        // runs synchronously, before the setters below, so the inbox still
-        // ends up open.
-        void selectHistorySessionRef.current?.(conversation);
-      }
-      if (overlay === "inbox") setInboxConversationId(conversation);
-      setInboxViewOpen(overlay === "inbox");
-      setSearchViewOpen(overlay === "search");
-      setSettingsOpen(overlay === "settings");
-      setNotesViewOpen(overlay === "notes");
-      if (!("tab" in location)) return;
-      const tab = tabsRef.current.find((entry) => entry.id === location.tab);
-      if (!tab) return;
-      // Leaf first: activateTab clears diffFocused when it moves focus, so
-      // the recorded diff flag is applied last.
-      activateTab(tab.id, location.leaf);
-      if (location.diff !== undefined && !!tab.diffFocused !== location.diff) {
-        setTabs((prev) =>
-          prev.map((entry) =>
-            entry.id === tab.id
-              ? { ...entry, diffFocused: !!location.diff }
-              : entry,
-          ),
-        );
-      }
-    },
-    [activateTab],
-  );
-
   const onVisitBack = useCallback(() => {
     const openIds = new Set(tabsRef.current.map((tab) => tab.id));
     const pruned = pruneTabVisitHistory(
       tabVisitRef.current,
       openIds,
-      navLocationRef.current,
+      activeTabIdRef.current,
     );
     const next = tabVisitBack(pruned);
-    if (!next || ("tab" in next.current && !openIds.has(next.current.tab)))
-      return;
+    if (!next || !openIds.has(next.current)) return;
     tabVisitFromHistoryRef.current = true;
     commitTabVisit(next);
-    applyVisitLocation(next.current);
-  }, [applyVisitLocation, commitTabVisit]);
+    activateTab(next.current);
+  }, [activateTab, commitTabVisit]);
 
   const onVisitForward = useCallback(() => {
     const openIds = new Set(tabsRef.current.map((tab) => tab.id));
     const pruned = pruneTabVisitHistory(
       tabVisitRef.current,
       openIds,
-      navLocationRef.current,
+      activeTabIdRef.current,
     );
     const next = tabVisitForward(pruned);
-    if (!next || ("tab" in next.current && !openIds.has(next.current.tab)))
-      return;
+    if (!next || !openIds.has(next.current)) return;
     tabVisitFromHistoryRef.current = true;
     commitTabVisit(next);
-    applyVisitLocation(next.current);
-  }, [applyVisitLocation, commitTabVisit]);
+    activateTab(next.current);
+  }, [activateTab, commitTabVisit]);
 
   const onActivate = useCallback(
     (slot: number) => {
@@ -3811,7 +3136,7 @@ export default function App({
   const onFocusPane = useCallback(
     (paneId: string) => {
       setProjectTerminalFocused(false);
-      if (inboxViewOpenRef.current && inboxAskPortal?.sessionId === paneId) {
+      if (inboxAskPortal?.sessionId === paneId) {
         setComposerFocused(true);
         return;
       }
@@ -3822,15 +3147,11 @@ export default function App({
             : t,
         ),
       );
-      const isSessionPane = sessionsRef.current.some(
-        (session) => session.id === paneId,
+      setComposerFocused(
+        sessionsRef.current.some((session) => session.id === paneId),
       );
-      setComposerFocused(isSessionPane);
-      // Clicking into a pane is strong intent to send — warm a bound but
-      // cold provider (prewarmSession itself gates on providerSessionId).
-      if (isSessionPane) prewarmSession(paneId);
     },
-    [activeTabId, inboxAskPortal, prewarmSession],
+    [activeTabId, inboxAskPortal],
   );
 
   const onOpenDiff = useCallback(
@@ -3839,9 +3160,12 @@ export default function App({
       session?: { sessionId: string; cwd: string },
       changeKind?: GitFileDiffKind,
     ) => {
-      dismissOverlays();
       void (async () => {
         const diffCwd = session?.cwd ?? gitCwdRef.current;
+        const diffProjectCwd = session
+          ? sessionsRef.current.find((entry) => entry.id === session.sessionId)
+              ?.cwd
+          : sidebarCwdRef.current;
         const resolved = path
           ? ((await resolveOpenablePath(diffCwd, path)) ?? path)
           : undefined;
@@ -3855,20 +3179,22 @@ export default function App({
                 session.cwd,
                 session.sessionId,
                 resolved,
+                diffProjectCwd,
               );
             }
             if (loadDiffViewer() === "unified") {
               return openChangesTab(
                 tab,
-                sidebarCwdRef.current,
+                diffCwd,
                 resolved,
                 changeKind,
+                diffProjectCwd,
               );
             }
             if (!resolved) return tab;
             return openEditorTab(
               tab,
-              newFileTab(resolved, sidebarCwdRef.current, true, changeKind),
+              newFileTab(resolved, diffCwd, true, changeKind, diffProjectCwd),
             );
           }),
         );
@@ -3876,7 +3202,7 @@ export default function App({
         setComposerFocused(false);
       })();
     },
-    [activeTabId, dismissOverlays],
+    [activeTabId],
   );
 
   const onOpenWorkingTreeDiff = useCallback(
@@ -3884,56 +3210,45 @@ export default function App({
     [onOpenDiff],
   );
 
-  const onOpenDelivery = useCallback(
-    (cwd: string, delivery: DeliveryTabSource) => {
-      dismissOverlays();
-      setTabs((previous) =>
-        previous.map((tab) =>
-          tab.id === activeTabId
-            ? openEditorTab(tab, {
-                id: crypto.randomUUID(),
-                path: delivery.kind === "pr" ? "Pull requests" : "CI",
-                cwd,
-                delivery,
-              })
-            : tab,
-        ),
-      );
-      setComposerFocused(false);
-    },
-    [activeTabId, dismissOverlays],
-  );
-
   /** Stack every working-tree change in one review, whatever the diff-view setting. */
   const onOpenAllChanges = useCallback(() => {
-    dismissOverlays();
     setTabs((prev) =>
       prev.map((tab) =>
         tab.id === activeTabId
-          ? openChangesTab(tab, sidebarCwdRef.current)
+          ? openChangesTab(
+              tab,
+              gitCwdRef.current,
+              undefined,
+              undefined,
+              sidebarCwdRef.current,
+            )
           : tab,
       ),
     );
     setComposerFocused(false);
-  }, [activeTabId, dismissOverlays]);
+  }, [activeTabId]);
 
   const onOpenCommit = useCallback(
     (commit: GitHistoryCommit) => {
-      dismissOverlays();
       setTabs((prev) =>
         prev.map((tab) =>
           tab.id === activeTabId
-            ? openCommitTab(tab, sidebarCwdRef.current, {
-                sha: commit.sha,
-                shortSha: commit.shortSha,
-                subject: commit.subject,
-              })
+            ? openCommitTab(
+                tab,
+                gitCwdRef.current,
+                {
+                  sha: commit.sha,
+                  shortSha: commit.shortSha,
+                  subject: commit.subject,
+                },
+                sidebarCwdRef.current,
+              )
             : tab,
         ),
       );
       setComposerFocused(false);
     },
-    [activeTabId, dismissOverlays],
+    [activeTabId],
   );
 
   const onShowSourceControl = useCallback(() => {
@@ -4024,27 +3339,13 @@ export default function App({
       sessionId,
     );
     if (!tab) return false;
-    setProjectTerminalFocused(false);
     loadedSessionCache.current.delete(sessionId);
     setActiveTabId(tab.id);
     setTabs((prev) =>
       prev.map((entry) =>
-        entry.id === tab.id
-          ? { ...entry, focusedId: sessionId, diffFocused: false }
-          : entry,
+        entry.id === tab.id ? { ...entry, focusedId: sessionId } : entry,
       ),
     );
-    const cwd = focusedWorkspaceTabCwd(
-      { ...tab, focusedId: sessionId },
-      sessionsRef.current,
-    );
-    if (cwd && looksLikeProject(cwd)) {
-      const normalized = normalizeProjectPath(cwd);
-      if (!sameProjectPath(normalized, projectCwdRef.current)) {
-        setProjectCwd(normalized);
-        setRecents(rememberProject(normalized));
-      }
-    }
     setComposerFocused(true);
     return true;
   }, []);
@@ -4124,8 +3425,7 @@ export default function App({
           ) {
             return null;
           }
-          const restored = restoreSessionCheckout(loaded);
-          return restored;
+          return loaded;
         })
         .catch(() => null);
       sessionLoads.current.set(sessionId, loading);
@@ -4158,41 +3458,26 @@ export default function App({
         (session) => session.id === sessionId,
       );
       if (appeared) return appeared;
-      // A persisted task session can predate the last rename/ticket edit —
-      // the edit sync only reaches sessions already in memory, so reconcile
-      // on load the same fields that sync writes.
-      const taskOwner = taskForSession(restored.id)?.task;
-      const synced =
-        taskOwner &&
-        (restored.title !== taskOwner.name ||
-          linkedWorkItemIdentityChanged(
-            restored.linkedWorkItem,
-            taskOwner.ticket,
-          ))
-          ? {
-              ...restored,
-              title: taskOwner.name,
-              linkedWorkItem: taskOwner.ticket,
-              linkedWorkItemUpdateCard: undefined,
-            }
-          : restored;
-      if (synced !== restored) void upsertSession(synced);
-      if (synced.providerSessionId && isLiveHarness(synced.harness)) {
+      if (
+        !restored.worktreeRemoved &&
+        restored.providerSessionId &&
+        isLiveHarness(restored.harness)
+      ) {
         bindHarnessSession(
-          synced.harness,
-          synced.id,
-          synced.providerSessionId,
-          sessionWorkCwd(synced),
-          synced.providerAccountId,
+          restored.harness,
+          restored.id,
+          restored.providerSessionId,
+          sessionWorkCwd(restored),
+          restored.providerAccountId,
         );
       }
-      lastPersisted.current.set(synced.id, persistFingerprint(synced));
-      if (!sessionsRef.current.some((session) => session.id === synced.id)) {
-        const next = [...sessionsRef.current, synced];
+      lastPersisted.current.set(restored.id, persistFingerprint(restored));
+      if (!sessionsRef.current.some((session) => session.id === restored.id)) {
+        const next = [...sessionsRef.current, restored];
         sessionsRef.current = next;
         setSessions(next);
       }
-      return synced;
+      return restored;
     },
     [loadStoredSession, refreshHistory, sidebarCwd],
   );
@@ -4232,42 +3517,39 @@ export default function App({
         (entry) => entry.id === sessionId,
       );
       if (!session?.linkedWorkItem) return;
+      const key = linkedWorkItemActivityKey(update);
       if (
-        session.linkedWorkItemUpdateCard?.updatedAt === update.updatedAt &&
+        session.linkedWorkItemUpdateCard?.key === key &&
         session.linkedWorkItemUpdateCard.status !== "error"
       ) {
         return;
       }
       if (
-        linkedWorkItemActivityFetches.current.get(sessionId) ===
-        update.updatedAt
+        linkedWorkItemActivityFetches.current.get(sessionId) === key
       ) {
         return;
       }
       const pending = pendingLinkedWorkItemUpdateCard(update);
-      linkedWorkItemActivityFetches.current.set(sessionId, update.updatedAt);
+      linkedWorkItemActivityFetches.current.set(sessionId, key);
       // A stale/error card should not remain visible while fresh details load.
       // The session itself is already open; this request stays fully detached
       // from the navigation path.
       setLinkedWorkItemUpdateCard(sessionId, (current) =>
-        current?.updatedAt === update.updatedAt && current.status === "ready"
+        current?.key === key && current.status === "ready"
           ? current
           : undefined,
       );
 
-      void fetchLinkedWorkItemThread(session.cwd, update.linked).then(
+      void inboxProvider({ ...update.item, projectPath: session.cwd }).thread(true).then(
         (thread) => {
           if (
-            linkedWorkItemActivityFetches.current.get(sessionId) !==
-            pending.updatedAt
+            linkedWorkItemActivityFetches.current.get(sessionId) !== key
           ) {
             return;
           }
           linkedWorkItemActivityFetches.current.delete(sessionId);
-          if (
-            linkedSessionUpdatesRef.current.get(sessionId)?.updatedAt !==
-            pending.updatedAt
-          ) {
+          const latest = linkedSessionUpdatesRef.current.get(sessionId);
+          if (!latest || linkedWorkItemActivityKey(latest) !== key) {
             return;
           }
           setLinkedWorkItemUpdateCard(sessionId, () =>
@@ -4276,16 +3558,13 @@ export default function App({
         },
         () => {
           if (
-            linkedWorkItemActivityFetches.current.get(sessionId) !==
-            pending.updatedAt
+            linkedWorkItemActivityFetches.current.get(sessionId) !== key
           ) {
             return;
           }
           linkedWorkItemActivityFetches.current.delete(sessionId);
-          if (
-            linkedSessionUpdatesRef.current.get(sessionId)?.updatedAt !==
-            pending.updatedAt
-          ) {
+          const latest = linkedSessionUpdatesRef.current.get(sessionId);
+          if (!latest || linkedWorkItemActivityKey(latest) !== key) {
             return;
           }
           setLinkedWorkItemUpdateCard(sessionId, () =>
@@ -4298,20 +3577,10 @@ export default function App({
   );
 
   const onAskInboxItem = useCallback(
-    (
-      item: InboxItem,
-      context?: import("./lib/githubTasks").InboxComposerCard,
-    ): Promise<string> => {
+    (item: InboxItem): Promise<string> => {
       const key = inboxAskKey(item);
       const pending = openingInboxSessions.current.get(key);
-      if (pending)
-        return context
-          ? Promise.reject(
-              new Error(
-                "This conversation is opening. Try again when it is ready.",
-              ),
-            )
-          : pending;
+      if (pending) return pending;
       const opening = (async () => {
         let session = sessionsRef.current.find(
           (entry) => entry.inboxAsk?.key === key,
@@ -4322,69 +3591,20 @@ export default function App({
             candidate && candidate !== "~"
               ? candidate
               : await invoke<string>("default_cwd");
-          const description = context
-            ? undefined
-            : item.provider === "azure"
-              ? (peekAzureDetails(item) ?? (await azureDetails(item))).body
-              : item.provider === "jira"
-                ? (peekJiraDetails(item) ?? (await jiraDetails(item))).body
-                : item.provider === "linear" && item.id
-                  ? (
-                      peekLinearIssueDetails(item.id) ??
-                      (await linearIssueDetails(item.id))
-                    ).body
-                  : item.provider === "gitlab" &&
-                      (item.kind === "issue" || item.kind === "pr")
-                    ? (
-                        peekGitlabWorkItemDetails(
-                          item.repo,
-                          item.kind,
-                          item.number,
-                        ) ??
-                        (await gitlabWorkItemDetails(
-                          item.repo,
-                          item.kind,
-                          item.number,
-                        ))
-                      ).body
-                    : undefined;
+          const description = await inboxSessionDescription(item);
           session = {
             ...newDefaultSession(cwd),
             title: `Ask · ${item.title}`,
-            inboxCard: context,
             inboxAsk: {
               key,
               title: item.title,
               url: item.url,
               provider: item.provider,
-              ...(item.provider === "jira" || item.provider === "azure"
-                ? {
-                    site: item.site,
-                    project: item.projectName,
-                    identifier: item.identifier,
-                  }
-                : {}),
+              ...(item.provider === "jira" || item.provider === "azure" ? { site: item.site, project: item.projectName, identifier: item.identifier, account: item.account } : {}),
               description,
             },
           };
           sessionsRef.current = [...sessionsRef.current, session];
-          setSessions(sessionsRef.current);
-        }
-        if (context && session.inboxCard?.contextId !== context.contextId) {
-          if (session.inboxCard)
-            throw new Error(
-              "This conversation already has staged context. Send or remove that card first, then try again.",
-            );
-          const updated = {
-            ...session,
-            inboxCard: context,
-            inboxAsk: session.inboxAsk
-              ? { ...session.inboxAsk, description: undefined }
-              : undefined,
-          };
-          sessionsRef.current = sessionsRef.current.map((entry) =>
-            entry.id === session.id ? updated : entry,
-          );
           setSessions(sessionsRef.current);
         }
         return session.id;
@@ -4447,9 +3667,6 @@ export default function App({
 
   const onSelectHistorySession = useCallback(
     async (sessionId: string) => {
-      // Selecting a conversation is a workspace navigation: overlays must not
-      // stay on top of it. `onOpenInboxSession` re-opens Inbox right after.
-      dismissOverlays();
       let session = await ensureOpenSession(sessionId);
       if (!session || session.inboxAsk) return;
       const parentId =
@@ -4477,27 +3694,29 @@ export default function App({
     },
     [
       appendTab,
-      dismissOverlays,
       ensureOpenSession,
       focusOpenSession,
       replaceBlankPaneWithSession,
       revealLinkedSessionUpdate,
     ],
   );
-  selectHistorySessionRef.current = onSelectHistorySession;
 
   const openReminderSession = useCallback(
     async (sessionId: string) => {
       const session = await ensureOpenSession(sessionId);
       if (!session)
         throw new Error("This conversation is no longer available.");
-      dismissOverlays();
+      setSearchViewOpen(false);
+      setInboxViewOpen(false);
+      setNotesViewOpen(false);
+      setSettingsOpen(false);
+      setFilePickerOpen(false);
       setSidebarTab("sessions");
       setProjectCwd(session.cwd);
       setRecents(rememberProject(session.cwd));
       await onSelectHistorySession(sessionId);
     },
-    [dismissOverlays, ensureOpenSession, onSelectHistorySession],
+    [ensureOpenSession, onSelectHistorySession],
   );
 
   const ensureReminderSessionsSaved = useCallback(
@@ -4579,7 +3798,10 @@ export default function App({
         replaceTarget,
         scope: tabCloseScope,
         createReplacement: (seed) =>
-          newDefaultSession(seed?.cwd ?? projectCwdRef.current),
+          newDefaultSession(
+            seed?.cwd ?? projectCwdRef.current,
+            seed?.runtimeMode,
+          ),
       });
       if (!result) return;
 
@@ -4660,8 +3882,7 @@ export default function App({
         };
         const saved = await upsertSession(updated).catch(() => null);
         if (saved) {
-          const cached = restoreSessionCheckout(updated);
-          rememberLoadedSession(loadedSessionCache.current, cached);
+          rememberLoadedSession(loadedSessionCache.current, updated);
           lastPersisted.current.set(sessionId, persistFingerprint(updated));
         }
       }
@@ -4670,13 +3891,164 @@ export default function App({
     [invalidateLoadedSession, persistSession, refreshHistory, sidebarCwd],
   );
 
+  const checkOpenWorktreeFiles = useCallback((path: string) => {
+    assertWorktreeFilesClosed(path, [
+      ...filesInWorkspaceTabs(tabsRef.current),
+      ...projectTerminalsRef.current.flatMap((dock) => dock.pane.files),
+    ]);
+  }, []);
+
+  const onCheckWorktreeRemoval = useCallback(
+    async (cwd: string, path: string, force: boolean) => {
+      checkOpenWorktreeFiles(path);
+      await checkWorktreeRemoval(cwd, path, force);
+      // Re-read UI state after the native check, before deleting sessions.
+      checkOpenWorktreeFiles(path);
+    },
+    [checkOpenWorktreeFiles],
+  );
+
+  const onRemoveWorktree = useCallback(
+    async (cwd: string, path: string, force: boolean, keepSessions = false) => {
+      if (removingWorktreePaths.current.has(path)) {
+        throw new Error("This worktree is already being deleted.");
+      }
+      removingWorktreePaths.current.add(path);
+      const lockedIds = new Set<string>();
+      const forgottenIds = new Set<string>();
+      try {
+        if (
+          [...switchingWorktrees.current.values()].some((target) =>
+            isEqualOrInside(target, path),
+          )
+        ) {
+          throw new Error(
+            "A session is selecting this worktree. Try deleting it again once selection finishes.",
+          );
+        }
+        await onCheckWorktreeRemoval(cwd, path, force);
+        const listed = await listWorktrees(cwd);
+        const tree = listed.worktrees.find(
+          (entry) => pathKey(entry.path) === pathKey(path),
+        );
+        if (!tree) throw new Error("This worktree is no longer available.");
+        const ids = worktreeSessionIds(tree, sessionsRef.current);
+        if (!keepSessions && ids.length) {
+          throw new Error(
+            "Move or delete the sessions using this worktree first.",
+          );
+        }
+        if (
+          ids.some(
+            (id) =>
+              removingSessionIds.current.has(id) ||
+              switchingWorktrees.current.has(id),
+          )
+        ) {
+          throw new Error(
+            "Wait for these sessions to finish changing before deleting the worktree.",
+          );
+        }
+        for (const id of ids) {
+          removingSessionIds.current.add(id);
+          lockedIds.add(id);
+          pendingPersist.current.delete(id);
+          invalidateLoadedSession(id);
+        }
+        for (const id of ids) {
+          await stopSessionForRemoval(id);
+          const session = sessionsRef.current.find((entry) => entry.id === id);
+          if (!session) continue;
+          await flushSessionCheckpoint(id);
+          forgottenIds.add(id);
+          for (const harness of sessionChildHarnesses(session)) {
+            await forgetHarnessSession(harness, id);
+          }
+          const latest = sessionsRef.current.find((entry) => entry.id === id);
+          if (!latest) continue;
+          const stopped = {
+            ...stopStreaming(latest),
+            busy: false,
+            queueStatus: "paused" as const,
+            pendingQuestion: undefined,
+          };
+          sessionsRef.current = sessionsRef.current.map((entry) =>
+            entry.id === id ? stopped : entry,
+          );
+          setSessions(sessionsRef.current);
+          if (shouldPersistSession(stopped)) await upsertSession(stopped);
+        }
+        await flushSessionWrites();
+        checkOpenWorktreeFiles(path);
+        const removed = await removeWorktree(cwd, path, force, keepSessions);
+        const affected = new Set([...ids, ...removed.sessionIds]);
+        if (isEqualOrInside(projectCwdRef.current, path)) {
+          setProjectCwd(removed.projectCwd);
+          setRecents(rememberProject(removed.projectCwd));
+        }
+        for (const id of affected) {
+          invalidateLoadedSession(id);
+          pendingPersist.current.delete(id);
+          lastPersisted.current.delete(id);
+        }
+        sessionsRef.current = sessionsRef.current.map((session) =>
+          affected.has(session.id)
+            ? detachSessionWorktree(session, removed.projectCwd, path)
+            : session,
+        );
+        setSessions(sessionsRef.current);
+        const patchSummary = (entry: SessionSummary) =>
+          affected.has(entry.id)
+            ? detachSessionWorktree(entry, removed.projectCwd, path)
+            : entry;
+        setHistory((current) => current.map(patchSummary));
+        setStoredLinkedSessions((current) => current.map(patchSummary));
+        for (const id of affected) notifyReviewChanged(id);
+      } catch (error) {
+        // Removal may fail after idle agent processes were stopped. Rebind
+        // their saved threads so the unchanged working copy can still resume.
+        const kept = sessionsRef.current.filter(
+          (session) => forgottenIds.has(session.id) && !session.worktreeRemoved,
+        );
+        bindResumedSessions(kept);
+        for (const session of kept) {
+          const pending = session.pendingSwitch;
+          if (pending?.fromProviderSessionId) {
+            bindHarnessSession(
+              pending.from,
+              session.id,
+              pending.fromProviderSessionId,
+              sessionWorkCwd(session),
+              pending.fromProviderAccountId,
+            );
+          }
+        }
+        throw error;
+      } finally {
+        removingWorktreePaths.current.delete(path);
+        for (const id of lockedIds) removingSessionIds.current.delete(id);
+      }
+    },
+    [
+      checkOpenWorktreeFiles,
+      invalidateLoadedSession,
+      onCheckWorktreeRemoval,
+      stopSessionForRemoval,
+    ],
+  );
+
   const onRemoveHistorySession = useCallback(
     async (
       sessionId: string,
       mode: "archive" | "delete",
       skipDeleteConfirm = false,
     ): Promise<boolean> => {
-      if (removingSessionIds.current.has(sessionId)) return false;
+      if (
+        removingSessionIds.current.has(sessionId) ||
+        switchingWorktrees.current.has(sessionId) ||
+        deleteConfirmationPending.current
+      )
+        return false;
       const open = sessionsRef.current.find(
         (session) => session.id === sessionId,
       );
@@ -4685,23 +4057,50 @@ export default function App({
       const label = seed
         ? sessionDisplayTitle(seed.title, seed.harness)
         : "this session";
-      if (
-        mode === "delete" &&
-        !skipDeleteConfirm &&
-        !(await ask(`Delete “${label}”?`, {
-          title: "MonoCode",
-          kind: "warning",
-          okLabel: "Delete",
-        }))
-      )
-        return false;
-
       removingSessionIds.current.add(sessionId);
+      let deleteWorktreePath: string | undefined;
+      if (mode === "delete" && !skipDeleteConfirm) {
+        deleteConfirmationPending.current = true;
+        let unusedWorktree: string | undefined;
+        if (seed?.worktreeCwd) {
+          try {
+            const { worktrees } = await listWorktrees(seed.cwd);
+            const tree = worktrees.find(
+              (entry) => pathKey(entry.path) === pathKey(seed.worktreeCwd!),
+            );
+            if (
+              tree &&
+              !tree.isMain &&
+              !tree.locked &&
+              tree.branch &&
+              worktreeSessionIds(tree, sessionsRef.current).every(
+                (id) => id === sessionId,
+              )
+            )
+              unusedWorktree = tree.path;
+          } catch {
+            // A failed lookup must never offer filesystem cleanup.
+          }
+        }
+        if (!unusedWorktree) {
+          deleteConfirmationPending.current = false;
+        } else {
+          const choice = await new Promise<SessionDeleteChoice>((resolve) => {
+            setSessionDeleteDialog({ title: label, unusedWorktree, resolve });
+          });
+          deleteConfirmationPending.current = false;
+          if (!choice.confirmed) {
+            removingSessionIds.current.delete(sessionId);
+            return false;
+          }
+          if (choice.deleteWorktree) deleteWorktreePath = unusedWorktree;
+        }
+      }
       invalidateLoadedSession(sessionId);
       pendingPersist.current.delete(sessionId);
       let savedSummary: SessionSummary | undefined;
       try {
-        return await runSessionRemoval({
+        const removed = await runSessionRemoval({
           sessionId,
           scope: tabCloseScope,
           readWorkspace: () => ({
@@ -4711,7 +4110,13 @@ export default function App({
             dirtyFiles: dirtyFilesRef.current,
           }),
           createReplacement: (latest) =>
-            newDefaultSession(latest?.cwd ?? seed?.cwd ?? sidebarCwd),
+            newSession(
+              latest?.harness ?? seed?.harness ?? "cursor",
+              latest?.cwd ?? seed?.cwd ?? sidebarCwd,
+              latest?.model ?? seed?.model,
+              latest?.runtimeMode ?? seed?.runtimeMode,
+              latest?.modelSettings ?? open?.modelSettings,
+            ),
           confirmClose: async (closedTabs) => {
             const files = filesInWorkspaceTabs(closedTabs);
             const unsaved = files.some(
@@ -4732,10 +4137,27 @@ export default function App({
           },
           stop: async () => {
             const run =
-              mode === "delete" ? orchestrator.forSession(sessionId) : undefined;
+              mode === "delete"
+                ? orchestrator.forSession(sessionId)
+                : undefined;
             if (run && (run.status === "active" || run.status === "paused"))
               await orchestrator.stopRun(run.leadId);
             await stopSessionForRemoval(sessionId);
+            if (mode === "delete") {
+              const latest = sessionsRef.current.find(
+                (s) => s.id === sessionId,
+              );
+              const harnesses: HarnessId[] = latest
+                ? sessionChildHarnesses(latest)
+                : [seed?.harness ?? "cursor"];
+              // Release native processes before deleting the record, so a
+              // following worktree removal cannot race fire-and-forget cleanup.
+              await Promise.all(
+                harnesses.map((harness) =>
+                  forgetHarnessSession(harness, sessionId),
+                ),
+              );
+            }
           },
           updateSession: (stopped) => {
             const next = sessionsRef.current.map((session) =>
@@ -4791,8 +4213,10 @@ export default function App({
             const harnesses: HarnessId[] = latest
               ? sessionChildHarnesses(latest)
               : [seed?.harness ?? "cursor"];
-            for (const harness of harnesses) {
-              void forgetHarnessSession(harness, sessionId);
+            if (mode === "archive") {
+              for (const harness of harnesses) {
+                void forgetHarnessSession(harness, sessionId);
+              }
             }
             lastPersisted.current.delete(sessionId);
             pendingPersist.current.delete(sessionId);
@@ -4817,8 +4241,6 @@ export default function App({
                 (session) => session.id === activeTab?.focusedId,
               ),
             );
-            // Gone from the workspace either way — its check row dies with it.
-            resolveVerifyForSession(sessionId);
             if (mode === "archive") {
               if (latest && shouldPersistSession(latest)) {
                 rememberLoadedSession(loadedSessionCache.current, latest);
@@ -4836,13 +4258,21 @@ export default function App({
               setHistory((current) =>
                 current.filter((entry) => entry.id !== sessionId),
               );
-              // A deleted conversation must not stay referenced by tasks —
-              // a stale id would dead-end "Open task" forever.
-              pruneTaskSession(sessionId);
               void refreshHistory(sidebarCwd);
             }
           },
         });
+        if (removed && deleteWorktreePath && seed) {
+          try {
+            await onRemoveWorktree(seed.cwd, deleteWorktreePath, false);
+          } catch (error) {
+            void message(
+              `The session was deleted. Its worktree was kept.\n\n${String(error)}\n\nYou can manage it in Settings → Worktrees.`,
+              { title: "MonoCode", kind: "warning" },
+            );
+          }
+        }
+        return removed;
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         void message(`Could not ${mode} this conversation.\n\n${detail}`, {
@@ -4862,6 +4292,7 @@ export default function App({
       sidebarCwd,
       stopSessionForRemoval,
       tabCloseScope,
+      onRemoveWorktree,
     ],
   );
 
@@ -4959,6 +4390,18 @@ export default function App({
     [onPinHistorySession],
   );
 
+  const onDeleteWorktreeSessions = useCallback(
+    async (sessionIds: readonly string[]): Promise<boolean> => {
+      for (const sessionId of sessionIds) {
+        if (!(await onRemoveHistorySession(sessionId, "delete", true))) {
+          return false;
+        }
+      }
+      return true;
+    },
+    [onRemoveHistorySession],
+  );
+
   const onDeleteHistorySession = useCallback(
     (sessionId: string) => onRemoveHistorySession(sessionId, "delete"),
     [onRemoveHistorySession],
@@ -4968,10 +4411,9 @@ export default function App({
     async (sessionIds: readonly string[]) => {
       if (sessionIds.length === 0) return;
       if (
-        !(await ask(
+        !window.confirm(
           `Delete ${sessionIds.length} selected conversations? This can’t be undone.`,
-          { title: "MonoCode", kind: "warning", okLabel: "Delete" },
-        ))
+        )
       )
         return;
       for (const sessionId of sessionIds) {
@@ -5004,7 +4446,7 @@ export default function App({
   );
 
   const onCwdChange = useCallback(
-    (sessionId: string, cwd: string, fresh = false) => {
+    (sessionId: string, cwd: string) => {
       const normalized = normalizeProjectPath(cwd);
       const current = sessionsRef.current.find((s) => s.id === sessionId);
       const previous = current?.cwd;
@@ -5012,15 +4454,20 @@ export default function App({
       // new tab instead of retargeting the conversation.
       if (
         current &&
-        (fresh ||
-          (previous &&
-            looksLikeProject(previous) &&
-            !sameProjectPath(previous, normalized) &&
-            !isBlankSession(current)))
+        previous &&
+        looksLikeProject(previous) &&
+        !sameProjectPath(previous, normalized) &&
+        !isBlankSession(current)
       ) {
         setProjectCwd(normalized);
         setRecents(rememberProject(normalized));
-        const session = newDefaultSession(normalized);
+        const session = newSession(
+          current.harness,
+          normalized,
+          current.model,
+          current.runtimeMode,
+          current.modelSettings,
+        );
         const tab = newTab(session.id);
         setSessions((prev) => [...prev, session]);
         appendTab(tab, normalized);
@@ -5045,6 +4492,9 @@ export default function App({
                 cwd: normalized,
                 branch: undefined,
                 worktreeCwd: undefined,
+                worktreeRemoved: undefined,
+                workspaceMode: undefined,
+                worktreeBase: undefined,
               }
             : s,
         ),
@@ -5074,18 +4524,181 @@ export default function App({
 
   const onBranchChange = useCallback(
     (sessionId: string) => {
+      notifyGitChanged();
       const current = sessionsRef.current.find((s) => s.id === sessionId);
-      if (current) notifyGitChanged(sessionWorkCwd(current));
-      if (!current || (!current.branch && !current.worktreeCwd)) return;
+      if (!current) return;
+      void forgetHarnessSession(current.harness, sessionId);
       const next = {
         ...current,
         branch: undefined,
+        providerSessionId: undefined,
+        context: undefined,
       };
+      sessionsRef.current = sessionsRef.current.map((s) =>
+        s.id === sessionId ? next : s,
+      );
       setSessions((prev) => prev.map((s) => (s.id === sessionId ? next : s)));
       persistSession(next);
       notifyReviewChanged(sessionId);
     },
     [persistSession],
+  );
+
+  const onWorkspaceModeChange = useCallback(
+    (sessionId: string, mode: WorkspaceMode, base?: string) => {
+      setSessions((prev) =>
+        prev.map((session) => {
+          if (
+            session.id !== sessionId ||
+            (!isBlankSession(session) &&
+              !(session.workspaceMode && !session.worktreeCwd && !session.busy))
+          ) {
+            return session;
+          }
+          return mode === "worktree"
+            ? base || session.worktreeBase
+              ? {
+                  ...session,
+                  workspaceMode: "worktree",
+                  worktreeBase: base || session.worktreeBase,
+                }
+              : session
+            : {
+                ...session,
+                workspaceMode: undefined,
+                worktreeBase: undefined,
+              };
+        }),
+      );
+    },
+    [],
+  );
+
+  const onWorktreeBaseChange = useCallback(
+    (sessionId: string, base: string) => {
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.id === sessionId &&
+          (isBlankSession(session) ||
+            (!!session.workspaceMode &&
+              !session.worktreeCwd &&
+              !session.busy)) &&
+          session.workspaceMode === "worktree"
+            ? { ...session, worktreeBase: base }
+            : session,
+        ),
+      );
+    },
+    [],
+  );
+
+  const onWorktreeChange = useCallback(
+    async (sessionId: string, tree: Worktree) => {
+      const current = sessionsRef.current.find((s) => s.id === sessionId);
+      if (
+        !current ||
+        current.busy ||
+        removingSessionIds.current.has(sessionId) ||
+        switchingWorktrees.current.has(sessionId)
+      ) {
+        throw new Error(
+          "Wait for this session to finish before changing working copies.",
+        );
+      }
+      if (
+        !current.worktreeRemoved &&
+        pathKey(sessionWorkCwd(current)) === pathKey(tree.path)
+      )
+        return;
+      if (
+        [...removingWorktreePaths.current].some((path) =>
+          isEqualOrInside(tree.path, path),
+        )
+      ) {
+        throw new Error(
+          "This worktree is being deleted. Select another working copy.",
+        );
+      }
+      if (!current.worktreeRemoved && current.queuedMessages?.length) {
+        throw new Error(
+          "Clear queued messages before changing working copies.",
+        );
+      }
+      const run = orchestrator.forSession(sessionId);
+      if (run && ["active", "paused"].includes(run.status)) {
+        throw new Error(
+          "Stop this orchestration run before changing working copies.",
+        );
+      }
+      switchingWorktrees.current.set(sessionId, tree.path);
+      pendingPersist.current.delete(sessionId);
+      try {
+        const listed = await listWorktrees(current.cwd);
+        const target = listed.worktrees.find(
+          (entry) =>
+            pathKey(entry.path) === pathKey(tree.path) && !entry.missing,
+        );
+        if (!target) {
+          throw new Error(
+            "This worktree is no longer available. Refresh the picker.",
+          );
+        }
+        const source = sessionsRef.current.find((s) => s.id === sessionId);
+        if (
+          !source ||
+          source.busy ||
+          source.cwd !== current.cwd ||
+          sessionWorkCwd(source) !== sessionWorkCwd(current)
+        ) {
+          throw new Error(
+            "The session changed. Try selecting the working copy again.",
+          );
+        }
+        const selected = sessionInWorktree(source, target);
+        if (selected.id !== sessionId) {
+          // Leave the original conversation, checkpoints, and live provider
+          // context attached to the files they describe.
+          const tab = newTab(selected.id);
+          sessionsRef.current = [...sessionsRef.current, selected];
+          setSessions(sessionsRef.current);
+          appendTab(tab, selected.cwd);
+          setActiveTabId(tab.id);
+          setComposerFocused(true);
+          return;
+        }
+        await flushSessionCheckpoint(sessionId);
+        for (const harness of sessionChildHarnesses(source)) {
+          await forgetHarnessSession(harness, sessionId);
+        }
+        const latest = sessionsRef.current.find((s) => s.id === sessionId);
+        if (
+          !latest ||
+          (!latest.worktreeRemoved && !isBlankSession(latest)) ||
+          latest.cwd !== current.cwd ||
+          sessionWorkCwd(latest) !== sessionWorkCwd(current)
+        ) {
+          throw new Error(
+            "The session changed. Try selecting the working copy again.",
+          );
+        }
+        const next = sessionInWorktree(latest, target);
+        if (latest.worktreeRemoved)
+          await keepSessionChanges(sessionId, target.path);
+        pendingPersist.current.delete(sessionId);
+        if (shouldPersistSession(next)) await upsertSession(next);
+        invalidateLoadedSession(sessionId);
+        sessionsRef.current = sessionsRef.current.map((s) =>
+          s.id === sessionId ? next : s,
+        );
+        setSessions(sessionsRef.current);
+        notifyGitChanged();
+        notifyReviewChanged(sessionId);
+        void refreshHistory(next.cwd);
+      } finally {
+        switchingWorktrees.current.delete(sessionId);
+      }
+    },
+    [appendTab, invalidateLoadedSession, refreshHistory],
   );
 
   const selectProject = useCallback(
@@ -5096,6 +4709,14 @@ export default function App({
       const normalized = normalizeProjectPath(path);
       if (!looksLikeProject(normalized)) return;
 
+      const activeWorkspace = tabsRef.current.find(
+        (entry) => entry.id === activeTabIdRef.current,
+      );
+      const current = activeWorkspace
+        ? sessionsRef.current.find(
+            (session) => session.id === activeWorkspace.focusedId,
+          )
+        : undefined;
       const decision = planProjectReturn({
         memory: readProjectReturnMemory(),
         tabs: tabsRef.current,
@@ -5124,7 +4745,14 @@ export default function App({
         }
       }
 
-      const session = newDefaultSession(normalized);
+      const seed = current ?? sessionsRef.current[0];
+      const session = newSession(
+        seed?.harness ?? "claude",
+        normalized,
+        seed?.model,
+        seed?.runtimeMode,
+        seed?.modelSettings,
+      );
       const tab = newTab(session.id);
       setProjectCwd(normalized);
       setRecents(rememberProject(normalized));
@@ -5136,67 +4764,8 @@ export default function App({
     [activateTab, appendTab, onCwdChange, readProjectReturnMemory],
   );
 
-  const onSelectProject = useCallback(
-    (path: string) => {
-      // Group rows key on `project:<id>` — open their last member copy instead
-      // of treating the key as a folder.
-      if (isProjectRailKey(path)) {
-        const project = loadProjects().find(
-          (entry) => projectRailKey(entry.id) === path,
-        );
-        const target = project?.lastPath;
-        if (target && project && projectContainsPath(project, target)) {
-          onSelectProject(target);
-        }
-        return;
-      }
-      wslOpenRequest.current?.abort();
-      if (!wslLocation(path)) {
-        setWslOpening(null);
-        selectProject(path);
-        return;
-      }
-      const controller = new AbortController();
-      wslOpenRequest.current = controller;
-      setWslOpening({ path, busy: true });
-      void connectWslProject(path, controller.signal)
-        .then((canonical) => {
-          if (controller.signal.aborted) return;
-          setWslOpening(null);
-          selectProject(canonical);
-        })
-        .catch((error) => {
-          if (!controller.signal.aborted)
-            setWslOpening({ path, busy: false, error: String(error) });
-        });
-    },
-    [selectProject],
-  );
+  const { onSelectProject, pickProject, wslPickerOpen, closePicker, wslOpening, dismissOpening } = useWslProjects(projectCwd, selectProject);
 
-  const [wslPickerOpen, setWslPickerOpen] = useState(false);
-  useEffect(() => {
-    const open = (event: Event) => {
-      const path = (event as CustomEvent<string>).detail;
-      if (typeof path === "string" && path) onSelectProject(path);
-    };
-    window.addEventListener(OPEN_PROJECT_PATH, open);
-    return () => window.removeEventListener(OPEN_PROJECT_PATH, open);
-  }, [onSelectProject]);
-  const pickProject = useCallback(async () => {
-    if (IS_WIN) {
-      // Only a successful empty probe skips the dialog — a failure can't
-      // prove WSL is absent, so the dialog opens for its error and retry.
-      const distributions = await wslDistributions().catch(() => null);
-      if (distributions === null || distributions.length) {
-        setWslPickerOpen(true);
-        return;
-      }
-    }
-    const path = await pickFolder();
-    if (path) onSelectProject(path);
-  }, [onSelectProject]);
-
-  const pickWslProject = useCallback(() => setWslPickerOpen(true), []);
   const onPlaceSessionInFolder = useCallback(
     (sessionId: string, target: SessionFolderTarget) => {
       const source = sessionsRef.current.find(
@@ -5285,7 +4854,8 @@ export default function App({
       let nextActiveTabId = activeTabIdRef.current;
 
       if (nextTabs.length === 0) {
-        const session = newDefaultSession("~");
+        const fallback = nextSessions[0];
+        const session = newDefaultSession("~", fallback?.runtimeMode);
         const tab = newTab(session.id);
         nextSessions = [...nextSessions, session];
         nextTabs = [tab];
@@ -5386,17 +4956,20 @@ export default function App({
 
   const onOpenFile = useCallback<OpenFileFn>(
     (path, navigation, options) => {
-      dismissOverlays();
       void (async () => {
-        const resolved = await resolveFileOpenRequest(
-          gitCwdRef.current,
-          path,
-          options,
-        );
-        rememberOpenedFile(sidebarCwdRef.current, resolved);
+        const fileCwd = gitCwdRef.current;
+        const fileProjectCwd = sidebarCwdRef.current;
+        const resolved = await resolveFileOpenRequest(fileCwd, path, options);
+        rememberOpenedFile(fileCwd, resolved);
         const tab = tabsRef.current.find((entry) => entry.id === activeTabId);
         if (!tab) return;
-        const file = newFileTab(resolved, sidebarCwdRef.current);
+        const file = newFileTab(
+          resolved,
+          fileCwd,
+          false,
+          undefined,
+          fileProjectCwd,
+        );
         setTabs((prev) =>
           prev.map((entry) => {
             if (entry.id !== tab.id) return entry;
@@ -5419,117 +4992,55 @@ export default function App({
         setComposerFocused(false);
       })();
     },
-    [activeTabId, dismissOverlays],
+    [activeTabId],
   );
 
-  /** Open (or focus) a browser tab for `url` in the current workspace tab.
-   * `undefined` opens the worktree's remembered page; "" is a deliberate
-   * blank tab (URL-entry state). `cwd` is the worktree the link came from. */
-  const onOpenBrowser = useCallback(
-    (url?: string, cwd?: string, paneId?: string) => {
-      dismissOverlays();
-      const tab = tabsRef.current.find(
-        (entry) => entry.id === activeTabIdRef.current,
-      );
-      if (!tab) return;
-      const source = sessionsRef.current.find(
-        (session) => session.id === tab.focusedId,
-      );
-      const workdir =
-        cwd ||
-        (source ? sessionWorkCwd(source) : activeRef.current?.cwd) ||
-        projectCwdRef.current;
-      // No URL = open the worktree's remembered page directly; only a
-      // deliberately blank request (the toolbar's +) lands on the form.
-      let target = url ?? rememberedBrowserUrl(workdir) ?? "";
-      // Normalize so the dedupe key is canonical (http://x vs http://x/).
-      if (target) {
-        try {
-          target = normalizeBrowserUrl(target);
-        } catch {
-          // Keep the raw value — BrowserView surfaces the parse error.
-        }
-      }
-      const file = newBrowserTab(workdir, target);
-      setTabs((prev) =>
-        prev.map((entry) =>
-          entry.id === tab.id
-            ? openEditorTab(entry, file, { targetPaneId: paneId })
-            : entry,
-        ),
-      );
-      setComposerFocused(false);
-    },
-    [dismissOverlays],
-  );
+  const onBrowserMetaChange = useCallback((fileId: string, patch: BrowserMetaPatch) => {
+    setTabs(previous => previous.map(tab => updateBrowserTab(tab, fileId, patch)));
+  }, []);
 
-  /** Title-bar globe toggle: with no browser open in the active workspace
-   * it opens one (the remembered page); with browsers open it closes them
-   * all. The remembered per-worktree URL restores the last page on the
-   * next open, so toggling off and on brings the browser back. */
-  const onToggleBrowser = useCallback(() => {
-    const tab = tabsRef.current.find(
-      (entry) => entry.id === activeTabIdRef.current,
-    );
+  const onOpenBrowser = useCallback((url?: string, cwd?: string, paneId?: string) => {
+    setSettingsOpen(false);
+    setSearchViewOpen(false);
+    setInboxViewOpen(false);
+    setNotesViewOpen(false);
+    setFilePickerOpen(false);
+    const tab = tabsRef.current.find(entry => entry.id === activeTabIdRef.current);
     if (!tab) return;
-    if (
-      !tab.editorPanes.some((pane) => pane.files.some((file) => file.browser))
-    ) {
-      onOpenBrowser();
-      return;
-    }
-    // A tab that is only a lone browser pane — closing the browser is
-    // closing the workspace tab itself.
-    if (
-      leafIds(tab.layout).length === 1 &&
-      tab.editorPanes.length === 1 &&
-      tab.editorPanes[0].files.every((file) => file.browser)
-    ) {
-      onCloseTab(tab.id);
-      return;
-    }
-    let layout = tab.layout;
-    let focusedId = tab.focusedId;
-    const editorPanes = tab.editorPanes.flatMap((pane) => {
-      const files = pane.files.filter((file) => !file.browser);
-      if (files.length > 0) {
-        return [
-          {
-            ...pane,
-            files,
-            activeFileId: files.some((file) => file.id === pane.activeFileId)
-              ? pane.activeFileId
-              : files[0].id,
-          },
-        ];
-      }
-      const sibling = siblingLeafId(layout, pane.id);
-      const without = removePane(layout, pane.id);
-      if (!without) return [pane];
-      layout = without;
-      if (focusedId === pane.id) focusedId = sibling ?? firstLeafId(without);
-      return [];
-    });
-    setTabs((prev) =>
-      prev.map((entry) =>
-        entry.id === tab.id
-          ? { ...entry, layout, focusedId, editorPanes }
-          : entry,
-      ),
-    );
-    setComposerFocused(
-      sessionsRef.current.some((session) => session.id === focusedId),
-    );
+    const source = sessionsRef.current.find(session => session.id === tab.focusedId)
+      ?? sessionsRef.current.find(session => leafIds(tab.layout).includes(session.id));
+    const workdir = cwd || (source ? sessionWorkCwd(source) : undefined) || projectCwdRef.current;
+    let target = url ?? rememberedBrowserUrl(workdir) ?? "";
+    if (target) { try { target = normalizeBrowserUrl(target); } catch { /* Browser shows the invalid address. */ } }
+    const file = newBrowserTab(workdir, target);
+    setTabs(previous => previous.map(entry => entry.id === tab.id ? openBrowserTab(entry, file, paneId) : entry));
+    setComposerFocused(false);
+  }, []);
+
+  const onToggleBrowser = useCallback(() => {
+    const tab = tabsRef.current.find(entry => entry.id === activeTabIdRef.current);
+    if (!tab) return;
+    if (!tab.editorPanes.some(pane => pane.files.some(file => file.browser))) { onOpenBrowser(); return; }
+    const next = closeBrowserTabs(tab);
+    if (!next) { onCloseTab(tab.id); return; }
+    setTabs(previous => previous.map(entry => entry.id === tab.id ? (closeBrowserTabs(entry) ?? entry) : entry));
+    setComposerFocused(sessionsRef.current.some(session => session.id === next.focusedId));
   }, [onCloseTab, onOpenBrowser]);
 
   useEffect(() => {
-    const listener = (event: Event) => {
-      if (!isBrowserOpenRequest(event)) return;
-      onOpenBrowser(event.detail.url, event.detail.cwd, event.detail.paneId);
+    const open = (event: Event) => {
+      if (isBrowserOpenRequest(event)) onOpenBrowser(event.detail.url, event.detail.cwd, event.detail.paneId);
     };
-    window.addEventListener(OPEN_BROWSER_EVENT, listener);
-    return () => window.removeEventListener(OPEN_BROWSER_EVENT, listener);
-  }, [onOpenBrowser]);
+    const reveal = (event: Event) => {
+      if (event instanceof CustomEvent && typeof event.detail === "string") focusOpenSession(event.detail);
+    };
+    window.addEventListener(OPEN_BROWSER_EVENT, open);
+    window.addEventListener(BROWSER_CONTEXT_ADDED, reveal);
+    return () => {
+      window.removeEventListener(OPEN_BROWSER_EVENT, open);
+      window.removeEventListener(BROWSER_CONTEXT_ADDED, reveal);
+    };
+  }, [onOpenBrowser, focusOpenSession]);
 
   const onOpenPlan = useCallback(
     (sessionId: string, blockId: string) => {
@@ -5539,12 +5050,15 @@ export default function App({
       );
       const block = session?.blocks.find((entry) => entry.id === blockId);
       if (!tab || !session || !block) return;
-      const file = newPlanTab(
-        session.id,
-        block.id,
-        planTitle(block.text),
-        session.cwd,
-      );
+      const file = {
+        ...newPlanTab(
+          session.id,
+          block.id,
+          planTitle(block.text),
+          sessionWorkCwd(session),
+        ),
+        ...(session.worktreeCwd ? { projectCwd: session.cwd } : {}),
+      };
       setTabs((prev) =>
         prev.map((entry) =>
           entry.id === tab.id ? openEditorTab(entry, file) : entry,
@@ -5579,40 +5093,29 @@ export default function App({
     [],
   );
 
-  const onSelectFileSurface = useCallback(
-    (paneId: string, fileId: string) => {
-      const owner = tabsRef.current.find((tab) =>
-        findSurfacePane(tab, paneId)?.pane.files.some(
-          (file) => file.id === fileId,
-        ),
-      );
-      if (!owner) return;
-      activateTab(owner.id);
-      setInboxViewOpen(false);
-      setTabs((prev) =>
-        prev.map((tab) => {
-          const found = findSurfacePane(tab, paneId);
-          if (!found) return tab;
-          return withSurfacePanes(
-            { ...tab, focusedId: paneId },
-            found.kind,
-            surfacePanes(tab, found.kind).map((pane) =>
-              pane.id === paneId ? { ...pane, activeFileId: fileId } : pane,
-            ),
-          );
-        }),
-      );
-      setComposerFocused(false);
-    },
-    [activateTab],
-  );
+  const onSelectFileSurface = useCallback((paneId: string, fileId: string) => {
+    setTabs((prev) =>
+      prev.map((tab) => {
+        const found = findSurfacePane(tab, paneId);
+        if (!found) return tab;
+        return withSurfacePanes(
+          { ...tab, focusedId: paneId },
+          found.kind,
+          surfacePanes(tab, found.kind).map((pane) =>
+            pane.id === paneId ? { ...pane, activeFileId: fileId } : pane,
+          ),
+        );
+      }),
+    );
+    setComposerFocused(false);
+  }, []);
 
   const onModelChange = useCallback(
     (sessionId: string, harness: HarnessId, model: string) => {
       const current = sessionsRef.current.find((s) => s.id === sessionId);
       if (!current) return;
       if (isPreparingHandoff(current)) return;
-      const resolved = resolveModel(harness, model, sessionWorkCwd(current));
+      const resolved = resolveModel(harness, model);
       saveRecentModelChoice(resolved.harness, resolved.id);
       if (current.modelSettings) {
         saveLastModelSettings(current.modelSettings, "fill");
@@ -5671,27 +5174,66 @@ export default function App({
 
   const onRuntimeModeChange = useCallback(
     (sessionId: string, runtimeMode: RuntimeMode) => {
-      const session = sessionsRef.current.find((s) => s.id === sessionId);
-      sessionsRef.current = sessionsRef.current.map((s) =>
-        s.id === sessionId ? { ...s, runtimeMode } : s,
+      setSessions((prev) =>
+        prev.map((s) => (s.id === sessionId ? { ...s, runtimeMode } : s)),
       );
-      setSessions(sessionsRef.current);
-      if (!session) return;
-      for (const harness of sessionChildHarnesses(session)) {
-        setHarnessRuntimeMode(harness, sessionId, runtimeMode);
+    },
+    [],
+  );
+
+  const onSaveDraft = useCallback(
+    (sessionId: string, text: string, attachments: Attachment[] = []) => {
+      const current = sessionsRef.current.find(
+        (session) => session.id === sessionId,
+      );
+      if (
+        !current ||
+        current.busy ||
+        current.blocks.length > 0 ||
+        current.inboxAsk ||
+        current.worktreeRemoved ||
+        (!text.trim() && attachments.length === 0)
+      ) {
+        return false;
       }
+      const placeholderTitle = canReplaceSessionTitle(
+        current.title,
+        current.harness,
+        HARNESS_LABEL[current.harness],
+      );
+      const title = placeholderTitle
+        ? titleFromPrompt(text, current.harness, attachments)
+        : current.title;
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.id === sessionId && session.blocks.length === 0
+            ? {
+                ...session,
+                title,
+                blocks: [
+                  {
+                    id: crypto.randomUUID(),
+                    role: "user",
+                    text,
+                    ...(attachments.length > 0 ? { attachments } : {}),
+                    draft: true,
+                  },
+                ],
+              }
+            : session,
+        ),
+      );
+      return true;
     },
     [],
   );
 
   const onSubmit = useCallback(
-    async (
+    (
       sessionId: string,
       text: string,
       attachments: Attachment[] = [],
       options?: {
-        repair?: RepairDelivery;
-        signal?: AbortSignal;
         secondOpinion?: SecondOpinionMeta;
         followUpBehavior?: FollowUpBehavior;
         noteCard?: NoteComposerCard;
@@ -5700,13 +5242,12 @@ export default function App({
         intent?: TurnIntent;
         planBlockId?: string;
         buildTarget?: PlanBuildTarget;
-        action?: ActionRunRef;
         managed?: boolean;
         orchestrationRetry?: OrchestrationProposal;
+        draftBlockId?: string;
         onSettled?: (outcome: ControlOutcome) => void;
       },
-    ): Promise<boolean> => {
-      const submittedAt = performance.now();
+    ) => {
       const controlError = orchestrator.submissionError(
         sessionId,
         options?.managed,
@@ -5733,53 +5274,40 @@ export default function App({
           return false;
         }
       }
-      if (removingSessionIds.current.has(sessionId)) return false;
-      let storedCurrent = sessionsRef.current.find((s) => s.id === sessionId);
-      const queuedRow = storedCurrent?.queuedMessages?.find(
-        (row) => row.id === options?.queuedMessageId,
-      );
-      const repair = options?.repair ?? queuedRow?.repair;
-      const action = options?.action ?? queuedRow?.action;
-      if (!storedCurrent) return false;
-      if (repair) {
-        if (repairCheckingRef.current.has(sessionId)) return false;
-        repairCheckingRef.current.add(sessionId);
-        try {
-          options?.signal?.throwIfAborted();
-          assertRepairOwner(repair, storedCurrent);
-          const record = repairRecords().find((row) => row.id === repair.id);
-          if (!record || !["checking", "queued"].includes(record.state))
-            throw new Error(
-              "This repair was already attempted or cancelled. Remove it from the queue and refresh evidence.",
-            );
-          if (options?.followUpBehavior === "steer")
-            throw new Error(
-              "Repair requests must start a separately tracked turn; use Queue for owner.",
-            );
-          await validateRepair(repair.evidence, repair.context);
-          options?.signal?.throwIfAborted();
-          storedCurrent = sessionsRef.current.find((s) => s.id === sessionId);
-          assertRepairOwner(repair, storedCurrent);
-          if (removingSessionIds.current.has(sessionId))
-            throw new Error("Conversation is being removed.");
-        } catch (error) {
-          updateRepair(repair.id, "blocked", String(error));
-          if (options?.queuedMessageId)
-            setSessions((prev) =>
-              prev.map((s) =>
-                s.id === sessionId ? { ...s, queueStatus: "paused" } : s,
-              ),
-            );
-          return false;
-        } finally {
-          repairCheckingRef.current.delete(sessionId);
-        }
-      }
-      if (!storedCurrent) return false;
-      const setSubmissionSessions = setSessions;
-      const current = options?.buildTarget
-        ? withPlanBuildTarget(storedCurrent, options.buildTarget)
+      if (
+        removingSessionIds.current.has(sessionId) ||
+        switchingWorktrees.current.has(sessionId)
+      )
+        return false;
+      const storedCurrent = sessionsRef.current.find((s) => s.id === sessionId);
+      if (
+        !storedCurrent ||
+        storedCurrent.worktreeRemoved ||
+        [...removingWorktreePaths.current].some((path) =>
+          isEqualOrInside(sessionWorkCwd(storedCurrent), path),
+        )
+      )
+        return false;
+      const draftBlock = options?.draftBlockId
+        ? storedCurrent.blocks.find(
+            (block) =>
+              block.id === options.draftBlockId &&
+              block.role === "user" &&
+              block.draft,
+          )
+        : undefined;
+      if (options?.draftBlockId && !draftBlock) return false;
+      const draftCleared = draftBlock
+        ? {
+            ...storedCurrent,
+            blocks: storedCurrent.blocks.filter(
+              (block) => block.id !== draftBlock.id,
+            ),
+          }
         : storedCurrent;
+      const current = options?.buildTarget
+        ? withPlanBuildTarget(draftCleared, options.buildTarget)
+        : draftCleared;
       const intent = options?.intent ?? "default";
       if (intent === "orchestrate") {
         try {
@@ -5825,48 +5353,32 @@ export default function App({
       ) {
         return false;
       }
-      if (isPreparingHandoff(current)) {
-        // Preserve submissions while the provider switch resolves.
-        if (options?.queuedMessageId) return false;
-        setSubmissionSessions((prev) =>
-          prev.map((s) =>
-            s.id === sessionId
-              ? {
-                  ...s,
-                  noteCard: undefined,
-                  handoffCard: undefined,
-                  queuedMessages: [
-                    ...(s.queuedMessages ?? []),
-                    {
-                      id: crypto.randomUUID(),
-                      repair,
-                      text,
-                      attachments,
-                      noteCard,
-                      handoffCard,
-                      intent,
-                      action,
-                    },
-                  ],
-                  queueStatus: s.queueStatus === "paused" ? "paused" : "active",
-                }
-              : s,
-          ),
-        );
-        return true;
-      }
+      if (isPreparingHandoff(current)) return false;
       saveRecentModelChoice(current.harness, current.model);
-      const workCwd = sessionWorkCwd(current);
-      const providerAccountId =
-        current.harness === "claude" || current.harness === "codex"
-          ? (current.providerAccountId ??
-            selectedProviderAccountId(current.harness, current.cwd))
-          : undefined;
-      const submittedText = repair
-        ? composeAgentContext(repair.context, "")
-        : intent === "build"
-          ? "Build approved plan"
-          : text;
+      const initialWorkCwd = sessionWorkCwd(current);
+      const createDraftWorktree =
+        !current.worktreeCwd && current.workspaceMode === "worktree";
+      const accountProvider = supportsProviderAccounts(current.harness)
+        ? current.harness
+        : undefined;
+      const providerAccountId = accountProvider
+        ? (current.providerAccountId ??
+          selectedProviderAccountId(accountProvider, current.cwd))
+        : undefined;
+      if (
+        accountProvider &&
+        providerAccountId &&
+        !providerAccountExists(accountProvider, providerAccountId)
+      ) {
+        enqueueHarnessEvent(sessionId, {
+          type: "session.error",
+          message:
+            "This conversation uses a removed provider account. Switch accounts from the usage control to start a new conversation.",
+        });
+        flushHarnessEvents();
+        return false;
+      }
+      const submittedText = intent === "build" ? "Build approved plan" : text;
       const rawCommand = isNativeCommandPrompt(submittedText, current.harness);
       const harnessText = rawCommand
         ? submittedText
@@ -5879,35 +5391,29 @@ export default function App({
 
       if (current.busy && !pendingSwitch) {
         const followUpBehavior =
-          intent === "plan" || intent === "orchestrate"
+          current.worktreePreparing ||
+          intent === "plan" ||
+          intent === "orchestrate"
             ? "queue"
             : (options?.followUpBehavior ?? loadFollowUpBehavior());
-        if (
-          followUpBehavior === "queue" ||
-          !matchesActiveTurnModel(current) ||
-          !canSteerHarnessSession(current.harness, sessionId)
-        ) {
-          if (options?.queuedMessageId) return false;
-          setSubmissionSessions((prev) =>
+        if (followUpBehavior === "queue") {
+          setSessions((prev) =>
             prev.map((s) =>
               s.id === sessionId
                 ? {
                     ...s,
                     inboxCard: rawCommand ? s.inboxCard : undefined,
-                    contextDraft: rawCommand ? s.contextDraft : undefined,
                     noteCard: rawCommand ? s.noteCard : undefined,
                     handoffCard: rawCommand ? s.handoffCard : undefined,
                     queuedMessages: [
                       ...(s.queuedMessages ?? []),
                       {
                         id: crypto.randomUUID(),
-                        repair,
                         text,
                         attachments,
                         noteCard,
                         handoffCard,
                         intent,
-                        action,
                       },
                     ],
                     queueStatus:
@@ -5916,12 +5422,6 @@ export default function App({
                 : s,
             ),
           );
-          if (repair)
-            updateRepair(
-              repair.id,
-              "queued",
-              "Queued for this agent; evidence will be checked again before delivery. App must remain open.",
-            );
           dismissNoticesForContinuedSession(sessionId);
           return true;
         }
@@ -5940,54 +5440,34 @@ export default function App({
         }
         dismissNoticesForContinuedSession(sessionId);
         const visible = displayAttachments(attachments);
-        const cards = userTurnCards(noteCard, undefined, action);
-        let optimisticBlockId: string | undefined;
-        setSubmissionSessions((prev) =>
+        const cards = userTurnCards(noteCard);
+        setSessions((prev) =>
           prev.map((s) => {
             if (s.id !== sessionId) return s;
             let next: Session = {
               ...s,
               inboxCard: rawCommand ? s.inboxCard : undefined,
-              contextDraft: rawCommand ? s.contextDraft : undefined,
               noteCard: rawCommand ? s.noteCard : undefined,
               handoffCard: rawCommand ? s.handoffCard : undefined,
             };
             if (options?.queuedMessageId) {
               next = dequeueQueuedMessage(next, options.queuedMessageId);
             }
-            const appended = appendSteerUser(
-              next,
-              submittedText,
-              visible,
-              cards,
-            );
-            optimisticBlockId = appended.blocks[appended.blocks.length - 1]?.id;
-            return appended;
+            return appendSteerUser(next, submittedText, visible, cards);
           }),
         );
-        const gen = turnGen.current.get(sessionId);
-        const activityKey = `${sessionId}:${gen}`;
-        const pending =
-          pendingSteersRef.current.get(activityKey) ?? new Set<Promise<void>>();
-        pendingSteersRef.current.set(activityKey, pending);
-        const stillOwned = () =>
-          turnGen.current.get(sessionId) === gen &&
-          !removingSessionIds.current.has(sessionId);
-        const followUp = (async () => {
+        void (async () => {
           try {
-            const [prepared, prompt] = await Promise.all([
-              prepareAttachments(attachments, workCwd),
-              preparePrompt(harnessText, {
-                harness: current.harness,
-                sessionId,
-                cwd: workCwd,
-              }),
-            ]);
-            if (!stillOwned()) return;
-            const input = {
+            const prepared = await prepareAttachments(attachments, initialWorkCwd);
+            const prompt = await preparePrompt(harnessText, {
               harness: current.harness,
               sessionId,
-              cwd: workCwd,
+              cwd: initialWorkCwd,
+            });
+            await steerHarnessTurn({
+              harness: current.harness,
+              sessionId,
+              cwd: initialWorkCwd,
               model: current.model,
               modelSettings: current.modelSettings,
               text: inboxAskPrompt(
@@ -5995,69 +5475,24 @@ export default function App({
                 prompt,
               ),
               attachments: prepared,
-            };
-            if (canSteerHarnessSession(current.harness, sessionId)) {
-              await steerHarnessTurn(input);
-            } else {
-              // No write happened. Let normal queue dispatch own the next turn.
-              setSessions((prev) =>
-                prev.map((s) =>
-                  s.id === sessionId
-                    ? retainQueuedFollowUp(
-                        s,
-                        {
-                          id: options?.queuedMessageId ?? crypto.randomUUID(),
-                          text,
-                          attachments,
-                          noteCard,
-                          handoffCard,
-                          intent,
-                          action,
-                        },
-                        optimisticBlockId,
-                      )
-                    : s,
-                ),
-              );
-            }
+            });
           } catch (error: unknown) {
-            if (!stillOwned()) return;
             const message =
               error instanceof Error
                 ? error.message
-                : `${current.harness} could not deliver the follow-up`;
-            // A rejected/uncertain steer is not proof the original turn stopped.
-            // Keep its transcript evidence and require review before any replay.
-            setSessions((prev) =>
-              prev.map((s) =>
-                s.id === sessionId
-                  ? retainQueuedFollowUp(s, {
-                      id: options?.queuedMessageId ?? crypto.randomUUID(),
-                      text,
-                      attachments,
-                      noteCard,
-                      handoffCard,
-                      intent,
-                      action,
-                      deliveryError: message,
-                    })
-                  : s,
-              ),
-            );
+                : `${current.harness} could not steer the active turn`;
+            enqueueHarnessEvent(sessionId, {
+              type: "session.error",
+              message,
+            });
+            flushHarnessEvents();
           }
         })();
-        pending.add(followUp);
         return true;
       }
 
       const gen = (turnGen.current.get(sessionId) ?? 0) + 1;
       turnGen.current.set(sessionId, gen);
-      const turnClock = beginTurnTiming(
-        sessionId,
-        current.harness,
-        String(gen),
-        submittedAt,
-      );
       const proposalId =
         intent === "orchestrate" ? crypto.randomUUID() : undefined;
       let proposalDraft: OrchestrationProposal | undefined = proposalId
@@ -6065,11 +5500,12 @@ export default function App({
             version: 1,
             leadId: sessionId,
             cwd: current.cwd,
+            checkoutCwd: initialWorkCwd,
             request: harnessText,
             author: {
               harness: current.harness,
               model: current.model,
-              name: resolveModel(current.harness, current.model, workCwd).name,
+              name: resolveModel(current.harness, current.model).name,
             },
             settings: { choices: [], maxWorkers: 2 },
             status: "planning",
@@ -6079,11 +5515,12 @@ export default function App({
           }
         : undefined;
       const isFirstTurn = current.blocks.length === 0;
-      const placeholderTitle = canReplaceSessionTitle(
-        current.title,
-        current.harness,
-        HARNESS_LABEL[current.harness],
-      );
+      const placeholderTitle =
+        canReplaceSessionTitle(
+          current.title,
+          current.harness,
+          HARNESS_LABEL[current.harness],
+        ) || !!draftBlock;
       const titleSeed =
         isFirstTurn &&
         !current.inboxCard &&
@@ -6102,7 +5539,7 @@ export default function App({
             ? SECOND_OPINION_TITLE
             : submittedText;
       const cards = {
-        ...(rawCommand ? undefined : userTurnCards(noteCard, card, action)),
+        ...(rawCommand ? undefined : userTurnCards(noteCard, card)),
         // The orchestrator writes these turns, not the user; hide them.
         ...(options?.managed ? { internal: true } : {}),
       };
@@ -6115,18 +5552,26 @@ export default function App({
       }
 
       dismissNoticesForContinuedSession(sessionId);
-      setSubmissionSessions((prev) =>
+      setSessions((prev) =>
         prev.map((s) => {
           if (s.id !== sessionId) return s;
-          const selected = options?.buildTarget
-            ? withPlanBuildTarget(s, options.buildTarget)
+          const draftRemoved = draftBlock
+            ? {
+                ...s,
+                blocks: s.blocks.filter((block) => block.id !== draftBlock.id),
+              }
             : s;
+          const selected = options?.buildTarget
+            ? withPlanBuildTarget(draftRemoved, options.buildTarget)
+            : draftRemoved;
           const titled = isFirstTurn ? titleSeed : selected.title;
           let next: Session = {
             ...selected,
             providerAccountId,
+            worktreePreparing: createDraftWorktree
+              ? true
+              : selected.worktreePreparing,
             inboxCard: rawCommand ? s.inboxCard : undefined,
-            contextDraft: rawCommand ? s.contextDraft : undefined,
             noteCard: rawCommand ? s.noteCard : undefined,
             handoffCard: rawCommand ? s.handoffCard : undefined,
           };
@@ -6196,7 +5641,8 @@ export default function App({
         }),
       );
 
-      if (isFirstTurn && live && placeholderTitle) {
+      const launchTitleGeneration = (workCwd: string) => {
+        if (!isFirstTurn || !live || !placeholderTitle) return;
         const titleMessage =
           harnessText || attachments.map((file) => file.name).join(", ");
         void generateHarnessTitle(current.harness, {
@@ -6233,13 +5679,12 @@ export default function App({
             );
           })
           .catch(() => undefined);
-      }
+      };
 
       if (!live) {
         if (pendingSwitch) {
           void forgetHarnessSession(pendingSwitch.from, sessionId);
         }
-        endTurnTiming(sessionId, "provider unavailable", turnClock);
         options?.onSettled?.({
           status: "failed",
           text: "",
@@ -6272,8 +5717,63 @@ export default function App({
       let nativeProposalText = "";
       let completedProposal: OrchestrationProposal | undefined;
       void (async () => {
+        let workCwd = initialWorkCwd;
+        if (createDraftWorktree) {
+          const tree = await createWorktree(
+            current.cwd,
+            temporaryWorktreeBranchName(),
+            current.worktreeBase || "HEAD",
+            false,
+          );
+          workCwd = tree.path;
+          if (proposalDraft)
+            proposalDraft = { ...proposalDraft, checkoutCwd: tree.path };
+          setSessions((prev) =>
+            prev.map((session) =>
+              session.id === sessionId
+                ? {
+                    ...session,
+                    worktreeCwd: tree.path,
+                    branch: tree.branch ?? undefined,
+                    workspaceMode: undefined,
+                    worktreeBase: undefined,
+                    worktreePreparing: undefined,
+                  }
+                : session,
+            ),
+          );
+          notifyReviewChanged(sessionId);
+
+          const branchMessage =
+            harnessText || attachments.map((file) => file.name).join(", ");
+          void generateHarnessBranchName(
+            pickTextHarness(current.harness),
+            workCwd,
+            branchMessage,
+          )
+            .then(async (fragment) => {
+              const branch = fragment ? namedWorktreeBranch(fragment) : null;
+              if (!branch) return;
+              const renamed = await renameWorktreeBranch(
+                current.cwd,
+                tree.path,
+                branch,
+              );
+              setSessions((prev) =>
+                prev.map((session) =>
+                  session.id === sessionId &&
+                  pathKey(sessionWorkCwd(session)) === pathKey(tree.path)
+                    ? { ...session, branch: renamed.branch ?? undefined }
+                    : session,
+                ),
+              );
+            })
+            .catch(() => undefined);
+        }
+        launchTitleGeneration(workCwd);
+        if (turnGen.current.get(sessionId) !== gen) return;
         if (proposalDraft && proposalId) {
-          const settings = await discoverOrchestrationSettings();
+          const settings = await discoverOrchestrationSettings(workCwd);
           if (turnGen.current.get(sessionId) !== gen) return;
           proposalDraft = { ...proposalDraft, settings };
           const discovering = proposalDraft;
@@ -6363,67 +5863,22 @@ export default function App({
           }
           return event;
         };
-        const onEvent = (event: HarnessEvent) => {
-          if (turnGen.current.get(sessionId) !== gen) return;
-          markFirstTurnEvent(sessionId, event);
-          if (
-            wrap &&
-            (event.type === "session.started" ||
-              event.type === "session.providerBound")
-          ) {
-            revealHandoff(wrap.text);
-          }
-          nudgeOpenEditors(event, workCwd);
-          trackSessionEdits(sessionId, workCwd, event);
-          const routed = routePlanEvent(event);
-          if (routed) enqueueHarnessEvent(sessionId, routed);
-        };
 
-        // The checkpoint only has to be durable before the turn can edit
-        // files, not before the prompt is prepared — run it alongside
-        // attachment/prompt prep instead of serially ahead of it.
-        const checkpoint =
-          current.inboxAsk || orchestrator.forSession(sessionId)
-            ? Promise.resolve()
-            : beginSessionTurn(sessionId, workCwd).catch(() => undefined);
-        if (turnGen.current.get(sessionId) !== gen) {
-          await checkpoint;
-          endTurnTiming(sessionId, "turn cancelled", turnClock);
-          return;
+        if (!current.inboxAsk && !orchestrator.forSession(sessionId)) {
+          await beginSessionTurn(sessionId, workCwd).catch(() => undefined);
         }
+        if (turnGen.current.get(sessionId) !== gen) return;
         let buildSucceeded = false;
         try {
-          // Attachment transfer and prompt preparation are independent of
-          // each other (and of the checkpoint) — run them together.
-          const [prepared, prompt] = await Promise.all([
-            prepareAttachments(attachments, workCwd),
+          const prepared = await prepareAttachments(attachments, workCwd);
+          const prompt =
             intent === "build" && approvedPlan
-              ? Promise.resolve(buildPlanPrompt(approvedPlan.text))
-              : preparePrompt(harnessText, {
+              ? buildPlanPrompt(approvedPlan.text)
+              : await preparePrompt(harnessText, {
                   harness: current.harness,
                   sessionId,
                   cwd: workCwd,
-                }),
-            // The user has submitted and the outgoing host is retired. Warm
-            // the replacement while preparing the prompt/checkpoint; it may
-            // initialize tools, but cannot edit files before sendTurn below.
-            prewarmHarness({
-              harness: current.harness,
-              sessionId,
-              cwd: workCwd,
-              model: current.model,
-              modelSettings: current.modelSettings,
-              runtimeMode: current.runtimeMode,
-              onEvent,
-            }),
-          ]);
-          await checkpoint;
-          if (
-            turnGen.current.get(sessionId) !== gen ||
-            removingSessionIds.current.has(sessionId)
-          )
-            return;
-          markTurn(sessionId, "checkpoint + prompt ready");
+                });
           const turnPrompt = proposalDraft
             ? options?.orchestrationRetry?.response
               ? orchestrationRepairPrompt({
@@ -6434,7 +5889,7 @@ export default function App({
               : orchestrationPlanningPrompt(
                   prompt,
                   proposalDraft.settings,
-                  proposalDraft.cwd,
+                  proposalDraft.checkoutCwd ?? proposalDraft.cwd,
                 )
             : intent === "plan" && !rawCommand
               ? planTurnPrompt(prompt)
@@ -6442,24 +5897,6 @@ export default function App({
           const earlier = queuedHandoff
             ? userMessagesAfterHandoff(current)
             : [];
-          if (repair) {
-            await validateRepair(repair.evidence, repair.context);
-            assertRepairOwner(
-              repair,
-              sessionsRef.current.find((s) => s.id === sessionId),
-            );
-            if (
-              turnGen.current.get(sessionId) !== gen ||
-              removingSessionIds.current.has(sessionId)
-            )
-              throw new Error("Repair was cancelled before delivery.");
-            updateRepair(
-              repair.id,
-              "running",
-              "Request submitted to the selected agent. Completion does not mean CI passes or comments are resolved.",
-            );
-          }
-          markTurn(sessionId, "sendHarnessTurn begin");
           const sendTurn = (text: string, turnAttachments = prepared) =>
             sendHarnessTurn({
               harness: current.harness,
@@ -6477,7 +5914,6 @@ export default function App({
               attachments: turnAttachments,
               onEvent: (event) => {
                 if (turnGen.current.get(sessionId) !== gen) return;
-                markFirstTurnEvent(sessionId, event);
                 orchestrator.observe(sessionId, event);
                 if (options?.onSettled && event.type === "message.delta")
                   controlText = (controlText + event.text).slice(-20_000);
@@ -6550,15 +5986,6 @@ export default function App({
           }
           buildSucceeded = true;
         } catch (error: unknown) {
-          if (repair)
-            updateRepair(
-              repair.id,
-              repairRecords().find((row) => row.id === repair.id)?.state ===
-                "running"
-                ? "uncertain"
-                : "blocked",
-              String(error),
-            );
           if (turnGen.current.get(sessionId) !== gen) return;
           if (wrap) revealHandoff(wrap.text);
           const message =
@@ -6574,32 +6001,7 @@ export default function App({
           }
           providerFailureSeen = true;
         } finally {
-          const activityKey = `${sessionId}:${gen}`;
-          const pending = pendingSteersRef.current.get(activityKey);
-          while (pending?.size) {
-            const batch = [...pending];
-            await Promise.all(batch);
-            for (const work of batch) pending.delete(work);
-          }
-          pendingSteersRef.current.delete(activityKey);
-          if (repair && turnGen.current.get(sessionId) !== gen)
-            updateRepair(
-              repair.id,
-              "uncertain",
-              "Turn interrupted. Inspect the conversation before allowing another request.",
-            );
-          if (turnGen.current.get(sessionId) !== gen) {
-            endTurnTiming(sessionId, "turn replaced", turnClock);
-            return;
-          }
-          if (repair && buildSucceeded)
-            updateRepair(
-              repair.id,
-              providerFailureSeen ? "uncertain" : "completed",
-              providerFailureSeen
-                ? "Provider reported a failure; inspect the conversation before retry."
-                : "Agent turn completed. Verify the changes and provider results separately.",
-            );
+          if (turnGen.current.get(sessionId) !== gen) return;
           flushHarnessEvents();
           controlOutcome = {
             status:
@@ -6611,10 +6013,15 @@ export default function App({
             text: controlText.trim(),
             ...(providerFailureSeen ? { error: controlOutcome.error } : {}),
           };
-          // The busy→idle edge only needs the applied event batch. Checkpoint
-          // durability is a pre-edit requirement, not a pre-idle one — later
-          // consumers serialize through the same queue, so settling here
-          // cannot reorder snapshot writes.
+          // A failed provider can leave its process alive with a dead event
+          // stream or poisoned turn state. Park it now; the next prompt will
+          // reconnect and resume through a fresh transport.
+          if (providerFailureSeen) {
+            await stopHarnessSession(current.harness, sessionId).catch(
+              () => undefined,
+            );
+          }
+          await flushSessionCheckpoint(sessionId);
           setSessions((prev) =>
             prev.map((s) => {
               if (s.id !== sessionId) return s;
@@ -6650,29 +6057,6 @@ export default function App({
                 : finalized;
             }),
           );
-          scheduleHarnessFlush(() => {
-            endTurnTiming(
-              sessionId,
-              providerFailureSeen ? "turn failed" : "turn done",
-              turnClock,
-            );
-          });
-          // A failed provider can leave its process alive with a dead event
-          // stream or poisoned turn state. Park it now; the next prompt will
-          // reconnect and resume through a fresh transport.
-          if (providerFailureSeen) {
-            await stopHarnessSession(current.harness, sessionId).catch(
-              () => undefined,
-            );
-          }
-          await flushSessionCheckpoint(sessionId);
-          if (
-            turnGen.current.get(sessionId) !== gen ||
-            removingSessionIds.current.has(sessionId)
-          ) {
-            endTurnTiming(sessionId, "turn replaced", turnClock);
-            return;
-          }
           // Next tick: the flush above has rendered by then, so the banner
           // quotes the reply's final text rather than the previous batch.
           window.setTimeout(() => {
@@ -6683,7 +6067,7 @@ export default function App({
             if (finished) void announceSessionFinished(finished, visible);
           }, 0);
           notifyReviewChanged(sessionId);
-          notifyGitChanged(workCwd);
+          notifyGitChanged();
           nudgeWorkspace(workCwd);
           nudgeWatchedFiles();
           window.setTimeout(() => nudgeWatchedFiles(), 150);
@@ -6702,21 +6086,24 @@ export default function App({
             });
             flushHarnessEvents();
             setSessions((prev) =>
-              prev.map((session) =>
-                session.id === sessionId
-                  ? proposalId && proposalDraft
-                    ? withOrchestrationProposal(
-                        stopStreaming(session),
-                        proposalId,
-                        completeOrchestrationProposal(
-                          proposalDraft,
-                          "",
-                          controlOutcome.error,
-                        ),
-                      )
-                    : stopStreaming(session)
-                  : session,
-              ),
+              prev.map((session) => {
+                if (session.id !== sessionId) return session;
+                const stopped = {
+                  ...stopStreaming(session),
+                  worktreePreparing: undefined,
+                };
+                return proposalId && proposalDraft
+                  ? withOrchestrationProposal(
+                      stopped,
+                      proposalId,
+                      completeOrchestrationProposal(
+                        proposalDraft,
+                        "",
+                        controlOutcome.error,
+                      ),
+                    )
+                  : stopped;
+              }),
             );
           }
         })
@@ -6733,1167 +6120,6 @@ export default function App({
       dismissNoticesForContinuedSession,
       enqueueHarnessEvent,
       flushHarnessEvents,
-    ],
-  );
-
-  useEffect(() => {
-    const open = (event: Event) => {
-      const id = (event as CustomEvent<string>).detail;
-      setInboxViewOpen(false);
-      void onSelectHistorySession(id);
-    };
-    window.addEventListener(OPEN_REPAIR, open);
-    return () => window.removeEventListener(OPEN_REPAIR, open);
-  }, [onSelectHistorySession]);
-
-  // "Open" on a removal blocker row: focus the bound session or terminal.
-  useEffect(() => {
-    const open = (event: Event) => {
-      const process = (event as CustomEvent<BoundProcess>).detail;
-      if (!process?.id) return;
-      if (process.kind === "terminal") {
-        for (const tab of tabsRef.current) {
-          for (const pane of tab.terminalPanes ?? []) {
-            if (!pane.files.some((file) => file.id === process.id)) continue;
-            setTabs((current) =>
-              current.map((entry) =>
-                entry.id === tab.id
-                  ? {
-                      ...entry,
-                      terminalPanes: (entry.terminalPanes ?? []).map((item) =>
-                        item.id === pane.id
-                          ? { ...item, activeFileId: process.id }
-                          : item,
-                      ),
-                    }
-                  : entry,
-              ),
-            );
-            activateTab(tab.id, pane.id);
-            return;
-          }
-        }
-        const dock = projectTerminalsRef.current.find((entry) =>
-          entry.pane.files.some((file) => file.id === process.id),
-        );
-        if (dock) {
-          setProjectCwd(dock.projectPath);
-          setProjectTerminals((prev) =>
-            mapProjectTerminal(prev, dock.projectPath, (entry) =>
-              withDockOpen(selectDockTerminal(entry, process.id), true),
-            ),
-          );
-          focusProjectTerminal();
-        }
-        return;
-      }
-      setInboxViewOpen(false);
-      void onSelectHistorySession(process.id);
-    };
-    window.addEventListener(OPEN_BOUND_PROCESS, open);
-    return () => window.removeEventListener(OPEN_BOUND_PROCESS, open);
-  }, [activateTab, focusProjectTerminal, onSelectHistorySession]);
-
-  // The task just created — the rail's "current" task until a task session
-  // takes over. Never launches work on its own.
-  const [focusTaskId, setFocusTaskId] = useState<string>();
-  // The session that was focused when the task was armed — the highlight
-  // must survive being created while another task's session is open.
-  const focusTaskSessionRef = useRef<string | undefined>(undefined);
-  const armTaskFocus = useCallback((taskId: string) => {
-    focusTaskSessionRef.current = activeRef.current?.id;
-    setFocusTaskId(taskId);
-  }, []);
-  // The just-created highlight lifts once another task's session becomes
-  // the rail's current task, or the task is archived/deleted. Focusing an
-  // unrelated non-task session keeps it — it still marks your current task.
-  // The store listener lives inside the effect — a root-level
-  // useSyncExternalStore would re-render the whole App on every task write.
-  useEffect(() => {
-    if (!focusTaskId) return;
-    const clearIfGone = () => {
-      const task = loadTaskWorkspaces().find(
-        (entry) => entry.id === focusTaskId && !entry.archived,
-      );
-      if (task) return;
-      focusTaskSessionRef.current = undefined;
-      setFocusTaskId(undefined);
-    };
-    clearIfGone();
-    return subscribeTaskWorkspaces(clearIfGone);
-  }, [focusTaskId]);
-  useEffect(() => {
-    if (!focusTaskId || !active?.id) return;
-    const activeTask = taskForSession(active.id, sessionWorkCwd(active));
-    const navigated = active.id !== focusTaskSessionRef.current;
-    if (navigated && activeTask && activeTask.task.id !== focusTaskId) {
-      focusTaskSessionRef.current = undefined;
-      setFocusTaskId(undefined);
-    }
-    // active?.id is the signal — the session object itself changes identity
-    // on every transcript write.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusTaskId, active?.id]);
-  const [taskSheet, setTaskSheet] = useState<{
-    /** Initial selection only — the sheet owns project picking. */
-    projectId?: string;
-    editingTaskId?: string;
-    setupChildId?: string;
-    initialTickets?: LinkedWorkItem[];
-    initialName?: string;
-    initialBrief?: string;
-    initialChildren?: TaskChildDraft[];
-    /** Send-to-new-task continuation — runs once in place of the default
-     * open after the task is created. */
-    continueSend?: (taskId: string) => void;
-    /** Remount key — a retarget never inherits the previous form's state. */
-    nonce: number;
-  } | null>(null);
-  const taskSheetNonce = useRef(0);
-  const openTaskSheet = useCallback(
-    (sheet: Omit<NonNullable<typeof taskSheet>, "nonce">) =>
-      setTaskSheet({ ...sheet, nonce: ++taskSheetNonce.current }),
-    [],
-  );
-  const onNewTask = useCallback(
-    (path: string, projectId?: string) => {
-      const stored = projectId
-        ? loadProjects().find((entry) => entry.id === projectId)
-        : undefined;
-      // An implicit rail row materializes so the task has a durable project.
-      const project =
-        stored ??
-        ensureProjectForPath(path, getVerifiedFamilies().get(pathKey(path)));
-      openTaskSheet({ projectId: project.id });
-    },
-    [openTaskSheet],
-  );
-
-  const onEditTask = useCallback(
-    (taskId: string, childId?: string) => {
-      const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-      // Archived tasks are read-only — reviseTask refuses too; this keeps the
-      // sheet from ever opening on one.
-      if (task && !task.archived)
-        openTaskSheet({
-          projectId: task.projectId,
-          editingTaskId: taskId,
-          // A child id means "set that child up" — the sheet opens with its
-          // working-copy draft already expanded.
-          ...(childId ? { setupChildId: childId } : {}),
-        });
-    },
-    [openTaskSheet],
-  );
-
-  const [taskPrSheetTaskId, setTaskPrSheetTaskId] = useState<string | null>(
-    null,
-  );
-  const onCreateTaskPrs = useCallback((taskId: string) => {
-    // Archived tasks are read-only — same guard as the OPEN_TASK_PRS event.
-    const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-    if (task && !task.archived) setTaskPrSheetTaskId(taskId);
-  }, []);
-  useEffect(() => {
-    const listener = (event: Event) => {
-      const taskId = (event as CustomEvent<string>).detail;
-      if (typeof taskId !== "string" || !taskId) return;
-      // Archived tasks are read-only — no new delivery work starts on them.
-      const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-      if (task && !task.archived) setTaskPrSheetTaskId(taskId);
-    };
-    window.addEventListener(OPEN_TASK_PRS, listener);
-    return () => window.removeEventListener(OPEN_TASK_PRS, listener);
-  }, []);
-
-  const [taskDetailsId, setTaskDetailsId] = useState<string | null>(null);
-  useEffect(() => {
-    const listener = (event: Event) => {
-      const taskId = (event as CustomEvent<string>).detail;
-      if (typeof taskId === "string" && taskId) setTaskDetailsId(taskId);
-    };
-    window.addEventListener(OPEN_TASK_DETAILS, listener);
-    return () => window.removeEventListener(OPEN_TASK_DETAILS, listener);
-  }, []);
-
-  /** True when a task-linked session can still be opened — open now, or
-   * loadable (archived sessions restore). A deleted id is pruned off the
-   * task so the next open relaunches instead of silently dead-ending. */
-  const taskSessionAlive = useCallback(
-    async (sessionId: string): Promise<boolean> => {
-      if (sessionsRef.current.some((entry) => entry.id === sessionId))
-        return true;
-      const loaded = await getSession(sessionId).catch(() => null);
-      if (loaded) return true;
-      pruneTaskSession(sessionId);
-      resolveVerifyForSession(sessionId);
-      return false;
-    },
-    [],
-  );
-
-  /** Full-launch dedupe: concurrent callers share one in-flight launch so a
-   * second open can't create the task session while children still prepare. */
-  const taskLaunchInflight = useRef(
-    new Map<string, Promise<string | undefined>>(),
-  );
-  /** Session creation serializes per task — child-scoped launches aren't
-   * covered by `taskLaunchInflight`, so two overlapping runs that both find
-   * no session would otherwise each create one and clobber the other's id. */
-  const taskSessionEnsure = useRef(
-    new Map<string, Promise<string | undefined>>(),
-  );
-  /** Brief sends in flight, keyed `taskIdsessionId` — `briefSentFor` is only
-   * persisted after the send resolves, so a second overlapping run (a
-   * child-scoped launch next to a full one) would send it twice. */
-  const taskBriefInflight = useRef(new Map<string, Promise<void>>());
-  /** Launch runs that already delivered the brief or a state-change notice —
-   * an edit's own "task was updated" notice must not repeat them. */
-  const taskLaunchDelivered = useRef(new WeakSet<Promise<unknown>>());
-  /**
-   * Prepares each unresolved child's working copy — creating the reviewed
-   * worktree or re-verifying an existing one — then ensures the task's
-   * single session exists, rooted at a ready host child's copy. The prompt
-   * names every repository's copy, branch and responsibility; the agent
-   * works across them from one conversation.
-   */
-  const launchTaskChildren = useCallback(
-    (
-      taskId: string,
-      childIds?: readonly string[],
-    ): Promise<string | undefined> => {
-      if (!childIds) {
-        const inflight = taskLaunchInflight.current.get(taskId);
-        if (inflight) return inflight;
-      }
-      const step = async (): Promise<string | undefined> => {
-        const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-        // An archived task is done — launching it would create a session the
-        // task indexes deliberately ignore.
-        if (!task || task.archived) return undefined;
-        const project = projectForTask(task);
-        // Launch states at run start — a reused session gets an update notice
-        // when this run changes any of them (prepared, downgraded, reset).
-        const startStates = new Map(
-          task.children.map((child) => [child.id, child.launch.state]),
-        );
-        // Ready children claim a live checkout — re-probe once per repository
-        // so a worktree deleted behind the task's back doesn't stay green.
-        const probedAnchors = new Map<
-          string,
-          Promise<RepositoryFamily | null>
-        >();
-        const familyFor = (anchor: string) => {
-          let probe = probedAnchors.get(anchor);
-          if (!probe) {
-            probe = probeRepositoryFamily(anchor).catch(() => null);
-            probedAnchors.set(anchor, probe);
-          }
-          return probe;
-        };
-        for (const child of task.children) {
-          if (childIds && !childIds.includes(child.id)) continue;
-          const record = loadTaskWorkspaces().find(
-            (entry) => entry.id === taskId,
-          );
-          // Removed or archived mid-run — stop preparing rather than writing
-          // launch state and a session onto a task that is now read-only.
-          if (!record || record.archived) return undefined;
-          const current = record.children.find(
-            (entry) => entry.id === child.id,
-          );
-          if (!current) continue;
-          if (current.launch.state === "ready") {
-            const target = current.workingCopy;
-            if (!target) continue;
-            const repo = project?.repositories.find(
-              (entry) => entry.id === current.repositoryId,
-            );
-            // A child whose repository left the project still gets its copy
-            // re-checked — probe from the recorded path itself so a vanished
-            // checkout downgrades honestly instead of staying green.
-            const family = await familyFor(repo?.anchor ?? target);
-            const exists = family && familyHasLiveCopy(family, target);
-            if (family && !exists) {
-              if (taskOwnsCheckout(current))
-                // The task recreates its own worktree on retry.
-                updateTaskChild(taskId, child.id, {
-                  launch: {
-                    state: "failed",
-                    error:
-                      "Working copy is no longer on disk — retry prepares it again.",
-                  },
-                });
-              else {
-                // A shared copy that vanished can't be recreated — clear the
-                // dead path so the child lands back on "set up". Session ids
-                // rooted at it and its saved PR row die with the binding.
-                updateTaskChild(taskId, child.id, {
-                  workingCopy: undefined,
-                  sessionIds: [],
-                  launch: { state: "pending" },
-                });
-                deleteTaskPrDraft(taskId, child.id);
-              }
-            }
-            continue;
-          }
-          if (!markTaskChildLaunching(taskId, child.id)) continue;
-          if (
-            !updateTaskChild(taskId, child.id, {
-              launch: { state: "working" },
-            })
-          ) {
-            unmarkTaskChildLaunching(taskId, child.id);
-            continue;
-          }
-          try {
-            const repo = project?.repositories.find(
-              (entry) => entry.id === child.repositoryId,
-            );
-            // A legacy child may own a session already — retry just resubmits
-            // its brief; worktrees and sessions are never replayed. A deleted
-            // session is pruned off the child so the copy relaunches cleanly.
-            // The session is only a shortcut while the copy it was rooted at
-            // still exists — a vanished or rebound path falls through to real
-            // preparation instead of marking a dead checkout "ready".
-            const sessionCopyExists = !current.workingCopy
-              ? false
-              : await (async () => {
-                  const anchor = repo?.anchor ?? current.workingCopy!;
-                  const family = await familyFor(anchor);
-                  if (!family) return true; // unverifiable — resubmit stays safe
-                  return familyHasLiveCopy(family, current.workingCopy!);
-                })();
-            if (
-              current.sessionIds.length &&
-              sessionCopyExists &&
-              (await taskSessionAlive(current.sessionIds[0]))
-            ) {
-              // The pre-launch snapshot still carries the previous failure —
-              // resend a brief built from the in-flight record so it doesn't
-              // announce "Preparation failed" while succeeding.
-              const latest =
-                loadTaskWorkspaces()
-                  .find((entry) => entry.id === taskId)
-                  ?.children.find((entry) => entry.id === child.id) ?? current;
-              const sent = await onSubmit(
-                current.sessionIds[0],
-                composeTaskPrompt(task, latest, repo),
-              );
-              // `onSubmit` returns undefined when the session can't take it
-              // (deleted mid-flight counts) — only `true` means delivered.
-              if (sent !== true)
-                throw new Error("The session did not accept the brief.");
-              updateTaskChild(taskId, child.id, {
-                launch: { state: "ready" },
-              });
-              continue;
-            }
-            if (
-              (current.baseRef && current.baseCommit && current.branch) ||
-              (current.existingBranch &&
-                current.baseCommit &&
-                current.workingCopy)
-            ) {
-              // Creating in the project anchor would target the wrong
-              // repository — the member record is required.
-              if (!repo)
-                throw new Error(
-                  "This repository is no longer in the project; re-add it, then retry.",
-                );
-              const anchor = repo.anchor;
-              try {
-                if (current.existingBranch) {
-                  // Attaches the reviewed local branch — Git refuses when it
-                  // is already checked out in another worktree of the family.
-                  await invoke<string>("git_worktree_checkout", {
-                    cwd: anchor,
-                    branch: current.existingBranch,
-                    commit: current.baseCommit,
-                    // Host-qualified path — the backend resolves WSL internally.
-                    path: current.workingCopy,
-                  });
-                } else {
-                  await invoke<string>("git_worktree_create", {
-                    cwd: anchor,
-                    base: current.baseRef,
-                    commit: current.baseCommit,
-                    branch: current.branch,
-                    // Host-qualified path — the backend resolves WSL internally.
-                    path: current.workingCopy,
-                  });
-                }
-              } catch (error) {
-                // A partial earlier attempt may already have created the copy —
-                // re-probe and reuse it rather than failing on "already exists".
-                // Only a worktree on the reviewed branch at the reviewed commit
-                // counts; a foreign copy at the same path is not ours.
-                const expected =
-                  current.existingBranch ??
-                  (current.branch ? `refs/heads/${current.branch}` : undefined);
-                const family = await probeRepositoryFamily(anchor);
-                const exists = family?.worktrees.some(
-                  (entry) =>
-                    current.workingCopy &&
-                    pathKey(entry.path) === pathKey(current.workingCopy) &&
-                    !entry.missing &&
-                    entry.branch === expected &&
-                    entry.head === current.baseCommit,
-                );
-                if (!exists) throw error;
-              }
-              notifyGitChanged(anchor);
-              // The anchor's notification does not reach subscribers keyed by
-              // the new worktree path — refresh it so task-child views stop
-              // showing the pre-creation empty state.
-              if (current.workingCopy) notifyGitChanged(current.workingCopy);
-            } else if (current.workingCopy) {
-              // Existing/main copy: re-verify it still exists before starting a
-              // session at a path that may have been moved or deleted. Shares
-              // the launch's per-anchor probe cache — siblings in the same
-              // repository don't re-list worktrees.
-              const target = current.workingCopy;
-              const family = await familyFor(repo?.anchor ?? target);
-              // A probe failure isn't a missing copy — say the check itself
-              // failed so a retry isn't mistaken for deletion.
-              if (!family)
-                throw new Error("Couldn't verify the working copy — retry.");
-              if (!familyHasLiveCopy(family, target))
-                throw new Error(
-                  "Working copy is no longer on disk — choose a replacement or remove this repository from the task.",
-                );
-            } else {
-              // Prepare-later child — stays actionable with no copy.
-              updateTaskChild(taskId, child.id, {
-                launch: { state: "pending" },
-              });
-              continue;
-            }
-            updateTaskChild(taskId, child.id, {
-              launch: { state: "ready" },
-            });
-          } catch (error) {
-            updateTaskChild(taskId, child.id, {
-              launch: { state: "failed", error: String(error) },
-            });
-          } finally {
-            unmarkTaskChildLaunching(taskId, child.id);
-          }
-        }
-        /** Creates the task's session when none is live — serialized through
-         * `taskSessionEnsure` so overlapping child-scoped runs can't each
-         * create one and clobber the winner's id. The brief is not sent here;
-         * the caller's brief-or-notice step covers new and reused sessions. */
-        const ensureTaskSessionLive = (): Promise<string | undefined> => {
-          const step = async (): Promise<string | undefined> => {
-            const current = loadTaskWorkspaces().find(
-              (entry) => entry.id === taskId,
-            );
-            if (!current || current.archived) return undefined;
-            const existing = firstTaskSessionId(current);
-            // A deleted conversation is pruned and replaced, not reused.
-            if (existing && (await taskSessionAlive(existing))) return existing;
-            // The session only exists once a child is verifiably ready —
-            // never rooted at a failed or not-yet-created working copy. The
-            // primary attempt's ready children win over a later attempt's.
-            const host =
-              current.children.find(
-                (entry) =>
-                  entry.id === current.lastActiveChildId &&
-                  entry.launch.state === "ready" &&
-                  entry.workingCopy,
-              ) ??
-              preferredTaskChild(
-                current,
-                (entry) =>
-                  entry.launch.state === "ready" && Boolean(entry.workingCopy),
-              );
-            if (!host?.workingCopy) return undefined;
-            const session = {
-              ...newDefaultSession(host.workingCopy),
-              title: current.name,
-              ...(current.ticket ? { linkedWorkItem: current.ticket } : {}),
-            };
-            const next = [...sessionsRef.current, session];
-            sessionsRef.current = next;
-            setSessions(next);
-            const tab = newTab(session.id);
-            appendTab(tab, host.workingCopy);
-            setRecents(rememberProject(host.workingCopy));
-            updateTask(taskId, (entry) => ({
-              ...entry,
-              // The launch conversation stays primary; sessions linked by
-              // location (created inside a task-owned worktree) keep their
-              // place in the list.
-              sessionIds: [
-                ...new Set([session.id, ...(entry.sessionIds ?? [])]),
-              ],
-              lastActiveChildId: host.id,
-            }));
-            setActiveTabId(tab.id);
-            // Match every other session reveal: the spawn may land while an
-            // overlay or the project terminal holds focus.
-            dismissOverlays();
-            setProjectTerminalFocused(false);
-            setComposerFocused(true);
-            return session.id;
-          };
-          const pending = taskSessionEnsure.current.get(taskId);
-          const ensure = (pending ?? Promise.resolve(undefined)).then(
-            step,
-            step,
-          );
-          taskSessionEnsure.current.set(taskId, ensure);
-          const cleanup = () => {
-            if (taskSessionEnsure.current.get(taskId) === ensure)
-              taskSessionEnsure.current.delete(taskId);
-          };
-          void ensure.then(cleanup, cleanup);
-          return ensure;
-        };
-        // One session per task — rooted at a ready child's working copy.
-        let fresh = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-        // Removed or archived while the child probes awaited — nothing more
-        // may launch on it.
-        if (!fresh || fresh.archived) return undefined;
-        const recorded = firstTaskSessionId(fresh);
-        let taskSessionId =
-          recorded && (await taskSessionAlive(recorded)) ? recorded : undefined;
-        if (!taskSessionId) {
-          taskSessionId = await ensureTaskSessionLive();
-          fresh = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-        }
-        if (!fresh || !taskSessionId) return undefined;
-        // The shared brief goes to any session missing it — briefSentFor can
-        // point at a replaced conversation or stay unset after a failed
-        // first send, and a child-scoped run may be this session's only
-        // chance to learn what the task is. A session that already has the
-        // brief gets a compact notice of what this run changed.
-        const briefKey = `${taskId}${taskSessionId}`;
-        let brief = taskBriefInflight.current.get(briefKey);
-        if (!brief && fresh.briefSentFor !== taskSessionId) {
-          brief = (async () => {
-            const sent = await onSubmit(
-              taskSessionId,
-              composeTaskSessionPrompt(fresh, project),
-            );
-            // A failed send leaves briefSentFor unset so a later run resends.
-            if (sent === true)
-              updateTask(taskId, (current) => ({
-                ...current,
-                briefSentFor: taskSessionId,
-              }));
-          })();
-          taskBriefInflight.current.set(briefKey, brief);
-          const clear = () => {
-            if (taskBriefInflight.current.get(briefKey) === brief)
-              taskBriefInflight.current.delete(briefKey);
-          };
-          void brief.then(clear, clear);
-          // `run` is already initialized — this line executes after awaits.
-          taskLaunchDelivered.current.add(run);
-        }
-        if (brief) {
-          // This run or an overlapping one delivers the brief — it carries
-          // the latest task state, so no separate update notice follows it.
-          await brief;
-        } else if (
-          fresh.children.some(
-            (entry) => startStates.get(entry.id) !== entry.launch.state,
-          )
-        ) {
-          // The session already has the brief — tell it what this run
-          // changed (a prepared child, a copy that vanished). Covers every
-          // caller: retry, open-child launch, and a repeated Start task.
-          taskLaunchDelivered.current.add(run);
-          void onSubmit(taskSessionId, composeTaskUpdateNotice(fresh, project));
-        }
-        if (!childIds) void onSelectHistorySession(taskSessionId);
-        return taskSessionId;
-      };
-      const run = step();
-      if (!childIds) {
-        taskLaunchInflight.current.set(taskId, run);
-        // then(cleanup, cleanup) — a bare `run.finally` would float a
-        // rejected promise nobody handles.
-        const cleanup = () => {
-          if (taskLaunchInflight.current.get(taskId) === run)
-            taskLaunchInflight.current.delete(taskId);
-        };
-        void run.then(cleanup, cleanup);
-      }
-      return run;
-    },
-    [
-      appendTab,
-      dismissOverlays,
-      onSelectHistorySession,
-      onSubmit,
-      taskSessionAlive,
-    ],
-  );
-
-  /** Sessions whose pending approval or question needs the user now. */
-  const needsInputSessionIds = useMemo(
-    () =>
-      new Set(sessions.filter(sessionNeedsInput).map((session) => session.id)),
-    [sessions],
-  );
-
-  /** Retries one task child's launch. A reused session is told what changed
-   * by the launch run itself — no per-caller notice needed here. */
-  const onRetryTaskChild = useCallback(
-    (taskId: string, childId: string) => {
-      void launchTaskChildren(taskId, [childId]);
-    },
-    [launchTaskChildren],
-  );
-
-  const onOpenTaskChild = useCallback(
-    async (taskId: string, childId: string) => {
-      const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-      const child = task?.children.find((entry) => entry.id === childId);
-      if (!task || !child) return;
-      armTaskFocus(taskId);
-      // The task's single session wins; a legacy child may own its own.
-      // A dead id falls through to the next candidate before giving up.
-      const candidates = [task.sessionIds?.[0], child.sessionIds[0]].filter(
-        (id): id is string => Boolean(id),
-      );
-      for (const sessionId of candidates) {
-        if (!(await taskSessionAlive(sessionId))) continue;
-        // Only re-attribute the active child when it actually owns the
-        // session we're opening — the shared task session stays rooted at
-        // its host's copy regardless of which child was clicked.
-        if (
-          !task.sessionIds?.includes(sessionId) &&
-          child.sessionIds.includes(sessionId)
-        )
-          recordTaskActiveChild(taskId, childId);
-        await onSelectHistorySession(sessionId);
-        // A "ready" child may point at a copy deleted since launch — the
-        // child launch path re-probes it and downgrades honestly.
-        void launchTaskChildren(taskId, [childId]);
-        return;
-      }
-      // No live session — dead or never recorded. Recreating one is a start,
-      // not an open: land on details where Start/Retry live.
-      setTaskDetailsId(taskId);
-    },
-    [
-      armTaskFocus,
-      launchTaskChildren,
-      onSelectHistorySession,
-      taskSessionAlive,
-    ],
-  );
-
-  /** The task's live session when one exists — otherwise its details sheet.
-   * Opening a row never launches work: "Start task" is the explicit verb. */
-  const onOpenTask = useCallback(
-    (taskId: string) => {
-      const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-      if (!task) return;
-      armTaskFocus(taskId);
-      if (task.sessionIds?.length) {
-        void (async () => {
-          if (await taskSessionAlive(task.sessionIds![0])) {
-            void onSelectHistorySession(task.sessionIds![0]);
-            return;
-          }
-          setTaskDetailsId(taskId);
-        })();
-        return;
-      }
-      if (!task.children.some((entry) => entry.sessionIds.length)) {
-        setTaskDetailsId(taskId);
-        return;
-      }
-      const child =
-        task.children.find(
-          (entry) =>
-            entry.id === task.lastActiveChildId && entry.sessionIds.length,
-        ) ??
-        preferredTaskChild(task, (entry) => entry.sessionIds.length > 0) ??
-        preferredTaskChild(task, (entry) => Boolean(entry.workingCopy)) ??
-        task.children[0];
-      if (child) void onOpenTaskChild(taskId, child.id);
-    },
-    [armTaskFocus, onOpenTaskChild, onSelectHistorySession, taskSessionAlive],
-  );
-
-  /** Explicit launch — prepares every actionable child and starts the
-   * task's session. Kept separate from open so a row click never surprises. */
-  const onStartTask = useCallback(
-    (taskId: string) => {
-      armTaskFocus(taskId);
-      void launchTaskChildren(taskId);
-    },
-    [armTaskFocus, launchTaskChildren],
-  );
-
-  /** Another conversation for a task, rooted in a child's working copy.
-   * Linked explicitly (not via the location claim) so shared checkouts link
-   * too; title + ticket match what the claim/`ensureOpenSession` would set.
-   * Returns the session so task-destination sends can stage onto it
-   * synchronously. */
-  const openTaskConversation = useCallback(
-    (taskId: string, childId: string): Session | undefined => {
-      const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-      const child = task?.children.find((entry) => entry.id === childId);
-      if (!task || task.archived || !child?.workingCopy) return undefined;
-      const session = newDefaultSession(child.workingCopy);
-      session.title = task.name;
-      session.linkedWorkItem = task.ticket;
-      linkTaskSession(task.id, session.id);
-      const tab = newTab(session.id);
-      const next = [...sessionsRef.current, session];
-      sessionsRef.current = next;
-      setSessions(next);
-      appendTab(tab, child.workingCopy);
-      setActiveTabId(tab.id);
-      setComposerFocused(true);
-      armTaskFocus(taskId);
-      // The sheet and whatever full surface it was opened over (inbox,
-      // search, …) would otherwise stay on top of the new conversation.
-      setTaskDetailsId(null);
-      dismissOverlays();
-      return session;
-    },
-    [appendTab, armTaskFocus, dismissOverlays],
-  );
-  const onNewTaskConversation = useCallback(
-    (taskId: string, childId: string) => {
-      openTaskConversation(taskId, childId);
-    },
-    [openTaskConversation],
-  );
-
-  /** Resolves the owning project for a send-to-task path without inventing
-   * rows: unverified worktree/subdirectory paths are probed so the real
-   * project is found by `commonDir`, and a path that isn't a Git repository
-   * yields no project rather than a junk anchor. */
-  const ensureTaskProject = useCallback(async (path: string | undefined) => {
-    if (!path || !looksLikeProject(path)) return undefined;
-    const keyed = pathKey(path);
-    let family = getVerifiedFamilies().get(keyed);
-    if (!family) family = (await probeRepositoryFamily(path)) ?? undefined;
-    const existing = family
-      ? findProjectByCommonDir(family.commonDir)?.project
-      : loadProjects().find(
-          (entry) => entry.anchor && pathKey(entry.anchor) === keyed,
-        );
-    if (existing) return existing;
-    if (!family) return undefined;
-    // Anchor at the real checkout, not a worktree or subdirectory the send
-    // happened to originate from.
-    return ensureProjectForPath(family.checkout || path, family);
-  }, []);
-
-  /** Prepared context routed to a task: stage it on the task's session —
-   * starting the task first when it has none — or open the create sheet and
-   * continue the send once the task exists. Repairs resolve the child whose
-   * working copy matches the evidence checkout, so the fix lands where the
-   * files are. */
-  const routeContextToTask = async (
-    request: AgentContextRequest,
-    destination: Extract<AgentDestination, { kind: "task" | "new-task" }>,
-    signal?: AbortSignal,
-  ): Promise<string | undefined> => {
-    const done = () => request.onPrepared?.();
-    /** The project repository whose family inventory contains `path` —
-     * the anchor itself or any member worktree. */
-    const repoOwningPath = (
-      project: ProjectRecord | undefined,
-      path: string,
-    ) => {
-      const key = pathKey(path);
-      return project?.repositories.find((repo) => {
-        if (pathKey(repo.anchor) === key) return true;
-        const family = familyForRepository(repo, getVerifiedFamilies());
-        return family ? familyHasCopy(family, path) : false;
-      });
-    };
-    let context = request.context;
-    // Work items carried by the entries also link onto the task — its
-    // Issues row and future sessions then see the same ticket.
-    const workItems = [
-      ...new Map(
-        context.entries.flatMap((entry) =>
-          entry.workItem
-            ? [
-                [
-                  `${entry.workItem.url} · ${entry.workItem.account ?? ""}`,
-                  entry.workItem,
-                ] as const,
-              ]
-            : [],
-        ),
-      ).values(),
-    ];
-    /** Same delivery rule as the session tail — text entries still land
-     * when the resolved harness can't take attachments. */
-    const deliverable = (target: Session) =>
-      request.attachmentsOptional &&
-      context.attachments.length &&
-      !harnessSupportsAttachments(target.harness)
-        ? { ...context, attachments: [] }
-        : context;
-    /** A task conversation rooted at the evidence checkout: the matching
-     * child is prepared when needed, then a live session rooted there wins
-     * over a freshly linked conversation at the same copy. */
-    const repairTaskSession = async (task: TaskWorkspace): Promise<string> => {
-      const evidence = request.repair!;
-      const key = pathKey(evidence.head.cwd);
-      let child = task.children.find(
-        (entry) => entry.workingCopy && pathKey(entry.workingCopy) === key,
-      );
-      if (!child) {
-        const repo = repoOwningPath(projectForTask(task), evidence.head.cwd);
-        if (!repo)
-          throw new Error(
-            `"${task.name}" has no working copy at ${evidence.head.cwd} — add that checkout to the task, or pick a conversation rooted there.`,
-          );
-        // The create sheet treats another task's claim as concurrent-writer
-        // evidence — hold the same line here instead of silently binding a
-        // shared checkout.
-        const claimed = taskChildrenForWorkingCopy(
-          evidence.head.cwd,
-          loadTaskWorkspaces(),
-          task.id,
-        )[0];
-        if (claimed)
-          throw new Error(
-            `${evidence.head.cwd} already belongs to "${claimed.task.name}" — send the repair there instead.`,
-          );
-        child = addTaskChildren(task.id, [
-          {
-            repositoryId: repo.id,
-            mode: "existing",
-            workingCopy: evidence.head.cwd,
-          },
-        ]).find(
-          (entry) => entry.workingCopy && pathKey(entry.workingCopy) === key,
-        );
-      }
-      if (!child)
-        throw new Error(
-          `The checkout at ${evidence.head.cwd} could not be added to "${task.name}".`,
-        );
-      if (child.launch.state !== "ready")
-        await launchTaskChildren(task.id, [child.id]);
-      const current =
-        loadTaskWorkspaces().find((entry) => entry.id === task.id) ?? task;
-      child = current.children.find((entry) => entry.id === child!.id);
-      if (!child?.workingCopy || child.launch.state !== "ready")
-        throw new Error(
-          child?.launch.state === "failed"
-            ? (child.launch.error ??
-                `The checkout at ${evidence.head.cwd} is not ready.`)
-            : `The checkout at ${evidence.head.cwd} is not ready yet — prepare it from the task first.`,
-        );
-      const resolved = await Promise.all(
-        [...taskSessionIds(current)].map(async (id) => ({
-          id,
-          session:
-            sessionsRef.current.find((entry) => entry.id === id) ??
-            (await getSession(id).catch(() => null)),
-        })),
-      );
-      for (const { id, session } of resolved) {
-        if (!session || pathKey(sessionWorkCwd(session)) !== key) continue;
-        // The repair tail needs the session in sessionsRef — if it can't
-        // be restored, the next candidate still gets its chance.
-        if (!(await ensureOpenSession(id))) continue;
-        return id;
-      }
-      const session = openTaskConversation(task.id, child.id);
-      if (!session)
-        throw new Error(
-          `A conversation could not be opened in ${evidence.head.cwd}.`,
-        );
-      return session.id;
-    };
-    /** The create sheet's post-creation step: the send continues on the
-     * new task's conversation instead of stopping at a linked ticket. */
-    const continueSend = (taskId: string) => {
-      void (async () => {
-        try {
-          const task = loadTaskWorkspaces().find(
-            (entry) => entry.id === taskId && !entry.archived,
-          );
-          if (!task) {
-            request.onFailed?.("That task no longer exists.");
-            return;
-          }
-          const sessionId = request.repair
-            ? await repairTaskSession(task)
-            : await launchTaskChildren(taskId);
-          if (!sessionId) {
-            // Children still pending or failed — details show why; the
-            // brief already carries the context summary, so the send did
-            // land on the task.
-            setTaskDetailsId(taskId);
-            request.onPrepared?.();
-            return;
-          }
-          await onSelectHistorySession(sessionId);
-          if (request.repair) {
-            // The sheet's confirm is a fresh user action — the picker's
-            // abort signal died with it and must not reach this send.
-            await prepareContextDestinationRef.current(
-              { ...request, context },
-              { kind: "session", sessionId },
-            );
-            return;
-          }
-          const target = sessionsRef.current.find(
-            (entry) => entry.id === sessionId,
-          );
-          if (!target) {
-            request.onFailed?.(
-              "The task's conversation is no longer available.",
-            );
-            return;
-          }
-          const next = workItems.length
-            ? linkTicketContext(target, deliverable(target))
-            : prepareSessionContext(target, deliverable(target), true);
-          const updated = sessionsRef.current.map((session) =>
-            session.id === next.id ? next : session,
-          );
-          sessionsRef.current = updated;
-          setSessions(updated);
-          request.onPrepared?.();
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : String(error);
-          request.onFailed?.(reason);
-          await message(reason, { title: "Send to task", kind: "error" });
-        }
-      })();
-    };
-    if (destination.kind === "new-task") {
-      // A second send would remount the sheet and silently discard the
-      // form the user is editing — refuse instead.
-      if (taskSheet)
-        throw new Error("Finish or cancel the open task sheet first.");
-      const copyPath = request.repair?.head.cwd ?? request.cwd;
-      const path =
-        copyPath || active?.cwd || sessionDefaults?.cwd || projectCwd;
-      // Unresolved context still opens the sheet — its project picker owns
-      // the choice the inbox used to ask for up front.
-      const project = await ensureTaskProject(path);
-      // The changes/evidence live in copyPath — that working copy becomes
-      // the task's child so the work stays where the files already are.
-      const changedRepo = copyPath
-        ? repoOwningPath(project, copyPath)
-        : undefined;
-      const files = context.entries
-        .map((entry) => `- ${entry.title}`)
-        .join("\n");
-      openTaskSheet({
-        ...(project ? { projectId: project.id } : {}),
-        ...(workItems.length ? { initialTickets: workItems } : {}),
-        ...(files
-          ? {
-              initialBrief: `${request.repair ? "Repair evidence" : "Selected changes"}${copyPath ? ` in ${prettyCwd(copyPath)}` : ""}:\n${files}`,
-            }
-          : {}),
-        ...(changedRepo && copyPath
-          ? {
-              initialChildren: [
-                {
-                  repositoryId: changedRepo.id,
-                  mode: "existing" as const,
-                  workingCopy: copyPath,
-                },
-              ],
-            }
-          : {}),
-        continueSend,
-      });
-      // Not `done()` — the send lands only when continueSend stages it, so
-      // a cancelled sheet leaves the sender's selection intact.
-      return undefined;
-    }
-    const task = loadTaskWorkspaces().find(
-      (entry) => entry.id === destination.taskId && !entry.archived,
-    );
-    if (!task) throw new Error("That task no longer exists.");
-    for (const workItem of workItems) linkTicketToTask(task.id, workItem);
-    // Record the worktree holding the changes on the task when its
-    // repository isn't a child yet — the task then lists where the
-    // selected change actually lives. Repairs resolve their own child in
-    // repairTaskSession instead.
-    const taskProject = projectForTask(task);
-    const changedRepo =
-      !request.repair && request.cwd
-        ? repoOwningPath(taskProject, request.cwd)
-        : undefined;
-    if (
-      changedRepo &&
-      !task.children.some((child) => child.repositoryId === changedRepo.id)
-    ) {
-      try {
-        addTaskChildren(task.id, [
-          {
-            repositoryId: changedRepo.id,
-            mode: "existing",
-            workingCopy: request.cwd,
-          },
-        ]);
-      } catch (error) {
-        // A conflicting copy claim — the staged context still carries
-        // the change, but say so instead of silently skipping the repo.
-        context = {
-          ...context,
-          entries: [
-            ...context.entries,
-            {
-              id: crypto.randomUUID(),
-              title: "Repository not added to the task",
-              origin: "Send to task",
-              text: `The working copy holding these changes was not added to "${task.name}": ${String(error)}`,
-            },
-          ],
-        };
-      }
-    }
-    let sessionId: string | undefined;
-    if (request.repair) {
-      sessionId = await repairTaskSession(task);
-    } else {
-      sessionId = firstTaskSessionId(task);
-      // A deleted conversation id must not shadow a relaunch.
-      if (sessionId && !(await taskSessionAlive(sessionId)))
-        sessionId = undefined;
-      // No session yet — the send starts the task, then stages the context.
-      if (!sessionId) sessionId = await launchTaskChildren(task.id);
-    }
-    if (!sessionId) {
-      // Land on details where the failed/pending launch state explains
-      // why — the throw then keeps the sender's selection for a retry.
-      setTaskDetailsId(task.id);
-      throw new Error(
-        `"${task.name}" has no session — its working copies aren't ready yet.`,
-      );
-    }
-    // Open first — a session that was only on disk loads into sessionsRef
-    // here, so staging before this call could silently drop the context.
-    await onSelectHistorySession(sessionId);
-    if (request.repair) {
-      return await prepareContextDestinationRef.current(
-        { ...request, context },
-        { kind: "session", sessionId },
-        signal,
-      );
-    }
-    const target = sessionsRef.current.find(
-      (session) => session.id === sessionId,
-    );
-    if (!target)
-      throw new Error("The task's conversation is no longer available.");
-    const next = workItems.length
-      ? linkTicketContext(target, deliverable(target))
-      : prepareSessionContext(target, deliverable(target), true);
-    const updated = sessionsRef.current.map((session) =>
-      session.id === next.id ? next : session,
-    );
-    sessionsRef.current = updated;
-    setSessions(updated);
-    done();
-    return sessionId;
-  };
-  const routeContextToTaskRef = useRef(routeContextToTask);
-  routeContextToTaskRef.current = routeContextToTask;
-
-  /** Send-to-agent routing through the task model: link the item onto an
-   * existing task and open it, or open the create sheet with the item
-   * pre-linked. `null` taskId means a new task. */
-  const onStartItemToTask = useCallback(
-    async (
-      item: InboxItem,
-      taskId: string | null,
-      opts?: { freshSession?: boolean },
-    ) => {
-      const linked = linkedWorkItemFromInboxItem(item);
-      if (taskId) {
-        const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-        if (linked) {
-          linkTicketToTask(taskId, linked);
-          // Reflect the link on the task's existing sessions too — otherwise
-          // the issue never shows in those conversations' Issues rows.
-          const sessionIds =
-            task && !task.archived ? [...taskSessionIds(task)] : []; // archived: the link was dropped — don't touch its sessions
-          if (sessionIds.length) {
-            const next = sessionsRef.current.map((session) => {
-              if (!sessionIds.includes(session.id)) return session;
-              const updated = addSessionWorkItems(session, [linked]);
-              return linkedWorkItemIdentityChanged(
-                session.linkedWorkItem,
-                updated.linkedWorkItem,
-              )
-                ? { ...updated, linkedWorkItemUpdateCard: undefined }
-                : updated;
-            });
-            sessionsRef.current = next;
-            setSessions(next);
-          }
-        }
-        setInboxViewOpen(false);
-        // Fresh send — a new agent session in the task's working copy
-        // rather than its existing conversation(s). The active child wins;
-        // nothing prepared falls back to open's routing so the user can
-        // still set the copy up.
-        if (opts?.freshSession && task && !task.archived) {
-          const child =
-            task.children.find(
-              (entry) =>
-                entry.id === task.lastActiveChildId && entry.workingCopy,
-            ) ?? task.children.find((entry) => entry.workingCopy);
-          if (child) {
-            onNewTaskConversation(taskId, child.id);
-            return;
-          }
-        }
-        // Several conversations — land on the details picker instead of an
-        // arbitrary one; one or none keeps open's own routing. Resolvable =
-        // open sessions plus persisted history, matching the sheet's list.
-        if (
-          task &&
-          liveTaskSessionIds(
-            task,
-            new Set(
-              [...sessionsRef.current, ...history].map((session) => session.id),
-            ),
-          ).length > 1
-        )
-          setTaskDetailsId(taskId);
-        else onOpenTask(taskId);
-        return;
-      }
-      const path =
-        item.projectPath || active?.cwd || sessionDefaults?.cwd || projectCwd;
-      // The resolved project is only the sheet's initial selection — the
-      // picker inside the modal owns the final choice.
-      const project = await ensureTaskProject(path);
-      setInboxViewOpen(false);
-      openTaskSheet({
-        ...(project ? { projectId: project.id } : {}),
-        initialName: inboxItemTaskName(item),
-        ...(linked ? { initialTickets: [linked] } : {}),
-      });
-    },
-    [
-      active?.cwd,
-      ensureTaskProject,
-      history,
-      onNewTaskConversation,
-      onOpenTask,
-      openTaskSheet,
-      projectCwd,
-      sessionDefaults?.cwd,
     ],
   );
 
@@ -7981,10 +6207,7 @@ export default function App({
         continue;
       }
       if (
-        !canDispatchQueuedHead(
-          session,
-          repairCheckingRef.current.has(session.id),
-        ) ||
+        !canDispatchQueuedHead(session) ||
         queueDispatchingRef.current.has(session.id)
       ) {
         continue;
@@ -8005,19 +6228,16 @@ export default function App({
             !latest ||
             !head ||
             head.id !== next.id ||
-            !canDispatchQueuedHead(
-              latest,
-              repairCheckingRef.current.has(session.id),
-            )
+            !canDispatchQueuedHead(latest)
           ) {
             return;
           }
-          onSubmit(
-            session.id,
-            head.text,
-            head.attachments,
-            queuedMessageOptions(head),
-          );
+          onSubmit(session.id, head.text, head.attachments, {
+            queuedMessageId: head.id,
+            noteCard: head.noteCard,
+            handoffCard: head.handoffCard,
+            intent: head.intent,
+          });
         }, 0),
       );
     }
@@ -8029,15 +6249,6 @@ export default function App({
 
   const onDeleteQueuedMessage = useCallback(
     (sessionId: string, messageId: string) => {
-      const repair = sessionsRef.current
-        .find((s) => s.id === sessionId)
-        ?.queuedMessages?.find((row) => row.id === messageId)?.repair;
-      if (repair)
-        updateRepair(
-          repair.id,
-          "blocked",
-          "Queued repair cancelled before delivery.",
-        );
       setSessions((prev) =>
         prev.map((session) =>
           session.id === sessionId
@@ -8070,13 +6281,7 @@ export default function App({
             ? {
                 ...session,
                 queuedMessages: session.queuedMessages?.map((message) =>
-                  message.id === messageId && !message.repair
-                    ? // Edited text no longer matches the action's captured
-                      // revision — drop the evidence stamp.
-                      message.text === text
-                      ? message
-                      : { ...message, text, action: undefined }
-                    : message,
+                  message.id === messageId ? { ...message, text } : message,
                 ),
                 editingQueuedMessageId: undefined,
               }
@@ -8105,8 +6310,11 @@ export default function App({
         return;
       }
       onSubmit(sessionId, message.text, message.attachments, {
-        ...queuedMessageOptions(message),
         followUpBehavior: "steer",
+        queuedMessageId: message.id,
+        noteCard: message.noteCard,
+        handoffCard: message.handoffCard,
+        intent: message.intent,
       });
     },
     [onSubmit, enqueueHarnessEvent, flushHarnessEvents],
@@ -8184,7 +6392,7 @@ export default function App({
       const source = sessionsRef.current.find(
         (session) => session.id === sourceId,
       );
-      if (!source) return;
+      if (!source || source.worktreeRemoved) return;
       const { harness, model, modelSettings } = target;
       const cwd = sessionWorkCwd(source);
       const from = harnessForTurn(source.blocks, turn, source.harness);
@@ -8197,14 +6405,16 @@ export default function App({
         files,
       });
       const session = {
-        ...newSession(harness, cwd, model, source.runtimeMode),
+        ...newSession(harness, source.cwd, model, source.runtimeMode),
+        worktreeCwd: source.worktreeCwd,
+        branch: source.branch,
         modelSettings: mergeModelSettings(
           resolveModel(harness, model),
           modelSettings,
         ),
         title: formatSessionTitle(harness, SECOND_OPINION_TITLE),
       };
-      openSessionBeside(sourceId, session, cwd);
+      openSessionBeside(sourceId, session, source.cwd);
       onSubmit(session.id, prompt, [], {
         secondOpinion: buildSecondOpinionCard({
           from,
@@ -8222,7 +6432,7 @@ export default function App({
       const source = sessionsRef.current.find(
         (session) => session.id === sourceId,
       );
-      if (!source) return;
+      if (!source || source.worktreeRemoved) return;
       const { harness, model, modelSettings } = target;
       const cwd = sessionWorkCwd(source);
       const from = harnessForTurn(source.blocks, turn, source.harness);
@@ -8231,7 +6441,9 @@ export default function App({
       const files = turnEditedFiles(sliced.blocks, cwd);
       const display = sessionDisplayTitle(source.title, source.harness);
       const session = {
-        ...newSession(harness, cwd, model, source.runtimeMode),
+        ...newSession(harness, source.cwd, model, source.runtimeMode),
+        worktreeCwd: source.worktreeCwd,
+        branch: source.branch,
         modelSettings: mergeModelSettings(
           resolveModel(harness, model),
           modelSettings,
@@ -8248,235 +6460,10 @@ export default function App({
           files,
         }),
       };
-      openSessionBeside(sourceId, session, cwd, true);
+      openSessionBeside(sourceId, session, source.cwd, true);
     },
     [openSessionBeside],
   );
-
-  const onRunAgentAction = useCallback(
-    (args: {
-      sourceSessionId: string;
-      cwd: string;
-      harness: HarnessId;
-      model: string;
-      text: string;
-      action: ActionRunRef;
-    }) => {
-      const source = sessionsRef.current.find(
-        (session) => session.id === args.sourceSessionId,
-      );
-      const session = {
-        ...newSession(args.harness, args.cwd, args.model, source?.runtimeMode),
-        title: formatSessionTitle(args.harness, args.action.name),
-      };
-      openSessionBeside(args.sourceSessionId, session, args.cwd);
-      onSubmit(session.id, args.text, [], {
-        action: args.action,
-        followUpBehavior: "queue",
-      });
-    },
-    [onSubmit, openSessionBeside],
-  );
-
-  const onOpenCommands = useCallback(
-    (options: {
-      anchor: PopoverAnchor;
-      path?: string;
-      projectId?: string;
-      taskId?: string;
-    }) => setCommandsMenu(options),
-    [],
-  );
-
-  /**
-   * Runs a saved command in the project dock. A bound terminal is reused —
-   * running (or a launch still in flight) → focus only, idle → rerun in
-   * place — so one command can never launch twice, and a remount or restart
-   * never re-fires it. Returns an error string for the menu to show.
-   */
-  const onRunProjectCommand = useCallback(
-    async (
-      command: {
-        id: string;
-        name: string;
-        command: string;
-        repositoryId?: string;
-        relativeCwd?: string;
-        steps?: { command: string; host?: "native" }[];
-      },
-      project: ProjectRecord | undefined,
-      task: TaskWorkspace | null | undefined,
-      fallbackCwd?: string,
-    ): Promise<string | undefined> => {
-      const target = resolveCommandTarget({
-        command,
-        project,
-        task,
-        fallbackCwd,
-      });
-      if ("error" in target) return target.error;
-      const projectPath = projectCwdRef.current;
-      if (!looksLikeProject(projectPath))
-        return "Open a project folder to run commands.";
-      // A launch already in flight (still awaiting the cwd check) must not
-      // let a fast second click queue a duplicate.
-      if (commandLaunchRef.current.has(command.id)) return;
-      commandLaunchRef.current.add(command.id);
-      try {
-        return await runProjectCommand(command, target, projectPath);
-      } finally {
-        commandLaunchRef.current.delete(command.id);
-      }
-    },
-    [focusProjectTerminal],
-  );
-
-  /** Body of `onRunProjectCommand`, split out so the in-flight guard can wrap
-   * every await uniformly. */
-  const runProjectCommand = async (
-    command: {
-      id: string;
-      name: string;
-      command: string;
-      repositoryId?: string;
-      relativeCwd?: string;
-      steps?: { command: string; host?: "native" }[];
-    },
-    target: { cwd: string },
-    projectPath: string,
-  ): Promise<string | undefined> => {
-    // The bound terminal can live in another project's dock — dedupe has
-    // to search everywhere, not just the visible dock.
-    let boundPath: string | undefined;
-    let bound: FilePaneTab | undefined;
-    for (const dock of projectTerminalsRef.current) {
-      const found = dock.pane.files.find(
-        (file) => file.command?.presetId === command.id,
-      );
-      if (found) {
-        boundPath = dock.projectPath;
-        bound = found;
-        break;
-      }
-    }
-    if (bound && boundPath) {
-      // A terminal bound to a different project's dock can't be focused or
-      // re-fired from here — mutating it would run invisible work.
-      if (!sameProjectPath(boundPath, projectPath)) {
-        return `"${command.name}" is bound to a terminal in ${prettyCwd(boundPath)}.`;
-      }
-      const fileId = bound.id;
-      const dockPath = boundPath;
-      const focus = () => {
-        if (sameProjectPath(dockPath, projectPath)) focusProjectTerminal();
-      };
-      const reveal = (entry: ProjectTerminal) =>
-        withDockOpen(selectDockTerminal(entry, fileId), true);
-      // runId > launched means a launch is queued but the PTY write hasn't
-      // landed — treat as running so a fast second click can't double-fire.
-      // A failed run is over even when `launched` never landed, so it stays
-      // re-runnable instead of wedging the terminal.
-      const launchPending =
-        (bound.command?.runId ?? 0) > (bound.command?.launched ?? 0) &&
-        bound.command?.failed !== bound.command?.runId;
-      if (bound.foreground || launchPending) {
-        setProjectTerminals((prev) =>
-          mapProjectTerminal(prev, dockPath, reveal),
-        );
-        focus();
-        return;
-      }
-      // pty_spawn silently falls back to $HOME for a missing directory —
-      // check first so a stale worktree can't run elsewhere. Only a rerun
-      // or fresh launch pays the (possibly WSL) roundtrip.
-      const exists = await listDir(target.cwd)
-        .then(() => true)
-        .catch(() => false);
-      if (!exists) return `Directory not found: ${target.cwd}`;
-      if (!sameProjectPath(bound.cwd, target.cwd)) {
-        // The target moved (task worktree, repository or subdirectory
-        // changed) — a PTY can't change directory, so replace the terminal
-        // in its own dock.
-        const file: FilePaneTab = {
-          ...newTerminalFile(target.cwd, command.name),
-          command: {
-            presetId: command.id,
-            name: command.name,
-            text: command.command,
-            ...(command.steps?.length ? { steps: command.steps } : {}),
-            runId: 1,
-          },
-        };
-        setProjectTerminals((prev) =>
-          mapProjectTerminal(prev, dockPath, (entry) => ({
-            ...entry,
-            open: true,
-            pane: {
-              ...entry.pane,
-              files: entry.pane.files.map((item) =>
-                item.id === fileId ? file : item,
-              ),
-              activeFileId: file.id,
-            },
-          })),
-        );
-        focus();
-        return;
-      }
-      // Same target — re-fire with the command's current text so edits are
-      // never replayed stale.
-      setProjectTerminals((prev) =>
-        mapProjectTerminal(prev, dockPath, (entry) =>
-          reveal(
-            patchDockTerminal(entry, fileId, {
-              // Tab label follows an edited command name.
-              title: command.name,
-              command: {
-                name: command.name,
-                text: command.command,
-                // Explicit undefined clears keys a fresh run no longer has —
-                // the meta merge keeps old keys otherwise.
-                steps: command.steps?.length ? command.steps : undefined,
-                failed: undefined,
-                step: undefined,
-                runId: (bound.command?.runId ?? 0) + 1,
-              },
-            }),
-          ),
-        ),
-      );
-      focus();
-      return;
-    }
-    const exists = await listDir(target.cwd)
-      .then(() => true)
-      .catch(() => false);
-    if (!exists) return `Directory not found: ${target.cwd}`;
-    const file: FilePaneTab = {
-      ...newTerminalFile(target.cwd, command.name),
-      command: {
-        presetId: command.id,
-        name: command.name,
-        text: command.command,
-        ...(command.steps?.length ? { steps: command.steps } : {}),
-        runId: 1,
-      },
-    };
-    setProjectTerminals((prev) =>
-      findProjectTerminal(prev, projectPath)
-        ? mapProjectTerminal(prev, projectPath, (entry) =>
-            addTerminalToDock(entry, file),
-          )
-        : [...prev, createProjectTerminal(projectPath, file)],
-    );
-    focusProjectTerminal();
-  };
-
-  const onStopProjectCommand = useCallback((fileId: string) => {
-    // Ctrl-C — stops the foreground process, keeps the terminal and its
-    // scrollback so the bound command stays re-runnable.
-    void writePty(fileId, "\x03").catch(() => undefined);
-  }, []);
 
   const autoContinueKey = sessions
     .filter(
@@ -8511,7 +6498,7 @@ export default function App({
       const current = sessionsRef.current.find(
         (session) => session.id === sessionId,
       );
-      if (!current || current.busy) return false;
+      if (!current || current.busy || current.worktreeRemoved) return false;
       if (!canCompactHarnessContext(current.harness)) {
         const unsupported = sessionsRef.current.map((session) =>
           session.id === sessionId
@@ -8532,10 +6519,10 @@ export default function App({
       const workCwd = sessionWorkCwd(current);
       const started = sessionsRef.current.map((session) =>
         session.id === sessionId
-          ? applyHarnessEvent(startSessionActivity(session), {
-              type: "status",
-              text: "Compacting context…",
-            })
+          ? applyHarnessEvent(
+              { ...session, busy: true },
+              { type: "status", text: "Compacting context…" },
+            )
           : session,
       );
       sessionsRef.current = started;
@@ -8550,11 +6537,10 @@ export default function App({
             cwd: workCwd,
             model: current.model,
             modelSettings: current.modelSettings,
-            providerAccountId:
-              current.harness === "claude" || current.harness === "codex"
-                ? (current.providerAccountId ??
-                  selectedProviderAccountId(current.harness, current.cwd))
-                : undefined,
+            providerAccountId: supportsProviderAccounts(current.harness)
+              ? (current.providerAccountId ??
+                selectedProviderAccountId(current.harness, current.cwd))
+              : undefined,
             runtimeMode: current.runtimeMode,
             onEvent: (event) => {
               if (turnGen.current.get(sessionId) !== gen) return;
@@ -8579,7 +6565,7 @@ export default function App({
           if (turnGen.current.get(sessionId) !== gen) return;
           flushHarnessEvents();
           const finished = sessionsRef.current.map((session) =>
-            session.id === sessionId ? stopStreaming(session) : session,
+            session.id === sessionId ? { ...session, busy: false } : session,
           );
           sessionsRef.current = finished;
           syncDockBadge(finished);
@@ -8604,9 +6590,6 @@ export default function App({
       turnGen.current.set(sessionId, (turnGen.current.get(sessionId) ?? 0) + 1);
       flushHarnessEvents();
       if (session) {
-        // The busy→idle edge below would otherwise verify a turn the user
-        // deliberately cut short.
-        suppressVerifyTurn(session);
         for (const id of sessionChildHarnesses(session)) {
           void cancelHarnessTurn(id, sessionId);
         }
@@ -8618,15 +6601,16 @@ export default function App({
           const completed = isPreparingHandoff(stopped)
             ? completeHandoff(stopped, buildDeterministicHandoff(stopped))
             : stopped;
-          return completed.queuedMessages?.length
-            ? { ...completed, queueStatus: "paused" }
-            : completed;
+          const ready = { ...completed, worktreePreparing: undefined };
+          return ready.queuedMessages?.length
+            ? { ...ready, queueStatus: "paused" }
+            : ready;
         }),
       );
       if (session) {
         notifyReviewChanged(sessionId);
         nudgeWorkspace(sessionWorkCwd(session));
-        notifyGitChanged(sessionWorkCwd(session));
+        notifyGitChanged();
         nudgeWatchedFiles();
         window.setTimeout(() => nudgeWatchedFiles(), 150);
       } else {
@@ -8683,13 +6667,8 @@ export default function App({
   const onApproval = useCallback(
     (sessionId: string, requestId: number, decision: ApprovalDecision) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
-      if (!session) return;
-      respondHarnessApproval(
-        sessionDecisionHarness(session),
-        sessionId,
-        requestId,
-        decision,
-      );
+      if (!session || session.worktreeRemoved) return;
+      respondHarnessApproval(session.harness, sessionId, requestId, decision);
     },
     [],
   );
@@ -8697,13 +6676,8 @@ export default function App({
   const onQuestionReply = useCallback(
     (sessionId: string, requestId: number, reply: UserQuestionReply) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
-      if (!session) return;
-      respondHarnessQuestion(
-        sessionDecisionHarness(session),
-        sessionId,
-        requestId,
-        reply,
-      );
+      if (!session || session.worktreeRemoved) return;
+      respondHarnessQuestion(session.harness, sessionId, requestId, reply);
     },
     [],
   );
@@ -8711,50 +6685,25 @@ export default function App({
   const onQuestionInteraction = useCallback(
     (sessionId: string, requestId: number) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
-      if (session)
-        keepHarnessQuestionOpen(
-          sessionDecisionHarness(session),
-          sessionId,
-          requestId,
-        );
+      if (session && !session.worktreeRemoved)
+        keepHarnessQuestionOpen(session.harness, sessionId, requestId);
     },
     [],
   );
 
   const onOpenApprovalSession = useCallback(
     (sessionId: string) => {
-      // Notification clicks and approval toasts can fire while an overlay is
-      // open — always reveal the session.
-      dismissOverlays();
       const parentId =
         sessionsRef.current.find((session) => session.id === sessionId)
           ?.orchestrationLeadId ?? orchestrator.forSession(sessionId)?.leadId;
       if (parentId && parentId !== sessionId) {
         setInspectedWorkerId(sessionId);
         if (!focusOpenSession(parentId)) void onSelectHistorySession(parentId);
-      } else if (focusOpenSession(sessionId)) {
-        const linkedUpdate = linkedSessionUpdatesRef.current.get(sessionId);
-        if (linkedUpdate) revealLinkedSessionUpdate(sessionId, linkedUpdate);
-      } else {
+      } else if (!focusOpenSession(sessionId)) {
         void onSelectHistorySession(sessionId);
       }
     },
-    [
-      dismissOverlays,
-      focusOpenSession,
-      onSelectHistorySession,
-      revealLinkedSessionUpdate,
-    ],
-  );
-
-  const onSelectLiveAgent = useCallback(
-    (sessionId: string) => {
-      setSearchViewOpen(false);
-      setInboxViewOpen(false);
-      setNotesViewOpen(false);
-      onOpenApprovalSession(sessionId);
-    },
-    [onOpenApprovalSession],
+    [focusOpenSession, onSelectHistorySession],
   );
 
   useEffect(() => {
@@ -8775,14 +6724,49 @@ export default function App({
     orchestrator.bind({
       session: (id) => sessionsRef.current.find((session) => session.id === id),
       sessions: () => sessionsRef.current,
-      choices: () =>
-        HARNESSES.filter((harness) => isHarnessAvailable(harness)).map(
-          (harness) => ({
-            harness,
-            models: modelsFor(harness).map(({ id, name }) => ({ id, name })),
-          }),
-        ),
+      choices: (cwd) =>
+        HARNESSES.filter((id) => isHarnessAvailable(id, cwd)).map((harness) => ({
+          harness,
+          models: modelsFor(harness, cwd).map(({ id, name }) => ({ id, name })),
+        })),
       createWorker: async (run, task) => {
+        const projectCwd = orchestrationProjectCwd(run);
+        const leadCheckoutCwd = orchestrationCheckoutCwd(run);
+        const lead = sessionsRef.current.find(
+          (session) => session.id === run.leadId,
+        );
+        if (!lead) throw new Error("Lead session is unavailable");
+        const workspace =
+          task.workspacePolicy === "shared"
+            ? workspaceIdentity(projectCwd, leadCheckoutCwd)
+            : task.workspace
+              ? await listWorktrees(leadCheckoutCwd).then((listed) => {
+                  const tree = listed.worktrees.find(
+                    (entry) =>
+                      pathKey(entry.path) ===
+                      pathKey(task.workspace!.checkoutCwd),
+                  );
+                  if (!tree)
+                    throw new Error(
+                      "This worker's retained worktree is missing. Its saved changes cannot be retried automatically.",
+                    );
+                  return workspaceIdentity(
+                    projectCwd,
+                    tree.path,
+                    tree.branch ?? task.workspace!.branch,
+                  );
+                })
+              : await createOrchestrationWorktree(
+                  leadCheckoutCwd,
+                  orchestrationWorktreeBranchName(task.id),
+                ).then((tree) =>
+                  workspaceIdentity(
+                    projectCwd,
+                    tree.path,
+                    tree.branch ?? undefined,
+                  ),
+                );
+        const checkoutCwd = workspace.checkoutCwd;
         const scratchDir = await invoke<string>("control_attach_worker", {
           leadId: run.leadId,
           sessionId: task.sessionId,
@@ -8790,31 +6774,37 @@ export default function App({
         const existing = sessionsRef.current.find(
           (session) => session.id === task.sessionId,
         );
-        const lead = sessionsRef.current.find(
-          (session) => session.id === run.leadId,
-        );
-        if (!lead) throw new Error("Lead session is unavailable");
         if (existing) {
           if (
             existing.harness !== task.harness ||
             existing.model !== task.model ||
-            existing.cwd !== run.cwd
+            !sameProjectPath(existing.cwd, projectCwd) ||
+            (!existing.worktreeRemoved &&
+              !sameProjectPath(sessionWorkCwd(existing), checkoutCwd))
           )
             throw new Error(
               "This worker's configuration changed. Restore its approved harness, model and project before retrying.",
             );
           // The lead's runtime mode governs its agents, including across a
           // change mid-run: auto stays auto, supervised asks the lead.
-          if (existing.runtimeMode !== lead.runtimeMode) {
-            const synced = { ...existing, runtimeMode: lead.runtimeMode };
-            await upsertSession(synced);
-            const next = sessionsRef.current.map((session) =>
-              session.id === synced.id ? synced : session,
-            );
-            sessionsRef.current = next;
-            setSessions(next);
-          }
-          return scratchDir;
+          const synced = {
+            ...existing,
+            cwd: projectCwd,
+            worktreeCwd: sameProjectPath(projectCwd, checkoutCwd)
+              ? undefined
+              : checkoutCwd,
+            branch: workspace.branch,
+            worktreeRemoved: false,
+            runtimeMode: lead.runtimeMode,
+            orchestrationLeadId: run.leadId,
+          };
+          await upsertSession(synced);
+          const next = sessionsRef.current.map((session) =>
+            session.id === synced.id ? synced : session,
+          );
+          sessionsRef.current = next;
+          setSessions(next);
+          return { scratchDir, workspace };
         }
         const restored = await getSession(task.sessionId);
         if (
@@ -8825,16 +6815,14 @@ export default function App({
             "The saved worker no longer matches its approved model. Create a new assignment.",
           );
         const fresh = {
-          ...newSession(
-            task.harness,
-            run.cwd,
-            task.model,
-            lead.runtimeMode,
-          ),
+          ...newSession(task.harness, projectCwd, task.model, lead.runtimeMode),
+          ...(sameProjectPath(projectCwd, checkoutCwd)
+            ? {}
+            : { worktreeCwd: checkoutCwd, branch: workspace.branch }),
           ...(task.modelSettings
             ? {
                 modelSettings: mergeModelSettings(
-                  resolveModel(task.harness, task.model, run.cwd),
+                  resolveModel(task.harness, task.model, checkoutCwd),
                   task.modelSettings,
                 ),
               }
@@ -8844,8 +6832,14 @@ export default function App({
           ? {
               ...restored,
               busy: false,
-              cwd: run.cwd,
-              worktreeCwd: undefined,
+              cwd: projectCwd,
+              worktreeCwd: sameProjectPath(projectCwd, checkoutCwd)
+                ? undefined
+                : checkoutCwd,
+              branch: sameProjectPath(projectCwd, checkoutCwd)
+                ? undefined
+                : workspace.branch,
+              worktreeRemoved: false,
               runtimeMode: lead.runtimeMode,
             }
           : {
@@ -8859,7 +6853,7 @@ export default function App({
             worker.harness,
             worker.id,
             worker.providerSessionId,
-            worker.cwd,
+            sessionWorkCwd(worker),
             worker.providerAccountId,
           );
         await upsertSession(worker);
@@ -8867,7 +6861,149 @@ export default function App({
         sessionsRef.current = next;
         setSessions(next);
         // Workers belong to the lead's agent panel; no workspace tab is created.
-        return scratchDir;
+        return { scratchDir, workspace };
+      },
+      integrateWorker: async (run, task) => {
+        const fromCwd = task.workspace?.checkoutCwd;
+        if (!fromCwd)
+          throw new Error("This worker's isolated checkout is unavailable");
+        const session = sessionsRef.current.find(
+          (entry) => entry.id === task.sessionId,
+        );
+        if (session)
+          await Promise.all(
+            sessionChildHarnesses(session).map((harness) =>
+              stopHarnessSession(harness, task.sessionId),
+            ),
+          );
+        await invoke("harness_kill", { sessionId: task.sessionId });
+        await invoke("control_turn_finished", { sessionId: task.sessionId });
+        await flushSessionCheckpoint(task.sessionId);
+        const listed = await listWorktrees(orchestrationCheckoutCwd(run));
+        const workerTree = listed.worktrees.find((tree) =>
+          sameProjectPath(tree.path, fromCwd),
+        );
+        const leadTree = listed.worktrees.find((tree) =>
+          sameProjectPath(tree.path, orchestrationCheckoutCwd(run)),
+        );
+        if (!workerTree || !leadTree)
+          throw new Error(
+            "The worker or lead checkout is no longer registered. The worker worktree was kept.",
+          );
+        if (workerTree.head !== leadTree.head)
+          throw new Error(
+            "The worker or lead branch moved while this task was running. The worker worktree was kept for manual review.",
+          );
+        return applySessionCheckpoint(
+          task.sessionId,
+          fromCwd,
+          orchestrationCheckoutCwd(run),
+        );
+      },
+      cleanupWorker: async (run, task, onlyIfUnchanged) => {
+        const workspace = task.workspace;
+        if (!workspace || workspace.kind !== "worktree") return true;
+        const path = workspace.checkoutCwd;
+        await flushSessionCheckpoint(task.sessionId);
+        const listed = await listWorktrees(orchestrationCheckoutCwd(run));
+        const exists = listed.worktrees.some(
+          (tree) => pathKey(tree.path) === pathKey(path),
+        );
+        if (!exists && onlyIfUnchanged) return false;
+        const workerTree = listed.worktrees.find(
+          (tree) => pathKey(tree.path) === pathKey(path),
+        );
+        const leadTree = listed.worktrees.find((tree) =>
+          sameProjectPath(tree.path, orchestrationCheckoutCwd(run)),
+        );
+        if (
+          exists &&
+          (!workerTree || !leadTree || workerTree.head !== leadTree.head)
+        ) {
+          if (onlyIfUnchanged) return false;
+          throw new Error(
+            "The worker or lead branch moved before cleanup. The worker worktree was kept for manual review.",
+          );
+        }
+        if (onlyIfUnchanged) {
+          const safe = await sessionCheckpointCleanupSafe(task.sessionId, path);
+          if (!safe) return false;
+        } else if (exists) {
+          // Re-verify immediately before destructive cleanup. The operation is
+          // idempotent, so this also finishes a partially applied integration.
+          await applySessionCheckpoint(
+            task.sessionId,
+            path,
+            orchestrationCheckoutCwd(run),
+          );
+        }
+
+        if (exists) {
+          onStop(task.sessionId, true);
+          const session = sessionsRef.current.find(
+            (entry) => entry.id === task.sessionId,
+          );
+          if (session) {
+            await Promise.all(
+              sessionChildHarnesses(session).map((harness) =>
+                stopHarnessSession(harness, task.sessionId),
+              ),
+            );
+          }
+          await invoke("harness_kill", { sessionId: task.sessionId });
+          await invoke("control_turn_finished", {
+            sessionId: task.sessionId,
+          });
+          await flushSessionWrites();
+          checkOpenWorktreeFiles(path);
+          const removed = await removeOrchestrationWorktree(
+            orchestrationCheckoutCwd(run),
+            path,
+          );
+          const affected = new Set([task.sessionId, ...removed.sessionIds]);
+          sessionsRef.current = sessionsRef.current.map((session) =>
+            affected.has(session.id)
+              ? detachSessionWorktree(session, removed.projectCwd, path)
+              : session,
+          );
+          setSessions(sessionsRef.current);
+          const detachSummary = (entry: SessionSummary) =>
+            affected.has(entry.id)
+              ? detachSessionWorktree(entry, removed.projectCwd, path)
+              : entry;
+          setHistory((current) => current.map(detachSummary));
+          setStoredLinkedSessions((current) => current.map(detachSummary));
+          if (session)
+            await Promise.allSettled(
+              sessionChildHarnesses(session).map((harness) =>
+                forgetHarnessSession(harness, task.sessionId),
+              ),
+            );
+        } else {
+          const detached = sessionsRef.current.find(
+            (entry) => entry.id === task.sessionId,
+          );
+          if (detached && !detached.worktreeRemoved) {
+            const next = detachSessionWorktree(
+              detached,
+              orchestrationProjectCwd(run),
+              path,
+            );
+            sessionsRef.current = sessionsRef.current.map((entry) =>
+              entry.id === task.sessionId ? next : entry,
+            );
+            setSessions(sessionsRef.current);
+            if (shouldPersistSession(next)) await upsertSession(next);
+          }
+        }
+        if (workspace.branch)
+          await removeOrchestrationBranch(
+            orchestrationCheckoutCwd(run),
+            workspace.branch,
+          );
+        await forgetSessionCheckpoint(task.sessionId);
+        notifyReviewChanged(task.sessionId);
+        return true;
       },
       submit: (id, text, done) => {
         // Commit the new turn before the scheduler or confirmation updates
@@ -8934,7 +7070,7 @@ export default function App({
         }
       },
     });
-  }, [onSubmit, onStop]);
+  }, [checkOpenWorktreeFiles, onSubmit, onStop]);
 
   useEffect(() => {
     orchestrator.sync();
@@ -9159,7 +7295,22 @@ export default function App({
         });
       },
     }),
-    [onOpenApprovalSession, queueWorkerPanes, onSubmit, updateOrchestrationCard],
+    [
+      onOpenApprovalSession,
+      queueWorkerPanes,
+      onSubmit,
+      updateOrchestrationCard,
+    ],
+  );
+
+  const onSelectLiveAgent = useCallback(
+    (sessionId: string) => {
+      setSearchViewOpen(false);
+      setInboxViewOpen(false);
+      setNotesViewOpen(false);
+      onOpenApprovalSession(sessionId);
+    },
+    [onOpenApprovalSession],
   );
 
   const nextTitleTabs: TitleTab[] = deckProjectTabs.map((tab) =>
@@ -9205,18 +7356,6 @@ export default function App({
     linkedSessionUpdates,
   } = useInboxActivity(recents, sidebarCwd, sidebarHistory);
   linkedSessionUpdatesRef.current = linkedSessionUpdates;
-  // Item-keyed view of the same updates — task rows own tickets, not
-  // sessions, so their menus look updates up by the ticket's identity.
-  const linkedItemUpdates = useMemo(() => {
-    const map = new Map<string, LinkedSessionUpdate>();
-    for (const update of linkedSessionUpdates.values()) {
-      const key = linkedWorkItemUpdateKey(update.linked);
-      const existing = map.get(key);
-      if (!existing || update.updatedAt > existing.updatedAt)
-        map.set(key, update);
-    }
-    return map;
-  }, [linkedSessionUpdates]);
   const inboxRelatedSessions = useMemo(() => {
     const byId = new Map<string, SessionSummary>();
     for (const session of storedLinkedSessions) byId.set(session.id, session);
@@ -9237,10 +7376,6 @@ export default function App({
               runtimeMode: summary.runtimeMode,
               title: summary.title,
               cwd: summary.cwd,
-              // Live values win — a stored summary can hold a worktree the
-              // session left behind, which would misgroup related threads.
-              worktreeCwd: summary.worktreeCwd,
-              branch: summary.branch,
               linkedWorkItem: summary.linkedWorkItem,
             }
           : summary,
@@ -9292,7 +7427,23 @@ export default function App({
     setSearchViewOpen(false);
     setInboxViewOpen(false);
     setNotesViewOpen(false);
+    setFilePickerInitialQuery("");
+    setFilePickerResetToken((token) => token + 1);
     setFilePickerOpen(true);
+  }, []);
+  const onOpenCommandPalette = useCallback(() => {
+    setSearchViewOpen(false);
+    setInboxViewOpen(false);
+    setNotesViewOpen(false);
+    setFilePickerInitialQuery(">");
+    setFilePickerResetToken((token) => token + 1);
+    setFilePickerOpen(true);
+  }, []);
+  const onReload = useCallback(() => {
+    void (async () => {
+      if (!(await confirmReload(dirtyFilesRef.current.size > 0))) return;
+      window.location.reload();
+    })();
   }, []);
 
   const onFindInProject = useCallback(() => {
@@ -9305,43 +7456,35 @@ export default function App({
   }, []);
 
   const onOpenSearch = useCallback(() => {
-    dismissOverlays();
+    setFilePickerOpen(false);
+    setSettingsOpen(false);
+    setInboxViewOpen(false);
+    setNotesViewOpen(false);
     setSearchViewOpen(true);
     setSearchViewFocusToken((token) => token + 1);
-  }, [dismissOverlays]);
+  }, []);
 
   const onLeaveSearch = useCallback(() => {
     setSearchViewOpen(false);
   }, []);
 
   const onOpenInbox = useCallback(() => {
-    // The remembered conversation portals through a live session leaf —
-    // re-place it when its pane was closed while the inbox was hidden. Its
-    // dismissOverlays runs synchronously before the setters below, so the
-    // inbox still ends up open.
-    if (
-      inboxConversationId &&
-      !tabsRef.current.some((entry) =>
-        leafIds(entry.layout).includes(inboxConversationId),
-      )
-    )
-      void onSelectHistorySession(inboxConversationId);
-    dismissOverlays();
-    setInboxTarget(null);
+    setFilePickerOpen(false);
+    setSettingsOpen(false);
+    setSearchViewOpen(false);
+    setNotesViewOpen(false);
     setInboxViewOpen(true);
-  }, [dismissOverlays, inboxConversationId, onSelectHistorySession]);
+  }, []);
 
   const onOpenLinkedWorkItem = useCallback(
-    (item: LinkedWorkItem, sessionId?: string) => {
-      if (!sessionId) {
-        dismissOverlays();
-        setInboxTarget({ ...item });
-        setInboxViewOpen(true);
-        return;
-      }
+    (item: LinkedWorkItem, sessionId: string) => {
       const request = linkedWorkItemPanelRequest.current + 1;
       linkedWorkItemPanelRequest.current = request;
-      dismissOverlays();
+      setFilePickerOpen(false);
+      setSettingsOpen(false);
+      setSearchViewOpen(false);
+      setNotesViewOpen(false);
+      setInboxViewOpen(false);
       const cwd =
         sessionsRef.current.find((session) => session.id === sessionId)?.cwd ??
         history.find((session) => session.id === sessionId)?.cwd ??
@@ -9361,132 +7504,30 @@ export default function App({
         });
       });
     },
-    [dismissOverlays, history, onSelectHistorySession, sidebarCwd],
+    [history, onSelectHistorySession, sidebarCwd],
   );
-
-  useEffect(() => {
-    const open = (event: Event) =>
-      onOpenLinkedWorkItem((event as CustomEvent<LinkedWorkItem>).detail);
-    window.addEventListener(OPEN_INBOX_WORK_ITEM, open);
-    return () => window.removeEventListener(OPEN_INBOX_WORK_ITEM, open);
-  }, [onOpenLinkedWorkItem]);
 
   const onLeaveInbox = useCallback(() => {
     setInboxViewOpen(false);
   }, []);
 
-  /** Mounts a delivery review tab (PR comments, checks, pipeline jobs) into
-   * the session's workspace tab — or a fresh workspace tab when the session
-   * isn't open anywhere. Shared by the inbox delivery opener and the task
-   * details' delivery rows. */
-  const mountDeliveryTab = useCallback(
-    (sessionId: string, cwd: string, delivery: DeliveryTabSource) => {
-      const existing = tabsRef.current.find((tab) =>
-        leafIds(tab.layout).includes(sessionId),
-      );
-      const base = existing ?? newTab(sessionId);
-      const file = {
-        id: crypto.randomUUID(),
-        path: delivery.kind === "pr" ? "Pull requests" : "CI",
-        cwd,
-        delivery,
-      };
-      if (existing) {
-        setTabs((previous) =>
-          previous.map((tab) =>
-            tab.id === existing.id ? openEditorTab(tab, file) : tab,
-          ),
-        );
-        activateTab(existing.id);
-      } else {
-        appendTab(openEditorTab(base, file), cwd);
-        setActiveTabId(base.id);
-      }
-      setSidebarTab("changes");
-      setComposerFocused(false);
-    },
-    [activateTab, appendTab],
-  );
-
-  const onOpenInboxDelivery = useCallback(
-    async (
-      sessionId: string,
-      kind: "pr" | "ci",
-      current: () => boolean,
-      provider: "github" | "azure" | "gitlab",
-      prUrl?: string,
-      gitlabTarget?: { repo: string; number: number },
-    ) => {
-      const session = await ensureOpenSession(sessionId);
-      if (!current()) return;
-      if (!session || session.inboxAsk)
-        throw new Error(
-          "Open a workspace conversation for this item before reviewing PRs or CI.",
-        );
-      const cwd = sessionWorkCwd(session);
-      const checkout = await ciContext(cwd);
-      if (!current()) return;
-      if (
-        sessionWorkCwd(
-          sessionsRef.current.find((value) => value.id === sessionId) ??
-            session,
-        ) !== cwd
-      )
-        throw new Error(
-          "The conversation checkout changed. Open its review again.",
-        );
-      // Reject before saving — a dead CI choice must not persist.
-      if (provider === "gitlab" && kind === "ci")
-        throw new Error(GITLAB_CI_ON_MR);
-      saveDeliveryProvider(cwd, checkout.branch, sessionId, kind, provider);
-      // GitLab delivery tabs bind to the inbox item's own MR identity when it
-      // carries one; otherwise to the open MR for the checkout's branch.
-      const target =
-        provider === "github"
-          ? await githubDeliveryTarget(cwd, prUrl, kind)
-          : provider === "gitlab"
-            ? (gitlabTarget ??
-              (await gitlabDeliveryTarget(cwd, checkout.branch)))
-            : undefined;
-      if (
-        !current() ||
-        sessionWorkCwd(
-          sessionsRef.current.find((value) => value.id === sessionId) ??
-            session,
-        ) !== cwd
-      )
-        throw new Error(
-          "The conversation checkout changed. Open its review again.",
-        );
-      mountDeliveryTab(sessionId, cwd, {
-        kind,
-        branch: checkout.branch,
-        sourceSessionId: sessionId,
-        ...(provider === "github" || provider === "gitlab"
-          ? { provider, repo: target!.repo, number: target!.number }
-          : {}),
-      });
-      setInboxViewOpen(false);
-    },
-    [ensureOpenSession, mountDeliveryTab],
-  );
-
   const onOpenInboxSession = useCallback(
-    async (sessionId: string) => {
-      await onSelectHistorySession(sessionId);
-      setInboxViewOpen(true);
-      setInboxConversationId(sessionId);
-      setInboxConversationRevision((value) => value + 1);
-      setComposerFocused(true);
+    (sessionId: string) => {
+      setInboxViewOpen(false);
+      setSidebarTab("sessions");
+      void onSelectHistorySession(sessionId);
     },
     [onSelectHistorySession],
   );
 
   const onOpenNotes = useCallback(() => {
     if (!loadNotesEnabled()) return;
-    dismissOverlays();
+    setFilePickerOpen(false);
+    setSettingsOpen(false);
+    setSearchViewOpen(false);
+    setInboxViewOpen(false);
     setNotesViewOpen(true);
-  }, [dismissOverlays]);
+  }, []);
 
   const onLeaveNotes = useCallback(() => {
     setNotesViewOpen(false);
@@ -9494,7 +7535,10 @@ export default function App({
 
   const openSettings = useCallback(
     (section?: SettingsSectionId, anchor?: SettingsAnchor) => {
-      dismissOverlays();
+      setFilePickerOpen(false);
+      setSearchViewOpen(false);
+      setInboxViewOpen(false);
+      setNotesViewOpen(false);
       if (section) {
         setSettingsSection(section);
         saveSettingsSection(section);
@@ -9503,16 +7547,19 @@ export default function App({
       setNotificationProjectPath(null);
       setSettingsOpen(true);
     },
-    [dismissOverlays],
+    [],
   );
 
   const onOpenSettings = useCallback(() => openSettings(), [openSettings]);
 
-  const onOpenNotificationSettings = useCallback((path?: string) => {
-    openSettings("inbox", "project-notifications");
-    setNotificationProjectPath(path ?? null);
-    setNotificationSettingsRequest((request) => request + 1);
-  }, [openSettings]);
+  const onOpenNotificationSettings = useCallback(
+    (path?: string) => {
+      openSettings("inbox", "project-notifications");
+      setNotificationProjectPath(path ?? null);
+      setNotificationSettingsRequest((request) => request + 1);
+    },
+    [openSettings],
+  );
 
   const onOpenInboxIntegrations = useCallback(
     (source: ConnectableInboxSource) => openSettings("inbox", source),
@@ -9528,937 +7575,39 @@ export default function App({
     saveSettingsSection(section);
   }, []);
 
-  // --- Attention queue (#76) + watcher engine (#23) ---
-
-  const attentionRaw = useSyncExternalStore(
-    subscribeAttention,
-    attentionSnapshot,
-  );
-  const mergeResolutions = useSyncExternalStore(
-    subscribeMergeResolutions,
-    mergeResolutionSnapshot,
-  );
-  const attentionStore = useMemo(
-    () => attentionStoreFromSnapshot(attentionRaw),
-    [attentionRaw],
-  );
-  const repairRows = useSyncExternalStore((listener) => {
-    window.addEventListener(REPAIR_CHANGE, listener);
-    return () => window.removeEventListener(REPAIR_CHANGE, listener);
-  }, repairRecordsSafe);
-  // Family discovery publishes once per probed path — coalesce the startup
-  // burst into one render the same way the rail does.
-  const [verifiedFamilies, setVerifiedFamilies] = useState(getVerifiedFamilies);
-  useEffect(() => {
-    let timer = 0;
-    const unsubscribe = subscribeRepositoryFamilies(() => {
-      window.clearTimeout(timer);
-      timer = window.setTimeout(
-        () => setVerifiedFamilies(getVerifiedFamilies()),
-        40,
-      );
-    });
-    return () => {
-      window.clearTimeout(timer);
-      unsubscribe();
-    };
-  }, []);
-  const hiddenWorktreeRaw = useSyncExternalStore(
-    subscribeWorkingCopyPreferences,
-    hiddenWorkingCopiesSnapshot,
-  );
-  const [worktreeManager, setWorktreeManager] =
-    useState<WorktreeManagerRequest | null>(null);
-  const [worktreeManagerBusy, setWorktreeManagerBusy] = useState(false);
-  // Rails, sheets and menus open the shared modal through this event instead
-  // of threading a callback through every layer.
-  useEffect(() => {
-    const open = (event: Event) => {
-      setWorktreeManagerBusy(false);
-      setWorktreeManager((event as CustomEvent<WorktreeManagerRequest>).detail);
-    };
-    window.addEventListener(OPEN_WORKTREE_MANAGER, open);
-    return () => window.removeEventListener(OPEN_WORKTREE_MANAGER, open);
-  }, []);
-  // Live + persisted sessions across every checkout. `sidebarHistory` is
-  // cwd-filtered; task details and worktree staleness must see sessions in
-  // sibling working copies too.
-  const allSessions = useMemo(() => {
-    const byId = new Map<string, SessionSummary>();
-    for (const entry of history) byId.set(entry.id, entry);
-    for (const session of sessions) {
-      if (session.inboxAsk) continue;
-      byId.set(session.id, summaryFromSession(session));
-    }
-    return [...byId.values()];
-  }, [history, sessions]);
-  // Every resolvable conversation — open sessions plus persisted history.
-  // Task "N conversations" labels count these, never stale task records.
-  const liveSessionIds = useMemo(
-    () => new Set(allSessions.map((session) => session.id)),
-    [allSessions],
-  );
-  const worktreeSessionActivity = useMemo(() => {
-    const activity = new Map<string, number>();
-    const touch = (cwd: string | undefined, at: number) => {
-      if (!cwd) return;
-      const key = pathKey(cwd);
-      if ((activity.get(key) ?? 0) < at) activity.set(key, at);
-    };
-    for (const entry of history)
-      touch(entry.worktreeCwd ?? entry.cwd, entry.updatedAt);
-    // An open session counts as activity now — Session carries no updatedAt.
-    for (const session of sessions) touch(sessionWorkCwd(session), Date.now());
-    return activity;
-  }, [history, sessions]);
-  // The cleanup nudge only covers repositories the rail can show —
-  // incidentally probed families must not raise attention rows.
-  const attentionFamilies = useMemo(
-    () =>
-      railReachableFamilies({
-        families: verifiedFamilies,
-        recents,
-        currentCwd: projectCwd,
-        projects: projectsList,
-      }),
-    [verifiedFamilies, recents, projectCwd, projectsList],
-  );
-  const worktreeAttention = useMemo(
-    () =>
-      worktreeCleanupAttention({
-        families: attentionFamilies,
-        recents,
-        sessionActivity: worktreeSessionActivity,
-        currentCwd: projectCwd,
-        hidden: hiddenWorkingCopies(hiddenWorktreeRaw),
-      }),
-    [
-      attentionFamilies,
-      recents,
-      worktreeSessionActivity,
-      projectCwd,
-      hiddenWorktreeRaw,
-    ],
-  );
-  const derivedAttention = useMemo(
-    () => [
-      ...deriveLocalAttention({
-        sessions,
-        unseenFinishedIds,
-        reminders: sessionReminders.due,
-        repairs: repairRows,
-      }),
-      ...worktreeAttention,
-    ],
-    [
-      sessions,
-      unseenFinishedIds,
-      sessionReminders,
-      repairRows,
-      worktreeAttention,
-    ],
-  );
-  const attentionItems = useMemo(
-    () => visibleAttention(derivedAttention, attentionStore),
-    [derivedAttention, attentionStore],
-  );
-  const [queueAnchor, setQueueAnchor] = useState<HTMLElement | null>(null);
-  const onToggleQueue = useCallback(
-    (anchor: HTMLElement) =>
-      setQueueAnchor((current) => (current ? null : anchor)),
-    [],
-  );
-
-  /** Repair drafts route through the context picker — the user confirms the
-   * destination and instruction before anything reaches an agent. */
-  const dispatchRepairDraft = useCallback(
-    (
-      draft: { evidence: RepairEvidence; context: AgentContext },
-      sessionId?: string,
-      options?: {
-        instruction?: string;
-        onRefresh?: (instruction: string) => void;
-      },
-    ) => {
-      // When the sending conversation belongs to a task, preselect that
-      // task — the repair resolves its checkout-matching child on confirm.
-      requestAgentContext({
-        context: options?.instruction
-          ? { ...draft.context, instruction: options.instruction }
-          : draft.context,
-        repair: draft.evidence,
-        cwd: draft.evidence.head.cwd,
-        sourceSessionId: sessionId,
-        destination: taskDestinationForSession(sessionId),
-        onRefreshEvidence: options?.onRefresh,
-      });
-    },
-    [],
-  );
-
-  /** The task conversation a checkout-scoped action belongs to: a session
-   * rooted in that working copy first (the fix lands where the files are),
-   * then the first live task conversation. Each id resolves once — the same
-   * load answers aliveness, the cwd match and the pruning. */
-  const taskActionSession = useCallback(
-    async (task: TaskWorkspace, cwd?: string): Promise<string | undefined> => {
-      const key = cwd ? pathKey(cwd) : undefined;
-      let first: string | undefined;
-      const resolved = await Promise.all(
-        [...taskSessionIds(task)].map(async (id) => ({
-          id,
-          session:
-            sessionsRef.current.find((entry) => entry.id === id) ??
-            (await getSession(id).catch(() => null)),
-        })),
-      );
-      for (const { id, session } of resolved) {
-        if (!session) {
-          // Dead id — same pruning taskSessionAlive performs.
-          pruneTaskSession(id);
-          resolveVerifyForSession(id);
-          continue;
-        }
-        if (!first) first = id;
-        if (key && pathKey(sessionWorkCwd(session)) === key) return id;
-      }
-      return first;
-    },
-    [],
-  );
-
-  /** Task-details CI Fix — builds the repair draft through the same verified
-   * provider flows the attention queue uses, then aims it at the task's live
-   * conversation. With no live conversation the destination picker asks where
-   * the evidence should go. */
-  const onFixTaskCi = useCallback(
-    async (task: TaskWorkspace, fix: TaskCiFix, instruction?: string) => {
-      try {
-        const sessionId = await taskActionSession(
-          task,
-          fix.kind === "azure" ? fix.source.cwd : fix.cwd,
-        );
-        const draft =
-          fix.kind === "azure"
-            ? await azureCiRepairDraft({
-                target: fix.source.target,
-                cwd: fix.source.cwd,
-                branch: fix.source.branch,
-                remote: fix.source.remote,
-                runId: fix.run.id,
-                definitionName: fix.source.definitionName,
-                sessionId,
-              })
-            : fix.kind === "github"
-              ? await githubCiRepair({
-                  cwd: fix.cwd,
-                  repo: fix.repo,
-                  number: fix.number,
-                })
-              : await gitlabPipelineRepair({
-                  cwd: fix.cwd,
-                  repo: fix.repo,
-                  number: fix.number,
-                });
-        requestAgentContext({
-          context: instruction
-            ? { ...draft.context, instruction }
-            : draft.context,
-          repair: draft.evidence,
-          cwd: draft.evidence.head.cwd,
-          sourceSessionId: sessionId,
-          // The task is the known destination — confirm resolves the child
-          // whose working copy matches the evidence checkout.
-          destination: { kind: "task", taskId: task.id },
-          // Rebuild the draft on refresh — stale evidence dead-ends the
-          // picker otherwise.
-          onRefreshEvidence: (next) => void onFixTaskCi(task, fix, next),
-        });
-      } catch (error) {
-        await message(error instanceof Error ? error.message : String(error), {
-          title: task.name,
-          kind: "error",
-        });
-      }
-    },
-    [taskActionSession],
-  );
-
-  /** Opens a details row's review surface — PR comments, checks, pipeline
-   * jobs — as a delivery tab inside the task's live conversation. The file
-   * binds the child's checkout (the PR/MR/run belongs to it) while the tab
-   * lands wherever that conversation lives. */
-  const onOpenTaskDelivery = useCallback(
-    async (task: TaskWorkspace, child: TaskChild, ref: TaskDeliveryRef) => {
-      try {
-        const sessionId = await taskActionSession(task, child.workingCopy);
-        if (!sessionId) {
-          await message(
-            "Start the task's conversation first — review tabs open inside it.",
-            { title: task.name, kind: "warning" },
-          );
-          return;
-        }
-        const session = await ensureOpenSession(sessionId);
-        if (!session || session.inboxAsk)
-          throw new Error("The task's conversation can't host review tabs.");
-        const cwd = child.workingCopy;
-        if (!cwd) return;
-        const checkout = await ciContext(cwd);
-        const repo =
-          ref.provider === "github" && !ref.repo
-            ? (await githubRepo(cwd)).trim()
-            : ref.repo;
-        // A provider row without a repo binding must not degrade into the
-        // Azure fallback — the review would open against the wrong provider.
-        if (ref.provider && !repo)
-          throw new Error(
-            `Couldn't resolve the ${ref.provider} remote for this checkout.`,
-          );
-        setTaskDetailsId(null);
-        mountDeliveryTab(sessionId, cwd, {
-          kind: ref.kind,
-          branch: checkout.branch,
-          sourceSessionId: sessionId,
-          ...(ref.provider && repo
-            ? { provider: ref.provider, repo, number: ref.number ?? 0 }
-            : {}),
-        });
-      } catch (error) {
-        await message(error instanceof Error ? error.message : String(error), {
-          title: task.name,
-          kind: "error",
-        });
-      }
-    },
-    [ensureOpenSession, mountDeliveryTab, taskActionSession],
-  );
-
-  /** Fetch + merge/rebase the PR's base branch into the bound checkout.
-   * Confirm-gated; conflicts stay in the tree and can be sent to the owning
-   * agent or aborted explicitly. */
-  const onAttentionUpdateBranch = useCallback(
-    async (
-      item: AttentionItem,
-      action: Extract<AttentionAction, { kind: "update-branch" }>,
-    ) => {
-      // Same guard as the menu/panel flow — a bare "~" would probe $HOME.
-      if (!action.cwd || action.cwd === "~") {
-        await message("This row has no working copy to update.", {
-          title: item.title,
-          kind: "warning",
-        });
-        return;
-      }
-      // Share the menu/panel sync slot — confirmations must not stack on
-      // the same working copy even when the entry points differ.
-      const release = acquireSyncSlot(action.cwd);
-      if (!release) {
-        await message(
-          "A sync or update is already running on this working copy — wait for it to finish.",
-          { title: item.title, kind: "warning" },
-        );
-        return;
-      }
-      try {
-        // The confirm must not describe an impossible operation — run the
-        // same preflight the menu/panel flow does before asking.
-        const index = await gitDiffIndex(action.cwd);
-        const refusal = syncPreflightRefusal(index);
-        if (refusal) {
-          await message(refusal, { title: item.title, kind: "warning" });
-          return;
-        }
-        // The binding names the branch this row was emitted for — merging
-        // into a checkout that has since moved would corrupt the wrong
-        // one. Rows without a binding pin the live branch instead.
-        if (action.branch && index.branch !== action.branch) {
-          await message(
-            `Checkout is on ${index.branch || "detached HEAD"}, not ${action.branch}. Switch back or dismiss the row.`,
-            { title: item.title, kind: "warning" },
-          );
-          return;
-        }
-        const branch = action.branch ?? index.branch;
-        if (!branch) {
-          await message(
-            `${action.cwd} has no branch checked out — nothing to update.`,
-            { title: item.title, kind: "warning" },
-          );
-          return;
-        }
-        // A bare base name is fetched from the checkout's remote — name it
-        // so the confirm can't hide a multi-remote surprise.
-        const baseLabel = action.base
-          ? `the ${action.base.includes("/") ? action.base : `${index.remote ?? "remote"}/${action.base}`} branch`
-          : `the ${index.remote ?? "remote"} default branch`;
-        const where = `\n\nWorking copy: ${action.cwd}\nHost: ${syncHostLabel(action.cwd)}`;
-        let mode: "merge" | "rebase" = "merge";
-        const merge = await ask(
-          `Fetch ${baseLabel} and merge it into ${branch}? The tree must be clean; conflicts stay in place for you to resolve. Nothing is pushed.${where}`,
-          {
-            title: item.title,
-            kind: "info",
-            okLabel: "Merge",
-            cancelLabel: "Rebase instead…",
-          },
-        );
-        // Esc/backdrop/X abort outright — only the "Rebase instead…" action
-        // leads to the rebase prompt.
-        if (merge === null) return;
-        if (!merge) {
-          if (
-            !(await ask(
-              `Rebase ${branch} onto ${baseLabel}? Nothing is pushed.${where}`,
-              {
-                title: item.title,
-                kind: "info",
-                okLabel: "Rebase",
-                cancelLabel: "Cancel",
-              },
-            ))
-          )
-            return;
-          mode = "rebase";
-        }
-        // Pin the branch the confirm named — it can move during the
-        // dialogs or the fetch itself.
-        const result = await gitUpdateFromDefault(
-          action.cwd,
-          mode,
-          action.base,
-          branch,
-        );
-        if (result.outcome === "conflicts") {
-          // Same resolution flow as a panel/menu sync — live merge state is
-          // re-read on send, and a sessionless row gets the picker.
-          await offerMergeResolution(
-            {
-              cwd: action.cwd,
-              sessionId: action.sessionId,
-              title: item.title,
-            },
-            result.updatedFrom,
-            result.conflicts,
-            mode,
-          );
-          return;
-        }
-        // The condition the row described is handled locally — mute it by
-        // signature so the next poll (still-behind remote state) doesn't
-        // immediately resurface it; a real state change re-emits it.
-        dismissAttention(item.key, item.signature);
-        await message(
-          result.outcome === "up-to-date"
-            ? `${result.branch} is already up to date with ${result.updatedFrom}.`
-            : mode === "rebase"
-              ? `Rebased ${result.branch} onto ${result.updatedFrom}. Nothing was pushed.`
-              : `Merged ${result.updatedFrom} into ${result.branch}. Nothing was pushed.`,
-          { title: item.title },
-        );
-      } finally {
-        // Any outcome — merged, conflicts, refusal, or a failed merge the
-        // backend unwound — can have changed the tree; refresh, then free
-        // the slot so a follow-up sync isn't refused.
-        notifyGitChanged(action.cwd);
-        release();
-      }
-    },
-    [],
-  );
-
-  /** Session-row "Sync with remote default": the session owns its working
-   * copy — the sync runs there and conflicts route back to this
-   * conversation. The shared flow confirms the exact ref/host first. */
-  const onSyncSessionDefault = useCallback(async (summary: SessionSummary) => {
-    const cwd = sessionWorkCwd(summary);
-    try {
-      await syncWithDefaultBranch({
-        cwd,
-        sessionId: summary.id,
-        title: sessionDisplayTitle(summary.title, summary.harness),
-      });
-    } catch (error) {
-      await message(error instanceof Error ? error.message : String(error), {
-        title: "Sync with remote default",
-        kind: "warning",
-      });
-    }
-  }, []);
-
-  /** Bulk sync of a task's linked working copies — conflicts go straight to
-   * each copy's owning agent; the sheet streams per-copy outcomes. */
-  const [taskSync, setTaskSync] = useState<{
-    name: string;
-    rows: TaskBranchSyncRow[];
-  } | null>(null);
-  const onSyncTaskBranches = useCallback((taskId: string) => {
-    const task = loadTaskWorkspaces().find((entry) => entry.id === taskId);
-    if (!task || task.archived) return;
-    setTaskSync({ name: task.name, rows: [] });
-    void syncTaskBranches(task, (rows) =>
-      setTaskSync((current) =>
-        // Dismissed mid-run — keep working, don't reopen the sheet.
-        current ? { ...current, rows: [...rows] } : current,
-      ),
-    );
-  }, []);
-
-  const onAttentionAction = useCallback(
-    async (item: AttentionItem, instruction?: string) => {
-      const action = item.action;
-      if (!action) return;
-      // Repair sends whose evidence this handler rebuilds can be refreshed
-      // in place — re-running the action re-reads the provider and keeps
-      // the instruction the user already typed.
-      const repairOpts = {
-        instruction,
-        onRefresh: (next: string) => void onAttentionAction(item, next),
-      };
-      try {
-        switch (action.kind) {
-          case "open-session":
-            onOpenApprovalSession(action.sessionId);
-            return;
-          case "open-changes":
-            onOpenApprovalSession(action.sessionId);
-            setSidebarTab("changes");
-            return;
-          case "open-item":
-            onOpenLinkedWorkItem(action.item);
-            return;
-          case "start-task":
-            onStartItemToTask(action.item, null);
-            return;
-          case "open-delivery":
-            await onOpenInboxDelivery(
-              action.sessionId,
-              action.delivery,
-              () => true,
-              action.provider,
-              action.prUrl,
-            );
-            return;
-          case "send-context":
-            requestAgentContext({
-              context: action.context,
-              cwd: item.cwd,
-              sourceSessionId: action.sessionId,
-            });
-            return;
-          case "repair": {
-            requestAgentContext({
-              context: action.context,
-              repair: action.evidence,
-              cwd: action.evidence.head.cwd,
-              sourceSessionId: item.sessionId,
-              destination: taskDestinationForSession(item.sessionId),
-            });
-            return;
-          }
-          case "azure-pr-comments": {
-            const { pr, revision } = await readAzurePr(action.target);
-            if (pr.status !== "active")
-              throw new Error("The PR is no longer active.");
-            const association: AzurePrAssociation = {
-              target: action.target,
-              pr,
-              revision,
-              account: action.target.accountId,
-              projectName: action.projectName,
-              repositoryName: action.repositoryName,
-              cwd: action.cwd,
-              branch: action.branch,
-              ...(action.sessionId
-                ? { sourceSessionId: action.sessionId }
-                : {}),
-            };
-            const threads = await readAzurePrSection<AzurePrThread>(
-              action.target,
-              revision,
-              "threads",
-            );
-            const draft = await commentsRepair(association, threads.items, 0);
-            dispatchRepairDraft(draft, action.sessionId, repairOpts);
-            return;
-          }
-          case "github-pr-comments": {
-            const thread = await githubWorkItemThread(
-              action.cwd,
-              action.repo,
-              "pr",
-              action.number,
-              { force: true },
-            );
-            // Only inline review threads carry a real resolution flag —
-            // "review" submissions can never resolve.
-            const threads = thread.comments.filter(
-              (comment) => comment.kind === "review_comment",
-            );
-            const open = threads.filter((comment) => !comment.resolved);
-            const comments = open.length ? open : threads.slice(-10);
-            if (!comments.length)
-              throw new Error("No review comments on this PR.");
-            const draft = await githubCommentsRepair({
-              cwd: action.cwd,
-              repo: action.repo,
-              number: action.number,
-              comments,
-            });
-            dispatchRepairDraft(draft, action.sessionId, repairOpts);
-            return;
-          }
-          case "azure-ci-fix": {
-            const draft = await azureCiRepairDraft(action);
-            dispatchRepairDraft(draft, action.sessionId, repairOpts);
-            return;
-          }
-          case "github-ci-fix": {
-            const draft = await githubCiRepair({
-              cwd: action.cwd,
-              repo: action.repo,
-              number: action.number,
-            });
-            dispatchRepairDraft(draft, action.sessionId, repairOpts);
-            return;
-          }
-          case "update-branch":
-            await onAttentionUpdateBranch(item, action);
-            return;
-          case "open-automations":
-            openSettings("automations");
-            return;
-          case "check-fix": {
-            const error = await sendCheckToAgent(action.runId);
-            if (error) throw new Error(error);
-            return;
-          }
-          case "reconnect":
-            openSettings("inbox", action.source);
-            return;
-          case "open-worktrees":
-            setWorktreeManagerBusy(false);
-            setWorktreeManager({ cwd: action.cwd, select: action.paths });
-            return;
-          case "open-url":
-            await openUrl(action.url);
-            return;
-        }
-      } catch (error) {
-        await message(error instanceof Error ? error.message : String(error), {
-          title: item.title,
-          kind: "error",
-        });
-      }
-    },
-    [
-      onOpenApprovalSession,
-      onOpenLinkedWorkItem,
-      onStartItemToTask,
-      onOpenInboxDelivery,
-      dispatchRepairDraft,
-      onAttentionUpdateBranch,
-      openSettings,
-    ],
-  );
-
-  const onAttentionSnooze = useCallback(
-    (item: AttentionItem) => snoozeAttention(item.key, item.signature),
-    [],
-  );
-  const onAttentionDismissItem = useCallback(
-    (item: AttentionItem) => dismissAttention(item.key, item.signature),
-    [],
-  );
-  const onAttentionDismissAll = useCallback((items: AttentionItem[]) => {
-    for (const item of items) dismissAttention(item.key, item.signature);
-  }, []);
-
-  const [watchSheet, setWatchSheet] = useState<WatchSheetRequest | null>(null);
-  useEffect(() => {
-    const onOpen = (event: Event) =>
-      setWatchSheet((event as CustomEvent<WatchSheetRequest>).detail ?? null);
-    window.addEventListener(OPEN_WATCH_SHEET, onOpen);
-    return () => window.removeEventListener(OPEN_WATCH_SHEET, onOpen);
-  }, []);
-
-  const [scheduleSheet, setScheduleSheet] =
-    useState<ScheduleSheetRequest | null>(null);
-  useEffect(() => {
-    const onOpen = (event: Event) =>
-      setScheduleSheet(
-        (event as CustomEvent<ScheduleSheetRequest>).detail ?? {},
-      );
-    window.addEventListener(OPEN_SCHEDULE_SHEET, onOpen);
-    return () => window.removeEventListener(OPEN_SCHEDULE_SHEET, onOpen);
-  }, []);
-
-  useEffect(() => {
-    const onOpen = (event: Event) => {
-      const detail = (event as CustomEvent<CommandsSheetRequest>).detail;
-      if (detail?.projectId) setCommandsSheet(detail);
-    };
-    window.addEventListener(OPEN_COMMANDS_SHEET, onOpen);
-    return () => window.removeEventListener(OPEN_COMMANDS_SHEET, onOpen);
-  }, []);
-
-  // The watcher engine owns polling/dedup; these hooks are its only bridge
-  // into App dispatch. Hooks live on a ref so the engine never re-subscribes.
-  const watcherHooksRef = useRef<WatcherEngineHooks>({});
-  watcherHooksRef.current = {
-    prepareDraft: (watcher, item) => {
-      // Draft mode prefills the context picker with the saved action's
-      // instructions — it never builds repair evidence or prepares checkouts
-      // unattended; the row's quick action does that on an explicit click.
-      const action = loadAgentActions().find(
-        (entry) => entry.id === watcher.actionId,
-      );
-      const { text } = composeActionPrompt({
-        name: action?.name ?? watcher.name,
-        instructions: action?.instructions ?? "",
-        sections: [
-          {
-            title: item.title,
-            text: [
-              item.detail,
-              item.url,
-              item.revision && `Revision: ${item.revision}`,
-            ]
-              .filter(Boolean)
-              .join("\n"),
-          },
-        ],
-      });
-      requestAgentContext({
-        context: contextFromText(
-          action?.name ?? item.title,
-          text,
-          item.repo ?? item.cwd ?? "",
-        ),
-        cwd: item.cwd,
-        sourceSessionId: watcher.target?.sessionId,
-      });
-    },
-    runAction: async (watcher, item) => {
-      const action = loadAgentActions().find(
-        (entry) => entry.id === watcher.actionId,
-      );
-      if (!action)
-        return { error: "The saved action is gone — edit the watcher." };
-      const target = watcher.target;
-      if (!target?.cwd)
-        return { error: "No target checkout — edit the watcher." };
-      const bound = target.sessionId
-        ? sessionsRef.current.find((row) => row.id === target.sessionId)
-        : undefined;
-      // An explicit session binding that no longer resolves must not silently
-      // spawn a new conversation — the user chose that conversation.
-      if (target.sessionId && !bound)
-        return {
-          error: "The bound conversation is gone — edit the watcher's target.",
-        };
-      if (bound && (bound.busy || sessionNeedsInput(bound)))
-        return { skipped: "The bound agent is busy — run skipped." };
-      const { text, revision } = composeActionPrompt({
-        name: action.name,
-        instructions: action.instructions,
-        sections: [
-          {
-            title: item.title,
-            text: [
-              item.detail,
-              item.url,
-              item.revision && `Revision: ${item.revision}`,
-            ]
-              .filter(Boolean)
-              .join("\n"),
-          },
-        ],
-      });
-      const ref = { actionId: action.id, name: action.name, revision };
-      if (bound) {
-        const accepted = await onSubmit(bound.id, text, [], {
-          action: ref,
-          followUpBehavior: "queue",
-        });
-        return accepted === false
-          ? { error: "The destination conversation refused the run." }
-          : undefined;
-      }
-      const session = {
-        // Unattended runs stay supervised — parked approvals are what the
-        // attention row reviews, and the conversation default must not
-        // silently lift that.
-        ...newSession(
-          target.harness,
-          target.cwd,
-          target.model,
-          DEFAULT_RUNTIME_MODE,
-        ),
-        title: formatSessionTitle(target.harness, watcher.name),
-      };
-      sessionsRef.current = [...sessionsRef.current, session];
-      setSessions(sessionsRef.current);
-      const tab = newTab(session.id);
-      // Unattended runs must not steal focus — the attention row is the
-      // entry point to review what ran.
-      appendTab(tab, target.cwd);
-      const accepted = await onSubmit(session.id, text, [], {
-        action: ref,
-        followUpBehavior: "queue",
-      });
-      return accepted === false
-        ? { error: "The destination conversation refused the run." }
-        : undefined;
-    },
-  };
-  useEffect(
-    () =>
-      startWatcherEngine({
-        prepareDraft: (watcher, item) =>
-          watcherHooksRef.current.prepareDraft?.(watcher, item),
-        runAction: (watcher, item) =>
-          watcherHooksRef.current.runAction?.(watcher, item) ??
-          Promise.resolve({ error: "No run handler." }),
-      }),
-    [],
-  );
-
-  // Checks on finish (#92) dispatch through the same bound-session path as
-  // watchers: live-state validation inside verify.ts, queued follow-up here.
-  useEffect(
-    () =>
-      setVerifyHooks({
-        getSession: (sessionId) =>
-          sessionsRef.current.find((row) => row.id === sessionId),
-        sendToSession: async (sessionId, text, action) => {
-          const accepted = await onSubmit(sessionId, text, [], {
-            followUpBehavior: "queue",
-            action,
-          });
-          return accepted !== false;
-        },
-      }),
-    [onSubmit],
-  );
-
-  // The schedule engine owns due-time/catch-up policy; these hooks are its
-  // only bridge into App dispatch — same target/dispatch path as watchers.
-  const scheduleHooksRef = useRef<ScheduleEngineHooks>({});
-  scheduleHooksRef.current = {
-    prepareDraft: (schedule) => {
-      requestAgentContext({
-        context: contextFromText(
-          `Schedule · ${schedule.name}`,
-          schedule.instructions,
-          schedule.target.cwd,
-        ),
-        cwd: schedule.target.cwd,
-        sourceSessionId: schedule.target.sessionId,
-      });
-    },
-    runSchedule: async (schedule) => {
-      const bound = schedule.target.sessionId
-        ? sessionsRef.current.find(
-            (row) => row.id === schedule.target.sessionId,
-          )
-        : undefined;
-      // An explicit session binding that no longer resolves must not
-      // silently spawn a new conversation — the user chose that one.
-      if (schedule.target.sessionId && !bound)
-        return "The bound conversation is gone — edit the schedule's target.";
-      if (bound && (bound.busy || sessionNeedsInput(bound)))
-        return "The bound conversation is busy — run skipped.";
-      const { text, revision } = composeActionPrompt({
-        name: `Schedule · ${schedule.name}`,
-        instructions: schedule.instructions,
-        sections: [],
-      });
-      const ref = {
-        actionId: `schedule:${schedule.id}`,
-        name: schedule.name,
-        revision,
-      };
-      if (bound) {
-        const accepted = await onSubmit(bound.id, text, [], {
-          action: ref,
-          followUpBehavior: "queue",
-        });
-        return accepted === false
-          ? "The destination conversation refused the run."
-          : undefined;
-      }
-      const session = {
-        // Same as watcher runs: unattended work stays supervised.
-        ...newSession(
-          schedule.target.harness,
-          schedule.target.cwd,
-          schedule.target.model,
-          DEFAULT_RUNTIME_MODE,
-        ),
-        title: formatSessionTitle(schedule.target.harness, schedule.name),
-      };
-      sessionsRef.current = [...sessionsRef.current, session];
-      setSessions(sessionsRef.current);
-      const tab = newTab(session.id);
-      // An unattended run must not steal focus — the outcome row is the
-      // entry point to review what ran.
-      appendTab(tab, schedule.target.cwd);
-      const accepted = await onSubmit(session.id, text, [], {
-        action: ref,
-        followUpBehavior: "queue",
-      });
-      return accepted === false
-        ? "The destination conversation refused the run."
-        : undefined;
-    },
-    targetBusy: (schedule) => {
-      const bound = schedule.target.sessionId
-        ? sessionsRef.current.find(
-            (row) => row.id === schedule.target.sessionId,
-          )
-        : undefined;
-      return !!bound && (bound.busy || sessionNeedsInput(bound));
-    },
-  };
-  useEffect(
-    () =>
-      startScheduleEngine({
-        prepareDraft: (schedule) =>
-          scheduleHooksRef.current.prepareDraft?.(schedule),
-        runSchedule: (schedule) =>
-          scheduleHooksRef.current.runSchedule?.(schedule) ??
-          Promise.resolve("No run handler."),
-        targetBusy: (schedule) =>
-          scheduleHooksRef.current.targetBusy?.(schedule) ?? false,
-      }),
-    [],
-  );
-
   const onOpenArchivedSession = useCallback(
     (sessionId: string) => {
+      setSettingsOpen(false);
       void onSelectHistorySession(sessionId);
     },
     [onSelectHistorySession],
   );
 
   const onRailBack = useCallback(() => {
-    // Overlays are stack entries, so a recorded back step handles them; this
-    // only covers an overlay that somehow never made it onto the stack.
-    if (
-      !canTabVisitBack(tabVisitRef.current) &&
-      (settingsOpenRef.current ||
-        searchViewOpenRef.current ||
-        inboxViewOpenRef.current ||
-        notesViewOpenRef.current)
-    ) {
-      dismissOverlays();
+    if (settingsOpen) {
+      setSettingsOpen(false);
+      return;
+    }
+    if (searchViewOpen) {
+      setSearchViewOpen(false);
+      return;
+    }
+    if (inboxViewOpen) {
+      setInboxViewOpen(false);
+      return;
+    }
+    if (notesViewOpen) {
+      setNotesViewOpen(false);
       return;
     }
     onVisitBack();
-  }, [dismissOverlays, onVisitBack]);
+  }, [onVisitBack, searchViewOpen, settingsOpen, inboxViewOpen, notesViewOpen]);
 
   const onRailForward = useCallback(() => {
+    setSearchViewOpen(false);
+    setSettingsOpen(false);
+    setInboxViewOpen(false);
+    setNotesViewOpen(false);
     onVisitForward();
   }, [onVisitForward]);
 
@@ -10545,14 +7694,16 @@ export default function App({
     onFocusDir,
     onToggleSidebar,
     onGoToFile,
+    onOpenCommandPalette,
+    onReload,
     onFindInProject,
     onOpenSearch,
     onOpenInbox,
     onOpenNotes,
-    onOpenBrowser,
     pickProject,
     onNewTerminal,
     onNewTerminalTab,
+    onOpenBrowser,
     onToggleProjectTerminal,
     onNavigateSessionList,
     onNavigateProjectList,
@@ -10574,19 +7725,29 @@ export default function App({
     onFocusDir,
     onToggleSidebar,
     onGoToFile,
+    onOpenCommandPalette,
+    onReload,
     onFindInProject,
     onOpenSearch,
     onOpenInbox,
     onOpenNotes,
-    onOpenBrowser,
     pickProject,
     onNewTerminal,
     onNewTerminalTab,
+    onOpenBrowser,
     onToggleProjectTerminal,
     onNavigateSessionList,
     onNavigateProjectList,
     openSettings,
     onOpenApprovalSession,
+  };
+
+  const focusedBrowserLabel = () => {
+    if (settingsOpenRef.current || inboxViewOpenRef.current || searchViewOpenRef.current || notesViewOpenRef.current || filePickerOpenRef.current) return null;
+    const tab = tabsRef.current.find(entry => entry.id === activeTabIdRef.current);
+    if (!tab || tab.diffFocused) return null;
+    const file = focusedFileTab(tab);
+    return file?.browser ? `browser-${file.id}` : null;
   };
 
   const debounce = useRef({ name: "", at: 0 });
@@ -10597,18 +7758,6 @@ export default function App({
     debounce.current = { name, at: now };
     fn();
   }, []);
-
-  /** Label of the browser tab in the focused pane — the routing target
-   * for menu accelerators and keys that reach the shell while a native
-   * webview owns the page's focus. */
-  const focusedBrowserLabel = () => {
-    const tab = tabsRef.current.find(
-      (entry) => entry.id === activeTabIdRef.current,
-    );
-    if (!tab || tab.diffFocused) return null;
-    const file = focusedFileTab(tab);
-    return file?.browser?.url ? `browser-${file.id}` : null;
-  };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -10723,8 +7872,6 @@ export default function App({
           run("prev-project", () => a.onNavigateProjectList(-1));
         else if (cmd === "next-project")
           run("next-project", () => a.onNavigateProjectList(1));
-        else if (cmd === "open-browser")
-          run("open-browser", () => a.onOpenBrowser());
         else if ("focus" in cmd)
           run(`focus-${cmd.focus}`, () => a.onFocusDir(cmd.focus));
         else run(`activate-${cmd.activate}`, () => a.onActivate(cmd.activate));
@@ -10740,6 +7887,19 @@ export default function App({
         return;
       }
       const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === "b") {
+        e.preventDefault(); e.stopPropagation();
+        run("open-browser", () => actions.current.onOpenBrowser(""));
+        return;
+      }
+      const browser = focusedBrowserLabel();
+      if (browser && mod && !e.shiftKey && (e.key.toLowerCase() === "r" || e.key.toLowerCase() === "l" || e.key.toLowerCase() === "f" || (e.altKey && e.key.toLowerCase() === "i"))) {
+        if (!e.altKey || e.key.toLowerCase() === "i") {
+          e.preventDefault(); e.stopPropagation();
+          requestBrowserCommand(browser, e.key.toLowerCase() === "r" ? "reload" : e.key.toLowerCase() === "l" ? "focus-url" : e.key.toLowerCase() === "f" ? "find" : "devtools");
+          return;
+        }
+      }
       if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "b") {
         e.preventDefault();
         e.stopPropagation();
@@ -10750,6 +7910,18 @@ export default function App({
         e.preventDefault();
         e.stopPropagation();
         run("go_to_file", actions.current.onGoToFile);
+        return;
+      }
+      if (mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === "p") {
+        e.preventDefault();
+        e.stopPropagation();
+        run("open_command_palette", actions.current.onOpenCommandPalette);
+        return;
+      }
+      if (mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === "r") {
+        e.preventDefault();
+        e.stopPropagation();
+        run("reload", actions.current.onReload);
         return;
       }
       if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
@@ -10827,16 +7999,15 @@ export default function App({
       listen("open_project", () => {
         void actions.current.pickProject();
       }),
-      listen("go_to_file", () => actions.current.onGoToFile()),
+      listen("go_to_file", () => run("go_to_file", actions.current.onGoToFile)),
+      listen("open_command_palette", () =>
+        run("open_command_palette", actions.current.onOpenCommandPalette),
+      ),
+      listen("reload", () => run("reload", actions.current.onReload)),
       listen("open_search", () => actions.current.onOpenSearch()),
       listen("open_inbox", () => actions.current.onOpenInbox()),
       listen("open_notes", () => actions.current.onOpenNotes()),
-      listen("open_browser", () => actions.current.onOpenBrowser()),
-      listen<{ section?: string }>("open_settings", ({ payload }) =>
-        actions.current.openSettings(
-          isSettingsSectionId(payload?.section) ? payload.section : undefined,
-        ),
-      ),
+      listen("open_settings", () => actions.current.openSettings()),
       listen("check_for_updates", () => {
         void runUpdateFlow(true);
       }),
@@ -10846,23 +8017,17 @@ export default function App({
       listen("find_in_project", () => actions.current.onFindInProject()),
       listen("find", () => {
         const label = focusedBrowserLabel();
-        if (label) requestBrowserCommand(label, "find");
-        else openFindInActiveEditor();
+        if (label) {
+          void getCurrentWindow().isFocused().then(focused => { if (focused && label === focusedBrowserLabel()) requestBrowserCommand(label, "find"); });
+        } else openFindInActiveEditor();
       }),
-      // Menu accelerators for the embedded browser — they fire even while
-      // the native webview holds focus, which a keydown handler can't.
-      listen("browser_reload", () => {
-        const label = focusedBrowserLabel();
-        if (label) requestBrowserCommand(label, "reload");
-      }),
-      listen("browser_focus_url", () => {
-        const label = focusedBrowserLabel();
-        if (label) requestBrowserCommand(label, "focus-url");
-      }),
-      listen("browser_devtools", () => {
-        const label = focusedBrowserLabel();
-        if (label) requestBrowserCommand(label, "devtools");
-      }),
+      getCurrentWindow().listen("open_browser", () => run("open-browser", () => actions.current.onOpenBrowser(""))),
+      ...(["reload", "focus-url", "devtools"] as const).map(command =>
+        getCurrentWindow().listen(command === "focus-url" ? "browser_focus_url" : `browser_${command}`, () => {
+          const label = focusedBrowserLabel();
+          if (label) requestBrowserCommand(label, command);
+        }),
+      ),
       listen("open_model_picker", () => {
         window.dispatchEvent(new Event("open_model_picker"));
       }),
@@ -10934,9 +8099,14 @@ export default function App({
     onClose: onClosePane,
     onCwdChange,
     onBranchChange,
+    onWorktreeChange,
+    onWorkspaceModeChange,
+    onWorktreeBaseChange,
+    onManageWorktrees: () => openSettings("worktrees"),
     onModelChange,
     onModelSettingsChange,
     onRuntimeModeChange,
+    onSaveDraft,
     onSubmit,
     onStop,
     onCompactContext,
@@ -10946,14 +8116,6 @@ export default function App({
     onQueuedMessageEditingChange,
     onSteerQueuedMessage,
     onResumeQueue,
-    onAddIssues: async (sessionId: string) => {
-      await onOpenInboxSession(sessionId);
-      setInboxSelectionRevision((value) => value + 1);
-    },
-    onOpenTaskChild,
-    onRetryTaskChild,
-    onSetupTaskChild: onEditTask,
-    needsInputSessionIds,
     onInboxCardDismiss,
     onLinkedWorkItemUpdateCardDismiss,
     onNoteCardDismiss,
@@ -10971,7 +8133,6 @@ export default function App({
     onSecondOpinion,
     onHandoff,
     onNewTerminal: onNewTerminalInSession,
-    onRunAgentAction,
   };
 
   return (
@@ -10985,6 +8146,7 @@ export default function App({
           <Sidebar
             cwd={sidebarCwd}
             gitCwd={gitCwd}
+            explorerRootLabel={explorerRootLabel}
             open
             tab={sidebarTab}
             onTabChange={setSidebarTab}
@@ -10993,7 +8155,6 @@ export default function App({
             onOpenFilesSearch={onFindInProject}
             searchFocusToken={searchFocusToken}
             sessions={sidebarHistory}
-            liveSessionIds={liveSessionIds}
             busySessionIds={busySessionIds}
             approvalSessionIds={approvalSessionIds}
             activeSessionId={active?.id}
@@ -11008,7 +8169,6 @@ export default function App({
             onArchiveSessions={onArchiveHistorySessions}
             onPinSession={onPinHistorySession}
             onPinSessions={onPinHistorySessions}
-            onSyncSession={onSyncSessionDefault}
             reminders={sessionReminders.reminders}
             onSetReminders={sessionReminders.schedule}
             onCancelReminders={sessionReminders.cancel}
@@ -11029,33 +8189,27 @@ export default function App({
             onGoBack={onRailBack}
             onGoForward={onRailForward}
             onOpenDiff={onOpenWorkingTreeDiff}
-            onOpenDelivery={onOpenDelivery}
             onOpenAllChanges={onOpenAllChanges}
             onOpenCommit={onOpenCommit}
             onShowSourceControl={onToggleChanges}
             selectedDiffPath={
               activeTab ? selectedChangePath(activeTab, gitCwd) : undefined
             }
-            selectedDiffKind={activeTab ? selectedChangeKind(activeTab) : undefined}
-            selectedCommitSha={activeTab ? selectedCommitSha(activeTab) : undefined}
+            selectedDiffKind={
+              activeTab ? selectedChangeKind(activeTab) : undefined
+            }
+            selectedCommitSha={
+              activeTab ? selectedCommitSha(activeTab) : undefined
+            }
             textHarness={pickTextHarness(active?.harness)}
             recents={recents}
-            busyProjectPaths={busyProjectPaths}
+            busyProjectPaths={sessions.flatMap((session) =>
+              session.busy && session.cwd ? [session.cwd] : [],
+            )}
             liveAgents={liveAgents}
             onSelectAgent={onSelectLiveAgent}
             onSelectProject={onSelectProject}
             onOpenProject={pickProject}
-            onNewTask={onNewTask}
-            onOpenCommands={onOpenCommands}
-            onOpenTask={onOpenTask}
-            onStartTask={onStartTask}
-            focusTaskId={focusTaskId}
-            onEditTask={onEditTask}
-            onCreateTaskPrs={onCreateTaskPrs}
-            onSyncTaskBranches={onSyncTaskBranches}
-            needsInputSessionIds={needsInputSessionIds}
-            linkedItemUpdates={linkedItemUpdates}
-            onOpenTaskDelivery={onOpenTaskDelivery}
             onRemoveProject={onRemoveProject}
             onNew={onNew}
             openSessions={openProjectSessions}
@@ -11063,9 +8217,6 @@ export default function App({
             onSearch={onOpenSearch}
             onOpenInbox={onOpenInbox}
             onOpenInboxItem={onOpenLinkedWorkItem}
-            attentionCount={attentionItems.length}
-            queueActive={queueAnchor !== null}
-            onOpenQueue={onToggleQueue}
             onOpenNotes={notesEnabled ? onOpenNotes : undefined}
             onGoToFile={onGoToFile}
             searchActive={searchViewOpen}
@@ -11088,295 +8239,9 @@ export default function App({
             onDismissUpdate={() => setUpdateNotice(null)}
           />
 
-          {(() => {
-            const request = mergeResolutions[0];
-            return request ? (
-              <MergeResolutionSheet key={request.key} request={request} />
-            ) : null;
-          })()}
-
-          <AppDialogs />
-
-          {taskSync ? (
-            <TaskSyncSheet
-              taskName={taskSync.name}
-              rows={taskSync.rows}
-              onClose={() => setTaskSync(null)}
-            />
-          ) : null}
-
-          {queueAnchor ? (
-            <AttentionQueue
-              anchor={queueAnchor}
-              items={attentionItems}
-              onDismiss={() => setQueueAnchor(null)}
-              // Dispatching navigates or opens a dialog — the queue must not stay
-              // on top holding keyboard focus, or typing hits its s/d shortcuts.
-              onAction={(item) => {
-                setQueueAnchor(null);
-                void onAttentionAction(item);
-              }}
-              onSnooze={onAttentionSnooze}
-              onDismissItem={onAttentionDismissItem}
-              onDismissAll={onAttentionDismissAll}
-              onOpenAutomations={() => openSettings("automations")}
-            />
-          ) : null}
-          {watchSheet ? (
-            <WatchSheet
-              request={watchSheet}
-              sessions={sessions}
-              defaultCwd={projectCwd || "~"}
-              onClose={() => setWatchSheet(null)}
-            />
-          ) : null}
-          {scheduleSheet ? (
-            <ScheduleSheet
-              request={scheduleSheet}
-              sessions={sessions}
-              defaultCwd={projectCwd || "~"}
-              onClose={() => setScheduleSheet(null)}
-            />
-          ) : null}
-          {worktreeManager ? (
-            <Modal
-              title="Worktrees"
-              size="md"
-              // A removal batch must not be dismissed mid-run — the results
-              // screen is where failures surface.
-              onClose={() => {
-                if (!worktreeManagerBusy) setWorktreeManager(null);
-              }}
-            >
-              <WorktreePanel
-                key={JSON.stringify(worktreeManager)}
-                cwd={worktreeManager.cwd}
-                initialPath={worktreeManager.path}
-                initialAction={worktreeManager.action}
-                initialSelect={worktreeManager.select}
-                activeCwd={projectCwd}
-                onClose={() => setWorktreeManager(null)}
-                onOpen={(path) => {
-                  setWorktreeManager(null);
-                  onSelectProject(path);
-                }}
-                onBusyChange={setWorktreeManagerBusy}
-              />
-            </Modal>
-          ) : null}
-          {wslPickerOpen && (
-            <WslProjectDialog
-              cwd={projectCwd}
-              onOpen={(paths) => {
-                if (paths[0]) selectProject(paths[0]);
-              }}
-              onClose={() => setWslPickerOpen(false)}
-            />
-          )}
-          {taskSheet && (
-            <TaskCreateSheet
-              // A retarget (other task, other setup child, new send-to-task)
-              // remounts — form state must never leak between targets.
-              key={taskSheet.nonce}
-              projectId={taskSheet.projectId}
-              editingTaskId={taskSheet.editingTaskId}
-              initialSetupChildId={taskSheet.setupChildId}
-              initialTickets={taskSheet.initialTickets}
-              initialName={taskSheet.initialName}
-              initialBrief={taskSheet.initialBrief}
-              initialChildren={taskSheet.initialChildren}
-              onCreated={(taskId) => {
-                // The sheet unmounts as Task Details mounts — same-commit swap.
-                modalSwap();
-                // A send-to-new-task continuation owns post-create navigation —
-                // it stages the context (or dispatches the repair) once the
-                // task's conversation exists.
-                if (taskSheet.continueSend) taskSheet.continueSend(taskId);
-                else onOpenTask(taskId);
-                setProjectRailOpen((open) => {
-                  if (open) return open;
-                  saveProjectRailOpen(true);
-                  return true;
-                });
-              }}
-              onEdited={(task, changed) => {
-                // A rename/ticket change should reach the conversation that
-                // shows the task — otherwise history and pickers keep the
-                // stale title and issue.
-                const ids = taskSessionIds(task);
-                if (ids.size) {
-                  const next = sessionsRef.current.map((session) =>
-                    ids.has(session.id)
-                      ? {
-                          ...session,
-                          title: task.name,
-                          linkedWorkItem: task.ticket,
-                          ...(linkedWorkItemIdentityChanged(
-                            session.linkedWorkItem,
-                            task.ticket,
-                          )
-                            ? { linkedWorkItemUpdateCard: undefined }
-                            : {}),
-                        }
-                      : session,
-                  );
-                  sessionsRef.current = next;
-                  setSessions(next);
-                }
-                // Repositories added or set up after launch need their launch —
-                // and a live session needs to hear the working-copy set changed.
-                const launchIds = [
-                  ...(changed?.addedChildIds ?? []),
-                  ...(changed?.setupChildIds ?? []),
-                ];
-                const priorSession = task.sessionIds?.[0];
-                const notifySession = () => {
-                  const fresh = loadTaskWorkspaces().find(
-                    (entry) => entry.id === task.id,
-                  );
-                  if (!fresh || !priorSession) return;
-                  void onSubmit(
-                    priorSession,
-                    composeTaskUpdateNotice(fresh, projectForTask(fresh)),
-                  );
-                };
-                if (launchIds.length) {
-                  const launch = launchTaskChildren(task.id, launchIds);
-                  void launch.then((sessionId) => {
-                    if (sessionId !== priorSession) return;
-                    // The launch already told the session — its brief send or
-                    // state-change notice carries the post-edit task. A repeat
-                    // "task was updated" would double it; only a launch that
-                    // delivered nothing leaves the meta notice to post.
-                    if (taskLaunchDelivered.current.has(launch)) return;
-                    if (changed?.metaChanged) notifySession();
-                  });
-                  return;
-                }
-                // Name/ticket/brief/repo-set edits don't relaunch anything, but a
-                // live session still holds the old brief — tell it what changed.
-                if (!changed?.metaChanged || !priorSession) return;
-                void taskSessionAlive(priorSession).then(
-                  (alive) => alive && notifySession(),
-                );
-              }}
-              onClose={() => setTaskSheet(null)}
-            />
-          )}
-          {commandsMenu ? (
-            <ProjectCommandsMenu
-              anchor={commandsMenu.anchor}
-              project={commandsProject}
-              task={commandsTask}
-              boundFiles={boundCommandFiles}
-              fallbackCwd={commandsFallbackCwd}
-              onRun={(command) =>
-                onRunProjectCommand(
-                  command,
-                  commandsProject,
-                  commandsTask,
-                  commandsFallbackCwd,
-                )
-              }
-              onStop={onStopProjectCommand}
-              onManage={() => {
-                // A menu opened on an explicit project whose record no longer
-                // resolves was deleted — don't silently edit another project's
-                // commands.
-                const project = commandsMenu.projectId
-                  ? commandsProject
-                  : (commandsProject ??
-                    (commandsMenu.path && looksLikeProject(commandsMenu.path)
-                      ? ensureProjectForPath(commandsMenu.path)
-                      : undefined) ??
-                    (looksLikeProject(projectCwd)
-                      ? ensureProjectForPath(projectCwd)
-                      : undefined));
-                if (project) setCommandsSheet({ projectId: project.id });
-              }}
-              onClose={() => setCommandsMenu(null)}
-            />
-          ) : null}
-          {commandsSheet ? (
-            <ProjectCommandsSheet
-              // A retarget while the sheet is open must not carry an edit draft
-              // from one project's form over another's data.
-              key={commandsSheet.projectId}
-              projectId={commandsSheet.projectId}
-              focus={commandsSheet.focus}
-              onClose={() => setCommandsSheet(null)}
-            />
-          ) : null}
-          {taskPrSheetTaskId && (
-            <TaskPrSheet
-              taskId={taskPrSheetTaskId}
-              sessions={sessions}
-              onClose={() => setTaskPrSheetTaskId(null)}
-            />
-          )}
-          {taskDetailsId ? (
-            <TaskDetails
-              // A retarget remounts — "Opening review…", the CI request set and
-              // the new-conversation picker must never leak between tasks.
-              key={taskDetailsId}
-              taskId={taskDetailsId}
-              sessions={allSessions}
-              needsInputIds={needsInputSessionIds}
-              busySessionIds={busySessionIds}
-              onClose={() => setTaskDetailsId(null)}
-              onOpenSession={(sessionId) => void onSelectHistorySession(sessionId)}
-              onOpenChild={(taskId, childId) =>
-                void onOpenTaskChild(taskId, childId)
-              }
-              onRetryChild={onRetryTaskChild}
-              onStart={onStartTask}
-              onEdit={onEditTask}
-              onFixCi={onFixTaskCi}
-              onOpenDelivery={onOpenTaskDelivery}
-              onNewConversation={onNewTaskConversation}
-              onSyncBranches={onSyncTaskBranches}
-            />
-          ) : null}
+          {wslPickerOpen && <WslProjectDialog cwd={projectCwd} onOpen={(paths) => { if (paths[0]) selectProject(paths[0]); }} onClose={closePicker} />}
           <div className="body-glass flex min-h-0 min-w-0 flex-1 flex-col">
-            {wslOpening && (
-              <div
-                role={wslOpening.error ? "alert" : "status"}
-                className="flex shrink-0 items-center gap-3 border-b border-content/10 px-4 py-2 text-[12px]"
-              >
-                <div className="min-w-0 flex-1">
-                  <p
-                    className="truncate text-content/75"
-                    title={prettyCwd(wslOpening.path)}
-                  >
-                    {prettyCwd(wslOpening.path)}
-                  </p>
-                  <p className="text-content/50">
-                    {wslOpening.error || "Connecting to WSL…"}
-                  </p>
-                </div>
-                {!wslOpening.busy && (
-                  <button
-                    className="rounded-md px-2 py-1 text-content/75 hover:bg-content/8"
-                    onClick={() =>
-                      wslLocation(wslOpening.path)
-                        ? onSelectProject(wslOpening.path)
-                        : void pickWslProject()
-                    }
-                  >
-                    Retry
-                  </button>
-                )}
-                <button
-                  className="rounded-md px-2 py-1 text-content/60 hover:bg-content/8"
-                  onClick={() => {
-                    wslOpenRequest.current?.abort();
-                    setWslOpening(null);
-                  }}
-                >
-                  {wslOpening.busy ? "Cancel" : "Dismiss"}
-                </button>
-              </div>
-            )}
+            {wslOpening && <WslConnectionStatus opening={wslOpening} onRetry={() => onSelectProject(wslOpening.path)} onDismiss={dismissOpening} />}
             <div
               className={
                 searchViewOpen || settingsOpen || inboxViewOpen || notesViewOpen
@@ -11394,11 +8259,13 @@ export default function App({
                 undefined
               }
             >
+              <LinkChoiceMenu onOpenBrowser={onOpenBrowser} />
               {!IS_MAC ? (
                 <MenuBar
                   onNew={onNew}
                   onNewTerminal={onNewTerminal}
                   onToggleTerminal={onToggleProjectTerminal}
+                  onOpenBrowser={() => onOpenBrowser("")}
                   onGoToFile={onGoToFile}
                   onToggleSidebar={onToggleSidebar}
                   onShowSourceControl={onToggleChanges}
@@ -11426,7 +8293,6 @@ export default function App({
                   }}
                 />
               ) : null}
-              {active ? <RepairStatus session={active.id} /> : null}
               <TitleBar
                 tabs={titleTabs}
                 activeId={activeTabId}
@@ -11436,8 +8302,6 @@ export default function App({
                 onSelect={activateTab}
                 onNew={onNew}
                 onNewTerminal={onNewTerminal}
-                onOpenBrowser={onToggleBrowser}
-                browserActive={browserOpen}
                 onOpenSettings={onOpenSettings}
                 onOpenInbox={onOpenInbox}
                 onOpenNotes={notesEnabled ? onOpenNotes : undefined}
@@ -11450,14 +8314,15 @@ export default function App({
                 onSelectProject={onSelectProject}
               />
 
-              <main className="relative min-h-0 min-w-0 flex-1">
+              <main className="relative flex min-h-0 min-w-0 flex-1">
                 <div
                   ref={dockGridRef}
-                  className="absolute inset-0 grid h-full min-h-0 min-w-0"
+                  className="grid h-full min-h-0 min-w-0 flex-1"
                 >
                   {projectTerminals.map((dock) => {
                     const show =
-                      dock.open && sameProjectPath(dock.projectPath, projectCwd);
+                      dock.open &&
+                      sameProjectPath(dock.projectPath, projectCwd);
                     return (
                       <div
                         key={dock.projectPath}
@@ -11477,19 +8342,12 @@ export default function App({
                           onSideChange={onProjectTerminalSide}
                           onSizePaint={paintDockSize}
                           onSizeCommit={commitDockSize}
-                          onAddTerminal={() =>
-                            onOpenTerminal(active?.cwd ?? projectCwd)
-                          }
+                          onAddTerminal={onNewTerminal}
                           onSelectTerminal={onSelectProjectTerminal}
                           onCloseTerminal={onCloseProjectTerminal}
                           onCloseOtherTerminals={onCloseOtherProjectTerminals}
                           onReorderTerminals={onReorderProjectTerminals}
                           onTerminalMetaChange={onTerminalMetaChange}
-                          onOpenCommands={
-                            show
-                              ? (rect) => onOpenCommands({ anchor: rect })
-                              : undefined
-                          }
                         />
                       </div>
                     );
@@ -11512,22 +8370,7 @@ export default function App({
                           <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
                             <PaneTree
                               {...sessionPaneProps}
-                              visible={
-                                tab.id === activeTabId &&
-                                !inboxViewOpen &&
-                                !searchViewOpen &&
-                                !notesViewOpen &&
-                                !settingsOpen
-                              }
-                              sessionPortal={
-                                inboxViewOpen &&
-                                inboxAskPortal &&
-                                leafIds(tab.layout).includes(
-                                  inboxAskPortal.sessionId,
-                                )
-                                  ? inboxAskPortal
-                                  : undefined
-                              }
+                              visible={tab.id === activeTabId && !inboxViewOpen}
                               layout={tab.layout}
                               sessions={sessions}
                               editorPanes={[
@@ -11550,6 +8393,7 @@ export default function App({
                               composerFocused={
                                 composerFocused && !projectTerminalFocused
                               }
+                              composerFocusToken={composerFocusToken}
                               onSelectFile={onSelectFileSurface}
                               onCloseFile={onCloseFile}
                               onCloseOtherFiles={onCloseOtherFiles}
@@ -11570,30 +8414,45 @@ export default function App({
                         </div>
                       ))}
                     </div>
-                    {[...linkedWorkItemPanels.values()].map((panel) => (
-                      <LinkedWorkItemPanel
-                        key={panel.sessionId}
-                        target={panel.item}
-                        cwd={panel.cwd}
-                        recents={recents}
-                        visible={
-                          !searchViewOpen &&
-                          !settingsOpen &&
-                          !inboxViewOpen &&
-                          !notesViewOpen &&
-                          activeLinkedWorkItemPanel?.sessionId === panel.sessionId
-                        }
-                        onClose={() => closeLinkedWorkItemPanel(panel.sessionId)}
-                      />
-                    ))}
                   </div>
                 </div>
+                {[...linkedWorkItemPanels.values()].map((panel) => (
+                  <LinkedWorkItemPanel
+                    key={panel.sessionId}
+                    target={panel.item}
+                    cwd={panel.cwd}
+                    recents={recents}
+                    visible={
+                      !searchViewOpen &&
+                      !settingsOpen &&
+                      !inboxViewOpen &&
+                      !notesViewOpen &&
+                      activeLinkedWorkItemPanel?.sessionId === panel.sessionId
+                    }
+                    onClose={() => closeLinkedWorkItemPanel(panel.sessionId)}
+                    onBindAccount={(account, site) => {
+                      const current = sessionsRef.current.find(session => session.id === panel.sessionId);
+                      if (!current?.linkedWorkItem) return false;
+                      const linkedWorkItem = bindLinkedWorkItemAccount(current.linkedWorkItem, panel.item, account, site);
+                      if (linkedWorkItem === current.linkedWorkItem) return false;
+                      const updated = { ...current, linkedWorkItem, linkedWorkItemUpdateCard: undefined };
+                      const next = sessionsRef.current.map(session => session.id === current.id ? updated : session);
+                      sessionsRef.current = next;
+                      setSessions(next);
+                      persistSession(updated);
+                      setLinkedWorkItemPanels(panels => new Map(panels).set(panel.sessionId, {
+                        ...panel, item: { ...panel.item, account, site },
+                      }));
+                      return true;
+                    }}
+                  />
+                ))}
               </main>
             </div>
             {searchViewOpen ? (
               <SearchView
                 open
-                cwd={sidebarCwd}
+                cwd={gitCwd}
                 recents={recents}
                 history={projectHistory}
                 sessions={sessions.filter((session) => !session.inboxAsk)}
@@ -11604,7 +8463,6 @@ export default function App({
                 onOpenFile={onOpenFile}
                 onOpenSession={onSelectHistorySession}
                 onOpenProject={onSelectProject}
-                onOpenTask={setTaskDetailsId}
               />
             ) : null}
             <div className="hidden" aria-hidden>
@@ -11625,54 +8483,26 @@ export default function App({
                         focused={visible}
                         inSplit={false}
                         composerFocused={composerFocused}
+                        composerFocusToken={composerFocusToken}
                       />
                     </SessionSurface>
                   );
                 })}
             </div>
-            {inboxMounted || inboxViewOpen ? (
-              <div
-                hidden={!inboxViewOpen}
-                className={inboxViewOpen ? "flex min-h-0 min-w-0 flex-1" : "hidden"}
-              >
-                <InboxView
-                  cwd={sidebarCwd}
-                  recents={recents}
-                  besideRail={projectRailOpen}
-                  onClose={onLeaveInbox}
-                  onToggleSidebar={onToggleSidebar}
-                  onOpenSettings={() => openSettings("inbox")}
-                  onAsk={onAskInboxItem}
-                  onAskRestart={onRestartInboxAsk}
-                  onAskMount={setInboxAskPortal}
-                  sessions={inboxRelatedSessions}
-                  onOpenSession={onOpenInboxSession}
-                  onOpenDelivery={onOpenInboxDelivery}
-                  busySessionIds={busySessionIds}
-                  needsInputSessionIds={needsInputSessionIds}
-                  attentionItems={attentionItems}
-                  onAttentionAction={onAttentionAction}
-                  target={inboxTarget}
-                  visible={inboxViewOpen}
-                  conversationId={inboxConversationId}
-                  conversationRevision={inboxConversationRevision}
-                  selectionRevision={inboxSelectionRevision}
-                  onCloseConversation={() => setInboxConversationId(undefined)}
-                  onToggleConversationTicket={onToggleConversationTicket}
-                  onOpenIntegrations={onOpenInboxIntegrations}
-                />
-              </div>
-            ) : null}
-            {contextRequest ? (
-              <AgentContextPicker
-                request={contextRequest}
-                history={sidebarHistory}
-                sessions={sessions}
-                onPrepare={prepareContextDestination}
-                onClose={() => {
-                  contextRequestOpenRef.current = false;
-                  setContextRequest(undefined);
-                }}
+            {inboxViewOpen ? (
+              <InboxView
+                cwd={sidebarCwd}
+                recents={recents}
+                besideRail={projectRailOpen}
+                onClose={onLeaveInbox}
+                onToggleSidebar={onToggleSidebar}
+                onStart={onStartInboxItem}
+                onAsk={onAskInboxItem}
+                onAskRestart={onRestartInboxAsk}
+                onAskMount={setInboxAskPortal}
+                sessions={inboxRelatedSessions}
+                onOpenSession={onOpenInboxSession}
+                onOpenIntegrations={onOpenInboxIntegrations}
               />
             ) : null}
             {notesViewOpen ? (
@@ -11693,6 +8523,10 @@ export default function App({
                 recents={recents}
                 cwd={sidebarCwd}
                 sessions={sidebarHistory}
+                liveSessions={sessions}
+                onRemoveWorktree={onRemoveWorktree}
+                onCheckWorktreeRemoval={onCheckWorktreeRemoval}
+                onDeleteWorktreeSessions={onDeleteWorktreeSessions}
                 besideRail
                 onClose={onCloseSettings}
                 onSelectSection={onSelectSettingsSection}
@@ -11704,7 +8538,6 @@ export default function App({
                   onRemoveProject(path, { purgeData: true })
                 }
                 onOpenWhatsNew={onOpenWhatsNew}
-                onOpenFile={onOpenFile}
               />
             ) : null}
             {searchViewOpen ||
@@ -11716,18 +8549,26 @@ export default function App({
                 session={usageSession}
                 project={active?.cwd ?? projectCwd}
                 onSelectAccount={onSelectProviderAccount}
-                terminals={footerTerminalList}
-                onOpenTerminal={onShowTerminal}
-                onCloseTerminal={onCloseFooterTerminal}
+                onManageAccounts={() =>
+                  openSettings("providers", "provider-accounts")
+                }
+                onToggleBrowser={onToggleBrowser}
+                commandsControl={looksLikeProject(projectCwd) ? <SavedCommandsControl key={JSON.stringify([projectCwd, gitCwd])} destination={{ projectCwd, worktreeCwd: gitCwd }} onLaunch={onLaunchSavedCommands} onShowTerminal={id => onToggleRunningTerminal(id, true)} /> : undefined}
+                resourcesControl={resourceTerminals.length ? <TerminalResourcesControl key={projectCwd} terminals={resourceTerminals} onOpen={id => onToggleRunningTerminal(id, true)} onClose={terminal => terminal.paneId ? onCloseFile(terminal.paneId, terminal.id) : onCloseProjectTerminal(terminal.id)} /> : undefined}
+                terminals={runningTerminals}
+                terminalOpen={runningTerminalOpen}
+                onToggleTerminal={onToggleRunningTerminal}
                 onNewTerminal={
                   looksLikeProject(projectCwd) ? onNewTerminal : undefined
                 }
                 onShowTerminal={
-                  looksLikeProject(projectCwd) ? onToggleProjectTerminal : undefined
+                  looksLikeProject(projectCwd)
+                    ? onShowProjectTerminal
+                    : undefined
                 }
-                projectTerminalActive={dockVisible}
-                projectTerminalExists={
-                  !!currentProjectDock && currentProjectDock.pane.files.length > 0
+                projectTerminalActive={
+                  !!currentProjectDock &&
+                  currentProjectDock.pane.files.length > 0
                 }
               />
             )}
@@ -11735,33 +8576,36 @@ export default function App({
 
           {filePickerOpen ? (
             <FilePicker
+              key={filePickerResetToken}
               open
               cwd={gitCwd}
               openPaths={openFilePaths}
+              initialQuery={filePickerInitialQuery}
               onOpenFile={onOpenFile}
+              onRunAction={(id) => {
+                if (id === "reload") actions.current.onReload();
+              }}
               onClose={() => setFilePickerOpen(false)}
             />
           ) : null}
 
-          <LinkChoiceMenu onOpenBrowser={onOpenBrowser} />
-
+          {sessionDeleteDialog && (
+            <DeleteSessionDialog
+              title={sessionDeleteDialog.title}
+              unusedWorktree={sessionDeleteDialog.unusedWorktree}
+              onClose={(choice) => {
+                sessionDeleteDialog.resolve(choice);
+                setSessionDeleteDialog(undefined);
+              }}
+            />
+          )}
           <ApprovalToasts
             notices={hiddenApprovalToasts}
             topOffset={
-              12 +
-              (reminderNoticesHeight ? reminderNoticesHeight + 8 : 0)
+              12 + (reminderNoticesHeight ? reminderNoticesHeight + 8 : 0)
             }
             onFocusSession={onOpenApprovalSession}
             onApproval={onApproval}
-            onHeightChange={setApprovalToastsHeight}
-          />
-          <CheckToasts
-            topOffset={
-              12 +
-              (reminderNoticesHeight ? reminderNoticesHeight + 8 : 0) +
-              (approvalToastsHeight ? approvalToastsHeight + 8 : 0)
-            }
-            onFocusSession={onOpenApprovalSession}
           />
           <ReminderNotices
             reminders={sessionReminders.due}
@@ -11897,9 +8741,7 @@ function toTitleTab(
         ? `plan:${file.plan.blockId}`
         : file.releaseNotes
           ? `release-notes:${file.releaseNotes.version}`
-          : file.browser
-            ? `browser:${file.browser.url}`
-            : file.path;
+          : file.path;
     if (seenKeys.has(key)) return;
     seenKeys.add(key);
     files.push(
@@ -11908,9 +8750,7 @@ function toTitleTab(
           ? releaseNotesTitle(file.releaseNotes.version)
           : file.terminal
             ? terminalTabLabel(file)
-            : file.browser
-              ? browserTabLabel(file.browser.url, file.browser.title)
-              : basename(file.path)),
+            : basename(file.path)),
     );
   };
   const focusedPane =
@@ -11944,7 +8784,7 @@ function toTitleTab(
     project: focused
       ? projectName(focused.cwd)
       : focusedFile
-        ? projectName(focusedFile.cwd)
+        ? projectName(focusedFile.projectCwd ?? focusedFile.cwd)
         : "~",
     title: focused ? conversationTitle(focused) : "",
     more,
@@ -12036,23 +8876,32 @@ function nudgeOpenEditors(event: HarnessEvent, cwd: string) {
     if (!completed) return;
     nudgeWatchedFiles();
     window.setTimeout(() => nudgeWatchedFiles(), 150);
-    notifyGitChanged(cwd);
+    notifyGitChanged();
     nudgeWorkspace(cwd);
     window.setTimeout(() => nudgeWorkspace(cwd), 150);
     return;
   }
 
   if (!isEditTool(event.kind, event.title, event.preview)) return;
-  const raw = event.preview?.path;
-  const resolved = raw ? resolveWorkspacePath(raw, cwd, true) : undefined;
-  if (resolved) {
-    nudgeWatchedFiles([resolved]);
-  } else if (completed) {
-    nudgeWatchedFiles();
+  const resolved = [
+    ...(event.paths ?? []),
+    ...(event.preview?.path ? [event.preview.path] : []),
+  ]
+    .map((path) => resolveWorkspacePath(path, cwd) ?? path)
+    .filter((path, index, paths) => paths.indexOf(path) === index);
+  if (completed) {
+    // A successful edit is authoritative. Reload it even if a startup race or
+    // coarse filesystem timestamp makes the mtime appear unchanged.
+    invalidateWatchedFiles(resolved.length > 0 ? resolved : undefined);
+  } else if (resolved.length > 0) {
+    nudgeWatchedFiles(resolved);
   }
   if (completed) {
-    window.setTimeout(() => nudgeWatchedFiles(), 150);
-    notifyGitChanged(cwd);
+    window.setTimeout(
+      () => nudgeWatchedFiles(resolved.length > 0 ? resolved : undefined),
+      150,
+    );
+    notifyGitChanged();
     nudgeWorkspace(cwd);
   }
 }

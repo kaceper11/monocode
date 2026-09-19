@@ -1,17 +1,16 @@
-import { AzurePrReview } from "../chrome/AzurePrReview";
-import { AzureCiReview } from "../chrome/AzureCiReview";
-import { GithubPrReview } from "../chrome/GithubPrReview";
-import { GitlabMrReview } from "../chrome/GitlabMrReview";
+import { requestBrowserOpen } from "../lib/browser";
+import { BrowserView } from "./BrowserView";
+import type { BrowserMetaPatch } from "../lib/browserWorkspace";
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { Activity, memo, useSyncExternalStore } from "react";
+import { memo, useSyncExternalStore } from "react";
 import {
   MarkdownViewShell,
   useMarkdownMode,
 } from "../chrome/MarkdownModeToggle";
 import { SurfaceTabs } from "../chrome/SurfaceTabs";
 import {
-  isBrowserTab,
   isAgentTab,
+  isBrowserTab,
   isChangesTab,
   isCommitTab,
   isPlanTab,
@@ -19,7 +18,6 @@ import {
   isReviewTab,
   isSessionChangesTab,
   isTerminalTab,
-  type BrowserMetaPatch,
   type EditorPane,
   type FilePaneTab,
 } from "../lib/layout";
@@ -29,13 +27,11 @@ import type { EditorNavigationTarget } from "../lib/search";
 import { editorPathsEqual } from "../lib/search";
 import type { PlanBuildTarget, Session } from "../lib/session";
 import { Play, Plus } from "../chrome/icons";
-import { requestBrowserOpen } from "../lib/browser";
 import { BuildTargetButton } from "../chrome/SecondOpinionButton";
 import { loadDiffViewer, subscribeDiffViewer } from "../lib/settings";
 import { AgentTabView } from "./AgentTabView";
 import { MarkdownPreview } from "./AgentMarkdown";
 import { BinaryFileView } from "./BinaryFileView";
-import { BrowserView } from "./BrowserView";
 import { CommitDiff } from "./CommitDiff";
 import { FileEditor } from "./FileEditor";
 import { ReleaseNotesSurface } from "./ReleaseNotesSurface";
@@ -45,10 +41,10 @@ import { WorkingTreeDiff } from "./WorkingTreeDiff";
 
 type Props = {
   pane: EditorPane;
+  visible?: boolean;
+  browserOccluded?: boolean;
+  onBrowserMetaChange?: (fileId: string, patch: BrowserMetaPatch) => void;
   focused: boolean;
-  visible: boolean;
-  /** Another leaf is expanded over this pane — hide native webviews. */
-  occluded?: boolean;
   dirtyFileIds: Set<string>;
   fileErrorCounts: Map<string, number>;
   sessions: Session[];
@@ -69,14 +65,14 @@ type Props = {
   editorNavigation?: EditorNavigationTarget | null;
   onPaneDragStart?: (event: ReactPointerEvent<HTMLElement>) => void;
   onTerminalMetaChange?: (fileId: string, patch: TerminalMetaPatch) => void;
-  onBrowserMetaChange?: (fileId: string, patch: BrowserMetaPatch) => void;
 };
 
 function FilePaneComponent({
   pane,
+  visible = true,
+  browserOccluded = false,
+  onBrowserMetaChange,
   focused,
-  visible,
-  occluded,
   dirtyFileIds,
   fileErrorCounts,
   sessions,
@@ -93,7 +89,6 @@ function FilePaneComponent({
   editorNavigation,
   onPaneDragStart,
   onTerminalMetaChange,
-  onBrowserMetaChange,
 }: Props) {
   const diffViewer = useSyncExternalStore(
     subscribeDiffViewer,
@@ -125,20 +120,9 @@ function FilePaneComponent({
         onCloseOtherFiles={(fileId) => onCloseOtherFiles(pane.id, fileId)}
         onReorder={(ids) => onReorderFiles(pane.id, ids)}
         onPaneDragStart={onPaneDragStart}
-        trailing={
-          <button
-            type="button"
-            title="New browser tab"
-            aria-label="New browser tab"
-            className="mr-1 grid size-5.5 shrink-0 place-items-center self-center rounded text-content/55 outline-none hover:bg-content/10 hover:text-content focus-visible:ring-1 focus-visible:ring-content/30"
-            onClick={(event) => {
-              event.stopPropagation();
-              requestBrowserOpen("", activeFile?.cwd, pane.id);
-            }}
-          >
-            <Plus className="size-3" strokeWidth={1.75} />
-          </button>
-        }
+        trailing={pane.files.some(isBrowserTab) ? <button type="button" title="New browser tab" aria-label="New browser tab" className="mr-1 grid size-5.5 shrink-0 place-items-center self-center rounded text-content/55 hover:bg-content/10 focus-visible:ring-1 focus-visible:ring-content/30" onClick={event => {
+          event.stopPropagation(); requestBrowserOpen("", activeFile?.cwd, pane.id);
+        }}><Plus className="size-3" strokeWidth={1.75} /></button> : undefined}
       />
       <div className="relative min-h-0 flex-1">
         {sessionReview ? (
@@ -180,16 +164,7 @@ function FilePaneComponent({
                   : "hidden"
               }
             >
-              {file.delivery ? (
-                <Activity mode={visible && file.id === pane.activeFileId ? "visible" : "hidden"}><div className="flex h-full min-h-0 flex-col">
-                  {file.delivery.provider === "github" ? <GithubPrReview cwd={file.cwd} repo={file.delivery.repo ?? ""} number={file.delivery.number ?? 0} branch={file.delivery.branch} sourceSessionId={file.delivery.sourceSessionId} enabled onReveal={() => onSelectFile(pane.id, file.id)} onClose={() => onCloseFile(pane.id, file.id)} />
-                    : file.delivery.provider === "gitlab" ? <GitlabMrReview cwd={file.cwd} repo={file.delivery.repo ?? ""} number={file.delivery.number ?? 0} branch={file.delivery.branch} sourceSessionId={file.delivery.sourceSessionId} enabled onReveal={() => onSelectFile(pane.id, file.id)} onClose={() => onCloseFile(pane.id, file.id)} />
-                    : file.delivery.kind === "pr" ? <AzurePrReview cwd={file.cwd} branch={file.delivery.branch} sourceSessionId={file.delivery.sourceSessionId}
-                      linkedWorkItem={sessions.find(session => session.id === file.delivery?.sourceSessionId)?.linkedWorkItem}
-                      enabled onReveal={() => onSelectFile(pane.id, file.id)} onClose={() => onCloseFile(pane.id, file.id)} />
-                    : <AzureCiReview cwd={file.cwd} branch={file.delivery.branch} sourceSessionId={file.delivery.sourceSessionId} enabled onReveal={() => onSelectFile(pane.id, file.id)} onClose={() => onCloseFile(pane.id, file.id)} />}
-                </div></Activity>
-              ) : isAgentTab(file) ? (
+              {isAgentTab(file) ? (
                 <AgentTabView
                   title={file.path}
                   session={sessions.find(
@@ -213,7 +188,6 @@ function FilePaneComponent({
                   id={file.id}
                   cwd={file.cwd}
                   active={focused && file.id === pane.activeFileId}
-                  command={file.command}
                   onMetaChange={(patch) =>
                     onTerminalMetaChange?.(file.id, patch)
                   }
@@ -221,11 +195,11 @@ function FilePaneComponent({
               ) : isBrowserTab(file) ? (
                 <BrowserView
                   file={file}
+                  sessions={sessions}
                   active={visible && file.id === pane.activeFileId}
-                  occluded={occluded}
-                  onMetaChange={(patch) =>
-                    onBrowserMetaChange?.(file.id, patch)
-                  }
+                  occluded={browserOccluded}
+                  onFocus={() => onFocus(pane.id)}
+                  onMetaChange={patch => onBrowserMetaChange?.(file.id, patch)}
                 />
               ) : isImagePath(file.path) ? (
                 <BinaryFileView path={file.path} cwd={file.cwd} />
@@ -260,10 +234,12 @@ function FilePaneComponent({
 
 export const FilePane = memo(FilePaneComponent, (previous, next) => {
   if (
+    previous.visible !== next.visible ||
+    previous.browserOccluded !== next.browserOccluded ||
+    previous.onBrowserMetaChange !== next.onBrowserMetaChange ||
+    (next.pane.files.some(isBrowserTab) && previous.sessions !== next.sessions) ||
     previous.pane !== next.pane ||
     previous.focused !== next.focused ||
-    previous.visible !== next.visible ||
-    previous.occluded !== next.occluded ||
     previous.dirtyFileIds !== next.dirtyFileIds ||
     previous.fileErrorCounts !== next.fileErrorCounts ||
     previous.onFocus !== next.onFocus ||
@@ -278,18 +254,14 @@ export const FilePane = memo(FilePaneComponent, (previous, next) => {
     previous.onBuildPlan !== next.onBuildPlan ||
     previous.editorNavigation !== next.editorNavigation ||
     Boolean(previous.onPaneDragStart) !== Boolean(next.onPaneDragStart) ||
-    previous.onTerminalMetaChange !== next.onTerminalMetaChange ||
-    previous.onBrowserMetaChange !== next.onBrowserMetaChange
+    previous.onTerminalMetaChange !== next.onTerminalMetaChange
   ) {
     return false;
   }
 
   for (const file of next.pane.files) {
-    // Plans, delivery reviews and agent tabs all read a live session object.
-    const sessionId =
-      file.plan?.sessionId ??
-      file.delivery?.sourceSessionId ??
-      file.agent?.sessionId;
+    // Plans and agent tabs both read a live session object from this pane.
+    const sessionId = file.plan?.sessionId ?? file.agent?.sessionId;
     if (!sessionId) continue;
     const before = previous.sessions.find(
       (session) => session.id === sessionId,

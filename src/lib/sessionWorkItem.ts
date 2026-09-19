@@ -3,7 +3,6 @@ import {
   githubRepo,
   inboxIdentityKey,
   type InboxItem,
-  type InboxComposerCard,
   type GithubTaskKind,
 } from "./githubTasks";
 import type { LinkedWorkItem } from "./session";
@@ -112,6 +111,7 @@ export function linkedWorkItemFromInboxItem(
       url: item.url || githubUrl(item.repo, item.kind, item.number),
     };
   }
+  if (item.provider !== "jira" && item.provider !== "azure") return null;
   try {
     const url = new URL(item.url);
     if (url.protocol !== "https:" || url.username || url.password) return null;
@@ -137,6 +137,7 @@ export function inboxItemMatchesLinkedWorkItem(
   linked: LinkedWorkItem,
 ): boolean {
   return (
+    !linkedWorkItemNeedsAccount(linked) &&
     item.provider === (linked.provider ?? "github") &&
     (linked.provider && linked.provider !== "github"
       ? item.url === linked.url &&
@@ -172,57 +173,27 @@ export function sessionWorkItems(session: {
   return first ? [first, ...(first.additionalItems ?? [])] : [];
 }
 
-export function addSessionWorkItems<
-  T extends { linkedWorkItem?: LinkedWorkItem },
->(session: T, incoming: LinkedWorkItem[]): T {
-  const links = [...sessionWorkItems(session)];
-  for (const item of incoming) {
-    const index = links.findIndex(
-      (link) =>
-        link.url === item.url &&
-        (link.account ?? "") === (item.account ?? ""),
-    );
-    if (index < 0) links.push(item);
-    else
-      links[index] = {
-        ...links[index],
-        ...item,
-        ...(item.account || links[index].account
-          ? { account: item.account || links[index].account }
-          : {}),
-      };
-  }
-  if (links.length > 20)
-    throw new Error("A conversation can link up to 20 tickets.");
-  if (!links.length) return session;
-  const [first, ...rest] = boundLinkedContexts(links).map(
-    ({ additionalItems: _extra, ...item }) => item,
-  );
-  return {
-    ...session,
-    linkedWorkItem: {
-      ...first,
-      ...(rest.length ? { additionalItems: rest } : {}),
-    },
-  };
+/** Earlier fork links did not save connection identity. Rebind only by user choice. */
+export function linkedWorkItemNeedsAccount(item: LinkedWorkItem): boolean {
+  return (item.provider === "jira" || item.provider === "azure") && !item.account;
 }
 
-export function removeSessionWorkItem<T extends { linkedWorkItem?: LinkedWorkItem }>(session: T, item: LinkedWorkItem): T {
-  const remaining = sessionWorkItems(session).filter(link =>
-    link.url !== item.url || ((link.account ?? "") !== (item.account ?? "")));
-  return addSessionWorkItems({ ...session, linkedWorkItem: undefined }, remaining);
-}
-
-
-export const OPEN_INBOX_WORK_ITEM = "monocode:open-inbox-work-item";
-
-/** Conversation cards navigate internally; provider URLs remain reference data. */
-export function openInboxCard(card: InboxComposerCard) {
-  const github = card.provider === "github" ? parseGithubWorkItemUrl(card.url) : null;
-  const number = github?.number ?? Number(card.identifier.match(/\d+$/)?.[0]);
-  if (!validNumber(number)) return;
-  const item: LinkedWorkItem = { provider: card.provider, account: card.account, kind: card.kind === "pr" ? "pr" : "issue", repo: github?.repo ?? card.source, number, url: card.url, identifier: card.identifier, title: card.title, ...(card.id ? { id: card.id } : {}), ...(card.site ? { site: card.site } : {}) };
-  window.dispatchEvent(new CustomEvent(OPEN_INBOX_WORK_ITEM, { detail: item }));
+export function bindLinkedWorkItemAccount(
+  saved: LinkedWorkItem,
+  target: LinkedWorkItem,
+  account: string,
+  site: string,
+): LinkedWorkItem {
+  if (!account || !linkedWorkItemNeedsAccount(target)) return saved;
+  const key = linkedWorkItemInboxKey(target);
+  const bind = (item: LinkedWorkItem) => linkedWorkItemNeedsAccount(item) && linkedWorkItemInboxKey(item) === key
+    ? { ...item, account, site }
+    : item;
+  const primary = bind(saved);
+  const additional = saved.additionalItems?.map(bind);
+  return additional?.some((item, index) => item !== saved.additionalItems![index])
+    ? { ...primary, additionalItems: additional }
+    : primary;
 }
 
 /** Keep saved descriptions within one shared budget, including incremental additions. */
@@ -244,8 +215,8 @@ export type WorkItemIndex<T> = Map<string, Map<string, Set<T>>>;
 /**
  * Entities indexed by their linked-work-item identities — one pass for a
  * whole caller's lookups. Account-scoped exactly like
- * {@link inboxItemMatchesLinkedWorkItem}: an unscoped link joins every
- * account, a scoped link only its own.
+ * {@link inboxItemMatchesLinkedWorkItem}: upstream unscoped links join every
+ * account; legacy Jira/Azure links require an explicit account first.
  */
 export function indexByWorkItem<T>(
   entities: readonly T[],
@@ -253,6 +224,7 @@ export function indexByWorkItem<T>(
 ): WorkItemIndex<T> {
   const index: WorkItemIndex<T> = new Map();
   for (const entity of entities) for (const link of linksOf(entity)) {
+    if (linkedWorkItemNeedsAccount(link)) continue;
     const key = workItemIdentity(link);
     let accounts = index.get(key);
     if (!accounts) index.set(key, accounts = new Map());
@@ -276,20 +248,4 @@ export function relatedFromIndex<T>(
       ...(accounts?.get(item.account || "") ?? []),
     ]),
   ];
-}
-
-/** Related sessions for every item in one indexed pass — same matching as
- * {@link relatedSessionsForInboxItem} without the per-row rescan. */
-export function inboxRelatedSessionMap<T extends { linkedWorkItem?: LinkedWorkItem }>(
-  items: readonly InboxItem[],
-  sessions: readonly T[],
-): Map<InboxItem, T[]> {
-  const index = indexByWorkItem(sessions, sessionWorkItems);
-  return new Map(items.map(item => [item, relatedFromIndex(item, index)]));
-}
-
-/** Index links once instead of scanning all sessions for every visible Inbox row. */
-export function inboxRelatedSessionCounts<T extends { linkedWorkItem?: LinkedWorkItem }>(items: readonly InboxItem[], sessions: readonly T[]): Map<InboxItem, number> {
-  const map = inboxRelatedSessionMap(items, sessions);
-  return new Map([...map].map(([item, related]) => [item, related.length]));
 }

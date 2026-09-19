@@ -25,45 +25,6 @@ function render(
 }
 
 describe("AgentTranscript collapsed work", () => {
-  it("shows a waiting indicator before the first response and clears it on output", () => {
-    const user: Block = { id: "user", role: "user", text: "hey", startedAt: 1 };
-    expect(render([user], true)).toContain("Waiting for agent response");
-    expect(render([user, { id: "answer", role: "assistant", text: "Hello" }], true))
-      .not.toContain("Waiting for agent response");
-    expect(render([user], false)).not.toContain("Waiting for agent response");
-  });
-  it("preserves unfenced generic and HTML examples alongside user Markdown", () => {
-    const markup = render([{ id: "user", role: "user", text: "**Compare** Array<T> with Array<U>.\n\n<script>alert(1)</script>\n\n- keep <div>literal</div>" }]);
-    expect(markup).toContain("Array&lt;T&gt;");
-    expect(markup).toContain("Array&lt;U&gt;");
-    expect(markup).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
-    expect(markup).toContain("&lt;div&gt;literal&lt;/div&gt;");
-    expect(markup).toContain('data-streamdown="strong"');
-    expect(markup).not.toContain("<script>");
-  });
-
-  it("shows finishing activity only for an in-flight turn", () => {
-    const blocks: Block[] = [{ id: "user", role: "user", text: "work", startedAt: 1 }];
-    const live = renderToStaticMarkup(createElement(AgentTranscript, { blocks, busy: true, activity: "Finishing…" }));
-    const done = renderToStaticMarkup(createElement(AgentTranscript, { blocks, busy: false, activity: "Finishing…" }));
-    expect(live).toContain("Finishing…");
-    expect(done).not.toContain("Finishing…");
-  });
-  it("formats follow-up Markdown and preserves plain-text line breaks", () => {
-    const markup = render([
-      { id: "first", role: "user", text: "Start" },
-      { id: "reply", role: "assistant", text: "Ready" },
-      { id: "followup", role: "user", text: "**Please change:**\n\n- use `fast()`\n- keep tests\n\nfirst line\nsecond line\n\n~~~ts\nconst answer = 42;\n~~~" },
-    ]);
-    expect(markup).toContain('data-streamdown="strong"');
-    expect(markup).toContain("<ul");
-    expect(markup).toContain("<code");
-    expect(markup).toContain("first line\nsecond line");
-    expect(markup).toContain("[&amp;_p]:whitespace-pre-wrap");
-    expect(markup).not.toContain("**Please change:**");
-    expect(markup).not.toContain("~~~ts");
-  });
-
   it("hides provider authentication errors handled by the sign-in modal", () => {
     const markup = renderToStaticMarkup(
       createElement(AgentTranscript, {
@@ -145,6 +106,17 @@ describe("AgentTranscript collapsed work", () => {
     expect(markup).not.toContain("text-ellipsis");
   });
 
+  it("renders an unsent turn as a draft bubble with a send control", () => {
+    const markup = render([
+      { id: "draft", role: "user", text: "Explore this", draft: true },
+    ]);
+
+    expect(markup).toContain('data-draft="true"');
+    expect(markup).toContain("border-dashed");
+    expect(markup).toContain('aria-label="Send draft"');
+    expect(markup).toContain(">Draft</span>");
+  });
+
   it("keeps surrounding prose and previews its first URL", () => {
     const markup = render([
       {
@@ -158,6 +130,24 @@ describe("AgentTranscript collapsed work", () => {
     expect(markup).toContain("Please check");
     expect(markup).toContain("Open example.com");
     expect(markup).not.toContain("Please check https://example.com/docs");
+  });
+
+  it("renders GitHub pull requests as compact work item chips", () => {
+    const markup = render([
+      {
+        id: "user",
+        role: "user",
+        text: "Review https://github.com/acme/widgets/pull/73 please",
+      },
+    ]);
+
+    expect(markup).toContain('data-github-work-item-chip="pr"');
+    expect(markup).toContain('data-compact="true"');
+    expect(markup).toContain("#73");
+    expect(markup).not.toContain(">acme/widgets</span>");
+    expect(markup).toContain("Review");
+    expect(markup).toContain("please");
+    expect(markup).not.toContain("user-link-preview-title");
   });
 
   it("keeps each completed turn's recorded model label", () => {
@@ -583,12 +573,4 @@ describe("worker assignment prompts", () => {
     expect(markup).not.toContain("monocode_assignment");
     expect(markup).not.toContain("You are a worker managed by a MonoCode lead");
   });
-});
-
-
-it("renders a selected-code user message with the existing Markdown code renderer", () => {
-  const markup = render([{ id: "code", role: "user", text: "src/example.ts\n\n```typescript\nconst value = 1;\n```" }]);
-  expect(markup).toContain("agent-markdown");
-  expect(markup).toContain("typescript");
-  expect(markup).not.toContain("```typescript");
 });

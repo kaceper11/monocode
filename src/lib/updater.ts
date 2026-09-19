@@ -1,5 +1,5 @@
 import { getVersion } from "@tauri-apps/api/app";
-import { ask, message } from "./dialogs";
+import { ask, message } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import { announceUpdateAvailable } from "./sounds";
@@ -90,7 +90,7 @@ export async function runUpdateFlow(
       onProgress?.(idle);
       if (manual) {
         await message(
-          "Automatic updates are unavailable in this development build. Install a published MonoCode release to receive updates.",
+          "Automatic updates aren't configured for this build.\n\nDownload releases at https://github.com/kaceper11/monocode/releases/latest",
           { title: "MonoCode" },
         );
       }

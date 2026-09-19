@@ -9,7 +9,6 @@ import {
   notifyGitChanged,
   subscribeGitChanged,
   type GitChangedFile,
-  type GitDiffGuard,
   type GitFileDiffKind,
 } from "../lib/fs";
 import { forEachConcurrent } from "../lib/concurrent";
@@ -20,7 +19,7 @@ import {
   workingTreeDiffEntryLabel,
   workingTreeDiffFocusId,
 } from "../lib/workingTreeDiff";
-import { revertChunkText, stageChunkText } from "./editorGit";
+import { stageChunkText } from "./editorGit";
 import { UnifiedDiffView, type UnifiedDiffFileModel } from "./UnifiedDiffView";
 
 type Props = {
@@ -45,9 +44,7 @@ export function WorkingTreeDiff({ cwd, focusPath, focusKind }: Props) {
   const [files, setFiles] = useState<GitChangedFile[] | null>(null);
   const [diffs, setDiffs] = useState<Map<string, LoadedDiff>>(new Map());
   const [error, setError] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
-  const busyRef = useRef<string | null>(null);
   const diffsRef = useRef(diffs);
   diffsRef.current = diffs;
 
@@ -102,7 +99,7 @@ export function WorkingTreeDiff({ cwd, focusPath, focusKind }: Props) {
                 };
               } catch (caught: unknown) {
                 loaded = {
-                  status: "modified",
+                  status: "",
                   binary: false,
                   tooLarge: false,
                   original: "",
@@ -138,7 +135,7 @@ export function WorkingTreeDiff({ cwd, focusPath, focusKind }: Props) {
         run();
       });
     };
-    const unsub = subscribeGitChanged(scheduleRun, cwd);
+    const unsub = subscribeGitChanged(scheduleRun);
     const onFocus = () => {
       if (!document.hidden) scheduleRun();
     };
@@ -191,13 +188,8 @@ export function WorkingTreeDiff({ cwd, focusPath, focusKind }: Props) {
         blocks: unchanged ? [] : (unified?.blocks ?? []),
         canStage: kind === "unstaged",
         canDiscard: kind === "unstaged",
-        hunkAction:
-          loaded && !loaded.binary && !loaded.tooLarge
-            ? kind === "staged"
-              ? "unstage"
-              : "stage"
-            : undefined,
-        contextRevision: loaded,
+        canStageHunk:
+          kind === "unstaged" && !loaded?.binary && !loaded?.tooLarge,
       };
     });
   }, [diffs, entries, files]);
@@ -226,7 +218,7 @@ export function WorkingTreeDiff({ cwd, focusPath, focusKind }: Props) {
       setBusyId(id);
       try {
         await gitStageFile(cwd, entry.file.relative);
-        notifyGitChanged(cwd);
+        notifyGitChanged();
       } finally {
         setBusyId(null);
       }
@@ -241,7 +233,7 @@ export function WorkingTreeDiff({ cwd, focusPath, focusKind }: Props) {
       setBusyId(id);
       try {
         await gitDiscardFile(cwd, entry.file.relative);
-        notifyGitChanged(cwd);
+        notifyGitChanged();
       } finally {
         setBusyId(null);
       }
@@ -249,71 +241,20 @@ export function WorkingTreeDiff({ cwd, focusPath, focusKind }: Props) {
     [cwd, entries],
   );
 
-  const onHunkAction = useCallback(
+  const onStageHunk = useCallback(
     async (id: string, pos: number) => {
-      if (busyRef.current) return;
       const entry = entries.find((candidate) => candidate.id === id);
-      if (!entry) return;
+      if (!entry || entry.kind !== "unstaged") return;
       const loaded = diffsRef.current.get(id);
       if (!loaded) return;
-      const next =
-        entry.kind === "staged"
-          ? revertChunkText(loaded.original, loaded.current, pos)
-          : stageChunkText(loaded.original, loaded.current, pos);
+      const next = stageChunkText(loaded.original, loaded.current, pos);
       if (next == null) return;
-      const guard: GitDiffGuard = {
-        kind: entry.kind,
-        status: loaded.status,
-        original: loaded.original,
-        current: loaded.current,
-      };
-      busyRef.current = id;
       setBusyId(id);
-      setActionError(null);
       try {
-        await gitStageContents(cwd, entry.file.relative, next, guard);
-        notifyGitChanged(cwd);
-      } catch (caught: unknown) {
-        setActionError(
-          caught instanceof Error ? caught.message : String(caught),
-        );
-        notifyGitChanged(cwd);
+        await gitStageContents(cwd, entry.file.relative, next, { kind: entry.kind, status: loaded.status, original: loaded.original, current: loaded.current });
+        notifyGitChanged();
       } finally {
-        busyRef.current = null;
         setBusyId(null);
-      }
-    },
-    [cwd, entries],
-  );
-
-  const validateContext = useCallback(
-    async (id: string, revision: object | undefined) => {
-      const entry = entries.find((candidate) => candidate.id === id);
-      const loaded = diffsRef.current.get(id);
-      if (!entry || !loaded || loaded !== revision) {
-        throw new Error(
-          "This diff changed. Review the refreshed hunk and try again.",
-        );
-      }
-      const current = await gitFileDiff(
-        cwd,
-        entry.file.relative,
-        entry.kind,
-      ).catch(() => {
-        notifyGitChanged(cwd);
-        throw new Error(
-          "This diff changed. Review the refreshed hunk and try again.",
-        );
-      });
-      if (
-        current.status !== loaded.status ||
-        current.original !== loaded.original ||
-        current.current !== loaded.current
-      ) {
-        notifyGitChanged(cwd);
-        throw new Error(
-          "This diff changed. Review the refreshed hunk and try again.",
-        );
       }
     },
     [cwd, entries],
@@ -344,26 +285,15 @@ export function WorkingTreeDiff({ cwd, focusPath, focusKind }: Props) {
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      {actionError ? (
-        <p
-          role="alert"
-          className="shrink-0 border-b border-content/10 px-3 py-1 text-[11px] text-red-400"
-        >
-          {actionError}
-        </p>
-      ) : null}
-      <UnifiedDiffView
-        files={models}
-        fileCount={files.length}
-        focusId={focusId}
-        busyId={busyId}
-        totals={totals}
-        onStageFile={onStageFile}
-        onDiscardFile={onDiscardFile}
-        onHunkAction={onHunkAction}
-        onValidateContext={validateContext}
-      />
-    </div>
+    <UnifiedDiffView
+      files={models}
+      fileCount={files.length}
+      focusId={focusId}
+      busyId={busyId}
+      totals={totals}
+      onStageFile={onStageFile}
+      onDiscardFile={onDiscardFile}
+      onStageHunk={onStageHunk}
+    />
   );
 }

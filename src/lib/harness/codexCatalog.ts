@@ -30,7 +30,7 @@ const REASONING_LABELS: Record<string, string> = {
 };
 
 export function refreshCodexCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("codex", cwd, () => discoverCodexModels(cwd));
+  return refreshModelCatalog("codex", cwd, discoverCodexModels);
 }
 
 async function discoverCodexModels(projectCwd?: string): Promise<AgentModel[]> {
@@ -91,16 +91,16 @@ async function discoverCodexModels(projectCwd?: string): Promise<AgentModel[]> {
         }>("account/read", {}, REQUEST_TIMEOUT_MS)
         .catch(() => null);
 
-      if (codexAccountSignedOut(account)) {
+      if (account && !account.account && account.requiresOpenaiAuth) {
         throw new Error(CODEX_SIGN_IN_ERROR);
       }
 
-      return await listCodexModels(rpc);
+      return await listAllModels(rpc);
     }, () => {
       void stop();
     });
   } catch (error) {
-    throw probeError(error, stderrTail);
+    throw projectCwd ? probeError(error, stderrTail) : error;
   } finally {
     await stop();
   }
@@ -121,21 +121,10 @@ function probeError(error: unknown, stderrTail: string[]): unknown {
   return new Error(`${message} — ${detail}`);
 }
 
-export const CODEX_SIGN_IN_ERROR =
+const CODEX_SIGN_IN_ERROR =
   "Codex CLI is not authenticated. Run `codex login` and try again.";
 
-export function codexAccountSignedOut(account: unknown): boolean {
-  const record = asRecord(account);
-  return (
-    record != null && !record.account && record.requiresOpenaiAuth === true
-  );
-}
-
-/** Model listing on an existing app-server connection (catalog probe or a live session). */
-export async function listCodexModels(
-  rpc: JsonRpcClient,
-  timeoutMs = REQUEST_TIMEOUT_MS,
-): Promise<AgentModel[]> {
+async function listAllModels(rpc: JsonRpcClient): Promise<AgentModel[]> {
   const models: AgentModel[] = [];
   const rows: unknown[] = [];
   let cursor: string | null | undefined;
@@ -143,7 +132,7 @@ export async function listCodexModels(
     const response = await rpc.request<{
       data?: unknown[];
       nextCursor?: string | null;
-    }>("model/list", cursor ? { cursor } : {}, timeoutMs);
+    }>("model/list", cursor ? { cursor } : {}, REQUEST_TIMEOUT_MS);
     const page = Array.isArray(response.data) ? response.data : [];
     rows.push(...page);
     for (const row of page) {

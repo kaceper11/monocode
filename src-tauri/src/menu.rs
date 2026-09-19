@@ -21,14 +21,22 @@ pub fn dispatch(app: &AppHandle, id: &str) {
         | "forward_tab" | "split_right" | "split_down" | "focus_left" | "focus_right"
         | "focus_up" | "focus_down" | "toggle_sidebar" | "sidebar_opacity" | "open_project"
         | "go_to_file" | "open_search" | "open_inbox" | "open_notes" | "find_in_project"
-        | "new_terminal" | "new_terminal_tab" | "toggle_terminal" | "open_browser"
+        | "find" | "new_terminal" | "new_terminal_tab" | "toggle_terminal"
         | "open_model_picker" | "open_settings" | "check_for_updates" => {
             let _ = app.emit(id, ());
         }
-        // Zoom, find, browser and Close All Tabs commands target one window:
-        // a broadcast would make every window act on a single menu click.
-        "zoom_in" | "zoom_out" | "zoom_reset" | "find" | "browser_reload" | "browser_focus_url"
-        | "browser_devtools" | "close_all_tabs" => emit_to_focused(app, id),
+        // Zoom, Reload, Command Palette, and Close All Tabs target one window: a broadcast would
+        // make every window act on a single menu click.
+        "open_browser"
+        | "browser_reload"
+        | "browser_focus_url"
+        | "browser_devtools"
+        | "zoom_in"
+        | "zoom_out"
+        | "zoom_reset"
+        | "reload"
+        | "open_command_palette"
+        | "close_all_tabs" => emit_to_focused(app, id),
         _ => {}
     }
 }
@@ -71,6 +79,9 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .build(app)?;
     let go_to_file = MenuItemBuilder::with_id("go_to_file", "Go to File…")
         .accelerator("CmdOrCtrl+P")
+        .build(app)?;
+    let command_palette = MenuItemBuilder::with_id("open_command_palette", "Command Palette…")
+        .accelerator("CmdOrCtrl+Shift+P")
         .build(app)?;
     let open_search = MenuItemBuilder::with_id("open_search", "Search…")
         .accelerator("CmdOrCtrl+K")
@@ -144,6 +155,9 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let zoom_in = MenuItemBuilder::with_id("zoom_in", "Zoom In").build(app)?;
     let zoom_out = MenuItemBuilder::with_id("zoom_out", "Zoom Out").build(app)?;
     let zoom_reset = MenuItemBuilder::with_id("zoom_reset", "Reset Zoom").build(app)?;
+    let reload = MenuItemBuilder::with_id("reload", "Reload")
+        .accelerator("CmdOrCtrl+Shift+R")
+        .build(app)?;
     let find = MenuItemBuilder::with_id("find", "Find")
         .accelerator("CmdOrCtrl+F")
         .build(app)?;
@@ -174,17 +188,13 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&open_project)
         .item(&open_search)
         .item(&go_to_file)
+        .item(&command_palette)
         .item(&find_in_project)
         .separator()
         .item(&new_tab)
         .item(&new_terminal)
         .item(&new_terminal_tab)
         .item(&open_browser)
-        .separator()
-        .item(&browser_reload)
-        .item(&browser_focus_url)
-        .item(&browser_devtools)
-        .separator()
         .item(&split_right)
         .item(&split_down)
         .item(&close_tab)
@@ -202,6 +212,9 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&open_inbox)
         .item(&open_notes)
         .item(&toggle_terminal)
+        .item(&browser_reload)
+        .item(&browser_focus_url)
+        .item(&browser_devtools)
         .item(&open_model_picker)
         .separator()
         .item(&focus_left)
@@ -212,6 +225,7 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&zoom_in)
         .item(&zoom_out)
         .item(&zoom_reset)
+        .item(&reload)
         .separator()
         .item(&sidebar_opacity)
         .build()?;
@@ -230,11 +244,10 @@ fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
 
     #[cfg(target_os = "macos")]
     {
-        let app_name = app.package_info().name.as_str();
-        let quit = MenuItemBuilder::with_id("quit", format!("Quit {app_name}"))
+        let quit = MenuItemBuilder::with_id("quit", "Quit MonoCode")
             .accelerator("CmdOrCtrl+Q")
             .build(app)?;
-        let app_menu = SubmenuBuilder::new(app, app_name)
+        let app_menu = SubmenuBuilder::new(app, "MonoCode")
             .about(Some(AboutMetadata::default()))
             .separator()
             .item(&open_settings)

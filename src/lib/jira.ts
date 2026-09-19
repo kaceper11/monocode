@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   GithubWorkItemDetails,
   GithubWorkItemThread,
@@ -9,6 +10,7 @@ export type JiraStatus = {
   connected: boolean;
   site: string;
   account: string;
+  accountId: string;
   /** Atlassian products verified for the saved credential. Empty means the
    * connection predates capability tracking — treat as unknown. */
   capabilities: string[];
@@ -32,8 +34,23 @@ export function jiraFilterCacheKey(): string {
 let generation = 0;
 const details = new Map<string, GithubWorkItemDetails>();
 const threads = new Map<string, GithubWorkItemThread>();
+function connectionChanged() {
+  generation++;
+  details.clear();
+  threads.clear();
+  window.dispatchEvent(new CustomEvent(JIRA_CHANGE_EVENT, { detail: "connection" }));
+}
+let connectionBridge: Promise<UnlistenFn | null> | null = null;
+function watchConnection() {
+  return connectionBridge ??= listen(JIRA_CHANGE_EVENT, connectionChanged).catch(() => {
+    connectionBridge = null;
+    return null;
+  });
+}
+import.meta.hot?.dispose(() => { void connectionBridge?.then(unlisten => unlisten?.()); });
 
-export function jiraConnected(): Promise<JiraStatus> {
+export async function jiraConnected(): Promise<JiraStatus> {
+  await watchConnection();
   return invoke("jira_status");
 }
 
@@ -51,15 +68,14 @@ export async function saveJiraConfig(
   email: string,
   token: string,
 ): Promise<JiraStatus> {
+  const observing = await watchConnection();
   const status = await invoke<JiraStatus>("jira_set_config", {
     site,
     email,
     token,
   });
-  generation++;
-  details.clear();
-  threads.clear();
-  window.dispatchEvent(new Event(JIRA_CHANGE_EVENT));
+  // Native broadcasts invalidate every window, including the caller.
+  if (!observing) connectionChanged();
   return status;
 }
 export function loadJiraFilter(site: string): JiraFilter {
@@ -92,8 +108,9 @@ export function saveJiraFilter(site: string, filter: JiraFilter) {
 export async function jiraOptions(
   site: string,
   favorites: boolean,
+  accountId: string,
 ): Promise<JiraOption[]> {
-  return invoke("jira_options", { site, favorites });
+  return invoke("jira_options", { site, favorites, accountId });
 }
 
 type JiraNode = {
@@ -253,19 +270,20 @@ export function jiraIssue(site: string, issue: IssueResponse): InboxItem {
 export async function listJiraIssues(
   site: string,
   state: "open" | "all",
+  accountId: string,
   filter?: JiraFilter,
 ): Promise<InboxItem[]> {
   const before = generation;
   const result = await invoke<{ site: string; issues: IssueResponse[] }>(
     "jira_list_issues",
-    { site, state, ...(filter ?? loadJiraFilter(site)) },
+    { site, state, accountId, ...(filter ?? loadJiraFilter(site)) },
   );
   if (before !== generation)
     throw new Error("Jira connection changed. Refresh and retry.");
-  return result.issues.map((issue) => jiraIssue(result.site, issue));
+  return result.issues.map((issue) => ({ ...jiraIssue(result.site, issue), account: accountId }));
 }
-function key(item: Pick<InboxItem, "site" | "id">) {
-  return `${item.site}:${item.id}`;
+function key(item: Pick<InboxItem, "site" | "id" | "account">) {
+  return JSON.stringify([item.account, item.site, item.id]);
 }
 function retain<T>(cache: Map<string, T>, id: string, value: T) {
   cache.delete(id);
@@ -276,15 +294,17 @@ function retain<T>(cache: Map<string, T>, id: string, value: T) {
 export async function jiraIssueSnapshot(
   site: string,
   id: string,
+  accountId: string,
 ): Promise<InboxItem> {
   const before = generation;
   const response = await invoke<IssueResponse>("jira_issue_snapshot", {
     site,
     id,
+    accountId,
   });
   if (before !== generation)
     throw new Error("Jira connection changed. Refresh and retry.");
-  return jiraIssue(site, response);
+  return { ...jiraIssue(site, response), account: accountId };
 }
 
 export function peekJiraDetails(item: InboxItem) {
@@ -300,6 +320,7 @@ export async function jiraDetails(
   const response = await invoke<IssueResponse>("jira_issue_content", {
     site: item.site,
     id: item.id,
+    accountId: item.account ?? "",
     comments: false,
   });
   if (before !== generation)
@@ -320,7 +341,7 @@ export async function jiraDetails(
   return result;
 }
 export async function jiraThread(
-  item: Pick<InboxItem, "site" | "id" | "url">,
+  item: Pick<InboxItem, "site" | "id" | "url" | "account">,
 ): Promise<GithubWorkItemThread> {
   const before = generation;
   const response = await invoke<{
@@ -331,7 +352,7 @@ export async function jiraThread(
       created: string;
       author?: { displayName?: string };
     }[];
-  }>("jira_issue_content", { site: item.site, id: item.id, comments: true });
+  }>("jira_issue_content", { site: item.site, id: item.id, accountId: item.account ?? "", comments: true });
   if (before !== generation)
     throw new Error("Jira connection changed. Refresh and retry.");
   const result: GithubWorkItemThread = {

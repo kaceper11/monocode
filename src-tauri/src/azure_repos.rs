@@ -2,188 +2,9 @@
 use crate::azure::{component, request, request_method, require_config, AzureConfig};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 const PAGE_SIZE: usize = 50;
-
-#[tauri::command]
-pub fn azure_pr_cancel_checkout(request_id: String) {
-    crate::checkout::cancel_checkout(&request_id);
-}
-
-#[tauri::command]
-pub async fn azure_pr_prepare_checkout(
-    app: AppHandle,
-    cwd: String,
-    target: PrTarget,
-    expected_revision: String,
-    request_id: String,
-) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let _preparation = crate::checkout::begin_checkout(&request_id)?;
-        if crate::wsl::location(&cwd)?.is_some() {
-            return Err("Automatic cloning requires a local execution host. Open a matching checkout in this WSL distribution to keep the agent on its selected host.".into());
-        }
-        let config = require_config(&app, &target.site)?;
-        checked_account(&config, &target.account_id)?;
-        let api_path = format!("{}/pullRequests/{}", repository_path(&target.project, &target.repository)?, target.number);
-        let pr = get(&config, &api_path, &[])?;
-        verify_pr(&pr, &target.project, &target.repository, target.number)?;
-        if revision(&pr)? != expected_revision || pr["status"] != "active" {
-            return Err("PR changed or is no longer active. Refresh before preparing its checkout.".into());
-        }
-        if pr.get("forkSource").is_some_and(|fork| !fork.is_null()) {
-            return Err("Fork PR checkouts require opening the source repository explicitly.".into());
-        }
-        let branch = text(&pr, "sourceRefName")?.strip_prefix("refs/heads/").ok_or("Invalid PR source branch")?;
-        let commit = text(&pr["lastMergeSourceCommit"], "commitId")?;
-        let remote = format!("{}/{}/_git/{}", config.site, segment(text(&pr["repository"]["project"], "name")?)?, segment(text(&pr["repository"], "name")?)?);
-        use std::hash::{Hash, Hasher};
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        (&config.site, &config.account_id, &target.project, &target.repository, target.number, branch, commit).hash(&mut hash);
-        let key = format!("pr-{}-{:016x}", target.number, hash.finish());
-        let base = app.path().app_data_dir().map_err(|_| "Cannot locate PR checkouts")?.join("checkouts").join("azure");
-        crate::checkout::prepare_checkout(&base, &key, &remote, branch, commit, Some(&config.authorization()), || {
-            if crate::checkout::checkout_cancelled() { return Err("Checkout preparation cancelled.".into()); }
-            let current = require_config(&app, &target.site)?;
-            checked_account(&current, &target.account_id)?;
-            let latest = get(&current, &api_path, &[])?;
-            verify_pr(&latest, &target.project, &target.repository, target.number)?;
-            if revision(&latest)? != expected_revision || latest["status"] != "active" {
-                return Err("PR changed or is no longer active. Refresh before repair.".into());
-            }
-            Ok(())
-        })
-    }).await.map_err(|_| "PR checkout preparation task failed")?
-}
-
-// Local Git stays on the checkout's execution host; credentials never leave it.
-#[tauri::command]
-pub async fn azure_pr_remotes(cwd: String, branch: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let root = crate::fs::expand_home(&cwd);
-        let head =
-            crate::fs::git_command_output(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-        if !head.status.success() || String::from_utf8_lossy(&head.stdout).trim() != branch {
-            return Err(
-                "Working branch changed or is detached. Refresh Changes before discovering PRs."
-                    .into(),
-            );
-        }
-        let output = crate::fs::git_command_output(
-            &root,
-            &["config", "--get-regexp", r"^remote\..*\.url$"],
-        )?;
-        if !output.status.success() && output.status.code() != Some(1) {
-            return Err("Cannot read this checkout's Git remotes.".into());
-        }
-        if output.stdout.len() > 64 * 1024 {
-            return Err("Too many Git remotes. Link a PR manually.".into());
-        }
-        let rows: Vec<_> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| {
-                let (key, raw) = line.split_once(char::is_whitespace)?;
-                let name = key.strip_prefix("remote.")?.strip_suffix(".url")?;
-                Some(json!({"name":name,"url":safe_azure_remote(raw.trim())?}))
-            })
-            .take(21)
-            .collect();
-        Ok(json!({"items":rows.iter().take(20).collect::<Vec<_>>(),"more":rows.len()>20}))
-    })
-    .await
-    .map_err(|_| "Git remote discovery task failed")?
-}
-
-fn safe_azure_remote(raw: &str) -> Option<String> {
-    if raw.len() > 2048 || raw.chars().any(char::is_control) {
-        return None;
-    }
-    if raw.starts_with("git@ssh.dev.azure.com:v3/") {
-        return Some(raw.into());
-    }
-    let mut url = tauri::Url::parse(raw).ok()?;
-    let host = url.host_str()?;
-    if !((url.scheme() == "https"
-        && (host == "dev.azure.com" || host.ends_with(".visualstudio.com")))
-        || (url.scheme() == "ssh" && host == "ssh.dev.azure.com" && url.username() == "git"))
-        || url.port().is_some()
-    {
-        return None;
-    }
-    url.set_password(None).ok()?;
-    if url.scheme() == "https" {
-        url.set_username("").ok()?;
-    }
-    url.set_query(None);
-    url.set_fragment(None);
-    Some(url.to_string())
-}
-
-fn story_pr_link(site: &str, relation: &Value) -> Option<String> {
-    let raw = relation["url"].as_str()?;
-    if relation["rel"] == "ArtifactLink" {
-        let artifact = raw
-            .strip_prefix("vstfs:///Git/PullRequestId/")?
-            .replace("%2F", "/")
-            .replace("%2f", "/");
-        let ids: Vec<_> = artifact.split('/').collect();
-        if ids.len() != 3 || ids[2].parse::<u32>().ok().filter(|n| *n > 0).is_none() {
-            return None;
-        }
-        Some(format!(
-            "{}/{}/_git/{}/pullrequest/{}",
-            site,
-            component(ids[0]),
-            component(ids[1]),
-            ids[2]
-        ))
-    } else if relation["rel"] == "Hyperlink" {
-        Some(raw.to_string())
-    } else {
-        None
-    }
-}
-
-/// Read a story's actual links, without following provider-controlled URLs.
-#[tauri::command]
-pub async fn azure_pr_story_links(
-    app: AppHandle,
-    provider: String,
-    url: String,
-    site: String,
-    account_id: String,
-) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let config = require_config(&app, &site)?;
-        checked_account(&config, &account_id)?;
-        let story = tauri::Url::parse(&url).map_err(|_| "Invalid linked story URL")?;
-        if story.scheme() != "https" || !story.username().is_empty() || story.password().is_some() || story.port().is_some() || story.query().is_some() || story.fragment().is_some() {
-            return Err("Invalid linked story URL".into());
-        }
-        let parts: Vec<_> = story.path().split('/').filter(|part| !part.is_empty()).collect();
-        let links = if provider == "azure" {
-            let prefix = format!("{}/", config.site);
-            if !url.starts_with(&prefix) || parts.len() != 5 || parts[2] != "_workitems" || parts[3] != "edit" {
-                return Err("This story belongs to a different Azure organization. Reconnect to discover its links.".into());
-            }
-            let item = crate::azure::item(&config, parts[4])?;
-            item["relations"].as_array().cloned().unwrap_or_default().iter().filter_map(|relation| story_pr_link(&config.site, relation)).collect::<Vec<_>>()
-        } else if provider == "jira" {
-            if parts.len() != 2 || parts[0] != "browse" || parts[1].len() > 128 || !parts[1].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
-                return Err("Invalid linked Jira story URL".into());
-            }
-            let jira_site = story.origin().ascii_serialization();
-            let jira = crate::jira::require_config(&app, &jira_site)?;
-            let response = crate::jira::request(&jira, &format!("issue/{}/remotelink", parts[1]), &[])?;
-            let current = crate::jira::require_config(&app, &jira_site)?;
-            if current.email != jira.email || current.token != jira.token { return Err("Jira connection changed. Discover story links again.".into()); }
-            response.as_array().ok_or("Jira returned an invalid story link list")?.iter().filter_map(|row| row["object"]["url"].as_str().map(String::from)).collect()
-        } else { return Err("Story provider does not expose Azure PR links here. Use captured story references or branch matches.".into()); };
-        checked_account(&require_config(&app, &site)?, &account_id)?;
-        Ok(json!({"links":links.iter().filter(|url| url.len()<=2048).take(50).collect::<Vec<_>>(),"more":links.len()>50}))
-    }).await.map_err(|_| "Story PR discovery task failed")?
-}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -281,6 +102,27 @@ fn check_skip(skip: u32) -> Result<(), String> {
         return Err("PR detail limit reached. Open the remaining context in Azure.".into());
     }
     Ok(())
+}
+
+/// The transport already bounds the full response. Include activity outside
+/// the visible thread page without downloading that same response repeatedly.
+fn activity_dates(value: &Value) -> Result<Vec<&str>, String> {
+    let threads = value["value"]
+        .as_array()
+        .ok_or("Azure returned an invalid PR thread list")?;
+    let mut dates = Vec::new();
+    for thread in threads {
+        for entry in
+            std::iter::once(thread).chain(thread["comments"].as_array().into_iter().flatten())
+        {
+            for key in ["publishedDate", "lastUpdatedDate"] {
+                if let Some(date) = entry[key].as_str().filter(|date| date.len() <= 64) {
+                    dates.push(date);
+                }
+            }
+        }
+    }
+    Ok(dates)
 }
 
 fn summary(pr: &Value) -> Result<Value, String> {
@@ -384,8 +226,24 @@ fn write_denied(error: &str) -> String {
     }
 }
 
+fn uncertain_write(error: &str) -> String {
+    let detail = if error.contains("denied access") {
+        " Check Code (Read & Write) and repository permissions."
+    } else {
+        ""
+    };
+    format!("Azure could not confirm the complete write. Some changes may already be saved. Refresh or open the PR and inspect it before submitting again.{detail}")
+}
+
+fn verify_created_branches(pr: &Value, source: &str, target: &str) -> Result<(), String> {
+    if pr["sourceRefName"] != source || pr["targetRefName"] != target {
+        return Err("Azure returned a different source or target branch. Open Azure and inspect the PR before creating another.".into());
+    }
+    Ok(())
+}
+
 /// Create a pull request in Azure Repos. A duplicate create returns the
-/// existing PR instead of failing, so retries never produce a second PR.
+/// matching PR instead of substituting a different target branch.
 #[tauri::command]
 pub async fn azure_pr_create(
     app: AppHandle,
@@ -423,6 +281,7 @@ pub async fn azure_pr_create(
         let path = repository_path(project, repository)?;
         let source_ref = format!("refs/heads/{source}");
         let target_ref = format!("refs/heads/{target_branch}");
+        checked_account(&require_config(&app, &target.site)?, &target.account_id)?;
         let created = request(
             &config,
             &format!("{path}/pullRequests"),
@@ -438,32 +297,33 @@ pub async fn azure_pr_create(
         let (pr, existing) = match created {
             Ok(pr) => (pr, false),
             Err(error) if error.contains("HTTP 409") => {
-                // Azure allows one active PR per source branch; the conflict may
-                // point at another target — look it up by source only and link it.
+                // Recover only the exact source/target pair the user chose.
                 let found = get(&config, &format!("{path}/pullRequests"), &[
-                    ("searchCriteria.sourceRefName", source_ref),
+                    ("searchCriteria.sourceRefName", source_ref.clone()),
+                    ("searchCriteria.targetRefName", target_ref.clone()),
                     ("searchCriteria.status", "active".into()),
                     ("$top", "1".into()),
                 ])?;
                 let pr = found["value"]
                     .as_array()
                     .and_then(|rows| rows.first().cloned())
-                    .ok_or(error)?;
+                    .ok_or_else(|| uncertain_write(&error))?;
                 (pr, true)
             }
-            Err(error) => return Err(write_denied(&error)),
+            Err(error) => return Err(uncertain_write(&error)),
         };
         let number = pr["pullRequestId"]
             .as_u64()
             .and_then(|id| u32::try_from(id).ok())
-            .ok_or("Azure returned an invalid PR number")?;
-        verify_pr(&pr, project, repository, number)?;
+            .ok_or_else(|| uncertain_write("invalid PR number"))?;
+        verify_pr(&pr, project, repository, number).map_err(|error| uncertain_write(&error))?;
+        verify_created_branches(&pr, &source_ref, &target_ref)?;
         // Never report a result under a newly selected account after a reconnect.
-        checked_account(&require_config(&app, &target.site)?, &target.account_id)?;
+        checked_account(&require_config(&app, &target.site).map_err(|error| uncertain_write(&error))?, &target.account_id).map_err(|error| uncertain_write(&error))?;
         Ok(json!({
-            "pr": summary(&pr)?,
+            "pr": summary(&pr).map_err(|error| uncertain_write(&error))?,
             "existing": existing,
-            "revision": revision(&pr)?,
+            "revision": revision(&pr).map_err(|error| uncertain_write(&error))?,
             "target": {"site":config.site,"accountId":config.account_id,"project":project,"repository":repository,"number":number},
             "repositoryName": repo["name"].clone(),
             "projectName": repo["project"]["name"].clone(),
@@ -471,55 +331,14 @@ pub async fn azure_pr_create(
         }))
     })
     .await
-    .map_err(|_| "Azure PR creation task failed")?
-}
-
-/// Replace an Azure Repos pull request's description.
-#[tauri::command]
-pub async fn azure_pr_update(
-    app: AppHandle,
-    target: PrTarget,
-    description: String,
-) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        if target.number == 0 {
-            return Err("Choose a PR first".into());
-        }
-        let config = require_config(&app, &target.site)?;
-        checked_account(&config, &target.account_id)?;
-        let description: String = description.trim().chars().take(64_000).collect();
-        let repo = get(
-            &config,
-            &repository_path(&target.project, &target.repository)?,
-            &[],
-        )?;
-        let repository = text(&repo, "id")?;
-        let project = text(&repo["project"], "id")?;
-        let path = format!(
-            "{}/pullRequests/{}",
-            repository_path(project, repository)?,
-            target.number
-        );
-        let pr = request_method(
-            &config,
-            "PATCH",
-            &path,
-            &[("api-version", "7.1".into())],
-            Some(json!({"description": description})),
-        )
-        .map_err(|error| write_denied(&error))?;
-        verify_pr(&pr, project, repository, target.number)?;
-        checked_account(&require_config(&app, &target.site)?, &target.account_id)?;
-        Ok(json!({"pr": summary(&pr)?, "revision": revision(&pr)?}))
-    })
-    .await
-    .map_err(|_| "Azure PR update task failed")?
+    .map_err(|_| uncertain_write("creation task failed"))?
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PrSection {
     Summary,
+    Activity,
     Threads,
     Workitems,
     Iterations,
@@ -566,6 +385,10 @@ pub async fn azure_pr_read(
             return Err("PR revision changed. Refresh before selecting or sending context.".into());
         }
         let mut result = match section {
+            PrSection::Activity => {
+                let threads = get(&config, &format!("{path}/threads"), &[])?;
+                json!({"pr": summary(&pr)?, "activityDates": activity_dates(&threads)?})
+            }
             PrSection::Diff => {
                 if pr.get("forkSource").is_some_and(|fork| !fork.is_null()) {
                     return Err("Fork diffs are available in Azure. Cross-repository content is not substituted.".into());
@@ -895,22 +718,37 @@ fn verified_active_pr(
     Ok(path)
 }
 
-/// A write is confirmed against a fresh read — a moved revision or a switched
-/// account must not be reported as a successful mutation of the seen PR.
-fn recheck_active_pr(
+/// Revalidate each step in a review; writes and verification reads are never replayed.
+fn mutate_pr(
     app: &AppHandle,
     target: &PrTarget,
-    path: &str,
     expected_revision: &str,
+    method: &str,
+    suffix: &str,
+    body: Value,
 ) -> Result<(), String> {
     let config = require_config(app, &target.site)?;
-    checked_account(&config, &target.account_id)?;
-    let pr = get(&config, path, &[])?;
-    verify_pr(&pr, &target.project, &target.repository, target.number)?;
-    if revision(&pr)? != expected_revision {
-        return Err("PR revision changed during the write. Refresh and retry.".into());
+    let path = verified_active_pr(&config, target, expected_revision)?;
+    checked_account(&require_config(app, &target.site)?, &target.account_id)?;
+    request_method(
+        &config,
+        method,
+        &format!("{path}/{suffix}"),
+        &[("api-version", "7.1".into())],
+        Some(body),
+    )
+    .map_err(|error| uncertain_write(&error))?;
+    let after = get(&config, &path, &[]).map_err(|error| uncertain_write(&error))?;
+    verify_pr(&after, &target.project, &target.repository, target.number)
+        .map_err(|error| uncertain_write(&error))?;
+    if revision(&after).map_err(|error| uncertain_write(&error))? != expected_revision {
+        return Err(uncertain_write("revision changed"));
     }
-    Ok(())
+    checked_account(
+        &require_config(app, &target.site).map_err(|error| uncertain_write(&error))?,
+        &target.account_id,
+    )
+    .map_err(|error| uncertain_write(&error))
 }
 
 /// Reply inside an existing pull-request thread.
@@ -930,59 +768,18 @@ pub async fn azure_pr_thread_comment(
         if body.is_empty() {
             return Err("Enter a reply first".into());
         }
-        let config = require_config(&app, &target.site)?;
-        let path = verified_active_pr(&config, &target, &expected_revision)?;
-        request_method(
-            &config,
+        mutate_pr(
+            &app,
+            &target,
+            &expected_revision,
             "POST",
-            &format!("{path}/threads/{thread_id}/comments"),
-            &[("api-version", "7.1".into())],
-            Some(json!({"content":body,"parentCommentId":0,"commentType":"text"})),
-        )
-        .map_err(|error| write_denied(&error))?;
-        recheck_active_pr(&app, &target, &path, &expected_revision)?;
+            &format!("threads/{thread_id}/comments"),
+            json!({"content":body,"parentCommentId":0,"commentType":"text"}),
+        )?;
         Ok(json!({"revision":expected_revision}))
     })
     .await
-    .map_err(|_| "Azure PR reply task failed")?
-}
-
-/// Change a thread's status — resolve ("fixed", "wontFix", "byDesign",
-/// "closed") or reopen ("active", "pending").
-#[tauri::command]
-pub async fn azure_pr_thread_status(
-    app: AppHandle,
-    target: PrTarget,
-    expected_revision: String,
-    thread_id: u32,
-    status: String,
-) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        if thread_id == 0 {
-            return Err("Choose a review thread first".into());
-        }
-        if ![
-            "active", "pending", "fixed", "wontFix", "closed", "byDesign",
-        ]
-        .contains(&status.as_str())
-        {
-            return Err("Unsupported thread status".into());
-        }
-        let config = require_config(&app, &target.site)?;
-        let path = verified_active_pr(&config, &target, &expected_revision)?;
-        request_method(
-            &config,
-            "PATCH",
-            &format!("{path}/threads/{thread_id}"),
-            &[("api-version", "7.1".into())],
-            Some(json!({"status":status})),
-        )
-        .map_err(|error| write_denied(&error))?;
-        recheck_active_pr(&app, &target, &path, &expected_revision)?;
-        Ok(json!({"revision":expected_revision}))
-    })
-    .await
-    .map_err(|_| "Azure PR thread update task failed")?
+    .map_err(|_| uncertain_write("reply task failed"))?
 }
 
 #[derive(Deserialize)]
@@ -1026,7 +823,7 @@ pub async fn azure_pr_submit_review(
             {
                 return Err("A line comment lost its file. Refresh and draft it again.".into());
             }
-            if comment.line == 0 {
+            if comment.line == 0 || comment.offset == u32::MAX {
                 return Err("A line comment lost its line. Refresh and draft it again.".into());
             }
             if !["left", "right"].contains(&comment.side.as_str()) {
@@ -1041,6 +838,7 @@ pub async fn azure_pr_submit_review(
         }
         let config = require_config(&app, &target.site)?;
         let path = verified_active_pr(&config, &target, &expected_revision)?;
+        let mut writes = Vec::new();
         if !comments.is_empty() {
             let iterations = get(&config, &format!("{path}/iterations"), &[])?;
             let latest = iterations["value"]
@@ -1069,54 +867,35 @@ pub async fn azure_pr_submit_review(
                 } else {
                     json!({"filePath":comment.path,"rightFileStart":start,"rightFileEnd":end})
                 };
-                request_method(
-                    &config,
-                    "POST",
-                    &format!("{path}/threads"),
-                    &[("api-version", "7.1".into())],
-                    Some(json!({
-                        "comments":[{"parentCommentId":0,"content":comment.body,"commentType":"text"}],
-                        "status":"active",
-                        "threadContext":thread_context,
-                        "pullRequestThreadContext":{
-                            "changeTrackingId":change_id,
-                            // first == second compares the common commit to the
-                            // latest iteration — the aggregated diff's view.
-                            "iterationContext":{"firstComparingIteration":latest,"secondComparingIteration":latest}
-                        }
-                    })),
-                )
-                .map_err(|error| write_denied(&error))?;
+                writes.push(("POST", "threads".to_string(), json!({
+                    "comments":[{"parentCommentId":0,"content":comment.body,"commentType":"text"}],
+                    "status":"active",
+                    "threadContext":thread_context,
+                    "pullRequestThreadContext":{
+                        "changeTrackingId":change_id,
+                        "iterationContext":{"firstComparingIteration":latest,"secondComparingIteration":latest}
+                    }
+                })));
             }
         }
         if !body.is_empty() {
-            request_method(
-                &config,
-                "POST",
-                &format!("{path}/threads"),
-                &[("api-version", "7.1".into())],
-                Some(json!({
-                    "comments":[{"parentCommentId":0,"content":body,"commentType":"text"}],
-                    "status":"active"
-                })),
-            )
-            .map_err(|error| write_denied(&error))?;
+            writes.push(("POST", "threads".to_string(), json!({
+                "comments":[{"parentCommentId":0,"content":body,"commentType":"text"}],
+                "status":"active"
+            })));
         }
         if let Some(vote) = vote {
-            request_method(
-                &config,
-                "PUT",
-                &format!("{path}/reviewers/{}", component(&config.account_id)),
-                &[("api-version", "7.1".into())],
-                Some(json!({"id":config.account_id,"vote":vote})),
-            )
-            .map_err(|error| write_denied(&error))?;
+            writes.push(("PUT", format!("reviewers/{}", component(&config.account_id)),
+                json!({"id":config.account_id,"vote":vote})));
         }
-        recheck_active_pr(&app, &target, &path, &expected_revision)?;
+        for (index, (method, suffix, body)) in writes.into_iter().enumerate() {
+            mutate_pr(&app, &target, &expected_revision, method, &suffix, body)
+                .map_err(|error| if index == 0 { error } else { uncertain_write(&error) })?;
+        }
         Ok(json!({"revision":expected_revision}))
     })
     .await
-    .map_err(|_| "Azure PR review task failed")?
+    .map_err(|_| uncertain_write("review task failed"))?
 }
 
 #[cfg(test)]
@@ -1124,37 +903,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovers_story_prs_and_redacts_remote_credentials() {
+    fn create_recovery_keeps_both_branches_and_uncertain_writes_do_not_instruct_retry() {
+        let pr = json!({"sourceRefName":"refs/heads/topic", "targetRefName":"refs/heads/main"});
+        assert!(verify_created_branches(&pr, "refs/heads/topic", "refs/heads/main").is_ok());
+        assert!(verify_created_branches(&pr, "refs/heads/topic", "refs/heads/release").is_err());
+        assert!(verify_created_branches(&pr, "refs/heads/other", "refs/heads/main").is_err());
+        for reason in [
+            "Cannot reach Azure. Retry.",
+            "Invalid response. Retry.",
+            "denied access",
+        ] {
+            let message = uncertain_write(reason);
+            assert!(message.contains("may already be saved"));
+            assert!(message.contains("inspect"));
+            assert!(!message.to_lowercase().contains("retry"));
+        }
+    }
+
+    #[test]
+    fn activity_includes_comments_beyond_the_visible_pages() {
+        let mut threads = vec![json!({"comments": []}); 601];
+        threads[600] = json!({"lastUpdatedDate": "2026-09-19T08:00:00Z", "comments": [
+            {"publishedDate": "2026-09-19T09:00:00Z", "lastUpdatedDate": "2026-09-19T10:00:00Z"}
+        ]});
+        let response = json!({"value": threads});
         assert_eq!(
-            story_pr_link(
-                "https://dev.azure.com/team",
-                &json!({"rel":"ArtifactLink","url":"vstfs:///Git/PullRequestId/project%2frepo%2F13"})
-            ),
-            Some("https://dev.azure.com/team/project/_git/repo/pullrequest/13".into())
+            activity_dates(&response).unwrap(),
+            vec![
+                "2026-09-19T08:00:00Z",
+                "2026-09-19T09:00:00Z",
+                "2026-09-19T10:00:00Z"
+            ]
         );
-        assert!(story_pr_link(
-            "https://dev.azure.com/team",
-            &json!({"rel":"ArtifactLink","url":"vstfs:///Git/Commit/project/repo/13"})
-        )
-        .is_none());
-        assert!(story_pr_link(
-            "https://dev.azure.com/team",
-            &json!({"rel":"ArtifactLink","url":"vstfs:///Git/PullRequestId/project/repo/0"})
-        )
-        .is_none());
-        assert_eq!(
-            safe_azure_remote(
-                "https://user:secret@dev.azure.com/team/project/_git/repo?token=secret#secret"
-            ),
-            Some("https://dev.azure.com/team/project/_git/repo".into())
-        );
-        assert_eq!(
-            safe_azure_remote("git@ssh.dev.azure.com:v3/team/project/repo"),
-            Some("git@ssh.dev.azure.com:v3/team/project/repo".into())
-        );
-        assert!(
-            safe_azure_remote("https://dev.azure.com.evil.test/team/project/_git/repo").is_none()
-        );
+        assert!(activity_dates(&json!({})).is_err());
     }
 
     #[test]

@@ -2,7 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { describe, expect, it, vi } from "vitest";
 import { newSession, type Block, type Session } from "./session";
 import {
-  upsertSession,
   getSession,
   shouldPersistSession,
   isPersistableId,
@@ -96,6 +95,27 @@ describe("persisting a subagent's trail", () => {
 });
 
 describe("sanitizeSessionForPersist", () => {
+  it("keeps an unsent user turn marked as a draft", () => {
+    const session = newSession("codex", "/repo");
+    session.blocks = [
+      { id: "draft", role: "user", text: "Explore this", draft: true },
+    ];
+    expect(sanitizeSessionForPersist(session).blocks).toEqual([
+      { id: "draft", role: "user", text: "Explore this", draft: true },
+    ]);
+  });
+
+  it("persists a removed worktree as an explicit unselected working-copy state", () => {
+    const session = newSession("codex", "/repo");
+    session.worktreeCwd = "/repo-worktrees/feature";
+    session.worktreeRemoved = true;
+    session.blocks = [{ id: "u", role: "user", text: "Build feature" }];
+    expect(sanitizeSessionForPersist(session)).toMatchObject({
+      worktreeCwd: "/repo-worktrees/feature",
+      worktreeRemoved: true,
+    });
+  });
+
   it("preserves an internal worker's lead, hidden turns, and token metrics", () => {
     const session = {
       ...newSession("claude", "/repo"),
@@ -456,22 +476,6 @@ describe("sanitizeSessionForPersist", () => {
     });
   });
 
-  it("keeps the action run evidence on the user turn", () => {
-    const session = newSession("codex", "/tmp/project");
-    session.blocks = [
-      {
-        id: "u1",
-        role: "user",
-        text: "Action: Review\n\nCheck the diff.",
-        action: { actionId: "review", name: "Review", revision: "0a1b2c3d" },
-      },
-    ];
-    expect(sanitizeSessionForPersist(session).blocks[0]).toMatchObject({
-      role: "user",
-      action: { actionId: "review", name: "Review", revision: "0a1b2c3d" },
-    });
-  });
-
   it("drops malformed action evidence instead of persisting it", () => {
     const session = newSession("codex", "/tmp/project");
     session.blocks = [
@@ -606,26 +610,15 @@ describe("persistFingerprint", () => {
   });
 });
 
-it("retains every explicit ticket link without requiring an initial prompt", () => {
+it("preserves saved ticket links while keeping blank tabs ephemeral", () => {
   const session = newSession("codex", "/tmp/project");
   session.linkedWorkItem = { kind: "issue", repo: "a/b", number: 8, url: "https://github.com/a/b/issues/8", additionalItems: [{ kind: "issue", repo: "a/b", number: 13, url: "https://github.com/a/b/issues/13" }] };
-  expect(shouldPersistSession(session)).toBe(true);
+  expect(shouldPersistSession(session)).toBe(false);
   expect(sanitizeSessionForPersist(session).linkedWorkItem).toEqual(session.linkedWorkItem);
   expect(sanitizeSessionForPersist(session).blocks).toEqual([]);
 });
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
-it("can clear the last persisted ticket without manufacturing a user message", async () => {
-  const session = newSession("codex", "/tmp/project");
-  vi.mocked(invoke).mockResolvedValue(null);
-  await upsertSession(session);
-  expect(invoke).not.toHaveBeenCalled();
-  await upsertSession(session, { allowEmpty: true });
-  expect(invoke).toHaveBeenCalledWith("session_upsert", { session: expect.objectContaining({ id: session.id, blocks: [] }) });
-  expect((vi.mocked(invoke).mock.calls[0][1] as { session: object }).session).not.toHaveProperty("linkedWorkItem");
-});
-
-
 it("restores saved issue descriptions and legacy links when reopening a conversation", async () => {
   const session = newSession("codex", "/tmp/project");
   session.linkedWorkItem = { kind: "issue", repo: "a/b", number: 8, url: "https://github.com/a/b/issues/8", title: "Saved issue", context: "Original description", additionalItems: [{ provider: "jira", account: "alice", kind: "issue", repo: "ENG", number: 13, url: "https://team.atlassian.net/browse/ENG-13", identifier: "ENG-13", title: "Second issue", context: "Jira description" }, { kind: "issue", repo: "a/b", number: 1, url: "https://github.com/a/b/issues/1" }] };

@@ -2,6 +2,10 @@
 import { act, createElement, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
+import { ask } from "@tauri-apps/plugin-dialog";
+import * as azure from "../lib/azure";
+import * as jira from "../lib/jira";
 import { SettingsView } from "./SettingsView";
 import { rememberNotificationProjects } from "../lib/notificationProjects";
 import {
@@ -9,6 +13,7 @@ import {
   SETTINGS_SECTIONS,
   type SettingsSectionId,
 } from "../lib/settings";
+import { providerAccounts, saveProviderAccount } from "../lib/providerAccounts";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async () => undefined),
@@ -21,6 +26,7 @@ vi.mock("@tauri-apps/api/window", () => ({
   }),
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ ask: vi.fn(async () => true) }));
 
 let container: HTMLDivElement;
 let root: Root;
@@ -72,6 +78,139 @@ afterEach(async () => {
 });
 
 describe("settings pages", () => {
+  it.each(["azure", "jira"] as const)("refreshes %s Settings after another window changes the connection", async provider => {
+    const first = { connected: true, site: "https://example.test", project: "Project", account: "Original account", accountId: "original", capabilities: [] };
+    const next = { ...first, account: "Replacement account", accountId: "replacement" };
+    const status = provider === "azure" ? vi.spyOn(azure, "azureConnected") : vi.spyOn(jira, "jiraConnected");
+    status.mockResolvedValue(first);
+    await render("inbox");
+    expect(container.textContent).toContain("Original account");
+    let finish!: (value: typeof next) => void;
+    status.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    await act(async () => window.dispatchEvent(new CustomEvent(`monocode:${provider}-change`, { detail: "connection" })));
+    expect(container.textContent).not.toContain("Original account");
+    expect([...container.querySelectorAll("button")].some(button => button.textContent === "Disconnect")).toBe(false);
+    await act(async () => finish(next));
+    expect(container.textContent).toContain("Replacement account");
+    expect(container.textContent).not.toContain("Original account");
+    status.mockClear();
+    await act(async () => window.dispatchEvent(new Event(`monocode:${provider}-change`)));
+    expect(status).not.toHaveBeenCalled(); // Filter changes do not discard credential edits.
+  });
+
+  it.each(["azure", "jira"] as const)("ignores an old %s status response after connecting", async (provider) => {
+    const next = { connected: true, site: "https://example.test", project: "Project", account: "Current account", accountId: "current", capabilities: [] };
+    let finish!: (status: typeof next) => void;
+    const pending = new Promise<typeof next>(resolve => { finish = resolve; });
+    if (provider === "azure") {
+      vi.spyOn(azure, "azureConnected").mockReturnValue(pending);
+      vi.spyOn(azure, "saveAzureConfig").mockResolvedValue(next);
+    } else {
+      vi.spyOn(jira, "jiraConnected").mockReturnValue(pending);
+      vi.spyOn(jira, "saveJiraConfig").mockResolvedValue(next);
+    }
+    await render("inbox");
+    const labels = provider === "azure"
+      ? ["Azure organization URL", "Default Azure project", "Personal access token"]
+      : ["Atlassian Cloud site", "Atlassian email", "Atlassian API token"];
+    for (const [index, label] of labels.entries()) {
+      const input = container.querySelector<HTMLInputElement>(`[aria-label="${label}"]`)!;
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, ["https://example.test", "dev@example.test", "test-token"][index]);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    }
+    const input = container.querySelector(`[aria-label="${labels[0]}"]`)!;
+    await act(async () => input.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    expect(container.textContent).toContain("Current account");
+    await act(async () => finish({ ...next, connected: false, account: "Old account" }));
+    expect(container.textContent).toContain("Current account");
+  });
+
+  it("keeps native provider settings unchanged and follows the selected WSL project", async () => {
+    await render("providers");
+    expect(container.querySelector('button[aria-label^="Provider execution location:"]')).toBeNull();
+    const ubuntu = "//wsl.localhost/Ubuntu/home/dev/repo";
+    const debian = "//wsl.localhost/Debian/home/dev/repo";
+    await render("providers", { cwd: ubuntu });
+    expect(container.querySelector('button[aria-label^="Provider execution location:"]')?.textContent).toContain("Ubuntu");
+    await render("providers", { cwd: debian });
+    expect(container.querySelector('button[aria-label^="Provider execution location:"]')?.textContent).toContain("Debian");
+    expect(container.textContent).not.toContain("Rename Default account");
+    await render("providers");
+    expect(container.querySelector('button[aria-label^="Provider execution location:"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Rename Default account"]')).not.toBeNull();
+  });
+
+  it("manages named accounts independently for each supported provider", async () => {
+    saveProviderAccount({
+      id: "account-work",
+      provider: "codex",
+      label: "Wrk",
+    });
+    await render("providers");
+
+    expect(container.textContent).toContain("Claude Code");
+    expect(container.textContent).toContain("Codex");
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>(
+          '[aria-label="Rename Default account"]',
+        )!
+        .click(),
+    );
+    const defaultInput = container.querySelector<HTMLInputElement>(
+      '[aria-label="Rename Claude Code account"]',
+    )!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )!.set!.call(defaultInput, "Primary");
+      defaultInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('button[type="submit"]')!
+        .click(),
+    );
+    expect(providerAccounts("claude")[0]?.label).toBe("Primary");
+
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('[aria-label="Rename Wrk"]')!
+        .click(),
+    );
+    const input = container.querySelector<HTMLInputElement>(
+      '[aria-label="Rename Codex account"]',
+    )!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )!.set!.call(input, "Work");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('button[type="submit"]')!
+        .click(),
+    );
+    expect(providerAccounts("codex")[1]?.label).toBe("Work");
+
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('[aria-label="Remove Work"]')!
+        .click(),
+    );
+    expect(ask).toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledWith("provider_account_remove", {
+      provider: "codex",
+      accountId: "account-work",
+    });
+    expect(providerAccounts("codex")).toHaveLength(1);
+  });
+
   it("reopens, scrolls to, focuses and highlights the same project on a repeated notification settings request", async () => {
     vi.useFakeTimers();
     const scroll = vi.spyOn(HTMLElement.prototype, "scrollIntoView");

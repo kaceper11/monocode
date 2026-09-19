@@ -81,7 +81,7 @@ export function AccessPicker({
     <div ref={root} className="relative">
       <button
         type="button"
-        title={`${RUNTIME_MODE_HINT[value]}${busy ? " Applies immediately." : ""}`}
+        title={`${RUNTIME_MODE_HINT[value]}${busy ? " Changes apply to the next turn." : ""}`}
         aria-label={RUNTIME_MODE_LABEL[value]}
         aria-expanded={open}
         aria-haspopup="listbox"
@@ -158,8 +158,8 @@ export function AccessPicker({
           })}
           {busy ? (
             <p className="px-2 py-1.5 text-[11px] leading-4 text-content/50">
-              Applies to pending and new requests right away. Sandbox limits
-              fixed when the turn started hold until the next turn.
+              Access changes apply to the next turn. Stop and resend to apply
+              them now.
             </p>
           ) : null}
         </Popover>

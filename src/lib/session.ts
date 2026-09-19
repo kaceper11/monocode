@@ -8,7 +8,6 @@ import type { OrchestrationProposal } from "./orchestrationPlan";
 import type { LinkedWorkItemUpdateCard } from "./linkedWorkItemActivity";
 import {
   defaultSessionChoice,
-  loadDefaultRuntimeMode,
   preferredModelId,
   preferredModelSettings,
   resolveModel,
@@ -23,6 +22,7 @@ export type HarnessId =
   | "pi"
   | "omp"
   | "fx"
+  | "hermes"
   | "devin"
   | "copilot"
   | "muse";
@@ -36,6 +36,7 @@ export const HARNESSES: HarnessId[] = [
   "pi",
   "omp",
   "fx",
+  "hermes",
   "devin",
   "copilot",
   "muse",
@@ -73,8 +74,8 @@ export type TaskListMeta = {
 export type TurnIntent = "default" | "plan" | "build" | "orchestrate";
 export type ComposerTurnOptions = {
   intent?: TurnIntent;
-  action?: import("./agentActions").ActionRunRef;
-  followUpBehavior?: import("./settings").FollowUpBehavior;
+  /** Promote an existing unsent transcript block instead of appending a turn. */
+  draftBlockId?: string;
 };
 
 export type PlanStatus = "streaming" | "ready" | "building" | "built";
@@ -184,6 +185,8 @@ export type AgentRunMeta = {
 export type AttachmentKind = "image" | "audio" | "file";
 
 export type Attachment = {
+  /** Live transcript only; deliberately excluded from persisted attachments. */
+  copyFromPath?: boolean;
   id: string;
   name: string;
   mimeType: string;
@@ -198,18 +201,12 @@ export type Attachment = {
 };
 
 export type QueuedMessage = {
-  repair?: import("./repair").RepairDelivery;
   id: string;
   text: string;
   attachments: Attachment[];
-  /** Delivery was not confirmed; paused until the user reviews before retrying. */
-  deliveryError?: string;
   noteCard?: NoteComposerCard;
   handoffCard?: HandoffComposerCard;
   intent?: TurnIntent;
-  /** Set when the message was produced by an agent action — carries the run
-   * evidence into the user block when the queue dispatches. */
-  action?: import("./agentActions").ActionRunRef;
 };
 
 export type MessageQueueStatus = "active" | "paused" | "resuming";
@@ -243,6 +240,8 @@ export type Block = {
   durationMs?: number;
   /** Stable model label for this turn. Present on newly created user blocks. */
   turnModel?: TurnModel;
+  /** User turn saved to the session but not submitted to the harness yet. */
+  draft?: boolean;
   /** Provider-reported token metrics for this user turn, when available. */
   turnMetrics?: TurnMetrics;
   tool?: {
@@ -274,8 +273,6 @@ export type Block = {
   secondOpinion?: SecondOpinionMeta;
   /** Note chip shown on this user turn. Body is not stored; the harness already received it. */
   noteCard?: NoteCardMeta;
-  /** Agent action that produced this user turn, with its context revision. */
-  action?: import("./agentActions").ActionRunRef;
   /** Mid-turn interjection chrome; system blocks only. Body lives in text. */
   interjection?: InterjectionMeta;
   /**
@@ -331,6 +328,8 @@ export const RUNTIME_MODE_HINT: Record<RuntimeMode, string> = {
   "full-access": "Allow commands and edits without prompts.",
 };
 
+export type WorkspaceMode = "current" | "worktree";
+
 export type Session = {
   /** Internal worker: displayed in its lead's panel rather than a workspace tab. */
   orchestrationLeadId?: string;
@@ -347,10 +346,6 @@ export type Session = {
   blocks: Block[];
   /** True while a harness turn is in flight. */
   busy?: boolean;
-  /** Actual running selection, distinct from the composer's next-turn choice. */
-  activeTurnModel?: TurnModel & { settings: Record<string, string> };
-  /** Transient provider activity, cleared by content or turn completion. */
-  activity?: string;
   /** Follow-ups waiting for current turn. In-memory only. */
   queuedMessages?: QueuedMessage[];
   /** Paused after user stops current turn; resuming waits for continued turn. */
@@ -368,19 +363,22 @@ export type Session = {
    * Handoff runs on the next send, not on picker change.
    */
   pendingSwitch?: PendingHarnessSwitch;
-  /**
-   * Last composer-pinned branch. Unused after session worktrees were removed;
-   * kept so older session records still load.
-   */
+  /** Last known branch in the session's working copy. */
   branch?: string;
-  /** Extra git worktree from the old session-branch feature. Unused. */
+  /** Selected working copy; cwd remains the project identity. */
   worktreeCwd?: string;
+  /** Blank-composer choice; consumed when the first turn starts. */
+  workspaceMode?: WorkspaceMode;
+  /** Base ref for a worktree that will be created on first send. */
+  worktreeBase?: string;
+  /** Internal guard while the first turn creates its selected worktree. */
+  worktreePreparing?: boolean;
+  /** Select a working copy before continuing after the previous one was deleted. */
+  worktreeRemoved?: boolean;
   /** One-shot composer text when opening a session from Inbox. */
   composerSeed?: string;
   /** Inbox issue/PR chip shown above the composer. In-memory, one-shot. */
   inboxCard?: InboxComposerCard;
-  /** Selected context prepared for the next message; never dispatched automatically. */
-  contextDraft?: import("./agentContext").AgentContext;
   /** GitHub issue or pull request shown on the persisted session card. */
   linkedWorkItem?: LinkedWorkItem;
   /** New linked-item activity shown above the composer. In-memory, one-shot. */
@@ -413,6 +411,7 @@ export const HARNESS_LABEL: Record<HarnessId, string> = {
   pi: "pi",
   omp: "omp",
   fx: "fx",
+  hermes: "hermes",
   devin: "devin",
   copilot: "copilot",
   muse: "muse",
@@ -427,6 +426,7 @@ export const HARNESS_TITLE: Record<HarnessId, string> = {
   pi: "Pi",
   omp: "omp",
   fx: "fx",
+  hermes: "Hermes Agent",
   devin: "Devin",
   copilot: "GitHub Copilot",
   muse: "Muse",
@@ -437,16 +437,11 @@ export function harnessSupportsAttachments(id: HarnessId): boolean {
   return id !== "fx";
 }
 
-/** Decisions belong to the running provider, even after a next-provider pick. */
-export function sessionDecisionHarness(session: Session): HarnessId {
-  return session.activeTurnModel?.harness ?? session.pendingSwitch?.from ?? session.harness;
-}
-
 export function newSession(
   harness: HarnessId = "claude",
   cwd = "~",
   model?: string,
-  runtimeMode: RuntimeMode = loadDefaultRuntimeMode(),
+  runtimeMode: RuntimeMode = DEFAULT_RUNTIME_MODE,
   modelSettings?: Record<string, string>,
 ): Session {
   const resolved = resolveModel(harness, model ?? preferredModelId(harness, cwd), cwd);
@@ -465,7 +460,7 @@ export function newSession(
 /** New conversation using the Providers defaults. */
 export function newDefaultSession(
   cwd = "~",
-  runtimeMode: RuntimeMode = loadDefaultRuntimeMode(),
+  runtimeMode: RuntimeMode = DEFAULT_RUNTIME_MODE,
 ): Session {
   const choice = defaultSessionChoice(cwd);
   return newSession(choice.harness, cwd, choice.model, runtimeMode);
@@ -517,7 +512,17 @@ export function hasPendingApproval(blocks: Block[]): boolean {
 }
 
 export function sessionNeedsInput(session: Session): boolean {
-  return hasPendingApproval(session.blocks) || session.pendingQuestion != null;
+  return (
+    !session.worktreeRemoved &&
+    (hasPendingApproval(session.blocks) || session.pendingQuestion != null)
+  );
+}
+
+/** The single unsent user turn held by a draft session, when present. */
+export function sessionDraftBlock(
+  session: Pick<Session, "blocks">,
+): Block | undefined {
+  return session.blocks.find((block) => block.role === "user" && block.draft);
 }
 
 /** Title without the harness prefix stored for the tab strip. */
@@ -536,10 +541,4 @@ export function sessionWorkCwd(session: {
   worktreeCwd?: string;
 }): string {
   return session.worktreeCwd || session.cwd;
-}
-
-/** Only replace an unused conversation; prepared context already belongs to it. */
-export function isBlankSession(session: Session | undefined): boolean {
-  if (!session || session.busy || session.linkedWorkItem || session.contextDraft || session.inboxCard || session.noteCard || session.handoffCard || session.composerSeed?.trim()) return false;
-  return !session.blocks.some(block => block.role === "user");
 }

@@ -1,6 +1,7 @@
+#[path = "terminal_resources.rs"]
+pub(crate) mod resources;
+
 use std::collections::HashMap;
-#[cfg(unix)]
-use std::collections::HashSet;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -40,14 +41,16 @@ struct PtyExit {
 }
 
 struct LivePty {
+    owner: String,
+    generation: String,
+    process_started: Option<u64>,
+    cwd: std::path::PathBuf,
     writer: Mutex<Box<dyn Write + Send>>,
     #[cfg(unix)]
     master_fd: i32,
     #[cfg(windows)]
     master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     pid: u32,
-    /// Spawn-time working directory — worktree-removal binding evidence.
-    cwd: String,
 }
 
 pub struct PtyHost {
@@ -55,6 +58,14 @@ pub struct PtyHost {
 }
 
 impl PtyHost {
+    pub(crate) fn has_working_dir(&self, path: &std::path::Path) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|live| crate::worktrees::contains_working_dir(path, &live.cwd))
+    }
+
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
@@ -91,40 +102,6 @@ impl PtyHost {
         sessions.remove(id)
     }
 
-    /// Live terminals with their spawn records — resource sampling and
-    /// workload kills read the same inventory.
-    fn inventory(&self) -> Vec<(String, Arc<LivePty>)> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|(id, live)| (id.clone(), live.clone()))
-            .collect()
-    }
-
-    /// (pty id, spawn cwd) of every live terminal — removal binding evidence.
-    pub(crate) fn live_cwds(&self) -> Vec<(String, String)> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|(id, live)| (id.clone(), live.cwd.clone()))
-            .collect()
-    }
-
-    /// `pty_kill` by id — also stops only the terminals proven to belong to a
-    /// reviewed worktree. Returns the stopped shell's pid so callers can wait
-    /// out the TERM→KILL escalation and report survivors.
-    pub(crate) fn kill_id(&self, id: &str) -> Result<Option<u32>, String> {
-        if let Some(live) = self.remove(id) {
-            terminate(live.pid);
-            #[cfg(unix)]
-            close_fd(live.master_fd);
-            return Ok(Some(live.pid));
-        }
-        Ok(None)
-    }
-
     pub(crate) fn kill_all(&self) {
         let kids: Vec<Arc<LivePty>> = {
             let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -145,29 +122,6 @@ impl PtyHost {
         // to run, and every shell is its own `setsid` session that outlives us.
         crate::harness::terminate_all(&pids);
     }
-
-    /// A real child behind a fake PTY, for tests that exercise scoped
-    /// ownership and stopping without a frontend.
-    #[cfg(all(test, unix))]
-    pub(crate) fn add_test_pty(&self, id: &str, cwd: &str) -> std::process::Child {
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn test process");
-        self.insert(
-            id.into(),
-            Arc::new(LivePty {
-                writer: Mutex::new(Box::new(std::io::sink())),
-                master_fd: -1,
-                pid: child.id(),
-                cwd: cwd.into(),
-            }),
-        );
-        child
-    }
 }
 
 impl Drop for PtyHost {
@@ -176,11 +130,9 @@ impl Drop for PtyHost {
     }
 }
 
-/// `exec` runs one command line instead of an interactive shell — a saved
-/// command step. The PTY's exit event then carries the step's exit code.
 #[tauri::command(async)]
 pub fn pty_spawn(
-    app: AppHandle,
+    window: tauri::Window,
     host: State<PtyHost>,
     id: String,
     cwd: String,
@@ -188,12 +140,18 @@ pub fn pty_spawn(
     rows: u16,
     exec: Option<String>,
 ) -> Result<(), String> {
-    if crate::wsl::location(&cwd)?.is_some() && !cfg!(windows) {
-        return Err("WSL terminals require the native Windows app".into());
-    }
-    let _worktree_guard = crate::fs::worktrees::LIFECYCLE
-        .try_read()
-        .map_err(|_| "Worktree operation in progress; retry terminal startup after it completes")?;
+    crate::saved_commands::validate(exec.as_deref())?;
+    let workdir = if crate::wsl::location(&cwd)?.is_some() {
+        if !cfg!(windows) {
+            return Err("WSL terminals require the native Windows app".into());
+        }
+        expand_home(&cwd)
+    } else if exec.is_some() {
+        crate::saved_commands::working_dir(&cwd)?
+    } else {
+        working_dir(&cwd)
+    };
+    let _reservation = crate::worktree_lifecycle::reserve_spawn(&workdir)?;
     if let Some(prev) = host.remove(&id) {
         terminate(prev.pid);
         #[cfg(unix)]
@@ -202,17 +160,17 @@ pub fn pty_spawn(
 
     #[cfg(unix)]
     {
-        spawn_unix(app, host, id, cwd, cols.max(2), rows.max(2), exec)
+        spawn_unix(window, host, id, workdir, cols.max(2), rows.max(2), exec)
     }
 
     #[cfg(windows)]
     {
-        spawn_windows(app, host, id, cwd, cols.max(2), rows.max(2), exec)
+        spawn_windows(window, host, id, workdir, cols.max(2), rows.max(2), exec)
     }
 
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (app, cwd, cols, rows, exec);
+        let _ = (window, cwd, cols, rows);
         Err("Terminals are not supported on this platform.".into())
     }
 }
@@ -284,181 +242,13 @@ pub fn pty_status(host: State<'_, PtyHost>, id: String) -> Result<PtyStatus, Str
 
 #[tauri::command]
 pub fn pty_kill(host: State<PtyHost>, id: String) -> Result<(), String> {
-    host.kill_id(&id).map(|_| ())
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PtyResource {
-    id: String,
-    /// `native` runs on the OS host; `wsl` is a Linux tree behind wsl.exe.
-    host: &'static str,
-    distro: Option<String>,
-    cpu_pct: f32,
-    rss_bytes: u64,
-    processes: u32,
-    /// Non-shell work exists — the kill-workload action is meaningful.
-    workload: bool,
-    /// Busiest non-shell process name, for the row's process label.
-    top: Option<String>,
-}
-
-/// One shared process sample for every terminal — much cheaper than the
-/// per-terminal `ps` forks the title poll already performs each second.
-/// Off the main thread: unix forks `ps`, WSL fans out to the bridges.
-#[tauri::command(async)]
-pub fn pty_resources(host: State<'_, PtyHost>) -> Vec<PtyResource> {
-    let live = host.inventory();
-    if live.is_empty() {
-        return Vec::new();
+    if let Some(live) = host.remove(&id) {
+        terminate(live.pid);
+        #[cfg(unix)]
+        close_fd(live.master_fd);
     }
-    let roots: Vec<u32> = live
-        .iter()
-        .map(|(_, live)| live.pid)
-        .filter(|&pid| pid > 1)
-        .collect();
-    let native = crate::proc_stats::sample_trees(&roots);
-    let linux = linux_stats(&live);
-    live.into_iter()
-        .map(|(id, live)| {
-            let location = crate::wsl::location(&live.cwd).ok().flatten();
-            let stat = linux
-                .get(&id)
-                .map(|stat| {
-                    (
-                        stat.cpu_pct,
-                        stat.rss_bytes,
-                        stat.processes,
-                        stat.workload,
-                        stat.top.clone(),
-                    )
-                })
-                .or_else(|| {
-                    native.get(&live.pid).map(|stat| {
-                        (
-                            stat.cpu_pct,
-                            stat.rss_bytes,
-                            stat.processes,
-                            stat.workload,
-                            stat.top.clone(),
-                        )
-                    })
-                });
-            let (cpu_pct, rss_bytes, processes, workload, top) =
-                stat.unwrap_or((0.0, 0, 0, false, None));
-            PtyResource {
-                id,
-                host: if location.is_some() { "wsl" } else { "native" },
-                distro: location.map(|location| location.distribution),
-                cpu_pct,
-                rss_bytes,
-                processes,
-                workload,
-                top,
-            }
-        })
-        .collect()
-}
-
-/// Linux-side stats keyed by pty id, one bridge request per distro.
-/// Missing bridges degrade to the Windows-side wsl.exe numbers instead
-/// of failing the whole poll.
-#[cfg(windows)]
-fn linux_stats(live: &[(String, Arc<LivePty>)]) -> HashMap<String, crate::wsl::WslPtyStat> {
-    let mut locations: HashMap<String, crate::wsl::Location> = HashMap::new();
-    for (_, live) in live {
-        if let Ok(Some(location)) = crate::wsl::location(&live.cwd) {
-            locations
-                .entry(location.distribution.to_lowercase())
-                .or_insert(location);
-        }
-    }
-    let mut stats = HashMap::new();
-    for location in locations.values() {
-        if let Ok(found) = crate::wsl::pty_stats(location) {
-            stats.extend(found);
-        }
-    }
-    stats
-}
-
-#[cfg(not(windows))]
-fn linux_stats(_live: &[(String, Arc<LivePty>)]) -> HashMap<String, crate::wsl::WslPtyStat> {
-    HashMap::new()
-}
-
-/// Stop the terminal's workload but keep its shell: every non-root member
-/// of the shell's process tree gets TERM, then KILL after the escalation
-/// window. WSL trees are signaled inside the distribution. Marker-based
-/// WSL attribution also reaches detached procs (tmux/nohup keep the env);
-/// native walks the live ppid tree, so reparented daemons escape there.
-#[tauri::command(async)]
-pub fn pty_kill_workload(host: State<'_, PtyHost>, id: String) -> Result<(), String> {
-    let live = host
-        .get(&id)
-        .ok_or_else(|| "Terminal is not running".to_string())?;
-    if live.pid <= 1 {
-        return Err("Terminal has no live process".into());
-    }
-    if let Some(location) = crate::wsl::location(&live.cwd)? {
-        #[cfg(windows)]
-        return crate::wsl::signal_workload(&location, &id);
-        #[cfg(not(windows))]
-        {
-            let _ = location;
-            return Err("WSL terminals require the native Windows app".into());
-        }
-    }
-    kill_tree(live.pid);
     Ok(())
 }
-
-#[cfg(unix)]
-fn kill_tree(root: u32) {
-    let members = crate::proc_stats::descendants(root);
-    for &pid in members.iter().filter(|&&pid| pid > 1) {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
-    }
-    if members.is_empty() {
-        return;
-    }
-    thread::spawn(move || {
-        thread::sleep(KILL_ESCALATE);
-        // Re-resolve the tree — a member that exited during the window may
-        // have had its pid recycled by an unrelated process.
-        let survivors: HashSet<u32> = crate::proc_stats::descendants(root).into_iter().collect();
-        for pid in members {
-            if pid > 1 && survivors.contains(&pid) {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-            }
-        }
-    });
-}
-
-/// Hard-stops each descendant — Windows has no TERM-equivalent here, so
-/// unlike unix there is no grace window before the kill.
-#[cfg(windows)]
-fn kill_tree(root: u32) {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-    for pid in crate::proc_stats::descendants(root) {
-        unsafe {
-            let raw = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if raw.is_null() {
-                continue;
-            }
-            let handle = OwnedHandle::from_raw_handle(raw);
-            let _ = TerminateProcess(handle.as_raw_handle(), 1);
-        }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn kill_tree(_root: u32) {}
 
 /// Off the main thread: `kill_all` waits for the shells to die before it
 /// returns, and a window close calls this while the app keeps running.
@@ -470,10 +260,10 @@ pub fn pty_kill_all(host: State<'_, PtyHost>) -> Result<(), String> {
 
 #[cfg(unix)]
 fn spawn_unix(
-    app: AppHandle,
+    window: tauri::Window,
     host: State<PtyHost>,
     id: String,
-    cwd: String,
+    workdir: std::path::PathBuf,
     cols: u16,
     rows: u16,
     exec: Option<String>,
@@ -483,16 +273,14 @@ fn spawn_unix(
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
-    let workdir = working_dir(&cwd);
+    let app = window.app_handle().clone();
     let (shell, args) = default_shell();
     let args = match exec {
-        // Login shell so user PATH (nvm, brew, ~/.local) applies; the step
-        // text stays one argument so the shell parses it itself.
         Some(exec) => login_args(&shell)
             .iter()
             .map(|arg| (*arg).to_string())
-            .chain(["-c".to_string(), exec])
-            .collect::<Vec<_>>(),
+            .chain(["-c".into(), exec])
+            .collect(),
         None => args,
     };
     let (master, slave) = open_pty(cols, rows)?;
@@ -542,10 +330,13 @@ fn spawn_unix(
     let writer = unsafe { File::from_raw_fd(dup_fd(master)?) };
 
     let live = Arc::new(LivePty {
+        owner: window.label().to_string(),
+        generation: uuid::Uuid::new_v4().to_string(),
+        process_started: crate::proc_stats::identity(pid).ok().flatten(),
+        cwd: workdir.clone(),
         writer: Mutex::new(Box::new(writer)),
         master_fd: master,
         pid,
-        cwd,
     });
     host.insert(id.clone(), live);
 
@@ -611,17 +402,19 @@ fn spawn_unix(
 
 #[cfg(windows)]
 fn spawn_windows(
-    app: AppHandle,
+    window: tauri::Window,
     host: State<PtyHost>,
     id: String,
-    cwd: String,
+    workdir: std::path::PathBuf,
     cols: u16,
     rows: u16,
     exec: Option<String>,
 ) -> Result<(), String> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-    let location = crate::wsl::location(&cwd)?;
+    let app = window.app_handle().clone();
+    let generation = uuid::Uuid::new_v4().to_string();
+    let location = crate::wsl::path_location(&workdir)?;
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -632,25 +425,24 @@ fn spawn_windows(
         })
         .map_err(|err| format!("Failed to open terminal: {err}"))?;
 
-    let mut cmd = if let Some(location) = &location {
+    let (mut cmd, shell) = if let Some(location) = &location {
         // ConPTY hosts wsl.exe; WSL supplies the Linux terminal and job control.
         // Dropping the master closes that terminal, rather than running a
         // Windows shell or walking UNC metadata here.
-        let command = match &exec {
-            Some(exec) => crate::wsl::exec_command(location, exec, Some(&id))?,
-            None => crate::wsl::terminal_command(location, Some(&id))?,
+        let command = match exec.as_deref() {
+            Some(exec) => crate::wsl::terminal_exec_command(location, exec, &generation)?,
+            None => crate::wsl::terminal_command(location, &generation)?,
         };
         let mut cmd = CommandBuilder::new(command.get_program());
         cmd.args(command.get_args());
         cmd.env("WSLENV", "");
-        cmd
+        (cmd, "WSL".to_string())
     } else {
-        let workdir = working_dir(&cwd);
         let (shell, args) = default_shell();
-        let args = match exec {
-            Some(exec) => windows_exec_args(&shell, &exec),
-            None => args,
-        };
+        let args = exec
+            .as_deref()
+            .map(|exec| crate::saved_commands::windows_args(&shell, exec))
+            .unwrap_or(args);
         let mut cmd = CommandBuilder::new(&shell);
         cmd.args(&args);
         cmd.cwd(&workdir);
@@ -660,7 +452,7 @@ fn spawn_windows(
             cmd.env("USERPROFILE", &home);
         }
         cmd.env("PWD", workdir.to_string_lossy().as_ref());
-        cmd
+        (cmd, shell)
     };
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
@@ -668,7 +460,7 @@ fn spawn_windows(
     cmd.env("TERM_PROGRAM", "MonoCode");
 
     let mut child = crate::windows::spawn_pty(pair.slave.as_ref(), cmd)
-        .map_err(|err| format!("Failed to start terminal: {err}"))?;
+        .map_err(|err| format!("Failed to start {shell}: {err}"))?;
     let pid = child.process_id().unwrap_or(0);
     let mut reader = pair
         .master
@@ -680,10 +472,13 @@ fn spawn_windows(
         .map_err(|err| format!("Failed to write to terminal: {err}"))?;
 
     let live = Arc::new(LivePty {
+        owner: window.label().to_string(),
+        generation,
+        process_started: crate::proc_stats::identity(pid).ok().flatten(),
+        cwd: workdir.clone(),
         writer: Mutex::new(Box::new(writer)),
         master: Mutex::new(pair.master),
         pid,
-        cwd,
     });
     host.insert(id.clone(), live);
 
@@ -730,7 +525,7 @@ fn working_dir(cwd: &str) -> std::path::PathBuf {
     dirs_home().map(std::path::PathBuf::from).unwrap_or(path)
 }
 
-pub(crate) fn default_shell() -> (String, Vec<String>) {
+fn default_shell() -> (String, Vec<String>) {
     #[cfg(windows)]
     {
         if let Ok(comspec) = std::env::var("COMSPEC") {
@@ -757,32 +552,6 @@ pub(crate) fn default_shell() -> (String, Vec<String>) {
             .map(|arg| (*arg).to_string())
             .collect();
         (shell, args)
-    }
-}
-
-/// Flags that make a Windows shell run one command line and exit, matching
-/// whichever shell `default_shell` picked — cmd and PowerShell differ. A
-/// failing step must exit nonzero, and PowerShell `-Command` alone reports
-/// success for non-terminating cmdlet errors, so the exec line is wrapped:
-/// `$ErrorActionPreference='Stop'` makes those throw, and a native exe's own
-/// code still wins via `$LASTEXITCODE`.
-#[cfg(any(windows, test))]
-pub(crate) fn windows_exec_args(shell: &str, exec: &str) -> Vec<String> {
-    let name = shell
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(shell)
-        .to_ascii_lowercase();
-    let name = name.strip_suffix(".exe").unwrap_or(&name);
-    match name {
-        "powershell" | "pwsh" => vec![
-            "-NoLogo".into(),
-            "-Command".into(),
-            format!(
-                "$ErrorActionPreference='Stop'; & {{ {exec} }}; if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}"
-            ),
-        ],
-        _ => vec!["/c".into(), exec.into()],
     }
 }
 
@@ -1082,31 +851,6 @@ mod label_tests {
     }
 }
 
-#[cfg(test)]
-mod exec_args_tests {
-    use super::*;
-
-    #[test]
-    fn windows_exec_args_match_the_default_shell() {
-        assert_eq!(
-            windows_exec_args("C:\\Windows\\System32\\cmd.exe", "echo hi"),
-            ["/c", "echo hi"]
-        );
-        assert_eq!(
-            windows_exec_args("C:\\Program Files\\PowerShell\\7\\pwsh.exe", "echo hi"),
-            [
-                "-NoLogo",
-                "-Command",
-                "$ErrorActionPreference='Stop'; & { echo hi }; if ($LASTEXITCODE) { exit $LASTEXITCODE }"
-            ]
-        );
-        assert_eq!(
-            windows_exec_args("powershell.exe", "echo hi")[..2],
-            ["-NoLogo", "-Command"]
-        );
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1132,10 +876,13 @@ mod tests {
         host.insert(
             "term".into(),
             Arc::new(LivePty {
+                owner: "test".into(),
+                generation: "test-generation".into(),
+                process_started: None,
+                cwd: std::path::PathBuf::from("/test"),
                 writer: Mutex::new(Box::new(std::io::sink())),
                 master_fd: -1,
                 pid: 42,
-                cwd: String::new(),
             }),
         );
         assert!(host.remove_if_pid("term", 7).is_none());

@@ -618,6 +618,8 @@ describe("sidebar orchestration card", () => {
       props.linkedSessionUpdateIds = new Set(["session-1"]);
       const lead = {
         ...props.sessions[0],
+        harness: "claude" as const,
+        model: "claude:sonnet-5",
         pinned,
         linkedWorkItem: {
           kind: "pr" as const,
@@ -669,7 +671,7 @@ describe("sidebar orchestration card", () => {
       // The lead card carries the sidebar's ordinary active treatment.
       expect(card().className).toContain("bg-selection");
       // The lead names its own model, like every agent row beneath it.
-      expect(card().textContent).toContain("Default");
+      expect(card().textContent).toContain("Claude Sonnet 5");
       expect(card().textContent).not.toContain("Orchestrator");
       const orchestrationIcon = card().querySelector<HTMLButtonElement>(
         "[data-orchestration-icon]",
@@ -699,12 +701,8 @@ describe("sidebar orchestration card", () => {
         1,
       );
       expect(card().lastElementChild?.contains(orchestrationIcon)).toBe(true);
-      // Linked work items ride in the tickets row above the footer actions.
-      const ticketsRow = card().querySelector('[aria-label="Linked tickets"]');
-      expect(ticketsRow?.contains(pullRequest)).toBe(true);
-      expect(archive.nextElementSibling?.contains(orchestrationIcon)).toBe(
-        true,
-      );
+      expect(card().lastElementChild?.contains(pullRequest)).toBe(true);
+      expect(archive.nextElementSibling).toBe(pullRequest);
       expect(orchestrationIcon?.parentElement?.lastElementChild).toBe(
         orchestrationIcon,
       );
@@ -910,7 +908,7 @@ describe("sidebar linked work item updates", () => {
     expect(props.onSelectSession).not.toHaveBeenCalled();
   });
 
-  it("shows the linked issue or PR in the tickets row above the footer", () => {
+  it("uses the footer for the linked issue or PR instead of a second harness icon", () => {
     props.busySessionIds = new Set();
     props.onArchiveSession = vi.fn();
     props.sessions = [
@@ -928,14 +926,13 @@ describe("sidebar linked work item updates", () => {
     ];
     act(() => render());
 
+    const rows = card().children;
     const archive = card().querySelector('[aria-label^="Archive "]');
     const pullRequest = card().querySelector('[aria-label="Open PR #42"]');
-    const tickets = card().querySelector('[aria-label="Linked tickets"]');
-    expect(pullRequest).not.toBeNull();
-    expect(tickets?.contains(pullRequest)).toBe(true);
-    expect(archive?.contains(pullRequest as Node)).toBe(false);
-    // Harness identity stays on the model row and the card's footer mark.
-    expect(card().querySelectorAll('img[alt=""]')).toHaveLength(2);
+    expect(card().querySelectorAll('img[alt=""]')).toHaveLength(1);
+    expect(rows.item(rows.length - 1)?.contains(pullRequest)).toBe(true);
+    expect(archive?.parentElement).toBe(pullRequest?.parentElement);
+    expect(archive?.nextElementSibling).toBe(pullRequest);
   });
 
   it("renders an unread dot without changing session order", () => {
@@ -1149,4 +1146,25 @@ describe("sidebar working agents", () => {
     act(() => render());
     expect(container.querySelector("[data-live-agents-preview]")).toBeNull();
   });
+});
+
+
+it("labels preserved sessions as having no branch selected", () => {
+  props.sessions = [
+    {
+      ...props.sessions[0],
+      branch: "old-feature",
+      repo: "project",
+      worktreeRemoved: true,
+    },
+  ];
+  act(render);
+  expect(card().textContent).toContain("No branch selected");
+  expect(card().textContent).not.toContain("old-feature");
+  props.sessions = [
+    { ...props.sessions[0], branch: "main", worktreeRemoved: undefined },
+  ];
+  act(render);
+  expect(card().textContent).not.toContain("No branch selected");
+  expect(card().textContent).toContain("project/main");
 });

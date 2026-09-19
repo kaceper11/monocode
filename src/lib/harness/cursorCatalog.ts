@@ -25,7 +25,7 @@ const CURSOR_CLIENT_CAPABILITIES = {
 };
 
 export function refreshCursorCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("cursor", cwd, () => discoverCursorModels(cwd));
+  return refreshModelCatalog("cursor", cwd, discoverCursorModels);
 }
 
 async function discoverCursorModels(projectCwd?: string): Promise<AgentModel[]> {

@@ -1,24 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  gitCommit,
+  gitHeadMessage,
   isCheckoutBlockedByChanges,
   listSkills,
-  restoreSessionCheckout,
 } from "./fs";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
-it("restores exact worktree and provider identity without retargeting the session", () => {
-  const session = {
-    cwd: "/repo",
-    worktreeCwd: "/repo work/żółć",
-    branch: "task",
-    providerSessionId: "provider-123",
-  };
-  expect(restoreSessionCheckout(session)).toBe(session);
-});
 describe("isCheckoutBlockedByChanges", () => {
   it("detects git's tracked-file checkout error", () => {
     expect(
@@ -67,5 +59,35 @@ describe("listSkills", () => {
       cwd: "/repo",
       disabledPaths: null,
     });
+  });
+});
+
+describe("gitCommit", () => {
+  it("invokes git_commit without amend by default", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(undefined);
+    await gitCommit("/repo", "Add feature");
+    expect(invoke).toHaveBeenCalledWith("git_commit", {
+      cwd: "/repo",
+      message: "Add feature",
+      amend: false,
+    });
+  });
+
+  it("passes amend when requested", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(undefined);
+    await gitCommit("/repo", "Fix feature", true);
+    expect(invoke).toHaveBeenCalledWith("git_commit", {
+      cwd: "/repo",
+      message: "Fix feature",
+      amend: true,
+    });
+  });
+});
+
+describe("gitHeadMessage", () => {
+  it("invokes git_head_message with cwd", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce("Subject\n\nBody");
+    await expect(gitHeadMessage("/repo")).resolves.toBe("Subject\n\nBody");
+    expect(invoke).toHaveBeenCalledWith("git_head_message", { cwd: "/repo" });
   });
 });

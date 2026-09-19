@@ -15,6 +15,7 @@ import {
   pruneInboxFilters,
   connectableInboxSources,
   loadInboxConnections,
+  loadInboxSource,
   resolveInboxSource,
   saveInboxConnections,
   visibleInboxSources,
@@ -76,49 +77,6 @@ describe("filterInboxByProject", () => {
     expect(
       filterInboxByProject(rows, ["/tmp/web"]).map((row) => row.number),
     ).toEqual([9]);
-  });
-
-  it("hides items through the resolved project key", () => {
-    const rows = [
-      item({
-        number: 1,
-        updatedAt: "2026-08-27T10:00:00Z",
-        projectPath: "/tmp/api",
-      }),
-      item({
-        number: 2,
-        updatedAt: "2026-08-27T10:00:00Z",
-        projectPath: "/tmp/web",
-      }),
-    ];
-    const keyOf = (path: string) =>
-      path === "/tmp/api" ? "project:g1" : path;
-    expect(
-      filterInboxByProject(rows, ["project:g1"], keyOf).map(
-        (row) => row.number,
-      ),
-    ).toEqual([2]);
-  });
-
-  it("still hides by raw member path alongside the project key", () => {
-    const rows = [
-      item({
-        number: 1,
-        updatedAt: "2026-08-27T10:00:00Z",
-        projectPath: "/tmp/api",
-      }),
-      item({
-        number: 2,
-        updatedAt: "2026-08-27T10:00:00Z",
-        projectPath: "/tmp/web",
-      }),
-    ];
-    const keyOf = (path: string) =>
-      path === "/tmp/api" ? "project:g1" : path;
-    // Older saves stored the working-copy path, not the project key.
-    expect(
-      filterInboxByProject(rows, ["/tmp/api"], keyOf).map((row) => row.number),
-    ).toEqual([2]);
   });
 });
 
@@ -689,9 +647,39 @@ describe("inbox connection cache", () => {
   });
 });
 
- it("falls back within the selected providers and keeps Jira and Azure independent", () => {
+ it("keeps Jira and Azure connection choices independent", () => {
    const connections = { github: true, linear: false, gitlab: false, jira: true, azure: false };
-   expect(resolveInboxSource("azure", connections, ["jira", "azure"])).toBe("jira");
+   expect(resolveInboxSource("azure", connections)).toBe("github");
    expect(visibleInboxSources(connections)).toEqual(["github", "jira"]);
    expect(connectableInboxSources(connections)).toEqual(["linear", "gitlab", "azure"]);
  });
+
+
+describe("selected-provider filter isolation", () => {
+  beforeEach(mockLocalStorage);
+
+  it("does not let a removed source-visibility preference redirect the saved tab", () => {
+    localStorage.setItem("monocode.inboxVisibleSources", '["jira"]');
+    localStorage.setItem("monocode.inboxSource", "github");
+    expect(loadInboxSource()).toBe("github");
+    localStorage.setItem("monocode.inboxSource", "azure");
+    expect(loadInboxSource()).toBe("azure");
+  });
+
+  it("counts only filters used by Jira and Azure", () => {
+    const unrelated = {
+      ...DEFAULT_INBOX_FILTERS,
+      assignedToMe: true,
+      hiddenProjects: ["/tmp/web"],
+      hiddenKinds: ["issue" as const],
+    };
+    expect(hasActiveInboxFilters(unrelated, "jira")).toBe(false);
+    expect(hasActiveInboxFilters(unrelated, "azure")).toBe(false);
+    expect(hasActiveInboxFilters(unrelated, "github")).toBe(true);
+    expect(hasActiveInboxFilters({ ...unrelated, hiddenKinds: ["ci"] }, "azure")).toBe(true);
+    const draft = { ...DEFAULT_INBOX_FILTERS, status: { ...DEFAULT_INBOX_FILTERS.status, draft: true } };
+    expect(hasActiveInboxFilters(draft, "jira")).toBe(false);
+    expect(hasActiveInboxFilters(draft, "azure")).toBe(true);
+    expect(hasActiveInboxFilters({ ...draft, time: "today" }, "jira")).toBe(true);
+  });
+});

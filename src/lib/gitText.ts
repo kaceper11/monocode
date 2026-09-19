@@ -55,7 +55,7 @@ export function buildPrContentPrompt(input: {
     "Rules:",
     "- title should be concise and specific",
     "- body must be markdown and include headings '## Summary' and '## Testing'",
-    "- under Summary, provide a brief high-level overview in 2-4 short bullet points; do not list files or low-level details",
+    "- under Summary, provide short bullet points",
     "- under Testing, include bullet points with concrete checks or 'Not run' where appropriate",
     "",
     `Base branch: ${input.baseBranch}`,

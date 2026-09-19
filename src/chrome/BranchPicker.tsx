@@ -18,24 +18,27 @@ import {
 } from "../lib/fs";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import { useProjectBranchesState } from "../hooks/useProjectBranches";
-import { projectName } from "../lib/paths";
+import { CreateBranchDialog } from "./CreateBranchDialog";
+import { GitPickerTrigger } from "./GitPickerTrigger";
 import { Popover } from "./Popover";
-import { WorktreePanel } from "./WorktreePicker";
 import { SwitchBranchDialog } from "./SwitchBranchDialog";
 
 type Props = {
   cwd: string;
   branch?: string;
   enabled?: boolean;
+  worktree?: boolean;
+  initialOpen?: boolean;
+  onDismiss?: () => void;
   onChange?: () => void;
-  onOpenWorktree?: (path: string) => void;
   onClose?: () => void;
 };
 
 const MENU_WIDTH = 280;
 
-type Row =
-  { kind: "create"; name: string } | { kind: "branch"; branch: GitBranchInfo };
+type CreateRow = { kind: "create"; name: string };
+type BranchRow = { kind: "branch"; branch: GitBranchInfo };
+type Row = CreateRow | BranchRow;
 
 type PendingSwitch =
   | { kind: "create"; name: string }
@@ -48,24 +51,24 @@ export function BranchPicker({
   cwd,
   branch,
   enabled = true,
+  worktree = false,
+  initialOpen = false,
+  onDismiss,
   onChange,
-  onOpenWorktree,
   onClose,
 }: Props) {
-  const [open, setOpen] = useState(false);
-  const [worktrees, setWorktrees] = useState(false);
-  const [worktreeBase, setWorktreeBase] = useState("");
+  const [open, setOpen] = useState(initialOpen);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
   const [blocked, setBlocked] = useState<PendingSwitch | null>(null);
   const [blockedError, setBlockedError] = useState<string | null>(null);
   const [blockedBusy, setBlockedBusy] = useState<"stash" | "commit" | null>(
     null,
   );
   const root = useRef<HTMLDivElement>(null);
-  const worktreeBusy = useRef(false);
   const search = useRef<HTMLInputElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
@@ -80,16 +83,15 @@ export function BranchPicker({
   const detached = !branch && !!projectBranches?.detached;
 
   const dismiss = (restore: boolean) => {
-    if (worktreeBusy.current) return;
     setOpen(false);
-    setWorktrees(false);
-    setWorktreeBase("");
+    setCreating(false);
     setQuery("");
     setError(null);
     setBusy(false);
     setBlocked(null);
     setBlockedError(null);
     setBlockedBusy(null);
+    onDismiss?.();
     if (restore) onCloseRef.current?.();
   };
 
@@ -98,7 +100,7 @@ export function BranchPicker({
     setQuery("");
     setError(null);
     setActive(0);
-  }, [open, worktrees]);
+  }, [open]);
 
   useEffect(() => {
     // Popover measures itself off-screen behind `visibility: hidden` before
@@ -112,6 +114,7 @@ export function BranchPicker({
   useEffect(() => {
     if (enabled) return;
     setOpen(false);
+    setCreating(false);
     setQuery("");
     setError(null);
     setBusy(false);
@@ -120,7 +123,15 @@ export function BranchPicker({
     setBlockedBusy(null);
   }, [enabled]);
 
-  const rows = useMemo((): Row[] => {
+  const createName = query.trim();
+  const createTaken = (projectBranches?.branches ?? []).some(
+    (entry) => !entry.remote && entry.name === createName,
+  );
+  const createRow: CreateRow | null = createTaken
+    ? null
+    : { kind: "create", name: createName };
+
+  const rows = useMemo((): BranchRow[] => {
     const branches = projectBranches?.branches ?? [];
     const name = query.trim();
     const needle = name.toLowerCase();
@@ -132,21 +143,14 @@ export function BranchPicker({
           return hay.toLowerCase().includes(needle);
         })
       : branches;
-    const taken = branches.some(
-      (entry) => !entry.remote && entry.name === name,
-    );
     const selected = branch || projectBranches?.current;
-    const create: Row[] = name && !taken ? [{ kind: "create", name }] : [];
-    return [
-      ...create,
-      ...filtered.map((entry) => ({
-        kind: "branch" as const,
-        branch: {
-          ...entry,
-          current: entry.name === selected && !entry.remote,
-        },
-      })),
-    ];
+    return filtered.map((entry) => ({
+      kind: "branch" as const,
+      branch: {
+        ...entry,
+        current: entry.name === selected && !entry.remote,
+      },
+    }));
   }, [branch, projectBranches, query]);
 
   useEffect(() => {
@@ -158,36 +162,30 @@ export function BranchPicker({
       ? gitCreateBranch(cwd, pending.name)
       : gitCheckout(cwd, pending.name, pending.remote);
 
-  const finishSwitch = (
-    result: string | { branch: string; worktree: string | null },
-  ) => {
-    if (typeof result !== "string" && result.worktree) {
-      if (!onOpenWorktree) {
-        throw new Error(
-          `${result.branch} is open in ${projectName(result.worktree)}.`,
-        );
-      }
-      onOpenWorktree(result.worktree);
-    } else {
-      notifyGitChanged(cwd);
-      onChangeRef.current?.();
-    }
+  const finishSwitch = () => {
+    notifyGitChanged();
+    onChangeRef.current?.();
     dismiss(true);
   };
 
   const failMessage = (err: unknown) =>
     err instanceof Error ? err.message : String(err);
 
-  const run = async (pending: PendingSwitch) => {
+  const run = async (
+    pending: PendingSwitch,
+    source: "picker" | "dialog" = "picker",
+  ) => {
     if (busy || blocked) return;
     setBusy(true);
     setError(null);
     try {
-      finishSwitch(await applySwitch(pending));
+      await applySwitch(pending);
+      finishSwitch();
     } catch (err) {
       const message = failMessage(err);
       if (isCheckoutBlockedByChanges(message)) {
         setOpen(false);
+        setCreating(false);
         setQuery("");
         setError(null);
         setBusy(false);
@@ -198,7 +196,7 @@ export function BranchPicker({
       }
       setError(message);
       setBusy(false);
-      search.current?.focus();
+      if (source === "picker") search.current?.focus();
     }
   };
 
@@ -211,7 +209,8 @@ export function BranchPicker({
     setBlockedError(null);
     try {
       await work();
-      finishSwitch(await applySwitch(blocked));
+      await applySwitch(blocked);
+      finishSwitch();
     } catch (err) {
       setBlockedError(failMessage(err));
       setBlockedBusy(null);
@@ -220,6 +219,13 @@ export function BranchPicker({
 
   const pick = (row: Row) => {
     if (row.kind === "create") {
+      if (!row.name) {
+        setOpen(false);
+        setQuery("");
+        setError(null);
+        setCreating(true);
+        return;
+      }
       void run({ kind: "create", name: row.name });
       return;
     }
@@ -249,6 +255,10 @@ export function BranchPicker({
     }
     if (e.key === "Enter") {
       e.preventDefault();
+      if (createName && createRow) {
+        pick(createRow);
+        return;
+      }
       const row = rows[active];
       if (row) pick(row);
     }
@@ -256,7 +266,7 @@ export function BranchPicker({
 
   // Always keep the control mounted so the composer's toolbar does not resize
   // when a folder isn't a git repo. The loading skeleton, "No repo" label, and
-  // real branch all share the same icon + 12px mono line box.
+  // real branch all share the same icon + 12px line box.
   const awaitingBranch = inProject && !current && !branchesSettled;
   const missingGit = !current && !awaitingBranch;
   const label = current
@@ -272,198 +282,141 @@ export function BranchPicker({
   const interactive = enabled && !awaitingBranch && !missingGit;
 
   return (
-    <div className="flex max-w-[45%] shrink-0 items-center gap-2.5">
-      <div ref={root} className="relative min-w-0">
-        <button
-          type="button"
-          title={title}
-          aria-label={
-            awaitingBranch
-              ? "Loading branch"
-              : missingGit
-                ? "No git repository"
-                : `Branch ${label}`
+    <div ref={root} className="relative flex min-w-0 shrink-0">
+      <GitPickerTrigger
+        title={title}
+        aria-label={
+          awaitingBranch
+            ? "Loading branch"
+            : missingGit
+              ? "No git repository"
+              : `Branch ${label}`
+        }
+        aria-expanded={missingGit ? undefined : open}
+        aria-haspopup={missingGit ? undefined : "dialog"}
+        disabled={!interactive}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => {
+          if (!interactive || blocked) return;
+          if (open) {
+            dismiss(true);
+            return;
           }
-          aria-expanded={missingGit ? undefined : open}
-          aria-haspopup={missingGit ? undefined : "dialog"}
-          disabled={!interactive}
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => {
-            if (!interactive || blocked) return;
-            if (open) {
-              dismiss(true);
-              return;
-            }
-            setOpen(true);
+          setOpen(true);
+        }}
+        label={label}
+        loading={awaitingBranch}
+        worktree={worktree}
+      />
+      {blocked ? (
+        <SwitchBranchDialog
+          cwd={cwd}
+          branch={blocked.name}
+          creating={blocked.kind === "create"}
+          busy={blockedBusy}
+          error={blockedError}
+          onStash={() => {
+            void resolveBlocked("stash", () =>
+              gitStash(cwd, `WIP before switching to ${blocked.name}`),
+            );
           }}
-          className={
-            missingGit
-              ? "flex min-w-0 cursor-default items-center gap-1.5 text-content/50"
-              : `flex min-w-0 items-center gap-1.5 ${
-                  open ? "text-content" : "text-content/50 hover:text-content"
-                } disabled:opacity-40 disabled:hover:text-content/50`
-          }
+          onCommit={(message) => {
+            void resolveBlocked("commit", async () => {
+              await gitStageAll(cwd);
+              await gitCommit(cwd, message);
+            });
+          }}
+          onCancel={() => {
+            if (blockedBusy) return;
+            setBlocked(null);
+            setBlockedError(null);
+            onCloseRef.current?.();
+          }}
+        />
+      ) : null}
+      {creating ? (
+        <CreateBranchDialog
+          busy={busy}
+          error={error}
+          onCreate={(name) => {
+            void run({ kind: "create", name }, "dialog");
+          }}
+          onCancel={() => {
+            if (busy) return;
+            setCreating(false);
+            setError(null);
+            onCloseRef.current?.();
+          }}
+        />
+      ) : null}
+      {open ? (
+        <Popover
+          anchor={root}
+          side="top"
+          width={MENU_WIDTH}
+          minHeight={MENU_MIN_HEIGHT}
+          maxHeight={MENU_MAX_HEIGHT}
+          onDismiss={(reason) => dismiss(reason === "escape")}
+          role="dialog"
+          aria-label="Branch picker"
+          data-branch-picker
+          className="flex flex-col overflow-hidden"
         >
-          <GitBranch className="size-3.5 shrink-0" strokeWidth={1.5} />
-          <span className="relative truncate font-mono text-[12px]">
-            {awaitingBranch ? (
-              <>
-                {/*
-                  A real text node, hidden rather than absent, so the pending
-                  line box is produced exactly the way the loaded one is — the
-                  toolbar's height cannot depend on which branch we are in.
-                  "main" also keeps the reserved width near a typical branch.
-                */}
-                <span className="invisible">main</span>
-                <span className="absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-current opacity-50" />
-              </>
-            ) : (
-              label
-            )}
-          </span>
-        </button>
-        {blocked ? (
-          <SwitchBranchDialog
-            cwd={cwd}
-            branch={blocked.name}
-            creating={blocked.kind === "create"}
-            busy={blockedBusy}
-            error={blockedError}
-            onStash={() => {
-              void resolveBlocked("stash", () =>
-                gitStash(cwd, `WIP before switching to ${blocked.name}`),
-              );
-            }}
-            onCommit={(message) => {
-              void resolveBlocked("commit", async () => {
-                await gitStageAll(cwd);
-                await gitCommit(cwd, message);
-              });
-            }}
-            onCancel={() => {
-              if (blockedBusy) return;
-              setBlocked(null);
-              setBlockedError(null);
-              onCloseRef.current?.();
-            }}
+          <label className="flex shrink-0 items-center gap-2 border-b border-stroke px-3 py-2.5 text-content/50">
+            <Search className="size-3.5 shrink-0" strokeWidth={1.75} />
+            <input
+              ref={search}
+              type="text"
+              value={query}
+              placeholder="Search or create a branch..."
+              aria-label="Search or create a branch"
+              spellCheck={false}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              disabled={busy}
+              className="min-w-0 flex-1 bg-transparent font-sans text-[13px] text-content outline-none placeholder:text-content/40 disabled:opacity-60"
+              onChange={(e) => {
+                setQuery(e.target.value);
+                setActive(0);
+                setError(null);
+              }}
+              onKeyDown={onSearchKey}
+            />
+          </label>
+          <BranchList
+            rows={rows}
+            active={active}
+            busy={busy}
+            emptyLabel={query.trim() ? "No matching branches" : "No branches"}
+            onActive={setActive}
+            onPick={pick}
           />
-        ) : null}
-        {open ? (
-          <Popover
-            anchor={root}
-            side="top"
-            width={worktrees ? 320 : MENU_WIDTH}
-            minHeight={MENU_MIN_HEIGHT}
-            maxHeight={worktrees ? 380 : MENU_MAX_HEIGHT}
-            onDismiss={(reason) => dismiss(reason === "escape")}
-            role="dialog"
-            aria-label="Branch picker"
-            data-branch-picker
-            className="flex flex-col overflow-hidden"
-          >
-            {onOpenWorktree && (
-              <div
-                className="flex shrink-0 gap-3 border-b border-stroke px-3 py-2 text-[12px]"
-                aria-label="Branch management views"
+          {error ? (
+            <p className="max-h-16 shrink-0 overflow-y-auto whitespace-pre-wrap border-t border-stroke px-2.5 py-2 text-[11px] leading-4 text-red-400/90">
+              {error}
+            </p>
+          ) : null}
+          {createRow ? (
+            <div className="shrink-0 border-t border-stroke p-1 px-1.5">
+              <button
+                type="button"
+                disabled={busy}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => pick(createRow)}
+                className="flex h-7.5 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[13px] text-content/75 hover:bg-content/8 hover:text-content disabled:opacity-60"
               >
-                <button
-                  type="button"
-                  disabled={busy}
-                  aria-pressed={!worktrees}
-                  className={!worktrees ? "text-content" : "text-content/50"}
-                  onClick={() => setWorktrees(false)}
-                >
-                  Branches
-                </button>
-                <button
-                  type="button"
-                  disabled={busy}
-                  aria-pressed={worktrees}
-                  className={worktrees ? "text-content" : "text-content/50"}
-                  onClick={() => {
-                    setWorktreeBase("");
-                    setWorktrees(true);
-                  }}
-                >
-                  Worktrees
-                </button>
-              </div>
-            )}
-            {worktrees && onOpenWorktree ? (
-              <WorktreePanel
-                cwd={cwd}
-                initialBase={worktreeBase}
-                onBusyChange={(value) => {
-                  worktreeBusy.current = value;
-                  setBusy(value);
-                }}
-                onOpen={onOpenWorktree}
-                onClose={() => {
-                  // The panel closes itself mid-`run` after a completed
-                  // removal — before its finally clears the busy flag. A
-                  // programmatic close is not a user dismissal, so it must
-                  // bypass that guard or the popover stays open on a stale
-                  // confirmation.
-                  worktreeBusy.current = false;
-                  dismiss(true);
-                }}
-              />
-            ) : (
-              <>
-                <label className="flex shrink-0 items-center gap-2 border-b border-stroke px-2 py-2.5 text-content/50">
-                  <Search className="size-3.5 shrink-0" strokeWidth={1.75} />
-                  <input
-                    ref={search}
-                    type="text"
-                    value={query}
-                    placeholder="Search or create a branch..."
-                    aria-label="Search or create a branch"
-                    spellCheck={false}
-                    autoComplete="off"
-                    autoCorrect="off"
-                    autoCapitalize="off"
-                    disabled={busy}
-                    className="min-w-0 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/40 disabled:opacity-60"
-                    onChange={(e) => {
-                      setQuery(e.target.value);
-                      setActive(0);
-                      setError(null);
-                    }}
-                    onKeyDown={onSearchKey}
-                  />
-                </label>
-                <BranchList
-                  rows={rows}
-                  active={active}
-                  busy={busy}
-                  emptyLabel={
-                    query.trim() ? "No matching branches" : "No branches"
-                  }
-                  onActive={setActive}
-                  onPick={pick}
-                  onCreateWorktree={
-                    onOpenWorktree
-                      ? (entry) => {
-                          setWorktreeBase(
-                            entry.remote
-                              ? `refs/remotes/${entry.remote}/${entry.name}`
-                              : `refs/heads/${entry.name}`,
-                          );
-                          setWorktrees(true);
-                        }
-                      : undefined
-                  }
-                />
-                {error ? (
-                  <p className="max-h-16 shrink-0 overflow-y-auto whitespace-pre-wrap border-t border-stroke px-2.5 py-2 text-[11px] leading-4 text-red-400/90">
-                    {error}
-                  </p>
-                ) : null}
-              </>
-            )}
-          </Popover>
-        ) : null}
-      </div>
+                <Plus className="size-4 shrink-0" strokeWidth={1.75} />
+                <span className="min-w-0 truncate">
+                  {createRow.name
+                    ? `Create and checkout ${createRow.name}`
+                    : "New branch"}
+                </span>
+              </button>
+            </div>
+          ) : null}
+        </Popover>
+      ) : null}
     </div>
   );
 }
@@ -475,15 +428,13 @@ function BranchList({
   emptyLabel,
   onActive,
   onPick,
-  onCreateWorktree,
 }: {
-  rows: Row[];
+  rows: BranchRow[];
   active: number;
   busy: boolean;
   emptyLabel: string;
   onActive: (index: number) => void;
-  onPick: (row: Row) => void;
-  onCreateWorktree?: (entry: GitBranchInfo) => void;
+  onPick: (row: BranchRow) => void;
 }) {
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const activeRef = useRef<HTMLButtonElement>(null);
@@ -494,96 +445,58 @@ function BranchList({
 
   if (rows.length === 0) {
     return (
-      <div className="px-3 py-4 text-[12px] text-content/50">{emptyLabel}</div>
+      <div className="min-h-0 flex-1 px-3 py-4 text-[12px] text-content/50">
+        {emptyLabel}
+      </div>
     );
   }
 
   return (
     <div
       ref={lockOverscroll}
-      role="group"
+      role="listbox"
       aria-label="Branches"
       className="min-h-0 flex-1 overflow-y-auto overscroll-none px-1.5 py-1.5"
     >
       {rows.map((row, index) => {
         const highlighted = index === active;
-        const selected = row.kind === "branch" && row.branch.current;
+        const selected = row.branch.current;
         return (
-          <div
-            className="flex items-center gap-1"
-            key={
-              row.kind === "create"
-                ? `create:${row.name}`
-                : `${row.branch.remote ?? "local"}:${row.branch.name}`
-            }
+          <button
+            key={`${row.branch.remote ?? "local"}:${row.branch.name}`}
+            ref={highlighted ? activeRef : undefined}
+            type="button"
+            role="option"
+            aria-selected={selected}
+            disabled={busy}
+            onMouseDown={(e) => e.preventDefault()}
+            onMouseEnter={() => onActive(index)}
+            onClick={() => onPick(row)}
+            className={`flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] disabled:opacity-60 ${
+              highlighted || selected
+                ? "bg-selection text-content"
+                : "text-content hover:bg-content/5"
+            }`}
           >
-            <button
-              ref={highlighted ? activeRef : undefined}
-              type="button"
-              aria-pressed={selected}
-              disabled={busy}
-              onMouseDown={(e) => e.preventDefault()}
-              onMouseEnter={() => onActive(index)}
-              onClick={() => onPick(row)}
-              className={
-                row.kind === "create"
-                  ? `mb-1 flex h-8 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left disabled:opacity-60 ${
-                      highlighted
-                        ? "bg-selection-hover text-content"
-                        : "bg-selection text-content hover:bg-selection-hover"
-                    }`
-                  : `flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left disabled:opacity-60 ${
-                      highlighted || selected
-                        ? "bg-selection text-content"
-                        : "text-content hover:bg-content/5"
-                    }`
-              }
-            >
-              {row.kind === "create" ? (
-                <>
-                  <Plus className="size-3.5 shrink-0" strokeWidth={1.75} />
-                  <span className="min-w-0 truncate text-[12px]">
-                    Create and checkout {row.name}
-                  </span>
-                </>
-              ) : (
-                <>
-                  {selected ? (
-                    <Check className="size-3.5 shrink-0" strokeWidth={1.75} />
-                  ) : (
-                    <GitBranch
-                      className="size-3.5 shrink-0 text-content/50"
-                      strokeWidth={1.75}
-                    />
-                  )}
-                  <span className="min-w-0 flex-1 truncate font-mono text-[12px]">
-                    {row.branch.name}
-                  </span>
-                  {row.branch.worktree && !selected ? (
-                    <span className="max-w-[45%] shrink-0 truncate text-[10px] text-content/40">
-                      Open in {projectName(row.branch.worktree)}
-                    </span>
-                  ) : row.branch.remote ? (
-                    <span className="shrink-0 text-[10px] text-content/40">
-                      {row.branch.remote}
-                    </span>
-                  ) : null}
-                </>
-              )}
-            </button>
-            {row.kind === "branch" && onCreateWorktree && (
-              <button
-                type="button"
-                disabled={busy}
-                title={`Create worktree from ${row.branch.remote ? row.branch.remote + "/" : ""}${row.branch.name}`}
-                aria-label={`Create worktree from ${row.branch.remote ? row.branch.remote + "/" : ""}${row.branch.name}`}
-                className="shrink-0 rounded p-1 text-content/50 hover:bg-content/10 hover:text-content disabled:opacity-40"
-                onClick={() => onCreateWorktree(row.branch)}
-              >
-                <Plus className="size-3.5" />
-              </button>
+            {selected ? (
+              <Check className="size-3.5 shrink-0" strokeWidth={1.75} />
+            ) : (
+              <GitBranch
+                className="size-3.5 shrink-0 text-content/50"
+                strokeWidth={1.75}
+              />
             )}
-          </div>
+            <span
+              className={`min-w-0 flex-1 truncate ${selected ? "font-medium" : ""}`}
+            >
+              {row.branch.name}
+            </span>
+            {row.branch.remote ? (
+              <span className="shrink-0 rounded bg-content/6 px-1.5 py-0.5 text-[10px] text-content/40">
+                {row.branch.remote}
+              </span>
+            ) : null}
+          </button>
         );
       })}
     </div>

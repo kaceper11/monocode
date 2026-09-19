@@ -42,7 +42,6 @@ pub struct LinearAssignee {
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LinearIssue {
-    pub account: String,
     pub provider: String,
     pub kind: String,
     pub id: String,
@@ -150,9 +149,7 @@ pub async fn linear_list_issues(
         let filter = issue_filter(assigned_to_me, &state, &team_ids);
         let data = graphql_with_token(
             &token,
-            &issue_row_query(
-                "query InboxIssues($first: Int!, $filter: IssueFilter) {\n  viewer { id }\n  issues(first: $first, filter: $filter, orderBy: updatedAt) {\n    nodes { ...IssueRow }\n  }\n}",
-            ),
+            ISSUES_QUERY,
             json!({ "first": limit, "filter": filter }),
         )?;
         parse_linear_issues(&data)
@@ -180,36 +177,6 @@ pub async fn linear_issue_details(
 }
 
 #[tauri::command]
-pub async fn linear_issue_snapshot(app: AppHandle, id: String) -> Result<LinearIssue, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let token = require_token(&app)?;
-        let id = id.trim();
-        if !valid_linear_id(id) {
-            return Err("Missing Linear issue".into());
-        }
-        let data = graphql_with_token(
-            &token,
-            &issue_row_query(
-                "query InboxIssueSnapshot($id: String!) {\n  viewer { id }\n  issue(id: $id) { ...IssueRow }\n}",
-            ),
-            json!({ "id": id }),
-        )?;
-        let account = data
-            .pointer("/viewer/id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let mut item = data
-            .get("issue")
-            .and_then(parse_linear_issue)
-            .ok_or_else(|| "Linear did not return that issue".to_string())?;
-        item.account = account.to_owned();
-        Ok(item)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
 pub async fn linear_issue_thread(app: AppHandle, id: String) -> Result<LinearIssueThread, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let token = require_token(&app)?;
@@ -219,96 +186,6 @@ pub async fn linear_issue_thread(app: AppHandle, id: String) -> Result<LinearIss
         }
         let data = graphql_with_token(&token, ISSUE_COMMENTS_QUERY, json!({ "id": id }))?;
         parse_linear_issue_thread(&data)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-/// Direction is positional in Linear: `relations` holds outgoing edges,
-/// `inverseRelations` the incoming ones. The label keeps that direction.
-fn relation_label(kind: &str, inverse: bool) -> (String, String) {
-    match (kind, inverse) {
-        ("blocks", false) => ("blocks".into(), "blocks".into()),
-        ("blocks", true) => ("blocked-by".into(), "is blocked by".into()),
-        ("duplicate", false) => ("duplicate".into(), "duplicates".into()),
-        ("duplicate", true) => ("duplicate".into(), "is duplicated by".into()),
-        ("related", _) => ("related".into(), "related".into()),
-        (other, _) => (other.to_string(), other.to_string()),
-    }
-}
-
-fn has_next_page(issue: &Value, field: &str) -> bool {
-    issue
-        .pointer(&format!("/{field}/pageInfo/hasNextPage"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
-fn parse_linear_relations(data: &Value) -> Result<Value, String> {
-    let issue = data
-        .get("issue")
-        .ok_or_else(|| "Linear did not return that issue".to_string())?;
-    let mut edges = Vec::new();
-    let mut truncated = false;
-    // Returns false only when the cap dropped the edge so `truncated` stays
-    // honest; unparseable targets are not truncation.
-    let mut push = |key: &str, label: &str, node: &Value| -> bool {
-        if edges.len() >= 50 {
-            return false;
-        }
-        if let Some(item) = parse_linear_issue(node) {
-            edges.push(json!({
-                "key": key,
-                "label": label,
-                "ref": item.identifier,
-                "item": item,
-            }));
-        }
-        true
-    };
-    if let Some(parent) = issue.get("parent") {
-        truncated |= !push("parent", "Parent", parent);
-    }
-    truncated |= has_next_page(issue, "children");
-    if let Some(nodes) = issue.pointer("/children/nodes").and_then(Value::as_array) {
-        for node in nodes {
-            truncated |= !push("children", "Sub-issue", node);
-        }
-    }
-    for (field, inverse) in [("relations", false), ("inverseRelations", true)] {
-        truncated |= has_next_page(issue, field);
-        let Some(nodes) = issue
-            .pointer(&format!("/{field}/nodes"))
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-        for node in nodes {
-            let kind = string_field(node, "type").unwrap_or_else(|| "related".into());
-            let counterpart = if inverse { "issue" } else { "relatedIssue" };
-            let (key, label) = relation_label(&kind, inverse);
-            truncated |= !push(&key, &label, &node[counterpart]);
-        }
-    }
-    Ok(json!({ "edges": edges, "truncated": truncated }))
-}
-
-#[tauri::command]
-pub async fn linear_issue_relations(app: AppHandle, id: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let token = require_token(&app)?;
-        let id = id.trim();
-        if !valid_linear_id(id) {
-            return Err("Missing Linear issue".into());
-        }
-        let data = graphql_with_token(
-            &token,
-            &issue_row_query(
-                "query InboxIssueRelations($id: String!) {\n  issue(id: $id) {\n    parent { ...IssueRow }\n    children(first: 50) {\n      pageInfo { hasNextPage }\n      nodes { ...IssueRow }\n    }\n    relations(first: 50) {\n      pageInfo { hasNextPage }\n      nodes { type relatedIssue { ...IssueRow } }\n    }\n    inverseRelations(first: 50) {\n      pageInfo { hasNextPage }\n      nodes { type issue { ...IssueRow } }\n    }\n  }\n}",
-            ),
-            json!({ "id": id }),
-        )?;
-        parse_linear_relations(&data)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -360,21 +237,25 @@ query {
   }
 }
 "#;
-/// Shared Inbox row shape — one fragment definition behind every query that
-/// maps results through `parse_linear_issue`.
-const ISSUE_ROW_FRAGMENT: &str = r#"fragment IssueRow on Issue {
-  id identifier number title url updatedAt
-  state { name type }
-  team { id key name }
-  project { id name }
-  labels { nodes { name color } }
-  assignee { name displayName avatarUrl }
-}"#;
-
-fn issue_row_query(body: &str) -> String {
-    format!("{ISSUE_ROW_FRAGMENT}\n{body}")
+const ISSUES_QUERY: &str = r#"
+query InboxIssues($first: Int!, $filter: IssueFilter) {
+  issues(first: $first, filter: $filter, orderBy: updatedAt) {
+    nodes {
+      id
+      identifier
+      number
+      title
+      url
+      updatedAt
+      state { name type }
+      team { id key name }
+      project { id name }
+      labels { nodes { name color } }
+      assignee { name displayName avatarUrl }
+    }
+  }
 }
-
+"#;
 const ISSUE_QUERY: &str = r#"
 query InboxIssue($id: String!) {
   issue(id: $id) {
@@ -432,7 +313,7 @@ fn issue_filter(assigned_to_me: bool, state: &str, team_ids: &[String]) -> Value
     Value::Object(filter)
 }
 
-pub(crate) fn linear_authorization(token: &str) -> String {
+fn linear_authorization(token: &str) -> String {
     let trimmed = token.trim();
     trimmed
         .strip_prefix("Bearer ")
@@ -442,11 +323,7 @@ pub(crate) fn linear_authorization(token: &str) -> String {
         .to_string()
 }
 
-pub(crate) fn graphql_with_token(
-    token: &str,
-    query: &str,
-    variables: Value,
-) -> Result<Value, String> {
+fn graphql_with_token(token: &str, query: &str, variables: Value) -> Result<Value, String> {
     let authorization = linear_authorization(token);
     let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
     let payload = serde_json::to_string(&json!({ "query": query, "variables": variables }))
@@ -541,18 +418,7 @@ fn parse_linear_issues(data: &Value) -> Result<Vec<LinearIssue>, String> {
         .pointer("/issues/nodes")
         .and_then(Value::as_array)
         .ok_or_else(|| "Linear did not return issues".to_string())?;
-    let account = data
-        .pointer("/viewer/id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    Ok(nodes
-        .iter()
-        .filter_map(parse_linear_issue)
-        .map(|mut item| {
-            item.account = account.to_owned();
-            item
-        })
-        .collect())
+    Ok(nodes.iter().filter_map(parse_linear_issue).collect())
 }
 
 fn parse_linear_issue(node: &Value) -> Option<LinearIssue> {
@@ -581,7 +447,6 @@ fn parse_linear_issue(node: &Value) -> Option<LinearIssue> {
         .unwrap_or_default();
     let state = node.get("state");
     Some(LinearIssue {
-        account: String::new(),
         provider: "linear".into(),
         kind: "linear".into(),
         id,
@@ -824,7 +689,7 @@ fn read_token(app: &AppHandle) -> Result<Option<String>, String> {
     }
 }
 
-pub(crate) fn require_token(app: &AppHandle) -> Result<String, String> {
+fn require_token(app: &AppHandle) -> Result<String, String> {
     read_token(app)?.ok_or_else(|| "Connect Linear in Settings".to_string())
 }
 
@@ -922,60 +787,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_linear_relations_keeps_edge_direction() {
-        let row = |id: &str, identifier: &str| {
-            json!({
-                "id": id, "identifier": identifier, "number": 1,
-                "title": "T", "url": "https://linear.app/x", "updatedAt": "",
-                "state": {"name":"Todo","type":"unstarted"},
-                "team": {"id":"t","key":"ENG","name":"Engineering"},
-            })
-        };
-        let data = json!({
-            "issue": {
-                "parent": row("p", "ENG-1"),
-                "children": {"pageInfo":{"hasNextPage":true},"nodes":[row("c","ENG-2")]},
-                "relations": {"pageInfo":{"hasNextPage":false},"nodes":[
-                    {"type":"blocks","relatedIssue":row("b","ENG-3")},
-                    {"type":"similar","relatedIssue":row("s","ENG-4")},
-                ]},
-                "inverseRelations": {"pageInfo":{"hasNextPage":false},"nodes":[
-                    {"type":"blocks","issue":row("u","ENG-5")},
-                    {"type":"duplicate","issue":row("d","ENG-6")},
-                ]},
-            }
-        });
-        let parsed = parse_linear_relations(&data).unwrap();
-        assert_eq!(parsed["truncated"], true);
-        let rows: Vec<(&str, &str, &str)> = parsed["edges"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|edge| {
-                (
-                    edge["key"].as_str().unwrap(),
-                    edge["label"].as_str().unwrap(),
-                    edge["ref"].as_str().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            rows,
-            [
-                ("parent", "Parent", "ENG-1"),
-                ("children", "Sub-issue", "ENG-2"),
-                ("blocks", "blocks", "ENG-3"),
-                ("similar", "similar", "ENG-4"),
-                ("blocked-by", "is blocked by", "ENG-5"),
-                ("duplicate", "is duplicated by", "ENG-6"),
-            ]
-        );
-    }
-
-    #[test]
     fn parse_linear_issues_maps_fields() {
         let data = json!({
-            "viewer": { "id": "account-1" },
             "issues": {
                 "nodes": [{
                     "id": "issue-1",
@@ -995,7 +808,6 @@ mod tests {
         let items = parse_linear_issues(&data).unwrap();
         assert_eq!(items.len(), 1);
         let item = &items[0];
-        assert_eq!(item.account, "account-1");
         assert_eq!(item.provider, "linear");
         assert_eq!(item.kind, "linear");
         assert_eq!(item.identifier, "ENG-9");

@@ -8,7 +8,6 @@ export type LinearTeam = {
 };
 
 export type LinearIssue = {
-  account?: string;
   provider: "linear";
   kind: "linear";
   id: string;
@@ -113,11 +112,6 @@ export function listLinearIssues(query: {
     teamIds: query.teamIds,
     limit: query.limit,
   });
-}
-
-/** Single-issue read used to refresh linked sessions outside the Inbox listing. */
-export function linearIssueSnapshot(id: string): Promise<LinearIssue> {
-  return invoke<LinearIssue>("linear_issue_snapshot", { id });
 }
 
 export function peekLinearIssueDetails(id: string): LinearIssueDetails | null {

@@ -1,5 +1,11 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ask } from "../lib/dialogs";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
+import { copyText as writeClipboardText } from "../lib/clipboard";
+import { BrowserContextPicker } from "../chrome/BrowserContextPicker";
+import type { AgentContext } from "../lib/agentContext";
+import type { Session } from "../lib/session";
+const readClipboardText = () => invoke<string>("browser_read_clipboard");
 import {
   CheckMenuItem,
   Menu,
@@ -7,13 +13,11 @@ import {
   PredefinedMenuItem,
 } from "@tauri-apps/api/menu";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
-import {
-  readText as readClipboardText,
-  writeText as writeClipboardText,
-} from "@tauri-apps/plugin-clipboard-manager";
+
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -61,23 +65,22 @@ import {
   updateBrowserFavorite,
   type BrowserFavorite,
 } from "../lib/browser";
-import { requestAgentContext } from "../lib/agentContext";
-import type {
-  BrowserMetaPatch,
-  BrowserTabSource,
-  FilePaneTab,
-} from "../lib/layout";
+
+import type { BrowserMetaPatch, BrowserTabSource } from "../lib/browserWorkspace";
+import type { FilePaneTab } from "../lib/layout";
 import { wslLocation } from "../lib/paths";
 
 type LoadStatus = "idle" | "opening" | "loading" | "ready" | "failed";
 
 type Props = {
+  sessions: readonly Session[];
   file: FilePaneTab & { browser: BrowserTabSource };
   /** The tab is the active tab of a pane that is on screen. */
   active: boolean;
   /** Another pane is expanded over this one — the DOM rect still reports
    * layout, so the webview must be hidden explicitly. */
   occluded?: boolean;
+  onFocus?: () => void;
   onMetaChange?: (patch: BrowserMetaPatch) => void;
 };
 
@@ -154,11 +157,39 @@ function paneBackground(host: HTMLElement | null): Rgba | undefined {
  */
 export function BrowserView({
   file,
+  sessions,
   active,
   occluded,
   onMetaChange,
+  onFocus,
 }: Props) {
-  const label = `browser-${file.id}`;
+  const [documentVisible, setDocumentVisible] = useState(() => !document.hidden);
+  useEffect(() => {
+    const update = () => setDocumentVisible(!document.hidden);
+    document.addEventListener("visibilitychange", update);
+    return () => document.removeEventListener("visibilitychange", update);
+  }, []);
+  const [captureContext, setCaptureContext] = useState<AgentContext | null>(null);
+  const captureOwner = useRef(0);
+  useEffect(() => {
+    setCaptureContext(null);
+    setCapturing(false);
+    return () => { captureOwner.current++; };
+  }, [file.id, file.cwd, file.browser.persist]);
+  const persist = file.browser.persist !== false;
+  // A remount or profile change must never receive a predecessor's queued IPC.
+  const label = useMemo(() => `browser-${crypto.randomUUID()}`, [file.id, persist]);
+  const nativeLabel = useRef(label);
+  nativeLabel.current = label;
+  const operationsEpoch = useRef(0);
+  const recordingRequest = useRef(0);
+  const recordingDesired = useRef(false);
+  const recordingQueue = useRef(Promise.resolve());
+  const findRequest = useRef(0);
+  const findQueue = useRef(Promise.resolve());
+  const geometryQueue = useRef(Promise.resolve());
+  const focusRef = useRef({ active, occluded, onFocus });
+  focusRef.current = { active, occluded, onFocus };
   const url = file.browser.url;
   const hostRef = useRef<HTMLDivElement>(null);
   const openedRef = useRef(false);
@@ -166,6 +197,7 @@ export function BrowserView({
   const shownRef = useRef(false);
   const boundsRef = useRef<{ x: number; y: number; width: number; height: number } | null>(null);
   const watchdogRef = useRef<number | null>(null);
+  const watchdogGeneration = useRef(0);
   const onMetaChangeRef = useRef(onMetaChange);
   onMetaChangeRef.current = onMetaChange;
   const cwdRef = useRef(file.cwd);
@@ -193,6 +225,7 @@ export function BrowserView({
   const [overlayOpen, setOverlayOpen] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [recordingPending, setRecordingPending] = useState(false);
   const [recordStart, setRecordStart] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   /** A steps session ran this mount — gates the steps-send so it doesn't
@@ -212,8 +245,20 @@ export function BrowserView({
   /** Latest find query for the page-event subscription. */
   const findQueryRef = useRef("");
   /** Storage mode the live webview was created with. */
-  const persist = file.browser.persist !== false;
   const persistRef = useRef(persist);
+
+  useEffect(() => {
+    operationsEpoch.current++;
+    recordingDesired.current = false;
+    recordingRef.current = false;
+    recordingQueue.current = Promise.resolve();
+    findQueue.current = Promise.resolve();
+    geometryQueue.current = Promise.resolve();
+    setRecording(false); setRecordingPending(false); setRecordStart(null); setRecordedOnce(false);
+    setFindOpen(false); setFindQuery(""); setFindResult(null); findQueryRef.current = "";
+    setOpened(false);
+    return () => { operationsEpoch.current++; };
+  }, [label]);
 
   const favorites = useSyncExternalStore(
     subscribeBrowserFavorites,
@@ -222,6 +267,7 @@ export function BrowserView({
   const favorited = !!current && favorites.some((fav) => fav.url === current);
 
   const clearWatchdog = useCallback(() => {
+    watchdogGeneration.current++;
     if (watchdogRef.current != null) window.clearTimeout(watchdogRef.current);
     watchdogRef.current = null;
   }, []);
@@ -247,12 +293,14 @@ export function BrowserView({
    */
   const armWatchdog = useCallback(
     (target: string, attempt = 1) => {
+      const generation = ++watchdogGeneration.current;
       if (watchdogRef.current != null) window.clearTimeout(watchdogRef.current);
       watchdogRef.current = window.setTimeout(
         () => {
           watchdogRef.current = null;
           void (async () => {
             const probe = await browserProbe(label).catch(() => null);
+            if (generation !== watchdogGeneration.current) return;
             if (!probe) {
               if (attempt >= WATCHDOG_MAX_ATTEMPTS) {
                 setStatus("failed");
@@ -294,37 +342,48 @@ export function BrowserView({
     [label, showNotice],
   );
 
-  /** Stop the steps session; the page-side flag is the real gate, the
-   * eval just flips it — harmless on a page where it no longer exists. */
-  const stopRecording = useCallback(
-    (message?: string): void => {
-      recordingRef.current = false;
-      setRecording(false);
-      setRecordStart(null);
-      if (message) showNotice(message);
-      void browserSetRecording(label, false).catch(() => undefined);
-    },
-    [label, showNotice],
-  );
+  const changeRecording = useCallback((on: boolean, resume = false) => {
+    const epoch = operationsEpoch.current;
+    const request = ++recordingRequest.current;
+    const origin = urlOrigin(currentRef.current);
+    const live = () => nativeLabel.current === label && operationsEpoch.current === epoch;
+    recordingDesired.current = on;
+    setRecordingPending(true);
+    const pending = recordingQueue.current.then(async () => {
+      if (!live() || request !== recordingRequest.current) return;
+      const applied = origin ? await browserSetRecording(label, on, origin, resume) : false;
+      if (!live() || request !== recordingRequest.current) return;
+      const next = on && applied;
+      recordingDesired.current = next;
+      recordingRef.current = next;
+      setRecording(next);
+      setRecordStart(previous => next ? (resume ? previous ?? Date.now() : Date.now()) : null);
+      if (!resume) setElapsed(0);
+      if (next) setRecordedOnce(true);
+      if (on && !applied) showNotice("Can't record steps on this page");
+    }).catch(error => {
+      if (!live() || request !== recordingRequest.current) return;
+      // An eval timeout does not prove the page-side write failed. Keep a
+      // visible stop control until a subsequent stop/reload confirms it.
+      recordingDesired.current = true;
+      recordingRef.current = true;
+      setRecording(true);
+      showNotice(`Cannot confirm recording state. Stop recording or reload the page. ${String(error)}`);
+    }).finally(() => {
+      if (live() && request === recordingRequest.current) setRecordingPending(false);
+    });
+    recordingQueue.current = pending;
+    return pending;
+  }, [label, showNotice]);
+
+  const stopRecording = useCallback((message?: string) => {
+    if (message) showNotice(message);
+    changeRecording(false);
+  }, [changeRecording, showNotice]);
 
   const toggleRecording = useCallback(() => {
-    const next = !recordingRef.current;
-    void browserSetRecording(label, next)
-      .then((applied) => {
-        // No hook on this page (e.g. still on its first load) — starting
-        // would show an indicator that records nothing.
-        if (next && !applied) {
-          showNotice("Can't record steps on this page");
-          return;
-        }
-        recordingRef.current = next;
-        setRecording(next);
-        setRecordStart(next ? Date.now() : null);
-        setElapsed(0);
-        if (next) setRecordedOnce(true);
-      })
-      .catch(noticeError);
-  }, [label, showNotice, noticeError]);
+    changeRecording(!recordingDesired.current);
+  }, [changeRecording]);
 
   const reloadPage = useCallback(() => {
     setStatus("loading");
@@ -332,14 +391,20 @@ export function BrowserView({
     void browserReload(label).catch(() => undefined);
   }, [label, armWatchdog]);
 
-  const runFind = useCallback(
-    (query: string, forward = true) => {
-      void browserFind(label, query, forward)
-        .then((result) => setFindResult(result))
-        .catch(() => setFindResult(null));
-    },
-    [label],
-  );
+  const runFind = useCallback((query: string, forward = true) => {
+    const epoch = operationsEpoch.current;
+    const request = ++findRequest.current;
+    const live = () => nativeLabel.current === label && operationsEpoch.current === epoch;
+    const pending = findQueue.current.then(async () => {
+      if (!live() || query !== findQueryRef.current) return;
+      const result = await browserFind(label, query, forward);
+      if (live() && request === findRequest.current && query === findQueryRef.current)
+        setFindResult(query ? result : null);
+    }).catch(() => {
+      if (live() && request === findRequest.current) setFindResult(null);
+    });
+    findQueue.current = pending;
+  }, [label]);
 
   /** Opens the find bar (or refocuses it) — no-op on a URL-less tab. */
   const openFind = useCallback(() => {
@@ -357,22 +422,25 @@ export function BrowserView({
       window.clearTimeout(findTimerRef.current);
     findTimerRef.current = null;
     // Empty query clears page-side highlights and match state.
-    void browserFind(label, "").catch(() => undefined);
-  }, [label]);
+    runFind("");
+  }, [runFind]);
 
   const clearSiteData = useCallback(() => {
     void (async () => {
+      const epoch = operationsEpoch.current;
+      const live = () => nativeLabel.current === label && operationsEpoch.current === epoch;
       const ok = await ask(
         "Clear cookies and site data for every site in this browser profile? You'll be signed out everywhere.",
         { title: "MonoCode", kind: "warning", okLabel: "Clear data" },
       ).catch(() => false);
-      if (!ok) return;
+      if (!ok || !live()) return;
       try {
         await browserClearData(label);
+        if (!live()) return;
         showNotice("Site data cleared");
         reloadPage();
       } catch (error) {
-        noticeError(error);
+        if (live()) noticeError(error);
       }
     })();
   }, [label, reloadPage, showNotice, noticeError]);
@@ -412,7 +480,7 @@ export function BrowserView({
   // — they fire even while the native webview holds DOM-unreachable focus.
   useEffect(() => {
     const onCommand = (event: Event) => {
-      if (!isBrowserCommandRequest(event) || event.detail.label !== label)
+      if (!isBrowserCommandRequest(event) || event.detail.label !== `browser-${file.id}`)
         return;
       switch (event.detail.command) {
         case "reload":
@@ -432,29 +500,51 @@ export function BrowserView({
     };
     window.addEventListener(BROWSER_COMMAND_EVENT, onCommand);
     return () => window.removeEventListener(BROWSER_COMMAND_EVENT, onCommand);
-  }, [label, reloadPage, openFind]);
+  }, [file.id, label, reloadPage, openFind]);
 
   // The recording chip's elapsed timer — only ticks while a session runs.
   useEffect(() => {
-    if (!recording || recordStart == null) return;
+    if (!recording || recordStart == null || !active || occluded || !documentVisible) return;
     const tick = () => setElapsed(Date.now() - recordStart);
     tick();
     const timer = window.setInterval(tick, 1000);
     return () => window.clearInterval(timer);
-  }, [recording, recordStart]);
+  }, [recording, recordStart, active, occluded, documentVisible]);
 
   // Page events → tab state. `navigate` fires for every committed
   // navigation (initial load, user clicks, redirects, history moves).
   useEffect(() => {
-    return subscribeBrowser(label, (event) => {
+    let readyPending = false;
+    let readyAgain = false;
+    let disposed = false;
+    let nextReadyAt = 0;
+    let readyTimer: ReturnType<typeof setTimeout> | undefined;
+    const acknowledgeReady = () => {
+      readyAgain = true;
+      if (readyPending || disposed) return;
+      readyPending = true;
+      readyTimer = setTimeout(async () => {
+        readyTimer = undefined;
+        nextReadyAt = Date.now() + 1000;
+        readyAgain = false;
+        if (recordingDesired.current) await changeRecording(true, recordingRef.current);
+        readyPending = false;
+        if (readyAgain && recordingDesired.current && !disposed) acknowledgeReady();
+      }, Math.max(50, nextReadyAt - Date.now()));
+    };
+    const unsubscribe = subscribeBrowser(label, (event) => {
       switch (event.kind) {
+        case "focus":
+          if (focusRef.current.active && !focusRef.current.occluded && wantShowRef.current) focusRef.current.onFocus?.();
+          break;
         case "navigate": {
           const next = event.url ?? "";
           const prev = currentRef.current;
           // The session flag can't cross origins — make the end visible
           // instead of leaving a dead indicator running.
           const movedOrigin = urlOrigin(prev) !== urlOrigin(next);
-          const stopped = movedOrigin && recordingRef.current;
+          const stopped = movedOrigin && (recordingDesired.current || recordingRef.current);
+          if (movedOrigin) setRecordedOnce(false);
           currentRef.current = next;
           setCurrent(next);
           setDraft(next);
@@ -486,24 +576,21 @@ export function BrowserView({
         case "load-started":
           setStatus("loading");
           break;
+        case "recording-ready":
+          // A new document/BFCache restore can accept the origin-checked
+          // owner acknowledgement before slow resources finish loading.
+          // The page can forge this notice: keep at most one scheduled or
+          // in-flight acknowledgement, and let an explicit Stop supersede it.
+          if (recordingDesired.current) acknowledgeReady();
+          break;
         case "load-finished": {
           clearWatchdog();
           setStatus("ready");
           // A navigation replaces the document — re-run an open find.
           if (findQueryRef.current) runFind(findQueryRef.current);
-          // Keep the indicator honest: a recreated webview lost the flag
-          // with its fresh sessionStorage — re-assert it (idempotent, the
-          // trail survives); a document that can't record — about:/data:
-          // never emit `navigate`, so this is the only signal — stops it.
-          if (recordingRef.current) {
+          if (recordingDesired.current) {
             if (/^https?:/.test(event.url ?? "")) {
-              void browserSetRecording(label, true).then((applied) => {
-                if (!applied && recordingRef.current) {
-                  stopRecording(
-                    "Recording stopped — this page can't be recorded",
-                  );
-                }
-              });
+              changeRecording(true, recordingRef.current);
             } else {
               stopRecording("Recording stopped — this page can't be recorded");
             }
@@ -537,13 +624,32 @@ export function BrowserView({
           break;
       }
     });
-  }, [label, armWatchdog, clearWatchdog, stopRecording, runFind, showNotice]);
+    return () => { disposed = true; clearTimeout(readyTimer); unsubscribe(); };
+  }, [label, armWatchdog, clearWatchdog, stopRecording, changeRecording, runFind, showNotice]);
+
+  // A delayed hide must finish before a later show/bounds restoration.
+  const queueGeometry = useCallback((update: () => Promise<void>) => {
+    const epoch = operationsEpoch.current;
+    const live = () => nativeLabel.current === label && operationsEpoch.current === epoch;
+    geometryQueue.current = geometryQueue.current.then(async () => {
+      if (live()) await update();
+    }).catch(() => {
+      if (live()) { shownRef.current = false; boundsRef.current = null; }
+    });
+  }, [label]);
 
   const wantShowRef = useRef(false);
   const bgRef = useRef<Rgba | undefined>(undefined);
   const syncBounds = useCallback(() => {
     const el = hostRef.current;
     if (!el || !openedRef.current) return;
+    if (!wantShowRef.current) {
+      if (shownRef.current) {
+        shownRef.current = false;
+        queueGeometry(() => browserSetVisible(label, false));
+      }
+      return;
+    }
     const rect = el.getBoundingClientRect();
     // An overlay view (search/settings/inbox) or an inactive workspace tab
     // hides the host: a zero rect, or an ancestor marked hidden/inert. The
@@ -552,10 +658,10 @@ export function BrowserView({
       !rect.width ||
       !rect.height ||
       !!el.closest("[aria-hidden='true'], [inert], .hidden");
-    if (covered || !wantShowRef.current) {
+    if (covered) {
       if (shownRef.current) {
         shownRef.current = false;
-        void browserSetVisible(label, false).catch(() => undefined);
+        queueGeometry(() => browserSetVisible(label, false));
       }
       return;
     }
@@ -564,7 +670,7 @@ export function BrowserView({
       // The "hidden" view was parked offscreen, so the real bounds must be
       // re-sent even when they match the last visible frame.
       boundsRef.current = null;
-      void browserSetVisible(label, true).catch(() => undefined);
+      queueGeometry(() => browserSetVisible(label, true));
     }
     const next = {
       x: rect.x,
@@ -582,8 +688,8 @@ export function BrowserView({
     )
       return;
     boundsRef.current = next;
-    void browserSetBounds(label, next).catch(() => undefined);
-  }, [label]);
+    queueGeometry(() => browserSetBounds(label, next));
+  }, [label, queueGeometry]);
 
   // Lazily create the webview the first time the tab is on screen with a
   // URL. A dep change or StrictMode remount can land while the native call
@@ -678,6 +784,7 @@ export function BrowserView({
   // the match has to descend, not just test top-level children. Scans are
   // rAF-coalesced and skipped entirely until a webview exists.
   useEffect(() => {
+    if (!opened || !active || occluded || !documentVisible) return;
     const OVERLAY =
       '[role="dialog"], [role="menu"], [data-explorer-menu], [data-popover-side], [data-app-overlay]';
     let queued = 0;
@@ -722,7 +829,7 @@ export function BrowserView({
       observer.disconnect();
       if (queued) cancelAnimationFrame(queued);
     };
-  }, []);
+  }, [opened, active, occluded, documentVisible]);
 
   // Theme flips rewrite the document's class and inline custom props —
   // keep the webview's swap-flash color in step with the pane behind it.
@@ -747,6 +854,7 @@ export function BrowserView({
   // window bounds, and a slow poll covers shifts that resize neither (e.g.
   // the sidebar toggling under a fixed-size pane).
   useEffect(() => {
+    if (!opened || !active || occluded || overlayOpen || !documentVisible) return;
     const el = hostRef.current;
     if (!el) return;
     const observer = new ResizeObserver(syncBounds);
@@ -758,23 +866,23 @@ export function BrowserView({
       window.removeEventListener("resize", syncBounds);
       window.clearInterval(interval);
     };
-  }, [syncBounds]);
+  }, [syncBounds, opened, active, occluded, overlayOpen, documentVisible]);
 
   const expanded = !!file.browser.expanded;
   const wantShow =
-    opened && active && !overlayOpen && status !== "failed" && !occluded;
+    opened && active && documentVisible && !overlayOpen && status !== "failed" && !occluded;
   wantShowRef.current = wantShow;
   useEffect(() => {
     if (!opened) return;
     if (!wantShow) {
       if (shownRef.current) {
         shownRef.current = false;
-        void browserSetVisible(label, false).catch(() => undefined);
+        queueGeometry(() => browserSetVisible(label, false));
       }
       return;
     }
     syncBounds();
-  }, [wantShow, opened, label, syncBounds]);
+  }, [wantShow, opened, label, syncBounds, queueGeometry]);
 
   const navigate = useCallback(
     (input: string) => {
@@ -821,32 +929,37 @@ export function BrowserView({
     (includeSteps = false) => {
       if (capturing) return;
       setCapturing(true);
+      const owner = ++captureOwner.current;
+      const captureCwd = cwdRef.current;
       void (async () => {
         try {
+          // Explicit capture flushes any pending document continuation even
+          // during the page-notification cooldown. It cannot start recording.
+          if (includeSteps && recordingDesired.current) {
+            await changeRecording(true, true);
+            if (owner !== captureOwner.current) return;
+          }
           const capture = await browserCapture(label);
+          if (owner !== captureOwner.current) return;
           if (includeSteps && !capture.steps.length) {
             showNotice("No steps recorded — press the record button first");
             return;
           }
           const context = browserAgentContext(
             capture,
-            cwdRef.current,
+            captureCwd,
             includeSteps,
           );
-          requestAgentContext({
-            context,
-            cwd: cwdRef.current,
-            attachmentsOptional: true,
-          });
+          setCaptureContext(context);
           if (capture.detail) showNotice(capture.detail);
         } catch (error) {
-          noticeError(error);
+          if (owner === captureOwner.current) noticeError(error);
         } finally {
-          setCapturing(false);
+          if (owner === captureOwner.current) setCapturing(false);
         }
       })();
     },
-    [capturing, label, showNotice, noticeError],
+    [capturing, label, showNotice, noticeError, changeRecording],
   );
 
   const wsl = wslLocation(file.cwd);
@@ -912,6 +1025,7 @@ export function BrowserView({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
+      {captureContext ? <BrowserContextPicker context={captureContext} sessions={sessions} onClose={() => setCaptureContext(null)} /> : null}
       {showChrome ? (
         <div
           className="flex h-9 shrink-0 items-center gap-1 border-b border-content/10 bg-content/2 px-1.5"
@@ -958,7 +1072,7 @@ export function BrowserView({
           {wsl ? (
             <span
               className="shrink-0 rounded-md bg-content/8 px-1.5 py-0.5 text-[10px] font-medium text-content/60"
-              title={`Runs against ${file.cwd}`}
+              title={`Repository: ${file.cwd}. Browser runs on the native host.`}
             >
               WSL · {wsl.distribution}
             </span>
@@ -971,7 +1085,7 @@ export function BrowserView({
             <Camera className="size-3.5" strokeWidth={1.75} />
           </ToolbarButton>
           <ToolbarButton
-            title={recording ? "Stop recording steps" : "Record steps to reproduce"}
+            title={recordingPending && recordingDesired.current ? "Cancel recording start" : recording ? "Stop recording steps" : "Record steps to reproduce"}
             disabled={!opened}
             pressed={recording}
             onClick={toggleRecording}

@@ -5,31 +5,6 @@ export function queuedHead(session: Session): QueuedMessage | undefined {
   return session.queuedMessages?.[0];
 }
 
-/** Automatic and explicit queued sends must preserve the same turn intent. */
-export function queuedMessageOptions(message: QueuedMessage) {
-  return {
-    queuedMessageId: message.id,
-    noteCard: message.noteCard,
-    handoffCard: message.handoffCard,
-    intent: message.intent,
-    action: message.action,
-  };
-}
-
-/** Recover a follow-up without declaring the still-running provider turn failed. */
-export function retainQueuedFollowUp(
-  session: Session,
-  message: QueuedMessage,
-  unsentBlockId?: string,
-): Session {
-  return {
-    ...session,
-    ...(unsentBlockId ? { blocks: session.blocks.filter((block) => block.id !== unsentBlockId) } : {}),
-    queuedMessages: [...(session.queuedMessages ?? []).filter((row) => row.id !== message.id), message],
-    queueStatus: message.deliveryError || session.queueStatus === "paused" ? "paused" : "active",
-  };
-}
-
 /** Hold auto-dispatch only while the item about to send is being edited. */
 export function isEditingQueuedHead(session: Session): boolean {
   const head = queuedHead(session);
@@ -58,8 +33,8 @@ export function dequeueQueuedMessage(
  * True when the idle session can send its queued head as a new turn.
  * Busy / paused / resuming / preparing-handoff / editing-the-head all wait.
  */
-export function canDispatchQueuedHead(session: Session, checkingRepair = false): boolean {
-  if (session.busy || checkingRepair) return false;
+export function canDispatchQueuedHead(session: Session): boolean {
+  if (session.busy) return false;
   if (session.queueStatus === "paused" || session.queueStatus === "resuming") {
     return false;
   }
@@ -80,9 +55,7 @@ export function queuedMessageForSubmit(
     (entry) => entry.id === messageId,
   );
   if (!message) return undefined;
-  if (mode === "steer") {
-    return message.repair || (session.busy && message.intent === "plan") ? undefined : message;
-  }
+  if (mode === "steer") return message;
   if (queuedHead(session)?.id !== messageId) return undefined;
   if (!canDispatchQueuedHead(session)) return undefined;
   return message;

@@ -9,9 +9,9 @@ import {
   type InboxItem,
 } from "./githubTasks";
 import {
-  inboxRelatedSessionCounts,
-  removeSessionWorkItem,
-  addSessionWorkItems,
+  indexByWorkItem,
+  bindLinkedWorkItemAccount,
+  relatedFromIndex,
   sessionWorkItems,
   inboxItemMatchesLinkedWorkItem,
   linkedWorkItemInboxKey,
@@ -157,6 +157,7 @@ describe("session work items", () => {
         kind: "linear",
         number: 12,
         repo: "",
+        url: "https://linear.app/team/issue/ENG-12",
       } as InboxItem),
     ).toBeNull();
   });
@@ -203,35 +204,33 @@ describe("session work items", () => {
   });
 });
 
-it("keeps account-less and identified links distinct", () => {
-  const first = { kind: "issue" as const, repo: "a/b", number: 8, url: "https://github.com/a/b/issues/8" };
-  const session = { linkedWorkItem: first };
-  const next = addSessionWorkItems(session, [{ ...first, account: "alice" }, { ...first, number: 13, url: "https://github.com/a/b/issues/13", account: "alice" }]);
-  expect(sessionWorkItems(next)).toHaveLength(3);
-  expect(next.linkedWorkItem.account).toBeUndefined();
-  expect(relatedSessionsForInboxItem({ provider: "github", kind: "issue", repo: "a/b", number: 13, account: "alice" } as InboxItem, [next])).toEqual([next]);
-  expect(sessionWorkItems(addSessionWorkItems(next, [{ ...first, account: "bob" }]))).toHaveLength(4);
-  const removed = removeSessionWorkItem(next, first);
-  expect(sessionWorkItems(removed).map(link => link.number)).toEqual([8, 13]);
-  expect(sessionWorkItems(removeSessionWorkItem(removed, sessionWorkItems(removed)[0]))).toHaveLength(1);
-});
-
-it("bounds the combined snapshot size after twenty incremental links", () => {
-  let session: { linkedWorkItem?: import("./session").LinkedWorkItem } = {};
-  for (let number = 1; number <= 20; number++) {
-    session = addSessionWorkItems(session, [{kind: "issue", repo: "a/b", number, url: `https://github.com/a/b/issues/${number}`, context: "x".repeat(32_000)}]);
-  }
-  const links = sessionWorkItems(session);
-  expect(links).toHaveLength(20);
-  expect(links.reduce((sum, link) => sum + (link.context?.length ?? 0), 0)).toBeLessThanOrEqual(32_000);
-  expect(links.every(link => link.context?.includes("Snapshot truncated"))).toBe(true);
-});
-
 it("indexes related counts without changing account and legacy matching", () => {
   const items = Array.from({ length: 100 }, (_, number) => ({ provider: "github", kind: "issue", repo: "a/b", number, url: `https://github.com/a/b/issues/${number}`, account: number % 2 ? "alice" : "bob" }) as InboxItem);
   const sessions = Array.from({ length: 100 }, (_, i) => ({ linkedWorkItem: {
     kind: "issue" as const, repo: "a/b", number: i % 50, url: `https://github.com/a/b/issues/${i % 50}`, account: i % 3 ? "alice" : undefined,
   } }));
-  const counts = inboxRelatedSessionCounts(items, sessions);
-  for (const item of items) expect(counts.get(item)).toBe(relatedSessionsForInboxItem(item, sessions).length);
+  const index = indexByWorkItem(sessions, sessionWorkItems);
+  for (const item of items) expect(relatedFromIndex(item, index).length).toBe(relatedSessionsForInboxItem(item, sessions).length);
+});
+
+
+it.each(["jira", "azure"] as const)("requires explicit account binding for legacy %s links in both matching paths", provider => {
+  const linked = { provider, kind: "issue" as const, number: 7, repo: "", url: "https://example.test/items/7" };
+  const item = { ...linked, account: "chosen" } as InboxItem;
+  const session = { linkedWorkItem: linked };
+  expect(inboxItemMatchesLinkedWorkItem(item, linked)).toBe(false);
+  expect(relatedFromIndex(item, indexByWorkItem([session], sessionWorkItems))).toEqual([]);
+  const bound = bindLinkedWorkItemAccount(linked, linked, "chosen", "https://example.test");
+  expect(bound).toMatchObject({ ...linked, account: "chosen", site: "https://example.test" });
+  expect(inboxItemMatchesLinkedWorkItem(item, bound)).toBe(true);
+  expect(bindLinkedWorkItemAccount(bound, linked, "another", "https://example.test")).toBe(bound);
+});
+
+it("rebinds only the chosen legacy link and retains saved context and other links", () => {
+  const linked = { provider: "jira" as const, kind: "issue" as const, repo: "", number: 7, url: "https://example.test/items/7", context: "saved description" };
+  const root = { kind: "issue" as const, repo: "org/repo", number: 1, url: "https://github.com/org/repo/issues/1", additionalItems: [linked] };
+  const bound = bindLinkedWorkItemAccount(root, linked, "chosen", "https://example.test");
+  expect(bound).toMatchObject({ ...root, additionalItems: [{ ...linked, account: "chosen", site: "https://example.test" }] });
+  expect(root.additionalItems[0]).toBe(linked);
+  expect(bindLinkedWorkItemAccount(root, { ...linked, url: "https://example.test/items/8" }, "chosen", "https://example.test")).toBe(root);
 });

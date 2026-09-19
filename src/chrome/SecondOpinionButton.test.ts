@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../lib/harness/availability", () => ({
   getHarnessAvailabilitySnapshot: () => 0,
   hasProbedHarnessAvailability: () => true,
-  isHarnessAvailable: (harness: string) => harness === "grok",
+  isHarnessAvailable: (harness: string) => harness === "grok" || harness === "codex",
   probeHarnessAvailability: () => Promise.resolve(),
   subscribeHarnessAvailability: () => () => undefined,
 }));
@@ -67,6 +67,21 @@ function hover(element: Element) {
 }
 
 describe("secondary model target picker", () => {
+  it("opens WSL-only models by clicking the provider without a hover", () => {
+    const cwd = "//wsl.localhost/Ubuntu/home/dev/repo";
+    setHarnessModels("codex", [{ id: "codex:guest", harness: "codex", name: "Guest review" }], cwd);
+    const onPick = vi.fn();
+    act(() => root.render(createElement(SecondOpinionButton, { cwd, from: "cursor", onPick })));
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="Second opinion"]')!.click());
+    const provider = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find(row => row.textContent?.includes("Codex"))!;
+    act(() => provider.click());
+    const model = document.querySelector<HTMLButtonElement>('[aria-label="Codex models"] [role="menuitem"]');
+    expect(model?.textContent).toContain("Guest review");
+    act(() => model!.click());
+    expect(onPick).toHaveBeenCalledWith({ harness: "codex", model: "codex:guest", modelSettings: {} });
+  });
+
   it("opens effort beside a hovered model and selects both atomically", () => {
     const onPick = vi.fn();
     act(() =>

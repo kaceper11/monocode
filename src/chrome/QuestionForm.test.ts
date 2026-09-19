@@ -1,83 +1,138 @@
 // @vitest-environment happy-dom
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QuestionForm } from "./QuestionForm";
+import type {
+  UserQuestionPrompt,
+  UserQuestionReply,
+} from "../lib/userQuestion";
 
-Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
-let root: Root | undefined;
-afterEach(async () => {
-  await act(async () => root?.unmount());
-  root = undefined;
+let container: HTMLDivElement;
+let root: Root;
+
+beforeEach(() => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
 });
 
-async function mount(allowCustom: boolean, error?: string) {
-  const host = document.createElement("div");
-  const onReply = vi.fn();
-  root = createRoot(host);
-  await act(async () => root!.render(createElement(QuestionForm, {
-    prompt: {
-      requestId: 7, error,
-      questions: [{ id: "q", prompt: "Pick an option", multiSelect: false, allowCustom, options: [{ id: "other-id", label: "Other" }] }],
-    },
-    onReply,
-  })));
-  const other = [...host.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Other"))!;
-  await act(async () => other.click());
-  return { host, onReply };
+afterEach(() => {
+  act(() => root.unmount());
+  container.remove();
+  vi.unstubAllGlobals();
+});
+
+function prompt(multiSelect = false): UserQuestionPrompt {
+  return {
+    requestId: 7,
+    questions: [
+      {
+        id: "colour",
+        prompt: "Pick a colour",
+        multiSelect,
+        allowCustom: false,
+        options: [
+          { id: "red", label: "Red" },
+          { id: "green", label: "Green" },
+          { id: "blue", label: "Blue" },
+        ],
+      },
+    ],
+  };
 }
 
-it("submits a provider's Other option without exposing unsupported custom input", async () => {
-  const { host, onReply } = await mount(false, "Choose a supported option");
-  expect(host.querySelector("input")).toBeNull();
-  expect(host.querySelector('[role="alert"]')?.textContent).toBe("Choose a supported option");
-  const submit = host.querySelector<HTMLButtonElement>('[type="submit"]')!;
-  expect(submit.disabled).toBe(false);
-  await act(async () => host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
-  expect(onReply).toHaveBeenCalledWith(7, { kind: "answered", answers: { q: ["other-id"] } });
-});
+function renderQuestion(
+  onReply: (requestId: number, reply: UserQuestionReply) => void = vi.fn(),
+  multiSelect = false,
+) {
+  act(() =>
+    root.render(
+      createElement(QuestionForm, {
+        prompt: prompt(multiSelect),
+        onReply,
+      }),
+    ),
+  );
+  return Array.from(
+    container.querySelectorAll<HTMLButtonElement>("button[aria-pressed]"),
+  );
+}
 
-it("retains the custom input for providers that support it", async () => {
-  const { host } = await mount(true);
-  expect(host.querySelector("input")).not.toBeNull();
-  expect(host.querySelector<HTMLButtonElement>('[type="submit"]')?.disabled).toBe(true);
-});
-
-it.each(["invalid", "skipped"])("lets users correct an earlier %s numeric answer without losing later answers", async (firstAnswer) => {
-  const { acpElicitation, acpElicitationResult } = await import("../lib/harness/acp");
-  const form = acpElicitation({ requestedSchema: { type: "object", required: ["count"], properties: {
-    count: { type: "integer", minimum: 1, title: "Count" },
-    name: { type: "string", title: "Name" },
-  } } })!;
-  const host = document.createElement("div");
-  root = createRoot(host);
-  const onReply = vi.fn();
-  const render = (error?: string) => act(async () => root!.render(createElement(QuestionForm, {
-    prompt: { requestId: 9, questions: form.questions, error }, onReply,
-  })));
-  const submit = () => act(async () => host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
-  const fill = (value: string) => act(async () => {
-    const input = host.querySelector("input")!;
-    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+function keyDown(target: Element, key: string) {
+  act(() => {
+    target.dispatchEvent(
+      new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
+    );
   });
-  await render();
-  if (firstAnswer === "invalid") {
-    await fill("NaN");
-    await submit();
-  } else {
-    await act(async () => [...host.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "Skip")!.click());
-  }
-  await fill("example");
-  await submit();
-  expect(() => acpElicitationResult(onReply.mock.calls[0][1], form.questions, form.fields)).toThrow(firstAnswer === "invalid" ? "Invalid integer" : "Answer the required question");
-  await render(firstAnswer === "invalid" ? "Invalid integer answer for count" : "Answer the required question: count");
-  const back = [...host.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === "Back")!;
-  await act(async () => back.click());
-  expect(host.querySelector("input")!.value).toBe(firstAnswer === "invalid" ? "NaN" : "");
-  await fill("3");
-  await submit();
-  expect(host.querySelector("input")!.value).toBe("example");
-  await submit();
-  expect(acpElicitationResult(onReply.mock.calls.at(-1)![1], form.questions, form.fields)).toEqual({ action: "accept", content: { count: 3, name: "example" } });
+}
+
+describe("QuestionForm keyboard navigation", () => {
+  it("moves the highlighted option with arrow keys and selects it with Enter", () => {
+    const onReply = vi.fn();
+    const options = renderQuestion(onReply);
+
+    expect(options[0].tabIndex).toBe(0);
+    expect(options[1].tabIndex).toBe(-1);
+    act(() => options[0].focus());
+
+    keyDown(options[0], "ArrowDown");
+    expect(document.activeElement).toBe(options[1]);
+    expect(options[1].dataset.highlighted).toBe("true");
+    expect(options[1].tabIndex).toBe(0);
+
+    keyDown(options[1], "Enter");
+    expect(options[1].getAttribute("aria-pressed")).toBe("true");
+
+    act(() =>
+      container
+        .querySelector<HTMLButtonElement>('button[type="submit"]')!
+        .click(),
+    );
+    expect(onReply).toHaveBeenCalledWith(7, {
+      kind: "answered",
+      answers: { colour: ["green"] },
+    });
+  });
+
+  it("wraps arrow navigation and supports Home and End", () => {
+    const options = renderQuestion();
+    act(() => options[0].focus());
+
+    keyDown(options[0], "ArrowUp");
+    expect(document.activeElement).toBe(options[2]);
+
+    keyDown(options[2], "Home");
+    expect(document.activeElement).toBe(options[0]);
+
+    keyDown(options[0], "End");
+    expect(document.activeElement).toBe(options[2]);
+  });
+
+  it("uses number keys to focus and select the matching option", () => {
+    const options = renderQuestion();
+    act(() => options[0].focus());
+
+    keyDown(options[0], "3");
+
+    expect(document.activeElement).toBe(options[2]);
+    expect(options[2].getAttribute("aria-pressed")).toBe("true");
+    expect(options[2].getAttribute("aria-keyshortcuts")).toBe("3");
+  });
+
+  it("toggles highlighted options for multi-select questions", () => {
+    const options = renderQuestion(vi.fn(), true);
+    act(() => options[0].focus());
+
+    keyDown(options[0], "Enter");
+    keyDown(options[0], "ArrowDown");
+    keyDown(options[1], " ");
+
+    expect(options[0].getAttribute("aria-pressed")).toBe("true");
+    expect(options[1].getAttribute("aria-pressed")).toBe("true");
+
+    keyDown(options[1], " ");
+    expect(options[1].getAttribute("aria-pressed")).toBe("false");
+  });
 });

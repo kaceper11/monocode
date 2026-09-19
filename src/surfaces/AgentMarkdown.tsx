@@ -1,4 +1,4 @@
-import { languageFromFileName } from "../lib/editorSelection";
+import { isLocalhostUrl, requestLinkChoice } from "../lib/browser";
 import { code } from "@streamdown/code";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
@@ -28,7 +28,6 @@ import {
 import type { PluggableList } from "unified";
 import { ExplorerMenu, type ExplorerMenuItem } from "../chrome/ExplorerMenu";
 import { FileTypeIcon } from "../chrome/FileTypeIcon";
-import { isHttpUrl, isLocalhostUrl, requestLinkChoice } from "../lib/browser";
 import { createLazyMermaidPlugin } from "./mermaidPlugin";
 import {
   displayPath,
@@ -145,6 +144,22 @@ function fileLinkMenuItems(
   ];
 }
 
+const LANGUAGE_FROM_EXT: Record<string, string> = {
+  sh: "bash",
+  zsh: "bash",
+  py: "python",
+  rb: "ruby",
+  rs: "rust",
+  ts: "typescript",
+  js: "javascript",
+  md: "markdown",
+  yml: "yaml",
+  cs: "csharp",
+  cpp: "cpp",
+  cc: "cpp",
+  cxx: "cpp",
+};
+
 const LANGUAGE_FILE_NAMES: Record<string, string> = {
   bash: "code.sh",
   c: "code.c",
@@ -216,14 +231,9 @@ function MarkdownLink({
           return;
         }
         event.preventDefault();
-        if (href && isHttpUrl(href)) {
+        if (href && /^https?:\/\//i.test(href)) {
           if (isLocalhostUrl(href)) {
-            requestLinkChoice({
-              url: href,
-              x: event.clientX,
-              y: event.clientY,
-              cwd,
-            });
+            requestLinkChoice({ url: href, x: event.clientX, y: event.clientY, cwd });
             return;
           }
           void openUrl(href).catch((error) => {
@@ -440,18 +450,6 @@ const MARKDOWN_COMPONENTS = {
   img: MarkdownImage,
 } satisfies Components;
 
-const TEXT_ONLY_COMPONENTS = { ...MARKDOWN_COMPONENTS, img: () => <span className="text-content/45">[Image — select separately under Images & files]</span> } satisfies Components;
-
-/** User prompts often contain unfenced generics/XML; display those literally. */
-function remarkLiteralHtml() {
-  type Node = { type: string; children?: Node[] };
-  function visit(node: Node) {
-    if (node.type === "html") node.type = "text";
-    for (const child of node.children ?? []) visit(child);
-  }
-  return visit;
-}
-
 export const AgentMarkdown = memo(function AgentMarkdown({
   text,
   streaming,
@@ -459,7 +457,6 @@ export const AgentMarkdown = memo(function AgentMarkdown({
   cwd,
   onOpenFile,
   allowRemoteMedia,
-  textOnly,
 }: {
   text: string;
   streaming?: boolean;
@@ -467,7 +464,6 @@ export const AgentMarkdown = memo(function AgentMarkdown({
   cwd?: string;
   onOpenFile?: OpenFileFn;
   allowRemoteMedia?: boolean;
-  textOnly?: boolean;
 }) {
   const [fileMenu, setFileMenu] = useState<FileLinkMenu | null>(null);
   const onFileContextMenu = useCallback(
@@ -485,10 +481,9 @@ export const AgentMarkdown = memo(function AgentMarkdown({
   const remarkPlugins = useMemo<PluggableList>(
     () => [
       ...Object.values(defaultRemarkPlugins),
-      ...(textOnly ? [remarkLiteralHtml] : []),
       [remarkWorkspaceFileLinks, { cwd }],
     ],
-    [cwd, textOnly],
+    [cwd],
   );
   const remoteMedia = !!allowRemoteMedia;
 
@@ -531,7 +526,7 @@ export const AgentMarkdown = memo(function AgentMarkdown({
         <>
           <Streamdown
             className={`agent-markdown min-w-0 font-sans text-sm leading-6 ${className ?? ""}`}
-            components={textOnly ? TEXT_ONLY_COMPONENTS : MARKDOWN_COMPONENTS}
+            components={MARKDOWN_COMPONENTS}
             controls={false}
             dir="auto"
             isAnimating={!!streaming}
@@ -806,6 +801,16 @@ function MarkdownCodePath({
       {path}
     </button>
   );
+}
+
+function languageFromFileName(fileName: string): string {
+  const lower = fileName.toLowerCase();
+  if (lower === "dockerfile") return "dockerfile";
+  if (lower === "makefile") return "makefile";
+  const ext = lower.includes(".")
+    ? lower.slice(lower.lastIndexOf(".") + 1)
+    : lower;
+  return LANGUAGE_FROM_EXT[ext] ?? ext;
 }
 
 function fileNameForLanguage(language: string): string {

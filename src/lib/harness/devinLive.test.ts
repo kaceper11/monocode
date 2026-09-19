@@ -285,7 +285,7 @@ describe("devin live turn sequence", () => {
       () => events.some((e) => e.type === "approval.requested"),
       "approval.requested",
     );
-    respondDevinApproval("t3", 77, "allow");
+    respondDevinApproval("t3", events.find((e) => e.type === "approval.requested")!.requestId, "allow");
     await waitFor(
       () => parse().some((m) => m.id === 77 && m.result),
       "permission response",
@@ -795,7 +795,7 @@ describe("devin live turn sequence", () => {
       () => events.some((e) => e.type === "approval.requested"),
       "approval.requested",
     );
-    respondDevinApproval("t10", 91, "deny");
+    respondDevinApproval("t10", events.find((e) => e.type === "approval.requested")!.requestId, "deny");
     await waitFor(
       () => parse().some((m) => m.id === 91 && m.result),
       "permission response",
@@ -871,7 +871,7 @@ describe("devin live turn sequence", () => {
       "approval.requested",
     );
     expect(parse().some((m) => m.id === 92)).toBe(false);
-    respondDevinApproval("t11", 92, "allow");
+    respondDevinApproval("t11", events.find((e) => e.type === "approval.requested")!.requestId, "allow");
     await waitFor(
       () => parse().some((m) => m.id === 92 && m.result),
       "permission response",

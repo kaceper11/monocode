@@ -154,6 +154,33 @@ describe("openSessionChangesTab", () => {
 });
 
 describe("openChangesTab", () => {
+  it("keeps Changes and per-file reviews independent across worktrees", () => {
+    const main = openChangesTab(newTab("session-a"), "/repo");
+    const mainReview = newFileTab("/repo/a.ts", "/repo", true);
+    const withReview = openEditorTab(main, mainReview);
+    const worktree = openChangesTab(
+      withReview,
+      "/repo-worktrees/feature",
+      undefined,
+      undefined,
+      "/repo",
+    );
+    const files = worktree.editorPanes.flatMap((pane) => pane.files);
+    expect(files.filter(isChangesTab).map((file) => file.cwd)).toEqual([
+      "/repo",
+      "/repo-worktrees/feature",
+    ]);
+    expect(files).toContainEqual(mainReview);
+    const pane = worktree.editorPanes.find((pane) => pane.id === worktree.focusedId)!;
+    expect(pane.files.find((file) => file.id === pane.activeFileId)).toMatchObject({
+      cwd: "/repo-worktrees/feature",
+      projectCwd: "/repo",
+    });
+    const back = openChangesTab(worktree, "/repo");
+    expect(back.editorPanes.flatMap((pane) => pane.files).filter(isChangesTab)).toHaveLength(2);
+    expect(back.editorPanes[0]?.activeFileId).toBe(main.editorPanes[0]?.activeFileId);
+  });
+
   it("reuses one Changes tab and updates the focused file", () => {
     const cwd = "/repo";
     const first = openChangesTab(
@@ -184,9 +211,9 @@ describe("openChangesTab", () => {
     );
     const next = openChangesTab(withReview, cwd, "/repo/b.ts");
     const files = next.editorPanes[0]?.files ?? [];
-    expect(
-      files.some((file) => editorTabKey(file) === `review:${cwd}/a.ts`),
-    ).toBe(false);
+    expect(files.some((file) => editorTabKey(file) === `review:${cwd}/a.ts`)).toBe(
+      false,
+    );
     expect(files.filter(isChangesTab)).toHaveLength(1);
   });
 
@@ -580,30 +607,4 @@ describe("placePane", () => {
     expect(placePane(tree, "b", "missing", "right")).toBe(tree);
     expect(placePane(tree, "a", "a", "right")).toBe(tree);
   });
-});
-
-it("reuses delivery tabs only for the exact checkout, branch, kind and owner", () => {
-  const file = {
-    id: "pr-1",
-    path: "Pull requests",
-    cwd: "/repo",
-    delivery: {
-      kind: "pr" as const,
-      branch: "feature",
-      sourceSessionId: "owner",
-    },
-  };
-  let tab = openEditorTab(newTab("owner"), file);
-  tab = openEditorTab(tab, { ...file, id: "pr-2" });
-  expect(tab.editorPanes[0].files).toHaveLength(1);
-  expect(isFilesystemTab(file)).toBe(false);
-  for (const variant of [
-    { ...file, cwd: "/other" },
-    { ...file, delivery: { ...file.delivery, branch: "other" } },
-    { ...file, delivery: { ...file.delivery, sourceSessionId: "other" } },
-    { ...file, delivery: { ...file.delivery, kind: "ci" as const } },
-  ]) {
-    tab = openEditorTab(tab, { ...variant, id: crypto.randomUUID() });
-  }
-  expect(tab.editorPanes[0].files).toHaveLength(5);
 });

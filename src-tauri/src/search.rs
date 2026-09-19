@@ -80,8 +80,25 @@ fn git_grep(root: &Path, options: &SearchOptions, query: &str) -> Option<SearchR
     let specs = pathspecs(&options.include, &options.exclude);
     args.extend(specs.iter().map(String::as_str));
     let output = crate::fs::git_command_output(root, &args).ok()?;
-    if !output.status.success() && output.status.code() != Some(1) {
+    // Guest non-repositories use the bridge-backed file scan. Keep native Git
+    // exit handling unchanged from upstream.
+    if crate::wsl::path_location(root).ok().flatten().is_some()
+        && !output.status.success()
+        && output.status.code() != Some(1)
+    {
         return None;
+    }
+    if !output.status.success() && !output.stdout.is_empty() {
+        // git grep exits 1 when there are no matches.
+        if output.status.code() != Some(1) {
+            return None;
+        }
+    }
+    if !output.status.success() && output.stdout.is_empty() {
+        return Some(SearchResult {
+            matches: Vec::new(),
+            truncated: false,
+        });
     }
 
     let root = root.to_path_buf();

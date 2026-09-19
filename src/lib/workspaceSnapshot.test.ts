@@ -151,6 +151,8 @@ describe("project return snapshots", () => {
 describe("collectWorkspaceSnapshot", () => {
   it("stores tabs, stubs, and the focused tab — not transcripts", () => {
     const session = chat("s1", "/tmp/a");
+    session.worktreeCwd = "/tmp/a-worktrees/feature";
+    session.worktreeRemoved = true;
     session.blocks.push({ id: "a1", role: "assistant", text: "hi" });
     const file = newFileTab("/tmp/a/README.md", "/tmp/a");
     const tab = {
@@ -174,6 +176,8 @@ describe("collectWorkspaceSnapshot", () => {
         id: "s1",
         cwd: "/tmp/a",
         providerSessionId: "p1",
+        worktreeCwd: "/tmp/a-worktrees/feature",
+        worktreeRemoved: true,
       }),
     ]);
     expect("blocks" in snapshot.sessions[0]!).toBe(false);
@@ -266,6 +270,27 @@ describe("collectWorkspaceSnapshot", () => {
     expect(restored?.path).toBe("/tmp/a/src/lib.rs");
   });
 
+  it("preserves a worktree editor's execution directory and owning project", () => {
+    const file = newFileTab(
+      "/repo-worktrees/feature/readme.md",
+      "/repo-worktrees/feature",
+      false,
+      undefined,
+      "/repo",
+    );
+    const tab = {
+      ...newTab("editor"),
+      editorPanes: [{ id: "editor", files: [file], activeFileId: file.id }],
+    };
+    const snapshot = collectWorkspaceSnapshot([tab], [], tab.id, "/repo", new Map());
+    const restored = hydrateWorkspaceSnapshot(snapshot, new Map())?.tabs[0]
+      ?.editorPanes[0]?.files[0];
+    expect(restored).toMatchObject({
+      cwd: "/repo-worktrees/feature",
+      projectCwd: "/repo",
+    });
+  });
+
   it("round-trips a commit review tab", () => {
     const file = newCommitTab("/tmp/a", {
       sha: "abc1234deadbeef",
@@ -329,142 +354,6 @@ describe("collectWorkspaceSnapshot", () => {
       }),
     ]);
     expect(snapshot.projectTerminals[0]?.pane.files[0]?.id).toBe(term.id);
-  });
-
-  it("round-trips a bound command so a restart never re-runs it", () => {
-    const term = {
-      ...newTerminalFile("/tmp/a", "Dev"),
-      command: {
-        presetId: "c1",
-        name: "Dev",
-        text: "npm run dev",
-        runId: 2,
-        launched: 2,
-      },
-    };
-    const dock = createProjectTerminal("/tmp/a", term);
-    const snapshot = collectWorkspaceSnapshot(
-      [{ ...newTab("s1"), id: "t1" }],
-      [],
-      "t1",
-      "/tmp/a",
-      new Map(),
-      [dock],
-    );
-    const restored = hydrateWorkspaceSnapshot(
-      parseWorkspaceSnapshot(snapshot)!,
-      new Map(),
-    );
-    const file = restored?.projectTerminals?.[0]?.pane.files[0];
-    expect(file?.command).toEqual({
-      presetId: "c1",
-      name: "Dev",
-      text: "npm run dev",
-      runId: 2,
-      launched: 2,
-    });
-    // `launched` >= `runId`: the command stays a record, never a re-run.
-    expect((file!.command!.launched ?? 0) >= file!.command!.runId).toBe(true);
-  });
-
-  it("round-trips a steps command with its progress and failure marker", () => {
-    const term = {
-      ...newTerminalFile("/tmp/a", "Maintenance"),
-      command: {
-        presetId: "c1",
-        name: "Maintenance",
-        text: "docker system prune -f\nwsl --shutdown",
-        steps: [
-          { command: "docker system prune -f" },
-          { command: "wsl --shutdown", host: "native" as const },
-        ],
-        runId: 3,
-        failed: 3,
-        launched: 3,
-        step: { runId: 3, done: 1 },
-      },
-    };
-    const dock = createProjectTerminal("/tmp/a", term);
-    const snapshot = collectWorkspaceSnapshot(
-      [{ ...newTab("s1"), id: "t1" }],
-      [],
-      "t1",
-      "/tmp/a",
-      new Map(),
-      [dock],
-    );
-    const restored = hydrateWorkspaceSnapshot(
-      parseWorkspaceSnapshot(snapshot)!,
-      new Map(),
-    );
-    const file = restored?.projectTerminals?.[0]?.pane.files[0];
-    expect(file?.command).toEqual({
-      presetId: "c1",
-      name: "Maintenance",
-      text: "docker system prune -f\nwsl --shutdown",
-      steps: [
-        { command: "docker system prune -f" },
-        { command: "wsl --shutdown", host: "native" },
-      ],
-      runId: 3,
-      failed: 3,
-      launched: 3,
-      step: { runId: 3, done: 1 },
-    });
-  });
-
-  it("drops step progress that does not belong to the stored run", () => {
-    const term = {
-      ...newTerminalFile("/tmp/a", "Maintenance"),
-      command: {
-        name: "Maintenance",
-        text: "a\nb",
-        steps: [{ command: "a" }, { command: "b" }],
-        runId: 2,
-        // Stale progress from an older run — restoring it would resume at
-        // the wrong step.
-        step: { runId: 1, done: 2 },
-      },
-    };
-    const dock = createProjectTerminal("/tmp/a", term);
-    const snapshot = collectWorkspaceSnapshot(
-      [{ ...newTab("s1"), id: "t1" }],
-      [],
-      "t1",
-      "/tmp/a",
-      new Map(),
-      [dock],
-    );
-    const restored = hydrateWorkspaceSnapshot(
-      parseWorkspaceSnapshot(snapshot)!,
-      new Map(),
-    );
-    const file = restored?.projectTerminals?.[0]?.pane.files[0];
-    expect(file?.command?.steps).toHaveLength(2);
-    expect(file?.command?.step).toBeUndefined();
-  });
-
-  it("drops a malformed bound command but keeps the terminal", () => {
-    const term = {
-      ...newTerminalFile("/tmp/a", "Dev"),
-      command: { name: "Dev" }, // no text/runId
-    };
-    const dock = createProjectTerminal("/tmp/a", term);
-    const snapshot = collectWorkspaceSnapshot(
-      [{ ...newTab("s1"), id: "t1" }],
-      [],
-      "t1",
-      "/tmp/a",
-      new Map(),
-      [dock],
-    );
-    const restored = hydrateWorkspaceSnapshot(
-      parseWorkspaceSnapshot(snapshot)!,
-      new Map(),
-    );
-    const file = restored?.projectTerminals?.[0]?.pane.files[0];
-    expect(file?.terminal).toBe(true);
-    expect(file?.command).toBeUndefined();
   });
 });
 
@@ -683,161 +572,57 @@ describe("hydrateWorkspaceSnapshot", () => {
   });
 });
 
-it("restores main and two worktree conversations without rebinding their owners", () => {
-  const paths = ["/repo", "/repo-child ż", "/repo-other"];
-  const sessions = paths.map((cwd, index) => ({
-    ...chat(`copy-${index}`, index === 0 ? cwd : "/repo"),
-    worktreeCwd: index === 0 ? undefined : cwd,
-    providerSessionId: `provider-${index}`,
-  }));
-  const tabs = sessions.map((session, index) => ({
+it("restores browser tabs, drops retired delivery tabs and preserves WSL sessions", () => {
+  const cwd = "//wsl.localhost/Ubuntu/home/user/project";
+  const session = chat("wsl-session", cwd);
+  session.worktreeCwd = `${cwd}-worktree`;
+  const file = { ...newFileTab(`${cwd}/README.md`, cwd), id: "file" };
+  const tab = { ...newTab(session.id), editorPanes: [{ id: "editor", files: [file], activeFileId: file.id }] };
+  const snapshot = collectWorkspaceSnapshot([tab], [session], tab.id, cwd, new Map());
+  const pane = snapshot.tabs.find(t => t.editorPanes.length)?.editorPanes[0];
+  expect(pane).toBeDefined();
+  pane!.files.push({ id: "browser", path: "browser://1", cwd, browser: { url: "http://localhost:3000" } } as never);
+  pane!.files.push({ id: "delivery", path: "delivery://1", cwd, delivery: { kind: "pr" } } as never);
+  const parsed = parseWorkspaceSnapshot(snapshot)!;
+  expect(parsed.tabs.flatMap(t => t.editorPanes.flatMap(p => p.files)).map(f => f.id)).toEqual(["file", "browser"]);
+  const restored = hydrateWorkspaceSnapshot(parsed, new Map([[session.id, session]]));
+  expect(restored?.sessions[0]?.worktreeCwd).toBe(`${cwd}-worktree`);
+});
+
+it("removes a retired delivery-only pane without losing the saved browser and conversation", () => {
+  const cwd = "//wsl.localhost/Ubuntu/home/user/project";
+  const session = chat("saved-chat", cwd);
+  const browser = { id: "page", path: "https://example.com", cwd, browser: { url: "https://example.com", title: "Saved page", persist: false, expanded: true } };
+  const tab = {
     ...newTab(session.id),
-    id: `tab-${index}`,
-  }));
-  const before = JSON.stringify(sessions);
-  for (let selected = 0; selected < paths.length; selected++) {
-    const snapshot = collectWorkspaceSnapshot(
-      tabs,
-      sessions,
-      tabs[selected].id,
-      paths[selected],
-      new Map(),
-    );
-    const parsed = parseWorkspaceSnapshot(JSON.parse(JSON.stringify(snapshot)));
-    expect(parsed).not.toBeNull();
-    const restored = hydrateWorkspaceSnapshot(
-      parsed!,
-      new Map(sessions.map((s) => [s.id, s])),
-    );
-    expect(restored?.projectCwd).toBe(paths[selected]);
-    expect(restored?.activeTabId).toBe(tabs[selected].id);
-    expect(
-      restored?.sessions.map((s) => [
-        s.id,
-        s.worktreeCwd ?? s.cwd,
-        s.providerSessionId,
-      ]),
-    ).toEqual(
-      paths.map((path, index) => [`copy-${index}`, path, `provider-${index}`]),
-    );
-    expect(restored?.tabs).toHaveLength(3);
-  }
-  expect(JSON.stringify(sessions)).toBe(before);
-});
+    layout: splitPane(splitPane(leaf(session.id), session.id, "right", "browser-pane"), "browser-pane", "down", "retired-pane"),
+    focusedId: "retired-pane",
+    editorPanes: [
+      { id: "browser-pane", activeFileId: browser.id, files: [browser] },
+      { id: "retired-pane", activeFileId: "delivery", files: [{ id: "delivery", path: "delivery://1", cwd, delivery: { kind: "pr", branch: "feature" } }] },
+    ],
+  };
+  const raw = { tabs: [tab], sessions: [session], activeTabId: tab.id, projectCwd: cwd };
+  const original = JSON.stringify(raw);
+  const parsed = parseWorkspaceSnapshot(raw);
+  expect(parsed).not.toBeNull();
+  const restored = hydrateWorkspaceSnapshot(parsed!, new Map([[session.id, session]]));
+  expect(leafIds(restored!.tabs[0].layout)).toEqual([session.id, "browser-pane"]);
+  expect(restored!.tabs[0].focusedId).toBe("browser-pane");
+  expect(restored!.tabs[0].editorPanes).toEqual([tab.editorPanes[0]]);
+  expect(restored!.sessions[0].blocks).toEqual(session.blocks);
+  expect(JSON.stringify(raw)).toBe(original);
 
-it("restores delivery scope without treating it as an editable file", () => {
-  const file = {
-    id: "pr-1",
-    path: "Pull requests",
-    cwd: "/repo",
-    delivery: {
-      kind: "pr" as const,
-      branch: "feature",
-      sourceSessionId: "owner",
-    },
-  };
-  const tab = {
-    ...newTab("owner"),
-    id: "t1",
-    editorPanes: [{ id: "e1", files: [file], activeFileId: file.id }],
-  };
-  const snapshot = collectWorkspaceSnapshot([tab], [], "t1", "/repo", new Map());
-  const restored = hydrateWorkspaceSnapshot(snapshot, new Map())?.tabs[0]
-    ?.editorPanes[0]?.files[0];
-  expect(restored).toEqual(file);
-  for (const bad of [
-    { ...file, delivery: { ...file.delivery, kind: "shell" } },
-    { ...file, terminal: true },
+  // Retired tabs do not make a malformed current tab safe to restore.
+  for (const invalid of [
+    { delivery: undefined }, { delivery: null }, { delivery: { kind: "pr" } },
+    { delivery: { kind: "unknown", branch: "feature" } },
+    { delivery: { kind: "pr", branch: "feature", provider: "github" } },
+    { terminal: true }, { id: "" },
   ]) {
-    const invalid = {
-      ...snapshot,
-      tabs: [
-        {
-          ...tab,
-          editorPanes: [{ id: "e1", files: [bad], activeFileId: bad.id }],
-        },
-      ],
-    };
-    expect(
-      parseWorkspaceSnapshot(invalid)?.tabs[0]?.editorPanes?.[0]?.files?.[0],
-    ).toBeUndefined();
-  }
-});
-
-it("keeps only delivery tabs whose provider identity can render", () => {
-  const file = {
-    id: "gl-1",
-    path: "Pull requests",
-    cwd: "/repo",
-    delivery: {
-      kind: "pr" as const,
-      branch: "feature",
-      provider: "gitlab" as const,
-      repo: "acme/web",
-      number: 7,
-    },
-  };
-  const tab = {
-    ...newTab("owner"),
-    id: "t1",
-    editorPanes: [{ id: "e1", files: [file], activeFileId: file.id }],
-  };
-  const snapshot = collectWorkspaceSnapshot([tab], [], "t1", "/repo", new Map());
-  // A well-formed GitLab delivery tab round-trips.
-  expect(
-    parseWorkspaceSnapshot(snapshot)?.tabs[0]?.editorPanes?.[0]?.files?.[0]
-      ?.delivery,
-  ).toEqual(file.delivery);
-  // A GitHub delivery tab with its PR identity round-trips too.
-  const githubFile = {
-    ...file,
-    delivery: { ...file.delivery, provider: "github" as const },
-  };
-  const githubSnapshot = collectWorkspaceSnapshot(
-    [{ ...tab, editorPanes: [{ id: "e1", files: [githubFile], activeFileId: githubFile.id }] }],
-    [],
-    "t1",
-    "/repo",
-    new Map(),
-  );
-  expect(
-    parseWorkspaceSnapshot(githubSnapshot)?.tabs[0]?.editorPanes?.[0]
-      ?.files?.[0]?.delivery,
-  ).toEqual(githubFile.delivery);
-  for (const bad of [
-    // A GitLab tab missing its MR identity cannot render its MR.
-    {
-      ...file,
-      delivery: {
-        kind: "pr",
-        branch: "feature",
-        provider: "gitlab",
-        number: 7,
-      },
-    },
-    {
-      ...file,
-      delivery: {
-        kind: "pr",
-        branch: "feature",
-        provider: "gitlab",
-        repo: "acme/web",
-      },
-    },
-    { ...file, delivery: { ...file.delivery, repo: "  " } },
-    { ...file, delivery: { ...file.delivery, number: 0 } },
-  ]) {
-    const invalid = {
-      ...snapshot,
-      tabs: [
-        {
-          ...tab,
-          editorPanes: [{ id: "e1", files: [bad], activeFileId: bad.id }],
-        },
-      ],
-    };
-    expect(
-      parseWorkspaceSnapshot(invalid)?.tabs[0]?.editorPanes?.[0]?.files?.[0],
-    ).toBeUndefined();
+    const pane = tab.editorPanes[1];
+    expect(parseWorkspaceSnapshot({ ...raw, tabs: [{ ...tab, editorPanes: [
+      tab.editorPanes[0], { ...pane, files: [{ ...pane.files[0], ...invalid }] },
+    ] }] })).toBeNull();
   }
 });

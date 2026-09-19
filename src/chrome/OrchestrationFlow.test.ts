@@ -169,7 +169,7 @@ async function input(
 describe("orchestration composer and card", () => {
   it("toggles a badge through the plus menu and submits without a team setup or execution", async () => {
     const model = modelsFor("codex")[0];
-    const submit = vi.fn().mockResolvedValue(true);
+    const submit = vi.fn();
     await act(async () =>
       root.render(
         createElement(Composer, {
@@ -924,7 +924,7 @@ describe("orchestration composer and card", () => {
     );
 
     expect(container.textContent).toContain(
-      "Interrupted tasks stay stopped for the lead to review.",
+      "Resume continues interrupted workers from their retained checkouts",
     );
     expect(container.textContent).toContain(
       "Investigating the failure is still running in this project.",

@@ -33,13 +33,14 @@ export type SessionSummary = {
   orchestration?: OrchestrationSummary;
   id: string;
   cwd: string;
-  worktreeCwd?: string;
   harness: HarnessId;
   model: string;
   runtimeMode: RuntimeMode;
   title: string;
   providerSessionId?: string;
   branch?: string;
+  worktreeCwd?: string;
+  worktreeRemoved?: boolean;
   repo?: string;
   additions?: number;
   deletions?: number;
@@ -47,6 +48,7 @@ export type SessionSummary = {
   updatedAt: number;
   archived?: boolean;
   pinned?: boolean;
+  draft?: boolean;
   linkedWorkItem?: LinkedWorkItem;
 };
 
@@ -66,6 +68,7 @@ type SessionRecord = {
   contextWindow?: number | null;
   branch?: string | null;
   worktreeCwd?: string | null;
+  worktreeRemoved?: boolean;
   linkedWorkItem?: LinkedWorkItem | null;
   createdAt: number;
   updatedAt: number;
@@ -86,6 +89,7 @@ type SessionUpsertPayload = {
   contextWindow?: number;
   branch?: string;
   worktreeCwd?: string;
+  worktreeRemoved?: boolean;
   linkedWorkItem?: LinkedWorkItem;
 };
 
@@ -94,7 +98,7 @@ export function shouldPersistSession(session: Session): boolean {
   return (
     !session.inboxAsk &&
     session.cwd !== "~" &&
-    (!!session.linkedWorkItem || session.blocks.some((block) => block.role === "user"))
+    session.blocks.some((block) => block.role === "user")
   );
 }
 
@@ -127,6 +131,7 @@ function persistableMeta(
       : {}),
     ...(session.branch ? { branch: session.branch } : {}),
     ...(session.worktreeCwd ? { worktreeCwd: session.worktreeCwd } : {}),
+    ...(session.worktreeRemoved ? { worktreeRemoved: true } : {}),
     ...(linkedWorkItem ? { linkedWorkItem } : {}),
   };
 }
@@ -224,9 +229,8 @@ function enqueueSessionWrite<T>(
 
 export async function upsertSession(
   session: Session,
-  options?: { allowEmpty?: boolean },
 ): Promise<SessionSummary | null> {
-  if ((!options?.allowEmpty && !shouldPersistSession(session)) || deletedSessionIds.has(session.id)) {
+  if (!shouldPersistSession(session) || deletedSessionIds.has(session.id)) {
     return null;
   }
   const payload = sanitizeSessionForPersist(session);
@@ -386,6 +390,11 @@ export async function setSessionPinned(
   await invoke<void>("session_set_pinned", { sessionId, pinned });
 }
 
+/** Drain pending saves before a worktree removal changes stored session context. */
+export async function flushSessionWrites(): Promise<void> {
+  await Promise.all([...sessionWriteQueues.values()]);
+}
+
 /**
  * `session_set_in_flight` runs off the main thread, so two replaces could
  * otherwise land in either order and restore a stale busy snapshot.
@@ -461,6 +470,7 @@ function sanitizeBlock(block: Block): Block | null {
   if (block.durationMs != null) next.durationMs = block.durationMs;
   const turnModel = sanitizeTurnModel(block.turnModel);
   if (block.role === "user" && turnModel) next.turnModel = turnModel;
+  if (block.role === "user" && block.draft) next.draft = true;
   if (
     block.role === "user" &&
     typeof block.orchestrationLeadId === "string" &&
@@ -501,8 +511,6 @@ function sanitizeBlock(block: Block): Block | null {
   if (secondOpinion) next.secondOpinion = secondOpinion;
   const noteCard = sanitizeNoteCard(block.noteCard);
   if (noteCard) next.noteCard = noteCard;
-  const action = sanitizeActionRun(block.action);
-  if (action) next.action = action;
   // Interjection chrome survives restarts only on system blocks; a malformed
   // payload keeps the ordinary system row rather than losing its body.
   if (block.role === "system") {
@@ -513,23 +521,6 @@ function sanitizeBlock(block: Block): Block | null {
     }
   }
   return next;
-}
-
-function sanitizeActionRun(
-  value: unknown,
-): Block["action"] | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
-  }
-  const record = value as Record<string, unknown>;
-  const actionId =
-    typeof record.actionId === "string" ? record.actionId.slice(0, 128) : "";
-  const name =
-    typeof record.name === "string" ? record.name.slice(0, 120) : "";
-  const revision =
-    typeof record.revision === "string" ? record.revision.slice(0, 32) : "";
-  if (!actionId || !name || !revision) return undefined;
-  return { actionId, name, revision };
 }
 
 function sanitizeTurnMetrics(value: unknown): TurnMetrics | undefined {
@@ -734,6 +725,7 @@ function normalizeSummary(summary: SessionSummary): SessionSummary {
     deletions: summary.deletions ?? 0,
     archived: summary.archived || undefined,
     pinned: summary.pinned || undefined,
+    draft: summary.draft || undefined,
     linkedWorkItem,
   };
 }
@@ -758,10 +750,12 @@ function recordToSession(record: SessionRecord): Session {
     title: record.title,
     blocks,
     busy: false,
-    orchestrationLeadId: record.orchestrationLeadId ?? blocks.find(
-      (block) =>
-        block.orchestrationLeadId && block.orchestrationLeadId !== record.id,
-    )?.orchestrationLeadId,
+    orchestrationLeadId:
+      record.orchestrationLeadId ??
+      blocks.find(
+        (block) =>
+          block.orchestrationLeadId && block.orchestrationLeadId !== record.id,
+      )?.orchestrationLeadId,
     ...(record.providerSessionId
       ? { providerSessionId: record.providerSessionId }
       : {}),
@@ -770,6 +764,7 @@ function recordToSession(record: SessionRecord): Session {
       : {}),
     ...(record.branch ? { branch: record.branch } : {}),
     ...(record.worktreeCwd ? { worktreeCwd: record.worktreeCwd } : {}),
+    ...(record.worktreeRemoved ? { worktreeRemoved: true } : {}),
     ...(linkedWorkItem ? { linkedWorkItem } : {}),
     ...(contextFromRecord(record) ?? {}),
   };

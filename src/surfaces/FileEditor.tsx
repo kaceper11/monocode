@@ -46,12 +46,12 @@ import {
   basename,
   gitFileDiff,
   gitStageContents,
+  type GitDiffGuard,
+  type GitFileDiffKind,
   notifyGitChanged,
   readTextFile,
   subscribeGitChanged,
   writeTextFile,
-  type GitDiffGuard,
-  type GitFileDiffKind,
 } from "../lib/fs";
 import { syncWatchedMtime, watchFile } from "../lib/fileWatch";
 import { displayPath } from "../lib/paths";
@@ -320,7 +320,7 @@ export function FileEditor({
       try {
         await operation;
         await syncWatchedMtime(path);
-        notifyGitChanged(cwd);
+        notifyGitChanged();
         if (generation === saveGeneration.current) {
           setSaveState({ status: "saved" });
         }
@@ -727,8 +727,7 @@ function CodeMirrorEditor({
             pendingNavigationRef.current = null;
           }
           if (update.selectionSet) {
-            const selected = editorSelectionTarget(update.view, commentPath);
-            setSelectionTarget(selected ? { ...selected, sourcePath: path } : null);
+            setSelectionTarget(editorSelectionTarget(update.view, commentPath));
           } else if (update.docChanged) {
             setSelectionTarget(null);
           }
@@ -905,7 +904,6 @@ function CodeMirrorEditor({
       {commentTarget ? (
         <DiffCommentComposer
           path={commentPath}
-          sourcePath={path}
           target={commentTarget}
           onDismiss={() => setCommentTarget(null)}
         />
@@ -947,7 +945,6 @@ function editorSelectionTarget(
   const lastSelectedPosition = Math.max(selection.from, selection.to - 1);
   return {
     path,
-    text: text.slice(0, 32_000) + (text.length > 32_000 ? "\n[Selected context truncated]" : ""),
     startLine: view.state.doc.lineAt(selection.from).number,
     endLine: view.state.doc.lineAt(lastSelectedPosition).number,
     anchor: new DOMRect(

@@ -1,21 +1,17 @@
 import { useEffect, useRef, useState } from "react";
-import { wslLocation, wslPath } from "../lib/paths";
+import { prettyCwd, wslLocation, wslPath } from "../lib/paths";
 import { connectWslProject, wslDistributions, wslDistributionsPeek } from "../lib/wsl";
 import { useWslStatus } from "../lib/wslStatus";
-import { pickFolder, pickFolders } from "../lib/fs";
+import { pickFolder } from "../lib/fs";
 import { Select } from "./Select";
 import { Modal } from "./Modal";
 
 export function WslProjectDialog({
   cwd,
-  multiple,
   onOpen,
   onClose,
 }: {
   cwd: string;
-  /** Lets the native folder picker return several folders at once. A typed
-   * WSL path always delivers a single entry. */
-  multiple?: boolean;
   onOpen: (paths: string[]) => void;
   onClose: () => void;
 }) {
@@ -123,7 +119,7 @@ export function WslProjectDialog({
                     controller.signal,
                   ),
                 ];
-              const selected = await (multiple ? pickFolders() : pickFolder());
+              const selected = await pickFolder();
               const paths = Array.isArray(selected)
                 ? selected
                 : selected
@@ -152,6 +148,7 @@ export function WslProjectDialog({
         <div className="space-y-1 text-[12px] text-content/75">
           <span>Execution location</span>
           <Select
+            dialog
             label="Execution location"
             value={distribution}
             disabled={busy}
@@ -240,3 +237,41 @@ export function WslProjectDialog({
     </Modal>
   );
 }
+
+export function WslConnectionStatus({ opening, onRetry, onDismiss }: {
+  opening: { path: string; busy: boolean; error?: string };
+  onRetry: () => void;
+  onDismiss: () => void;
+}) { return (
+              <div
+                role={opening.error ? "alert" : "status"}
+                className="flex shrink-0 items-center gap-3 border-b border-content/10 px-4 py-2 text-[12px]"
+              >
+                <div className="min-w-0 flex-1">
+                  <p
+                    className="truncate text-content/75"
+                    title={prettyCwd(opening.path)}
+                  >
+                    {prettyCwd(opening.path)}
+                  </p>
+                  <p className="text-content/50">
+                    {opening.error || "Connecting to WSL…"}
+                  </p>
+                </div>
+                {!opening.busy && (
+                  <button
+                    className="rounded-md px-2 py-1 text-content/75 hover:bg-content/8"
+                    onClick={onRetry}
+                  >
+                    Retry
+                  </button>
+                )}
+                <button
+                  className="rounded-md px-2 py-1 text-content/60 hover:bg-content/8"
+                  onClick={onDismiss}
+                >
+                  {opening.busy ? "Cancel" : "Dismiss"}
+                </button>
+              </div>
+
+); }

@@ -1,4 +1,3 @@
-import { formatCodeBlock } from "./editorSelection";
 import type { UnifiedLine } from "./unifiedDiff";
 
 export type DiffCommentTarget = {
@@ -26,7 +25,7 @@ export function formatDiffComment(
   return [
     `Diff comment on \`${location}\`${deleted}:`,
     "",
-    formatCodeBlock(`${marker}${target.line.text}`, "diff"),
+    `> ${marker}${target.line.text}`,
     "",
     body,
   ].join("\n");

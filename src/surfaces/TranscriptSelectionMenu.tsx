@@ -1,13 +1,13 @@
-import { useEffect, useRef } from "react";
-import { ExplorerMenu } from "../chrome/ExplorerMenu";
+import { FilePlusCorner, MessageSquarePlus } from "../chrome/icons";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Popover } from "../chrome/Popover";
 import { type TranscriptSelection } from "../lib/transcriptSelection";
 
 type Props = {
   selection: TranscriptSelection | null;
-  onAddToChat?: (text: string, responseId?: string) => void;
-  onAddToNotes?: (text: string) => void;
+  onAddToChat?: (text: string) => void;
+  onAddToNotes?: (text: string) => void | Promise<void>;
   onDismiss: () => void;
-  onSendToAgent?: (text: string, responseId?: string) => void;
 };
 
 export function TranscriptSelectionMenu({
@@ -15,7 +15,6 @@ export function TranscriptSelectionMenu({
   onAddToChat,
   onAddToNotes,
   onDismiss,
-  onSendToAgent,
 }: Props) {
   const onDismissRef = useRef(onDismiss);
   onDismissRef.current = onDismiss;
@@ -36,30 +35,96 @@ export function TranscriptSelectionMenu({
   if (!selection) return null;
 
   return (
-    <ExplorerMenu
-      x={selection.rect.left}
-      y={selection.rect.bottom + 6}
-      width={180}
-      ariaLabel="Selected text actions"
-      items={[
-        ...(onAddToChat
-          ? [{ kind: "item" as const, id: "add", label: "Add to chat" }]
-          : []),
-        ...(onAddToNotes
-          ? [{ kind: "item" as const, id: "note", label: "Add to notes" }]
-          : []),
-        ...(onSendToAgent
-          ? [{ kind: "item" as const, id: "send", label: "Send to agent…" }]
-          : []),
-      ]}
-      onPick={(id) => {
-        if (id === "add") onAddToChat?.(selection.text, selection.responseId);
-        else if (id === "note") onAddToNotes?.(selection.text);
-        else onSendToAgent?.(selection.text, selection.responseId);
-        window.getSelection()?.removeAllRanges();
+    <Popover
+      anchor={selection.rect}
+      side="top"
+      align="center"
+      onDismiss={(reason) => {
+        if (reason === "escape") window.getSelection()?.removeAllRanges();
         onDismiss();
       }}
-      onClose={onDismiss}
-    />
+      role="toolbar"
+      aria-label="Selected text actions"
+      className="p-1"
+    >
+      <div className="flex min-w-36 flex-col items-stretch gap-0.5">
+        {onAddToChat ? (
+          <SelectionAction
+            label="Add to chat"
+            onSelect={() => onAddToChat(selection.text)}
+            onDismiss={onDismiss}
+          >
+            <MessageSquarePlus
+              aria-hidden="true"
+              className="size-3.5"
+              strokeWidth={1.75}
+            />
+          </SelectionAction>
+        ) : null}
+        {onAddToNotes ? (
+          <SelectionAction
+            label="Add to notes"
+            onSelect={() => onAddToNotes(selection.text)}
+            onDismiss={onDismiss}
+          >
+            <FilePlusCorner
+              aria-hidden="true"
+              className="size-3.5"
+              strokeWidth={1.75}
+            />
+          </SelectionAction>
+        ) : null}
+      </div>
+    </Popover>
+  );
+}
+
+function SelectionAction({
+  label,
+  children,
+  onSelect,
+  onDismiss,
+}: {
+  label: string;
+  children: ReactNode;
+  onSelect: () => void | Promise<void>;
+  onDismiss: () => void;
+}) {
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  return (
+    <>
+      <button
+        type="button"
+        disabled={pending}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={async () => {
+          setPending(true);
+          setError(null);
+          try {
+            const result = onSelect();
+            if (result) await result;
+            window.getSelection()?.removeAllRanges();
+            onDismiss();
+          } catch (error) {
+            setError(error instanceof Error ? error.message : String(error));
+          } finally {
+            setPending(false);
+          }
+        }}
+        className="flex h-8 w-full items-center gap-2 whitespace-nowrap rounded-lg px-2.5 font-sans text-[13px] leading-none text-content outline-none ring-accent/40 hover:bg-content/5 focus-visible:ring-2"
+      >
+        {children}
+        {label}
+      </button>
+      {error && (
+        <span
+          role="alert"
+          className="max-w-xs px-2.5 py-1 text-xs text-content/70"
+        >
+          Could not save note. {error}
+        </span>
+      )}
+    </>
   );
 }

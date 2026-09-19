@@ -134,14 +134,32 @@ describe("historyWithLiveSessions", () => {
 
   it("includes live sessions for the active project", () => {
     const session = newSession("cursor", "/tmp/project-a");
-    session.worktreeCwd = "/tmp/project-a-feature";
     session.blocks = [{ id: "u1", role: "user", text: "hello" }];
     session.busy = true;
 
     const rows = historyWithLiveSessions([], [session], "/tmp/project-a");
     expect(rows.map((row) => row.id)).toEqual([session.id]);
     expect(rows[0]?.repo).toBe("project-a");
-    expect(rows[0]?.worktreeCwd).toBe("/tmp/project-a-feature");
+  });
+
+  it("marks saved drafts and clears stale draft status when they are sent", () => {
+    const session = newSession("cursor", "/tmp/project-a");
+    session.id = "draft-session";
+    session.blocks = [
+      { id: "draft", role: "user", text: "Explore this", draft: true },
+    ];
+
+    const draftRows = historyWithLiveSessions([], [session], "/tmp/project-a");
+    expect(draftRows[0]?.draft).toBe(true);
+
+    session.blocks = [{ id: "sent", role: "user", text: "Explore this" }];
+    session.busy = true;
+    const sentRows = historyWithLiveSessions(
+      [{ ...draftRows[0], draft: true }],
+      [session],
+      "/tmp/project-a",
+    );
+    expect(sentRows[0]?.draft).toBeUndefined();
   });
 
   it("stamps composer git onto a live session that is not persisted yet", () => {
@@ -207,20 +225,6 @@ describe("historyWithLiveSessions", () => {
 
     const rows = historyWithLiveSessions(history, [], "/tmp/project-a");
     expect(rows.map((row) => row.id)).toEqual(["a1"]);
-  });
-
-  it("lets a live session override its stale persisted harness/model", () => {
-    const session = newSession("codex", "/tmp/project-a");
-    session.blocks = [{ id: "u1", role: "user", text: "hello" }];
-    const history = [
-      { ...summary(session.id, "/tmp/project-a"), harness: "claude", model: "claude:opus" },
-    ];
-
-    const rows = historyWithLiveSessions(history, [session], "/tmp/project-a");
-    const row = rows.find((entry) => entry.id === session.id);
-    expect(row?.harness).toBe("codex");
-    expect(row?.model).toBe(session.model);
-    expect(rows).toHaveLength(1);
   });
 });
 

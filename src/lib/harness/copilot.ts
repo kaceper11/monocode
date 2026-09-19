@@ -1,30 +1,6 @@
-import {
-  acpUnsupportedControl,
-  type AcpPermissionOption,
-  acpAuthError,
-  acpAutoOption,
-  acpCommandsFromUpdate,
-  acpConfigOptions,
-  acpCurrentModelId,
-  acpElicitation,
-  acpElicitationResult,
-  acpEventsFromUpdate,
-  acpModeId,
-  acpModeIdsFromConfig,
-  acpModesFromSetup,
-  acpModelConfigId,
-  acpPermissionOptionId,
-  acpPermissionRequest,
-  acpPromptBlocks,
-  asRecord,
-  sessionIdFromResult,
-  stringField,
-  AcpClient,
-  type AcpConfigOption,
-  type AcpHandlers,
-} from "./acp";
+import { AcpClient, type AcpHandlers } from "./acp";
+import { acpUnsupportedControl, type AcpPermissionOption, acpAuthError, acpAutoOption, acpCommandsFromUpdate, acpConfigOptions, acpCurrentModelId, acpElicitation, acpElicitationResult, acpEventsFromUpdate, acpModeId, acpModeIdsFromConfig, acpModesFromSetup, acpModelConfigId, acpPermissionOptionId, acpPermissionRequest, acpPromptBlocks, asRecord, sessionIdFromResult, stringField, type AcpConfigOption } from "./acpProtocol";
 import { acquireSharedStart } from "./liveStart";
-import { markTurn } from "../turnTiming";
 import {
   hasLiveCatalog,
   modelsFor,
@@ -98,7 +74,7 @@ type Live = {
    * is ignored while pinned; a third value means the server really moved.
    */
   pinnedConfigValue?: string;
-  /** Synthetic requestId source for ACP requests with non-numeric ids. */
+  /** UI request sequence independent of provider wire ids. */
   nextRequestId: number;
   modelConfigId: string;
   configOptions: AcpConfigOption[];
@@ -135,10 +111,10 @@ const resumeByThread = new Map<string, Resume>();
 const cancelledThreads = new Set<string>();
 const startingClients = new Map<string, AcpClient>();
 /**
- * Threads whose Copilot build rejected the `--effort` launch flag; their
- * sessions run at the CLI's default effort until forgotten.
+ * Remember flag rejection only for this thread's chosen execution cwd.
+ * A different checkout/host must probe its own CLI capabilities.
  */
-const effortUnsupportedThreads = new Set<string>();
+const effortUnsupportedThreads = new Map<string, string>();
 const commandListeners = new Map<
   string,
   Set<(commands: NativeCommand[]) => void>
@@ -437,7 +413,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   // one selection that must recycle this session's child (the ACP session is
   // reloaded afterwards when the server supports it). A build that rejected
   // the flag once keeps launching without it.
-  const effort = effortUnsupportedThreads.has(input.sessionId)
+  const effort = effortUnsupportedThreads.get(input.sessionId) === pathKey(input.cwd)
     ? undefined
     : copilotEffortFromSettings(input.modelSettings);
   const existing = liveByThread.get(input.sessionId);
@@ -463,7 +439,6 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
   const { path } = await resolveCopilotBinary(input.cwd);
   if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
-  markTurn(input.sessionId, "copilot binary resolved");
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(input.sessionId, handlers);
   startingClients.set(input.sessionId, acp);
@@ -473,11 +448,20 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   // everything and replay it once installed — live.muteUpdates then decides
   // which of the replayed events reach the UI.
   const earlyNotifications: { method: string; params: unknown }[] = [];
+  let earlyNotificationChars = 0;
   let childExited = false;
+  let effortRejected = false;
 
   handlers.onNotification = (method, params) => {
     const live = liveRef.current;
     if (!live) {
+      // Bound startup replay; fail visibly instead of silently dropping events.
+      earlyNotificationChars += JSON.stringify({ method, params }).length;
+      if (earlyNotifications.length >= 256 || earlyNotificationChars > 4 * 1024 * 1024) {
+        acp.close(new Error("Agent exceeded the startup notification limit"));
+        earlyNotifications.length = 0;
+        return;
+      }
       earlyNotifications.push({ method, params });
       return;
     }
@@ -526,6 +510,9 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     },
     (line) => {
       console.debug("[monocode] copilot stderr", line);
+      if (/(?:unknown|unrecognized|unsupported) (?:option|argument|flag)[^\n]*--effort\b|--effort\b[^\n]*(?:unknown|unrecognized|unsupported|not supported)/i.test(line)) {
+        effortRejected = true;
+      }
       if (COPILOT_AUTH_PATTERN.test(line)) {
         emit({
           type: "session.error",
@@ -652,7 +639,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       providerSessionId: acpSessionId,
     });
     live.onEvent({ type: "session.started" });
-    for (const early of earlyNotifications) {
+    for (const early of earlyNotifications.splice(0)) {
       handleNotification(live, early.method, early.params);
     }
     return live;
@@ -661,9 +648,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     // stopCopilotSession clears cancelledThreads, so keep it for the caller's
     // consume-check and never retry a turn the user already stopped.
     const wasCancelled = cancelledThreads.has(input.sessionId);
-    // `--effort` rejection looks like the child dying mid-handshake; an ACP
-    // error or timeout with the process still running is unrelated to it.
-    const flagSuspect = Boolean(effort) && childExited;
+    // A crash alone says nothing about flag support; require the CLI diagnosis.
+    const flagSuspect = Boolean(effort) && childExited && effortRejected;
     acp.close(error instanceof Error ? error : new Error(String(error)));
     await stopCopilotSession(input.sessionId, true);
     if (startingClients.get(input.sessionId) === acp) startingClients.delete(input.sessionId);
@@ -672,8 +658,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       cancelledThreads.add(input.sessionId);
       throw error;
     }
-    if (flagSuspect && !effortUnsupportedThreads.has(input.sessionId)) {
-      effortUnsupportedThreads.add(input.sessionId);
+    if (flagSuspect && effortUnsupportedThreads.get(input.sessionId) !== pathKey(input.cwd)) {
+      effortUnsupportedThreads.set(input.sessionId, pathKey(input.cwd));
       const live = await ensureLive(input);
       live.onEvent({
         type: "session.error",
@@ -732,7 +718,7 @@ async function applyModelSelection(
     live.pinnedConfigValue = staleConfigValue;
     return;
   } catch (error) {
-    if (!isUnsupportedControl(error)) {
+    if (!acpUnsupportedControl(error)) {
       const message = modelApplyError(base, error);
       live.onEvent({ type: "session.error", message });
       throw error;
@@ -743,7 +729,7 @@ async function applyModelSelection(
   try {
     verified = await setConfigOption(live, live.modelConfigId, base);
   } catch (error) {
-    if (isUnsupportedControl(error)) {
+    if (acpUnsupportedControl(error)) {
       // Neither control exists on this build — the explicit selection cannot
       // be honored, so fail rather than run the turn on a different model.
       const message = `Copilot cannot switch to ${base}: this build supports neither session/set_model nor the model config option.`;
@@ -879,11 +865,6 @@ async function prompt(live: Live, input: SendTurnInput): Promise<void> {
   }
 }
 
-function isUnsupportedControl(error: unknown): boolean {
-  if ((error as { code?: number } | null)?.code === -32601) return true;
-  const detail = error instanceof Error ? error.message : String(error);
-  return /method not found|not implemented|unknown method/i.test(detail);
-}
 
 function ignoreUnsupportedControl(method: string, error: unknown): void {
   console.debug(`[monocode] copilot ${method} failed`, error);
@@ -1057,9 +1038,8 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     return;
   }
 
-  // The UI needs a numeric requestId; give non-numeric ACP ids a synthetic
-  // one (large, so it cannot collide with server-chosen numeric ids).
-  const requestId = typeof id === "number" ? id : (live.nextRequestId += 1);
+  // Keep UI identity independent of both string and numeric wire request ids.
+  const requestId = ++live.nextRequestId;
   live.onEvent({
     type: "approval.requested",
     requestId,
@@ -1100,7 +1080,7 @@ async function handleElicitation(live: Live, id: JsonRpcId, params: unknown, can
       .catch(() => undefined);
     return;
   }
-  const requestId = typeof id === "number" ? id : (live.nextRequestId += 1);
+  const requestId = ++live.nextRequestId;
   live.onEvent({
     type: "question.asked",
     requestId,

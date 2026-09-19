@@ -6,23 +6,16 @@ const sent: string[] = [];
 const spawned: string[][] = [];
 let onLine: ((line: string) => void) | undefined;
 let onExit: ((code?: number | null) => void) | undefined;
-let permissionReply: "success" | "error" | null = "success";
-let interruptReply: "success" | "error" | null = "success";
-const killChild = vi.fn(async () => undefined);
-const spawnChild = vi.fn(async (_id: string, _path: string, args: string[]) => { spawned.push(args); });
 const writeChild = vi.fn(async (_id: string, line: string) => {
   sent.push(line);
-  const request = JSON.parse(line);
-  if (request.request?.subtype === "set_permission_mode" && permissionReply)
-    onLine?.(JSON.stringify({ type: "control_response", response: { subtype: permissionReply, request_id: request.request_id, error: permissionReply === "error" ? "mode rejected" : undefined } }));
-  if (request.request?.subtype === "interrupt" && interruptReply)
-    onLine?.(JSON.stringify({ type: "control_response", response: { subtype: interruptReply, request_id: request.request_id, error: interruptReply === "error" ? "interrupt rejected" : undefined } }));
 });
 
 vi.mock("./child", () => ({
   resolveClaudeBinary: async () => ({ path: "/fake/claude" }),
-  spawnChild,
-  killChild,
+  spawnChild: async (_id: string, _path: string, args: string[]) => {
+    spawned.push(args);
+  },
+  killChild: async () => undefined,
   unwatchChild: () => undefined,
   watchChild: (
     _id: string,
@@ -36,15 +29,11 @@ vi.mock("./child", () => ({
 }));
 
 const {
+  bindClaudeSession,
   compactClaudeContext,
-  canSteerClaudeSession,
-  cancelClaudeTurn,
-  forgetClaudeSession,
-  setClaudeBinaryResolver,
   respondClaudeApproval,
   respondClaudeQuestion,
   sendClaudeTurn,
-  setClaudeRuntimeMode,
   stopClaudeSession,
   __claudeTestReset,
 } = await import("./claude");
@@ -111,14 +100,9 @@ async function startTurn(
 beforeEach(() => {
   sent.length = 0;
   spawned.length = 0;
-  permissionReply = "success";
-  interruptReply = "success";
-  killChild.mockClear();
   onLine = undefined;
   onExit = undefined;
   writeChild.mockClear();
-  spawnChild.mockClear();
-  setClaudeBinaryResolver(async () => ({ path: "/fake/claude" }));
   __claudeTestReset();
 });
 
@@ -169,6 +153,32 @@ describe("claude model switching", () => {
     );
     emit({ type: "result", subtype: "success", session_id: "sess_1" });
     await second;
+  });
+});
+
+describe("claude legacy account resume", () => {
+  it("resumes a legacy thread when the missing account resolves to default", async () => {
+    bindClaudeSession("s1", "legacy-session", "/repo");
+    const { turn } = await startTurn("s1", {
+      providerAccountId: "default",
+    });
+    expect(spawned[0]).toEqual(
+      expect.arrayContaining(["--resume", "legacy-session"]),
+    );
+    expect(spawned[0]).not.toContain("--session-id");
+    emit({ type: "result", subtype: "success", session_id: "legacy-session" });
+    await turn;
+  });
+
+  it("does not resume a legacy default thread under a named account", async () => {
+    bindClaudeSession("s1", "legacy-session", "/repo");
+    const { turn } = await startTurn("s1", {
+      providerAccountId: "account-work",
+    });
+    expect(spawned[0]).not.toContain("--resume");
+    expect(spawned[0]).toContain("--session-id");
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await turn;
   });
 });
 
@@ -677,417 +687,6 @@ describe("claude subagents", () => {
   });
 });
 
-describe("claude runtime mode changes", () => {
-  it("pushes set_permission_mode and settles parked approvals", async () => {
-    const { events, turn } = await startTurn("s1");
-    emit({
-      type: "control_request",
-      request_id: "cmd_1",
-      request: {
-        subtype: "can_use_tool",
-        tool_name: "Bash",
-        input: { command: "git status" },
-      },
-    });
-    await waitFor(
-      () => events.some((event) => event.type === "approval.requested"),
-      "approval UI",
-    );
-
-    setClaudeRuntimeMode("s1", "full-access");
-
-    await waitFor(
-      () =>
-        parse().some(
-          (message) =>
-            (message.request as Record<string, unknown>)?.subtype ===
-            "set_permission_mode",
-        ),
-      "set_permission_mode",
-    );
-    expect(
-      parse().find(
-        (message) =>
-          (message.request as Record<string, unknown>)?.subtype ===
-          "set_permission_mode",
-      )?.request,
-    ).toMatchObject({ mode: "bypassPermissions" });
-    await waitFor(
-      () =>
-        parse().some(
-          (message) =>
-            (message.response as Record<string, unknown>)?.request_id ===
-            "cmd_1",
-        ),
-      "parked approval response",
-    );
-    expect(
-      parse().find(
-        (message) =>
-          (message.response as Record<string, unknown>)?.request_id ===
-          "cmd_1",
-      ),
-    ).toMatchObject({ response: { response: { behavior: "allow" } } });
-    expect(events).toContainEqual(
-      expect.objectContaining({
-        type: "approval.resolved",
-        decision: "allow",
-      }),
-    );
-
-    // Fresh asks are answered locally instead of reaching the UI.
-    emit({
-      type: "control_request",
-      request_id: "cmd_2",
-      request: {
-        subtype: "can_use_tool",
-        tool_name: "Bash",
-        input: { command: "pwd" },
-      },
-    });
-    await waitFor(
-      () =>
-        parse().some(
-          (message) =>
-            (message.response as Record<string, unknown>)?.request_id ===
-            "cmd_2",
-        ),
-      "second ask auto-answer",
-    );
-    expect(
-      events.filter((event) => event.type === "approval.requested"),
-    ).toHaveLength(1);
-
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
-    await turn;
-  });
-
-  it("parks MCP asks under auto-accept-edits and settles them under full-access", async () => {
-    const { events, turn } = await startTurn("s1", {
-      runtimeMode: "auto-accept-edits",
-    });
-    // acceptEdits still raises can_use_tool for MCP calls, the way the real
-    // CLI prompts for them; the ask parks for the user.
-    emit({
-      type: "control_request",
-      request_id: "mcp_1",
-      request: {
-        subtype: "can_use_tool",
-        tool_name: "mcp__github__create_issue",
-        input: { title: "Bug" },
-      },
-    });
-    await waitFor(
-      () => events.some((event) => event.type === "approval.requested"),
-      "MCP approval UI",
-    );
-    const requested = events.find((e) => e.type === "approval.requested")!;
-    expect(requested.kind).toBe("mcp");
-    expect(
-      parse().some(
-        (message) =>
-          (message.response as Record<string, unknown>)?.request_id ===
-          "mcp_1",
-      ),
-    ).toBe(false);
-
-    // Full-access admits everything — the parked MCP ask settles as allowed.
-    setClaudeRuntimeMode("s1", "full-access");
-    await waitFor(
-      () =>
-        parse().some(
-          (message) =>
-            (message.response as Record<string, unknown>)?.request_id ===
-            "mcp_1",
-        ),
-      "MCP settle response",
-    );
-    expect(
-      parse().find(
-        (message) =>
-          (message.response as Record<string, unknown>)?.request_id ===
-          "mcp_1",
-      ),
-    ).toMatchObject({ response: { response: { behavior: "allow" } } });
-    expect(
-      events.some(
-        (e) => e.type === "approval.resolved" && e.decision === "allow",
-      ),
-    ).toBe(true);
-
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
-    await turn;
-  });
-
-  it("auto-answers a residual MCP ask under full-access", async () => {
-    const { events, turn } = await startTurn("s1", {
-      runtimeMode: "full-access",
-    });
-    // bypassPermissions means the CLI skips can_use_tool entirely, but a
-    // straggler that still arrives is allowed without parking.
-    emit({
-      type: "control_request",
-      request_id: "mcp_2",
-      request: {
-        subtype: "can_use_tool",
-        tool_name: "mcp__github__create_issue",
-        input: { title: "Bug" },
-      },
-    });
-    await waitFor(
-      () =>
-        parse().some(
-          (message) =>
-            (message.response as Record<string, unknown>)?.request_id ===
-            "mcp_2",
-        ),
-      "MCP auto response",
-    );
-    expect(events.some((e) => e.type === "approval.requested")).toBe(false);
-
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
-    await turn;
-  });
-
-  it("settles a parked MCP approval when the child exits", async () => {
-    const { events, turn } = await startTurn("s1", {
-      runtimeMode: "auto-accept-edits",
-    });
-    emit({
-      type: "control_request",
-      request_id: "mcp_exit",
-      request: {
-        subtype: "can_use_tool",
-        tool_name: "mcp__github__create_issue",
-        input: { title: "Bug" },
-      },
-    });
-    await waitFor(
-      () => events.some((event) => event.type === "approval.requested"),
-      "MCP approval UI",
-    );
-
-    // Attach the catch before the exit so the turn's rejection is handled.
-    const settled = turn.catch(() => undefined);
-    onExit!(1);
-    await waitFor(
-      () => events.some((event) => event.type === "approval.resolved"),
-      "approval.resolved",
-    );
-    expect(events.find((e) => e.type === "approval.resolved")).toMatchObject({
-      decision: "cancelled",
-    });
-    expect(events.some((e) => e.type === "session.ended")).toBe(true);
-    // The dead child gets no control response — "cancelled" skips the write.
-    expect(
-      parse().some(
-        (message) =>
-          (message.response as Record<string, unknown>)?.request_id ===
-          "mcp_exit",
-      ),
-    ).toBe(false);
-    await settled;
-  });
-
-  it("settles only the asks the new mode covers", async () => {
-    const { events, turn } = await startTurn("s1");
-    emit({
-      type: "control_request",
-      request_id: "edit_1",
-      request: {
-        subtype: "can_use_tool",
-        tool_name: "Write",
-        input: { file_path: "/repo/new.ts", content: "export {}" },
-      },
-    });
-    emit({
-      type: "control_request",
-      request_id: "cmd_1",
-      request: {
-        subtype: "can_use_tool",
-        tool_name: "Bash",
-        input: { command: "git status" },
-      },
-    });
-    await waitFor(
-      () =>
-        events.filter((event) => event.type === "approval.requested").length ===
-        2,
-      "both approvals parked",
-    );
-
-    setClaudeRuntimeMode("s1", "auto-accept-edits");
-
-    await waitFor(
-      () =>
-        parse().some(
-          (message) =>
-            (message.response as Record<string, unknown>)?.request_id ===
-            "edit_1",
-        ),
-      "edit response",
-    );
-    expect(
-      parse().some(
-        (message) =>
-          (message.response as Record<string, unknown>)?.request_id ===
-          "cmd_1",
-      ),
-    ).toBe(false);
-
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
-    await turn;
-  });
-
-  it("keeps plan-mode gating when the picker loosens mid-plan", async () => {
-    const { events, turn } = await startTurn("s1", { intent: "plan" });
-    emit({
-      type: "control_request",
-      request_id: "edit_1",
-      request: {
-        subtype: "can_use_tool",
-        tool_name: "Write",
-        input: { file_path: "/repo/new.ts", content: "export {}" },
-      },
-    });
-    await waitFor(
-      () =>
-        parse().some(
-          (message) =>
-            (message.response as Record<string, unknown>)?.request_id ===
-            "edit_1",
-        ),
-      "plan deny",
-    );
-
-    setClaudeRuntimeMode("s1", "full-access");
-
-    // The wire mode must stay "plan" — bypassPermissions would ungate the
-    // plan-intent process entirely.
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    const pushes = parse().filter(
-      (message) =>
-        (message.request as Record<string, unknown>)?.subtype ===
-        "set_permission_mode",
-    );
-    expect(pushes.map((m) => m.request)).toEqual(
-      pushes.map(() => expect.objectContaining({ mode: "plan" })),
-    );
-
-    emit({
-      type: "control_request",
-      request_id: "edit_2",
-      request: {
-        subtype: "can_use_tool",
-        tool_name: "Write",
-        input: { file_path: "/repo/other.ts", content: "export {}" },
-      },
-    });
-    await waitFor(
-      () =>
-        parse().some(
-          (message) =>
-            (message.response as Record<string, unknown>)?.request_id ===
-            "edit_2",
-        ),
-      "second plan deny",
-    );
-    expect(
-      parse().find(
-        (message) =>
-          (message.response as Record<string, unknown>)?.request_id ===
-          "edit_2",
-      ),
-    ).toMatchObject({ response: { response: { behavior: "deny" } } });
-    expect(events.some((event) => event.type === "approval.requested")).toBe(
-      false,
-    );
-
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
-    await turn;
-  });
-
-  it("pushes default and resumes parking when the mode tightens", async () => {
-    const { events, turn } = await startTurn("s1");
-    setClaudeRuntimeMode("s1", "full-access");
-    await waitFor(
-      () =>
-        parse().some(
-          (message) =>
-            (message.request as Record<string, unknown>)?.subtype ===
-            "set_permission_mode",
-        ),
-      "bypass push",
-    );
-
-    setClaudeRuntimeMode("s1", "supervised");
-    await waitFor(
-      () =>
-        parse().filter(
-          (message) =>
-            (message.request as Record<string, unknown>)?.subtype ===
-            "set_permission_mode",
-        ).length === 2,
-      "default push",
-    );
-    expect(
-      parse().filter(
-        (message) =>
-          (message.request as Record<string, unknown>)?.subtype ===
-          "set_permission_mode",
-      )[1]?.request,
-    ).toMatchObject({ mode: "default" });
-
-    emit({
-      type: "control_request",
-      request_id: "cmd_1",
-      request: {
-        subtype: "can_use_tool",
-        tool_name: "Bash",
-        input: { command: "git status" },
-      },
-    });
-    await waitFor(
-      () => events.some((event) => event.type === "approval.requested"),
-      "approval parks again",
-    );
-
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
-    await turn;
-  });
-
-  it("reuses the process for the next turn instead of respawning", async () => {
-    const first = await startTurn("s1");
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
-    await first.turn;
-
-    setClaudeRuntimeMode("s1", "full-access");
-    const userCount = parse().filter(
-      (message) => message.type === "user",
-    ).length;
-    const second = sendClaudeTurn({
-      sessionId: "s1",
-      cwd: "/repo",
-      model: "claude:claude-sonnet-5",
-      modelSettings: {},
-      runtimeMode: "full-access",
-      text: "keep going",
-      attachments: [],
-      onEvent: () => undefined,
-    });
-    await waitFor(
-      () =>
-        parse().filter((message) => message.type === "user").length >
-        userCount,
-      "follow-up prompt",
-    );
-    expect(spawned).toHaveLength(1);
-
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
-    await second;
-  });
-});
-
 describe("claude plan permissions", () => {
   it("answers residual plan-mode permissions without prompting the user", async () => {
     const { events, turn } = await startTurn("s1", {
@@ -1198,166 +797,4 @@ describe("claude manual compaction", () => {
     });
     expect(events.some((event) => event.type === "message.delta")).toBe(false);
   });
-});
-
-
-describe("Claude startup ownership", () => {
-  it.each(["resolve", "spawn"])(
-    "forgets a pending %s without sending a prompt",
-    async (stage) => {
-      let release!: () => void;
-      const gate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      if (stage === "resolve")
-        setClaudeBinaryResolver(async () => {
-          await gate;
-          return { path: "/fake/claude" };
-        });
-      else
-        spawnChild.mockImplementationOnce(async () => {
-          await gate;
-        });
-      const events: HarnessEvent[] = [];
-      const pending = sendClaudeTurn({
-        sessionId: "s1",
-        cwd: "/repo",
-        model: "claude:opus-5",
-        runtimeMode: "supervised",
-        text: "must not send",
-        onEvent: (event) => events.push(event),
-      });
-      const outcome = pending.catch((error: unknown) => error);
-      if (stage === "spawn")
-        await waitFor(() => spawnChild.mock.calls.length > 0, "spawn begins");
-      expect(canSteerClaudeSession("s1")).toBe(false);
-      const stopping = forgetClaudeSession("s1");
-      release();
-      expect(await outcome).toMatchObject({ name: "AbortError" });
-      await stopping;
-      expect(sent).toEqual([]);
-      expect(
-        events.some((event) => event.type === "session.providerBound"),
-      ).toBe(false);
-      if (stage === "resolve") expect(spawnChild).not.toHaveBeenCalled();
-    },
-  );
-
-  it("reports readiness only while a prompt is active", async () => {
-    expect(canSteerClaudeSession("s1")).toBe(false);
-    const running = await startTurn("s1");
-    expect(canSteerClaudeSession("s1")).toBe(true);
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
-    await running.turn;
-    expect(canSteerClaudeSession("s1")).toBe(false);
-  });
-});
-
-it("Claude cancels queued turns and keeps the next explicit send usable", async () => {
-  const first = await startTurn("s1");
-  const args = {
-    sessionId: "s1",
-    cwd: "/repo",
-    model: "claude:claude-sonnet-5",
-    modelSettings: {},
-    runtimeMode: "supervised" as const,
-    text: "cancelled queued prompt",
-    onEvent: () => undefined,
-  };
-  const queued = sendClaudeTurn(args);
-  for (let i = 0; i < 6; i++) await Promise.resolve();
-  await cancelClaudeTurn("s1");
-  await Promise.all([first.turn, queued]);
-  expect(parse().filter((m) => m.type === "user")).toHaveLength(1);
-  const next = sendClaudeTurn({ ...args, text: "explicit new prompt" });
-  await waitFor(() => spawned.length === 2, "resumed spawn");
-  emit({ type: "system", subtype: "init", session_id: "sess_1" });
-  await waitFor(
-    () => parse().filter((m) => m.type === "user").length === 2,
-    "explicit next prompt",
-  );
-  emit({ type: "result", subtype: "success", session_id: "sess_1" });
-  await next;
-});
-
-it.each(["error", null] as const)("retires Claude when permission tightening is %s instead of dispatching", async (reply) => {
-  const first = await startTurn("s1", { runtimeMode: "full-access" });
-  emit({ type: "result", subtype: "success", session_id: "sess_1" });
-  await first.turn;
-  permissionReply = reply;
-  if (reply === null) vi.useFakeTimers();
-  const events: HarnessEvent[] = [];
-  const next = sendClaudeTurn({ sessionId: "s1", cwd: "/repo", model: "claude:claude-sonnet-5", modelSettings: {}, runtimeMode: "supervised", text: "requires approval", onEvent: (event) => events.push(event) });
-  const rejected = expect(next).rejects.toThrow(reply === "error" ? "mode rejected" : "timed out");
-  if (reply === null) await vi.advanceTimersByTimeAsync(8_001);
-  await rejected;
-  vi.useRealTimers();
-  expect(parse().filter((message) => message.type === "user")).toHaveLength(1);
-  expect(killChild).toHaveBeenCalledWith("s1");
-  expect(events).toContainEqual(expect.objectContaining({ type: "session.error", message: expect.stringContaining("permissions") }));
-  permissionReply = "success";
-  sent.length = 0;
-  const retry = await startTurn("s1");
-  expect(spawned.at(-1)).toContain("--resume");
-  expect(spawned.at(-1)).toContain("sess_1");
-  emit({ type: "result", subtype: "success", session_id: "sess_1" });
-  await retry.turn;
-});
-
-it("waits for Claude permission acknowledgement before releasing parked approvals", async () => {
-  const { events, turn } = await startTurn("s1");
-  emit({ type: "control_request", request_id: "parked", request: { subtype: "can_use_tool", tool_name: "Bash", input: { command: "echo hello" } } });
-  await waitFor(() => events.some((event) => event.type === "approval.requested"), "parked approval");
-  permissionReply = null;
-  setClaudeRuntimeMode("s1", "full-access");
-  await waitFor(() => parse().some((message) => (message.request as Record<string, unknown>)?.subtype === "set_permission_mode"), "permission update");
-  expect(events.some((event) => event.type === "approval.resolved")).toBe(false);
-  const control = parse().find((message) => (message.request as Record<string, unknown>)?.subtype === "set_permission_mode")!;
-  emit({ type: "control_response", response: { subtype: "success", request_id: control.request_id } });
-  await waitFor(() => events.some((event) => event.type === "approval.resolved"), "confirmed approval release");
-  emit({ type: "result", subtype: "success", session_id: "sess_1" });
-  await turn;
-});
-
-it("cancels a pending Claude mode change without waiting for its timeout", async () => {
-  const first = await startTurn("s1", { runtimeMode: "full-access" });
-  emit({ type: "result", subtype: "success", session_id: "sess_1" });
-  await first.turn;
-  permissionReply = null;
-  const next = sendClaudeTurn({ sessionId: "s1", cwd: "/repo", model: "claude:claude-sonnet-5", modelSettings: {}, runtimeMode: "supervised", text: "will be cancelled", onEvent: () => undefined });
-  await waitFor(() => parse().some((message) => (message.request as Record<string, unknown>)?.subtype === "set_permission_mode"), "pending mode");
-  await cancelClaudeTurn("s1");
-  await next;
-  expect(killChild).toHaveBeenCalledWith("s1");
-  expect(parse().filter((message) => message.type === "user")).toHaveLength(1);
-});
-
-it.each(["success", "error", null] as const)("retires Claude after interrupt %s and excludes the old result from the resumed turn", async (reply) => {
-  const first = await startTurn("s1");
-  const oldLine = onLine!;
-  interruptReply = reply;
-  if (reply === null) vi.useFakeTimers();
-  const stopping = cancelClaudeTurn("s1");
-  if (reply === null) await vi.advanceTimersByTimeAsync(8_001);
-  await stopping;
-  await first.turn;
-  vi.useRealTimers();
-  expect(killChild).toHaveBeenCalledWith("s1");
-  expect(first.events.some((event) => event.type === "session.error")).toBe(reply !== "success");
-  if (reply === "error") expect(first.events).toContainEqual(expect.objectContaining({ type: "session.error", message: expect.stringContaining("interrupt rejected") }));
-  sent.length = 0;
-  const second = await startTurn("s1");
-  expect(spawned).toHaveLength(2);
-  expect(spawned[1]).toEqual(expect.arrayContaining(["--resume", "sess_1"]));
-  let settled = false;
-  void second.turn.then(() => { settled = true; });
-  // Even acknowledgement success need not imply that the old terminal frame
-  // has arrived. Its retired host must not finish the resumed turn.
-  oldLine(JSON.stringify({ type: "result", subtype: "success", session_id: "sess_1" }));
-  await Promise.resolve();
-  await Promise.resolve();
-  expect(settled).toBe(false);
-  expect(second.events.some((event) => event.type === "message.completed")).toBe(false);
-  emit({ type: "result", subtype: "success", session_id: "sess_1" });
-  await second.turn;
 });

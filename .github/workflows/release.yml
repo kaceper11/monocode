@@ -74,12 +74,15 @@ jobs:
 
       - name: Write release config
         env:
+          APPLE_SIGNING_CONFIGURED: ${{ steps.apple_signing.outputs.configured }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
         run: |
           node <<'NODE'
           const { writeFileSync } = require("node:fs");
-          const identity = (process.env.APPLE_SIGNING_IDENTITY || "").trim() || "-";
+          const identity = process.env.APPLE_SIGNING_CONFIGURED === "true"
+            ? (process.env.APPLE_SIGNING_IDENTITY || "").trim()
+            : "-";
           const pubkey = process.env.TAURI_UPDATER_PUBKEY || "";
           const endpoint = "https://github.com/kaceper11/monocode/releases/latest/download/latest.json";
           if (!pubkey) {
@@ -170,16 +173,41 @@ jobs:
           BUNDLE="target/release/bundle"
           ARM_BUNDLE="target/aarch64-apple-darwin/release/bundle"
           INTEL_BUNDLE="target/x86_64-apple-darwin/release/bundle"
-          TAR=$(find "$ARM_BUNDLE/macos" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)
+          shopt -s nullglob
+          ARM_TARS=("$ARM_BUNDLE"/macos/*.app.tar.gz)
+          ARM_DMGS=("$ARM_BUNDLE"/dmg/*.dmg)
+          INTEL_TARS=("$INTEL_BUNDLE"/macos/*.app.tar.gz)
+          INTEL_DMGS=("$INTEL_BUNDLE"/dmg/*.dmg)
+          WINDOWS_INSTALLERS=("$BUNDLE"/nsis/*.exe)
+          WINDOWS_SIGNATURES=("$BUNDLE"/nsis/*.exe.sig)
+          if (( ${#ARM_TARS[@]} != 1 || ${#ARM_DMGS[@]} != 1 )); then
+            echo "Expected exactly one Apple Silicon updater archive and DMG" >&2
+            exit 1
+          fi
+          if (( ${#INTEL_TARS[@]} != 1 || ${#INTEL_DMGS[@]} != 1 )); then
+            echo "Expected exactly one Intel updater archive and DMG" >&2
+            exit 1
+          fi
+          if (( ${#WINDOWS_INSTALLERS[@]} != 1 || ${#WINDOWS_SIGNATURES[@]} != 1 )); then
+            echo "Expected exactly one Windows installer and updater signature" >&2
+            exit 1
+          fi
+          TAR="${ARM_TARS[0]}"
           SIG="${TAR}.sig"
-          DMG=$(find "$ARM_BUNDLE/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)
-          INTEL_TAR=$(find "$INTEL_BUNDLE/macos" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)
+          DMG="${ARM_DMGS[0]}"
+          INTEL_TAR="${INTEL_TARS[0]}"
           INTEL_SIG="${INTEL_TAR}.sig"
-          INTEL_DMG=$(find "$INTEL_BUNDLE/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)
-          DEB=$(find "$BUNDLE/linux" -maxdepth 1 -type f -name '*.deb' -print -quit)
-          APPIMAGE=$(find "$BUNDLE/linux" -maxdepth 1 -type f -name '*.AppImage' -print -quit)
-          WINDOWS_INSTALLER=$(find "$BUNDLE/nsis" -maxdepth 1 -type f -name '*.exe' -print -quit)
-          WINDOWS_SIGNATURE="${WINDOWS_INSTALLER}.sig"
+          INTEL_DMG="${INTEL_DMGS[0]}"
+          WINDOWS_INSTALLER="${WINDOWS_INSTALLERS[0]}"
+          WINDOWS_SIGNATURE="${WINDOWS_SIGNATURES[0]}"
+          DEBS=("$BUNDLE"/linux/*.deb)
+          APPIMAGES=("$BUNDLE"/linux/*.AppImage)
+          if (( ${#DEBS[@]} != 1 || ${#APPIMAGES[@]} != 1 )); then
+            echo "Expected exactly one Debian package and AppImage" >&2
+            exit 1
+          fi
+          DEB="${DEBS[0]}"
+          APPIMAGE="${APPIMAGES[0]}"
           for artifact in "$DMG" "$TAR" "$SIG" "$INTEL_DMG" "$INTEL_TAR" "$INTEL_SIG" "$DEB" "$APPIMAGE" "$WINDOWS_INSTALLER" "$WINDOWS_SIGNATURE"; do
             if [[ ! -f "$artifact" ]]; then
               echo "Missing release artifact: $artifact" >&2
@@ -250,14 +278,10 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" release-artifacts/* --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" \
-              --title "MonoCode $VERSION" \
-              --notes "See CHANGELOG.md for details. macOS uses Apple signing when its optional secrets are configured; the Windows installer is not Authenticode-signed." \
-              release-artifacts/*
-          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --title "MonoCode $VERSION" \
+            --notes "See CHANGELOG.md for details. macOS uses Apple signing when its optional secrets are configured; the Windows installer is not Authenticode-signed." \
+            release-artifacts/*
 
   linux:
     if: github.repository == 'kaceper11/monocode'

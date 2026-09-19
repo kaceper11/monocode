@@ -10,7 +10,7 @@ const { getVersion, check, message, ask, relaunch } = vi.hoisted(() => ({
 
 vi.mock("@tauri-apps/api/app", () => ({ getVersion }));
 vi.mock("@tauri-apps/plugin-updater", () => ({ check }));
-vi.mock("./dialogs", () => ({ ask, message }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ ask, message }));
 vi.mock("@tauri-apps/plugin-process", () => ({ relaunch }));
 vi.mock("./sounds", () => ({ announceUpdateAvailable: vi.fn() }));
 
@@ -32,7 +32,7 @@ describe("updater", () => {
     expect(message).not.toHaveBeenCalled();
   });
 
-  it("explains that development builds do not have an update channel", async () => {
+  it("points manual checks without updater endpoints to GitHub releases", async () => {
     getVersion.mockResolvedValue("0.1.23");
     check.mockRejectedValue(new Error("Updater does not have any endpoints set"));
 
@@ -41,9 +41,7 @@ describe("updater", () => {
       currentVersion: "0.1.23",
     });
     expect(message).toHaveBeenCalledWith(
-      expect.stringContaining(
-        "Automatic updates are unavailable in this development build",
-      ),
+      expect.stringContaining("https://github.com/kaceper11/monocode/releases/latest"),
       { title: "MonoCode" },
     );
   });

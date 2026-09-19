@@ -1,6 +1,6 @@
 # Working on MonoCode
 
-Read [docs/PRODUCT.md](docs/PRODUCT.md) and the assigned GitHub issue before changing code. The ordered backlog is [docs/ROADMAP.md](docs/ROADMAP.md). Read upstream [CONTRIBUTING.md](CONTRIBUTING.md) for the existing layout and checks; its requests about submissions to upstream still apply to upstream submissions.
+Read [docs/PRODUCT.md](docs/PRODUCT.md) and any assigned GitHub issue before changing code. The current scope is [docs/ROADMAP.md](docs/ROADMAP.md); older expansion issues do not authorize additional fork features. Read upstream [CONTRIBUTING.md](CONTRIBUTING.md) for the existing layout and checks; its requests about submissions to upstream still apply to upstream submissions.
 
 ## Product direction
 
@@ -8,7 +8,7 @@ Keep MonoCode's clean, compact, structured-chat-first interface and existing Tau
 
 Issue tracker, Git remote, PR provider, CI provider, and agent provider are independent choices. Never infer one from another without an explicit, visible mapping. Support mixed configurations such as GitHub issues + Azure Repos/Pipelines, Jira + Azure Repos/Pipelines, and GitHub PRs + Azure Pipelines. Preserve existing GitHub/Linear and agent behavior.
 
-Delivery priority: Windows UI with WSL-hosted Git/agents, Jira and Azure Boards tickets, and Azure Repos PRs/Azure Pipelines CI come before secondary workspace expansion. Scheduled tasks (one-shot and recurring) and provider watchers are first-class priorities. Do not make new GitHub enhancements, terminal redesign, or a full durable daemon prerequisites for an initial usable WSL/Jira/Azure slice. Clearly distinguish app-open automation from execution that survives app exit.
+Upstream owns the core application, UI and workflows. Retain WSL integration, Azure Boards/Repos/Pipelines, Jira, Confluence, Devin, Muse and Copilot, the full browser side panel, Keep Awake, saved project commands without task scope, draft-only Actions prompts, the terminal resource manager and dictation, and necessary fork identity and data-safety changes. Outside that scope, prefer current upstream implementations and remove fork-only additions. Reuse GitHub's shared surfaces for equivalent ticket/PR/CI operations; keep real service differences inside small adapters. Keep Browser labeled with a globe beside Terminal. Do not build custom task, automation, terminal or browser frameworks to support these integrations.
 
 ## Implementing an issue
 

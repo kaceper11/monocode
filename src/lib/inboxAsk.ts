@@ -6,6 +6,7 @@ export type InboxAskContext = {
   title: string;
   url: string;
   provider: InboxItem["provider"];
+  account?: string;
   site?: string;
   project?: string;
   identifier?: string;
@@ -15,7 +16,10 @@ export type InboxAskContext = {
 export function inboxAskKey(item: InboxItem): string {
   if (item.provider === "linear") return `linear:${item.id}`;
   const url = new URL(item.url);
-  return `${item.provider}:${url.host.toLowerCase()}:${url.pathname.replace(/\/$/, "").toLowerCase()}`;
+  const key = `${item.provider}:${url.host.toLowerCase()}:${url.pathname.replace(/\/$/, "").toLowerCase()}`;
+  return (item.provider === "jira" || item.provider === "azure") && item.account
+    ? JSON.stringify([key, item.account])
+    : key;
 }
 
 export function inboxAskPrompt(

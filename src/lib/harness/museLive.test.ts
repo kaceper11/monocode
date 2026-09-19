@@ -30,7 +30,6 @@ vi.mock("./child", () => ({
 
 const {
   sendMuseTurn,
-  canSteerMuseSession,
   steerMuseTurn,
   cancelMuseTurn,
   compactMuseContext,
@@ -150,6 +149,41 @@ describe("muse live turn sequence", () => {
     replied.clear();
     onStderr = undefined;
     __museTestReset();
+  });
+
+  it("rejects a startup request flood without dispatching a turn", async () => {
+    const turn = sendMuseTurn(baseInput([], "must not run", "startup-flood"));
+    void turn.catch(() => undefined);
+    await waitFor(() => byMethod("initialize").length > 0, "initialize");
+    for (let index = 0; index < 257; index++) {
+      serverRequest(1000 + index, "approval/request", { approvalId: `a-${index}` });
+    }
+    reply(lastByMethod("initialize")!.id, INIT_RESULT);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(byMethod("session/start")).toHaveLength(0);
+    await expect(turn).rejects.toThrow(/startup request limit/);
+    expect(killChild).toHaveBeenCalled();
+  });
+
+  it.each([undefined, "unknown"])("rejects an unrecognized terminal state (%s)", async terminal => {
+    const { turn } = await startTurn([], "first", "unknown-terminal");
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal });
+    await expect(turn).rejects.toThrow(/unrecognized terminal state/);
+    await stopMuseSession("unknown-terminal");
+  });
+
+  it("retains an early compaction failure until admission is acknowledged", async () => {
+    const { turn } = await startTurn([], "first", "compact-early");
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
+    await turn;
+    const compact = compactMuseContext(baseInput([], "", "compact-early"));
+    const rejected = expect(compact).rejects.toThrow("compaction failed");
+    await waitFor(() => byMethod("session/compact").length > 0, "compact");
+    notify("item/completed", { sessionId: "MS1", item: { itemId: "compact", kind: "compaction", status: "failed", failureReason: "compaction failed" } });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    reply(lastByMethod("session/compact")!.id, { status: "accepted" });
+    await rejected;
+    await stopMuseSession("compact-early");
   });
 
   it("starts a session, sets the approval mode, and streams a turn", async () => {
@@ -440,6 +474,47 @@ describe("muse live turn sequence", () => {
     await turn;
     await stopMuseSession("t3m");
   });
+
+  it.each(["approval/updated", "approval/requested"])(
+    "keeps a newer requirement pending after an old decision succeeds (%s)",
+    async (method) => {
+      const events: HarnessEvent[] = [];
+      const { turn } = await startTurn(events, "run tests", "approval-revision");
+      const approval = {
+        approvalId: "revision", sessionId: "MS1", itemId: "tool",
+        currentRequirementId: { approvalId: "revision", sourceIndex: 0 },
+        availableChoices: [
+          { choiceId: "allow", decision: "approved", scope: "once" },
+          { choiceId: "deny", decision: "denied", scope: "once" },
+        ],
+        subject: { kind: "shell", command: "npm test" },
+      };
+      notify("approval/requested", approval);
+      const first = events.filter((e) => e.type === "approval.requested").at(-1)!;
+      respondMuseApproval("approval-revision", first.requestId, "allow");
+      const oldDecision = lastByMethod("approval/decide")!;
+      notify(method, {
+        ...approval,
+        currentRequirementId: { approvalId: "revision", sourceIndex: 1 },
+      });
+      const second = events.filter((e) => e.type === "approval.requested").at(-1)!;
+      expect(second.requestId).not.toBe(first.requestId);
+      reply(oldDecision.id, {});
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(events.some((e) => e.type === "approval.resolved" && e.requestId === second.requestId)).toBe(false);
+      respondMuseApproval("approval-revision", first.requestId, "allow");
+      expect(byMethod("approval/decide")).toHaveLength(1);
+      respondMuseApproval("approval-revision", second.requestId, "deny");
+      expect(lastByMethod("approval/decide")!.params).toMatchObject({
+        requirementId: { approvalId: "revision", sourceIndex: 1 }, choiceId: "deny",
+      });
+      reply(lastByMethod("approval/decide")!.id, {});
+      notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
+      await turn;
+      await stopMuseSession("approval-revision");
+    },
+  );
 
   it("re-asks when Muse reports a stale approval requirement", async () => {
     const events: HarnessEvent[] = [];
@@ -736,49 +811,19 @@ describe("muse live turn sequence", () => {
     await stopMuseSession("t9");
   });
 
-  it("falls back to session/start when resume reports the session missing", async () => {
-    bindMuseSession("t10", "MS-GONE", "/repo");
-    const events: HarnessEvent[] = [];
-    const turn = sendMuseTurn(baseInput(events, "hello", "t10") as never);
+  it("preserves a missing resume binding instead of starting an empty conversation", async () => {
+    bindMuseSession("missing-resume", "MS-GONE", "/repo");
+    const turn = sendMuseTurn(baseInput([], "hello", "missing-resume"));
+    void turn.catch(() => undefined);
     await waitFor(() => byMethod("initialize").length > 0, "initialize");
-    reply(byMethod("initialize")[0].id, INIT_RESULT);
-    await waitFor(
-      () => byMethod("session/resume").length > 0,
-      "session/resume",
-    );
-    fail(lastByMethod("session/resume")!.id, {
-      code: -32000,
-      message: "session not found",
-      data: { kind: "sessionNotFound" },
-    });
-    await waitFor(() => byMethod("session/start").length > 0, "session/start");
-    reply(lastByMethod("session/start")!.id, {
-      session: { sessionId: "MS-NEW" },
-      viewCursor: "c0",
-    });
-    await waitFor(() => byMethod("turn/start").length > 0, "turn/start");
-    const turnMsg = lastByMethod("turn/start")!;
-    reply(turnMsg.id, {
-      commandId: turnMsg.params.commandId,
-      disposition: "started",
-      startedNewTurn: true,
-      status: "accepted",
-      turnId: "T10",
-    });
-    notify("turn/completed", {
-      sessionId: "MS-NEW",
-      turnId: "T10",
-      terminal: "completed",
-    });
-    await turn;
-    expect(
-      events.some(
-        (e) =>
-          e.type === "session.providerBound" &&
-          e.providerSessionId === "MS-NEW",
-      ),
-    ).toBe(true);
-    await stopMuseSession("t10");
+    reply(lastByMethod("initialize")!.id, INIT_RESULT);
+    await waitFor(() => byMethod("session/resume").length > 0, "resume");
+    fail(lastByMethod("session/resume")!.id, { code: -32000, message: "session not found", data: { kind: "sessionNotFound" } });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(byMethod("session/start")).toHaveLength(0);
+    await expect(turn).rejects.toThrow(/binding was preserved/);
+    expect(byMethod("turn/start")).toHaveLength(0);
+    await stopMuseSession("missing-resume");
   });
 
   it("routes a child exit to the running turn's listener", async () => {
@@ -874,7 +919,7 @@ describe("muse live turn sequence", () => {
     await stopMuseSession("tr");
   });
 
-  it("dedupes a re-issued approval/request for the same approvalId", async () => {
+  it("dedupes a re-issued approval/request for the same requirement", async () => {
     const events: HarnessEvent[] = [];
     const { turn } = await startTurn(events, "run", "td");
     notify("turn/started", { sessionId: "MS1", turnId: "T1" });
@@ -891,10 +936,7 @@ describe("muse live turn sequence", () => {
       subject: { kind: "shell", command: "make" },
     };
     serverRequest(98, "approval/request", params);
-    serverRequest(99, "approval/request", {
-      ...params,
-      currentRequirementId: { approvalId: "aD", sourceIndex: 1 },
-    });
+    serverRequest(99, "approval/request", params);
     await new Promise((r) => setTimeout(r, 10));
     expect(
       events.filter((e) => e.type === "approval.requested").length,
@@ -905,10 +947,9 @@ describe("muse live turn sequence", () => {
       () => byMethod("approval/decide").length > 0,
       "approval/decide",
     );
-    // The refreshed requirement token is what gets decided.
     expect(lastByMethod("approval/decide")!.params.requirementId).toEqual({
       approvalId: "aD",
-      sourceIndex: 1,
+      sourceIndex: 0,
     });
 
     notify("turn/completed", {
@@ -1061,7 +1102,6 @@ describe("muse live turn sequence", () => {
       sessionId: "MS1",
       item: { itemId: "rc1", kind: "reminderChild", status: "completed" },
     });
-    expect(events.some((e) => e.type === "session.activity")).toBe(false);
     expect(events.some((e) => e.type === "tool.started")).toBe(false);
     expect(events.some((e) => e.type === "tool.updated")).toBe(false);
     expect(events.some((e) => e.type === "status")).toBe(false);
@@ -1075,329 +1115,39 @@ describe("muse live turn sequence", () => {
     await stopMuseSession("tr1");
   });
 
-  it("settles the send at drain detection while the host finishes bookkeeping", async () => {
+  it.each(["started", "completed"])("waits for the authoritative terminal event after reminder %s", async phase => {
     const events: HarnessEvent[] = [];
-    const { turn } = await startTurn(events, "hey", "td1");
-    let settled = false;
-    void turn.then(() => {
-      settled = true;
-    });
-    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "inProgress" },
-    });
-    expect(canSteerMuseSession("td1")).toBe(true);
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "completed" },
-    });
-    // The drain's reminder child opens after the answer: the UI turn settles
-    // here instead of waiting out the host's bookkeeping gate.
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "rc1", kind: "reminderChild", status: "inProgress" },
-    });
-    await waitFor(() => settled, "drain settle");
-    // Still draining with no real item open — steer is refused at the
-    // boundary and a follow-up Send queues host-side instead.
-    expect(canSteerMuseSession("td1")).toBe(false);
-    expect(events.some(e => e.type === "session.activity" && e.text?.includes("finishing"))).toBe(true);
-
-    // The trailing turn/completed still lands; nothing double-settles.
-    notify("turn/completed", {
-      sessionId: "MS1",
-      turnId: "T1",
-      terminal: "completed",
-    });
-    await turn;
-    await stopMuseSession("td1");
-  });
-
-  it("settles the send on a single-shot reminder child during the drain", async () => {
-    const events: HarnessEvent[] = [];
-    const { turn } = await startTurn(events, "hey", "td2");
-    let settled = false;
-    void turn.then(() => {
-      settled = true;
-    });
-    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "inProgress" },
-    });
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "completed" },
-    });
-    // Echo-fast children arrive as item/completed only — the event itself
-    // while no real item is open is drain evidence.
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: { itemId: "rc1", kind: "reminderChild", status: "completed" },
-    });
-    await waitFor(() => settled, "single-shot drain settle");
-    expect(events.some(e => e.type === "session.activity" && e.text?.includes("finishing"))).toBe(true);
-    await turn;
-    await stopMuseSession("td2");
-  });
-
-  it("does not settle on turn-start recall before any real item", async () => {
-    const events: HarnessEvent[] = [];
-    const { turn } = await startTurn(events, "hey", "td3");
-    let settled = false;
-    void turn.then(() => {
-      settled = true;
-    });
-    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
-    // Memory recall runs before the model call: a reminder child while no
-    // real item has completed must not free the turn.
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "rc0", kind: "reminderChild", status: "inProgress" },
-    });
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: { itemId: "rc0", kind: "reminderChild", status: "completed" },
-    });
-    await new Promise((r) => setTimeout(r, 30));
-    expect(settled).toBe(false);
-
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "inProgress" },
-    });
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "completed" },
-    });
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "rc1", kind: "reminderChild", status: "inProgress" },
-    });
-    await waitFor(() => settled, "drain settle after answer");
-    expect(events.some(e => e.type === "session.activity" && e.text?.includes("finishing"))).toBe(true);
-    await turn;
-    await stopMuseSession("td3");
-  });
-
-  it("does not settle while a real item is still open", async () => {
-    const events: HarnessEvent[] = [];
-    const { turn } = await startTurn(events, "hey", "td4");
-    let settled = false;
-    void turn.then(() => {
-      settled = true;
-    });
-    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "inProgress" },
-    });
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "completed" },
-    });
-    // A mid-turn reminder child while a tool call runs is not the drain.
-    notify("item/started", {
-      sessionId: "MS1",
-      item: {
-        itemId: "c1",
-        kind: "toolCall",
-        status: "inProgress",
-        tool: "bash",
-      },
-    });
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "rc1", kind: "reminderChild", status: "inProgress" },
-    });
-    await new Promise((r) => setTimeout(r, 30));
-    expect(settled).toBe(false);
-
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: {
-        itemId: "c1",
-        kind: "toolCall",
-        status: "completed",
-        tool: "bash",
-      },
-    });
-    await waitFor(() => settled, "settle once real work closes");
-    expect(events.some(e => e.type === "session.activity" && e.text?.includes("finishing"))).toBe(true);
-    await turn;
-    await stopMuseSession("td4");
-  });
-
-  it("holds drain settlement while a model retry is pending", async () => {
-    const events: HarnessEvent[] = [];
-    const { turn } = await startTurn(events, "hey", "td5");
-    let settled = false;
-    void turn.then(() => {
-      settled = true;
-    });
-    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "inProgress" },
-    });
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "completed" },
-    });
-    notify("turn/retryScheduled", {
-      sessionId: "MS1",
-      turnId: "T1",
-      attempt: 1,
-      nextAttempt: 2,
-      maxAttempts: 3,
-      retryDelayMs: 5000,
-    });
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "rc1", kind: "reminderChild", status: "inProgress" },
-    });
-    await new Promise((r) => setTimeout(r, 30));
-    expect(settled).toBe(false);
-
-    // The retry produces real work; once it closes with the reminder child
-    // still open, the drain is real and the UI turn settles.
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "m2", kind: "agentMessage", status: "inProgress" },
-    });
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: { itemId: "m2", kind: "agentMessage", status: "completed" },
-    });
-    await waitFor(() => settled, "settle after retried work closes");
-    expect(events.some(e => e.type === "session.activity" && e.text?.includes("finishing"))).toBe(true);
-    await turn;
-    await stopMuseSession("td5");
-  });
-
-  it("still waits out a drain that emits no reminder items", async () => {
-    const events: HarnessEvent[] = [];
-    const { turn } = await startTurn(events, "hey", "td6");
-    let settled = false;
-    void turn.then(() => {
-      settled = true;
-    });
-    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "inProgress" },
-    });
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "completed" },
-    });
-    await new Promise((r) => setTimeout(r, 30));
-    expect(settled).toBe(false);
-
-    notify("turn/completed", {
-      sessionId: "MS1",
-      turnId: "T1",
-      terminal: "completed",
-    });
-    await waitFor(() => settled, "backstop settle");
-    await stopMuseSession("td6");
-  });
-
-  it("keeps the drained turn as the steer/interrupt target", async () => {
-    const events: HarnessEvent[] = [];
-    const { turn } = await startTurn(events, "hey", "td7");
-    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "completed" },
-    });
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "rc1", kind: "reminderChild", status: "inProgress" },
-    });
-    // The UI turn settles on the drain, but the host turn still owns T1:
-    // an in-flight steer/interrupt must keep addressing it until the real
-    // turn/completed lands.
+    const { turn } = await startTurn(events, "hey", "bookkeeping");
     let settled = false;
     void turn.then(() => { settled = true; });
-    await waitFor(() => settled, "drain settle");
-    const steer = steerMuseTurn({
-      sessionId: "td7",
-      cwd: "/repo",
-      model: "muse:default",
-      text: "one more thing",
-    });
-    await waitFor(() => byMethod("turn/steer").length > 0, "turn/steer");
-    const steerMsg = lastByMethod("turn/steer")!;
-    expect(steerMsg.params.expectedTurnId).toBe("T1");
-    reply(steerMsg.id, { commandId: steerMsg.params.commandId, disposition: "queued" });
-    await steer;
-    await stopMuseSession("td7");
+    notify("turn/started", { sessionId: "MS1", turnId: "T1" });
+    notify("item/completed", { sessionId: "MS1", item: { itemId: "answer", kind: "agentMessage", status: "completed", text: "Done" } });
+    notify(`item/${phase}`, { sessionId: "MS1", item: { itemId: "reminder", kind: "reminderChild", status: phase === "started" ? "inProgress" : "completed" } });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    expect(events.some(event => event.type === "message.completed")).toBe(true);
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
     await turn;
+    await stopMuseSession("bookkeeping");
   });
 
-  it("queues a follow-up on the host while the drain finishes", async () => {
+  it("keeps a follow-up queued until the previous host turn really completes", async () => {
     const events: HarnessEvent[] = [];
-    const { turn } = await startTurn(events, "hey", "td8");
+    const { turn } = await startTurn(events, "first", "bookkeeping-queue");
     notify("turn/started", { sessionId: "MS1", turnId: "T1" });
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "inProgress" },
-    });
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: { itemId: "m1", kind: "agentMessage", status: "completed" },
-    });
-    notify("item/started", {
-      sessionId: "MS1",
-      item: { itemId: "rc1", kind: "reminderChild", status: "inProgress" },
-    });
-    // The UI turn settled at drain detection; the host still owns T1.
+    notify("item/completed", { sessionId: "MS1", item: { itemId: "answer", kind: "agentMessage", status: "completed" } });
+    notify("item/started", { sessionId: "MS1", item: { itemId: "reminder", kind: "reminderChild", status: "inProgress" } });
+    const next = sendMuseTurn(baseInput(events, "follow up", "bookkeeping-queue"));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(byMethod("turn/start")).toHaveLength(1);
+    notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
     await turn;
-
-    // A follow-up sent during the drain goes through turn/start with
-    // ifBusy:"queue" — the host admits it now and runs it after bookkeeping.
-    const next = sendMuseTurn(baseInput(events, "follow up", "td8"));
-    await waitFor(() => byMethod("turn/start").length === 2, "follow-up turn/start");
-    const queuedStart = lastByMethod("turn/start")!;
-    expect(queuedStart.params.ifBusy).toBe("queue");
-    let nextSettled = false;
-    void next.then(() => { nextSettled = true; });
-    reply(queuedStart.id, {
-      commandId: queuedStart.params.commandId,
-      disposition: "queued",
-      turnId: "T2",
-    });
-    await new Promise((r) => setTimeout(r, 30));
-    expect(nextSettled).toBe(false);
-
-    // The drained turn's terminal event must not settle the queued send.
-    notify("turn/completed", {
-      sessionId: "MS1",
-      turnId: "T1",
-      terminal: "completed",
-    });
-    await new Promise((r) => setTimeout(r, 10));
-    expect(nextSettled).toBe(false);
-
-    notify("turn/started", { sessionId: "MS1", turnId: "T2" });
-    notify("item/completed", {
-      sessionId: "MS1",
-      item: {
-        itemId: "m2",
-        kind: "agentMessage",
-        status: "completed",
-        text: "again",
-      },
-    });
-    notify("turn/completed", {
-      sessionId: "MS1",
-      turnId: "T2",
-      terminal: "completed",
-    });
+    await waitFor(() => byMethod("turn/start").length === 2, "follow-up after terminal");
+    const request = lastByMethod("turn/start")!;
+    reply(request.id, { turnId: "T2", disposition: "started" });
+    notify("turn/completed", { sessionId: "MS1", turnId: "T2", terminal: "completed" });
     await next;
-    await stopMuseSession("td8");
+    await stopMuseSession("bookkeeping-queue");
   });
 
   it("does not let a late completed turn seal the next response", async () => {
@@ -1691,12 +1441,12 @@ describe("muse live turn sequence", () => {
     const { turn } = await startTurn(events, "never run", "admission", () => cancelMuseTurn("admission"));
     await turn;
     expect(killChild).toHaveBeenCalledOnce();
-    expect(canSteerMuseSession("admission")).toBe(false);
+    await expect(steerMuseTurn({ sessionId: "admission", cwd: "/repo", model: "muse:default", text: "late" })).rejects.toThrow("No active Muse session");
     notify("item/started", { sessionId: "MS1", item: { itemId: "late", kind: "agentMessage", text: "hidden" } });
     expect(events.some(e => e.type === "message.delta")).toBe(false);
   });
 
-  it.each(["model", "mode"])("does not send when a required %s selection is rejected", async setting => {
+  it.each([["model", -32602], ["mode", -32602], ["model", -32601], ["mode", -32601]] as const)("does not send when a required %s selection is rejected (%s)", async (setting, code) => {
     const events: HarnessEvent[] = [];
     const { turn } = await startTurn(events, "first", "settings", undefined, setting === "mode" ? "auto" : "supervised");
     notify("turn/completed", { sessionId: "MS1", turnId: "T1", terminal: "completed" });
@@ -1706,7 +1456,9 @@ describe("muse live turn sequence", () => {
     const rejected = expect(next).rejects.toThrow("selection rejected");
     const method = setting === "model" ? "session/setModel" : "session/setApprovalMode";
     await waitFor(() => byMethod(method).length > 0, method);
-    fail(lastByMethod(method)!.id, { code: -32602, message: "selection rejected" });
+    fail(lastByMethod(method)!.id, { code, message: "selection rejected" });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(byMethod("turn/start")).toHaveLength(1);
     await rejected;
     expect(byMethod("turn/start")).toHaveLength(1);
     await stopMuseSession("settings");
@@ -1949,7 +1701,7 @@ describe("muse live turn sequence", () => {
       await cancel;
       await turn;
       expect(killChild).toHaveBeenCalledOnce();
-      expect(canSteerMuseSession("stop-failure")).toBe(false);
+      await expect(steerMuseTurn({ sessionId: "stop-failure", cwd: "/repo", model: "muse:default", text: "late" })).rejects.toThrow("No active Muse session");
     } finally { vi.useRealTimers(); }
     sent.length = 0;
     const retry = sendMuseTurn(baseInput([], "retry", "stop-failure"));

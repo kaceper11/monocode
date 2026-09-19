@@ -3,12 +3,12 @@ import {
   ArrowLeft,
   Bot,
   Inbox,
+  FolderTree,
   Keyboard,
   MessageSquare,
   Palette,
   SlidersHorizontal,
   Sparkles,
-  Zap,
   type IconComponent,
 } from "./icons";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
@@ -23,9 +23,9 @@ const SECTION_ICONS: Record<SettingsSectionId, IconComponent> = {
   keybindings: Keyboard,
   chat: MessageSquare,
   providers: Bot,
-  automations: Zap,
   skills: Sparkles,
   inbox: Inbox,
+  worktrees: FolderTree,
   archive: Archive,
 };
 

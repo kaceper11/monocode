@@ -1,10 +1,5 @@
-import {
-  acpUnsupportedControl,
-  acpAssertConfigApplied,
-  type AcpPermissionOption,
-  AcpClient,
-  type AcpHandlers,
-} from "./acp";
+import { AcpClient, type AcpHandlers } from "./acp";
+import { acpUnsupportedControl, acpAssertConfigApplied, type AcpPermissionOption } from "./acpProtocol";
 import { findModel, nativeModelId } from "../models";
 import { pathKey } from "../paths";
 import type { RuntimeMode } from "../session";
@@ -52,7 +47,6 @@ import {
   type NativeCommandProvider,
 } from "./nativeCommands";
 import { acquireSharedStart } from "./liveStart";
-import { markTurn } from "../turnTiming";
 import type {
   ApprovalDecision,
   CompactContextInput,
@@ -80,7 +74,7 @@ type Live = {
   subagents: AcpSubagents;
   modelConfigId: string;
   configOptions: DevinConfigOption[];
-  /** Synthetic requestId source for ACP requests with non-numeric ids. */
+  /** UI request sequence independent of provider wire ids. */
   nextRequestId: number;
   modeIds: string[];
   currentModeId?: string;
@@ -163,7 +157,6 @@ export async function sendDevinTurn(input: SendTurnInput): Promise<void> {
           ),
         ]);
         if (live.cancelled) return;
-        markTurn(input.sessionId, "devin controls applied");
         await prompt(live, input);
         await live.acp.waitForPrompts();
       } catch (error) {
@@ -456,7 +449,6 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
   const { path } = await resolveDevinBinary(input.cwd);
   if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
-  markTurn(input.sessionId, "devin binary resolved");
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(input.sessionId, handlers);
   startingClients.set(input.sessionId, acp);
@@ -466,12 +458,20 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   // everything and replay it once installed — live.muteUpdates then decides
   // which of the replayed events reach the UI.
   const earlyNotifications: { method: string; params: unknown }[] = [];
+  let earlyNotificationChars = 0;
   /** Dedupes repeated identical auth-error stderr lines into one block. */
   let lastAuthLine: string | undefined;
 
   handlers.onNotification = (method, params) => {
     const live = liveRef.current;
     if (!live) {
+      // Bound startup replay; fail visibly instead of silently dropping events.
+      earlyNotificationChars += JSON.stringify({ method, params }).length;
+      if (earlyNotifications.length >= 256 || earlyNotificationChars > 4 * 1024 * 1024) {
+        acp.close(new Error("Agent exceeded the startup notification limit"));
+        earlyNotifications.length = 0;
+        return;
+      }
       earlyNotifications.push({ method, params });
       return;
     }
@@ -531,7 +531,6 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
 
   try {
     await spawnChild(input.sessionId, path, devinSpawnArgs(), input.cwd);
-    markTurn(input.sessionId, "devin spawned");
   } catch (error) {
     unwatchChild(input.sessionId);
     acp.close(error instanceof Error ? error : new Error(String(error)));
@@ -557,7 +556,6 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     }
     const agentCaps = asRecord(asRecord(initResult)?.agentCapabilities);
     const supportsLoad = agentCaps?.loadSession === true;
-    markTurn(input.sessionId, "devin initialized");
 
     let setup: unknown;
     let acpSessionId: string | undefined;
@@ -595,10 +593,6 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       acpSessionId = sessionIdFromResult(setup);
     }
     if (!acpSessionId) throw new Error("Devin did not return a session id");
-    markTurn(
-      input.sessionId,
-      didLoad ? "devin session loaded" : "devin session started",
-    );
 
     const configOptions = devinConfigOptions(asRecord(setup)?.configOptions);
     const modes = devinModesFromSetup(setup);
@@ -641,7 +635,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       providerSessionId: acpSessionId,
     });
     live.onEvent({ type: "session.started" });
-    for (const early of earlyNotifications) {
+    for (const early of earlyNotifications.splice(0)) {
       handleNotification(live, early.method, early.params);
     }
     return live;
@@ -750,7 +744,6 @@ async function prompt(live: Live, input: SendTurnInput): Promise<void> {
         },
         PROMPT_TIMEOUT_MS,
       );
-      markTurn(input.sessionId, "devin prompt resolved");
     } finally {
       live.promptInFlight -= 1;
     }
@@ -931,9 +924,8 @@ async function handlePermission(live: Live, id: JsonRpcId, params: unknown) {
     return;
   }
 
-  // The UI needs a numeric requestId; give non-numeric ACP ids a synthetic
-  // one (large, so it cannot collide with server-chosen numeric ids).
-  const requestId = typeof id === "number" ? id : (live.nextRequestId += 1);
+  // Keep UI identity independent of both string and numeric wire request ids.
+  const requestId = ++live.nextRequestId;
   live.onEvent({
     type: "approval.requested",
     requestId,
@@ -974,7 +966,7 @@ async function handleElicitation(live: Live, id: JsonRpcId, params: unknown, can
       .catch(() => undefined);
     return;
   }
-  const requestId = typeof id === "number" ? id : (live.nextRequestId += 1);
+  const requestId = ++live.nextRequestId;
   live.onEvent({
     type: "question.asked",
     requestId,

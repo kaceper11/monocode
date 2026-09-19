@@ -1,8 +1,5 @@
-import {
-  acpPermissionRequest,
-  acpPermissionOptionId,
-  AcpClient,
-} from "./acp";
+import { AcpClient } from "./acp";
+import { acpPermissionRequest, acpPermissionOptionId } from "./acpProtocol";
 import type { JsonRpcId } from "./jsonRpc";
 import {
   killChild,

@@ -3,7 +3,6 @@ import { isInFlightSession } from "./inFlight";
 import { displayPath } from "./paths";
 import {
   sessionDisplayTitle,
-  sessionWorkCwd,
   type Block,
   type HarnessId,
   type Session,
@@ -12,8 +11,6 @@ import {
 export type LiveAgent = {
   id: string;
   cwd: string;
-  /** The copy the session actually works in (`worktreeCwd` when bound). */
-  workCwd: string;
   title: string;
   harness: HarnessId;
   activity: string;
@@ -59,7 +56,6 @@ function toLiveAgent(session: Session, unseenFinished: boolean): LiveAgent {
   return {
     id: session.id,
     cwd: session.cwd,
-    workCwd: sessionWorkCwd(session),
     title: sessionDisplayTitle(session.title, session.harness),
     harness: session.harness,
     activity: done

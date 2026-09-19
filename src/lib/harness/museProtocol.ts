@@ -527,7 +527,7 @@ export function museDeltaEvent(
   const field = stringField(rec, "field") ?? "text";
   const state = items.get(itemId);
   if (!state) return [];
-  // Reminder children render as status only; no field streams a tool row.
+  // Reminder children are bookkeeping; no field streams a tool row.
   if (state.kind === "reminderChild") return [];
 
   if (field === "text") {
@@ -861,13 +861,6 @@ export function museErrorKind(error: unknown): string | undefined {
     (error as { data?: unknown } | null | undefined)?.data,
   );
   return stringField(data, "kind");
-}
-
-export function isMuseSessionMissing(error: unknown): boolean {
-  const kind = museErrorKind(error);
-  if (kind === "sessionNotFound" || kind === "notFound") return true;
-  const message = error instanceof Error ? error.message : String(error);
-  return /session.*not found|unknown session/i.test(message);
 }
 
 export function museAuthError(error: unknown, verb = "start"): Error {

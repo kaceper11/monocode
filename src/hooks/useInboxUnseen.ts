@@ -1,18 +1,8 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
-import {
-  inboxFetchPaths,
   inboxListCacheKey,
   inboxItemKey,
-  inboxProjectIdentities,
   inboxProjectsForRail,
-  inboxRailKeyResolver,
   listInboxItems,
   type InboxItem,
   type InboxQuery,
@@ -46,11 +36,10 @@ import {
 } from "../lib/sessionWorkItem";
 import {
   markLinkedSessionUpdateSeen,
-  linkedSessionSeenAll,
+  linkedSessionSeenAt,
   subscribeLinkedSessionSeen,
 } from "../lib/linkedSessionSeen";
 import { loadHiddenLinearTeamIds } from "../lib/linear";
-import { projectsSnapshot, subscribeProjects } from "../lib/projects";
 import type { RecentProject } from "../lib/recents";
 import type { SessionSummary } from "../lib/sessionStore";
 import { playCue } from "../lib/sounds";
@@ -73,6 +62,8 @@ import {
   subscribeInboxSelfActivity,
 } from "../lib/inboxSelfActivity";
 
+import { listInboxIntegrations } from "../lib/inboxIntegrations";
+
 const POLL_MS = 30_000;
 const FALLBACK_REFRESH_MS = 60_000;
 const MAX_CONCURRENT_LOOKUPS = 3;
@@ -93,7 +84,8 @@ function mergeSnapshots(
 ): ReadonlyMap<string, InboxItem> {
   let next: Map<string, InboxItem> | undefined;
   for (const [key, item] of snapshots) {
-    if (current.get(key)?.updatedAt === item.updatedAt) continue;
+    const previous = current.get(key);
+    if (previous?.updatedAt === item.updatedAt && previous.account === item.account) continue;
     next ??= new Map(current);
     next.set(key, item);
   }
@@ -149,11 +141,9 @@ export function useInboxActivity(
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
   const fallbackFetchedAt = useRef(new Map<string, number>());
-  const targets = useMemo(() => linkedWorkItemTargets(sessions), [sessions]);
-  const targetKey = useMemo(
-    () => targets.map((target) => target.key).join("\0"),
-    [targets],
-  );
+  const targetKey = linkedWorkItemTargets(sessions)
+    .map((target) => target.key)
+    .join("\0");
 
   const applyUnseen = useCallback(() => {
     const preferences = loadNotificationPreferences();
@@ -187,11 +177,8 @@ export function useInboxActivity(
     [],
   );
 
-  // Repulling on a project-store save is what lands a just-added project's
-  // items without waiting for the next interval or a remount.
-  const projectsRaw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
-
   useEffect(() => {
+    const projects = inboxProjectsForRail(recents, cwd);
     let cancelled = false;
     let pulling = false;
     let pullAgain = false;
@@ -202,12 +189,8 @@ export function useInboxActivity(
         return;
       }
       pulling = true;
-      // Recomputed per pass — membership edits between polls are picked up.
-      const projects = inboxProjectsForRail(recents, cwd);
-      const filters = pruneInboxFilters(
-        loadInboxFilters(),
-        inboxProjectIdentities(projects),
-      );
+      const projectPaths = projects.map((project) => project.path);
+      const filters = pruneInboxFilters(loadInboxFilters(), projectPaths);
       const query: InboxQuery = {
         assignedToMe: filters.assignedToMe,
         state: inboxFetchState(filters),
@@ -215,25 +198,18 @@ export function useInboxActivity(
         linearHiddenTeamIds: loadHiddenLinearTeamIds(),
       };
       try {
-        // No rail projects still refreshes linked items via the fallback.
+        // Preserve upstream's no-project boundary; added services are project-independent.
         const listed = projects.length
-          ? await listInboxItems(inboxFetchPaths(projects), query, { force })
-          : { items: [], errors: {} };
+          ? await listInboxItems(projects, query, { force })
+          : await listInboxIntegrations(query.state);
         if (cancelled) return;
-        const visible = applyInboxFilters(
-          listed.items,
-          filters,
-          "",
-          Date.now(),
-          undefined,
-          inboxRailKeyResolver(projects),
-        );
+        const visible = applyInboxFilters(listed.items, filters, "");
         rememberNotificationProjects(
           listed.items.map(inboxNotificationProject),
         );
         const changed = notifications.current.observe(
           listed.items,
-          inboxListCacheKey(inboxFetchPaths(projects), query),
+          inboxListCacheKey(projects, query),
           Object.keys(listed.errors) as InboxProvider[],
         );
         const selfAuthored = changed.filter((item) =>
@@ -287,7 +263,10 @@ export function useInboxActivity(
         }
         applyUnseen();
 
-        const targets = linkedWorkItemTargets(sessionsRef.current);
+        const targets = linkedWorkItemTargets(sessionsRef.current).filter(
+          (target) => projects.length > 0 ||
+            target.item.provider === "jira" || target.item.provider === "azure",
+        );
         const liveKeys = new Set(targets.map((target) => target.key));
         for (const key of fallbackFetchedAt.current.keys()) {
           if (!liveKeys.has(key)) fallbackFetchedAt.current.delete(key);
@@ -353,16 +332,12 @@ export function useInboxActivity(
       document.removeEventListener("visibilitychange", onVis);
       stopSelfActivity();
     };
-  }, [applyUnseen, cwd, recents, targetKey, projectsRaw]);
+  }, [applyUnseen, cwd, recents, targetKey]);
 
-  const updates = useMemo(() => {
-    const seen = linkedSessionSeenAll();
-    return linkedSessionUpdates(
-      sessions,
-      workItems,
-      (sessionId) => seen[sessionId] ?? 0,
-    );
-  }, [sessions, workItems, linkedSeenRevision]);
+  const updates = useMemo(
+    () => linkedSessionUpdates(sessions, workItems, linkedSessionSeenAt),
+    [sessions, workItems, linkedSeenRevision],
+  );
   const linkedIndicators = useMemo(() => {
     const preferences = loadNotificationPreferences();
     return new Set(
@@ -384,4 +359,9 @@ export function useInboxActivity(
     linkedSessionUpdates: updates,
     linkedSessionUpdateIds: linkedIndicators,
   };
+}
+
+/** Badge-only compatibility wrapper for consumers that do not render sessions. */
+export function useInboxUnseen(recents: RecentProject[], cwd: string): boolean {
+  return useInboxActivity(recents, cwd, []).unseen;
 }

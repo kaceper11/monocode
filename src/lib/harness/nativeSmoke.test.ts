@@ -154,7 +154,6 @@ it.skipIf(!provider || comparison)(
       );
     }
     const direct: { turn: number; completedMs: number }[] = [];
-    let prewarmMs: number | undefined;
     const samples: {
       turn: number;
       firstContentMs?: number;
@@ -163,12 +162,6 @@ it.skipIf(!provider || comparison)(
       errors: string[];
     }[] = [];
     try {
-      if (process.env.MONOCODE_PREWARM === "1") {
-        const start = performance.now();
-        await adapter.prewarm?.({ sessionId, cwd, model, modelSettings,
-          runtimeMode: "supervised", onEvent: () => undefined });
-        prewarmMs = performance.now() - start;
-      }
       for (let i = 1; i <= (pairs || 3); i++) {
         const text = greetings ? ["hey", "how are you", "thanks"][i - 1]
           : `Reply with exactly HARNESS_OK_${i}. Do not use tools, read or modify files, or run commands.`;
@@ -238,7 +231,7 @@ it.skipIf(!provider || comparison)(
               event.type === "message.completed"
             ) {
               followUpRequested = true;
-              if (adapter.canSteerSession?.(sessionId)) {
+              if (adapter.canSteer !== false) {
                 followUp = adapter.steerTurn({
                   sessionId,
                   cwd,
@@ -254,7 +247,7 @@ it.skipIf(!provider || comparison)(
         };
         await adapter.sendTurn(input);
         if (followUpRequested && !followUp) {
-          // Same visible-queue fallback as App when the provider is finishing.
+          // A provider without steering receives a follow-up after completion.
           followUp = adapter.sendTurn({
             ...input,
             text: "Reply with exactly HARNESS_FOLLOWUP. Do not use tools or modify anything.",
@@ -306,7 +299,6 @@ it.skipIf(!provider || comparison)(
         cwd,
         model,
         modelSettings,
-        prewarmMs,
         samples,
         direct,
         wireModels,

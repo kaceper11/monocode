@@ -3,8 +3,9 @@
 //! All audio and transcripts stay on the machine. Models are pinned,
 //! checksummed whisper.cpp GGML files downloaded on demand to app data.
 //! Capture (cpal) and inference (whisper-rs) run on dedicated threads.
-//! `dictation_transcribe_file` is the headless diagnostics entry point.
+//! WAV decoding is test-only; no unrelated file-transcription IPC is exposed.
 
+#[cfg(test)]
 pub mod audio_file;
 pub mod capture;
 pub mod catalog;
@@ -12,13 +13,13 @@ mod download;
 pub mod engine;
 pub mod resample;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 use capture::{AudioBuffer, BufferSnapshot, MicPermission};
 use catalog::ModelSpec;
@@ -39,11 +40,10 @@ const TICK: std::time::Duration = std::time::Duration::from_millis(60);
 /// device stack must not wedge the host state machine.
 const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long dictation_stop waits for the worker's final pass before
-/// escalating to cancel — a pass that will not finish must not hold
-/// `finishing` (and block every later session) forever.
+/// escalating to cancel. A stuck worker continues to reserve the microphone
+/// until it actually exits; a timeout must never allow overlapping capture.
 const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-/// Grace after the cancel escalation, dictation_cancel's own join budget,
-/// and how long a take-over cancel waits for `finishing` to clear.
+/// Grace after the cancel escalation and dictation_cancel's join budget.
 const CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Poll cadence for the bounded joins — JoinHandle has no timed wait.
 const JOIN_POLL: std::time::Duration = std::time::Duration::from_millis(25);
@@ -52,6 +52,7 @@ const PARTIAL_WINDOW: usize = PARTIAL_WINDOW_S * WHISPER_RATE as usize;
 /// ~1.5 s of new audio between partial passes.
 const PARTIAL_EVERY: u64 = WHISPER_RATE as u64 * 3 / 2;
 const MIN_PARTIAL_SAMPLES: u64 = WHISPER_RATE as u64 / 2;
+const MAX_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 
 // ── IPC types ───────────────────────────────────────────────────────────────
 
@@ -63,6 +64,7 @@ pub struct DictationModelInfo {
     pub tier: String,
     pub size_bytes: u64,
     pub installed: bool,
+    pub removable: bool,
     /// Bytes of a resumable `.part` download on disk.
     pub partial_bytes: u64,
     pub downloading: bool,
@@ -74,11 +76,12 @@ pub struct DictationModelInfo {
 #[serde(rename_all = "camelCase")]
 pub struct DictationStatus {
     pub mic_permission: MicPermission,
-    /// idle | starting | recording | finishing (final pass running)
+    /// idle | starting (including reserved) | recording | finishing
     pub phase: &'static str,
     pub recording: bool,
     pub session_id: Option<u64>,
     pub model_id: Option<String>,
+    pub owned_by_window: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,17 +107,6 @@ pub struct DictationResult {
     /// transcript still covers whatever audio was captured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileTranscript {
-    pub text: String,
-    pub language: Option<String>,
-    pub audio_ms: u64,
-    pub model_load_ms: u64,
-    pub infer_ms: u64,
-    pub first_segment_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,10 +137,6 @@ struct SessionEvent {
 #[derive(Clone, Default)]
 pub struct DictationHost {
     inner: Arc<Mutex<HostState>>,
-    /// Serializes dictation_transcribe_file — each call loads a model
-    /// (up to ~1.6 GB plus GPU buffers), so concurrent diagnostics must not
-    /// pile up.
-    diag: Arc<Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -156,17 +144,21 @@ struct HostState {
     /// model_id → download; presence means a download thread is alive
     /// (including winding down after cancel).
     downloads: HashMap<String, Download>,
+    closed: bool,
+    /// Remember destroyed window identities so delayed prepare IPC cannot
+    /// reserve capture after teardown. Fail closed at the bounded ceiling.
+    closed_windows: HashSet<String>,
+    prepared: Option<PreparedSession>,
     session: Option<Session>,
     /// The starting worker's cancel flag, set before spawn — lets shutdown
     /// and takeover-cancel reach a session that does not exist yet and
     /// keeps two concurrent starts from both spawning.
-    starting: Option<Arc<AtomicBool>>,
+    starting: Option<SessionLease>,
     /// The session's id and cancel flag while stop/cancel joins the worker —
     /// keeps the final pass abortable and blocks an overlapping start.
-    finishing: Option<(u64, Arc<AtomicBool>)>,
-    /// Workers that outlived their stop/cancel timeout — detached but still
-    /// tracked so shutdown can reach their cancel flag and a later reap can
-    /// collect them once they actually exit.
+    finishing: Option<SessionLease>,
+    /// Workers that outlived their IPC timeout retain exclusive capture
+    /// ownership until a later reap collects their completed handles.
     orphans: Vec<OrphanedSession>,
 }
 
@@ -176,17 +168,144 @@ struct Download {
 }
 
 struct OrphanedSession {
-    id: u64,
-    cancel: Arc<AtomicBool>,
+    lease: SessionLease,
     join: WorkerJoin,
 }
 
-struct Session {
+#[derive(Clone)]
+struct SessionLease {
     id: u64,
+    window: String,
+    cancel: Arc<AtomicBool>,
+}
+
+struct PreparedSession {
+    lease: SessionLease,
+    expires: std::time::Instant,
+}
+
+struct Session {
+    lease: SessionLease,
     model_id: String,
     stop: Arc<AtomicBool>,
-    cancel: Arc<AtomicBool>,
     join: WorkerJoin,
+}
+
+impl HostState {
+    fn active_lease(&self) -> Option<&SessionLease> {
+        self.session
+            .as_ref()
+            .map(|s| &s.lease)
+            .or(self.starting.as_ref())
+            .or(self.finishing.as_ref())
+            .or_else(|| self.orphans.first().map(|s| &s.lease))
+            .or_else(|| self.prepared.as_ref().map(|s| &s.lease))
+    }
+
+    fn expire_prepared(&mut self) {
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|s| s.expires <= std::time::Instant::now())
+        {
+            self.prepared = None;
+        }
+    }
+
+    fn reserve(&mut self, window: &str) -> Result<u64, String> {
+        self.expire_prepared();
+        if self.closed {
+            return Err("Dictation is shutting down".into());
+        }
+        if self.closed_windows.contains(window) || self.closed_windows.len() >= 1024 {
+            return Err("This dictation window has closed; reopen the app if needed".into());
+        }
+        if self.active_lease().is_some() {
+            return Err("A dictation session is already running".into());
+        }
+        let id = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+        self.prepared = Some(PreparedSession {
+            lease: SessionLease {
+                id,
+                window: window.into(),
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            expires: std::time::Instant::now() + START_TIMEOUT,
+        });
+        Ok(id)
+    }
+
+    fn begin(&mut self, window: &str, id: u64) -> Result<SessionLease, String> {
+        self.expire_prepared();
+        if self.closed
+            || !self
+                .prepared
+                .as_ref()
+                .is_some_and(|s| s.lease.matches(window, id, false))
+        {
+            return Err("Dictation reservation expired or was cancelled".into());
+        }
+        let lease = self.prepared.take().unwrap().lease;
+        self.starting = Some(lease.clone());
+        Ok(lease)
+    }
+
+    fn request_cancel(
+        &mut self,
+        window: &str,
+        id: u64,
+        takeover: bool,
+    ) -> Result<Option<Session>, String> {
+        let Some(lease) = self.active_lease() else {
+            return Ok(None);
+        };
+        if !lease.matches(window, id, takeover) {
+            return Err("Dictation session changed or belongs to another window".into());
+        }
+        lease.cancel.store(true, Ordering::Relaxed);
+        // A reservation has no worker; cancelling it prevents a late start.
+        if self.prepared.take().is_some() {
+            return Ok(None);
+        }
+        // Starting/finalizing workers already have an IPC owner. Keep their
+        // reservation until that owner joins or transfers the worker to orphans.
+        let Some(session) = self.session.take() else {
+            return Ok(None);
+        };
+        self.finishing = Some(session.lease.clone());
+        Ok(Some(session))
+    }
+
+    fn cancel_window(&mut self, window: Option<&str>) {
+        let matches = |lease: &SessionLease| window.is_none_or(|w| w == lease.window);
+        if self.prepared.as_ref().is_some_and(|s| matches(&s.lease)) {
+            self.prepared = None;
+        }
+        if self.session.as_ref().is_some_and(|s| matches(&s.lease)) {
+            let session = self.session.take().unwrap();
+            session.lease.cancel.store(true, Ordering::Relaxed);
+            self.orphans.push(OrphanedSession {
+                lease: session.lease,
+                join: session.join,
+            });
+        }
+        for lease in self
+            .starting
+            .iter()
+            .chain(self.finishing.iter())
+            .chain(self.orphans.iter().map(|s| &s.lease))
+        {
+            if matches(lease) {
+                lease.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl SessionLease {
+    fn matches(&self, window: &str, id: u64, takeover: bool) -> bool {
+        self.id == id && (self.window == window || takeover)
+    }
 }
 
 impl DictationHost {
@@ -194,30 +313,36 @@ impl DictationHost {
         Self::default()
     }
 
-    /// Abort any live session and download on window teardown or exit. The
-    /// webview is gone, so events no longer matter — workers are detached
-    /// (join handles dropped) and exit on their own, dropping the engine and
-    /// releasing the mic. Without this a destroyed window leaves capture
-    /// running indefinitely.
+    /// Window teardown cancels only its capture; other windows and app-wide
+    /// downloads retain their ownership.
+    pub fn shutdown_window(&self, window: &str) {
+        let mut state = self.inner.lock().unwrap();
+        // ponytail: cap retired window IDs at 1024 and fail closed rather
+        // than evicting an identity that delayed IPC could still reference.
+        if state.closed_windows.len() < 1024 {
+            state.closed_windows.insert(window.into());
+        }
+        state.cancel_window(Some(window));
+    }
+
+    /// Upstream hides windows with running agents instead of destroying them.
+    /// Stop microphone use while preserving that window's ability to reopen.
+    pub fn suspend_window(&self, app: &AppHandle, window: &str) {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(lease) = state.active_lease().filter(|s| s.window == window) {
+            emit_session(app, lease, "cancelled", None);
+        }
+        state.cancel_window(Some(window));
+    }
+
+    /// App exit cancels every worker. Keep their handles until host teardown;
+    /// no later IPC may reserve capture or start a download.
     pub fn shutdown(&self) {
         let mut state = self.inner.lock().unwrap();
-        if let Some(session) = state.session.take() {
-            session.cancel.store(true, Ordering::Relaxed);
-        }
-        if let Some(cancel) = state.starting.take() {
-            // A worker blocked in capture start: dictation_start re-checks
-            // the flag after the channel resolves and refuses to register
-            // the session, so the mic is released instead of orphaned.
-            cancel.store(true, Ordering::Relaxed);
-        }
-        if let Some((_, cancel)) = state.finishing.take() {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        for (_, download) in state.downloads.drain() {
+        state.closed = true;
+        state.cancel_window(None);
+        for download in state.downloads.values() {
             download.cancel.store(true, Ordering::Relaxed);
-        }
-        for orphan in &state.orphans {
-            orphan.cancel.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -233,11 +358,12 @@ fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
-fn emit_session(app: &AppHandle, session_id: u64, state: &'static str, error: Option<String>) {
-    let _ = app.emit(
+fn emit_session(app: &AppHandle, lease: &SessionLease, state: &'static str, error: Option<String>) {
+    let _ = app.emit_to(
+        lease.window.as_str(),
         SESSION_EVENT,
         SessionEvent {
-            session_id,
+            session_id: lease.id,
             state,
             error,
         },
@@ -246,7 +372,7 @@ fn emit_session(app: &AppHandle, session_id: u64, state: &'static str, error: Op
 
 // ── Model commands ──────────────────────────────────────────────────────────
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn dictation_catalog(
     app: AppHandle,
     host: State<'_, DictationHost>,
@@ -265,7 +391,7 @@ fn installed_path(dir: &Path, spec: &ModelSpec) -> Option<PathBuf> {
     let path = download::final_path(dir, spec);
     path.metadata()
         .ok()
-        .filter(|m| m.len() == spec.size_bytes)
+        .filter(|m| m.is_file() && m.len() == spec.size_bytes)
         .map(|_| path)
 }
 
@@ -308,13 +434,15 @@ fn model_info(dir: &Path, spec: &ModelSpec, state: &HostState) -> DictationModel
         tier: spec.tier.into(),
         size_bytes: spec.size_bytes,
         installed,
+        removable: download::final_path(dir, spec).symlink_metadata().is_ok()
+            || download::part_path(dir, spec).symlink_metadata().is_ok(),
         partial_bytes,
         downloading: state.downloads.contains_key(spec.id),
         supports_translate: spec.supports_translate,
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn dictation_model_install(
     app: AppHandle,
     host: State<'_, DictationHost>,
@@ -325,6 +453,9 @@ pub fn dictation_model_install(
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut state = host.inner.lock().unwrap();
+        if state.closed {
+            return Err("Dictation is shutting down".into());
+        }
         if let Some(download) = state.downloads.get(spec.id) {
             if download.join.is_finished() {
                 // Finished but not yet self-removed — the worker is done
@@ -378,11 +509,12 @@ pub fn dictation_model_cancel_download(
 /// worker itself could not send if it panicked. Also collects orphaned
 /// workers that have since exited.
 fn reap_finished_session(state: &mut HostState, app: &AppHandle) {
+    state.expire_prepared();
     if let Some(s) = state.session.as_ref() {
         if s.join.is_finished() {
             let stale = state.session.take().unwrap();
             if stale.join.join().is_err() {
-                emit_panic(app, stale.id);
+                emit_panic(app, &stale.lease);
             }
         }
     }
@@ -393,7 +525,7 @@ fn reap_finished_session(state: &mut HostState, app: &AppHandle) {
             // An orphan was already reported — joining just frees the
             // thread; a panic is still worth surfacing to any listener.
             if orphan.join.join().is_err() {
-                emit_panic(app, orphan.id);
+                emit_panic(app, &orphan.lease);
             }
         } else {
             i += 1;
@@ -426,57 +558,55 @@ fn join_with_timeout(
 
 /// The worker died before it could report — surface it on the session
 /// event channel like any other failure.
-fn emit_panic(app: &AppHandle, id: u64) {
-    emit_session(app, id, "error", Some("Dictation worker panicked".into()));
+fn emit_panic(app: &AppHandle, lease: &SessionLease) {
+    emit_session(
+        app,
+        lease,
+        "error",
+        Some("Dictation worker panicked".into()),
+    );
 }
 
-/// Clear `starting` only while it still belongs to this attempt — a
-/// takeover cancel takes the flag and a retried start may already have
-/// installed a newer one, which must not be wiped.
-fn clear_starting(state: &mut HostState, cancel: &Arc<AtomicBool>) {
-    if state
-        .starting
-        .as_ref()
-        .is_some_and(|flag| Arc::ptr_eq(flag, cancel))
-    {
+/// Clear only the reservation owned by this start attempt.
+fn clear_starting(state: &mut HostState, id: u64) {
+    if state.starting.as_ref().is_some_and(|lease| lease.id == id) {
         state.starting = None;
     }
 }
 
-/// Clear `finishing` only while it still names this session — after a
-/// takeover force-clear a newer session may already own the entry.
+/// Clear only the reservation owned by this finishing session.
 fn clear_finishing(state: &mut HostState, id: u64) {
-    if state
-        .finishing
-        .as_ref()
-        .is_some_and(|(owner, _)| *owner == id)
-    {
+    if state.finishing.as_ref().is_some_and(|lease| lease.id == id) {
         state.finishing = None;
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn dictation_model_remove(
     app: AppHandle,
     host: State<'_, DictationHost>,
     model_id: String,
 ) -> Result<(), String> {
     let spec = catalog::find(&model_id).ok_or("Unknown dictation model")?;
-    {
-        let mut state = host.inner.lock().unwrap();
-        reap_finished_session(&mut state, &app);
-        if state.downloads.contains_key(spec.id) {
-            return Err("Cancel the download before removing this model".into());
-        }
-        if state.starting.is_some() || state.finishing.is_some() {
-            return Err("A dictation session is starting or finishing".into());
-        }
-        if state.session.as_ref().map(|s| s.model_id.as_str()) == Some(spec.id) {
-            return Err("Model is in use by an active dictation".into());
-        }
+    let mut state = host.inner.lock().unwrap();
+    reap_finished_session(&mut state, &app);
+    if state.downloads.contains_key(spec.id) {
+        return Err("Cancel the download before removing this model".into());
+    }
+    if state.starting.is_some() || state.finishing.is_some() || !state.orphans.is_empty() {
+        return Err("A dictation session is starting or finishing".into());
+    }
+    if state.session.as_ref().map(|s| s.model_id.as_str()) == Some(spec.id) {
+        return Err("Model is in use by an active dictation".into());
     }
     let dir = models_dir(&app)?;
-    let _ = std::fs::remove_file(download::part_path(&dir, spec));
+    let _file_lock = download::model_lock(&dir, spec)?;
+    match std::fs::remove_file(download::part_path(&dir, spec)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("Cannot remove partial model: {error}"))
+        }
+        _ => {}
+    }
     match std::fs::remove_file(download::final_path(&dir, spec)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         result => result.map_err(|e| format!("Cannot remove model: {e}")),
@@ -485,21 +615,21 @@ pub fn dictation_model_remove(
 
 // ── Permission / status commands ────────────────────────────────────────────
 
-#[tauri::command]
-pub fn dictation_status(app: AppHandle, host: State<'_, DictationHost>) -> DictationStatus {
+#[tauri::command(async)]
+pub fn dictation_status(window: Window, host: State<'_, DictationHost>) -> DictationStatus {
     // TCC can stall — never call the framework while holding the host lock.
     let mic_permission = capture::mic_permission();
     let mut state = host.inner.lock().unwrap();
-    reap_finished_session(&mut state, &app);
+    reap_finished_session(&mut state, window.app_handle());
     let active = state
         .session
         .as_ref()
         .is_some_and(|s| !s.join.is_finished());
     let phase = if active {
         "recording"
-    } else if state.starting.is_some() {
+    } else if state.starting.is_some() || state.prepared.is_some() {
         "starting"
-    } else if state.finishing.is_some() {
+    } else if state.finishing.is_some() || !state.orphans.is_empty() {
         "finishing"
     } else {
         "idle"
@@ -508,8 +638,11 @@ pub fn dictation_status(app: AppHandle, host: State<'_, DictationHost>) -> Dicta
         mic_permission,
         phase,
         recording: active,
-        session_id: state.session.as_ref().map(|s| s.id),
+        session_id: state.active_lease().map(|s| s.id),
         model_id: state.session.as_ref().map(|s| s.model_id.clone()),
+        owned_by_window: state
+            .active_lease()
+            .is_some_and(|s| s.window == window.label()),
     }
 }
 
@@ -532,15 +665,32 @@ pub fn dictation_open_mic_settings() {
 
 // ── Dictation session commands ──────────────────────────────────────────────
 
+/// Reserve an identity before opening the microphone. The composer can cancel
+/// this exact reservation if it unmounts while prepare/start IPC is in flight.
+#[tauri::command(async)]
+pub fn dictation_prepare(window: Window, host: State<'_, DictationHost>) -> Result<u64, String> {
+    if !window.is_visible().map_err(|e| e.to_string())? {
+        return Err("Open this window before starting dictation".into());
+    }
+    let mut state = host.inner.lock().unwrap();
+    reap_finished_session(&mut state, window.app_handle());
+    state.reserve(window.label())
+}
+
 #[tauri::command(async)]
 pub fn dictation_start(
-    app: AppHandle,
+    window: Window,
     host: State<'_, DictationHost>,
+    session_id: u64,
     model_id: String,
     language: Option<String>,
     translate: bool,
 ) -> Result<DictationStarted, String> {
-    let model_path = resolve_model(&app, &model_id, &language, translate)?;
+    if !window.is_visible().map_err(|e| e.to_string())? {
+        return Err("Open this window before starting dictation".into());
+    }
+    let app = window.app_handle();
+    let model_path = resolve_model(app, &model_id, &language, translate)?;
     match capture::mic_permission() {
         MicPermission::Denied | MicPermission::Restricted => {
             return Err(
@@ -555,29 +705,27 @@ pub fn dictation_start(
         }
         _ => {}
     }
-    let id = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+    let id = session_id;
     let stop = Arc::new(AtomicBool::new(false));
-    let cancel = Arc::new(AtomicBool::new(false));
-    {
+    let lease = {
         let mut state = host.inner.lock().unwrap();
-        reap_finished_session(&mut state, &app);
-        if state.session.is_some() || state.starting.is_some() || state.finishing.is_some() {
-            return Err("A dictation session is already running".into());
-        }
-        // Expose the flag before spawning so shutdown/cancel can reach the
-        // worker while it is still starting the stream.
-        state.starting = Some(Arc::clone(&cancel));
-    }
+        state.begin(window.label(), id)?
+    };
+    let cancel = Arc::clone(&lease.cancel);
 
     let buffer = AudioBuffer::shared();
     let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
 
     let spawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let app = app.clone();
+        let lease = lease.clone();
         let stop = Arc::clone(&stop);
         let cancel = Arc::clone(&cancel);
         let language = language.clone();
         std::thread::spawn(move || {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
             // Capture is created on this thread so the cpal stream never
             // crosses threads; start errors come back through `tx`.
             let capture = match capture::start(Arc::clone(&buffer)) {
@@ -599,11 +747,11 @@ pub fn dictation_start(
             // Emit the error event from here — a panic discovered only via
             // join() would otherwise wait for an unrelated command to reap.
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_session(&io, id, &model_path, language, translate, capture)
+                run_session(&io, &lease, &model_path, language, translate, capture)
             })) {
                 Ok(result) => result,
                 Err(_) => {
-                    emit_panic(&app, id);
+                    emit_panic(&app, &lease);
                     Err("Dictation worker panicked".into())
                 }
             }
@@ -612,7 +760,7 @@ pub fn dictation_start(
     let join = match spawn {
         Ok(join) => join,
         Err(_) => {
-            clear_starting(&mut host.inner.lock().unwrap(), &cancel);
+            clear_starting(&mut host.inner.lock().unwrap(), id);
             return Err("Cannot start the dictation worker".into());
         }
     };
@@ -621,14 +769,13 @@ pub fn dictation_start(
     // every start "already running", cancel and shutdown unable to reach it.
     let outcome = rx.recv_timeout(START_TIMEOUT);
     let mut state = host.inner.lock().unwrap();
-    clear_starting(&mut state, &cancel);
+    clear_starting(&mut state, id);
     match outcome {
         Ok(Ok(device_name)) if !cancel.load(Ordering::Relaxed) => {
             state.session = Some(Session {
-                id,
+                lease,
                 model_id: model_id.clone(),
                 stop,
-                cancel,
                 join,
             });
             Ok(DictationStarted {
@@ -638,9 +785,9 @@ pub fn dictation_start(
             })
         }
         Ok(Ok(_)) => {
-            // Shutdown/takeover cancelled mid-start — drop the handle; the
-            // worker exits at its loop-top cancel check and drops capture.
-            drop(join);
+            // Cancellation can arrive during model loading. Keep the
+            // reservation until capture and the engine have actually exited.
+            state.orphans.push(OrphanedSession { lease, join });
             Err("cancelled".into())
         }
         Ok(Err(error)) => {
@@ -652,7 +799,7 @@ pub fn dictation_start(
             // Detached but tracked — shutdown can still reach its cancel
             // flag and a later reap collects it if it ever exits.
             cancel.store(true, Ordering::Relaxed);
-            state.orphans.push(OrphanedSession { id, cancel, join });
+            state.orphans.push(OrphanedSession { lease, join });
             Err("Microphone did not respond — check the input device".into())
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -664,171 +811,89 @@ pub fn dictation_start(
 
 #[tauri::command(async)]
 pub fn dictation_stop(
-    app: AppHandle,
+    window: Window,
     host: State<'_, DictationHost>,
     session_id: u64,
 ) -> Result<DictationResult, String> {
     let session = {
         let mut state = host.inner.lock().unwrap();
-        // A stop for a session that isn't current must not take over whatever
-        // session replaced it — the caller's session is already gone.
-        match state.session.as_ref() {
-            Some(session) if session_id != session.id => {
-                return Err("No dictation in progress".into());
-            }
-            _ => {}
+        if !state
+            .session
+            .as_ref()
+            .is_some_and(|s| s.lease.matches(window.label(), session_id, false))
+        {
+            return Err("No dictation owned by this window".into());
         }
-        let Some(session) = state.session.take() else {
-            return Err("No dictation in progress".into());
-        };
+        let session = state.session.take().unwrap();
         session.stop.store(true, Ordering::Relaxed);
-        // Keep the cancel flag reachable so the final pass can still abort,
-        // and block a new session from overlapping this one.
-        state.finishing = Some((session.id, Arc::clone(&session.cancel)));
+        state.finishing = Some(session.lease.clone());
         session
     };
-    let id = session.id;
-    let cancel = Arc::clone(&session.cancel);
-    // Bound the wait: the final pass is unbounded CPU work, and a worker
-    // that will not exit must not hold `finishing` — and therefore block
-    // every later session — forever.
+    let lease = session.lease;
     let outcome = match join_with_timeout(session.join, STOP_TIMEOUT) {
         Ok(outcome) => outcome,
         Err(join) => {
-            // Escalate to cancel — the final pass checks the flag at each
-            // decoding step, so a healthy worker exits inside the grace.
-            cancel.store(true, Ordering::Relaxed);
+            lease.cancel.store(true, Ordering::Relaxed);
             match join_with_timeout(join, CANCEL_TIMEOUT) {
                 Ok(outcome) => outcome,
                 Err(join) => {
-                    // Truly stuck — park it so `finishing` can't wedge every
-                    // later session; reaped when (if) it ever exits.
-                    {
-                        let mut state = host.inner.lock().unwrap();
-                        clear_finishing(&mut state, id);
-                        state.orphans.push(OrphanedSession { id, cancel, join });
-                    }
-                    let message = "Dictation took too long to stop — the session was abandoned";
-                    emit_session(&app, id, "error", Some(message.into()));
+                    let mut state = host.inner.lock().unwrap();
+                    clear_finishing(&mut state, lease.id);
+                    let message =
+                        "Dictation is still stopping — wait for the microphone to be released";
+                    emit_session(window.app_handle(), &lease, "error", Some(message.into()));
+                    state.orphans.push(OrphanedSession { lease, join });
                     return Err(message.into());
                 }
             }
         }
     };
-    clear_finishing(&mut host.inner.lock().unwrap(), id);
+    clear_finishing(&mut host.inner.lock().unwrap(), lease.id);
+    if lease.cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
     match outcome {
         Ok(result) => result,
         Err(_) => {
-            emit_panic(&app, id);
+            emit_panic(window.app_handle(), &lease);
             Err("Dictation worker panicked".into())
         }
     }
 }
 
+/// Cancellation always identifies the observed reservation. Explicit takeover
+/// permits another window's exact ID, never whatever session happens to be new.
 #[tauri::command(async)]
 pub fn dictation_cancel(
-    app: AppHandle,
+    window: Window,
     host: State<'_, DictationHost>,
-    session_id: Option<u64>,
+    session_id: u64,
+    takeover: bool,
 ) -> Result<(), String> {
-    enum Pending {
-        /// The session was this call's to take — join its worker below.
-        Join(Session),
-        /// Stop/cancel already took it — the flag was set; wait for the
-        /// owner to clear `finishing` so a take-over retry can't hit a
-        /// stale "already running". Carries the watched session id.
-        WaitClear(u64),
-    }
-    let pending = {
+    let session = {
         let mut state = host.inner.lock().unwrap();
-        match state.session.as_ref() {
-            Some(session) if session_id.is_some_and(|id| id != session.id) => {
-                return Err("No dictation in progress".into());
-            }
-            _ => {}
-        }
-        match state.session.take() {
-            Some(session) => {
-                session.cancel.store(true, Ordering::Relaxed);
-                state.finishing = Some((session.id, Arc::clone(&session.cancel)));
-                Pending::Join(session)
-            }
-            None => match state.finishing.as_ref() {
-                // Stop already took the session — abort its final pass.
-                Some((id, cancel)) if session_id.is_none_or(|wanted| wanted == *id) => {
-                    cancel.store(true, Ordering::Relaxed);
-                    Pending::WaitClear(*id)
-                }
-                Some(_) => return Err("No dictation in progress".into()),
-                // An id-less cancel is an explicit takeover — a session
-                // still starting has no id yet, so only None can abort it.
-                None => match state.starting.take() {
-                    Some(cancel) if session_id.is_none() => {
-                        cancel.store(true, Ordering::Relaxed);
-                        return Ok(());
-                    }
-                    Some(cancel) => {
-                        state.starting = Some(cancel);
-                        return Err("No dictation in progress".into());
-                    }
-                    None => return Err("No dictation in progress".into()),
-                },
-            },
-        }
+        reap_finished_session(&mut state, window.app_handle());
+        let Some(session) = state.request_cancel(window.label(), session_id, takeover)? else {
+            return Ok(());
+        };
+        session
     };
-    match pending {
-        Pending::WaitClear(watched) => {
-            // The command that owns the join clears `finishing` when the
-            // worker exits — wait for it so a retried start sees a clean
-            // host. If it never clears, take the flag: the worker's cancel
-            // is already set, so the stale entry is dead weight either way.
-            let deadline = std::time::Instant::now() + CANCEL_TIMEOUT;
-            loop {
-                {
-                    let mut state = host.inner.lock().unwrap();
-                    // Done once the watched entry is gone — cleared by its
-                    // owner, or replaced by a newer session's.
-                    let still_watched = state
-                        .finishing
-                        .as_ref()
-                        .is_some_and(|(id, _)| *id == watched);
-                    if !still_watched {
-                        return Ok(());
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        state.finishing = None;
-                        return Ok(());
-                    }
-                }
-                std::thread::sleep(JOIN_POLL);
+    let lease = session.lease;
+    let outcome = join_with_timeout(session.join, CANCEL_TIMEOUT);
+    let mut state = host.inner.lock().unwrap();
+    clear_finishing(&mut state, lease.id);
+    match outcome {
+        Ok(result) => {
+            if result.is_err() {
+                emit_panic(window.app_handle(), &lease);
             }
         }
-        Pending::Join(session) => {
-            let id = session.id;
-            let cancel = Arc::clone(&session.cancel);
-            match join_with_timeout(session.join, CANCEL_TIMEOUT) {
-                Ok(outcome) => {
-                    clear_finishing(&mut host.inner.lock().unwrap(), id);
-                    if outcome.is_err() {
-                        emit_panic(&app, id);
-                    }
-                }
-                Err(join) => {
-                    // Cancel was already set — park the stuck worker rather
-                    // than blocking on it forever; reaped once it exits.
-                    {
-                        let mut state = host.inner.lock().unwrap();
-                        clear_finishing(&mut state, id);
-                        state.orphans.push(OrphanedSession { id, cancel, join });
-                    }
-                    // The owning composer is still showing this session —
-                    // nothing else will clear its UI now.
-                    emit_session(&app, id, "cancelled", None);
-                }
-            }
-            Ok(())
+        Err(join) => {
+            emit_session(window.app_handle(), &lease, "cancelled", None);
+            state.orphans.push(OrphanedSession { lease, join });
         }
     }
+    Ok(())
 }
 
 // ── Session worker ──────────────────────────────────────────────────────────
@@ -865,9 +930,31 @@ fn captured_only_silence(samples: &[f32], duration_ms: u64) -> bool {
     duration_ms > 1_500 && samples.iter().all(|s| *s == 0.0)
 }
 
+fn append_transcript(committed: &mut String, text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let separator = usize::from(!committed.is_empty());
+    if committed
+        .len()
+        .saturating_add(separator)
+        .saturating_add(text.len())
+        > MAX_TRANSCRIPT_BYTES
+    {
+        return Err(
+            "Dictation reached its text limit — keep this draft and start a new recording".into(),
+        );
+    }
+    if separator != 0 {
+        committed.push(' ');
+    }
+    committed.push_str(text);
+    Ok(())
+}
+
 fn run_session(
     io: &SessionIo<'_>,
-    session_id: u64,
+    lease: &SessionLease,
     model_path: &Path,
     language: Option<String>,
     translate: bool,
@@ -883,17 +970,17 @@ fn run_session(
     // was still opening — don't spend seconds loading a model for a dead
     // session.
     if cancel.load(Ordering::Relaxed) {
-        emit_session(app, session_id, "cancelled", None);
+        emit_session(app, lease, "cancelled", None);
         return Err("cancelled".into());
     }
     let (engine, load_ms) = match Engine::load(model_path) {
         Ok(ok) => ok,
         Err(error) => {
-            emit_session(app, session_id, "error", Some(error.clone()));
+            emit_session(app, lease, "error", Some(error.clone()));
             return Err(error);
         }
     };
-    emit_session(app, session_id, "recording", None);
+    emit_session(app, lease, "recording", None);
     let recording_since = std::time::Instant::now();
 
     let opts = TranscribeOptions {
@@ -909,14 +996,14 @@ fn run_session(
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            emit_session(app, session_id, "cancelled", None);
+            emit_session(app, lease, "cancelled", None);
             // `engine` drops here → model memory released.
             return Err("cancelled".into());
         }
         // Peek without cloning — `tail` would copy ~512 KB every 60 ms tick.
         let (end_abs, base, stream_error) = buffer.lock().unwrap().stats();
         if let Some(error) = stream_error {
-            emit_session(app, session_id, "error", Some(error.clone()));
+            emit_session(app, lease, "error", Some(error.clone()));
             return Err(error);
         }
         let enough_new = end_abs.saturating_sub(last_partial_end) >= PARTIAL_EVERY;
@@ -956,12 +1043,9 @@ fn run_session(
                             && seg_start >= committed_end_ms
                         {
                             let text = seg.text.trim();
-                            if !text.is_empty() {
-                                if !committed.is_empty() {
-                                    committed.push(' ');
-                                }
-                                committed.push_str(text);
-                            }
+                            append_transcript(&mut committed, text).inspect_err(|error| {
+                                emit_session(app, lease, "error", Some(error.clone()));
+                            })?;
                             committed_end_ms = seg_end;
                         } else {
                             deferred = true;
@@ -969,10 +1053,11 @@ fn run_session(
                         }
                     }
                     seq += 1;
-                    let _ = app.emit(
+                    let _ = app.emit_to(
+                        lease.window.as_str(),
                         PARTIAL_EVENT,
                         PartialEvent {
-                            session_id,
+                            session_id: lease.id,
                             seq,
                             committed: committed.clone(),
                             partial: join_segments(&partial),
@@ -982,13 +1067,13 @@ fn run_session(
                 }
                 Err(error) => {
                     if cancel.load(Ordering::Relaxed) {
-                        emit_session(app, session_id, "cancelled", None);
+                        emit_session(app, lease, "cancelled", None);
                         return Err("cancelled".into());
                     }
                     if stop.load(Ordering::Relaxed) {
                         break; // the partial was aborted by stop, not a failure
                     }
-                    emit_session(app, session_id, "error", Some(error.clone()));
+                    emit_session(app, lease, "error", Some(error.clone()));
                     return Err(error);
                 }
             }
@@ -1020,7 +1105,7 @@ fn run_session(
         "The microphone captured only silence — check the input device and the OS microphone privacy setting".into()
     }));
     if silent {
-        emit_session(app, session_id, "finished", None);
+        emit_session(app, lease, "finished", None);
         return Ok(DictationResult {
             text: committed,
             language: None,
@@ -1049,14 +1134,11 @@ fn run_session(
             // `committed` already covers the audio the tail skipped — the
             // merge the dropped-head case relied on, now unconditional. A
             // word clipped exactly at the boundary can echo in the tail.
-            let text = if !committed.is_empty() && !transcript.text.is_empty() {
-                format!("{} {}", committed, transcript.text)
-            } else if !committed.is_empty() {
-                committed
-            } else {
-                transcript.text
-            };
-            emit_session(app, session_id, "finished", None);
+            append_transcript(&mut committed, &transcript.text).inspect_err(|error| {
+                emit_session(app, lease, "error", Some(error.clone()));
+            })?;
+            let text = committed;
+            emit_session(app, lease, "finished", None);
             Ok(DictationResult {
                 text,
                 language: transcript.language,
@@ -1069,56 +1151,110 @@ fn run_session(
         }
         Err(error) => {
             if cancel.load(Ordering::Relaxed) {
-                emit_session(app, session_id, "cancelled", None);
+                emit_session(app, lease, "cancelled", None);
                 return Err("cancelled".into());
             }
-            emit_session(app, session_id, "error", Some(error.clone()));
+            emit_session(app, lease, "error", Some(error.clone()));
             Err(error)
         }
     }
 }
 
-// ── Diagnostics: transcribe a file without the mic ─────────────────────────
-
-/// Test entry point: transcribe/translate a WAV file through the same engine
-/// the session worker uses. Not wired to the composer.
-#[tauri::command(async)]
-pub fn dictation_transcribe_file(
-    app: AppHandle,
-    host: State<'_, DictationHost>,
-    path: String,
-    model_id: String,
-    language: Option<String>,
-    translate: bool,
-) -> Result<FileTranscript, String> {
-    let model_path = resolve_model(&app, &model_id, &language, translate)?;
-    // Each call loads the model fresh — serialize so parallel diagnostics
-    // can't multiply that memory spike.
-    let _diag = host.diag.lock().unwrap();
-    let samples = audio_file::read_wav_mono(std::path::Path::new(&path))?;
-    let audio_ms = samples.len() as u64 * 1000 / WHISPER_RATE as u64;
-    let (engine, load_ms) = Engine::load(&model_path)?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    let opts = TranscribeOptions {
-        language,
-        translate,
-        no_context: false,
-        temperature_inc: 0.2,
-    };
-    let transcript = engine.transcribe(&samples, &opts, move || cancel.load(Ordering::Relaxed))?;
-    Ok(FileTranscript {
-        text: transcript.text,
-        language: transcript.language,
-        audio_ms,
-        model_load_ms: load_ms,
-        infer_ms: transcript.infer_ms,
-        first_segment_ms: transcript.first_segment_ms,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_recording_text_limit_preserves_the_existing_transcript() {
+        let mut text = "a".repeat(MAX_TRANSCRIPT_BYTES - 3);
+        append_transcript(&mut text, "é").unwrap();
+        assert_eq!(text.len(), MAX_TRANSCRIPT_BYTES);
+        let before = text.clone();
+        assert!(append_transcript(&mut text, "next").is_err());
+        assert_eq!(text, before);
+        append_transcript(&mut text, "").unwrap();
+        assert_eq!(text, before);
+    }
+
+    #[test]
+    fn cancelled_reservation_cannot_start_or_cancel_its_replacement() {
+        let mut state = HostState::default();
+        let first = state.reserve("main").unwrap();
+        assert!(state.request_cancel("other", first, false).is_err());
+        assert!(state.begin("other", first).is_err());
+        state.request_cancel("main", first, false).unwrap();
+        let second = state.reserve("main").unwrap();
+        assert!(state.begin("main", first).is_err());
+        assert!(state.request_cancel("main", first, false).is_err());
+        // Even explicit takeover is bound to the observed session.
+        assert!(state.request_cancel("other", first, true).is_err());
+        assert_eq!(state.active_lease().unwrap().id, second);
+        state.request_cancel("other", second, true).unwrap();
+        assert!(state.active_lease().is_none());
+    }
+
+    #[test]
+    fn cancelled_start_reserves_capture_until_its_worker_exits() {
+        let mut state = HostState::default();
+        let id = state.reserve("main").unwrap();
+        let lease = state.begin("main", id).unwrap();
+        state.request_cancel("main", id, false).unwrap();
+        assert!(lease.cancel.load(Ordering::Relaxed));
+        assert!(state.reserve("other").is_err());
+        clear_starting(&mut state, id + 1);
+        assert!(state.reserve("other").is_err());
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let join = std::thread::spawn(move || {
+            let _ = rx.recv();
+            empty_result()
+        });
+        clear_starting(&mut state, id);
+        state.orphans.push(OrphanedSession { lease, join });
+        assert!(state.reserve("other").is_err());
+        drop(tx);
+        let orphan = state.orphans.pop().unwrap();
+        assert!(orphan.join.join().is_ok());
+        assert!(state.reserve("other").is_ok());
+    }
+
+    #[test]
+    fn window_teardown_cancels_only_owned_capture_and_exit_blocks_restart() {
+        let host = DictationHost::new();
+        let lease = {
+            let mut state = host.inner.lock().unwrap();
+            let id = state.reserve("main").unwrap();
+            state.begin("main", id).unwrap()
+        };
+        host.shutdown_window("other");
+        assert!(!lease.cancel.load(Ordering::Relaxed));
+        host.shutdown_window("main");
+        assert!(lease.cancel.load(Ordering::Relaxed));
+        assert!(host.inner.lock().unwrap().reserve("other").is_err());
+        host.shutdown();
+        let mut state = host.inner.lock().unwrap();
+        clear_starting(&mut state, lease.id);
+        assert!(state.reserve("main").is_err());
+    }
+
+    #[test]
+    fn abandoned_preparation_expires_without_allowing_a_late_start() {
+        let mut state = HostState::default();
+        let first = state.reserve("main").unwrap();
+        state.prepared.as_mut().unwrap().expires = std::time::Instant::now();
+        let next = state.reserve("other").unwrap();
+        assert!(state.begin("main", first).is_err());
+        assert_eq!(state.begin("other", next).unwrap().id, next);
+    }
+
+    #[test]
+    fn hidden_window_can_reopen_but_cannot_resume_cancelled_capture() {
+        let mut state = HostState::default();
+        let id = state.reserve("main").unwrap();
+        state.cancel_window(Some("main"));
+        assert!(state.begin("main", id).is_err());
+        let next = state.reserve("main").unwrap();
+        assert_ne!(id, next);
+    }
 
     fn snapshot(base: u64, len: usize) -> BufferSnapshot {
         BufferSnapshot {

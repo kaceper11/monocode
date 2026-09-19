@@ -6,10 +6,7 @@ import {
   isEditingQueuedHead,
   queuedHead,
   queuedMessageForSubmit,
-  queuedMessageOptions,
-  retainQueuedFollowUp,
 } from "./messageQueue";
-import { appendUser, appendSteerUser, stopStreaming } from "./harness/apply";
 import { newSession, type QueuedMessage, type Session } from "./session";
 
 function queued(id: string, text = id): QueuedMessage {
@@ -24,31 +21,6 @@ function chat(patch: Partial<Session> = {}): Session {
     ...patch,
   };
 }
-
-describe("follow-up delivery recovery", () => {
-  it("moves a definitely unsent steer back to the queue until real completion", () => {
-    let session = appendSteerUser(appendUser(chat({ queuedMessages: [] }), "first"), "followup");
-    const optimistic = session.blocks[session.blocks.length - 1];
-    session = retainQueuedFollowUp(session, queued("followup"), optimistic.id);
-    expect(session.blocks.map((block) => block.text)).toEqual(["first"]);
-    expect(session.busy).toBe(true);
-    expect(canDispatchQueuedHead(session)).toBe(false);
-    expect(canDispatchQueuedHead(stopStreaming(session))).toBe(true);
-    expect(session.queuedMessages?.map((row) => row.id)).toEqual(["followup"]);
-  });
-
-  it("preserves uncertain delivery evidence and pauses replay without stopping the active turn", () => {
-    const active = appendSteerUser(appendUser(chat(), "first"), "followup");
-    const failed = { ...queued("failed"), deliveryError: "transport closed" };
-    const session = retainQueuedFollowUp(retainQueuedFollowUp(active, failed), failed);
-    expect(session.blocks).toBe(active.blocks);
-    expect(session.busy).toBe(true);
-    expect(session.activeTurnModel).toBe(active.activeTurnModel);
-    expect(session.queueStatus).toBe("paused");
-    expect(session.queuedMessages?.filter((row) => row.id === "failed")).toHaveLength(1);
-    expect(canDispatchQueuedHead(stopStreaming(session))).toBe(false);
-  });
-});
 
 describe("queuedHead", () => {
   it("returns the first queued follow-up", () => {
@@ -128,15 +100,6 @@ describe("dequeueQueuedMessage", () => {
 });
 
 describe("queuedMessageForSubmit", () => {
-  it("keeps plans queued while busy and preserves intent for explicit idle delivery", () => {
-    const plan: QueuedMessage = { ...queued("plan"), intent: "plan" };
-    const session = chat({ queuedMessages: [plan], queueStatus: "paused" });
-    expect(queuedMessageForSubmit({ ...session, busy: true }, plan.id, "steer")).toBeUndefined();
-    const ready = queuedMessageForSubmit(session, plan.id, "steer");
-    expect(ready).toBe(plan);
-    expect(queuedMessageOptions(ready!)).toMatchObject({ queuedMessageId: plan.id, intent: "plan" });
-  });
-
   it("only auto-dispatches the idle head", () => {
     expect(queuedMessageForSubmit(chat(), "a", "dispatch")?.id).toBe("a");
     expect(queuedMessageForSubmit(chat(), "b", "dispatch")).toBeUndefined();
@@ -154,10 +117,4 @@ describe("queuedMessageForSubmit", () => {
     ).toBe("a");
     expect(queuedMessageForSubmit(chat(), "missing", "steer")).toBeUndefined();
   });
-});
-
-it("holds a queued head through asynchronous repair checking", () => {
- const session = { busy: false, blocks: [], queuedMessages: [{ id: "repair", text: "Fix", attachments: [] }] } as unknown as Session;
- expect(canDispatchQueuedHead(session, true)).toBe(false);
- expect(canDispatchQueuedHead(session, false)).toBe(true);
 });

@@ -52,16 +52,13 @@ describe("project return memory", () => {
       activeTabId: "tab-a1",
     });
     expect(changed.get("/alpha")).toBe("a1");
-    const history = recordTabVisit(
-      emptyTabVisitHistory({ tab: "tab-a2" }),
-      { tab: "tab-b2" },
-    );
+    const history = recordTabVisit(emptyTabVisitHistory("tab-a2"), "tab-b2");
     const back = tabVisitBack(history);
     expect(back).not.toBeNull();
     const returned = reconcileProjectReturn({
       ...state,
       memory: changed,
-      activeTabId: back && "tab" in back.current ? back.current.tab : "",
+      activeTabId: back?.current ?? "",
     });
     expect(returned.get("/alpha")).toBe("a2");
     expect(returned.get("/beta")).toBe("b2");

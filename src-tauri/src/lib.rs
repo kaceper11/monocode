@@ -1,27 +1,28 @@
 mod bounded_process;
+mod browser;
+mod browser_preview;
+pub mod dictation;
+mod power;
+mod saved_commands;
 mod wsl;
 use tauri::Manager;
 
-mod agent_config;
 mod azure;
 mod azure_inbox;
 mod azure_pipelines;
 mod azure_repos;
-mod browser;
 mod chat_background;
-mod checkout;
 mod checkpoint;
-mod checks;
 mod confluence;
 mod control;
 pub mod control_cli;
 mod cursor_store;
-pub mod dictation;
+mod external_editor;
 mod fs;
 mod gitlab;
 mod harness;
-mod inbox_context;
 mod inbox_media;
+mod integration_config;
 mod jira;
 mod linear;
 mod link_preview;
@@ -30,7 +31,7 @@ mod macos;
 mod menu;
 mod notes;
 mod notifications;
-mod power;
+mod pasteboard;
 mod proc_stats;
 mod project_logo;
 mod pty;
@@ -39,10 +40,14 @@ mod reminders;
 mod search;
 mod session_store;
 mod skills;
+#[cfg(target_os = "windows")]
+mod tray;
 mod window;
 mod window_transfer;
 #[cfg(windows)]
 mod windows;
+mod worktree_lifecycle;
+mod worktrees;
 
 // Phase 1 seam: spawn / kill harness children per MonoCode thread.
 // Adapters own the protocol; this host only supervises processes.
@@ -50,12 +55,7 @@ mod windows;
 /// Project directory for new sessions — prefer cwd, else home.
 #[tauri::command]
 fn default_cwd() -> String {
-    default_cwd_from(std::env::current_dir().ok())
-}
-
-fn default_cwd_from(cwd: Option<std::path::PathBuf>) -> String {
-    // Finder launches app bundles at the filesystem root, not a project.
-    if let Some(cwd) = cwd.filter(|path| path.parent().is_some()) {
+    if let Ok(cwd) = std::env::current_dir() {
         return fs::path_to_js(&cwd);
     }
     dirs_home()
@@ -215,15 +215,15 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .manage(browser::BrowserState::default())
+        .manage(power::PowerHost::new())
+        .manage(dictation::DictationHost::new())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(harness::HarnessHost::new())
-        .manage(power::PowerHost::new())
-        .manage(browser::BrowserState::default())
         .manage(pty::PtyHost::new())
         .manage(window_transfer::WindowTransferState::new())
-        .manage(dictation::DictationHost::new())
         .setup(|app| {
             harness::reap_orphaned_harness_processes();
             session_store::init(app.handle())?;
@@ -231,6 +231,8 @@ pub fn run() {
             reminders::init(app.handle());
             checkpoint::init(app.handle())?;
             menu::install(app.handle())?;
+            #[cfg(target_os = "windows")]
+            tray::install(app.handle())?;
             #[cfg(target_os = "macos")]
             {
                 macos::install_dock_menu(app.handle());
@@ -251,6 +253,40 @@ pub fn run() {
             menu::dispatch(app, event.id().as_ref());
         })
         .invoke_handler(tauri::generate_handler![
+            power::power_sync,
+            power::power_set_enabled,
+            power::power_status,
+            power::power_retry,
+            dictation::dictation_catalog,
+            dictation::dictation_model_install,
+            dictation::dictation_model_cancel_download,
+            dictation::dictation_model_remove,
+            dictation::dictation_status,
+            dictation::dictation_request_mic_permission,
+            dictation::dictation_open_mic_settings,
+            dictation::dictation_prepare,
+            dictation::dictation_start,
+            dictation::dictation_stop,
+            dictation::dictation_cancel,
+            browser::browser_open,
+            browser::browser_close,
+            browser::browser_navigate,
+            browser::browser_reload,
+            browser::browser_go_back,
+            browser::browser_go_forward,
+            browser::browser_set_bounds,
+            browser::browser_set_visible,
+            browser::browser_set_background,
+            browser::browser_probe,
+            browser::browser_set_recording,
+            browser::browser_capture,
+            browser::browser_devtools,
+            browser::browser_clear_data,
+            browser::browser_copy_screenshot,
+            browser::browser_find,
+            browser::browser_read_clipboard,
+            browser_preview::browser_preview_open,
+            browser_preview::browser_preview_action,
             wsl::wsl_distributions,
             wsl::wsl_connect,
             wsl::wsl_resolve_harness,
@@ -279,22 +315,8 @@ pub fn run() {
             reminders::reminder_take_open,
             reminders::reminder_register_window,
             reminders::reminder_open,
-            browser::browser_open,
-            browser::browser_close,
-            browser::browser_navigate,
-            browser::browser_reload,
-            browser::browser_go_back,
-            browser::browser_go_forward,
-            browser::browser_set_bounds,
-            browser::browser_set_visible,
-            browser::browser_set_background,
-            browser::browser_probe,
-            browser::browser_set_recording,
-            browser::browser_capture,
-            browser::browser_devtools,
-            browser::browser_clear_data,
-            browser::browser_copy_screenshot,
-            browser::browser_find,
+            external_editor::list_external_editors,
+            external_editor::open_in_external_editor,
             fs::list_dir,
             fs::list_project_files,
             fs::git_diff_stats,
@@ -311,9 +333,8 @@ pub fn run() {
             fs::git_discard_all,
             fs::git_stage_all,
             fs::git_unstage_all,
-            fs::git_keep_local,
-            fs::git_unkeep_local,
             fs::git_commit,
+            fs::git_head_message,
             fs::git_staged_context,
             fs::git_push,
             fs::git_pull,
@@ -321,48 +342,28 @@ pub fn run() {
             fs::git_range_context,
             fs::git_pr_status,
             fs::git_pr_create,
-            fs::git_pr_update,
-            fs::git_pr_body,
-            fs::git_pr_check,
             fs::git_github_status,
+            fs::github_monocode_star_status,
+            fs::github_star_monocode,
             fs::git_github_repo,
             fs::git_github_repositories,
             fs::git_github_work_item,
             fs::git_github_work_items,
             fs::git_github_work_item_details,
-            fs::git_github_issue_relations,
             fs::git_github_work_item_thread,
             fs::git_github_work_item_comment,
-            fs::git_github_pr_state,
             fs::git_github_pr_action,
             fs::git_github_pr_diff,
-            fs::git_github_submit_review,
-            fs::github_pr_prepare_checkout,
-            fs::github_pr_cancel_checkout,
-            fs::git_update_from_default,
-            fs::git_sync_branch,
-            checks::run_check,
-            fs::git_merge_context,
-            fs::git_merge_abort,
             inbox_media::fetch_inbox_media,
-            inbox_context::inbox_context_document,
-            inbox_context::inbox_context_download,
             gitlab::gitlab_status,
             gitlab::gitlab_set_config,
             gitlab::gitlab_repo,
             gitlab::gitlab_list_work_items,
             gitlab::gitlab_list_todos,
-            gitlab::gitlab_work_item,
             gitlab::gitlab_work_item_details,
             gitlab::gitlab_work_item_thread,
             gitlab::gitlab_work_item_comment,
-            gitlab::gitlab_issue_relations,
             gitlab::gitlab_mr_diff,
-            gitlab::gitlab_mr_for_branch,
-            gitlab::gitlab_mr_state,
-            gitlab::gitlab_mr_discussions,
-            gitlab::gitlab_mr_discussion_reply,
-            gitlab::gitlab_mr_discussion_resolve,
             linear::linear_status,
             jira::jira_status,
             jira::jira_set_config,
@@ -370,7 +371,6 @@ pub fn run() {
             jira::jira_options,
             jira::jira_issue_content,
             jira::jira_issue_snapshot,
-            jira::jira_issue_relations,
             jira::jira_image,
             confluence::confluence_spaces,
             confluence::confluence_search,
@@ -382,50 +382,42 @@ pub fn run() {
             azure::azure_list_items,
             azure::azure_options,
             azure::azure_item_content,
-            azure::azure_item_relations,
             azure::azure_image,
             azure_pipelines::azure_ci_context,
             azure_pipelines::azure_ci_lookup,
             azure_pipelines::azure_ci_read,
             azure_repos::azure_pr_list,
             azure_repos::azure_pr_create,
-            azure_repos::azure_pr_update,
-            azure_repos::azure_pr_remotes,
-            azure_repos::azure_pr_story_links,
             azure_repos::azure_pr_read,
             azure_repos::azure_pr_thread_comment,
-            azure_repos::azure_pr_thread_status,
             azure_repos::azure_pr_submit_review,
-            azure_repos::azure_pr_prepare_checkout,
-            azure_repos::azure_pr_cancel_checkout,
             linear::linear_set_token,
             linear::linear_list_teams,
             linear::linear_list_issues,
             linear::linear_issue_details,
-            linear::linear_issue_snapshot,
-            linear::linear_issue_relations,
             linear::linear_issue_thread,
             linear::linear_issue_comment,
             link_preview::fetch_link_preview,
             fs::git_branches,
-            fs::worktrees::git_worktrees,
-            fs::worktrees::git_branch_changed_files,
-            fs::worktrees::git_repository_family,
-            fs::worktrees::git_worktree_refs,
-            fs::worktrees::git_worktree_create,
-            fs::worktrees::git_worktree_checkout,
-            fs::worktrees::git_worktree_remove,
-            fs::worktrees::git_worktree_safety,
-            fs::worktrees::git_worktree_removal_preview,
             fs::git_checkout,
             fs::git_create_branch,
             fs::git_stash,
+            worktrees::git_worktrees,
+            worktrees::git_worktree_create,
+            worktrees::git_orchestration_worktree_create,
+            worktrees::git_worktree_rename_branch,
+            worktrees::git_worktree_check_remove,
+            worktrees::git_worktree_remove,
+            worktrees::git_orchestration_worktree_remove,
+            worktrees::git_orchestration_branch_remove,
             fs::create_path,
             fs::rename_path,
             fs::delete_path,
             fs::copy_path,
             fs::move_path,
             fs::reveal_path,
+            pasteboard::clipboard_file_paths,
+            pasteboard::copy_file_to_clipboard,
             fs::clone_repo,
             fs::read_file_preview,
             fs::stat_files,
@@ -438,9 +430,6 @@ pub fn run() {
             fs::omp_active_assistant_texts,
             fs::write_text_file,
             skills::list_skills,
-            agent_config::agent_config_inventory,
-            agent_config::agent_config_set_enabled,
-            agent_config::agent_config_remove,
             search::search_project,
             cursor_store::cursor_tool_calls,
             cursor_store::cursor_subagent_runs,
@@ -452,6 +441,7 @@ pub fn run() {
             harness::harness_resolve_pi,
             harness::harness_resolve_fx,
             harness::harness_resolve_grok,
+            harness::harness_resolve_hermes,
             harness::harness_resolve_devin,
             harness::harness_resolve_copilot,
             harness::harness_resolve_muse,
@@ -464,18 +454,16 @@ pub fn run() {
             harness::harness_sse_open,
             harness::harness_sse_close,
             harness::harness_exec,
-            power::power_sync,
-            power::power_set_enabled,
-            power::power_status,
-            power::power_retry,
+            harness::provider_account_remove,
             rate_limits::fetch_claude_usage,
+            rate_limits::fetch_opencode_go_usage,
             pty::pty_spawn,
             pty::pty_write,
             pty::pty_resize,
             pty::pty_status,
-            pty::pty_resources,
             pty::pty_kill,
-            pty::pty_kill_workload,
+            pty::resources::pty_resources,
+            pty::resources::pty_kill_workload,
             pty::pty_kill_all,
             session_store::session_upsert,
             session_store::session_list_by_project,
@@ -500,6 +488,9 @@ pub fn run() {
             checkpoint::session_checkpoint_prepare,
             checkpoint::session_checkpoint_capture,
             checkpoint::session_checkpoint_status,
+            checkpoint::session_checkpoint_apply,
+            checkpoint::session_checkpoint_cleanup_safe,
+            checkpoint::session_checkpoint_forget,
             checkpoint::session_checkpoint_file_diff,
             checkpoint::session_checkpoint_undo,
             checkpoint::session_checkpoint_keep,
@@ -509,7 +500,9 @@ pub fn run() {
             open_new_window,
             window::hide_window,
             window::destroy_window,
-            window::confirm_quit,
+            window::quit_poll_reply,
+            window::quit_decision,
+            window::quit_ready,
             window::set_window_glass_enabled,
             window_transfer::stage_window_transfer,
             window_transfer::take_window_transfer,
@@ -520,17 +513,6 @@ pub fn run() {
             project_logo::save_project_logo,
             project_logo::remove_project_logo,
             project_logo::forget_logo_file,
-            dictation::dictation_catalog,
-            dictation::dictation_model_install,
-            dictation::dictation_model_cancel_download,
-            dictation::dictation_model_remove,
-            dictation::dictation_status,
-            dictation::dictation_request_mic_permission,
-            dictation::dictation_open_mic_settings,
-            dictation::dictation_start,
-            dictation::dictation_stop,
-            dictation::dictation_cancel,
-            dictation::dictation_transcribe_file,
         ])
         .build(tauri::generate_context!())
         .expect("error while building MonoCode");
@@ -558,9 +540,14 @@ pub fn run() {
             event: tauri::WindowEvent::Destroyed,
             ..
         } => {
-            if let Some(host) = handle.try_state::<power::PowerHost>() {
-                host.drop_window(Some(handle), &label);
-            }
+            handle
+                .state::<power::PowerHost>()
+                .drop_window(Some(handle), &label);
+            handle
+                .state::<dictation::DictationHost>()
+                .shutdown_window(&label);
+            browser_preview::close_for_owner(handle, &label);
+            window::forget_quit_window(handle, &label);
             let other_window = handle.webview_windows().keys().any(|name| name != &label);
             control::window_closed(handle, &label);
             if !other_window {
@@ -583,9 +570,8 @@ pub fn run() {
             window::request_quit(handle);
         }
         tauri::RunEvent::Exit => {
-            if let Some(host) = handle.try_state::<power::PowerHost>() {
-                host.release(Some(handle));
-            }
+            handle.state::<dictation::DictationHost>().shutdown();
+            handle.state::<power::PowerHost>().release(Some(handle));
             reap_harness_children(handle);
         }
         _ => {}
@@ -599,31 +585,9 @@ fn reap_harness_children(handle: &tauri::AppHandle) {
     if let Some(host) = handle.try_state::<pty::PtyHost>() {
         host.kill_all();
     }
-    if let Some(host) = handle.try_state::<dictation::DictationHost>() {
-        host.shutdown();
-    }
-    checks::reap_running();
 }
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
 pub fn ensure_macos_dev_bundle() {
     macos::ensure_dev_bundle();
-}
-
-#[cfg(test)]
-mod default_cwd_tests {
-    #[test]
-    fn root_launch_uses_home_but_project_launch_keeps_its_directory() {
-        let project = std::env::temp_dir().join("monocode-default-project");
-        assert_eq!(
-            super::default_cwd_from(Some(project.clone())),
-            crate::fs::path_to_js(&project)
-        );
-        let root = project.ancestors().last().unwrap().to_path_buf();
-        let home = super::dirs_home().unwrap();
-        assert_eq!(
-            super::default_cwd_from(Some(root)),
-            crate::fs::path_to_js(std::path::Path::new(&home))
-        );
-    }
 }

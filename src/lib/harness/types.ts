@@ -14,8 +14,6 @@ export type HarnessEvent =
   | { type: "session.started" }
   | { type: "session.ended"; code?: number | null }
   | { type: "session.error"; message: string }
-  /** Transient host activity; never changes turn ownership or completion. */
-  | { type: "session.activity"; text?: string }
   | { type: "session.providerBound"; providerSessionId: string }
   | {
       type: "session.configChanged";

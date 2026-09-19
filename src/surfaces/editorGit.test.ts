@@ -45,15 +45,6 @@ describe("stageChunkText", () => {
 });
 
 describe("revertChunkText", () => {
-  it("unstages one hunk and leaves a later hunk staged", () => {
-    const head = "alpha\nbeta\ngamma\ndelta\n";
-    const index = "alpha\nBETA\ngamma\nDELTA\n";
-    const beta = Text.of(index.split("\n")).line(2).from;
-    expect(revertChunkText(head, index, beta)).toBe(
-      "alpha\nbeta\ngamma\nDELTA\n",
-    );
-  });
-
   it("restores a deleted line", () => {
     const original = "alpha\nbeta\ngamma\n";
     const current = "alpha\ngamma\n";

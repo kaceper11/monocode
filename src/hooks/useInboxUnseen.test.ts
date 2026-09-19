@@ -18,10 +18,11 @@ import {
 } from "../lib/inboxSelfActivity";
 import { useInboxActivity, type InboxActivity } from "./useInboxUnseen";
 
-const { githubWorkItem, listInboxItems, refreshLinkedWorkItem, playCue } =
+const { githubWorkItem, listInboxItems, listInboxIntegrations, refreshLinkedWorkItem, playCue } =
   vi.hoisted(() => ({
     githubWorkItem: vi.fn(),
     listInboxItems: vi.fn(),
+    listInboxIntegrations: vi.fn(),
     refreshLinkedWorkItem: vi.fn(),
     playCue: vi.fn(),
   }));
@@ -29,6 +30,10 @@ vi.mock("../lib/githubTasks", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../lib/githubTasks")>()),
   githubWorkItem,
   listInboxItems,
+}));
+vi.mock("../lib/inboxIntegrations", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/inboxIntegrations")>()),
+  listInboxIntegrations,
 }));
 vi.mock("../lib/linkedWorkItemRefresh", () => ({
   refreshLinkedWorkItem,
@@ -71,9 +76,10 @@ let container: HTMLDivElement;
 let activity: InboxActivity;
 const recents = [];
 let sessions = [session];
+let cwd = "/tmp/app";
 
 function Harness() {
-  activity = useInboxActivity(recents, "/tmp/app", sessions);
+  activity = useInboxActivity(recents, cwd, sessions);
   return null;
 }
 
@@ -86,7 +92,10 @@ async function mount() {
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   localStorage.clear();
+  cwd = "/tmp/app";
   listInboxItems.mockReset();
+  listInboxIntegrations.mockReset();
+  listInboxIntegrations.mockResolvedValue({ items: [], errors: {} });
   githubWorkItem.mockReset();
   refreshLinkedWorkItem.mockReset();
   refreshLinkedWorkItem.mockImplementation(async (_cwd, linked) =>
@@ -110,6 +119,33 @@ afterEach(() => {
 });
 
 describe("Inbox activity polling", () => {
+  it("does not poll upstream providers without a rail project", async () => {
+    cwd = "";
+    listInboxItems.mockResolvedValue({ items: [], errors: {} });
+    await mount();
+    expect(listInboxIntegrations).toHaveBeenCalledOnce();
+    expect(listInboxItems).not.toHaveBeenCalled();
+    expect(refreshLinkedWorkItem).not.toHaveBeenCalled();
+  });
+
+  it("does not bind a legacy link to listed accounts as the connection changes", async () => {
+    vi.useFakeTimers();
+    const linked = {
+      provider: "jira" as const, kind: "issue" as const, repo: "", number: 123,
+      url: "https://acme.atlassian.net/browse/PROJ-123",
+    };
+    sessions = [{ ...session, linkedWorkItem: linked }];
+    let row: InboxItem = { ...remote, ...linked, kind: "jira", account: "account-a" };
+    listInboxItems.mockImplementation(async () => ({ items: [row], errors: {} }));
+    await mount();
+    expect(activity.linkedSessionUpdates.has(session.id)).toBe(false);
+    expect(refreshLinkedWorkItem).not.toHaveBeenCalled();
+    row = { ...row, account: "account-b" };
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(activity.linkedSessionUpdates.has(session.id)).toBe(false);
+    expect(refreshLinkedWorkItem).not.toHaveBeenCalled();
+  });
+
   it("updates Inbox and linked-session indicators on category changes without consuming unread activity", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-09-14T12:00:00Z"));
@@ -230,7 +266,7 @@ describe("Inbox activity polling", () => {
     );
   });
 
-  it("matches linked GitLab items from the shared Inbox listing", async () => {
+  it("does not activate fork-only GitLab link polling for retained legacy records", async () => {
     const gitlabItem: InboxItem = {
       ...remote,
       provider: "gitlab",
@@ -252,7 +288,7 @@ describe("Inbox activity polling", () => {
     listInboxItems.mockResolvedValue({ items: [gitlabItem], errors: {} });
     await mount();
 
-    expect(activity.linkedSessionUpdateIds.has("gitlab-session")).toBe(true);
+    expect(activity.linkedSessionUpdateIds.has("gitlab-session")).toBe(false);
     expect(refreshLinkedWorkItem).not.toHaveBeenCalled();
   });
 
@@ -265,6 +301,7 @@ describe("Inbox activity polling", () => {
       url: "https://acme.atlassian.net/browse/PROJ-123",
       identifier: "PROJ-123",
       site: "https://acme.atlassian.net",
+      account: "jira-account",
       id: "10042",
     };
     sessions = [
@@ -279,6 +316,7 @@ describe("Inbox activity polling", () => {
       identifier: "PROJ-123",
       id: "10042",
       site: jiraLinked.site,
+      account: jiraLinked.account,
     });
     await mount();
 
@@ -296,6 +334,7 @@ describe("Inbox activity polling", () => {
       number: 7,
       url: azureUrl,
       site: "https://dev.azure.com/org",
+      account: "azure-account",
       id: "7",
     };
     sessions = [
@@ -311,6 +350,7 @@ describe("Inbox activity polling", () => {
           number: 7,
           url: azureUrl,
           site: azureLinked.site,
+          account: azureLinked.account,
           updatedAt: "2026-09-13T09:00:00Z",
         },
       ],
@@ -323,6 +363,7 @@ describe("Inbox activity polling", () => {
       number: 7,
       url: azureUrl,
       site: azureLinked.site,
+      account: azureLinked.account,
     });
     await mount();
 
@@ -340,33 +381,6 @@ describe("Inbox activity polling", () => {
     });
 
     expect(activity.linkedSessionUpdateIds.has(session.id)).toBe(false);
-  });
-
-  it("re-pulls with the new project's repositories when the store changes", async () => {
-    const { addRepositoryToProject, createProjectGroup } = await import(
-      "../lib/projects"
-    );
-    listInboxItems.mockResolvedValue({ items: [], errors: {} });
-    await mount();
-    expect(listInboxItems).toHaveBeenLastCalledWith(
-      [{ path: "/tmp/app" }],
-      expect.anything(),
-      expect.anything(),
-    );
-
-    await act(async () => {
-      const group = createProjectGroup("Suite");
-      addRepositoryToProject(group.id, {
-        commonDir: "/tmp/api/.git",
-        anchor: "/tmp/api",
-      });
-    });
-
-    expect(listInboxItems).toHaveBeenLastCalledWith(
-      [{ path: "/tmp/app" }, { path: "/tmp/api" }],
-      expect.anything(),
-      expect.anything(),
-    );
   });
 
   it("acknowledges an app-authored revision without a cue or linked-session notification", async () => {

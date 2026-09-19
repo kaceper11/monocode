@@ -1,4 +1,4 @@
-# Windows UI with WSL execution (#22)
+# Windows UI with WSL execution
 
 **Draft implementation; awaiting live Windows-to-WSL acceptance.** Mac fixtures exercise the production routing, Git/filesystem helper and agent supervisor. They do not prove WSL interoperability. Native Windows CI builds the application on a public standard runner, but that does not exercise a real Windows-to-WSL connection.
 
@@ -8,7 +8,7 @@ After the Windows CI job passes, open the matching run under GitHub **Actions �
 
 The CI installer is an unsigned test build of MonoCode with its existing app identity and profile. It updates an existing installation rather than installing an isolated preview. Windows may show an unknown-publisher warning. CI artifacts do not publish a release or enable automatic updates; tagged release builds use the separately signed updater channel. A packaged build does not establish live WSL acceptance.
 
-To build locally instead, clone `feat/22-wsl-execution` into a Windows directory, install the [Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/), then run `npm ci` and `npm run build:windows` on Windows. The installer is written to `target/release/bundle/nsis/`.
+To build locally instead, clone the tested branch into a Windows directory, install the [Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/), then run `npm ci` and `npm run build:windows` on Windows. The installer is written to `target/release/bundle/nsis/`.
 
 ## Opening a project
 
@@ -18,32 +18,24 @@ The WSL badge beside project/composer identity opens connection details and Reco
 
 Internal saved paths carry distribution identity. Linux filename case is retained. There is no session-schema migration, credential copying or Windows fallback. Existing native sessions stay native. Selecting a different distribution is an explicit project selection.
 
-## UI fixture evidence
-
-These 800×600 Chromium captures render the production React components with only Tauri/OS calls substituted. Selection, Unicode paths, retry with retained values, cancellation of a late result, Tab/Shift-Tab containment and Escape/focus return were exercised. The final accessibility audit reported zero violations; transparency prevented automatic contrast determination for some modal content, so contrast is not claimed fully certified. This is not a Windows WebView or live WSL result.
-
-![Production project picker, dark theme, fake OS boundary](images/wsl-picker-dark.png)
-![Production project picker error recovery, light theme, fake OS boundary](images/wsl-picker-error-light.png)
-
 ## Runtime and limits
 
 - WSL 2, Python 3.9+, Linux Git and GNU `mv` are required. Agent cancellation also requires Linux pidfd support. Install/authenticate agent CLIs and optional `gh` inside the selected distribution.
 - New connections validate the selected path/Git before registration. Failed initial opens release their process and slot; a bad path on an existing host preserves that connection. Watchdog expiry marks the connection dead even if a response races the timeout; reconnect creates a fresh bridge, and interrupted mutations remain uncertain.
-- At most four connected distributions use two app-open Python stdio channels each: serialized Git/mutations and read-only filesystem requests (eight helper processes maximum for registered hosts). No service, socket or scheduled automation is installed. Requests have a 30-second deadline; pending requests are capped at 32 and 64 MiB of encoded data. Each message is capped at 40 MiB. Interrupted mutations are not retried automatically.
-- Metadata/read requests are batched (up to 64 files); search reads 16 files per batch, at most 512 KiB each. Directory listings are capped at 20,000 entries. Git subprocess output is capped at 8 MiB per pipe and runs for at most 25 seconds.
+- At most four connected distributions use two app-open Python stdio channels each: serialized Git/mutations and read-only filesystem requests (eight helper processes maximum for registered hosts). No service, socket or scheduled automation is installed. Requests have a 30-second default execution deadline and a separate bounded queue wait; longer Git operations carry an explicit deadline; pending requests are capped at 32 and 64 MiB of encoded data. Each message is capped at 40 MiB. Interrupted mutations are not retried automatically.
+- Metadata/read requests are batched (up to 64 files); search reads 16 files per batch, at most 512 KiB each. Directory listings are capped at 20,000 entries. Git subprocess output is capped at 8 MiB per pipe. Its default timeout is 25 seconds; callers may explicitly raise it up to 600 seconds for fetch/merge operations.
 - Checkpoint capture, comparison and undo read/write through Linux; saved snapshots remain in the app profile. Linux names are encoded for case-sensitive, Windows-safe storage; existing native snapshots are unchanged. The existing 500-file snapshot cap and 8 MiB file limit remain. Project/user skill discovery scans at most 2,000 entries and 300 skills per root, reading at most 16 KiB per skill; creating a user skill resolves the Linux home.
 - Explicit native attachments transfer sequentially to a private Linux temporary directory, at most 20 MiB per file, 64 distinct files/128 MiB per bridge. Repeated identical attachments reuse the file. Another distribution's attachments require an explicit transfer outside this flow. Temporary attachment paths are not durable resume data after reconnect/app exit.
 - Agents use separate streaming subprocesses, not the filesystem request queue. Startup waits for an acknowledgement before launching the provider. Cancellation checks distribution boot identity and process start time, signals through a pidfd, and waits for the supervisor to terminate its Linux process group. At most four cancellation launchers run concurrently during shutdown.
-- Agent output lines are limited to 32 MiB. Frontend startup/event buffers retain at most 1,000 entries/64 MiB per session. The existing ConPTY terminal stream keeps its bounded reads/coalescing.
+- Agent output lines are limited to 32 MiB. Startup/event buffers are bounded by the shared transport and tighter provider-specific limits. The existing ConPTY terminal stream keeps its bounded reads/coalescing.
 
 ## Explicit remaining boundaries
 
 - **No live Windows/WSL result is claimed.** Distribution shutdown, Windows/ConPTY hangup/job control, concurrent native/WSL agents, credentials, approval recovery and Windows networking still need the scenarios below.
-- OpenCode's HTTP/SSE transport is explicitly unavailable for WSL. Use a stdio provider such as Claude or Codex. Native OpenCode remains available. WSL model menus use bundled models; Windows-discovered catalogs are not evidence of Linux account/model availability. Linux CLI installation/authentication and provider-specific resume must be accepted live.
+- OpenCode's HTTP/SSE transport is explicitly unavailable for WSL. Use a stdio provider such as Claude or Codex. Native OpenCode remains available. WSL model discovery is scoped to the selected distribution; Windows-discovered catalogs are not evidence of Linux account/model availability. Linux CLI installation/authentication and provider-specific resume must be accepted live.
 - Claude installed-plugin registry skill discovery is not implemented for WSL; fixed project/user skill directories are supported.
 - Browsers open on Windows. MonoCode does not forward ports; localhost access depends on Windows/WSL networking configuration. Run Linux editors from the terminal. Reveal in Explorer uses an explicit WSL path, after Linux validation.
-- This is an app-open runtime. Normal cancellation attempts Linux cleanup; abrupt Windows termination, app crashes or descendants surviving a provider's ordinary exit may leave work requiring inspection inside Linux. Durable supervision is #21, not implied here. Reconnect restores access, not a promise that an interrupted agent turn completed.
-- The compact activity/cleanup controls from #38 are included: known/unknown MonoCode activity, oldest-first sorting, reversible hiding, on-demand Linux safety checks and confirmed Git removal. Full concurrent-agent and cross-platform hierarchy acceptance remains separate.
+- This is an app-open runtime. Normal cancellation attempts Linux cleanup; abrupt Windows termination, app crashes or descendants surviving a provider's ordinary exit may leave work requiring inspection inside Linux. Durable supervision is not supplied by this integration. Reconnect restores access, not a promise that an interrupted agent turn completed.
 
 ## Runnable live acceptance
 
@@ -52,7 +44,7 @@ Record Windows version, `wsl --version`, `wsl --list --verbose`, distribution re
 In each selected Linux distribution, prepare a fixture:
 
 ```sh
-fixture=$(mktemp -d -t monocode22-XXXXXX)
+fixture=$(mktemp -d -t monocode-wsl-XXXXXX)
 mkdir "$fixture/repo space ż"
 cd "$fixture/repo space ż"
 git init -b main
@@ -72,11 +64,11 @@ printf '%s\n' "$PWD"
 6. Repeat with the second distribution and same Linux path/branch names. Stop only the disposable test distribution with `wsl --terminate <distribution>`. Confirm a clear disconnect, preserved intended path and no Windows fallback. Reconnect once; test a deleted/missing project path, failed Git/CLI prerequisite and cancellation during connection.
 7. Read an existing authorized GitHub issue/PR/check using Linux `gh`; confirm Linux credentials. New external comments/PRs require their own explicit authorization. Jira/Azure acceptance follows their connectors. Record unsupported operations, especially OpenCode HTTP.
 8. Start a harmless Linux dev server and test Windows browser access with the machine's actual WSL networking mode. Record whether localhost forwarding works; no automatic forwarding is promised. Test explicit Explorer reveal and Linux-terminal editor opening.
-9. In the disposable linked worktree, attempt removal while an agent/terminal runs, with changed HEAD, with tracked/untracked/ignored changes, and while locked. Confirm refusals preserve every file/process. Close processes and clean only the fixture; verify safe removal without branch deletion. Record the still-pending #32 UI boundaries separately.
+9. In the disposable linked worktree, attempt removal while an agent/terminal runs, with changed HEAD, with tracked/untracked/ignored changes, and while locked. Confirm refusals preserve every file/process. Close processes and clean only the fixture; verify safe removal without branch deletion. Record any remaining UI boundaries separately.
 
-Attach screenshots, commands/results, tested commit and remaining failures to draft PR #40. Keep it draft until required acceptance is reviewed; do not infer acceptance from unit tests or compilation.
+Record screenshots, commands/results, tested revision and remaining failures in the current acceptance report. Do not infer acceptance from unit tests or compilation.
 
-Cleanup inherits the direct removal confirmation from #38: remaining files are disclosed inside the permanent-deletion confirmation, without a standing dirty-file blocker message. The bounded filesystem fingerprint runs inside Linux through the existing bridge; Windows never walks a WSL tree. Rust revalidates the distro-qualified Git family, path, HEAD and index, and rejects changed file evidence before invoking Git removal. The Linux scan caps 10,000 entries, 64 MiB, 25 seconds and 100 displayed names. Running app processes still block cleanup conservatively; no implicit process stopping or stale-registration pruning is performed.
+Cleanup uses upstream's direct removal confirmation: remaining files are disclosed inside the permanent-deletion confirmation, without a standing dirty-file blocker message. The bounded filesystem fingerprint runs inside Linux through the existing bridge; Windows never walks a WSL tree. Rust revalidates the distro-qualified Git family, path, HEAD and index, and rejects changed file evidence before invoking Git removal. The Linux metadata scan caps 250,000 entries, 25 seconds and 100 displayed names; it does not hash file contents. Running app processes still block cleanup conservatively; no implicit process stopping or stale-registration pruning is performed.
 
 Additional production-boundary regression checks cover dirty Linux force-review refusal, changed-content rejection, fresh confirmed removal and branch preservation; concurrent bridge requests preserve their responses, and requests blocked behind a disconnected bridge fail without writing files. Native/Ubuntu/Debian paths with the same Linux suffix remain distinct repository families. These fixtures do not establish live Windows/WSL acceptance. Add force-cleanup checks to the disposable worktree scenario above, including a live Linux agent/terminal blocker and a file changed after preview.
 
@@ -100,14 +92,9 @@ same-session ordering across hosts. Real process tests hold Git while metadata
 completes, verify a queued write stays blocked until Git finishes, and check that
 oversized JSON produces a complete error without disconnecting the read channel.
 
-Mac release fixtures using production Rust/Python code: eight concurrent tiny
-requests improved from 36.42 ms to 0.509 ms median (21 samples); metadata behind a
-one-second Git operation improved from 1.018 s to 0.091 ms. An 8 MiB diff response
-took 22.41 ms median (7 samples). Encoded fragments avoid full-response joins and
-newline copies, and Rust moves the parsed result instead of cloning it. Python
-worker RSS after those responses fell from 119.64 MiB to 108.94 MiB; Rust peak RSS
-was essentially unchanged (106.83 vs 105.86 MiB). These different metrics do not
-establish total app memory savings, especially with the extra idle helper. Large
-JSON/base64 responses retain substantial overhead despite the existing caps.
-Measurements exclude WebView, agents and Windows/WSL transport. Live Windows-to-WSL
-acceptance remains pending.
+Earlier fork notes reported local Rust/Python measurements; those figures have
+not been reproduced for this convergence branch. Measure the current release
+build on representative workloads, recording hardware and app/backend/WebView
+costs separately. The extra idle read helper has a memory cost, and large
+JSON/base64 responses still have overhead despite the caps. Local process
+measurements do not establish Windows/WSL performance or acceptance.

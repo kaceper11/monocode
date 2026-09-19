@@ -150,17 +150,11 @@ describe("buildClaudeSpawnArgs", () => {
     expect(args).not.toContain("--permission-prompt-tool");
   });
 
-  it("maps an explicit bypassPermissions mode onto the skip flag", () => {
+  it("adds bypass flag for full-access", () => {
     const args = buildClaudeSpawnArgs({
       permissionMode: "bypassPermissions",
     });
     expect(args).toContain("--allow-dangerously-skip-permissions");
-  });
-
-  it("always enables bypass so a later mode switch to it is accepted", () => {
-    const args = buildClaudeSpawnArgs({});
-    expect(args).toContain("--allow-dangerously-skip-permissions");
-    expect(args).not.toContain("bypassPermissions");
   });
 });
 

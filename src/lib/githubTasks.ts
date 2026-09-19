@@ -1,7 +1,6 @@
-import { listAzureDelivery, type AzureInboxDelivery } from "./azureInbox";
+import type { AzureInboxDelivery } from "./azureInbox";
 import { invoke } from "@tauri-apps/api/core";
-import { atlassianCapable, jiraConnected, listJiraIssues, jiraFilterCacheKey } from "./jira";
-import { azureConnected, listAzureItems, azureFilterCacheKey } from "./azure";
+import { inboxIntegrationCacheKey, listInboxIntegrations } from "./inboxIntegrations";
 import { clearKnownInboxItems } from "./inboxSeen";
 import {
   linearConnected,
@@ -19,30 +18,13 @@ import {
   listGitlabWorkItems,
   type GitlabWorkItem,
 } from "./gitlab";
-import { pathKey, projectKey, projectName } from "./paths";
 import {
-  isProjectRailKey,
-  loadProjects,
-  projectContainsPath,
-  projectForPath,
-  projectRailKey,
-  type ProjectRecord,
-} from "./projects";
-import {
-  loadPinnedProjects,
-  loadProjectRailOrder,
+  collectRailProjects,
   normalizeProjectPath,
-  projectRailSections,
   sameProjectPath,
   type RecentProject,
 } from "./recents";
-import {
-  getVerifiedFamilies,
-  type RepositoryFamily,
-} from "./repositoryFamilies";
-import { loadTabGroupLabels, resolveTabGroupLabel } from "./tabGroups";
 import { recordInboxSelfActivity } from "./inboxSelfActivity";
-import type { UnifiedLine } from "./unifiedDiff";
 
 export type GithubTaskKind = "issue" | "pr";
 export type GithubPrAction =
@@ -60,7 +42,6 @@ export type GithubAssignee = {
 };
 
 export type GithubWorkItem = {
-  account?: string;
   kind: GithubTaskKind;
   number: number;
   title: string;
@@ -77,6 +58,7 @@ export type GithubWorkItem = {
 export type InboxProvider = "github" | "linear" | "gitlab" | "jira" | "azure";
 
 export type InboxItem = Omit<GithubWorkItem, "kind"> & {
+  account?: string;
   kind: InboxKind;
   delivery?: AzureInboxDelivery;
   projectPath: string;
@@ -171,6 +153,8 @@ export type GithubStatus = {
   authenticated: boolean;
 };
 
+export type GithubStarStatus = "starred" | "notStarred" | "unavailable";
+
 export type InboxListResult = {
   items: InboxItem[];
   errors: InboxProviderErrors;
@@ -225,7 +209,7 @@ export function inboxListCacheKey(
     .sort()
     .join("|");
   const teams = [...(query.linearHiddenTeamIds ?? [])].sort().join(",");
-  return `${query.assignedToMe ? 1 : 0}:${query.state}:${paths}:${teams}:${jiraFilterCacheKey()}:${azureFilterCacheKey()}`;
+  return `${query.assignedToMe ? 1 : 0}:${query.state}:${paths}:${teams}:${inboxIntegrationCacheKey()}`;
 }
 
 export function peekInboxList(
@@ -258,6 +242,16 @@ export function inboxListIsFresh(
 
 export function githubStatus(): Promise<GithubStatus> {
   return invoke<GithubStatus>("git_github_status");
+}
+
+/** Whether the active GitHub CLI account has starred MonoCode. */
+export function githubMonocodeStarStatus(): Promise<GithubStarStatus> {
+  return invoke<GithubStarStatus>("github_monocode_star_status");
+}
+
+/** Star MonoCode for the active GitHub CLI account. */
+export function starMonocodeOnGithub(): Promise<void> {
+  return invoke<void>("github_star_monocode");
 }
 
 export async function githubRepo(cwd: string): Promise<string> {
@@ -455,7 +449,7 @@ export async function githubWorkItemThread(
   repo: string,
   kind: GithubTaskKind,
   number: number,
-  options?: { force?: boolean; repo?: string },
+  options?: { force?: boolean },
 ): Promise<GithubWorkItemThread> {
   const key = detailsCacheKey(repo, kind, number);
   if (options?.force) {
@@ -502,53 +496,6 @@ export async function githubWorkItemComment(
   threadInflight.delete(key);
   recordInboxSelfActivity({ provider: "github", kind, number, repo });
   return url;
-}
-
-export type GithubPrCheck = {
-  name: string;
-  status: string;
-  conclusion: string;
-  url: string;
-  /** Sanitized, bounded failure summary — only set on failing runs. */
-  outputTitle: string;
-  outputText: string;
-};
-
-/** Check conclusions that count as CI failures — shared by the watcher
- * adapter and repair evidence so they never drift apart. */
-export const FAILING_CHECK_CONCLUSIONS = [
-  "failure",
-  "timed_out",
-  "action_required",
-  "startup_failure",
-  "cancelled",
-];
-
-export type GithubPrState = {
-  number: number;
-  title: string;
-  url: string;
-  state: string;
-  headRefOid: string;
-  headRefName: string;
-  baseRefName: string;
-  /** GitHub's merge verdict: BEHIND, DIRTY (conflicts), CLEAN, BLOCKED… */
-  mergeStateStatus: string;
-  reviewDecision: string;
-  isDraft: boolean;
-  checks: GithubPrCheck[];
-};
-
-/**
- * One read of a PR's review/merge/check state. Watcher polls and repair
- * evidence both go through this — check output is already bounded and
- * sanitized by the backend.
- */
-export function githubPrState(
-  cwd: string,
-  number: number,
-): Promise<GithubPrState> {
-  return invoke<GithubPrState>("git_github_pr_state", { cwd, number });
 }
 
 /** Run a state-changing pull request action and return GitHub's fresh PR state. */
@@ -689,61 +636,6 @@ export async function githubPrDiff(
   return promise;
 }
 
-export type GithubReviewEvent = "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
-
-/** One pending inline comment — the anchor GitHub's review API expects. */
-export type GithubReviewCommentDraft = {
-  path: string;
-  line: number;
-  side: "LEFT" | "RIGHT";
-  body: string;
-};
-
-/** A rendered diff line's GitHub review anchor: deletions anchor on the old
- *  side, additions and context lines on the new. Hunk headers can't anchor. */
-export function githubReviewAnchor(
-  line: UnifiedLine,
-): { line: number; side: "LEFT" | "RIGHT" } | null {
-  if (line.kind === "del") {
-    return line.oldNumber == null
-      ? null
-      : { line: line.oldNumber, side: "LEFT" };
-  }
-  return line.newNumber == null
-    ? null
-    : { line: line.newNumber, side: "RIGHT" };
-}
-
-/**
- * Submit a formal pull-request review — the event plus all pending inline
- * comments in one API call, pinned to the head revision the reviewer saw.
- */
-export async function githubSubmitReview(
-  cwd: string,
-  repo: string,
-  number: number,
-  review: {
-    commitId: string;
-    event: GithubReviewEvent;
-    body: string;
-    comments: GithubReviewCommentDraft[];
-  },
-): Promise<string> {
-  const url = await invoke<string>("git_github_submit_review", {
-    cwd,
-    repo,
-    number,
-    commitId: review.commitId,
-    event: review.event,
-    body: review.body,
-    comments: review.comments,
-  });
-  const key = detailsCacheKey(cwd, "pr", number);
-  threadByKey.delete(key);
-  threadInflight.delete(key);
-  return url;
-}
-
 export async function listInboxItems(
   projects: readonly { path: string }[],
   query: InboxQuery,
@@ -772,6 +664,7 @@ async function fetchInboxItems(
   projects: readonly { path: string }[],
   query: InboxQuery,
 ): Promise<InboxListResult> {
+  const integrations = listInboxIntegrations(query.state);
   const unique = uniqueInboxProjects(projects);
   const preferredPaths = unique.map((project) => project.path);
   const discovery = await Promise.allSettled(
@@ -827,39 +720,13 @@ async function fetchInboxItems(
     errors.gitlab = inboxErrorMessage(error);
   }
 
-  let jiraItems: InboxItem[] = [];
-  try {
-    const status = await jiraConnected();
-    if (status.connected && atlassianCapable(status, "Jira"))
-      jiraItems = (await listJiraIssues(status.site, query.state)).map(item => ({ ...item, account: status.account }));
-    else if (!status.connected)
-      errors.jira = "Connect Jira Cloud in Settings to see assigned issues.";
-  } catch (error) {
-    errors.jira = inboxErrorMessage(error);
-  }
-
-  let azureItems: InboxItem[] = [];
-  try {
-    const status = await azureConnected();
-    if (status.connected) {
-      const [boards, delivery] = await Promise.allSettled([listAzureItems(status), listAzureDelivery(status, query.state)]);
-      const failures: string[] = [];
-      if (boards.status === "fulfilled") azureItems.push(...boards.value.map(item => ({...item,account:status.accountId || status.account})));
-      else failures.push(`Boards: ${inboxErrorMessage(boards.reason)}`);
-      if (delivery.status === "fulfilled") { azureItems.push(...delivery.value.items); failures.push(...delivery.value.errors); }
-      else failures.push(`Delivery: ${inboxErrorMessage(delivery.reason)}`);
-      if (failures.length) errors.azure = failures.join(" ");
-    }
-    else errors.azure = "Connect Azure DevOps in Settings to see work items.";
-  } catch (error) {
-    errors.azure = inboxErrorMessage(error);
-  }
+  const integrated = await integrations;
   return {
     items: dedupeInboxItems(
-      [...github.items, ...linearItems, ...gitlabItems, ...jiraItems, ...azureItems],
+      [...github.items, ...linearItems, ...gitlabItems, ...integrated.items],
       preferredPaths,
     ),
-    errors,
+    errors: { ...errors, ...integrated.errors },
   };
 }
 
@@ -939,9 +806,8 @@ async function fetchLinearInboxItems(query: InboxQuery): Promise<InboxItem[]> {
     .map(linearIssueToInboxItem);
 }
 
-export function linearIssueToInboxItem(issue: LinearIssue): InboxItem {
+function linearIssueToInboxItem(issue: LinearIssue): InboxItem {
   return {
-    account: issue.account,
     provider: "linear",
     kind: "linear",
     id: issue.id,
@@ -964,7 +830,7 @@ export function linearIssueToInboxItem(issue: LinearIssue): InboxItem {
   };
 }
 
-export function gitlabWorkItemToInboxItem(
+function gitlabWorkItemToInboxItem(
   item: GitlabWorkItem,
   projectPath: string,
   repo: string,
@@ -977,129 +843,16 @@ export function gitlabWorkItemToInboxItem(
   };
 }
 
-/** One row of the rail's project point of view — a stored project or an
- * unclaimed folder — with the working copies the inbox fetches through. */
-export type InboxRailProject = {
-  /** Rail identity — `project:<id>` for pure groups. Keys filters and
-   * appearance; never assume it is a filesystem path. */
-  key: string;
-  /** Stored project name, saved rail label, or folder name. */
-  name: string;
-  /** Working copies this project fetches through: member repository anchors
-   * plus the folder anchor when the project keeps one. */
-  paths: string[];
-  /** A real folder for new-work defaults — never a `project:` sentinel. */
-  cwd: string;
-  project?: ProjectRecord;
-};
-
-/** The Inbox's project rows follow the rail, not the recents list: stored
- * projects collapse their member folders into one row and keep appearing
- * while they own repositories, even when nothing member-side is a recent. */
 export function inboxProjectsForRail(
   recents: RecentProject[],
   cwd: string,
-  storedProjects: readonly ProjectRecord[] = loadProjects(),
-  families: ReadonlyMap<string, RepositoryFamily> = getVerifiedFamilies(),
-): InboxRailProject[] {
-  const sections = projectRailSections(
-    recents,
-    cwd,
-    loadProjectRailOrder(),
-    loadPinnedProjects(),
-    families,
-    storedProjects,
+): RecentProject[] {
+  const map = collectRailProjects(recents, cwd);
+  const current = cwd ? map.get(normalizeProjectPath(cwd)) : undefined;
+  const rest = [...map.values()].filter(
+    (project) => !current || !sameProjectPath(project.path, current.path),
   );
-  const labels = loadTabGroupLabels();
-  const out: InboxRailProject[] = [];
-  for (const item of [...sections.pinned, ...sections.projects]) {
-    const project = item.project;
-    const seen = new Set<string>();
-    const paths: string[] = [];
-    for (const path of project
-      ? [project.anchor, ...project.repositories.map((repo) => repo.anchor)]
-      : [item.path]) {
-      if (!path) continue;
-      const key = pathKey(path);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      paths.push(path);
-    }
-    const target = project
-      ? (project.anchor ??
-        project.lastPath ??
-        project.repositories[0]?.anchor ??
-        "")
-      : item.path;
-    // A pathless project with no repositories yet has nothing to fetch.
-    if (!paths.length || !target) continue;
-    out.push({
-      key: item.path,
-      name:
-        project?.name ??
-        resolveTabGroupLabel(
-          projectKey(item.path),
-          labels,
-          isProjectRailKey(item.path) ? "Project" : projectName(item.path),
-        ),
-      paths,
-      cwd: target,
-      ...(project ? { project } : {}),
-    });
-  }
-  const currentIndex = cwd
-    ? out.findIndex(
-        (entry) =>
-          sameProjectPath(entry.key, cwd) ||
-          entry.paths.some((path) => sameProjectPath(path, cwd)) ||
-          (entry.project
-            ? projectContainsPath(entry.project, cwd, families)
-            : false),
-      )
-    : -1;
-  if (currentIndex > 0) out.unshift(...out.splice(currentIndex, 1));
-  return out;
-}
-
-/** Fetch units for `listInboxItems` — every working copy across the rows. */
-export function inboxFetchPaths(
-  projects: readonly InboxRailProject[],
-): { path: string }[] {
-  return projects.flatMap((project) =>
-    project.paths.map((path) => ({ path })),
-  );
-}
-
-/** Every value a stored `hiddenProjects` entry can mean — rail keys now,
- * member working-copy paths from older saves. */
-export function inboxProjectIdentities(
-  projects: readonly InboxRailProject[],
-): string[] {
-  return projects.flatMap((project) => [project.key, ...project.paths]);
-}
-
-/** Maps a working copy to its inbox project key — the rail row it was
- * fetched under. Member worktrees inherit the project's identity; unknown
- * paths keep their own normalized form. */
-export function inboxRailKeyResolver(
-  projects: readonly InboxRailProject[],
-): (path: string) => string {
-  const byPath = new Map<string, string>();
-  for (const project of projects) {
-    byPath.set(pathKey(project.key), project.key);
-    for (const path of project.paths) {
-      const key = pathKey(path);
-      if (!byPath.has(key)) byPath.set(key, project.key);
-    }
-  }
-  return (path: string) => {
-    const normalized = normalizeProjectPath(path);
-    if (!normalized || normalized === "/") return normalized;
-    const direct = byPath.get(pathKey(normalized));
-    if (direct) return direct;
-    const owner = projectForPath(normalized);
-    return owner ? (owner.anchor ?? projectRailKey(owner.id)) : normalized;
-  };
+  return current ? [current, ...rest] : rest;
 }
 
 export function uniqueInboxProjects(
@@ -1156,6 +909,7 @@ function inboxErrorMessage(error: unknown): string {
 
 export function inboxIdentityKey(item: {
   provider?: InboxProvider;
+  account?: string;
   kind: InboxKind;
   number: number;
   repo: string;
@@ -1163,7 +917,10 @@ export function inboxIdentityKey(item: {
   identifier?: string;
   id?: string;
 }): string {
-  if (item.provider === "jira" || item.provider === "azure") return item.url.trim().toLowerCase();
+  if (item.provider === "jira" || item.provider === "azure") {
+    const url = item.url.trim().toLowerCase();
+    return item.account ? JSON.stringify([item.account, url]) : url;
+  }
   if (item.provider === "linear") {
     const identity = item.identifier?.trim() || item.id?.trim();
     if (identity) return identity.toLowerCase();
@@ -1229,13 +986,21 @@ export function githubWorkItemKey(item: GithubWorkItem): string {
 }
 
 export function inboxItemStatus(item: {
+  provider?: InboxProvider;
   kind: InboxKind;
   state: string;
   draft: boolean;
   stateType?: string;
 }): string {
-  if (item.kind === "ci") return ["failed", "partiallySucceeded"].includes(item.state) ? "Open" : "Closed";
-  if (item.kind === "jira") return item.stateType === "done" ? "Closed" : "Open";
+  if (item.kind === "ci") {
+    if (["failed", "partiallySucceeded"].includes(item.state)) return "Open";
+    return ["succeeded", "canceled"].includes(item.state) ? "Closed" : "Unknown";
+  }
+  if (item.kind === "jira") {
+    const category = item.stateType?.trim().toLowerCase();
+    if (category === "done") return "Closed";
+    return category === "new" || category === "indeterminate" ? "Open" : "Unknown";
+  }
   if (item.kind === "azure") {
     const category = item.stateType?.toLowerCase();
     if (category === "completed" || category === "removed") return "Closed";
@@ -1246,6 +1011,7 @@ export function inboxItemStatus(item: {
     if (type === "completed" || type === "canceled") return "Closed";
     return "Open";
   }
+  if (item.provider === "azure" && item.kind === "pr" && !["open", "closed", "merged"].includes(item.state)) return "Unknown";
   if (item.draft) return "Draft";
   if (item.state === "merged") return "Merged";
   if (item.state === "closed") return "Closed";
@@ -1339,10 +1105,6 @@ export function inboxStartDraft(item: InboxItem, body?: string): string {
 /** Compact chip shown above the composer when starting from Inbox. */
 export type InboxComposerCard = {
   account?: string;
-  contextId?: string;
-  contextSummary?: string;
-  contextPreview?: { description?: string; comments: { id: string; author: string; createdAt: string; body: string }[] };
-  attachments?: import("./session").Attachment[];
   provider: InboxProvider;
   kind: InboxKind;
   identifier: string;

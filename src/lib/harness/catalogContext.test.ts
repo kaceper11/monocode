@@ -25,6 +25,7 @@ const mock = vi.hoisted(() => ({
   resolve: vi.fn(),
   kill: vi.fn(),
 }));
+vi.mock("../fs", () => ({ homeDir: async () => "/native-home" }));
 vi.mock("./child", () => ({
   resolveCodexBinary: async (cwd?: string) => {
     mock.resolve(cwd);
@@ -156,4 +157,40 @@ it("uses the effective worktree catalog for model identity and capacity", () => 
   expect(resolveModel("codex", "codex:shared", cwd).name).toBe("worktree");
   expect(nativeModelId("codex:shared", cwd)).toBe("worktree");
   expect(modelContextWindow("codex:shared", cwd)).toBe(2000);
+});
+
+it("does not evict the native catalog when many WSL projects are opened", () => {
+  setHarnessModels("codex", [model("native")]);
+  for (let i = 0; i < 40; i++) {
+    setHarnessModels("codex", [model(`linux-${i}`)], `${ubuntu}-${i}`);
+  }
+  expect(hasLiveCatalog("codex")).toBe(true);
+  expect(findModel("codex:shared")?.name).toBe("native");
+});
+
+
+it("keeps native catalog probes in the upstream home directory", async () => {
+  await refreshCodexCatalog("/native-project");
+  expect(mock.spawn.mock.calls[0][3]).toBe("/native-home");
+  expect(mock.resolve).toHaveBeenCalledWith(undefined);
+});
+
+it("reserves native discovery capacity when all guest catalogs are busy", async () => {
+  const finish: Array<() => void> = [];
+  const pending: Promise<void>[] = [];
+  for (let i = 0; i < 32; i++) {
+    try {
+      pending.push(refreshModelCatalog("codex", `${ubuntu}-${i}`, () => new Promise((resolve) => finish.push(() => resolve([model("guest")])))));
+    } catch {
+      // Reaching the bounded guest limit must not consume the native slot.
+    }
+  }
+  try {
+    await expect(Promise.resolve().then(() => refreshModelCatalog("codex", undefined, async () => [model("native")]))).resolves.toBeUndefined();
+    expect(findModel("codex:shared")?.name).toBe("native");
+  } finally {
+    await Promise.resolve();
+    finish.forEach((resolve) => resolve());
+    await Promise.all(pending);
+  }
 });

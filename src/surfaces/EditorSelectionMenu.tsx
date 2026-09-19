@@ -1,16 +1,14 @@
-import { contextFromText, requestAgentContext } from "../lib/agentContext";
 import { useEffect, useRef } from "react";
-import { ExplorerMenu } from "../chrome/ExplorerMenu";
+import { MessageSquarePlus } from "../chrome/icons";
+import { Popover } from "../chrome/Popover";
 import {
-  formatEditorSelectionContext,
+  formatEditorSelectionReference,
   type EditorCodeSelection,
 } from "../lib/editorSelection";
 import { requestAddToChat } from "../lib/quoteDraft";
 
 export type EditorSelectionTarget = EditorCodeSelection & {
   anchor: DOMRect;
-  text?: string;
-  sourcePath?: string;
 };
 
 export function EditorSelectionMenu({
@@ -39,23 +37,32 @@ export function EditorSelectionMenu({
   if (!selection) return null;
 
   return (
-    <ExplorerMenu
-      x={selection.anchor.left}
-      y={selection.anchor.bottom + 6}
-      width={180}
-      ariaLabel="Selected code actions"
-      items={[
-        { kind: "item", id: "add", label: "Add to chat" },
-        { kind: "item", id: "send", label: "Send to agent…" },
-      ]}
-      onPick={(id) => {
-        const path = selection.sourcePath ?? selection.path;
-        const text = formatEditorSelectionContext({ ...selection, path });
-        if (id === "add") requestAddToChat(text, "plain");
-        else requestAgentContext({ context: contextFromText("Selected file lines", text, path) });
-        onDismiss();
-      }}
-      onClose={onDismiss}
-    />
+    <Popover
+      anchor={selection.anchor}
+      side="top"
+      align="center"
+      gap={6}
+      onDismiss={onDismiss}
+      role="toolbar"
+      aria-label="Selected code actions"
+      className="p-1"
+    >
+      <button
+        type="button"
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => {
+          requestAddToChat(formatEditorSelectionReference(selection), "plain");
+          onDismiss();
+        }}
+        className="flex h-7 items-center gap-1.5 rounded-lg px-2 font-sans text-[13px] leading-none text-content outline-none ring-accent/40 hover:bg-content/5 focus-visible:ring-2"
+      >
+        <MessageSquarePlus
+          aria-hidden="true"
+          className="size-3.5"
+          strokeWidth={1.75}
+        />
+        Add to chat
+      </button>
+    </Popover>
   );
 }

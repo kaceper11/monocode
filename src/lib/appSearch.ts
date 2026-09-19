@@ -1,7 +1,6 @@
 import { fuzzyMatch } from "./fuzzy";
 import { projectName } from "./paths";
-import type { ProjectRecord } from "./projects";
-import type { RecentProject } from "./recents";
+import { sameProjectPath, type RecentProject } from "./recents";
 import {
   HARNESSES,
   sessionDisplayTitle,
@@ -13,21 +12,10 @@ import type {
   SessionSearchHit,
   SessionSummary,
 } from "./sessionStore";
-import {
-  projectForTask,
-  taskChildRepoLabel,
-  taskMatchesQuery,
-  type TaskWorkspace,
-} from "./taskWorkspaces";
 import type { RankedFile } from "./fileIndex";
 import type { ProjectSearchMatch } from "./search";
 
-export type SearchScope =
-  | "all"
-  | "conversations"
-  | "files"
-  | "projects"
-  | "tasks";
+export type SearchScope = "all" | "conversations" | "files" | "projects";
 
 export type ConversationHit = {
   id: string;
@@ -85,31 +73,16 @@ export type ProjectHit = {
   positions: number[];
 };
 
-export type TaskHit = {
-  id: string;
-  kind: "task";
-  taskId: string;
-  name: string;
-  /** Ticket identifier and repo/branch labels, joined for display. */
-  detail: string;
-  archived: boolean;
-  createdAt: number;
-  score: number;
-  positions: number[];
-};
-
 export type AppSearchHit =
   | ConversationHit
   | MessageHit
   | FileHit
   | ContentHit
-  | ProjectHit
-  | TaskHit;
+  | ProjectHit;
 
 export type GroupedHits = {
   conversations: ConversationHit[];
   messages: MessageHit[];
-  tasks: TaskHit[];
   files: FileHit[];
   content: ContentHit[];
   projects: ProjectHit[];
@@ -118,7 +91,6 @@ export type GroupedHits = {
 const ALL_LIMITS: Record<keyof GroupedHits, number> = {
   conversations: 8,
   messages: 8,
-  tasks: 6,
   files: 10,
   content: 12,
   projects: 6,
@@ -129,7 +101,6 @@ const SCOPE_LIMITS: Record<SearchScope, Record<keyof GroupedHits, number>> = {
   conversations: {
     conversations: 24,
     messages: 24,
-    tasks: 0,
     files: 0,
     content: 0,
     projects: 0,
@@ -137,7 +108,6 @@ const SCOPE_LIMITS: Record<SearchScope, Record<keyof GroupedHits, number>> = {
   files: {
     conversations: 0,
     messages: 0,
-    tasks: 0,
     files: 40,
     content: 48,
     projects: 0,
@@ -145,18 +115,9 @@ const SCOPE_LIMITS: Record<SearchScope, Record<keyof GroupedHits, number>> = {
   projects: {
     conversations: 0,
     messages: 0,
-    tasks: 0,
     files: 0,
     content: 0,
     projects: 24,
-  },
-  tasks: {
-    conversations: 0,
-    messages: 0,
-    tasks: 24,
-    files: 0,
-    content: 0,
-    projects: 0,
   },
 };
 
@@ -290,63 +251,6 @@ export function searchRecentProjects(
   return hits.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
 }
 
-/**
- * Tasks matching the query — name first, then ticket identifier/title, then
- * the wider field set via `taskMatchesQuery` (brief, repos, branches,
- * attempts). Reads stored records only.
- */
-export function searchTasks(
-  tasks: readonly TaskWorkspace[],
-  query: string,
-  projectFor: (task: TaskWorkspace) => ProjectRecord | undefined = projectForTask,
-): TaskHit[] {
-  const needle = query.trim();
-  if (!needle) return [];
-  const hits: TaskHit[] = [];
-  for (const task of tasks) {
-    const project = projectFor(task);
-    const nameHit = fuzzyMatch(needle, task.name);
-    const ticketText = [
-      task.ticket?.identifier,
-      task.ticket?.title,
-      ...(task.ticket?.additionalItems ?? []).flatMap((item) => [
-        item.identifier,
-        item.title,
-      ]),
-    ]
-      .filter((field): field is string => Boolean(field))
-      .join(" ");
-    const ticketHit =
-      !nameHit && ticketText ? fuzzyMatch(needle, ticketText) : null;
-    const match = nameHit ?? ticketHit;
-    if (!match && !taskMatchesQuery(task, needle, project)) continue;
-    hits.push({
-      id: `task:${task.id}`,
-      kind: "task",
-      taskId: task.id,
-      name: task.name,
-      detail: [
-        task.ticket?.identifier,
-        ...task.children.map((child) =>
-          taskChildRepoLabel(task, child, project),
-        ),
-      ]
-        .filter((field): field is string => Boolean(field))
-        .join(" · "),
-      archived: Boolean(task.archived),
-      createdAt: task.createdAt,
-      score:
-        (match?.score ?? 0) +
-        (nameHit ? 80 : ticketHit ? 50 : 20) +
-        recencyBonus(task.createdAt),
-      positions: nameHit ? nameHit.positions : [],
-    });
-  }
-  return hits.sort(
-    (a, b) => b.score - a.score || b.createdAt - a.createdAt,
-  );
-}
-
 export function hitsFromFileRanks(files: RankedFile[]): FileHit[] {
   return files.map((file) => ({
     id: `file:${file.path}`,
@@ -470,6 +374,18 @@ export function mergeHits(...lists: AppSearchHit[][]): AppSearchHit[] {
   return [...byId.values()];
 }
 
+export function filterHitsByProject(
+  hits: AppSearchHit[],
+  cwd: string | undefined,
+): AppSearchHit[] {
+  if (!cwd || cwd === "~") return hits;
+  return hits.filter((hit) => {
+    if (hit.kind === "file" || hit.kind === "content") return true;
+    if (hit.kind === "project") return sameProjectPath(hit.path, cwd);
+    return sameProjectPath(hit.cwd, cwd);
+  });
+}
+
 export function groupHits(
   hits: AppSearchHit[],
   scope: SearchScope,
@@ -477,7 +393,6 @@ export function groupHits(
   const grouped: GroupedHits = {
     conversations: [],
     messages: [],
-    tasks: [],
     files: [],
     content: [],
     projects: [],
@@ -485,16 +400,12 @@ export function groupHits(
   for (const hit of hits) {
     if (hit.kind === "conversation") grouped.conversations.push(hit);
     else if (hit.kind === "message") grouped.messages.push(hit);
-    else if (hit.kind === "task") grouped.tasks.push(hit);
     else if (hit.kind === "file") grouped.files.push(hit);
     else if (hit.kind === "content") grouped.content.push(hit);
     else grouped.projects.push(hit);
   }
   grouped.conversations.sort(byScoreThenRecency);
   grouped.messages.sort(byScoreThenRecency);
-  grouped.tasks.sort(
-    (a, b) => b.score - a.score || b.createdAt - a.createdAt,
-  );
   grouped.files.sort((a, b) => b.score - a.score || a.relative.localeCompare(b.relative));
   grouped.projects.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
 
@@ -502,7 +413,6 @@ export function groupHits(
   return {
     conversations: grouped.conversations.slice(0, limits.conversations),
     messages: grouped.messages.slice(0, limits.messages),
-    tasks: grouped.tasks.slice(0, limits.tasks),
     files: grouped.files.slice(0, limits.files),
     content: grouped.content.slice(0, limits.content),
     projects: grouped.projects.slice(0, limits.projects),
@@ -513,7 +423,6 @@ export function flattenGrouped(grouped: GroupedHits): AppSearchHit[] {
   return [
     ...grouped.conversations,
     ...grouped.messages,
-    ...grouped.tasks,
     ...grouped.files,
     ...grouped.content,
     ...grouped.projects,

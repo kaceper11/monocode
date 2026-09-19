@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { GithubWorkItemThread } from "./githubTasks";
 import {
   completeLinkedWorkItemUpdateCard,
+  linkedWorkItemActivityKey,
   linkedWorkItemActivityPrompt,
   linkedWorkItemTerminalState,
   linkedWorkItemUpdateSummary,
@@ -76,6 +77,18 @@ const thread: GithubWorkItemThread = {
 };
 
 describe("linked work item activity card", () => {
+  it("binds an async activity read to the account, item and revision", () => {
+    const key = linkedWorkItemActivityKey(update);
+    expect(linkedWorkItemActivityKey({ ...update, item: { ...update.item } })).toBe(key);
+    for (const item of [
+      { ...update.item, account: "another-account" },
+      { ...update.item, url: "https://github.com/acme/other/pull/42" },
+      { ...update.item, number: 43 },
+    ]) expect(linkedWorkItemActivityKey({ ...update, item })).not.toBe(key);
+    expect(linkedWorkItemActivityKey({ ...update, updatedAt: update.updatedAt + 1 })).not.toBe(key);
+    expect(pendingLinkedWorkItemUpdateCard(update).key).toBe(key);
+  });
+
   it("only includes activity newer than the prior read baseline", () => {
     const card = completeLinkedWorkItemUpdateCard(
       pendingLinkedWorkItemUpdateCard(update),
@@ -124,6 +137,21 @@ describe("linked work item activity card", () => {
 });
 
 describe("provider-specific activity", () => {
+  it.each([undefined, "resolved", "inprogress", "unknown"])(
+    "does not infer Azure completion from a display name (%s category)",
+    (stateType) => {
+      expect(linkedWorkItemTerminalState({
+        provider: "azure", kind: "issue", state: "Done", stateType,
+      })).toBeUndefined();
+    },
+  );
+
+  it("recognizes the Azure removed category regardless of display name", () => {
+    expect(linkedWorkItemTerminalState({
+      provider: "azure", kind: "issue", state: "Discarded", stateType: "removed",
+    })).toBe("issue_closed");
+  });
+
   const gitlabUpdate: LinkedSessionUpdate = {
     ...update,
     item: {

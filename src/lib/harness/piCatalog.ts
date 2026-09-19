@@ -13,7 +13,7 @@ import { buildPiSpawnArgs, modelsFromRpcData } from "./piProtocol";
 const DISCOVERY_TIMEOUT_MS = 45_000;
 
 function refreshCatalog(flavor: PiFlavor, cwd?: string): Promise<void> {
-  return refreshModelCatalog(flavor.id, cwd, () => discoverModels(flavor, cwd));
+  return refreshModelCatalog(flavor.id, cwd, (projectCwd) => discoverModels(flavor, projectCwd));
 }
 
 async function discoverModels(flavor: PiFlavor, projectCwd?: string) {

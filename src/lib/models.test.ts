@@ -7,12 +7,12 @@ import {
   hasLiveCatalog,
   isPickerProviderVisible,
   loadDefaultModels,
-  loadDefaultRuntimeMode,
   loadHiddenPickerProviders,
   loadLastModelChoice,
   loadLastModelSettings,
   loadRecentModelChoices,
   mergeModelSettings,
+  modelEffortSetting,
   modelPickerTabs,
   modelsFor,
   preferredModelId,
@@ -20,7 +20,6 @@ import {
   resetHarnessModelOverlays,
   resolveModel,
   saveDefaultModel,
-  saveDefaultRuntimeMode,
   saveLastModelChoice,
   saveLastModelSettings,
   savePickerProviderVisible,
@@ -176,6 +175,34 @@ describe("model settings memory", () => {
       preferredModelSettings(opus, { effort: "xhigh", fast: "true" }),
     ).toEqual({ effort: "xhigh", fast: "true" });
   });
+
+  it("treats OpenCode variant as the effort setting", () => {
+    const model: AgentModel = {
+      id: "opencode:some-cloud/spark-1",
+      harness: "opencode",
+      name: "Spark 1",
+      nativeId: "some-cloud/spark-1",
+      settings: [
+        {
+          id: "variant",
+          label: "Variant",
+          kind: "select",
+          value: "medium",
+          options: [
+            { value: "minimal", label: "Minimal" },
+            { value: "low", label: "Low" },
+            { value: "medium", label: "Medium" },
+            { value: "high", label: "High" },
+            { value: "xhigh", label: "Extra High" },
+          ],
+        },
+      ],
+    };
+    expect(modelEffortSetting(model)?.id).toBe("variant");
+    expect(mergeModelSettings(model, { variant: "high" })).toEqual({
+      variant: "high",
+    });
+  });
 });
 
 describe("provider defaults", () => {
@@ -228,27 +255,12 @@ describe("provider defaults", () => {
     });
   });
 
-  it("starts new conversations supervised until an access mode is saved", () => {
-    expect(loadDefaultRuntimeMode()).toBe("supervised");
-    saveDefaultRuntimeMode("full-access");
-    expect(loadDefaultRuntimeMode()).toBe("full-access");
-    saveDefaultRuntimeMode("auto-accept-edits");
-    expect(loadDefaultRuntimeMode()).toBe("auto-accept-edits");
-  });
-
-  it("ignores a stored value that is not a runtime mode", () => {
-    localStorage.setItem("monocode.defaultRuntimeMode", "yolo");
-    expect(loadDefaultRuntimeMode()).toBe("supervised");
-  });
-
-  it("seeds new sessions with the saved access mode unless one is given", () => {
-    saveDefaultRuntimeMode("full-access");
-    expect(newDefaultSession().runtimeMode).toBe("full-access");
-    expect(newSession("claude").runtimeMode).toBe("full-access");
+  it("uses upstream access defaults despite a legacy fork preference", () => {
+    localStorage.setItem("monocode.defaultRuntimeMode", "full-access");
+    expect(newDefaultSession().runtimeMode).toBe("supervised");
+    expect(newSession("claude").runtimeMode).toBe("supervised");
     expect(newDefaultSession("~", "auto").runtimeMode).toBe("auto");
-    expect(newSession("claude", "~", undefined, "supervised").runtimeMode).toBe(
-      "supervised",
-    );
+    expect(newSession("claude", "~", undefined, "full-access").runtimeMode).toBe("full-access");
   });
 
   it("seeds new sessions with the saved provider and model", () => {
@@ -456,4 +468,16 @@ it.each(["codex", "devin", "copilot", "muse"] as const)("keeps %s Default semant
   expect(nativeModelId(`${harness}:default`, "/repo")).toBe("");
   expect(nativeModelId(`${harness}:live`, "/repo")).toBe("live");
   resetHarnessModelOverlays();
+});
+
+it("does not apply Devin variant migration to upstream model choices", () => {
+  setHarnessModels("claude", [
+    { id: "claude:sonnet-5", harness: "claude", name: "Sonnet", nativeId: "sonnet-5" },
+    { ...opus, settings: [{ id: "effort", label: "Reasoning", kind: "select", value: "high", options: [{ value: "legacy-value", label: "High" }] }] },
+  ]);
+  try {
+    expect(resolveModel("claude", "claude:legacy-value").id).toBe("claude:sonnet-5");
+  } finally {
+    resetHarnessModelOverlays();
+  }
 });

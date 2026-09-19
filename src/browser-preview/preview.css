@@ -1,0 +1,85 @@
+:root {
+  color-scheme: light dark;
+  font:
+    12px -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  color: light-dark(#252525, #e6e6e6);
+  background: light-dark(#f7f7f7, #202020);
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+main {
+  height: 88px;
+  padding: 10px 12px;
+  border-bottom: 1px solid light-dark(#ddd, #383838);
+}
+form {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+button,
+input {
+  font: inherit;
+  color: inherit;
+  border-radius: 6px;
+  height: 32px;
+}
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  flex-shrink: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+button svg {
+  width: 16px;
+  height: 16px;
+}
+button:hover:not(:disabled) {
+  background: light-dark(#e5e5e5, #383838);
+}
+button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+input {
+  min-width: 0;
+  flex: 1;
+  padding: 0 10px;
+  border: 1px solid light-dark(#d4d4d4, #484848);
+  background: light-dark(white, #292929);
+}
+:focus-visible {
+  outline: 2px solid light-dark(#456ec0, #8eb9ff);
+  outline-offset: 2px;
+}
+.go {
+  width: auto;
+  padding: 0 12px;
+  background: light-dark(#252525, #e6e6e6);
+  color: light-dark(white, #202020);
+}
+.go:hover:not(:disabled) {
+  opacity: 0.85;
+  background: light-dark(#252525, #e6e6e6);
+}
+p {
+  margin: 8px 2px 0;
+  line-height: 14px;
+  font-size: 11px;
+  opacity: 0.7;
+}
+.error {
+  opacity: 1;
+  color: light-dark(#aa2525, #ffabab);
+}

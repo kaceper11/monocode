@@ -3,8 +3,6 @@ import { type ReactNode } from "react";
 import type { InboxKind } from "../lib/githubTasks";
 import {
   DEFAULT_INBOX_FILTERS,
-  INBOX_SOURCES,
-  INBOX_SOURCE_LABELS,
   hasActiveInboxFilters,
   type InboxFilters,
   type InboxSource,
@@ -19,15 +17,13 @@ import {
 } from "../lib/jira";
 import { Popover } from "./Popover";
 import { ProjectLogoIcon } from "./ProjectLogoIcon";
-import { InboxProviderMark } from "./InboxProviderMark";
 import { useEffect, useState } from "react";
 import { azureOptions, saveAzureFilter, type AzureFilter, type AzureOption } from "../lib/azure";
 
 export const INBOX_FILTER_MENU_WIDTH = 228;
 
 type ProjectOption = {
-  /** Rail identity — a normalized path or `project:<id>` for groups. */
-  key: string;
+  path: string;
   name: string;
   logoPath: string | null;
 };
@@ -50,9 +46,7 @@ type Props = {
   jiraFavorites?: JiraOption[];
   jiraOptionsError?: string;
   onJiraFilterChange?: (filter: JiraFilter) => void;
-  visibleSources?: InboxSource[];
-  onVisibleSourcesChange?: (sources: InboxSource[]) => void;
-  azure?: { site: string; filter: AzureFilter };
+  azure?: { site: string; accountId: string; filter: AzureFilter };
 };
 
 const TIME_OPTIONS: { id: InboxTimeFilter; label: string }[] = [
@@ -96,8 +90,6 @@ export function InboxFiltersMenu({
   jiraFavorites = [],
   jiraOptionsError,
   onJiraFilterChange,
-  visibleSources = INBOX_SOURCES,
-  onVisibleSourcesChange,
   azure,
 }: Props) {
   const ticket = source === "linear" || source === "jira";
@@ -118,10 +110,10 @@ export function InboxFiltersMenu({
     onChange({ ...filters, hiddenKinds: [...next] });
   };
 
-  const toggleProject = (key: string) => {
+  const toggleProject = (path: string) => {
     const next = new Set(hiddenProjects);
-    if (next.has(key)) next.delete(key);
-    else next.add(key);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
     onChange({ ...filters, hiddenProjects: [...next] });
   };
 
@@ -162,38 +154,7 @@ export function InboxFiltersMenu({
       onContextMenu={(event) => event.preventDefault()}
       className="overflow-y-auto overscroll-none p-1"
     >
-      {onVisibleSourcesChange ? (
-        <>
-          <SectionLabel>Visible sources</SectionLabel>
-          {INBOX_SOURCES.map((provider) => (
-            <FilterItem
-              key={provider}
-              label={INBOX_SOURCE_LABELS[provider]}
-              icon={
-                <InboxProviderMark
-                  provider={provider}
-                  className="size-3.5 shrink-0"
-                />
-              }
-              checked={visibleSources.includes(provider)}
-              disabled={
-                visibleSources.length === 1 && visibleSources.includes(provider)
-              }
-              onClick={() =>
-                onVisibleSourcesChange(
-                  INBOX_SOURCES.filter((candidate) =>
-                    candidate === provider
-                      ? !visibleSources.includes(candidate)
-                      : visibleSources.includes(candidate),
-                  ),
-                )
-              }
-            />
-          ))}
-          <div role="separator" className="my-1 h-px bg-content/10" />
-        </>
-      ) : null}
-      {source === "azure" && azure ? <AzureFilters site={azure.site} filter={azure.filter} /> : <FilterItem
+      {source === "azure" && azure ? <AzureFilters key={`${azure.site}:${azure.accountId}`} site={azure.site} accountId={azure.accountId} filter={azure.filter} /> : <FilterItem
         label={source === "gitlab" ? "Needs attention" : "Assigned to me"}
         checked={source === "jira" ? jiraFilter.assigned : filters.assignedToMe}
         onClick={
@@ -344,9 +305,9 @@ export function InboxFiltersMenu({
           <SectionLabel>Projects</SectionLabel>
           {projects.map((project) => (
             <FilterItem
-              key={project.key}
+              key={project.path}
               label={project.name}
-              checked={!hiddenProjects.has(project.key)}
+              checked={!hiddenProjects.has(project.path)}
               icon={
                 project.logoPath ? (
                   <ProjectLogoIcon
@@ -356,7 +317,7 @@ export function InboxFiltersMenu({
                   />
                 ) : undefined
               }
-              onClick={() => toggleProject(project.key)}
+              onClick={() => toggleProject(project.path)}
             />
           ))}
         </>
@@ -388,17 +349,17 @@ export function InboxFiltersMenu({
   );
 }
 
-function AzureFilters({ site, filter }: { site: string; filter: AzureFilter }) {
+function AzureFilters({ site, accountId, filter }: { site: string; accountId: string; filter: AzureFilter }) {
   const [projects, setProjects] = useState<AzureOption[]>([]);
   const [queries, setQueries] = useState<AzureOption[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [retry, setRetry] = useState(0);
   useEffect(() => {
-    if (!site) return;
+    if (!site || !accountId) return;
     let cancelled = false;
-    setLoading(true); setError(""); setQueries([]);
-    void Promise.allSettled([azureOptions(site, filter.project, false), azureOptions(site, filter.project, true)]).then(([p,q]) => {
+    setLoading(true); setError(""); setProjects([]); setQueries([]);
+    void Promise.allSettled([azureOptions(site, filter.project, false, accountId), azureOptions(site, filter.project, true, accountId)]).then(([p,q]) => {
       if (cancelled) return;
       if (p.status === "fulfilled") setProjects(p.value);
       if (q.status === "fulfilled") setQueries(q.value);
@@ -406,7 +367,7 @@ function AzureFilters({ site, filter }: { site: string; filter: AzureFilter }) {
       setLoading(false);
     });
     return () => { cancelled = true; };
-  }, [site, filter.project, retry]);
+  }, [site, accountId, filter.project, retry]);
   const change = (next: AzureFilter) => saveAzureFilter(site, next);
   return <>
     <div className="truncate px-2 py-1 text-[11px] text-content/50" title={site}>{site.replace("https://dev.azure.com/", "") || "Connect Azure DevOps in Settings"}</div>

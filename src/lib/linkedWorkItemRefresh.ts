@@ -1,70 +1,28 @@
-import type {
-  GithubWorkItemComment,
-  GithubWorkItemThread,
-  InboxItem,
-} from "./githubTasks";
-import {
-  githubWorkItem,
-  githubWorkItemThread,
-  gitlabWorkItemToInboxItem,
-  linearIssueToInboxItem,
-} from "./githubTasks";
-import {
-  gitlabConnected,
-  gitlabWorkItem,
-  gitlabWorkItemThread,
-} from "./gitlab";
-import { azureConnected, azureItemSnapshot, azureThread } from "./azure";
+import type { InboxItem } from "./githubTasks";
+import { githubWorkItem } from "./githubTasks";
+import { azureConnected, azureItemSnapshot } from "./azure";
 import {
   parseAzurePrLocation,
-  readAzurePr,
-  readAzurePrSection,
+  readAzurePrActivity,
   type AzurePrTarget,
-  type AzurePrThread,
 } from "./azureRepos";
-import { jiraConnected, jiraIssueSnapshot, jiraThread } from "./jira";
-import { linearIssueSnapshot, linearIssueThread } from "./linear";
+import { jiraConnected, jiraIssueSnapshot } from "./jira";
 import type { LinkedWorkItem } from "./session";
+import { linkedWorkItemNeedsAccount } from "./sessionWorkItem";
 
 const providerOf = (linked: LinkedWorkItem) => linked.provider ?? "github";
-
-type AzurePrThreadRow = Omit<AzurePrThread, "comments"> & {
-  publishedDate?: string;
-  lastUpdatedDate?: string;
-  comments: (AzurePrThread["comments"][number] & {
-    publishedDate?: string;
-    lastUpdatedDate?: string;
-  })[];
-};
 
 async function azurePrTarget(
   linked: LinkedWorkItem,
 ): Promise<AzurePrTarget | null> {
   try {
     const location = parseAzurePrLocation(linked.url);
-    const accountId =
-      linked.account ?? (await azureConnected()).accountId ?? "";
+    if (!linked.account) return null;
+    const accountId = linked.account;
     return { ...location, accountId };
   } catch {
     return null;
   }
-}
-
-/** Newest thread/comment stamp across one Azure PR threads page (ISO strings). */
-function azurePrActivityStamp(items: readonly AzurePrThreadRow[]): string {
-  let latest = "";
-  const note = (stamp?: string) => {
-    if (stamp && stamp > latest) latest = stamp;
-  };
-  for (const thread of items) {
-    note(thread.publishedDate);
-    note(thread.lastUpdatedDate);
-    for (const comment of thread.comments ?? []) {
-      note(comment.publishedDate);
-      note(comment.lastUpdatedDate);
-    }
-  }
-  return latest;
 }
 
 function azurePrSnapshotState(status: string): {
@@ -74,30 +32,8 @@ function azurePrSnapshotState(status: string): {
   const normalized = status.trim().toLowerCase();
   if (normalized === "completed") return { state: "merged", stateType: "completed" };
   if (normalized === "abandoned") return { state: "closed", stateType: "removed" };
-  return { state: "open", stateType: "inProgress" };
-}
-
-/** Thread pages are 50 rows; 10 keeps the activity read bounded on old PRs. */
-const AZURE_PR_THREAD_PAGES = 10;
-
-async function azurePrThreadRows(
-  target: AzurePrTarget,
-  revision: string,
-): Promise<{ items: AzurePrThreadRow[]; truncated: boolean }> {
-  const items: AzurePrThreadRow[] = [];
-  let skip = 0;
-  for (let page = 0; page < AZURE_PR_THREAD_PAGES; page++) {
-    const result = await readAzurePrSection<AzurePrThreadRow>(
-      target,
-      revision,
-      "threads",
-      skip,
-    );
-    items.push(...result.items);
-    if (result.nextSkip == null) return { items, truncated: false };
-    skip = result.nextSkip;
-  }
-  return { items, truncated: true };
+  if (normalized === "active") return { state: "open", stateType: "inProgress" };
+  return { state: "unknown", stateType: "unknown" };
 }
 
 async function azurePrSnapshot(
@@ -105,17 +41,14 @@ async function azurePrSnapshot(
 ): Promise<InboxItem | null> {
   const target = await azurePrTarget(linked);
   if (!target) return null;
-  const { pr, revision } = await readAzurePr(target);
-  const { items } = await azurePrThreadRows(target, revision);
+  const { pr, activityDates } = await readAzurePrActivity(target);
   const { state, stateType } = azurePrSnapshotState(pr.status);
-  const updatedAt = [
-    azurePrActivityStamp(items),
-    pr.closedDate ?? "",
-    pr.creationDate ?? "",
-  ]
-    .filter(Boolean)
-    .sort()
-    .pop() ?? "";
+  const latest = [...activityDates, pr.closedDate ?? "", pr.creationDate ?? ""]
+    .reduce((latest, stamp) => {
+      const timestamp = Date.parse(stamp);
+      return Number.isFinite(timestamp) ? Math.max(latest, timestamp) : latest;
+    }, 0);
+  const updatedAt = latest ? new Date(latest).toISOString() : "";
   return {
     provider: "azure",
     account: target.accountId,
@@ -138,65 +71,6 @@ async function azurePrSnapshot(
   };
 }
 
-async function azurePrThreadFor(
-  linked: LinkedWorkItem,
-): Promise<GithubWorkItemThread> {
-  const target = await azurePrTarget(linked);
-  if (!target) throw new Error("Missing Azure pull request target");
-  const { revision } = await readAzurePr(target);
-  const { items, truncated } = await azurePrThreadRows(target, revision);
-  const comments: GithubWorkItemComment[] = items.flatMap((thread) =>
-    (thread.comments ?? [])
-      .filter((comment) => !comment.isDeleted)
-      .map((comment) => ({
-        id: `${thread.id}:${comment.id}`,
-        kind: thread.threadContext?.filePath ? "review_comment" : "comment",
-        author: comment.author?.displayName ?? "",
-        body: comment.content ?? "",
-        createdAt: comment.publishedDate ?? thread.publishedDate ?? "",
-        url: linked.url,
-        state: thread.status ?? "",
-        path: thread.threadContext?.filePath ?? "",
-        line: thread.threadContext?.rightFileStart?.line ?? null,
-        resolved:
-          thread.status === "closed" || thread.status === "fixed",
-        threadId: String(thread.id),
-        replies: [],
-      })),
-  );
-  return {
-    comments,
-    commits: [],
-    truncated,
-    reviewDecision: "",
-    baseRefName: "",
-    headRefName: "",
-  };
-}
-
-/**
- * GitLab config is a single instance; a link whose URL belongs to another
- * instance must not silently query the configured one. A link whose URL
- * cannot be parsed is not verifiable, so it is treated as foreign.
- */
-async function gitlabSameInstance(linked: LinkedWorkItem): Promise<boolean> {
-  const status = await gitlabConnected();
-  if (!status.connected) return false;
-  try {
-    return new URL(status.url).origin === new URL(linked.url).origin;
-  } catch {
-    return false;
-  }
-}
-
-async function jiraSite(linked: LinkedWorkItem): Promise<string> {
-  return linked.site ?? (await jiraConnected()).site;
-}
-
-async function azureSite(linked: LinkedWorkItem): Promise<string> {
-  return linked.site ?? (await azureConnected()).site;
-}
-
 /**
  * Refresh one linked item when it does not appear in the Inbox listing —
  * e.g. assigned to someone else, filtered out, or in a closed state. Returns
@@ -206,44 +80,27 @@ export async function refreshLinkedWorkItem(
   cwd: string,
   linked: LinkedWorkItem,
 ): Promise<InboxItem | null> {
+  if (linkedWorkItemNeedsAccount(linked)) return null;
   try {
     switch (providerOf(linked)) {
-      case "gitlab": {
-        if (!(await gitlabSameInstance(linked))) return null;
-        const item = await gitlabWorkItem(
-          linked.repo,
-          linked.kind,
-          linked.number,
-        );
-        return {
-          ...gitlabWorkItemToInboxItem(item, "", item.repo || linked.repo),
-          account: linked.account ?? item.account,
-        };
-      }
+      case "gitlab":
+      case "linear":
+        return null;
       case "jira": {
         const id = linked.id ?? linked.identifier;
-        const site = await jiraSite(linked);
+        const status = await jiraConnected();
+        const site = linked.site ?? status.site;
+        if (!status.connected || !status.accountId || (linked.account && linked.account !== status.accountId)) return null;
         if (!id || !site) return null;
-        const item = await jiraIssueSnapshot(site, id);
-        return { ...item, account: linked.account ?? item.account };
+        return await jiraIssueSnapshot(site, id, status.accountId);
       }
       case "azure": {
-        if (linked.kind === "pr") return azurePrSnapshot(linked);
+        if (linked.kind === "pr") return await azurePrSnapshot(linked);
         const id = linked.id ?? String(linked.number);
         const status = await azureConnected();
         const site = linked.site ?? status.site;
-        if (!site) return null;
-        const item = await azureItemSnapshot(site, id);
-        return {
-          ...item,
-          account: linked.account ?? status.accountId ?? item.account,
-        };
-      }
-      case "linear": {
-        const id = linked.id ?? linked.identifier;
-        if (!id) return null;
-        const item = linearIssueToInboxItem(await linearIssueSnapshot(id));
-        return { ...item, account: linked.account ?? item.account };
+        if (!status.connected || !site || !status.accountId || (linked.account && linked.account !== status.accountId)) return null;
+        return await azureItemSnapshot(site, id, status.accountId);
       }
       default: {
         const item = await githubWorkItem(
@@ -258,49 +115,5 @@ export async function refreshLinkedWorkItem(
     }
   } catch {
     return null;
-  }
-}
-
-/** Detail read behind the activity card, dispatched on the linked provider. */
-export async function fetchLinkedWorkItemThread(
-  cwd: string,
-  linked: LinkedWorkItem,
-): Promise<GithubWorkItemThread> {
-  switch (providerOf(linked)) {
-    case "gitlab": {
-      if (!(await gitlabSameInstance(linked))) {
-        throw new Error("Linked GitLab item is on another instance");
-      }
-      const thread = await gitlabWorkItemThread(
-        linked.repo,
-        linked.kind,
-        linked.number,
-        { force: true },
-      );
-      return { ...thread, commits: [] };
-    }
-    case "jira": {
-      const id = linked.id ?? linked.identifier;
-      const site = await jiraSite(linked);
-      if (!id || !site) throw new Error("Missing Jira issue identity");
-      return jiraThread({ site, id, url: linked.url });
-    }
-    case "azure": {
-      if (linked.kind === "pr") return azurePrThreadFor(linked);
-      const site = await azureSite(linked);
-      const id = linked.id ?? String(linked.number);
-      if (!site) throw new Error("Missing Azure site");
-      return azureThread({ site, id, url: linked.url });
-    }
-    case "linear": {
-      const id = linked.id ?? linked.identifier;
-      if (!id) throw new Error("Missing Linear issue identity");
-      const thread = await linearIssueThread(id, { force: true });
-      return { ...thread, commits: [] };
-    }
-    default:
-      return githubWorkItemThread(cwd, linked.repo, linked.kind, linked.number, {
-        force: true,
-      });
   }
 }

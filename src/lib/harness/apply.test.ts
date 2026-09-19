@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { newSession } from "../session";
+import { resetHarnessModelOverlays, setHarnessModels } from "../models";
 import { previewFromTool } from "./claudeProtocol";
 import {
   appendUser,
@@ -7,8 +8,6 @@ import {
   appendSteerUser,
   promoteLastAssistantToPlan,
   stopStreaming,
-  matchesActiveTurnModel,
-  startSessionActivity,
 } from "./apply";
 
 let now = 0;
@@ -20,22 +19,18 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  resetHarnessModelOverlays();
 });
 
 describe("turn duration", () => {
-  it("preserves next-turn settings through compaction acknowledgements and clears ownership on completion", () => {
-    let session = startSessionActivity({ ...newSession("omp", "/tmp", "omp:old"), modelSettings: { thinking: "medium" } });
-    expect(session.blocks).toHaveLength(0);
-    session = { ...session, model: "omp:new", modelSettings: { thinking: "high" } };
-    session = applyHarnessEvent(session, { type: "session.configChanged", model: "omp:old", modelSettings: { thinking: "medium" } });
-    expect(session.model).toBe("omp:new");
-    expect(session.modelSettings).toEqual({ thinking: "high" });
-    expect(session.activeTurnModel).toMatchObject({ id: "omp:old", settings: { thinking: "medium" } });
-    expect(matchesActiveTurnModel(session)).toBe(false);
-    session = stopStreaming(session);
-    expect(session.busy).toBe(false);
-    expect(session.activeTurnModel).toBeUndefined();
-    expect(session.model).toBe("omp:new");
+  it("records the model name from the turn's WSL worktree catalog", () => {
+    const cwd = "//wsl.localhost/Ubuntu/home/me/project";
+    const worktreeCwd = `${cwd}-branch`;
+    for (const [host, name] of [[undefined, "Native"], [cwd, "Project"], [worktreeCwd, "Worktree"]]) {
+      setHarnessModels("codex", [{ id: "codex:shared", harness: "codex", name: name! }], host);
+    }
+    const session = appendUser({ ...newSession("codex", cwd, "codex:shared"), worktreeCwd }, "work");
+    expect(session.blocks[0].turnModel?.name).toBe("Worktree");
   });
 
   it("records the selected provider and model on a user turn", () => {
@@ -110,6 +105,54 @@ describe("turn duration", () => {
       role: "system",
       text: "Codex app-server exited",
       notice: "error",
+    });
+  });
+});
+
+describe("approval lifetime", () => {
+  function waitingForApproval() {
+    let session = appendUser(newSession("codex", "/tmp"), "check it");
+    session = applyHarnessEvent(session, {
+      type: "tool.started",
+      callId: "shell-1",
+      title: "Run npm test",
+      kind: "execute",
+      status: "pending",
+    });
+    return applyHarnessEvent(session, {
+      type: "approval.requested",
+      requestId: 7,
+      callId: "shell-1",
+      title: "Run npm test",
+      kind: "execute",
+    });
+  }
+
+  it("cancels an unresolved request when its turn stops", () => {
+    const session = stopStreaming(waitingForApproval());
+    const tool = session.blocks.find(
+      (block) => block.tool?.callId === "shell-1",
+    );
+
+    expect(session.busy).toBe(false);
+    expect(tool).toMatchObject({
+      streaming: false,
+      tool: { status: "cancelled" },
+      approval: { requestId: 7, decided: "cancelled" },
+    });
+  });
+
+  it("cancels a stale request before a later turn is appended", () => {
+    const stale = { ...waitingForApproval(), busy: false };
+    const session = appendUser(stale, "continue");
+    const tool = session.blocks.find(
+      (block) => block.tool?.callId === "shell-1",
+    );
+
+    expect(tool?.approval).toEqual({ requestId: 7, decided: "cancelled" });
+    expect(session.blocks.at(-1)).toMatchObject({
+      role: "user",
+      text: "continue",
     });
   });
 });
@@ -247,33 +290,6 @@ describe("streamed markdown", () => {
 });
 
 describe("appendSteerUser", () => {
-  it("uses provider-confirmed settings without overwriting a newer picker choice", () => {
-    let session = appendUser(newSession("claude", "/tmp", "claude:opus-5"), "start");
-    session = applyHarnessEvent(session, { type: "session.configChanged", modelSettings: { effort: "high" } });
-    expect(matchesActiveTurnModel(session)).toBe(true);
-    session = { ...session, model: "claude:sonnet-5", modelSettings: { effort: "low" } };
-    session = applyHarnessEvent(session, { type: "session.configChanged", model: "claude:opus-5", modelSettings: { effort: "max" } });
-    expect(session.model).toBe("claude:sonnet-5");
-    expect(session.modelSettings.effort).toBe("low");
-    expect(session.activeTurnModel?.settings.effort).toBe("max");
-    expect(session.blocks[0].turnModel?.id).toBe("claude:opus-5");
-    expect(matchesActiveTurnModel(session)).toBe(false);
-  });
-  it("keeps the running model on steers and reserves changed model/effort for a new turn", () => {
-    let session = appendUser(newSession("claude", "/tmp", "claude:opus-5"), "build it");
-    const original = session.blocks[0].turnModel;
-    expect(matchesActiveTurnModel(session)).toBe(true);
-    session = { ...session, modelSettings: { ...session.modelSettings, effort: "different" } };
-    expect(matchesActiveTurnModel(session)).toBe(false);
-    session = { ...session, model: "claude:sonnet-5" };
-    expect(matchesActiveTurnModel(session)).toBe(false);
-    session = appendSteerUser(session, "followup");
-    expect(session.blocks[1].turnModel).toEqual(original);
-    session = appendUser(stopStreaming(session), "next turn");
-    expect(session.blocks[2].turnModel?.id).toBe("claude:sonnet-5");
-    expect(matchesActiveTurnModel(session)).toBe(true);
-    expect(stopStreaming(session).activeTurnModel).toBeUndefined();
-  });
   it("appends a user message without sealing an in-flight assistant block", () => {
     let session = appendUser(newSession("cursor", "/tmp"), "build it");
     session = applyHarnessEvent(session, {
@@ -307,33 +323,6 @@ describe("appendSteerUser", () => {
       text: "hi",
       noteCard: { id: "n1", slug: "overview", title: "Overview" },
     });
-  });
-});
-
-describe("transient provider activity", () => {
-  it("retains a question and busy ownership when a reply needs correction", () => {
-    let session = appendUser(newSession("copilot", "/tmp"), "work");
-    session = applyHarnessEvent(session, { type: "question.asked", requestId: 7, questions: [] });
-    const before = session;
-    session = applyHarnessEvent(session, { type: "question.error", requestId: 7, message: "Enter a number" });
-    expect(session.busy).toBe(true);
-    expect(session.activeTurnModel).toBe(before.activeTurnModel);
-    expect(session.blocks).toBe(before.blocks);
-    expect(session.pendingQuestion).toMatchObject({ requestId: 7, error: "Enter a number" });
-    expect(applyHarnessEvent(session, { type: "question.error", requestId: 8, message: "stale" })).toBe(session);
-  });
-  it("keeps one transient label without settling or growing the conversation", () => {
-    let session = appendUser(newSession("muse", "/tmp"), "work");
-    const blocks = session.blocks;
-    for (let count = 0; count < 30; count += 1) {
-      session = applyHarnessEvent(session, { type: "session.activity", text: "Finishing…" });
-    }
-    expect(session.blocks).toBe(blocks);
-    expect(session.busy).toBe(true);
-    expect(session.activity).toBe("Finishing…");
-    expect(applyHarnessEvent(session, { type: "session.activity" }).activity).toBeUndefined();
-    expect(applyHarnessEvent(session, { type: "message.delta", text: "Done" }).activity).toBeUndefined();
-    expect(stopStreaming(session).activity).toBeUndefined();
   });
 });
 
@@ -1009,4 +998,26 @@ describe("subagent steps", () => {
     expect(session.blocks[0].tool?.status).toBe("completed");
     expect(session.blocks[0].agentRun?.steps).toHaveLength(1);
   });
+});
+
+describe("provider request settlement", () => {
+  it("settles a provider-cancelled tool without ending the turn", () => {
+    let session = appendUser(newSession("copilot", "/tmp"), "work");
+    session = applyHarnessEvent(session, { type: "tool.started", callId: "tool", title: "Read", status: "pending" });
+    session = applyHarnessEvent(session, { type: "tool.updated", callId: "tool", status: "cancelled" });
+    expect(session.blocks.at(-1)).toMatchObject({ streaming: false, tool: { status: "cancelled" } });
+    expect(session.busy).toBe(true);
+  });
+
+  it("retains a question and busy ownership when a reply needs correction", () => {
+    let session = appendUser(newSession("copilot", "/tmp"), "work");
+    session = applyHarnessEvent(session, { type: "question.asked", requestId: 7, questions: [] });
+    const before = session;
+    session = applyHarnessEvent(session, { type: "question.error", requestId: 7, message: "Enter a number" });
+    expect(session.busy).toBe(true);
+    expect(session.blocks).toBe(before.blocks);
+    expect(session.pendingQuestion).toMatchObject({ requestId: 7, error: "Enter a number" });
+    expect(applyHarnessEvent(session, { type: "question.error", requestId: 8, message: "stale" })).toBe(session);
+  });
+
 });

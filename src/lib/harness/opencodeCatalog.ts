@@ -12,7 +12,9 @@ import {
   inferDefaultVariant,
   KNOWN_HIDDEN_AGENTS,
   MINIMUM_OPENCODE_VERSION,
+  openCodeVariantLabel,
   parseOpenCodeVersion,
+  sortOpenCodeVariants,
   titleCaseSlug,
 } from "./opencodeProtocol";
 
@@ -47,7 +49,7 @@ export type OpenCodeAgent = {
 };
 
 export function refreshOpenCodeCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("opencode", cwd, () => discoverOpenCodeModels(cwd));
+  return refreshModelCatalog("opencode", cwd, discoverOpenCodeModels);
 }
 
 async function discoverOpenCodeModels(projectCwd?: string): Promise<AgentModel[]> {
@@ -209,12 +211,12 @@ function openCodeModelSettings(
   agents: OpenCodeAgent[],
 ): ModelSetting[] | undefined {
   const settings: ModelSetting[] = [];
-  const variantValues = Object.keys(model.variants ?? {});
+  const variantValues = sortOpenCodeVariants(Object.keys(model.variants ?? {}));
   if (variantValues.length > 0) {
     const defaultVariant = inferDefaultVariant(providerID, variantValues);
     const options: ModelSettingChoice[] = variantValues.map((value) => ({
       value,
-      label: titleCaseSlug(value),
+      label: openCodeVariantLabel(value),
     }));
     settings.push({
       id: "variant",

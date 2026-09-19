@@ -113,14 +113,19 @@ function release() {
   }, 500);
 }
 
+/** Saved step execution must not outrun its exit-event subscription. */
+export async function readyPtyEvents(): Promise<void> {
+  if (!bridge) throw new Error("The terminal event bridge is not connected.");
+  await bridge;
+}
+
 export async function spawnPty(
   id: string,
   cwd: string,
   cols: number,
   rows: number,
-  exec?: string,
 ): Promise<void> {
-  await invoke("pty_spawn", { id, cwd, cols, rows, exec });
+  await invoke("pty_spawn", { id, cwd, cols, rows });
 }
 
 export async function writePty(id: string, data: string): Promise<void> {
@@ -139,29 +144,6 @@ export async function getPtyStatus(
   id: string,
 ): Promise<{ foreground: string | null }> {
   return invoke<{ foreground: string | null }>("pty_status", { id });
-}
-
-export type PtyResource = {
-  id: string;
-  /** `native` runs on the OS host; `wsl` is a Linux tree behind wsl.exe. */
-  host: "native" | "wsl";
-  distro: string | null;
-  cpuPct: number;
-  rssBytes: number;
-  processes: number;
-  /** Non-shell work exists — the kill-workload action is meaningful. */
-  workload: boolean;
-  /** Busiest non-shell process name. */
-  top: string | null;
-};
-
-export async function getPtyResources(): Promise<PtyResource[]> {
-  return invoke<PtyResource[]>("pty_resources");
-}
-
-/** Stop the terminal's workload; its shell stays alive. */
-export async function killPtyWorkload(id: string): Promise<void> {
-  await invoke("pty_kill_workload", { id });
 }
 
 export async function killPty(id: string): Promise<void> {

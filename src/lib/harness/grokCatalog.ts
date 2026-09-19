@@ -28,7 +28,7 @@ const CLIENT_CAPABILITIES = {
 };
 
 export function refreshGrokCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("grok", cwd, () => discoverGrokModels(cwd));
+  return refreshModelCatalog("grok", cwd, discoverGrokModels);
 }
 
 async function discoverGrokModels(projectCwd?: string) {

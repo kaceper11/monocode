@@ -11,6 +11,9 @@ export default defineConfig(async ({ mode }) => {
   return {
     plugins: [react(), tailwindcss()],
     clearScreen: false,
+    build: {
+      rollupOptions: { input: ["index.html", "browser-preview.html"] },
+    },
     server: {
       port: 1420,
       strictPort: true,

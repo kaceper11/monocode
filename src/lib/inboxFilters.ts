@@ -55,10 +55,6 @@ export const DEFAULT_INBOX_FILTERS: InboxFilters = {
 };
 
 export type InboxSource = InboxProvider;
-export const INBOX_SOURCES: InboxSource[] = ["github", "linear", "gitlab", "jira", "azure"];
-export const INBOX_SOURCE_LABELS: Record<InboxSource, string> = {
-  github: "GitHub", linear: "Linear", gitlab: "GitLab", jira: "Jira", azure: "Azure",
-};
 
 export type ConnectableInboxSource = InboxSource;
 
@@ -68,6 +64,13 @@ export type InboxSourceConnections = Record<
   boolean | null
 >;
 
+export const INBOX_SOURCE_LABELS: Record<InboxSource, string> = {
+  github: "GitHub",
+  linear: "Linear",
+  gitlab: "GitLab",
+  jira: "Jira",
+  azure: "Azure",
+};
 
 export function visibleInboxSources(
   connections: InboxSourceConnections,
@@ -96,33 +99,13 @@ export function connectableInboxSources(
 export function resolveInboxSource(
   source: InboxSource,
   connections: InboxSourceConnections,
-  preferredSources: InboxSource[] = INBOX_SOURCES,
 ): InboxSource {
-  const visible = visibleInboxSources(connections).filter(source => preferredSources.includes(source));
+  const visible = visibleInboxSources(connections);
   return visible.includes(source) ? source : (visible[0] ?? "github");
 }
 
 const FILTERS_KEY = "monocode.inboxFilters";
 const SOURCE_KEY = "monocode.inboxSource";
-const VISIBLE_SOURCES_KEY = "monocode.inboxVisibleSources";
-
-export function loadVisibleInboxSources(): InboxSource[] {
-  try {
-    const saved = JSON.parse(localStorage.getItem(VISIBLE_SOURCES_KEY) ?? "null");
-    const visible = INBOX_SOURCES.filter(source => Array.isArray(saved) && saved.includes(source));
-    return visible.length ? visible : INBOX_SOURCES;
-  } catch {
-    return INBOX_SOURCES;
-  }
-}
-
-export function saveVisibleInboxSources(sources: InboxSource[]) {
-  try {
-    localStorage.setItem(VISIBLE_SOURCES_KEY, JSON.stringify(sources));
-  } catch {
-    // private mode / quota
-  }
-}
 const CONNECTIONS_KEY = "monocode.inboxConnections";
 
 const UNKNOWN_CONNECTIONS: InboxSourceConnections = {
@@ -136,8 +119,7 @@ const UNKNOWN_CONNECTIONS: InboxSourceConnections = {
 export function loadInboxSource(): InboxSource {
   try {
     const raw = localStorage.getItem(SOURCE_KEY);
-    const visible = loadVisibleInboxSources();
-    return visible.find(source => source === raw) ?? visible[0];
+    return raw === "linear" || raw === "gitlab" || raw === "jira" || raw === "azure" ? raw : "github";
   } catch {
     return "github";
   }
@@ -247,6 +229,11 @@ export function hasActiveInboxFilters(
   /** Teams live outside InboxFilters — they narrow the fetch and are shared with Settings. */
   hiddenLinearTeamIds: readonly string[] = [],
 ): boolean {
+  if (source === "jira" || source === "azure") {
+    const status = statusFilterForSource(filters.status, source);
+    return filters.time !== "all" || Object.values(status).some(Boolean) ||
+      (source === "azure" && filters.hiddenKinds.some(kind => kind === "azure" || kind === "pr" || kind === "ci"));
+  }
   const statusActive =
     source === "linear"
       ? filters.status.open || filters.status.closed
@@ -276,20 +263,15 @@ export function inboxFetchState(filters: InboxFilters): "open" | "all" {
 export function filterInboxByProject(
   items: readonly InboxItem[],
   hiddenProjects: Iterable<string>,
-  /** Resolves a working copy to its project identity — a hidden rail key or
-   * member path hides every item the project fetched. */
-  keyOf: (path: string) => string = normalizeProjectPath,
 ): InboxItem[] {
   const hidden = new Set(
     [...hiddenProjects].map((path) => normalizeProjectPath(path)),
   );
   if (hidden.size === 0) return [...items];
   return items.filter((item) => {
-    if (!item.projectPath.trim()) return true;
     const path = normalizeProjectPath(item.projectPath);
-    return (
-      !hidden.has(path) && !hidden.has(normalizeProjectPath(keyOf(path)))
-    );
+    if (!path) return true;
+    return !hidden.has(path);
   });
 }
 
@@ -383,7 +365,6 @@ export function applyInboxFilters(
   query: string,
   now = Date.now(),
   source?: InboxSource,
-  keyOf?: (path: string) => string,
 ): InboxItem[] {
   const scoped = source ? filterInboxByProvider(items, source) : [...items];
   const hiddenProjects =
@@ -399,7 +380,7 @@ export function applyInboxFilters(
       filterInboxByTime(
         filterInboxByKind(
           filterInboxByLinearProject(
-            filterInboxByProject(scoped, hiddenProjects, keyOf),
+            filterInboxByProject(scoped, hiddenProjects),
             filters.hiddenLinearProjects,
           ),
           hiddenKinds,

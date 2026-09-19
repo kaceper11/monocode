@@ -209,7 +209,7 @@ const EFFORT_LABELS: Record<string, string> = {
 };
 
 export function refreshClaudeCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("claude", cwd, () => discoverClaudeModels(cwd));
+  return refreshModelCatalog("claude", cwd, discoverClaudeModels);
 }
 
 async function discoverClaudeModels(projectCwd?: string): Promise<AgentModel[]> {

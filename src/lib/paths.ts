@@ -1,11 +1,7 @@
 import { IS_WIN } from "./platform";
 
 function windowsPath(path: string): boolean {
-  return (
-    /^[A-Za-z]:[\\/]/.test(path) ||
-    path.startsWith("\\\\") ||
-    path.startsWith("//")
-  );
+  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\") || path.startsWith("//");
 }
 
 export function slash(path: string): string {
@@ -51,27 +47,7 @@ export function wslPath(distribution: string, path: string): string {
 }
 
 function trimSlash(path: string): string {
-  const slashed = slash(path).replace(/\/+$/, "") || "/";
-  const parts = slashed.split("/");
-  // Elements ".." may never pop: "" for a POSIX root or the leading ""s +
-  // host of a //wsl.localhost/UNC path. A Windows drive is protected by the
-  // pop test below.
-  const floor =
-    parts[0] === "" && parts[1] === "" ? 3 : parts[0] === "" ? 1 : 0;
-  const out = parts.slice(0, floor);
-  for (const part of parts.slice(floor)) {
-    if (part === ".") continue;
-    if (part === "..") {
-      const last = out[out.length - 1];
-      if (out.length > floor && last !== ".." && !/^[A-Za-z]:$/.test(last))
-        out.pop();
-      // Relative paths keep leading hops; anchored paths can't escape root.
-      else if (!floor && (out.length === 0 || last === "..")) out.push(part);
-      continue;
-    }
-    out.push(part);
-  }
-  return out.join("/") || "/";
+  return slash(path).replace(/\/+$/, "") || "/";
 }
 
 /** Stable comparison key for Windows paths without changing their display case. */
@@ -293,16 +269,4 @@ export function projectName(cwd: string): string {
  */
 export function projectKey(cwd: string): string {
   return pathKey(cwd);
-}
-
-/** True if this looks like a user project, not an app bundle or system root. */
-export function looksLikeProject(path: string): boolean {
-  if (!path || path === "/" || path === "~") return false;
-  const normalized = slash(path).replace(/\/+$/, "") || "/";
-  if (/^[A-Za-z]:$/.test(normalized) || normalized === "/") return false;
-  // Home itself arrives expanded (`/Users/me`), so the `~` check above misses
-  // it. Indexing it walks `~/Library`, which trips the OS consent prompt.
-  if (prettyCwd(path) === "~") return false;
-  if (path.includes(".app/") || path.includes(".app\\")) return false;
-  return true;
 }

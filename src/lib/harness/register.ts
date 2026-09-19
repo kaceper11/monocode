@@ -5,6 +5,7 @@ import { ensureCursorRegistered } from "./cursorAdapter";
 import { ensureDevinRegistered } from "./devinAdapter";
 import { ensureFxRegistered } from "./fxAdapter";
 import { ensureGrokRegistered } from "./grokAdapter";
+import { ensureHermesRegistered } from "./hermesAdapter";
 import { ensureMuseRegistered } from "./museAdapter";
 import { ensureOpenCodeRegistered } from "./opencodeAdapter";
 import { ensureOmpRegistered } from "./ompAdapter";
@@ -20,6 +21,7 @@ export function registerBuiltinHarnesses(): void {
   ensurePiRegistered();
   ensureOmpRegistered();
   ensureFxRegistered();
+  ensureHermesRegistered();
   ensureDevinRegistered();
   ensureCopilotRegistered();
   ensureMuseRegistered();

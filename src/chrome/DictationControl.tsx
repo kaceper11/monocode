@@ -26,15 +26,45 @@ import {
 } from "../lib/dictation";
 import type { Dictation } from "./useDictation";
 import { hotkeyBlockedByTarget } from "../lib/hotkeyTarget";
+import { MOD, SHIFT } from "../lib/platform";
 
 const TOOL_BUTTON =
-  "grid size-6.5 shrink-0 place-items-center rounded-md bg-content/10 text-content/50 hover:bg-content/15 hover:text-content disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-content/50";
+  "grid size-6.5 shrink-0 place-items-center rounded-md bg-content/10 text-content/70 hover:bg-content/15 hover:text-content disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-content/70";
 
 const ROW_ICON_BUTTON =
-  "grid size-6 shrink-0 place-items-center rounded-md text-content/50 hover:bg-content/10 hover:text-content";
+  "grid size-6 shrink-0 place-items-center rounded-md text-content/70 hover:bg-content/10 hover:text-content";
 
 const SECTION_LABEL =
-  "px-2 pb-0.5 pt-1.5 text-[10px] font-medium uppercase tracking-wide text-content/40";
+  "px-2 pb-0.5 pt-1.5 text-[10px] font-medium uppercase tracking-wide text-content/70";
+
+export function DictationError({ dictation }: { dictation: Dictation }) {
+  if (!dictation.error) return null;
+  return (
+    <p
+      role="alert"
+      className="flex items-center gap-2 px-3 pt-2 text-xs text-red-400 in-[.theme-light]:text-red-700"
+    >
+      <span className="min-w-0 flex-1">{dictation.error}</span>
+      {dictation.micBlocked && (
+        <button
+          type="button"
+          onClick={dictation.openMicSettings}
+          className="shrink-0 underline"
+        >
+          Open Settings
+        </button>
+      )}
+      <button
+        type="button"
+        aria-label="Dismiss dictation error"
+        onClick={dictation.dismissError}
+        className={ROW_ICON_BUTTON}
+      >
+        <X className="size-3" />
+      </button>
+    </p>
+  );
+}
 
 function ModelRow({
   model,
@@ -62,8 +92,7 @@ function ModelRow({
     <div className="flex items-center gap-1">
       <button
         type="button"
-        role="menuitemradio"
-        aria-checked={selected}
+        aria-pressed={selected}
         onClick={() => dictation.selectModel(model.id)}
         className="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-content hover:bg-content/10"
       >
@@ -74,7 +103,7 @@ function ModelRow({
           <span className="block truncate text-[13px] leading-4.5">
             {model.label}
           </span>
-          <span className="block truncate text-[11px] leading-4 text-content/45">
+          <span className="block text-[11px] leading-4 text-content/70">
             {model.tier} · {formatModelSize(model.sizeBytes)}
             {status ? ` · ${status}` : ""}
           </span>
@@ -82,7 +111,7 @@ function ModelRow({
       </button>
       {downloading ? (
         <>
-          <span className="shrink-0 text-[11px] tabular-nums text-content/55">
+          <span className="shrink-0 text-[11px] tabular-nums text-content/70">
             {progress?.phase === "verifying"
               ? "Verifying"
               : progress
@@ -99,7 +128,8 @@ function ModelRow({
             <X className="size-3" />
           </button>
         </>
-      ) : model.installed ? (
+      ) : null}
+      {!downloading && model.removable ? (
         <button
           type="button"
           title={`Remove ${model.label}`}
@@ -109,7 +139,8 @@ function ModelRow({
         >
           <Trash2 className="size-3.5" />
         </button>
-      ) : (
+      ) : null}
+      {!downloading && !model.installed ? (
         <button
           type="button"
           title={
@@ -123,14 +154,14 @@ function ModelRow({
               : `Download ${model.label}`
           }
           onClick={() => dictation.installModel(model.id)}
-          className="flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] text-content/60 hover:bg-content/10 hover:text-content"
+          className="flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] text-content/70 hover:bg-content/10 hover:text-content"
         >
           <Download className="size-3.5" />
           {model.partialBytes > 0 || progress?.phase === "failed"
             ? "Resume"
             : null}
         </button>
-      )}
+      ) : null}
     </div>
   );
 }
@@ -168,7 +199,6 @@ function LanguageSection({ dictation }: { dictation: Dictation }) {
     <>
       <button
         type="button"
-        role="menuitem"
         aria-expanded={open}
         onClick={() => {
           setOpen(!open);
@@ -176,18 +206,18 @@ function LanguageSection({ dictation }: { dictation: Dictation }) {
         }}
         className="mx-0.5 flex w-[calc(100%-4px)] items-center gap-2 rounded-lg px-2 py-1.5 text-left text-content hover:bg-content/10"
       >
-        <Languages className="size-3.5 shrink-0 text-content/45" />
+        <Languages className="size-3.5 shrink-0 text-content/70" />
         <span className="min-w-0 flex-1 text-[13px]">Spoken language</span>
-        <span className="shrink-0 text-[11px] text-content/45">
+        <span className="shrink-0 text-[11px] text-content/70">
           {dictationLanguageLabel(dictation.prefs.language)}
         </span>
         <ChevronRight
-          className={`size-3 shrink-0 text-content/40 transition-transform ${open ? "rotate-90" : ""}`}
+          className={`size-3 shrink-0 text-content/70 transition-transform ${open ? "rotate-90" : ""}`}
         />
       </button>
       {open ? (
         <div className="mx-0.5 mb-1 mt-0.5 overflow-hidden rounded-lg border border-content/10">
-          <label className="flex h-7 items-center gap-2 border-b border-content/10 px-2 text-content/45">
+          <label className="flex h-7 items-center gap-2 border-b border-content/10 px-2 text-content/70">
             <Search className="size-3 shrink-0" strokeWidth={1.75} />
             <input
               value={query}
@@ -199,9 +229,13 @@ function LanguageSection({ dictation }: { dictation: Dictation }) {
               className="min-w-0 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/35"
             />
           </label>
-          <div role="listbox" className="max-h-40 overflow-y-auto py-0.5">
+          <div
+            role="group"
+            aria-label="Spoken languages"
+            className="max-h-40 overflow-y-auto py-0.5"
+          >
             {languages.length === 0 ? (
-              <p className="px-2 py-1.5 text-[12px] text-content/45">
+              <p className="px-2 py-1.5 text-[12px] text-content/70">
                 No matching language
               </p>
             ) : (
@@ -211,8 +245,7 @@ function LanguageSection({ dictation }: { dictation: Dictation }) {
                   <button
                     key={language.id ?? "auto"}
                     type="button"
-                    role="option"
-                    aria-selected={active}
+                    aria-pressed={active}
                     onClick={() => {
                       dictation.selectLanguage(language.id);
                       setOpen(false);
@@ -220,9 +253,7 @@ function LanguageSection({ dictation }: { dictation: Dictation }) {
                     className="flex w-full items-center gap-2 px-2 py-1 text-left text-[12.5px] text-content hover:bg-content/10"
                   >
                     <span className="grid size-3.5 shrink-0 place-items-center">
-                      {active ? (
-                        <Check className="size-3 text-accent" />
-                      ) : null}
+                      {active ? <Check className="size-3 text-accent" /> : null}
                     </span>
                     <span className="min-w-0 flex-1 truncate">
                       {language.label}
@@ -263,8 +294,7 @@ export function DictationControl({
   const selected = dictation.catalog
     ? resolveDictationModel(dictation.catalog, dictation.prefs.modelId)
     : null;
-  const translateDisabled =
-    selected != null && !selected.supportsTranslate;
+  const translateDisabled = selected != null && !selected.supportsTranslate;
 
   // ⌘⇧M dictates — toggle mode presses start/stop; hold mode runs while the
   // chord is held. Window-level so it works wherever focus sits in the pane.
@@ -273,8 +303,10 @@ export function DictationControl({
   /** True while a hotkey-started hold is down — a stray KeyM keyup (typing
    * "m" during a pointer hold) must not end it. */
   const hotkeyHoldRef = useRef(false);
+  const pointerReleaseRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => pointerReleaseRef.current?.(), [enabled, hold]);
   useEffect(() => {
-    if (!hotkeys) return;
+    if (!hotkeys || !enabled) return;
     const isHotkey = (event: KeyboardEvent) =>
       (event.metaKey || event.ctrlKey) &&
       event.shiftKey &&
@@ -342,11 +374,12 @@ export function DictationControl({
       hotkeyHoldRef.current = false;
       if (hold) dictationRef.current.release();
     };
-  }, [hotkeys, hold]);
+  }, [hotkeys, hold, enabled]);
 
+  const shortcut = `${MOD}${SHIFT}M`;
   const micTitle = hold
-    ? "Hold to dictate (⌘⇧M)"
-    : "Dictate (⌘⇧M)";
+    ? `Hold to dictate (${shortcut})`
+    : `Dictate (${shortcut})`;
 
   return (
     <div ref={anchor} className="flex shrink-0 items-center gap-1">
@@ -361,16 +394,21 @@ export function DictationControl({
             hold
               ? (event) => {
                   if (event.button !== 0) return;
+                  pointerReleaseRef.current?.();
                   dictation.press();
                   // The button unmounts as soon as the phase changes, so the
                   // release has to be heard at window level.
                   const done = () => {
                     window.removeEventListener("pointerup", done, true);
                     window.removeEventListener("pointercancel", done, true);
+                    window.removeEventListener("blur", done, true);
+                    pointerReleaseRef.current = null;
                     dictationRef.current.release();
                   };
+                  pointerReleaseRef.current = done;
                   window.addEventListener("pointerup", done, true);
                   window.addEventListener("pointercancel", done, true);
+                  window.addEventListener("blur", done, true);
                 }
               : undefined
           }
@@ -388,7 +426,7 @@ export function DictationControl({
         <div
           role="status"
           aria-live="polite"
-          className="flex h-6.5 items-center gap-1 rounded-md bg-red-500/15 pl-1.5 pr-0.5 text-[11px] text-red-300"
+          className="flex h-6.5 items-center gap-1 rounded-md bg-red-500/15 pl-1.5 pr-0.5 text-[11px] text-red-300 in-[.theme-light]:text-red-700"
           data-dictation-recording
         >
           {dictation.phase === "recording" ? (
@@ -417,9 +455,7 @@ export function DictationControl({
                 strokeWidth={2}
               />
               <span className="shrink-0">
-                {dictation.phase === "finishing"
-                  ? "Finishing…"
-                  : "Starting…"}
+                {dictation.phase === "finishing" ? "Finishing…" : "Starting…"}
               </span>
             </>
           )}
@@ -438,7 +474,7 @@ export function DictationControl({
         type="button"
         title="Dictation settings"
         aria-label="Dictation settings"
-        aria-haspopup="menu"
+        aria-haspopup="dialog"
         aria-expanded={dictation.menuOpen}
         disabled={!enabled}
         onMouseDown={(event) => event.preventDefault()}
@@ -457,14 +493,14 @@ export function DictationControl({
           align="end"
           width={264}
           onDismiss={() => dictation.setMenuOpen(false)}
-          role="menu"
+          role="dialog"
           aria-label="Dictation"
           data-dictation-menu
           className="p-1.5"
         >
           {dictation.micPermission === "denied" ||
           dictation.micPermission === "restricted" ? (
-            <div className="mx-0.5 mb-1 flex items-center gap-2 rounded-lg bg-red-500/10 px-2 py-1.5 text-[11px] text-red-300">
+            <div className="mx-0.5 mb-1 flex items-center gap-2 rounded-lg bg-red-500/10 px-2 py-1.5 text-[11px] text-red-300 in-[.theme-light]:text-red-700">
               <MicOff className="size-3.5 shrink-0" />
               <span className="min-w-0 flex-1">Microphone access is off</span>
               <button
@@ -478,7 +514,7 @@ export function DictationControl({
           ) : null}
           <p className={SECTION_LABEL}>Voice model</p>
           {dictation.catalog === null ? (
-            <p className="flex items-center gap-2 px-2 py-1.5 text-[12px] text-content/45">
+            <p className="flex items-center gap-2 px-2 py-1.5 text-[12px] text-content/70">
               <span className="min-w-0 flex-1">
                 {dictation.catalogFailed
                   ? "Couldn't load the model list"
@@ -506,7 +542,7 @@ export function DictationControl({
             ))
           )}
           <LanguageSection dictation={dictation} />
-          <p className={SECTION_LABEL}>Trigger · ⌘⇧M</p>
+          <p className={SECTION_LABEL}>Trigger · {shortcut}</p>
           <div className="flex gap-1 px-0.5 pb-0.5">
             {(
               [
@@ -519,13 +555,12 @@ export function DictationControl({
                 <button
                   key={mode.id}
                   type="button"
-                  role="menuitemradio"
-                  aria-checked={active}
+                  aria-pressed={active}
                   onClick={() => dictation.setMode(mode.id)}
                   className={`flex-1 rounded-md px-2 py-1 text-[11px] ${
                     active
                       ? "bg-content/15 text-content"
-                      : "text-content/55 hover:bg-content/10 hover:text-content"
+                      : "text-content/70 hover:bg-content/10 hover:text-content"
                   }`}
                 >
                   {mode.label}
@@ -536,8 +571,7 @@ export function DictationControl({
           <div className="mt-1 border-t border-content/10 pt-1">
             <button
               type="button"
-              role="menuitemcheckbox"
-              aria-checked={dictation.prefs.translate}
+              aria-pressed={dictation.prefs.translate}
               disabled={translateDisabled}
               title={
                 translateDisabled
@@ -547,7 +581,7 @@ export function DictationControl({
               onClick={() => dictation.setTranslate(!dictation.prefs.translate)}
               className="flex h-9 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] text-content hover:bg-content/10 disabled:opacity-40 disabled:hover:bg-transparent"
             >
-              <Languages className="size-3.5 shrink-0 text-content/45" />
+              <Languages className="size-3.5 shrink-0 text-content/70" />
               <span className="min-w-0 flex-1">Translate to English</span>
               <span
                 aria-hidden="true"

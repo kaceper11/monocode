@@ -5,8 +5,8 @@ import { Modal } from "./Modal";
 import { Select } from "./Select";
 import { AgentMarkdown } from "../surfaces/AgentMarkdown";
 import { ChevronRight, ExternalLink, LoaderCircle, Search } from "./icons";
-import { atlassianCapable, jiraConnected } from "../lib/jira";
-import { MAX_CONTEXT_ITEMS, requestAgentContext } from "../lib/agentContext";
+import { atlassianCapable, jiraConnected, JIRA_CHANGE_EVENT, type JiraStatus } from "../lib/jira";
+import { MAX_CONTEXT_ITEMS, type AgentContext } from "../lib/agentContext";
 import {
   confluenceMarkdown,
   confluencePage,
@@ -24,15 +24,14 @@ type Selection = { sections: Set<string> | null };
 /** Confluence page/section picker on the shared Atlassian connection. Page
  * content is untrusted reference data — rendered, never executed. */
 export function ConfluencePicker({
-  cwd,
-  sessionId,
+  onAdd,
   onClose,
 }: {
-  cwd: string;
-  sessionId?: string;
+  onAdd: (context: AgentContext) => void;
   onClose: () => void;
 }) {
-  const [site, setSite] = useState<string | null>(null);
+  const [connection, setConnection] = useState<Pick<JiraStatus, "site" | "accountId"> | null>(null);
+  const site = connection?.site;
   const [connectError, setConnectError] = useState("");
   const [spaces, setSpaces] = useState<ConfluenceSpace[]>([]);
   const [space, setSpace] = useState("");
@@ -58,11 +57,29 @@ export function ConfluencePicker({
   const searching = text.trim() !== "";
 
   useEffect(() => {
-    const current = ++generation.current;
-    void jiraConnected()
+    let disposed = false;
+    let request = 0;
+    let identity = "";
+    const refresh = () => {
+      const current = ++request;
+      void jiraConnected()
       .then((status) => {
-        if (current !== generation.current) return;
-        if (!status.connected) {
+        if (disposed || current !== request) return;
+        setConnectError("");
+        const nextIdentity = JSON.stringify([status.connected, status.site, status.accountId, atlassianCapable(status, "Confluence")]);
+        if (nextIdentity === identity) return;
+        identity = nextIdentity;
+        generation.current++;
+        setConnection(null);
+        setSpaces([]);
+        setSpace("");
+        setResults([]);
+        setPages(new Map());
+        setSelected(new Map());
+        setExpanded(null);
+        setSending(false);
+        setSendError("");
+        if (!status.connected || !status.accountId) {
           setConnectError("Connect Atlassian Cloud in Settings to add Confluence pages.");
           return;
         }
@@ -72,38 +89,45 @@ export function ConfluencePicker({
           );
           return;
         }
-        setSite(status.site);
+        setConnection({ site: status.site, accountId: status.accountId });
       })
       .catch((reason: unknown) => {
-        if (current === generation.current)
+        if (!disposed && current === request)
           setConnectError(
             reason instanceof Error ? reason.message : String(reason),
           );
       });
+    };
+    refresh();
+    window.addEventListener(JIRA_CHANGE_EVENT, refresh);
+    window.addEventListener("focus", refresh);
     return () => {
+      disposed = true;
       generation.current++;
+      window.removeEventListener(JIRA_CHANGE_EVENT, refresh);
+      window.removeEventListener("focus", refresh);
     };
   }, []);
 
   useEffect(() => {
-    if (!site) return;
+    if (!connection) return;
     const current = generation.current;
-    void confluenceSpaces(site)
+    void confluenceSpaces(connection)
       .then((list) => {
         if (current === generation.current) setSpaces(list);
       })
       .catch(() => {});
-  }, [site]);
+  }, [connection]);
 
   const search = (cursor = "", cursorParam = "") => {
-    if (!site) return;
+    if (!connection) return;
     // A fresh search invalidates any in-flight one — otherwise a stale
     // response can overwrite or append onto newer results.
     const seq = ++searchSeq.current;
     const current = generation.current;
     setLoading(true);
     setListError("");
-    void confluenceSearch(site, { text, space, cursor, cursorParam })
+    void confluenceSearch(connection, { text, space, cursor, cursorParam })
       .then((page) => {
         if (current !== generation.current || seq !== searchSeq.current) return;
         setResults((existing) =>
@@ -132,7 +156,8 @@ export function ConfluencePicker({
 
   // Recent pages first; debounce text/space changes into a fresh search.
   useEffect(() => {
-    if (!site) return;
+    if (!connection) return;
+    searchSeq.current++;
     setExpanded(null);
     setPreviewError(null);
     // A stale cursor would pair the new query with the old query's page.
@@ -140,10 +165,10 @@ export function ConfluencePicker({
     const timer = window.setTimeout(() => search(), 300);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [site, text, space]);
+  }, [connection, text, space]);
 
   const openPreview = (summary: ConfluencePageSummary) => {
-    if (!site) return;
+    if (!connection) return;
     if (expanded === summary.id) {
       setExpanded(null);
       return;
@@ -152,7 +177,7 @@ export function ConfluencePicker({
     setPreviewError(null);
     if (pages.has(summary.id)) return;
     const current = generation.current;
-    void confluencePage(site, summary.id)
+    void confluencePage(connection, summary.id)
       .then((page) => {
         if (current !== generation.current) return;
         if (!page) {
@@ -211,8 +236,9 @@ export function ConfluencePicker({
     });
   };
 
-  const send = async (destination: "chat" | "agent") => {
-    if (!site || !selected.size) return;
+  const send = async () => {
+    if (!connection || !selected.size || sending) return;
+    const current = generation.current;
     setSending(true);
     setSendError("");
     try {
@@ -224,8 +250,8 @@ export function ConfluencePicker({
           while (nextIndex < wanted.length) {
             const id = wanted[nextIndex++];
             if (!fetched.has(id)) {
-              // One unavailable page skips; it must not fail the send.
-              const page = await confluencePage(site, id).catch(() => null);
+              // Report unavailable selections together after the bounded fetch.
+              const page = await confluencePage(connection, id).catch(() => null);
               if (page) fetched.set(id, page);
             }
           }
@@ -255,22 +281,17 @@ export function ConfluencePicker({
           `${skipped.length} selected ${skipped.length === 1 ? "page was" : "pages were"} unavailable: ${skipped.join(", ")}. Uncheck them or retry.`,
         );
       }
-      const context = confluencePageContext(site, chosen);
-      requestAgentContext({
-        context,
-        ...(destination === "chat"
-          ? {
-              destination: { kind: "source" as const },
-              sourceSessionId: sessionId,
-              cwd,
-            }
-          : {}),
-      });
+      const status = await jiraConnected();
+      if (current !== generation.current) return;
+      if (!status.connected || status.site !== connection.site || status.accountId !== connection.accountId || !atlassianCapable(status, "Confluence"))
+        throw new Error("The Atlassian account changed. Close and reopen this picker to reselect pages.");
+      const context = confluencePageContext(connection, chosen);
+      onAdd(context);
       onClose();
     } catch (reason) {
-      setSendError(reason instanceof Error ? reason.message : String(reason));
+      if (current === generation.current) setSendError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setSending(false);
+      if (current === generation.current) setSending(false);
     }
   };
 
@@ -299,18 +320,20 @@ export function ConfluencePicker({
           ? "Search page titles and content"
           : "Recently updated pages"
       }
-      onClose={() => {
-        // Closing mid-send would still land the context after cancel.
-        if (!sending) onClose();
-      }}
-      className="max-h-[80vh] text-[13px] text-content [&_header_h2]:text-base"
+      onClose={onClose}
+      className="max-h-[80vh] text-[13px] text-content [&_header_h2]:text-base [&_header_p]:text-content/80"
     >
       <div className="flex max-h-[62vh] min-h-48 flex-col gap-2 p-3">
         {connectError ? (
-          <p className="px-1 py-2 text-content/60">{connectError}</p>
+          <p className="px-1 py-2 text-content/80">{connectError}</p>
+        ) : !connection ? (
+          <p role="status" className="px-1 py-2 text-content/80">Checking Atlassian connection…</p>
         ) : (
           <>
-            <div className="flex items-center gap-2">
+            <p className="shrink-0 truncate px-1 text-[11px] text-content/80" title={`${connection.site} · ${connection.accountId}`}>
+              {connection.site} · {connection.accountId}
+            </p>
+            <div className="flex shrink-0 items-center gap-2">
               <span className="relative min-w-0 flex-1">
                 <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-content/40" />
                 <input
@@ -323,6 +346,7 @@ export function ConfluencePicker({
                 />
               </span>
               <Select
+                dialog
                 label="Confluence space"
                 value={space}
                 options={spaceOptions}
@@ -353,19 +377,19 @@ export function ConfluencePicker({
                         className="flex min-w-0 flex-1 items-center gap-2 rounded px-1 py-0.5 text-left hover:bg-content/5"
                       >
                         <ChevronRight
-                          className={`size-3 shrink-0 text-content/45 transition-transform ${open ? "rotate-90" : ""}`}
+                          className={`size-3 shrink-0 text-content/80 transition-transform ${open ? "rotate-90" : ""}`}
                         />
                         <span className="min-w-0 flex-1">
                           <span className="block truncate text-content/90">
                             {page.title}
                           </span>
-                          <span className="block truncate text-[11px] text-content/45">
+                          <span className="block truncate text-[11px] text-content/80">
                             {page.spaceKey || "Space"}
                             {page.version ? ` · v${page.version}` : ""}
                           </span>
                         </span>
                         {chosen ? (
-                          <span className="shrink-0 text-[10px] text-content/45">
+                          <span className="shrink-0 text-[10px] text-content/80">
                             {chosen.sections
                               ? `${chosen.sections.size} section${chosen.sections.size === 1 ? "" : "s"}`
                               : "Whole page"}
@@ -378,7 +402,7 @@ export function ConfluencePicker({
                           title="Open in Confluence"
                           aria-label={`Open ${page.title} in Confluence`}
                           onClick={() => void openUrl(page.url)}
-                          className="grid size-6 shrink-0 place-items-center rounded text-content/45 hover:bg-content/5 hover:text-content"
+                          className="grid size-6 shrink-0 place-items-center rounded text-content/80 hover:bg-content/5 hover:text-content"
                         >
                           <ExternalLink className="size-3.5" strokeWidth={1.75} />
                         </button>
@@ -388,17 +412,15 @@ export function ConfluencePicker({
                       <div className="border-t border-content/5 px-3 py-2">
                         {expandedPage ? (
                           <>
-                            <div className="max-h-48 overflow-y-auto rounded-md border border-content/10 p-2 text-[12px]">
+                            <div tabIndex={0} role="region" aria-label={`${page.title} preview`} className="max-h-48 overflow-y-auto rounded-md border border-content/10 p-2 text-[12px] outline-accent">
                               <AgentMarkdown
                                 text={expandedMarkdown || "Empty page"}
-                                textOnly
                               />
                             </div>
                             {expandedSections.length ? (
                               <div className="mt-2 flex max-h-28 flex-col gap-1 overflow-y-auto">
-                                <p className="text-[11px] text-content/45">
-                                  Whole page is selected by default — pick
-                                  sections to bound the content.
+                                <p className="shrink-0 text-[11px] text-content/80">
+                                  Select the whole page above, or choose individual sections.
                                 </p>
                                 {expandedSections.map((section) => (
                                   <label
@@ -435,7 +457,7 @@ export function ConfluencePicker({
                             {previewError.message}
                           </p>
                         ) : (
-                          <p className="flex items-center gap-2 text-content/45">
+                          <p className="flex items-center gap-2 text-content/80">
                             <LoaderCircle className="size-3.5 animate-spin" strokeWidth={1.75} />
                             Loading page…
                           </p>
@@ -446,13 +468,13 @@ export function ConfluencePicker({
                 );
               })}
               {loading ? (
-                <p className="flex items-center gap-2 px-3 py-2 text-content/45">
+                <p className="flex items-center gap-2 px-3 py-2 text-content/80">
                   <LoaderCircle className="size-3.5 animate-spin" strokeWidth={1.75} />
                   {searching ? "Searching…" : "Loading recent pages…"}
                 </p>
               ) : null}
               {!loading && !results.length && site ? (
-                <p className="px-3 py-3 text-content/45">
+                <p className="px-3 py-3 text-content/80">
                   {searching || space
                     ? "No pages match. Try different text or another space."
                     : "No pages yet."}
@@ -473,7 +495,7 @@ export function ConfluencePicker({
               {next.value && !loading ? (
                 <button
                   type="button"
-                  className="w-full px-3 py-2 text-left text-content/60 hover:bg-content/5"
+                  className="w-full px-3 py-2 text-left text-content/80 hover:bg-content/5"
                   onClick={() => search(next.value, next.param)}
                 >
                   Load more pages
@@ -481,7 +503,7 @@ export function ConfluencePicker({
               ) : null}
             </div>
             {selected.size ? (
-              <p className="text-[11px] text-content/45">
+              <p className="shrink-0 text-[11px] text-content/80">
                 {selected.size} page{selected.size === 1 ? "" : "s"} selected —
                 content is untrusted reference data for the agent.
               </p>
@@ -491,12 +513,11 @@ export function ConfluencePicker({
                 {sendError}
               </p>
             ) : null}
-            <div className="flex justify-end gap-2 border-t border-content/10 pt-2">
+            <div className="flex shrink-0 justify-end gap-2 border-t border-content/10 pt-2">
               <button
                 type="button"
-                disabled={sending}
                 onClick={onClose}
-                className="rounded-md px-2 py-1.5 text-content/60 hover:bg-content/5 disabled:opacity-40"
+                className="rounded-md px-2 py-1.5 text-content/80 hover:bg-content/5 disabled:opacity-40"
               >
                 Cancel
               </button>
@@ -504,18 +525,11 @@ export function ConfluencePicker({
                 type="button"
                 disabled={!selected.size || sending}
                 className="rounded-md bg-content/10 px-2.5 py-1.5 disabled:opacity-40"
-                onClick={() => void send("chat")}
+                onClick={() => void send()}
               >
                 Add to chat
               </button>
-              <button
-                type="button"
-                disabled={!selected.size || sending}
-                className="rounded-md bg-content px-2.5 py-1.5 text-background-base disabled:opacity-40"
-                onClick={() => void send("agent")}
-              >
-                {sending ? "Loading pages…" : "Send to agent…"}
-              </button>
+
             </div>
           </>
         )}

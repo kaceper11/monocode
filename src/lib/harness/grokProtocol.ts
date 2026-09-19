@@ -1,10 +1,4 @@
-import {
-  acpPermissionOptions,
-  type AcpPermissionOption,
-  acpAutoOption,
-  acpPermissionOptionId,
-  isAcpMcpToolCall,
-} from "./acp";
+import { acpPermissionOptions, type AcpPermissionOption, acpAutoOption, acpPermissionOptionId, isAcpMcpToolCall } from "./acpProtocol";
 import { promptBlocks, type PromptContentBlock } from "../attachments";
 import type { AgentModel, ModelSetting, ModelSettingChoice } from "../models";
 import type { Attachment, RuntimeMode, ToolPreview } from "../session";

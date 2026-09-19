@@ -58,6 +58,7 @@ describe("keepAwakeSessionIds", () => {
       queuedMessages: [{ id: "q1", text: "next", attachments: [] }],
     });
     const finished = chat({ busy: false });
-    expect(keepAwakeSessionIds([queued, finished])).toEqual([]);
+    const removed = chat({ busy: true, worktreeRemoved: true });
+    expect(keepAwakeSessionIds([queued, finished, removed])).toEqual([]);
   });
 });

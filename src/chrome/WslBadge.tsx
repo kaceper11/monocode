@@ -17,7 +17,17 @@ export function WslBadge({
   const [open, setOpen] = useState(false);
   const status = useWslStatus(location?.distribution);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
   const request = useRef<AbortController | null>(null);
+  useEffect(() => {
+    setOpen(false);
+    setBusy(false);
+    setError("");
+    return () => {
+      request.current?.abort();
+      request.current = null;
+    };
+  }, [cwd]);
   useEffect(() => {
     if (!location) return;
     let cancelled = false;
@@ -111,9 +121,9 @@ export function WslBadge({
             networking; MonoCode does not forward ports. Open Linux editors from
             the terminal.
           </p>
-          {status.error && (
+          {(error || status.error) && (
             <p role="alert" className="break-words text-content/80">
-              {status.error}
+              {error || status.error}
             </p>
           )}
           <button
@@ -124,6 +134,7 @@ export function WslBadge({
               const controller = new AbortController();
               request.current = controller;
               setBusy(true);
+              setError("");
               void connectWslProject(cwd, controller.signal, true)
                 .then((canonical) => {
                   if (pathKey(canonical) !== pathKey(cwd))
@@ -131,15 +142,14 @@ export function WslBadge({
                       "This folder resolves to a different path. Choose it again from Open project.",
                     );
                 })
-                .catch(() => {
-                  // The shared store already carries the failure for this
-                  // distribution; the popover renders it above.
+                .catch((reason) => {
+                  if (!controller.signal.aborted) setError(String(reason));
                 })
                 .finally(() => {
-                  // Unconditional: an aborted connect still settles, and the
-                  // popover may have closed without aborting the request.
-                  if (request.current === controller) request.current = null;
-                  setBusy(false);
+                  if (request.current === controller) {
+                    request.current = null;
+                    setBusy(false);
+                  }
                 });
             }}
           >

@@ -1,123 +1,163 @@
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { sessionNeedsInput, type Session } from "./session";
 
+const KEY = "monocode.keepAwake";
 export type PowerStatus = {
-  /** False on platforms without a supported idle-sleep assertion. */
   supported: boolean;
   enabled: boolean;
-  /** A verified OS assertion is held right now. */
   held: boolean;
-  /** Qualifying sessions across all windows. */
   working: number;
   error: string | null;
-  /** False until the first backend status arrives; gates "not available". */
+  revision: number;
   loaded: boolean;
 };
-
-/** Status as the backend emits it; `loaded` is added frontend-side. */
-type BackendPowerStatus = Omit<PowerStatus, "loaded">;
-
-const POWER_EVENT = "power-assertion";
-
-const EMPTY_STATUS: PowerStatus = {
+type BackendStatus = Omit<PowerStatus, "loaded">;
+export function loadKeepAwakeEnabled(): boolean {
+  try {
+    const value = localStorage.getItem(KEY);
+    return value === "1" || value === "true";
+  } catch {
+    return false;
+  }
+}
+let snapshot: PowerStatus = {
   supported: true,
-  enabled: false,
+  enabled: loadKeepAwakeEnabled(),
   held: false,
   working: 0,
   error: null,
+  revision: 0,
   loaded: false,
 };
-
-/**
- * Sessions doing real execution: a live turn that is not parked on an
- * approval or question. Background subagents keep `busy` set, so they are
- * covered; inbox-ask turns count too — they are real agent work. Waiting,
- * queued-only, finished, failed and unknown sessions are not.
- */
-export function keepAwakeSessionIds(sessions: Session[]): string[] {
-  const ids = new Set<string>();
-  for (const session of sessions) {
-    if (session.busy && !sessionNeedsInput(session)) ids.add(session.id);
+const listeners = new Set<() => void>();
+let bridge: Promise<() => void> | null = null;
+export const getPowerStatus = () => snapshot;
+function applyStatus(status: BackendStatus) {
+  // Revision zero means no window has initialized the saved preference yet.
+  if (!status.revision || status.revision < snapshot.revision) return;
+  if (
+    status.revision === snapshot.revision &&
+    snapshot.loaded &&
+    status.error === snapshot.error
+  )
+    return;
+  snapshot = { ...status, loaded: true };
+  try {
+    localStorage.setItem(KEY, status.enabled ? "1" : "0");
+  } catch {
+    /* storage unavailable */
   }
-  return [...ids].sort();
+  for (const listener of listeners) listener();
 }
-
-let lastEnabledPush: boolean | null = null;
-let lastIdsKey: string | null = null;
-
-/**
- * Push the shared setting and this window's qualifying set; each runs only
- * when its own value changes. The enabled flag travels on its own command so
- * a window whose localStorage has not converged yet cannot release another
- * window's legitimate hold through a routine ref sync.
- */
-export function syncKeepAwake(enabled: boolean, sessionIds: string[]) {
-  if (enabled !== lastEnabledPush) {
-    lastEnabledPush = enabled;
-    void invoke("power_set_enabled", { enabled }).catch(() => {
-      lastEnabledPush = null;
-    });
-  }
-  const key = sessionIds.join("\n");
-  if (key === lastIdsKey) return;
-  lastIdsKey = key;
-  void invoke("power_sync", { sessionIds }).catch(() => {
-    // A lost push must not wedge the key: the next change sends again.
-    lastIdsKey = null;
+function reportError(reason: unknown) {
+  snapshot = {
+    ...snapshot,
+    loaded: true,
+    error: reason instanceof Error ? reason.message : String(reason),
+  };
+  for (const listener of listeners) listener();
+}
+function ensureBridge() {
+  if (bridge) return;
+  const pending = listen<BackendStatus>("power-assertion", (event) => {
+    if (bridge === pending) applyStatus(event.payload);
   });
+  bridge = pending;
+  void pending.then(
+    async () => {
+      const before = snapshot.revision;
+      try {
+        const status = await invoke<BackendStatus>("power_status");
+        if (bridge === pending) applyStatus(status);
+      } catch (reason) {
+        if (bridge === pending && snapshot.revision === before)
+          reportError(reason);
+      }
+    },
+    (reason) => {
+      if (bridge === pending) {
+        bridge = null;
+        reportError(reason);
+      }
+    },
+  );
 }
-
-export function retryKeepAwake(): Promise<BackendPowerStatus> {
-  // Pipe the fresh status through the store too: the broadcast event does the
-  // same thing, but this keeps Retry working even if the listener is dead.
-  return invoke<BackendPowerStatus>("power_retry").then((status) => {
-    applyStatus(status);
-    return status;
-  });
-}
-
-let statusSnapshot: PowerStatus = EMPTY_STATUS;
-const statusListeners = new Set<() => void>();
-let statusBridge: Promise<unknown> | null = null;
-
-export function getPowerStatus(): PowerStatus {
-  return statusSnapshot;
-}
-
-export function subscribePowerStatus(onStoreChange: () => void): () => void {
-  statusListeners.add(onStoreChange);
-  ensureStatusBridge();
+export function subscribePowerStatus(listener: () => void): () => void {
+  listeners.add(listener);
+  ensureBridge();
   return () => {
-    statusListeners.delete(onStoreChange);
+    listeners.delete(listener);
+    if (!listeners.size && bridge) {
+      const closing = bridge;
+      bridge = null;
+      void closing.then((unlisten) => unlisten()).catch(() => {});
+    }
   };
 }
-
-function notifyStatus() {
-  for (const listener of statusListeners) listener();
-}
-
-function applyStatus(status: BackendPowerStatus) {
-  statusSnapshot = { ...status, loaded: true };
-  notifyStatus();
-}
-
-function ensureStatusBridge() {
-  if (statusBridge) return;
-  // Register the listener before fetching: a status event landing between
-  // registration and the fetch resolving must not be overwritten by the
-  // older snapshot.
-  const bridge = listen<BackendPowerStatus>(POWER_EVENT, (event) => {
-    applyStatus(event.payload);
-  }).then(() =>
-    invoke<BackendPowerStatus>("power_status")
-      .then(applyStatus)
-      .catch(() => undefined),
+export function usePowerStatus() {
+  return useSyncExternalStore(
+    subscribePowerStatus,
+    getPowerStatus,
+    getPowerStatus,
   );
-  statusBridge = bridge;
-  // A failed bridge must not wedge status for the session lifetime; the next
-  // subscriber tries again.
-  void bridge.catch(() => {
-    if (statusBridge === bridge) statusBridge = null;
-  });
+}
+export async function setKeepAwakeEnabled(enabled: boolean) {
+  applyStatus(await invoke<BackendStatus>("power_set_enabled", { enabled }));
+}
+let latestReport = {
+  initialEnabled: loadKeepAwakeEnabled(),
+  sessionIds: [] as string[],
+};
+export async function retryKeepAwake() {
+  ensureBridge();
+  applyStatus(await invoke<BackendStatus>("power_sync", latestReport));
+  applyStatus(await invoke<BackendStatus>("power_retry"));
+}
+
+/** Observe upstream execution state, excluding questions, approvals and lost worktrees. */
+export function keepAwakeSessionIds(sessions: readonly Session[]): string[] {
+  return [
+    ...new Set(
+      sessions
+        .filter(
+          (session) =>
+            session.busy &&
+            !session.worktreeRemoved &&
+            !sessionNeedsInput(session),
+        )
+        .map((session) => session.id),
+    ),
+  ].sort();
+}
+
+/** One app-root hook; native window destruction also releases its report. */
+export function useKeepAwake(sessions: readonly Session[]) {
+  const status = usePowerStatus();
+  const [initialEnabled] = useState(loadKeepAwakeEnabled);
+  const ids = status.enabled ? keepAwakeSessionIds(sessions) : [];
+  const key = JSON.stringify(ids);
+  useEffect(() => {
+    latestReport = {
+      initialEnabled,
+      sessionIds: JSON.parse(key),
+    };
+    let current = true;
+    void invoke<BackendStatus>("power_sync", latestReport)
+      .then(applyStatus)
+      .catch((reason) => {
+        if (current) reportError(reason);
+      });
+    return () => {
+      current = false;
+    };
+  }, [key]);
+  useEffect(
+    () => () => {
+      latestReport = { initialEnabled, sessionIds: [] };
+      void invoke<BackendStatus>("power_sync", latestReport).catch(() => {});
+    },
+    [],
+  );
 }

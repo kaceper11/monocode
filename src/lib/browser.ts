@@ -9,7 +9,7 @@ import type { Attachment } from "./session";
  * Untrusted page preview. The native webview lives in the window next to
  * the tab; this module owns the invoke surface, the event fan-in, URL
  * normalization and the per-worktree remembered URL. Everything page-side
- * is untrusted — no script bridges, and the Rust host bounds navigation.
+ * is untrusted — no app command bridge, and the Rust host bounds navigation.
  */
 
 export const OPEN_BROWSER_EVENT = "monocode:open-browser";
@@ -46,6 +46,8 @@ const REMEMBERED_KEY = "monocode.browserUrls";
 const REMEMBERED_LIMIT = 50;
 
 export type BrowserEventKind =
+  | "focus"
+  | "recording-ready"
   | "navigate"
   | "load-started"
   | "load-finished"
@@ -140,7 +142,10 @@ export function normalizeBrowserUrl(input: string): string {
 }
 
 export function isHttpUrl(value: string): boolean {
-  return /^https?:\/\//i.test(value.trim());
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") && !!url.hostname;
+  } catch { return false; }
 }
 
 /** First http(s) URL in copied text — handles whole-line copies like
@@ -377,7 +382,7 @@ export function browserOpen(
   background?: [number, number, number, number],
   persist?: boolean,
 ): Promise<void> {
-  return invoke("browser_open", { label, url, bounds, background, persist });
+  return invoke("browser_open", { label, url, bounds: { ...bounds, viewportWidth: window.innerWidth }, background, persist });
 }
 
 export function browserClose(label: string): Promise<void> {
@@ -404,7 +409,7 @@ export function browserSetBounds(
   label: string,
   bounds: BrowserBounds,
 ): Promise<void> {
-  return invoke("browser_set_bounds", { label, bounds });
+  return invoke("browser_set_bounds", { label, bounds: { ...bounds, viewportWidth: window.innerWidth } });
 }
 
 export function browserSetVisible(
@@ -522,8 +527,10 @@ export function browserCapture(label: string): Promise<BrowserCapture> {
 export function browserSetRecording(
   label: string,
   on: boolean,
+  expectedOrigin: string,
+  resume = false,
 ): Promise<boolean> {
-  return invoke("browser_set_recording", { label, on });
+  return invoke("browser_set_recording", { label, on, expectedOrigin, resume });
 }
 
 function base64Bytes(base64: string): number {
@@ -565,7 +572,7 @@ export function browserAgentContext(
   const origin = [
     url || null,
     cwd,
-    wsl ? `WSL ${wsl.distribution}` : "native host",
+    wsl ? `Browser: native host; repository: WSL ${wsl.distribution}` : "native host",
     `captured ${new Date().toISOString()}`,
   ]
     .filter(Boolean)
@@ -698,7 +705,7 @@ export function subscribeBrowser(
     if (set.size === 0) {
       handlers.delete(label);
       if (handlers.size === 0) {
-        void subscription?.then((unlisten) => unlisten());
+        void subscription?.then((unlisten) => unlisten(), () => {});
         subscription = null;
       }
     }

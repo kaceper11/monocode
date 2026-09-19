@@ -68,12 +68,6 @@ describe("AgentMarkdown inline code", () => {
 });
 
 describe("AgentMarkdown note images", () => {
-  it("renders readable context without loading remote, data or local-note images", () => {
-    const markup = renderToStaticMarkup(createElement(AgentMarkdown, { textOnly: true, text: "# Requirements\n\n![remote](https://uploads.linear.app/team/image.png)\n\n![local](/note-assets/note-1/image.png)\n\n![inline](data:image/png;base64,aGVsbG8=)" }));
-    expect(markup).toContain("<h1");
-    expect(markup).not.toContain("<img");
-    expect(markup).toContain("select separately");
-  });
   it("keeps app-owned note image references for the async image resolver", () => {
     const markup = renderToStaticMarkup(
       createElement(AgentMarkdown, {

@@ -28,40 +28,18 @@ pub async fn fetch_inbox_media(url: String) -> Result<tauri::ipc::Response, Stri
 }
 
 fn fetch_inbox_media_sync(url: &str) -> Result<Vec<u8>, String> {
-    let current = parse_allowed_media_url(url)?;
+    let mut current = parse_allowed_media_url(url)?;
     let token = if github_auth_host(&current.host) {
         github_auth_token()
     } else {
         None
     };
-    fetch_media(url, token, false)
-}
-
-pub(crate) fn allowed_github_attachment(url: &str) -> bool {
-    let Ok(parsed) = tauri::Url::parse(url) else {
-        return false;
-    };
-    parsed.port().is_none()
-        && parsed.username().is_empty()
-        && parsed.password().is_none()
-        && parse_allowed_media_url(url).is_ok_and(|target| !is_linear_uploads(&target.host))
-}
-
-pub(crate) fn fetch_with_token(url: &str, token: Option<String>) -> Result<Vec<u8>, String> {
-    fetch_media(url, token, true)
-}
-
-fn fetch_media(url: &str, token: Option<String>, github_only: bool) -> Result<Vec<u8>, String> {
-    let mut current = parse_allowed_media_url(url)?;
     let agent = ureq::AgentBuilder::new()
         .timeout(HTTP_TIMEOUT)
         .redirects(0)
         .build();
 
     for _ in 0..MAX_REDIRECTS {
-        if github_only && !allowed_github_attachment(&current.url) {
-            return Err("Attachment redirect is outside GitHub's allowed hosts".into());
-        }
         if !is_allowed_media_target(&current) {
             return Err("That media host is not allowed".into());
         }
@@ -283,12 +261,12 @@ fn path_has_dotdot(path: &str) -> bool {
     })
 }
 
-pub(crate) fn github_auth_token() -> Option<String> {
+fn github_auth_token() -> Option<String> {
     let program = crate::harness::resolve_gui_binary("gh")?;
     let home = dirs_home()?;
     let mut cmd = Command::new(program);
     cmd.current_dir(&home)
-        .args(["auth", "token", "--hostname", "github.com"])
+        .args(["auth", "token"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GH_PAGER", "cat");
     crate::harness::apply_gui_env(&mut cmd);
@@ -302,6 +280,20 @@ pub(crate) fn github_auth_token() -> Option<String> {
         None
     } else {
         Some(token)
+    }
+}
+
+pub(crate) fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else {
+        None
     }
 }
 

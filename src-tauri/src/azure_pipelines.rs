@@ -43,7 +43,7 @@ pub struct CiLookup {
 #[serde(rename_all = "camelCase")]
 pub struct CiRead {
     target: CiTarget,
-    head: CiHead,
+    head: Option<CiHead>,
     run_id: u32,
     revision: String,
     section: String,
@@ -161,7 +161,57 @@ fn repository_url(raw: &str) -> Option<String> {
     )
 }
 
-fn checkout(cwd: &str) -> Result<Value, String> {
+// PR routing also supports the hosts understood by gh. CI evidence keeps its
+// stricter provider mapping; this identity alone never authorizes a request.
+fn pr_repository_url(raw: &str) -> Option<String> {
+    if let Some(url) = repository_url(raw) {
+        return Some(url);
+    }
+    if raw.len() > 2048 || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let raw = if !raw.contains("://") {
+        let (host, path) = raw.split_once(':')?;
+        format!("ssh://{host}/{path}")
+    } else {
+        raw.to_string()
+    };
+    let url = tauri::Url::parse(&raw).ok()?;
+    let host = url.host_str()?;
+    if host == "dev.azure.com" || host == "ssh.dev.azure.com" || host.ends_with(".visualstudio.com")
+    {
+        return None;
+    }
+    let parts: Vec<_> = url.path().trim_matches('/').split('/').collect();
+    if !matches!(url.scheme(), "https" | "http" | "ssh")
+        || parts.len() != 2
+        || parts.iter().any(|part| part.is_empty())
+    {
+        return None;
+    }
+    let scheme = if url.scheme() == "http" {
+        "http"
+    } else {
+        "https"
+    };
+    let port = if url.scheme() == "ssh" {
+        String::new()
+    } else {
+        url.port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default()
+    };
+    Some(
+        format!(
+            "{scheme}://{host}{port}/{}/{}",
+            parts[0],
+            parts[1].trim_end_matches(".git")
+        )
+        .to_lowercase(),
+    )
+}
+
+fn checkout(cwd: &str, for_pr: bool) -> Result<Value, String> {
     let root = crate::fs::expand_home(cwd);
     let read = |args: &[&str]| -> Result<String, String> {
         let output = crate::fs::git_command_output(&root, args)?;
@@ -181,13 +231,13 @@ fn checkout(cwd: &str) -> Result<Value, String> {
     }
     let remotes: Vec<_> = String::from_utf8_lossy(&config.stdout).lines().filter_map(|line| {
         let (key, raw) = line.split_once(char::is_whitespace)?;
-        Some(json!({"name":key.strip_prefix("remote.")?.strip_suffix(".url")?,"url":repository_url(raw.trim())?}))
+        Some(json!({"name":key.strip_prefix("remote.")?.strip_suffix(".url")?,"url":if for_pr { pr_repository_url(raw.trim())? } else { repository_url(raw.trim())? }}))
     }).take(20).collect();
     Ok(json!({"cwd":cwd,"branch":branch,"commit":commit,"remotes":remotes}))
 }
 
 fn check_head(head: &CiHead) -> Result<(), String> {
-    let current = checkout(&head.cwd)?;
+    let current = checkout(&head.cwd, false)?;
     if current["branch"] != head.branch
         || current["commit"] != head.commit
         || !current["remotes"]
@@ -203,8 +253,8 @@ fn check_head(head: &CiHead) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn azure_ci_context(cwd: String) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || checkout(&cwd))
+pub async fn azure_ci_context(cwd: String, for_pr: Option<bool>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || checkout(&cwd, for_pr.unwrap_or(false)))
         .await
         .map_err(|_| "CI checkout lookup failed")?
 }
@@ -227,7 +277,7 @@ fn verify_run(run: &Value, target: &CiTarget) -> Result<(), String> {
     Ok(())
 }
 
-fn revision(run: &Value) -> String {
+pub(crate) fn revision(run: &Value) -> String {
     json!([
         run["id"],
         run["definition"]["id"],
@@ -393,14 +443,14 @@ pub(crate) fn sanitize_log(raw: &str) -> String {
 #[tauri::command]
 pub async fn azure_ci_read(app: AppHandle, input: CiRead) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        check_head(&input.head)?;
+        if let Some(head) = &input.head { check_head(head)?; }
         let config = connection(&app,&input.target)?;
         if input.run_id==0 || input.skip>10_000 { return Err("Choose a valid run/page".into()); }
         let run_path = format!("{}/builds/{}",path(&input.target.project)?,input.run_id);
         let run = get(&config,&run_path,&[])?;
         verify_run(&run,&input.target)?;
         if run["id"] != input.run_id || revision(&run) != input.revision { return Err("Run changed or was retried. Refresh CI evidence before continuing.".into()); }
-        let result = if input.section == "summary" { summary(&run,&input.head) } else {
+        let result = if input.section == "summary" { summary(&run,input.head.as_ref().ok_or("Select a checkout to compare this run")?) } else {
             let timeline = get(&config,&format!("{run_path}/timeline"),&[])?;
             let records = timeline["records"].as_array().ok_or("Timeline is unavailable. Retry or open in Azure.")?;
             if input.section == "jobs" {
@@ -428,7 +478,7 @@ pub async fn azure_ci_read(app: AppHandle, input: CiRead) -> Result<Value, Strin
         let after = get(&config,&run_path,&[])?;
         verify_run(&after,&input.target)?;
         if revision(&after)!=input.revision { return Err("Run changed while reading. Refresh CI evidence.".into()); }
-        connection(&app,&input.target)?; check_head(&input.head)?;
+        connection(&app,&input.target)?; if let Some(head) = &input.head { check_head(head)?; }
         Ok(result)
     }).await.map_err(|_| "Pipeline detail read failed")?
 }
@@ -479,7 +529,7 @@ mod tests {
             "origin",
             "https://user:password@github.com/team/repo.git",
         ]);
-        let snapshot = checkout(root.to_str().unwrap()).unwrap();
+        let snapshot = checkout(root.to_str().unwrap(), false).unwrap();
         assert!(!snapshot.to_string().contains("password"));
         let head = CiHead {
             cwd: root.to_string_lossy().into(),
@@ -545,6 +595,29 @@ mod tests {
         assert_eq!(match_kind(&merge, &head), "pr-source");
         assert_ne!(revision(&merge), revision(&json!({"id":2})));
     }
+    #[test]
+    fn pr_hosts_do_not_expand_ci_mapping_or_expose_remote_credentials() {
+        for remote in [
+            "https://user:secret@github.example.com/Team/Repo.git?token=secret",
+            "git@github.example.com:Team/Repo.git",
+            "ssh://git@github.example.com/Team/Repo.git",
+        ] {
+            assert_eq!(
+                pr_repository_url(remote).as_deref(),
+                Some("https://github.example.com/team/repo")
+            );
+            assert!(repository_url(remote).is_none());
+        }
+        assert_eq!(
+            pr_repository_url("http://github.example.com:8080/team/repo").as_deref(),
+            Some("http://github.example.com:8080/team/repo")
+        );
+        assert!(pr_repository_url("https://dev.azure.com/invalid/repo").is_none());
+        assert!(pr_repository_url("https://org.visualstudio.com/invalid/repo").is_none());
+        assert!(pr_repository_url("file:///team/repo").is_none());
+        assert!(pr_repository_url("https://github.example.com/team/repo\n").is_none());
+    }
+
     #[test]
     fn canonicalizes_remotes_and_bounds_sanitized_evidence() {
         assert_eq!(

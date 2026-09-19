@@ -1,22 +1,20 @@
-import {
-  ACTION_GHOST,
-  ACTION_OUTLINE,
-  ACTION_PANEL_HEADER,
-} from "../chrome/inboxActions";
-import { AzureInboxDetail } from "../chrome/AzureInboxDetail";
-import {
-  InboxDetailShell,
-  inboxKindLabel,
-  inboxStatusMark,
-} from "../chrome/InboxDetailShell";
-
-import { contextTicketKey } from "../lib/agentContext";
+import { ciState } from "../lib/azurePipelines";
+import { InboxChecks } from "./InboxChecks";
+import { inboxProvider, type InboxThread, type InboxDiff } from "../lib/inboxProvider";
+import { refreshLinkedWorkItem } from "../lib/linkedWorkItemRefresh";
+import { linkedWorkItemNeedsAccount } from "../lib/sessionWorkItem";
+import { LinkedWorkItemAccount } from "./LinkedWorkItemAccount";
+import { TicketImages } from "./InboxMedia";
+import { AZURE_CHANGE_EVENT, azureConnected, loadAzureFilter, type AzureFilter } from "../lib/azure";
+import { JIRA_CHANGE_EVENT, jiraConnected, atlassianCapable, jiraOptions, loadJiraFilter, saveJiraFilter, DEFAULT_JIRA_FILTER, type JiraFilter, type JiraOption } from "../lib/jira";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
-  CheckCheck,
   Check,
+  CheckCheck,
   ChevronDown,
+  CircleDot,
   CircleX,
+  Copy,
   ExternalLink,
   GitCompare,
   GitMerge,
@@ -24,6 +22,7 @@ import {
   GitPullRequestClosed,
   GitPullRequestDraft,
   Inbox,
+  MessageSquare,
   ListFilter,
   LoaderCircle,
   MessageMultiple,
@@ -31,16 +30,14 @@ import {
   Plus,
   RefreshCw,
   Search,
-  Zap,
+  type IconComponent,
 } from "../chrome/icons";
 import {
-  memo,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import {
@@ -49,81 +46,37 @@ import {
 } from "../chrome/InboxFiltersMenu";
 import { InboxConnectMenu } from "../chrome/InboxConnectMenu";
 import { InboxProviderMark } from "../chrome/InboxProviderMark";
-import { Checkbox } from "../chrome/controls";
-import { useInboxContext } from "../chrome/InboxContextPicker";
-import { InboxRelated } from "../chrome/InboxRelated";
-import { MyWorkBadges, myWorkBadges } from "../chrome/InboxMyWorkSection";
-import { inboxMyWorkForItems, type InboxMyWork } from "../lib/inboxMyWork";
-import type { AttentionItem } from "../lib/attention";
-import {
-  listTaskPrDrafts,
-  subscribeTaskPrs,
-  taskPrsSnapshot,
-} from "../lib/taskPrs";
-import {
-  loadProjects,
-  projectsSnapshot,
-  subscribeProjects,
-} from "../lib/projects";
-import { useDeliveryStores } from "../hooks/useDeliveryStores";
-import {
-  diffStatsVersion,
-  peekProjectDiffStats,
-  subscribeDiffStatsVersion,
-} from "../hooks/useProjectDiffStats";
-import {
-  branchPrVersion,
-  cachedBranchPr,
-  subscribeBranchPrVersion,
-} from "../hooks/useBranchPr";
-import type { InboxComposerCard } from "../lib/githubTasks";
-import { contextFromTickets, requestAgentContext } from "../lib/agentContext";
 import { ProjectLogoIcon } from "../chrome/ProjectLogoIcon";
 import { ProjectMascot } from "../chrome/ProjectMascot";
 import { Popover } from "../chrome/Popover";
 import { IconButton, OverlayNav } from "../chrome/TitleBar";
-import {
-  loadTaskWorkspaces,
-  subscribeTaskWorkspaces,
-  taskWorkspacesSnapshot,
-} from "../lib/taskWorkspaces";
 import { WindowControls } from "../chrome/WindowControls";
 import { useDragResize } from "../hooks/useDragResize";
 import { useLockOverscroll } from "../hooks/useLockOverscroll";
 import { useTabGroupLogos } from "../hooks/useTabGroupLogos";
-import { refreshLinkedWorkItem } from "../lib/linkedWorkItemRefresh";
 import {
+  clearInboxCache,
   githubStatus,
-  githubPrAction,
   githubWorkItem,
+  peekGithubWorkItem,
+  githubPrAction,
   githubReviewDecisionLabel,
-  githubWorkItemComment,
-  githubWorkItemDetails,
-  githubWorkItemThread,
   gitlabAttentionLabel,
-  inboxFetchPaths,
   inboxItemKey,
   inboxItemRef,
+  inboxItemStatus,
   inboxListIsFresh,
-  inboxProjectIdentities,
   inboxProjectsForRail,
-  inboxRailKeyResolver,
   listInboxItems,
-  peekGithubWorkItem,
-  peekGithubWorkItemDetails,
-  peekGithubWorkItemThread,
   peekInboxList,
   formatRelativeTime,
   inboxPersonAvatarUrl,
   type GithubLabel,
   type GithubPrAction,
   type GithubWorkItemDetails,
-  type GithubWorkItemThread,
   type InboxItem,
   type InboxProviderErrors,
   type InboxQuery,
-  type InboxRailProject,
-  clearInboxCache,
 } from "../lib/githubTasks";
 import {
   applyInboxFilters,
@@ -134,37 +87,27 @@ import {
   inboxFetchState,
   loadInboxFilters,
   loadInboxSource,
-  loadVisibleInboxSources,
-  saveVisibleInboxSources,
-  INBOX_SOURCE_LABELS,
   pruneInboxFilters,
   saveInboxFilters,
   resolveInboxSource,
   saveInboxConnections,
   saveInboxSource,
   visibleInboxSources,
+  INBOX_SOURCE_LABELS,
   type ConnectableInboxSource,
   type InboxFilters,
   type InboxSource,
 } from "../lib/inboxFilters";
+import { copyText } from "../lib/clipboard";
 import { projectKey, projectName } from "../lib/paths";
 import { IS_MAC } from "../lib/platform";
-import { type RecentProject } from "../lib/recents";
-import {
-  getVerifiedFamilies,
-  subscribeRepositoryFamilies,
-  type RepositoryFamily,
-} from "../lib/repositoryFamilies";
-import {
-  sessionDisplayTitle,
-  type LinkedWorkItem,
-} from "../lib/session";
+import { playCue } from "../lib/sounds";
+import { sameProjectPath, type RecentProject } from "../lib/recents";
+import { sessionDisplayTitle, type LinkedWorkItem } from "../lib/session";
 import type { SessionSummary } from "../lib/sessionStore";
 import {
-  inboxRelatedSessionCounts,
   inboxItemMatchesLinkedWorkItem,
   linkedWorkItemInboxKey,
-  sessionWorkItems,
   relatedSessionsForInboxItem,
 } from "../lib/sessionWorkItem";
 import {
@@ -178,26 +121,14 @@ import { LIST_PAGE_SIZE, listWindowSize } from "../lib/listWindow";
 import {
   LINEAR_CHANGE_EVENT,
   linearConnected,
-  linearIssueComment,
-  linearIssueDetails,
-  linearIssueThread,
   listLinearTeams,
   loadHiddenLinearTeamIds,
-  peekLinearIssueDetails,
-  peekLinearIssueThread,
   saveHiddenLinearTeamIds,
-  type LinearIssueThread,
   type LinearTeam,
 } from "../lib/linear";
 import {
   GITLAB_CHANGE_EVENT,
   gitlabConnected,
-  gitlabWorkItemComment,
-  gitlabWorkItemDetails,
-  gitlabWorkItemThread,
-  peekGitlabWorkItemDetails,
-  peekGitlabWorkItemThread,
-  type GitlabWorkItemThread,
 } from "../lib/gitlab";
 import {
   loadTabGroupColors,
@@ -208,64 +139,37 @@ import {
   resolveTabGroupMascot,
 } from "../lib/tabGroups";
 import { AgentMarkdown } from "./AgentMarkdown";
-import { TicketImages } from "./InboxMedia";
-import {
-  AZURE_CHANGE_EVENT,
-  azureConnected,
-  azureDetails,
-  azureThread,
-  peekAzureDetails,
-  peekAzureThread,
-  loadAzureFilter,
-  type AzureFilter,
-} from "../lib/azure";
 import {
   InboxComments,
   InboxCommentForm,
   type InboxReplyTarget,
 } from "./InboxComments";
-import { GithubPrReview } from "../chrome/GithubPrReview";
-import { GitlabMrReview } from "../chrome/GitlabMrReview";
+import { InboxPrDiff } from "./InboxPrDiff";
 import {
   InboxDiscussionPanel,
   type InboxSessionPortal,
 } from "./InboxDiscussionPanel";
 import { inboxAskKey } from "../lib/inboxAsk";
-import { openWatchSheet } from "../lib/watchers";
-import {
-  JIRA_CHANGE_EVENT,
-  atlassianCapable,
-  jiraConnected,
-  jiraDetails,
-  jiraThread,
-  peekJiraDetails,
-  peekJiraThread,
-  jiraOptions,
-  loadJiraFilter,
-  saveJiraFilter,
-  DEFAULT_JIRA_FILTER,
-  type JiraFilter,
-  type JiraOption,
-} from "../lib/jira";
 
 const MIN_WIDTH = 240;
 const MAX_WIDTH = 420;
 
+// One height for the whole detail action row; `border` is inside it, so the
+// outline variant lines up with the filled and ghost ones.
+const ACTION = "inline-flex items-center gap-1.5 rounded-md px-3 text-[12px]";
+const ACTION_FILLED = `${ACTION} h-6.5 bg-content text-background-base hover:bg-content/80`;
+const ACTION_OUTLINE = `${ACTION} h-7 border border-content/15 text-content/80 hover:bg-content/5`;
+const ACTION_PANEL_HEADER = `${ACTION} h-6.5 text-content/70 hover:bg-content/10 hover:text-content`;
+const ACTION_GHOST = `${ACTION} h-7 text-content/70 hover:bg-content/10 hover:text-content`;
 const DEFAULT_WIDTH = 280;
 const LINKED_PANEL_MIN_WIDTH = 360;
 const LINKED_PANEL_DEFAULT_WIDTH = 520;
 
 let rememberedWidth = DEFAULT_WIDTH;
 let rememberedLinkedPanelWidth = LINKED_PANEL_DEFAULT_WIDTH;
-const rememberedSelections: Partial<Record<InboxSource, string>> = {};
 
 type InboxProjectOption = {
-  /** Rail identity — a normalized path or `project:<id>` for pure groups. */
-  key: string;
-  /** Real folder for new-work defaults — never a `project:` sentinel. */
   path: string;
-  /** Working copies this project fetches through. */
-  paths: string[];
   name: string;
   logoPath: string | null;
   mascotName: string | null;
@@ -273,7 +177,7 @@ type InboxProjectOption = {
 };
 
 function inboxProjectOptions(
-  projects: InboxRailProject[],
+  projects: RecentProject[],
   logos: ReturnType<typeof useTabGroupLogos>,
 ): InboxProjectOption[] {
   const mascots = loadTabGroupMascots();
@@ -281,27 +185,53 @@ function inboxProjectOptions(
   const custom = loadTabGroupCustomColors();
   return [...projects]
     .map((project) => {
-      const key = projectKey(project.key);
+      const name = projectName(project.path);
+      const key = projectKey(project.path);
       return {
-        key: project.key,
-        path: project.cwd,
-        paths: project.paths,
-        name: project.name,
+        path: project.path,
+        name,
         logoPath: resolveTabGroupLogo(key, logos),
         mascotName: resolveTabGroupMascot(key, mascots),
-        mascotColor: resolveTabGroupColor(key, colors, custom, project.name),
+        mascotColor: resolveTabGroupColor(key, colors, custom, name),
       };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function InboxProjectMark({
+  project,
+}: {
+  project: Pick<
+    InboxProjectOption,
+    "name" | "logoPath" | "mascotName" | "mascotColor"
+  >;
+}) {
+  if (project.logoPath) {
+    return (
+      <ProjectLogoIcon
+        path={project.logoPath}
+        className="size-3.5 shrink-0 rounded-sm"
+        imageClassName="size-3.5"
+      />
+    );
+  }
+  return (
+    <ProjectMascot
+      project={project.name}
+      color={project.mascotColor}
+      name={project.mascotName}
+      className="size-3 shrink-0"
+    />
+  );
 }
 
 function peekInboxForRail(recents: RecentProject[], cwd: string) {
   const projects = inboxProjectsForRail(recents, cwd);
   const filters = pruneInboxFilters(
     loadInboxFilters(),
-    inboxProjectIdentities(projects),
+    projects.map((project) => project.path),
   );
-  return peekInboxList(inboxFetchPaths(projects), {
+  return peekInboxList(projects, {
     assignedToMe: filters.assignedToMe,
     state: inboxFetchState(filters),
     search: "",
@@ -325,17 +255,16 @@ function InboxSourceTab({
       role="tab"
       aria-selected={selected}
       onClick={() => onSelect(source)}
-      aria-label={source === "azure" ? "Azure DevOps" : label}
-      className={`flex h-6 min-w-0 flex-1 items-center justify-center rounded-md px-0.5 text-[11px] leading-none focus-visible:outline focus-visible:outline-1 focus-visible:outline-content/50 ${
+      className={`flex h-6 min-w-0 flex-1 items-center justify-center rounded-md px-2 text-[12px] leading-none ${
         selected
           ? "bg-selection text-content"
           : "text-content/50 hover:bg-content/5 hover:text-content"
       }`}
     >
-      <span className="flex items-center gap-0.5">
+      <span className="flex items-center gap-1.5">
         <InboxProviderMark
           provider={source}
-          className="block size-4 shrink-0"
+          className="block size-3.5 shrink-0"
         />
         <span className="leading-none">{label}</span>
       </span>
@@ -343,8 +272,35 @@ function InboxSourceTab({
   );
 }
 
+function InboxDetailTab({
+  label,
+  selected,
+  onSelect,
+}: {
+  label: string;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={selected}
+      onClick={onSelect}
+      className={`relative flex h-9 items-center text-[12px] leading-none ${
+        selected ? "text-content" : "text-content/50 hover:text-content"
+      }`}
+    >
+      {label}
+      {selected ? (
+        <span className="absolute inset-x-0 bottom-0 h-0.5 bg-content" />
+      ) : null}
+    </button>
+  );
+}
+
 type Props = {
-  onAsk: (item: InboxItem, context?: InboxComposerCard) => Promise<string>;
+  onAsk: (item: InboxItem) => Promise<string>;
   onAskRestart: (item: InboxItem) => Promise<string>;
   onAskMount: (portal: InboxSessionPortal | null) => void;
   cwd: string;
@@ -352,37 +308,13 @@ type Props = {
   besideRail?: boolean;
   onClose?: () => void;
   onToggleSidebar?: () => void;
-  onOpenSettings?: () => void;
+  onStart?: (item: InboxItem, body?: string) => void | Promise<void>;
   sessions?: readonly SessionSummary[];
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (
-    sessionId: string,
-    kind: "pr" | "ci",
-    current: () => boolean,
-    provider: "github" | "azure" | "gitlab",
-    prUrl?: string,
-    gitlabTarget?: { repo: string; number: number },
-  ) => Promise<void>;
-  /** Live session state for "my work" badges — mid-turn and input-blocked. */
-  busySessionIds?: ReadonlySet<string>;
-  needsInputSessionIds?: ReadonlySet<string>;
-  /** Visible attention queue rows — "waiting on you" joins per ticket. */
-  attentionItems?: readonly AttentionItem[];
-  onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
   /** Session-card destination to reveal after the Inbox list loads. */
   target?: LinkedWorkItem | null;
-  visible?: boolean;
-  conversationId?: string;
-  conversationRevision?: number;
-  selectionRevision?: number;
-  onCloseConversation?: () => void;
-  onToggleConversationTicket?: (
-    sessionId: string,
-    item: InboxItem,
-    selected: boolean,
-  ) => Promise<void>;
   /** Opens Settings on the card where the given source is connected. */
-  onOpenIntegrations?: (source: ConnectableInboxSource) => void;
+  onOpenIntegrations: (source: ConnectableInboxSource) => void;
 };
 
 export function InboxView({
@@ -394,98 +326,13 @@ export function InboxView({
   besideRail = false,
   onClose,
   onToggleSidebar,
-  onOpenSettings,
+  onStart,
   sessions = [],
   onOpenSession,
-  onOpenDelivery,
-  busySessionIds,
-  needsInputSessionIds,
-  attentionItems,
-  onAttentionAction,
   target = null,
-  visible = true,
-  conversationId,
-  conversationRevision,
-  selectionRevision = 0,
-  onCloseConversation,
-  onToggleConversationTicket,
   onOpenIntegrations,
 }: Props) {
-  const [selectingTickets, setSelectingTickets] = useState(false);
-  const [issuesCollapsed, setIssuesCollapsed] = useState(false);
-  useEffect(() => {
-    if (selectionRevision) {
-      setSelectingTickets(true);
-      setIssuesCollapsed(false);
-    }
-  }, [selectionRevision]);
-  const [selectedTickets, setSelectedTickets] = useState<
-    Map<string, InboxItem>
-  >(new Map());
-  const [selectionError, setSelectionError] = useState("");
-  const [pendingTickets, setPendingTickets] = useState<Map<string, boolean>>(
-    new Map(),
-  );
-  const conversationLinks = sessionWorkItems(
-    sessions.find((session) => session.id === conversationId) ?? {},
-  );
-  const editingLinks = !!conversationId && !!onToggleConversationTicket;
-  const selectionCount = editingLinks
-    ? conversationLinks.length
-    : selectedTickets.size;
-  const ticketSelected = (item: InboxItem) =>
-    pendingTickets.get(contextTicketKey(item)) ??
-    (editingLinks
-      ? conversationLinks.some((link) =>
-          inboxItemMatchesLinkedWorkItem(item, link),
-        )
-      : selectedTickets.has(contextTicketKey(item)));
-  const toggleTicket = (item: InboxItem) => {
-    if (item.delivery) return;
-    setSelectionError("");
-    if (editingLinks) {
-      const key = contextTicketKey(item);
-      if (pendingTickets.has(key)) return;
-      const selected = !ticketSelected(item);
-      setPendingTickets((previous) => new Map(previous).set(key, selected));
-      void onToggleConversationTicket!(conversationId!, item, selected)
-        .catch((error) =>
-          setSelectionError(`Could not save ticket links: ${String(error)}`),
-        )
-        .finally(() =>
-          setPendingTickets((previous) => {
-            const next = new Map(previous);
-            next.delete(key);
-            return next;
-          }),
-        );
-      return;
-    }
-    const identity = contextTicketKey(item);
-    if (!selectedTickets.has(identity) && selectedTickets.size >= 20) {
-      setSelectionError("Select at most 20 tickets.");
-      return;
-    }
-    setSelectedTickets((previous) => {
-      const next = new Map(previous);
-      if (next.has(identity)) next.delete(identity);
-      else next.set(identity, { ...item });
-      return next;
-    });
-  };
   const [discussionOpen, setDiscussionOpen] = useState(false);
-  const [previewingTicket, setPreviewingTicket] = useState(false);
-  useEffect(
-    () => setPreviewingTicket(false),
-    [conversationId, conversationRevision],
-  );
-  useEffect(() => {
-    if (visible) return;
-    setSelectingTickets(false);
-    setSelectedTickets(new Map());
-    setSelectionError("");
-    setDiscussionOpen(false);
-  }, [visible]);
   const listLock = useLockOverscroll<HTMLDivElement>();
   const listScrollRef = useRef<HTMLDivElement>(null);
   const loadMoreRef = useRef<HTMLLIElement>(null);
@@ -519,23 +366,16 @@ export function InboxView({
   const [refresh, setRefresh] = useState(0);
   const targetSelectionKey = target ? linkedWorkItemInboxKey(target) : null;
   const [selectedKey, setSelectedKey] = useState<string | null>(
-    targetSelectionKey ?? rememberedSelections[loadInboxSource()] ?? null,
+    targetSelectionKey,
   );
   const [targetItem, setTargetItem] = useState<InboxItem | null>(null);
   const [filters, setFilters] = useState(loadInboxFilters);
   const [connections, setConnections] = useState(loadInboxConnections);
   const [source, setSource] = useState(() =>
-    resolveInboxSource(
-      loadInboxSource(),
-      connections,
-      loadVisibleInboxSources(),
-    ),
+    resolveInboxSource(loadInboxSource(), connections),
   );
   const [connectMenuOpen, setConnectMenuOpen] = useState(false);
   const connectButtonRef = useRef<HTMLButtonElement | null>(null);
-  const [preferredSources, setVisibleSources] = useState(
-    loadVisibleInboxSources,
-  );
   const [filterMenu, setFilterMenu] = useState<{ x: number; y: number } | null>(
     null,
   );
@@ -544,7 +384,9 @@ export function InboxView({
   );
   const [linearTeams, setLinearTeams] = useState<LinearTeam[]>([]);
   const [jiraSite, setJiraSite] = useState("");
+  const [jiraAccountId, setJiraAccountId] = useState("");
   const [azureSite, setAzureSite] = useState("");
+  const [azureAccountId, setAzureAccountId] = useState("");
   const azureOwner = useRef("");
   const [azureFilter, setAzureFilter] = useState<AzureFilter>({
     project: "",
@@ -557,37 +399,9 @@ export function InboxView({
   const [jiraOptionsError, setJiraOptionsError] = useState("");
   const prevRefresh = useRef(refresh);
 
-  // Project rows follow the durable project store and verified repository
-  // families — adding a project or moving a repository republishes both and
-  // lands here without waiting for a remount.
-  const projectsRaw = useSyncExternalStore(subscribeProjects, projectsSnapshot);
-  const [families, setFamilies] = useState<
-    ReadonlyMap<string, RepositoryFamily>
-  >(() => getVerifiedFamilies());
-  // Discovery publishes once per probed path; coalesce the burst like the
-  // rail's useRepositoryFamilies instead of regrouping a step at a time.
-  useEffect(() => {
-    let timer = 0;
-    const unsubscribe = subscribeRepositoryFamilies(() => {
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => setFamilies(getVerifiedFamilies()), 40);
-    });
-    return () => {
-      window.clearTimeout(timer);
-      unsubscribe();
-    };
-  }, []);
-  const storedProjects = useMemo(() => loadProjects(), [projectsRaw]);
   const projects = useMemo(
-    () => inboxProjectsForRail(recents, cwd, storedProjects, families),
-    [cwd, recents, storedProjects, families],
-  );
-  const fetchProjects = useMemo(() => inboxFetchPaths(projects), [projects]);
-  const railKeyOf = useMemo(() => inboxRailKeyResolver(projects), [projects]);
-  const projectByKey = useMemo(
-    () =>
-      new Map(projects.map((project) => [projectKey(project.key), project])),
-    [projects],
+    () => inboxProjectsForRail(recents, cwd),
+    [cwd, recents],
   );
   const projectOptions = useMemo(
     () => inboxProjectOptions(projects, logos),
@@ -595,28 +409,18 @@ export function InboxView({
   );
   const linearProjects = useMemo(() => linearProjectOptions(items), [items]);
   const activeFilters = useMemo(
-    () => pruneInboxFilters(filters, inboxProjectIdentities(projects)),
+    () =>
+      pruneInboxFilters(
+        filters,
+        projects.map((project) => project.path),
+      ),
     [filters, projects],
   );
-  const filtersActive =
-    source === "azure"
-      ? !!(
-          azureFilter.query ||
-          !azureFilter.assigned ||
-          activeFilters.time !== "all" ||
-          activeFilters.status.open ||
-          activeFilters.status.closed
-        )
-      : source === "jira"
-        ? !!(
-            jiraFilter.project ||
-            jiraFilter.filter ||
-            !jiraFilter.assigned ||
-            activeFilters.time !== "all" ||
-            activeFilters.status.open ||
-            activeFilters.status.closed
-          )
-        : hasActiveInboxFilters(activeFilters, source, linearHiddenTeamIds);
+  const filtersActive = hasActiveInboxFilters(
+    activeFilters,
+    source,
+    linearHiddenTeamIds,
+  );
   const fetchState = inboxFetchState(activeFilters);
   const fetchQuery = useMemo<InboxQuery>(
     () => ({
@@ -639,22 +443,12 @@ export function InboxView({
   });
 
   useEffect(() => {
-    if (!visible) return;
     if (!target) return;
-    setPreviewingTicket(true);
-    setDiscussionOpen(false);
-    setSelectedKey(linkedWorkItemInboxKey(target));
     setSource(target.provider ?? "github");
-    setVisibleSources((previous) =>
-      previous.includes(target.provider ?? "github")
-        ? previous
-        : [target.provider ?? "github", ...previous],
-    );
     setSearchInput("");
-  }, [target, visible]);
+  }, [target]);
 
   useEffect(() => {
-    if (!visible) return;
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
@@ -671,34 +465,34 @@ export function InboxView({
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [visible, connectMenuOpen, filterMenu]);
+  }, [connectMenuOpen, filterMenu]);
 
   useEffect(() => {
-    if (!visible) return;
     const onChange = () => {
       setLinearHiddenTeamIds(loadHiddenLinearTeamIds());
       setRefresh((value) => value + 1);
     };
     window.addEventListener(LINEAR_CHANGE_EVENT, onChange);
     return () => window.removeEventListener(LINEAR_CHANGE_EVENT, onChange);
-  }, [visible]);
+  }, []);
 
   useEffect(() => {
-    if (!visible) return;
     const onChange = () => setRefresh((value) => value + 1);
     window.addEventListener(GITLAB_CHANGE_EVENT, onChange);
     return () => window.removeEventListener(GITLAB_CHANGE_EVENT, onChange);
-  }, [visible]);
+  }, []);
 
   useEffect(() => {
-    if (!visible) return;
     let cancelled = false;
+    let request = 0;
     const update = (changed = false) => {
+      const current = ++request;
       if (changed) clearInboxCache();
       void jiraConnected()
         .then((status) => {
-          if (cancelled) return;
-          setJiraSite(status.site);
+          if (cancelled || current !== request) return;
+          setJiraSite(status.connected ? status.site : "");
+          setJiraAccountId(status.connected ? status.accountId : "");
           setConnections((prev) => ({
             ...prev,
             jira: status.connected && atlassianCapable(status, "Jira"),
@@ -719,16 +513,15 @@ export function InboxView({
       cancelled = true;
       window.removeEventListener(JIRA_CHANGE_EVENT, onChange);
     };
-  }, [visible]);
+  }, []);
 
   useEffect(() => {
-    if (!visible) return;
     if (source !== "jira" || !jiraSite || !filterMenu) return;
     let cancelled = false;
     setJiraOptionsError("");
     void Promise.all([
-      jiraOptions(jiraSite, false),
-      jiraOptions(jiraSite, true),
+      jiraOptions(jiraSite, false, jiraAccountId),
+      jiraOptions(jiraSite, true, jiraAccountId),
     ])
       .then(([projects, favorites]) => {
         if (cancelled) return;
@@ -741,16 +534,17 @@ export function InboxView({
     return () => {
       cancelled = true;
     };
-  }, [visible, source, jiraSite, !!filterMenu, refresh]);
+  }, [source, jiraSite, jiraAccountId, !!filterMenu, refresh]);
 
   useEffect(() => {
-    if (!visible) return;
     let cancelled = false;
+    let request = 0;
     const update = (changed = false) => {
+      const current = ++request;
       if (changed) clearInboxCache();
       void azureConnected()
         .then((status) => {
-          if (cancelled) return;
+          if (cancelled || current !== request) return;
           const owner = status.connected
             ? `${status.site}:${status.accountId}`
             : "";
@@ -760,6 +554,7 @@ export function InboxView({
             );
           azureOwner.current = owner;
           setAzureSite(status.connected ? status.site : "");
+          setAzureAccountId(status.connected ? status.accountId ?? "" : "");
           setConnections((prev) => ({ ...prev, azure: status.connected }));
           setAzureFilter(loadAzureFilter(status.site, status.project));
           if (changed) setRefresh((value) => value + 1);
@@ -775,14 +570,13 @@ export function InboxView({
       cancelled = true;
       window.removeEventListener(AZURE_CHANGE_EVENT, onChange);
     };
-  }, [visible]);
+  }, []);
 
   // The mount read does the real work: opening Settings unmounts this view, so
   // a token set there lands on the way back in. Reads can also overlap, and
   // only the newest may write, or a slow earlier answer restores a stale one.
   useEffect(() => {
     let cancelled = false;
-    if (!visible) return;
     let latest = 0;
     const read = () => {
       const generation = ++latest;
@@ -817,7 +611,7 @@ export function InboxView({
       window.removeEventListener(LINEAR_CHANGE_EVENT, read);
       window.removeEventListener(GITLAB_CHANGE_EVENT, read);
     };
-  }, [visible]);
+  }, []);
 
   useEffect(() => {
     saveInboxConnections(connections);
@@ -834,15 +628,13 @@ export function InboxView({
 
   // Disconnecting can pull the tab out from under the current selection.
   useEffect(() => {
-    const next = resolveInboxSource(source, connections, preferredSources);
+    const next = resolveInboxSource(source, connections);
     if (next === source) return;
     setSource(next);
     saveInboxSource(next);
-  }, [connections, source, preferredSources]);
+  }, [connections, source]);
 
-  const visibleSources = visibleInboxSources(connections).filter((source) =>
-    preferredSources.includes(source),
-  );
+  const visibleSources = visibleInboxSources(connections);
   const connectableSources = connectableInboxSources(connections);
   const sourceAvailable = visibleSources.includes(source);
   const noSourcesConnected = visibleSources.length === 0;
@@ -850,7 +642,6 @@ export function InboxView({
   // The roster has to come from Linear, not from the fetched issues: hiding a
   // team drops its issues, so a derived list could never offer it back.
   useEffect(() => {
-    if (!visible) return;
     if (source !== "linear") return;
     let cancelled = false;
     void listLinearTeams()
@@ -863,30 +654,18 @@ export function InboxView({
     return () => {
       cancelled = true;
     };
-  }, [visible, source, linearHiddenTeamIds]);
+  }, [source, linearHiddenTeamIds]);
 
   useEffect(() => {
-    if (!visible) return;
     const force = refresh !== prevRefresh.current;
     prevRefresh.current = refresh;
-    const cached = peekInboxList(fetchProjects, fetchQuery);
+    const cached = peekInboxList(projects, fetchQuery);
     if (cached) {
-      setItems((previous) => [
-        ...cached.items,
-        ...previous.filter(
-          (item) =>
-            (item.provider === "jira" &&
-              cached.errors.jira &&
-              jiraSite === item.site) ||
-            (item.provider === "azure" &&
-              cached.errors.azure &&
-              azureSite === item.site),
-        ),
-      ]);
+      setItems(cached.items);
       setProviderErrors(cached.errors);
       setLoading(false);
     }
-    if (!force && cached && inboxListIsFresh(fetchProjects, fetchQuery)) {
+    if (!force && cached && inboxListIsFresh(projects, fetchQuery)) {
       return;
     }
 
@@ -896,21 +675,10 @@ export function InboxView({
       setLoading(true);
       setProviderErrors({});
     }
-    void listInboxItems(fetchProjects, fetchQuery, { force })
+    void listInboxItems(projects, fetchQuery, { force })
       .then((next) => {
         if (cancelled) return;
-        setItems((previous) => [
-          ...next.items,
-          ...previous.filter(
-            (item) =>
-              (item.provider === "jira" &&
-                next.errors.jira &&
-                jiraSite === item.site) ||
-              (item.provider === "azure" &&
-                next.errors.azure &&
-                azureSite === item.site),
-          ),
-        ]);
+        setItems(next.items);
         setProviderErrors(next.errors);
       })
       .catch((err: unknown) => {
@@ -922,8 +690,6 @@ export function InboxView({
           github: message,
           linear: message,
           gitlab: message,
-          jira: message,
-          azure: message,
         });
       })
       .finally(() => {
@@ -935,10 +701,9 @@ export function InboxView({
     return () => {
       cancelled = true;
     };
-  }, [visible, fetchQuery, fetchProjects, refresh]);
+  }, [fetchQuery, projects, refresh]);
 
   useEffect(() => {
-    if (!visible) return;
     if (
       !target ||
       items.some((item) => inboxItemMatchesLinkedWorkItem(item, target))
@@ -946,17 +711,20 @@ export function InboxView({
       return;
     }
     let cancelled = false;
-    void refreshLinkedWorkItem(cwd, target).then((item) => {
-      if (cancelled || !item) return;
-      setTargetItem({
-        ...item,
-        projectPath: item.projectPath || cwd,
+    const pending = !target.provider || target.provider === "github"
+      ? githubWorkItem(cwd, target.repo, target.kind, target.number)
+          .then(item => ({ ...item, projectPath: cwd, provider: "github" as const }))
+      : refreshLinkedWorkItem(cwd, target);
+    void pending.then((item) => {
+        if (!cancelled) setTargetItem(item);
+      })
+      .catch(() => {
+        // The normal Inbox remains usable when an exact lookup is unavailable.
       });
-    });
     return () => {
       cancelled = true;
     };
-  }, [visible, cwd, items, target, targetSelectionKey]);
+  }, [cwd, items, target, targetSelectionKey]);
 
   const visibleItems = useMemo(() => {
     if (!sourceAvailable) return [];
@@ -966,7 +734,6 @@ export function InboxView({
       searchInput,
       Date.now(),
       source,
-      railKeyOf,
     );
     if (!target || source !== (target.provider ?? "github")) return visible;
     const targeted =
@@ -979,72 +746,12 @@ export function InboxView({
   }, [
     activeFilters,
     items,
-    railKeyOf,
     searchInput,
     source,
     sourceAvailable,
     target,
     targetItem,
   ]);
-
-  const relatedSessionCounts = useMemo(
-    () => inboxRelatedSessionCounts(visibleItems, sessions),
-    [visibleItems, sessions],
-  );
-
-  // "My work" inputs are all already-cached snapshots — the version ticks
-  // re-derive the join when a store publish lands; nothing here fetches.
-  const tasksRaw = useSyncExternalStore(
-    subscribeTaskWorkspaces,
-    taskWorkspacesSnapshot,
-  );
-  const prDraftsRaw = useSyncExternalStore(subscribeTaskPrs, taskPrsSnapshot);
-  const statsVersion = useSyncExternalStore(
-    subscribeDiffStatsVersion,
-    diffStatsVersion,
-  );
-  const branchPrV = useSyncExternalStore(
-    subscribeBranchPrVersion,
-    branchPrVersion,
-  );
-  const stores = useDeliveryStores();
-  const myWorkByItem = useMemo(
-    () =>
-      inboxMyWorkForItems(visibleItems, {
-        sessions,
-        busySessionIds,
-        needsInputSessionIds,
-        tasks: loadTaskWorkspaces(),
-        projects: loadProjects(),
-        prDrafts: listTaskPrDrafts(),
-        stores,
-        attention: attentionItems,
-        branchForCwd: (cwd) => peekProjectDiffStats(cwd)?.branch,
-        githubPrFor: cachedBranchPr,
-      }),
-    // Snapshot strings above are the real inputs.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [
-      visibleItems,
-      sessions,
-      busySessionIds,
-      needsInputSessionIds,
-      attentionItems,
-      tasksRaw,
-      projectsRaw,
-      prDraftsRaw,
-      stores,
-      statsVersion,
-      branchPrV,
-    ],
-  );
-  const selectTicketPreview = useCallback((item: InboxItem) => {
-    const key = inboxItemKey(item);
-    markInboxItemSeen({ key, updatedAt: item.updatedAt });
-    setSelectedKey(key);
-    setPreviewingTicket(true);
-    setDiscussionOpen(false);
-  }, []);
 
   const inboxSeenTick = useInboxSeenTick();
   useEffect(() => {
@@ -1070,55 +777,6 @@ export function InboxView({
     () => sourceEntries.some(isInboxEntryUnseen),
     [inboxSeenTick, sourceEntries],
   );
-
-  /** "Watch this query" (#23) — binds a watcher to the current source tab's
-   * filter. GitHub queries span repos, so the sheet asks which repository. */
-  const watchRepos = useMemo(
-    () => [
-      ...new Map(
-        items
-          .filter((item) => item.provider === "github" && item.repo)
-          .map((item) => [
-            `${item.projectPath}|${item.repo}`,
-            { cwd: item.projectPath, repo: item.repo },
-          ]),
-      ).values(),
-    ],
-    [items],
-  );
-  const canWatch =
-    (source === "jira" && connections.jira && !!jiraSite) ||
-    (source === "azure" && !!azureSite) ||
-    (source === "github" && watchRepos.length > 0);
-  const onWatchQuery = () => {
-    if (source === "jira" && jiraSite) {
-      openWatchSheet({
-        source: { kind: "jira-items", site: jiraSite, filter: jiraFilter },
-        name: `Jira · ${jiraFilter.project || "Assigned to me"}`,
-      });
-    } else if (source === "azure" && azureSite) {
-      openWatchSheet({
-        source: {
-          kind: "azure-boards",
-          site: azureSite,
-          project: azureFilter.project,
-          filter: azureFilter,
-        },
-        name: `Azure Boards · ${azureFilter.project || "Assigned to me"}`,
-      });
-    } else if (source === "github" && watchRepos.length) {
-      openWatchSheet({
-        source: {
-          kind: "github-items",
-          cwd: watchRepos[0].cwd,
-          repo: watchRepos[0].repo,
-          itemKind: "issue",
-        },
-        name: `GitHub · ${watchRepos[0].repo}`,
-        repos: watchRepos,
-      });
-    }
-  };
 
   const searchNarrowed = searchInput.trim().length > 0;
   const narrowedByUser = searchNarrowed || filtersActive;
@@ -1172,7 +830,6 @@ export function InboxView({
       return;
     }
     const key = inboxItemKey(selected);
-    rememberedSelections[source] = key;
     // Keep waiting while the exact cache-miss lookup loads. Otherwise the
     // current list's first row replaces the requested key.
     if (
@@ -1186,22 +843,17 @@ export function InboxView({
   }, [selected, selectedKey, targetSelectionKey]);
 
   const onFiltersChange = (next: InboxFilters) => {
-    const pruned = pruneInboxFilters(next, inboxProjectIdentities(projects));
+    const pruned = pruneInboxFilters(
+      next,
+      projects.map((project) => project.path),
+    );
     setFilters(pruned);
     saveInboxFilters(pruned);
   };
 
   const onSourceChange = (next: InboxSource) => {
-    setSelectedKey(rememberedSelections[next] ?? null);
     setSource(next);
     saveInboxSource(next);
-  };
-
-  const onVisibleSourcesChange = (next: InboxSource[]) => {
-    if (!next.length) return;
-    setVisibleSources(next);
-    saveVisibleInboxSources(next);
-    if (!next.includes(source)) onSourceChange(next[0]);
   };
 
   const onFilterButtonClick = (event: ReactMouseEvent<HTMLButtonElement>) => {
@@ -1219,13 +871,7 @@ export function InboxView({
   const list = (
     <div
       ref={resize.setPaneRef}
-      id="inbox-ticket-list"
-      hidden={!!conversationId && issuesCollapsed}
-      className={
-        conversationId && issuesCollapsed
-          ? "hidden"
-          : "relative flex h-full min-h-0 shrink-0 flex-col border-r border-stroke"
-      }
+      className="relative flex h-full min-h-0 shrink-0 flex-col border-r border-stroke"
     >
       <div className="flex h-9 shrink-0 items-center gap-px border-b border-stroke px-2">
         {visibleSources.length > 0 ? (
@@ -1265,145 +911,64 @@ export function InboxView({
           </button>
         ) : null}
       </div>
-      <div className="flex h-9 shrink-0 items-center gap-1 border-b border-stroke px-2">
-        {selectingTickets ? (
-          <>
-            <span className="min-w-0 flex-1 text-[12px] text-content/60">
-              {selectionCount} {editingLinks ? "linked" : "selected"}
-            </span>
-            {!editingLinks ? (
-              <button
-                type="button"
-                aria-label="Send selected tickets to an agent"
-                disabled={!selectionCount}
-                onClick={() => {
-                  const items = [...selectedTickets.values()];
-                  try {
-                    requestAgentContext({
-                      inboxItems: items,
-                      context: contextFromTickets(items),
-                      cwd: items[0]?.projectPath || cwd || undefined,
-                      // Selection survives until the route accepts — a
-                      // cancelled picker or a failed launch keeps it so the
-                      // send can be retried without re-picking tickets.
-                      onPrepared: () => {
-                        setSelectedTickets(new Map());
-                        setSelectingTickets(false);
-                      },
-                      onFailed: (reason) => setSelectionError(reason),
-                    });
-                  } catch (error) {
-                    setSelectionError(String(error));
-                  }
-                }}
-                className="rounded-md bg-content/10 px-2 py-1 text-[11px] disabled:opacity-40"
-              >
-                Send to agent
-              </button>
-            ) : null}
-            <button
-              type="button"
-              aria-label="Done selecting tickets"
-              onClick={() => {
-                setSelectedTickets(new Map());
-                setSelectingTickets(false);
-                setSelectionError("");
-              }}
-              className="rounded-md px-2 py-1 text-[11px] text-content/60 hover:bg-content/5"
-            >
-              Done
-            </button>
-          </>
-        ) : (
-          <>
-            <div className="relative flex h-7 min-w-0 flex-1 items-center">
-              <Search className="pointer-events-none absolute left-2 size-3 shrink-0 opacity-50" />
-              <input
-                value={searchInput}
-                onChange={(event) => setSearchInput(event.target.value)}
-                placeholder="Filter inbox"
-                aria-label="Filter inbox"
-                spellCheck={false}
-                autoComplete="off"
-                className="h-7 w-full rounded-md bg-transparent pl-7 pr-2 text-[12px] text-content outline-none placeholder:text-content/40"
-              />
-            </div>
-            <button
-              type="button"
-              title="Filters and visible sources"
+      {noSourcesConnected ? null : (
+        <div className="flex h-9 shrink-0 items-center gap-1 border-b border-stroke px-2">
+          <div className="relative flex h-7 min-w-0 flex-1 items-center">
+            <Search className="pointer-events-none absolute left-2 size-3 shrink-0 opacity-50" />
+            <input
+              value={searchInput}
+              onChange={(event) => setSearchInput(event.target.value)}
+              placeholder="Filter inbox"
               aria-label="Filter inbox"
-              aria-expanded={!!filterMenu}
-              aria-haspopup="menu"
-              onClick={onFilterButtonClick}
-              className={`grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content ${
-                filterMenu || filtersActive ? "bg-selection text-content" : ""
-              }`}
-            >
-              <ListFilter className="size-3" strokeWidth={1.75} />
-            </button>
-            {canWatch ? (
-              <button
-                type="button"
-                title="Watch this query — poll it while MonoCode is open"
-                aria-label="Watch this query"
-                onClick={onWatchQuery}
-                className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
-              >
-                <Zap className="size-3.5" strokeWidth={1.75} />
-              </button>
-            ) : null}
-            <button
-              type="button"
-              aria-label="Select tickets"
-              title="Select tickets"
-              onClick={() => {
-                setSelectingTickets(true);
-                setFilterMenu(null);
-                setSelectionError("");
-              }}
-              className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
-            >
-              <Check className="size-3.5" strokeWidth={1.75} />
-            </button>
-            <button
-              type="button"
-              title="Mark all as read"
-              aria-label="Mark all as read"
-              disabled={!sourceHasUnseen}
-              onClick={() =>
-                setReadStatusError(
-                  markInboxItemsSeen(sourceEntries)
-                    ? null
-                    : "Could not save read status. Please try again.",
-                )
-              }
-              className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content disabled:cursor-default disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-content/45"
-            >
-              <CheckCheck className="size-3.5" strokeWidth={1.75} />
-            </button>
-            <button
-              type="button"
-              aria-label="Refresh"
-              onClick={() => setRefresh((value) => value + 1)}
-              className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
-            >
-              {loading || revalidating ? (
-                <LoaderCircle
-                  className="size-3.5 animate-spin"
-                  strokeWidth={1.75}
-                />
-              ) : (
-                <RefreshCw className="size-3.5" strokeWidth={1.75} />
-              )}
-            </button>
-          </>
-        )}
-      </div>
-      {selectionError ? (
-        <p role="alert" className="px-3 py-1 text-[11px] text-red-400">
-          {selectionError}
-        </p>
-      ) : null}
+              spellCheck={false}
+              autoComplete="off"
+              className="h-7 w-full rounded-md bg-transparent pl-7 pr-2 text-[12px] text-content outline-none placeholder:text-content/40"
+            />
+          </div>
+          <button
+            type="button"
+            title="Filter inbox"
+            aria-label="Filter inbox"
+            aria-expanded={!!filterMenu}
+            aria-haspopup="menu"
+            onClick={onFilterButtonClick}
+            className={`grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content ${
+              filterMenu || filtersActive ? "bg-selection text-content" : ""
+            }`}
+          >
+            <ListFilter className="size-3" strokeWidth={1.75} />
+          </button>
+          <button
+            type="button"
+            title="Mark all as read"
+            aria-label="Mark all as read"
+            disabled={!sourceHasUnseen}
+            onClick={() => setReadStatusError(
+              markInboxItemsSeen(sourceEntries)
+                ? null
+                : "Could not save read status. Please try again.",
+            )}
+            className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content disabled:cursor-default disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-content/45"
+          >
+            <CheckCheck className="size-3.5" strokeWidth={1.75} />
+          </button>
+          <button
+            type="button"
+            aria-label="Refresh"
+            onClick={() => setRefresh((value) => value + 1)}
+            className="grid size-6 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/10 hover:text-content"
+          >
+            {loading || revalidating ? (
+              <LoaderCircle
+                className="size-3.5 animate-spin"
+                strokeWidth={1.75}
+              />
+            ) : (
+              <RefreshCw className="size-3.5" strokeWidth={1.75} />
+            )}
+          </button>
+        </div>
+      )}
       {readStatusError ? (
         <p role="alert" className="px-3 py-2 text-xs text-red-400">
           {readStatusError}
@@ -1413,157 +978,73 @@ export function InboxView({
         ref={setListScrollRef}
         className="min-h-0 flex-1 overflow-y-auto overscroll-none"
       >
-        {sourceError && visibleItems.length > 0 ? (
-          <p role="status" className="px-3 py-2 text-[12px] text-content/50">
-            {sourceError}{" "}
-            <button
-              type="button"
-              onClick={() => setRefresh((value) => value + 1)}
-              className="underline"
-            >
-              Retry
-            </button>
-          </p>
-        ) : null}
         {noSourcesConnected ? (
           <p className="px-3 py-3 text-[12px] text-content/50">
             Add a connection to start using the Inbox.
           </p>
         ) : sourceError && visibleItems.length === 0 ? (
-          <div className="px-3 py-2 text-[12px] text-content/50">
-            <p>{sourceError}</p>
-            {source === "azure" ? (
-              <div className="mt-2 flex gap-3">
-                {onOpenSettings ? (
-                  <button
-                    type="button"
-                    className="underline"
-                    onClick={onOpenSettings}
-                  >
-                    {azureSite ? "Connection settings" : "Connect Azure DevOps"}
-                  </button>
-                ) : null}
-                {azureSite ? (
-                  <button
-                    type="button"
-                    className="underline"
-                    onClick={() => setRefresh((value) => value + 1)}
-                  >
-                    Retry
-                  </button>
-                ) : null}
-              </div>
-            ) : null}
-            {source === "jira" ? (
-              <div className="mt-2 flex gap-3">
-                {onOpenSettings ? (
-                  <button
-                    type="button"
-                    className="underline"
-                    onClick={onOpenSettings}
-                  >
-                    {jiraSite ? "Connection settings" : "Connect Jira"}
-                  </button>
-                ) : null}
-                {jiraSite ? (
-                  <button
-                    type="button"
-                    className="underline"
-                    onClick={() => setRefresh((value) => value + 1)}
-                  >
-                    Retry
-                  </button>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
+          <p className="px-3 py-2 text-[12px] text-content/50">{sourceError}</p>
         ) : loading && items.length === 0 ? (
           <div className="flex justify-center py-10 text-content/40">
             <LoaderCircle className="size-4 animate-spin" strokeWidth={1.75} />
           </div>
         ) : visibleItems.length === 0 ? (
           <p className="px-3 py-2 text-[12px] text-content/50">
-            {source === "azure"
-              ? "No Azure items match these filters"
-              : source === "jira"
-                ? "No Jira issues match these filters"
-                : narrowedByUser
-                  ? searchNarrowed
-                    ? source === "linear"
-                      ? "No matching Linear issues"
-                      : source === "gitlab"
-                        ? "No matching issues or merge requests"
-                        : "No matching issues or pull requests"
-                    : source === "linear"
-                      ? "No Linear issues match these filters"
-                      : source === "gitlab"
-                        ? activeFilters.assignedToMe
-                          ? "Nothing needs your attention"
-                          : "No GitLab items match these filters"
-                        : "No issues or pull requests match these filters"
-                  : source === "linear"
-                    ? "No Linear issues"
-                    : source === "gitlab"
-                      ? projects.length === 0
-                        ? "Open a project to fill the inbox"
-                        : "No matching issues or merge requests"
-                      : projects.length === 0
-                        ? "Open a project to fill the inbox"
-                        : "No matching issues or pull requests"}
+            {narrowedByUser
+              ? searchNarrowed
+                ? source === "linear"
+                  ? "No matching Linear issues"
+                  : source === "gitlab"
+                    ? "No matching issues or merge requests"
+                    : "No matching issues or pull requests"
+                : source === "linear"
+                  ? "No Linear issues match these filters"
+                  : source === "gitlab"
+                    ? activeFilters.assignedToMe
+                      ? "Nothing needs your attention"
+                      : "No GitLab items match these filters"
+                    : "No issues or pull requests match these filters"
+              : source === "linear"
+                ? "No Linear issues"
+                : source === "gitlab"
+                  ? projects.length === 0
+                    ? "Open a project to fill the inbox"
+                    : "No matching issues or merge requests"
+                  : projects.length === 0
+                    ? "Open a project to fill the inbox"
+                    : "No matching issues or pull requests"}
           </p>
         ) : (
           <ul className="flex flex-col gap-0.5 p-1.5">
             {shownItems.map((item) => {
               const key = inboxItemKey(item);
-              // The row a working copy was fetched under — a stored project's
-              // key or its own path when nothing claims it.
-              const projectId = item.projectPath
-                ? projectKey(railKeyOf(item.projectPath))
-                : "";
-              const project = projectId
-                ? projectByKey.get(projectId)
-                : undefined;
+              const projectId = projectKey(item.projectPath);
+              const relatedSessions = relatedSessionsForInboxItem(
+                item,
+                sessions,
+              );
               return (
-                <li
-                  key={key}
-                  className={
-                    selectingTickets ? "flex items-center gap-1" : undefined
-                  }
-                >
-                  {selectingTickets ? (
-                    <Checkbox
-                      label={`Select ${item.provider} ${item.identifier || item.number} ${item.title}`}
-                      checked={ticketSelected(item)}
-                      disabled={
-                        !!item.delivery ||
-                        pendingTickets.has(contextTicketKey(item))
-                      }
-                      onChange={() => toggleTicket(item)}
-                    />
-                  ) : null}
-                  <div className="min-w-0 flex-1">
-                    <InboxCard
-                      item={item}
-                      active={
-                        selected != null && key === inboxItemKey(selected)
-                      }
-                      projectLabel={project?.name}
-                      logoPath={resolveTabGroupLogo(projectId, logos)}
-                      mascotName={resolveTabGroupMascot(
-                        projectId,
-                        groupMascots,
-                      )}
-                      mascotColor={resolveTabGroupColor(
-                        projectId,
-                        groupColors,
-                        groupCustomColors,
-                        project?.name ?? projectName(item.projectPath),
-                      )}
-                      relatedSessionCount={relatedSessionCounts.get(item) ?? 0}
-                      myWork={myWorkByItem.get(item)}
-                      onSelect={selectTicketPreview}
-                    />
-                  </div>
+                <li key={key}>
+                  <InboxCard
+                    item={item}
+                    active={selected != null && key === inboxItemKey(selected)}
+                    logoPath={resolveTabGroupLogo(projectId, logos)}
+                    mascotName={resolveTabGroupMascot(projectId, groupMascots)}
+                    mascotColor={resolveTabGroupColor(
+                      projectId,
+                      groupColors,
+                      groupCustomColors,
+                      projectName(item.projectPath),
+                    )}
+                    relatedSessionCount={relatedSessions.length}
+                    onSelect={() => {
+                      markInboxItemSeen({
+                        key,
+                        updatedAt: item.updatedAt,
+                      });
+                      setSelectedKey(key);
+                    }}
+                  />
                 </li>
               );
             })}
@@ -1595,13 +1076,11 @@ export function InboxView({
       linearTeams={linearTeams}
       hiddenLinearTeamIds={linearHiddenTeamIds}
       source={source}
-      visibleSources={preferredSources}
-      onVisibleSourcesChange={onVisibleSourcesChange}
       filters={activeFilters}
       onChange={onFiltersChange}
       onLinearTeamsChange={saveHiddenLinearTeamIds}
       jiraFilter={jiraFilter}
-      azure={{ site: azureSite, filter: azureFilter }}
+      azure={{ site: azureSite, accountId: azureAccountId, filter: azureFilter }}
       jiraProjects={jiraProjects}
       jiraFavorites={jiraFavorites}
       jiraOptionsError={jiraOptionsError}
@@ -1618,7 +1097,7 @@ export function InboxView({
       <InboxConnectMenu
         anchor={connectButtonRef}
         sources={connectableSources}
-        onConnect={(source) => onOpenIntegrations?.(source)}
+        onConnect={onOpenIntegrations}
         onClose={() => setConnectMenuOpen(false)}
       />
     ) : null;
@@ -1644,26 +1123,6 @@ export function InboxView({
             strokeWidth={1.75}
           />
           <span className="min-w-0 truncate text-content">Inbox</span>
-          {conversationId ? (
-            <button
-              type="button"
-              aria-expanded={!issuesCollapsed}
-              aria-controls="inbox-ticket-list"
-              onClick={() => setIssuesCollapsed((value) => !value)}
-              className="rounded-md px-2 py-1 text-[11px] text-content/60 hover:bg-content/5"
-            >
-              {issuesCollapsed ? "Show issues" : "Hide issues"}
-            </button>
-          ) : null}
-          {conversationId && previewingTicket ? (
-            <button
-              type="button"
-              className="ml-auto rounded-md px-2 py-1 text-[11px] text-content/60 hover:bg-content/5"
-              onClick={() => setPreviewingTicket(false)}
-            >
-              Back to conversation
-            </button>
-          ) : null}
         </div>
         {IS_MAC ? null : <WindowControls />}
       </div>
@@ -1671,32 +1130,7 @@ export function InboxView({
       <div className="flex min-h-0 min-w-0 flex-1">
         {list}
         <div className="relative flex min-h-0 min-w-0 flex-1">
-          <div
-            hidden={!!conversationId && !previewingTicket}
-            className={
-              conversationId && !previewingTicket
-                ? "hidden"
-                : "min-h-0 min-w-0 flex-1"
-            }
-          >
-            {target &&
-            !selected &&
-            selectedKey === targetSelectionKey &&
-            !loading &&
-            source === target.provider &&
-            target.provider !== "github" ? (
-              <div role="status" className="p-4 text-[13px] text-content/60">
-                <p className="mb-2 font-medium text-content">
-                  {target.title ||
-                    target.identifier ||
-                    `Issue ${target.number}`}
-                </p>
-                <p>
-                  This linked issue is not available in the current Inbox. Check
-                  the connected account and provider filters.
-                </p>
-              </div>
-            ) : null}
+          <div className="min-h-0 min-w-0 flex-1">
             <InboxDetailBody
               item={selected}
               cwd={cwd}
@@ -1705,35 +1139,20 @@ export function InboxView({
               relatedSessions={
                 selected ? relatedSessionsForInboxItem(selected, sessions) : []
               }
-              viewingSessionId={conversationId}
-              onDiscuss={async (context) => {
-                if (!selected) return;
-                await onAsk(selected, context);
-                setDiscussionOpen(true);
-              }}
-              onOpenDelivery={onOpenDelivery}
-              onOpenSession={(id) => {
-                setPreviewingTicket(false);
-                return onOpenSession?.(id);
-              }}
-              myWork={selected ? myWorkByItem.get(selected) : undefined}
-              onAttentionAction={onAttentionAction}
+              onDiscuss={() => setDiscussionOpen(true)}
+              onStart={onStart}
+              onOpenSession={onOpenSession}
               onItemChange={updateInboxItem}
             />
           </div>
-          {(conversationId && !previewingTicket) ||
-          (discussionOpen && selected) ? (
+          {discussionOpen && selected ? (
             <InboxDiscussionPanel
               onOpen={onAsk}
               onRestart={onAskRestart}
               onMount={onAskMount}
-              key={conversationId ?? (selected ? inboxAskKey(selected) : "")}
-              sessionId={conversationId}
-              item={selected ?? undefined}
-              onClose={() => {
-                setDiscussionOpen(false);
-                onCloseConversation?.();
-              }}
+              key={inboxAskKey(selected)}
+              item={selected}
+              onClose={() => setDiscussionOpen(false)}
             />
           ) : null}
         </div>
@@ -1750,12 +1169,14 @@ export function LinkedWorkItemPanel({
   recents,
   visible = true,
   onClose,
+  onBindAccount,
 }: {
   target: LinkedWorkItem;
   cwd: string;
   recents: RecentProject[];
   visible?: boolean;
   onClose: () => void;
+  onBindAccount?: (account: string, site: string) => boolean;
 }) {
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
@@ -1768,11 +1189,9 @@ export function LinkedWorkItemPanel({
     () => inboxProjectOptions(projects, logos),
     [logos, projects],
   );
-  const cachedItem = peekGithubWorkItem(
-    target.repo,
-    target.kind,
-    target.number,
-  );
+  const github = !target.provider || target.provider === "github";
+  const needsAccount = linkedWorkItemNeedsAccount(target);
+  const cachedItem = github ? peekGithubWorkItem(target.repo, target.kind, target.number) : null;
   const [item, setItem] = useState<InboxItem | null>(() =>
     cachedItem ? { ...cachedItem, projectPath: cwd, provider: "github" } : null,
   );
@@ -1799,16 +1218,20 @@ export function LinkedWorkItemPanel({
 
   useEffect(() => {
     let cancelled = false;
-    const cached = peekGithubWorkItem(target.repo, target.kind, target.number);
-    setItem(
-      cached ? { ...cached, projectPath: cwd, provider: "github" } : null,
-    );
+    const cached = github ? peekGithubWorkItem(target.repo, target.kind, target.number) : null;
+    setItem(cached ? { ...cached, projectPath: cwd, provider: "github" } : null);
     setError(null);
     setLoading(cached == null);
-    void githubWorkItem(cwd, target.repo, target.kind, target.number)
+    if (needsAccount) { setLoading(false); return; }
+    const pending = github
+      ? githubWorkItem(cwd, target.repo, target.kind, target.number)
+          .then(item => ({ ...item, provider: "github" as const }))
+      : refreshLinkedWorkItem(cwd, target);
+    void pending
       .then((next) => {
         if (cancelled) return;
-        setItem({ ...next, projectPath: cwd, provider: "github" });
+        if (!next) throw new Error("Could not load the linked item. Check its provider connection.");
+        setItem({ ...next, projectPath: cwd });
       })
       .catch((reason: unknown) => {
         if (cancelled) return;
@@ -1820,7 +1243,7 @@ export function LinkedWorkItemPanel({
     return () => {
       cancelled = true;
     };
-  }, [cwd, target.kind, target.number, target.repo]);
+  }, [cwd, target.kind, target.number, target.repo, target.provider, target.account, target.site, target.id, target.identifier, target.url, needsAccount]);
 
   useEffect(() => {
     if (!visible) return;
@@ -1866,7 +1289,11 @@ export function LinkedWorkItemPanel({
         </IconButton>
       </div>
       <div className="min-h-0 min-w-0 flex-1">
-        {item ? (
+        {needsAccount ? (
+          <div className="flex h-full items-center justify-center px-8 text-center">
+            <LinkedWorkItemAccount key={`${target.provider}:${target.url}`} target={target} cwd={cwd} onBind={onBindAccount ?? (() => false)} />
+          </div>
+        ) : item ? (
           <InboxDetail
             key={inboxItemKey(item)}
             item={item}
@@ -1889,7 +1316,7 @@ export function LinkedWorkItemPanel({
               className={ACTION_OUTLINE}
             >
               <ExternalLink className="size-3.5" strokeWidth={1.75} />
-              Open on GitHub
+              {github ? "Open on" : "Open in"} {INBOX_SOURCE_LABELS[target.provider ?? "github"]}
             </button>
           </div>
         ) : (
@@ -1907,13 +1334,10 @@ function InboxDetailBody({
   cwd,
   projects,
   revision = 0,
-  relatedSessions = [],
-  viewingSessionId,
+  relatedSessions,
   onDiscuss,
+  onStart,
   onOpenSession,
-  onOpenDelivery,
-  myWork,
-  onAttentionAction,
   onItemChange,
 }: {
   item: InboxItem | null;
@@ -1921,21 +1345,9 @@ function InboxDetailBody({
   projects: InboxProjectOption[];
   revision?: number;
   relatedSessions: readonly SessionSummary[];
-  /** Session the user is currently reading in the inbox conversation
-   * panel — delivery rows host on it when it shares the working copy. */
-  viewingSessionId?: string;
-  onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
+  onDiscuss?: () => void;
+  onStart?: (item: InboxItem, body?: string) => void | Promise<void>;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
-  onOpenDelivery?: (
-    sessionId: string,
-    kind: "pr" | "ci",
-    current: () => boolean,
-    provider: "github" | "azure" | "gitlab",
-    prUrl?: string,
-    gitlabTarget?: { repo: string; number: number },
-  ) => Promise<void>;
-  myWork?: InboxMyWork;
-  onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
   onItemChange?: (item: InboxItem) => void;
 }) {
   if (!item) {
@@ -1946,22 +1358,6 @@ function InboxDetailBody({
       </div>
     );
   }
-  if (item.delivery)
-    return (
-      <AzureInboxDetail
-        key={inboxItemKey(item)}
-        item={item}
-        cwd={cwd}
-        projects={projects}
-        relatedSessions={relatedSessions}
-        viewingSessionId={viewingSessionId}
-        onOpenSession={onOpenSession}
-        onOpenDelivery={onOpenDelivery}
-        onDiscuss={onDiscuss}
-        myWork={myWork}
-        onAttentionAction={onAttentionAction}
-      />
-    );
   return (
     <InboxDetail
       key={inboxItemKey(item)}
@@ -1970,55 +1366,80 @@ function InboxDetailBody({
       projects={projects}
       revision={revision}
       relatedSessions={relatedSessions}
-      viewingSessionId={viewingSessionId}
       onDiscuss={onDiscuss}
+      onStart={onStart}
       onOpenSession={onOpenSession}
-      onOpenDelivery={onOpenDelivery}
-      myWork={myWork}
-      onAttentionAction={onAttentionAction}
       onItemChange={onItemChange}
     />
   );
 }
 
-const InboxCard = memo(function InboxCard({
+type InboxStatusMark = {
+  Icon: IconComponent;
+  className: string;
+  label: string;
+};
+
+/** Status reads from the glyph first and the color second, so it survives color blindness. */
+function inboxStatusMark(item: InboxItem): InboxStatusMark {
+  const label = item.kind === "ci" ? ciState("completed", item.state)
+    : ["azure", "jira"].includes(item.kind) ? item.state || inboxItemStatus(item)
+    : inboxItemStatus(item);
+  if (item.kind === "ci") return { Icon: CircleX, className: "text-rose-400/90", label };
+  const pr = item.kind === "pr";
+  if (label === "Draft") {
+    return {
+      Icon: GitPullRequestDraft,
+      className: "text-content/50",
+      label,
+    };
+  }
+  if (label === "Merged") {
+    return { Icon: GitMerge, className: "text-violet-400/90", label };
+  }
+  if (label === "Closed") {
+    return {
+      Icon: pr ? GitPullRequestClosed : CircleX,
+      className: "text-rose-400/90",
+      label,
+    };
+  }
+  return {
+    Icon: pr ? GitPullRequest : CircleDot,
+    className: "text-emerald-400/90",
+    label,
+  };
+}
+
+function InboxCard({
   item,
   active,
-  projectLabel,
   logoPath,
   mascotName,
   mascotColor,
   relatedSessionCount,
-  myWork,
   onSelect,
 }: {
   item: InboxItem;
   active: boolean;
-  /** Owning project's display name — falls back to the folder name. */
-  projectLabel?: string;
   logoPath: string | null;
   mascotName: string | null;
   mascotColor: string;
   relatedSessionCount: number;
-  myWork?: InboxMyWork;
-  onSelect: (item: InboxItem) => void;
+  onSelect: () => void;
 }) {
   useInboxSeenTick();
   const status = inboxStatusMark(item);
-  const kindLabel = inboxKindLabel(item);
+  const kindLabel =
+    item.kind === "ci" ? "Pipeline run" : item.kind === "pr"
+      ? item.provider === "gitlab"
+        ? "Merge request"
+        : "Pull request"
+      : "Issue";
   const time = formatRelativeTime(item.updatedAt);
-  const name = projectLabel?.trim() || projectName(item.projectPath);
+  const name = projectName(item.projectPath);
   const linear = item.provider === "linear";
-  const jira = item.provider === "jira";
-  const azure = item.provider === "azure";
-  const statusLabel = linear || jira || azure ? item.state : status.label;
-  const source = azure
-    ? `${item.site?.split("/").pop()} / ${item.projectName}`
-    : jira
-      ? item.projectName
-      : linear
-        ? item.teamName || item.repo
-        : item.repo || name;
+  const source = linear ? item.teamName || item.repo : item.repo || name;
   const attentionLabel =
     item.provider === "gitlab"
       ? gitlabAttentionLabel(item.attentionReason ?? "")
@@ -2027,17 +1448,16 @@ const InboxCard = memo(function InboxCard({
     key: inboxItemKey(item),
     updatedAt: item.updatedAt,
   });
-  const work = myWorkBadges(myWork);
 
   return (
     <button
       type="button"
       title={item.title}
       aria-current={active ? "true" : undefined}
-      aria-label={`${statusLabel} ${kindLabel.toLowerCase()} ${inboxItemRef(
+      aria-label={`${status.label} ${kindLabel.toLowerCase()} ${inboxItemRef(
         item,
-      )}: ${item.title}${attentionLabel ? `, ${attentionLabel}` : ""}${unseen ? ", new" : ""}${relatedSessionCount > 0 ? `, ${relatedSessionCount} related ${relatedSessionCount === 1 ? "thread" : "threads"}` : ""}${work?.aria ? `, ${work.aria}` : ""}`}
-      onClick={() => onSelect(item)}
+      )}: ${item.title}${attentionLabel ? `, ${attentionLabel}` : ""}${unseen ? ", new" : ""}${relatedSessionCount > 0 ? `, ${relatedSessionCount} related ${relatedSessionCount === 1 ? "thread" : "threads"}` : ""}`}
+      onClick={onSelect}
       className={`flex w-full flex-col rounded-md border px-2.5 py-2 text-left ${
         active
           ? "border-transparent bg-selection text-content"
@@ -2086,7 +1506,7 @@ const InboxCard = memo(function InboxCard({
       </span>
       <span className="mt-1 flex min-w-0 items-center gap-2">
         <span className="flex min-w-0 flex-1 items-center gap-1.5 text-[11px] text-content/45">
-          {linear || jira || azure || !item.projectPath ? null : logoPath ? (
+          {linear || !item.projectPath ? null : logoPath ? (
             <ProjectLogoIcon
               path={logoPath}
               className="size-3.5 shrink-0 rounded-sm"
@@ -2100,14 +1520,8 @@ const InboxCard = memo(function InboxCard({
               className="size-3 shrink-0"
             />
           )}
-          {linear || jira || azure ? (
-            <span className="max-w-[55%] truncate" title={item.state}>
-              {item.state} ·
-            </span>
-          ) : null}
           <span className="min-w-0 truncate">{source}</span>
         </span>
-        <MyWorkBadges work={myWork} />
         {item.labels.length > 0 ? (
           <span className="flex min-w-0 shrink-0 items-center gap-1">
             {item.labels.slice(0, 2).map((label) => (
@@ -2118,7 +1532,7 @@ const InboxCard = memo(function InboxCard({
       </span>
     </button>
   );
-});
+}
 
 export function inboxShowsFullFileDiff(item: InboxItem): boolean {
   return item.provider === "github" && item.kind === "pr";
@@ -2494,16 +1908,14 @@ export function GithubPrActions({
 export function InboxDetail({
   item,
   cwd,
+  projects,
   revision,
-  relatedSessions = [],
+  relatedSessions,
   mode = "inbox",
-  viewingSessionId,
   onDiscuss,
+  onStart,
   onOpenSession,
   onItemChange,
-  onOpenDelivery,
-  myWork,
-  onAttentionAction,
 }: {
   item: InboxItem;
   cwd: string;
@@ -2511,112 +1923,67 @@ export function InboxDetail({
   revision: number;
   relatedSessions: readonly SessionSummary[];
   mode?: "inbox" | "panel";
-  /** Session the user is currently reading — it hosts its checkout's
-   * delivery cluster when several conversations share a working copy. */
-  viewingSessionId?: string;
-  onDiscuss?: (context: InboxComposerCard) => void | Promise<void>;
+  onDiscuss?: () => void;
   onStart?: (item: InboxItem, body?: string) => void | Promise<void>;
   onOpenSession?: (sessionId: string) => void | Promise<void>;
   onItemChange?: (item: InboxItem) => void;
-  onOpenDelivery?: (
-    sessionId: string,
-    kind: "pr" | "ci",
-    current: () => boolean,
-    provider: "github" | "azure" | "gitlab",
-    prUrl?: string,
-    gitlabTarget?: { repo: string; number: number },
-  ) => Promise<void>;
-  myWork?: InboxMyWork;
-  onAttentionAction?: (item: AttentionItem) => void | Promise<void>;
 }) {
   const detailLock = useLockOverscroll<HTMLDivElement>();
   const panel = mode === "panel";
   const linear = item.provider === "linear";
-  const jira = item.provider === "jira";
-  const azure = item.provider === "azure";
-  const ticket = linear || jira || azure;
   const gitlab = item.provider === "gitlab";
   const isPr = !linear && item.kind === "pr";
   const githubKind =
     item.provider === "github" && (item.kind === "issue" || item.kind === "pr")
       ? item.kind
       : null;
-  const gitlabKind =
-    gitlab && (item.kind === "issue" || item.kind === "pr") ? item.kind : null;
-  const cached = azure
-    ? peekAzureDetails(item)
-    : jira
-      ? peekJiraDetails(item)
-      : linear
-        ? peekLinearIssueDetails(item.id ?? "")
-        : gitlabKind
-          ? peekGitlabWorkItemDetails(item.repo, gitlabKind, item.number)
-          : githubKind
-            ? peekGithubWorkItemDetails(item.repo, githubKind, item.number)
-            : null;
-  const cachedThread = azure
-    ? peekAzureThread(item)
-    : jira
-      ? peekJiraThread(item)
-      : linear
-        ? peekLinearIssueThread(item.id ?? "")
-        : gitlabKind
-          ? peekGitlabWorkItemThread(item.repo, gitlabKind, item.number)
-          : githubKind
-            ? peekGithubWorkItemThread(item.repo, githubKind, item.number)
-            : null;
+  const externalActionLabel = `${isPr ? "Review on" : item.provider === "linear" || item.provider === "jira" ? "Open in" : "Open on"} ${INBOX_SOURCE_LABELS[item.provider]}`;
+  const upstreamProvider = item.provider === "github" || item.provider === "gitlab" || linear;
+  const adapter = useMemo(() => inboxProvider(item), [
+    item.provider, item.kind, item.id, item.number, item.projectPath, item.repo,
+    item.account, item.site, item.url, item.delivery, revision,
+  ]);
+  const cached = adapter.peekDetails();
+  const cachedDiff = adapter.peekDiff?.(false) ?? null;
+  const cachedThread = adapter.peekThread();
   const [details, setDetails] = useState<GithubWorkItemDetails | null>(cached);
   const [loading, setLoading] = useState(cached == null);
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<"summary" | "code">("summary");
+  const [tab, setTab] = useState<"summary" | "code" | "checks">("summary");
+  const [diffMode, setDiffMode] = useState<"hunks" | "full">("hunks");
+  const fullFile = inboxShowsFullFileDiff(item) && diffMode === "full";
+  const [prDiff, setPrDiff] = useState<InboxDiff | null>(cachedDiff);
+  const [diffLoading, setDiffLoading] = useState(isPr && cachedDiff == null);
+  const [diffError, setDiffError] = useState<string | null>(null);
   const [thread, setThread] = useState<
-    GithubWorkItemThread | LinearIssueThread | GitlabWorkItemThread | null
+    InboxThread | null
   >(cachedThread);
   const [threadLoading, setThreadLoading] = useState(cachedThread == null);
-  const galleryAttachments = [
-    ...new Map(
-      [
-        ...(details?.attachments ?? []),
-        ...(azure && thread && "attachments" in thread
-          ? (thread.attachments ?? [])
-          : []),
-      ].map((file) => [file.id, file]),
-    ).values(),
-  ];
   const [threadError, setThreadError] = useState<string | null>(null);
   const [replyTo, setReplyTo] = useState<InboxReplyTarget | null>(null);
   const [posting, setPosting] = useState(false);
   const [postError, setPostError] = useState<string | null>(null);
-  const context = useInboxContext(item);
-  const [retry, setRetry] = useState(0);
+  const defaultProject =
+    projects.find((project) => sameProjectPath(project.path, cwd))?.path ??
+    projects[0]?.path ??
+    cwd;
+  const [startProject, setStartProject] = useState(defaultProject);
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
+  const chooseStartProject = linear || ((gitlab || item.provider === "azure" || item.provider === "jira") && !item.projectPath);
+  const statusMark = inboxStatusMark(item);
+  const status = linear ? item.state || inboxItemStatus(item) : statusMark.label;
 
-  const source = azure
-    ? `${item.site?.split("/").pop()} / ${item.projectName}`
-    : jira
-      ? item.projectName
-      : linear
-        ? item.teamName || item.repo
-        : item.repo || projectName(item.projectPath);
-  const externalActionLabel =
-    item.kind === "pr"
-      ? gitlab
-        ? "Review on GitLab"
-        : azure
-          ? "Review in Azure"
-          : "Review on GitHub"
-      : linear
-        ? "Open in Linear"
-        : jira
-          ? "Open in Jira"
-          : azure
-            ? "Open in Azure"
-            : gitlab
-              ? "Open on GitLab"
-              : "Open on GitHub";
+  const source = linear ? item.teamName || item.repo
+    : item.provider === "azure" || item.provider === "jira"
+      ? item.projectName || item.repo
+      : item.repo || projectName(item.projectPath);
   const attentionLabel = gitlab
     ? gitlabAttentionLabel(item.attentionReason ?? "")
     : "";
-  const markdownCwd = item.projectPath || cwd;
+  const markdownCwd = chooseStartProject
+    ? startProject || cwd
+    : item.projectPath || cwd;
   const authorName = details?.author?.trim() ?? "";
   const extraAssignees = item.assignees.filter(
     (person) =>
@@ -2641,596 +2008,448 @@ export function InboxDetail({
 
   useEffect(() => {
     let cancelled = false;
-    const cachedDetails = azure
-      ? peekAzureDetails(item)
-      : jira
-        ? peekJiraDetails(item)
-        : linear
-          ? peekLinearIssueDetails(item.id ?? "")
-          : gitlabKind
-            ? peekGitlabWorkItemDetails(item.repo, gitlabKind, item.number)
-            : githubKind
-              ? peekGithubWorkItemDetails(item.repo, githubKind, item.number)
-              : null;
-    if (cachedDetails) {
-      setDetails(cachedDetails);
-      setLoading(false);
-      setError(null);
-    } else {
-      setLoading(true);
-      setError(null);
-      setDetails(null);
-    }
-    const pending = azure
-      ? azureDetails(item)
-      : jira
-        ? jiraDetails(item)
-        : linear
-          ? item.id
-            ? linearIssueDetails(item.id)
-            : Promise.reject(new Error("Missing Linear issue"))
-          : gitlabKind
-            ? gitlabWorkItemDetails(item.repo, gitlabKind, item.number)
-            : githubKind
-              ? githubWorkItemDetails(
-                  item.projectPath,
-                  item.repo,
-                  githubKind,
-                  item.number,
-                )
-              : Promise.reject(new Error("Unknown inbox item"));
-    void pending
-      .then((next) => {
-        if (cancelled) return;
-        setDetails(next);
-        setError(null);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        if (cachedDetails && !jira && !azure) return;
-        setError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    githubKind,
-    gitlabKind,
-    item.id,
-    item.number,
-    item.projectPath,
-    item.repo,
-    linear,
-    revision,
-    jira,
-    retry,
-  ]);
+    const cached = adapter.peekDetails();
+    setDetails(cached); setLoading(!cached); setError(null);
+    void adapter.details().then(next => {
+      if (!cancelled) setDetails(next);
+    }).catch((error: unknown) => {
+      if (!cancelled && !(cached && upstreamProvider)) setError(error instanceof Error ? error.message : String(error));
+    }).finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [adapter]);
 
   useEffect(() => {
     let cancelled = false;
-    if (ticket) {
-      const id = item.id ?? "";
-      const cachedThread = azure
-        ? peekAzureThread(item)
-        : jira
-          ? peekJiraThread(item)
-          : peekLinearIssueThread(id);
-      if (cachedThread) {
-        setThread(cachedThread);
-        setThreadLoading(false);
-        setThreadError(null);
-      } else {
-        setThreadLoading(true);
-        setThreadError(null);
-        setThread(null);
-      }
-      void (
-        azure
-          ? azureThread(item)
-          : jira
-            ? jiraThread(item)
-            : linearIssueThread(id)
-      )
-        .then((next) => {
-          if (cancelled) return;
-          setThread(next);
-          setThreadError(null);
-        })
-        .catch((err: unknown) => {
-          if (cancelled) return;
-          if (cachedThread && !jira && !azure) return;
-          setThreadError(err instanceof Error ? err.message : String(err));
-        })
-        .finally(() => {
-          if (!cancelled) setThreadLoading(false);
-        });
-      return () => {
-        cancelled = true;
-      };
-    }
-    if (gitlabKind) {
-      const cachedThread = peekGitlabWorkItemThread(
-        item.repo,
-        gitlabKind,
-        item.number,
-      );
-      if (cachedThread) {
-        setThread(cachedThread);
-        setThreadLoading(false);
-        setThreadError(null);
-      } else {
-        setThreadLoading(true);
-        setThreadError(null);
-        setThread(null);
-      }
-      void gitlabWorkItemThread(item.repo, gitlabKind, item.number)
-        .then((next) => {
-          if (cancelled) return;
-          setThread(next);
-          setThreadError(null);
-        })
-        .catch((err: unknown) => {
-          if (cancelled) return;
-          if (cachedThread) return;
-          setThreadError(err instanceof Error ? err.message : String(err));
-        })
-        .finally(() => {
-          if (!cancelled) setThreadLoading(false);
-        });
-      return () => {
-        cancelled = true;
-      };
-    }
-    if (!githubKind) return;
-    const cachedThread = peekGithubWorkItemThread(
-      item.repo,
-      githubKind,
-      item.number,
-    );
-    if (cachedThread) {
-      setThread(cachedThread);
-      setThreadLoading(false);
-      setThreadError(null);
-    } else {
-      setThreadLoading(true);
-      setThreadError(null);
-      setThread(null);
-    }
-    void githubWorkItemThread(
-      item.projectPath,
-      item.repo,
-      githubKind,
-      item.number,
-    )
-      .then((next) => {
-        if (cancelled) return;
-        setThread(next);
-        setThreadError(null);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        if (cachedThread) return;
-        setThreadError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setThreadLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    githubKind,
-    gitlabKind,
-    item.id,
-    item.number,
-    item.projectPath,
-    item.repo,
-    linear,
-    revision,
-    jira,
-    retry,
-  ]);
+    const cached = adapter.peekThread();
+    setThread(cached); setThreadLoading(!cached); setThreadError(null);
+    void adapter.thread().then(next => {
+      if (!cancelled) setThread(next);
+    }).catch((error: unknown) => {
+      if (!cancelled && !(cached && upstreamProvider)) setThreadError(error instanceof Error ? error.message : String(error));
+    }).finally(() => { if (!cancelled) setThreadLoading(false); });
+    return () => { cancelled = true; };
+  }, [adapter]);
+
+  useEffect(() => {
+    if (!adapter.diff || tab !== "code") return;
+    let cancelled = false;
+    const cached = adapter.peekDiff?.(fullFile) ?? null;
+    setPrDiff(cached); setDiffLoading(!cached); setDiffError(null);
+    void adapter.diff(fullFile).then(next => {
+      if (!cancelled) setPrDiff(next);
+    }).catch((error: unknown) => {
+      if (!cancelled && !(cached && upstreamProvider)) setDiffError(error instanceof Error ? error.message : String(error));
+    }).finally(() => { if (!cancelled) setDiffLoading(false); });
+    return () => { cancelled = true; };
+  }, [adapter, fullFile, tab]);
 
   const postComment = async (body: string) => {
-    setPosting(true);
-    setPostError(null);
+    if (!adapter.comment) return;
+    setPosting(true); setPostError(null);
     try {
-      if (linear) {
-        const id = item.id ?? "";
-        await linearIssueComment(id, body, { parentId: replyTo?.id });
-        setReplyTo(null);
-        try {
-          setThread(await linearIssueThread(id, { force: true }));
-        } catch (err: unknown) {
-          setPostError(err instanceof Error ? err.message : String(err));
-        }
-        return;
-      }
-      if (gitlabKind) {
-        await gitlabWorkItemComment(item.repo, gitlabKind, item.number, body);
-        setReplyTo(null);
-        try {
-          setThread(
-            await gitlabWorkItemThread(item.repo, gitlabKind, item.number, {
-              force: true,
-            }),
-          );
-        } catch (err: unknown) {
-          setPostError(err instanceof Error ? err.message : String(err));
-        }
-        return;
-      }
-      if (!githubKind) throw new Error("Unknown inbox item");
-      await githubWorkItemComment(
-        item.projectPath,
-        item.repo,
-        githubKind,
-        item.number,
-        body,
-        { inReplyTo: replyTo?.threadId },
-      );
+      await adapter.comment(body, replyTo);
       setReplyTo(null);
-      try {
-        setThread(
-          await githubWorkItemThread(
-            item.projectPath,
-            item.repo,
-            githubKind,
-            item.number,
-            {
-              force: true,
-            },
-          ),
-        );
-      } catch (err: unknown) {
-        setPostError(err instanceof Error ? err.message : String(err));
-      }
-    } catch (err: unknown) {
-      setPostError(err instanceof Error ? err.message : String(err));
-      throw err;
-    } finally {
-      setPosting(false);
-    }
+      // A failed refresh must not invite resubmission of an accepted comment.
+      try { setThread(await adapter.thread(true)); }
+      catch (error) { setPostError(error instanceof Error ? error.message : String(error)); }
+    } catch (error) {
+      setPostError(error instanceof Error ? error.message : String(error)); throw error;
+    } finally { setPosting(false); }
   };
 
-  // Sessions linked to the item but not tracked as work — myWork's
-  // conversation rows already cover the rest.
-  const idleRelatedSessions = relatedSessions.filter(
-    (session) =>
-      !myWork?.sessions.some((work) => work.sessionId === session.id),
-  );
-
-  return (
-    <InboxDetailShell
-      item={item}
-      cwd={cwd}
-      context={context}
-      panel={panel}
-      scrollRef={detailLock}
-      panelAction={
+  const identityRow = (
+    <div
+      data-inbox-detail-identity
+      data-inbox-detail-fixed-header={panel ? "" : undefined}
+      className={`flex min-w-0 items-center gap-2 text-[12px] text-content/50 ${
+        panel ? "h-9 shrink-0 border-b border-stroke px-4 pr-[34px]" : ""
+      }`}
+    >
+      <InboxProviderMark
+        provider={item.provider}
+        className="size-3.5 shrink-0"
+      />
+      <span className="shrink-0">
+        {item.kind === "ci" ? "Pipeline run" : item.kind === "pr"
+          ? gitlab
+            ? "Merge request"
+            : "Pull request"
+          : "Issue"}
+      </span>
+      <span className="shrink-0 tabular-nums">{inboxItemRef(item)}</span>
+      <span
+        className={`flex shrink-0 items-center gap-1 ${statusMark.className}`}
+      >
+        <statusMark.Icon className="size-3.5" strokeWidth={1.75} />
+        {status}
+      </span>
+      {attentionLabel ? (
+        <span className="shrink-0 text-accent">{attentionLabel}</span>
+      ) : null}
+      {source ? <span className="min-w-0 truncate">{source}</span> : null}
+      {panel ? (
         <button
           type="button"
           title={externalActionLabel}
           aria-label={externalActionLabel}
           onClick={() => void openUrl(item.url)}
-          className={ACTION_PANEL_HEADER}
+          className={`${ACTION_PANEL_HEADER} ml-auto shrink-0`}
         >
           <ExternalLink className="size-3.5" strokeWidth={1.75} />
           <span className="@max-[420px]/linked:hidden">
             {externalActionLabel}
           </span>
         </button>
-      }
-      attention={
-        attentionLabel ? (
-          <span className="shrink-0 text-accent">{attentionLabel}</span>
-        ) : null
-      }
-      source={source ? <span className="truncate">{source}</span> : null}
-      meta={
-        <>
-          {authorName ? (
-            <InboxPerson
-              name={authorName}
-              avatarUrl={inboxPersonAvatarUrl(
-                item.provider,
-                authorName,
-                details?.authorAvatarUrl,
-              )}
-              size={16}
-            />
-          ) : null}
-          {showAssignment ? (
-            <>
-              {authorName ? <span aria-hidden>·</span> : null}
-              {extraAssignees.length > 0 ? (
-                <span className="flex min-w-0 flex-wrap items-center gap-2">
-                  {extraAssignees.map((person) => (
-                    <InboxPerson
-                      key={person.login}
-                      name={person.login}
-                      avatarUrl={inboxPersonAvatarUrl(
-                        item.provider,
-                        person.login,
-                        person.avatarUrl,
-                      )}
-                      size={16}
-                    />
-                  ))}
-                </span>
-              ) : (
-                <span>Unassigned</span>
-              )}
-            </>
-          ) : null}
-          {item.createdAt && formatRelativeTime(item.createdAt) ? (
-            <>
-              <span aria-hidden>·</span>
-              <time
-                dateTime={item.createdAt}
-                title={new Date(item.createdAt).toLocaleString()}
-              >
-                Created {formatRelativeTime(item.createdAt)}
-              </time>
-            </>
-          ) : null}
-          {formatRelativeTime(item.updatedAt) ? (
-            <>
-              <span aria-hidden>·</span>
-              <span>Updated {formatRelativeTime(item.updatedAt)}</span>
-            </>
-          ) : null}
-          {baseRef && headRef ? (
-            <>
-              <span aria-hidden>·</span>
-              <span className="inline-flex min-w-0 items-center gap-1">
-                <GitCompare className="size-3 shrink-0" strokeWidth={1.75} />
-                <span className="min-w-0 truncate">
-                  {baseRef} ← {headRef}
-                </span>
-              </span>
-            </>
-          ) : null}
-          {reviewLabel ? (
-            <>
-              <span aria-hidden>·</span>
-              <span className={reviewClass}>{reviewLabel}</span>
-            </>
-          ) : null}
-        </>
-      }
-      myWork={myWork}
-      viewingSessionId={viewingSessionId}
-      onOpenSession={onOpenSession}
-      onOpenDelivery={onOpenDelivery}
-      onOpenAttention={onAttentionAction}
-      onDiscuss={onDiscuss}
-      extra={
-        !panel && idleRelatedSessions.length > 0 ? (
-          <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
-            <span className="mr-0.5 inline-flex shrink-0 items-center gap-1 text-[11px] text-content/45">
-              <MessageMultiple className="size-3.5" strokeWidth={1.75} />
-              Related{" "}
-              {idleRelatedSessions.length === 1 ? "thread" : "threads"}
-            </span>
-            {idleRelatedSessions.map((session) => {
-              const title = sessionDisplayTitle(session.title, session.harness);
-              return (
-                <button
-                  key={session.id}
-                  type="button"
-                  title={`Open thread: ${title}`}
-                  onClick={() => void onOpenSession?.(session.id)}
-                  className="inline-flex min-w-0 max-w-64 items-center gap-1 rounded-md bg-content/5 px-2 py-1 text-[11px] text-content/70 hover:bg-content/10 hover:text-content"
-                >
-                  <span className="truncate">{title}</span>
-                  {session.archived ? (
-                    <span className="shrink-0 text-content/40">Archived</span>
-                  ) : null}
-                </button>
-              );
-            })}
-          </div>
-        ) : null
-      }
-      actions={
-        <>
-          {githubKind === "pr" ? (
-            <GithubPrActions
-              item={item}
-              baseRef={baseRef}
-              headRef={headRef}
-              onChange={onItemChange}
-            />
-          ) : null}
-          {isPr && (item.provider === "github" || gitlab) ? (
-            <button
-              type="button"
-              className={ACTION_OUTLINE}
-              onClick={() => setTab("code")}
-            >
-              Review PR
-            </button>
-          ) : null}
-          {item.provider === "github" && item.kind === "pr" && item.repo ? (
-            <button
-              type="button"
-              className={ACTION_GHOST}
-              title="Watch reviews and checks on this PR"
-              onClick={() =>
-                openWatchSheet({
-                  source: {
-                    kind: "github-pr",
-                    cwd: item.projectPath,
-                    repo: item.repo,
-                    number: item.number,
-                  },
-                  name: `Reviews · ${item.repo}#${item.number}`,
-                })
-              }
-            >
-              <Zap className="size-3.5" strokeWidth={1.75} /> Watch
-            </button>
-          ) : null}
-          <button
-            type="button"
-            onClick={() => void openUrl(item.url)}
-            className={ACTION_GHOST}
-          >
-            <ExternalLink className="size-3.5" strokeWidth={1.75} />
-            {item.kind === "pr"
-              ? gitlab
-                ? "Open on GitLab"
-                : "Open on GitHub"
-              : azure
-                ? "Open in Azure DevOps"
-                : jira
-                  ? "Open in Jira"
-                  : linear
-                    ? "Open in Linear"
-                    : gitlab
-                      ? "Open on GitLab"
-                      : "Open on GitHub"}
-          </button>
-        </>
-      }
-      error={
-        (jira || azure) && error && details ? (
-          <p role="status" className="text-[12px] text-content/50">
-            {error}{" "}
-            <button
-              type="button"
-              className={ACTION_GHOST}
-              onClick={() => setRetry((value) => value + 1)}
-            >
-              Retry
-            </button>
-          </p>
-        ) : null
-      }
-      tabs={
-        isPr && (item.provider === "github" || gitlab)
-          ? {
-              ariaLabel: gitlab
-                ? "Merge request sections"
-                : "Pull request sections",
-              items: [
-                {
-                  label: "Summary",
-                  selected: tab === "summary",
-                  onSelect: () => setTab("summary"),
-                },
-                {
-                  label: "Code",
-                  selected: tab === "code",
-                  onSelect: () => setTab("code"),
-                },
-              ],
-            }
-          : undefined
-      }
-    >
+      ) : null}
+    </div>
+  );
+
+  return (
+    <div className="flex h-full min-h-0 min-w-0 flex-col">
+      {panel ? identityRow : null}
       <div
-        ref={panel ? undefined : detailLock}
-        data-inbox-detail-scroll={panel ? undefined : ""}
+        ref={panel ? detailLock : undefined}
+        data-inbox-detail-scroll={panel ? "" : undefined}
         className={
           panel
-            ? "contents"
-            : "min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-none"
+            ? "min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-none"
+            : "contents"
         }
       >
-        <div className="mx-auto flex w-full max-w-5xl flex-col gap-5 px-8 py-5">
-          {item.labels.length > 0 ? (
-            <div className="flex flex-wrap gap-1">
-              {item.labels.map((label) => (
-                <InboxLabel key={label.name} label={label} />
-              ))}
-            </div>
-          ) : null}
-          {isPr && tab === "code" ? (
-            item.provider === "github" ? (
-              <GithubPrReview
-                key={`${item.projectPath}:${item.repo}:${item.number}:${revision}`}
-                embedded
-                cwd={item.projectPath}
-                repo={item.repo}
-                number={item.number}
-                enabled
-                onClose={() => undefined}
-              />
-            ) : gitlab ? (
-              <GitlabMrReview
-                key={`${item.projectPath}:${item.repo}:${item.number}:${revision}`}
-                embedded
-                cwd={item.projectPath}
-                repo={item.repo}
-                number={item.number}
-                enabled
-                onClose={() => undefined}
-              />
-            ) : null
-          ) : loading ? (
-            <div className="flex justify-center py-10 text-content/40">
-              <LoaderCircle className="size-4 animate-spin" strokeWidth={1.75} />
-            </div>
-          ) : error && !details ? (
-            <div className="text-[13px] text-content/50">
-              {error}
-              {jira || azure ? (
-                <button
-                  type="button"
-                  className={ACTION_GHOST}
-                  onClick={() => setRetry((value) => value + 1)}
-                >
-                  Retry
-                </button>
+        <div
+          data-inbox-detail-header
+          className={`relative border-b border-stroke ${
+            panel ? "" : "z-10 shrink-0"
+          }`}
+        >
+          <div
+            className={`mx-auto flex w-full max-w-5xl flex-col ${
+              panel ? "gap-2 px-4 pt-4" : "gap-2.5 px-8 pt-5"
+            } ${isPr ? "" : panel ? "pb-4" : "pb-5"}`}
+          >
+            <header className={`flex flex-col ${panel ? "gap-2" : "gap-2.5"}`}>
+              {panel ? null : identityRow}
+              <h1
+                title={item.title}
+                className={`line-clamp-2 font-semibold leading-tight text-content ${
+                  panel ? "text-[18px]" : "text-[20px]"
+                }`}
+              >
+                {item.title}
+              </h1>
+              <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-[12px] text-content/50">
+                {authorName ? (
+                  <InboxPerson
+                    name={authorName}
+                    avatarUrl={inboxPersonAvatarUrl(
+                      item.provider,
+                      authorName,
+                      details?.authorAvatarUrl,
+                    )}
+                    size={16}
+                  />
+                ) : null}
+                {showAssignment ? (
+                  <>
+                    {authorName ? <span aria-hidden>·</span> : null}
+                    {extraAssignees.length > 0 ? (
+                      <span className="flex min-w-0 items-center gap-2 overflow-hidden">
+                        {extraAssignees.map((person) => (
+                          <InboxPerson
+                            key={person.login}
+                            name={person.login}
+                            avatarUrl={inboxPersonAvatarUrl(
+                              item.provider,
+                              person.login,
+                              person.avatarUrl,
+                            )}
+                            size={16}
+                          />
+                        ))}
+                      </span>
+                    ) : (
+                      <span>Unassigned</span>
+                    )}
+                  </>
+                ) : null}
+                {item.createdAt && formatRelativeTime(item.createdAt) ? (
+                  <>
+                    <span aria-hidden>·</span>
+                    <time
+                      dateTime={item.createdAt}
+                      title={new Date(item.createdAt).toLocaleString()}
+                    >
+                      Created {formatRelativeTime(item.createdAt)}
+                    </time>
+                  </>
+                ) : null}
+                {formatRelativeTime(item.updatedAt) ? (
+                  <>
+                    <span aria-hidden>·</span>
+                    <span>Updated {formatRelativeTime(item.updatedAt)}</span>
+                  </>
+                ) : null}
+                {baseRef && headRef ? (
+                  <>
+                    <span aria-hidden>·</span>
+                    <span className="inline-flex min-w-0 items-center gap-1">
+                      <GitCompare
+                        className="size-3 shrink-0"
+                        strokeWidth={1.75}
+                      />
+                      <span className="min-w-0 truncate">
+                        {baseRef} ← {headRef}
+                      </span>
+                      <CopyBranchNameButton branch={headRef} />
+                    </span>
+                  </>
+                ) : null}
+                {reviewLabel ? (
+                  <>
+                    <span aria-hidden>·</span>
+                    <span className={reviewClass}>{reviewLabel}</span>
+                  </>
+                ) : null}
+              </div>
+              {!panel && relatedSessions.length > 0 ? (
+                <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+                  <span className="mr-0.5 inline-flex shrink-0 items-center gap-1 text-[11px] text-content/45">
+                    <MessageMultiple className="size-3.5" strokeWidth={1.75} />
+                    Related{" "}
+                    {relatedSessions.length === 1 ? "thread" : "threads"}
+                  </span>
+                  {relatedSessions.map((session) => {
+                    const title = sessionDisplayTitle(
+                      session.title,
+                      session.harness,
+                    );
+                    return (
+                      <button
+                        key={session.id}
+                        type="button"
+                        title={`Open thread: ${title}`}
+                        onClick={() => void onOpenSession?.(session.id)}
+                        className="inline-flex min-w-0 max-w-64 items-center gap-1 rounded-md bg-content/5 px-2 py-1 text-[11px] text-content/70 hover:bg-content/10 hover:text-content"
+                      >
+                        <span className="truncate">{title}</span>
+                        {session.archived ? (
+                          <span className="shrink-0 text-content/40">
+                            Archived
+                          </span>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
               ) : null}
-            </div>
-          ) : (
-            <>
-              {details?.body.trim() ? (
-                <AgentMarkdown
-                  text={details.body}
-                  cwd={markdownCwd}
-                  allowRemoteMedia
+              <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                {onStart && item.kind !== "pr" ? (
+                  <>
+                    <button
+                      type="button"
+                      disabled={
+                        starting ||
+                        (chooseStartProject &&
+                          (projects.length === 0 ||
+                            !startProject ||
+                            loading ||
+                            !!error))
+                      }
+                      onClick={() => {
+                        if (starting) return;
+                        setStarting(true);
+                        setStartError(null);
+                        const next = chooseStartProject
+                          ? { ...item, projectPath: startProject }
+                          : item;
+                        void Promise.resolve(
+                          onStart(
+                            next,
+                            linear || item.provider === "azure" || item.provider === "jira"
+                              ? details?.body ?? "" : undefined,
+                          ),
+                        )
+                          .catch((err: unknown) => {
+                            setStartError(
+                              err instanceof Error ? err.message : String(err),
+                            );
+                          })
+                          .finally(() => setStarting(false));
+                      }}
+                      className={`${ACTION_FILLED} disabled:cursor-default disabled:opacity-40`}
+                    >
+                      {starting ? "Sending..." : "Send to agent"}
+                    </button>
+                    {chooseStartProject ? (
+                      <InboxProjectPicker
+                        projects={projects}
+                        value={startProject}
+                        onChange={setStartProject}
+                      />
+                    ) : null}
+                  </>
+                ) : null}
+                {githubKind === "pr" ? (
+                  <GithubPrActions
+                    item={item}
+                    baseRef={baseRef}
+                    headRef={headRef}
+                    onChange={onItemChange}
+                  />
+                ) : null}
+                {onDiscuss ? (
+                  <button
+                    type="button"
+                    onClick={onDiscuss}
+                    className={ACTION_OUTLINE}
+                  >
+                    <MessageSquare className="size-3.5" strokeWidth={1.75} />{" "}
+                    Ask
+                  </button>
+                ) : null}
+                {panel ? null : (
+                  <button
+                    type="button"
+                    onClick={() => void openUrl(item.url)}
+                    className={ACTION_GHOST}
+                  >
+                    <ExternalLink className="size-3.5" strokeWidth={1.75} />
+                    {externalActionLabel}
+                  </button>
+                )}
+              </div>
+              {startError ? (
+                <p className="text-[12px] text-red-400/90">{startError}</p>
+              ) : null}
+            </header>
+            {isPr || adapter.checks ? (
+              <div className="flex h-9 items-stretch gap-4">
+                <div
+                  role="tablist"
+                  aria-label={
+                    gitlab ? "Merge request sections" : "Pull request sections"
+                  }
+                  className="flex items-stretch gap-4"
+                >
+                  <InboxDetailTab
+                    label="Summary"
+                    selected={tab === "summary"}
+                    onSelect={() => setTab("summary")}
+                  />
+                  {isPr ? <InboxDetailTab
+                    label="Code"
+                    selected={tab === "code"}
+                    onSelect={() => setTab("code")}
+                  /> : null}
+                  {adapter.checks ? <InboxDetailTab label="Checks" selected={tab === "checks"} onSelect={() => setTab("checks")} /> : null}
+                </div>
+                {tab === "code" && inboxShowsFullFileDiff(item) ? (
+                  <div
+                    role="group"
+                    aria-label="Diff context"
+                    className="ml-auto flex items-center self-center rounded-md border border-content/10 bg-content/[0.03] p-0.5"
+                  >
+                    <button
+                      type="button"
+                      aria-pressed={diffMode === "hunks"}
+                      onClick={() => setDiffMode("hunks")}
+                      className={`rounded px-2.5 py-1 text-[11px] leading-none ${
+                        diffMode === "hunks"
+                          ? "bg-selection text-content"
+                          : "text-content/45 hover:text-content/70"
+                      }`}
+                    >
+                      Hunks
+                    </button>
+                    <button
+                      type="button"
+                      aria-pressed={diffMode === "full"}
+                      onClick={() => setDiffMode("full")}
+                      className={`rounded px-2.5 py-1 text-[11px] leading-none ${
+                        diffMode === "full"
+                          ? "bg-selection text-content"
+                          : "text-content/45 hover:text-content/70"
+                      }`}
+                    >
+                      Full file
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        </div>
+        <div
+          ref={panel ? undefined : detailLock}
+          data-inbox-detail-scroll={panel ? undefined : ""}
+          className={
+            panel
+              ? "min-w-0"
+              : "min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-none"
+          }
+        >
+          <div
+            className={`mx-auto flex w-full max-w-5xl flex-col ${
+              panel ? "gap-4 px-4 py-4" : "gap-5 px-8 py-5"
+            }`}
+          >
+            {item.labels.length > 0 ? (
+              <div className="flex flex-wrap gap-1">
+                {item.labels.map((label) => (
+                  <InboxLabel key={label.name} label={label} />
+                ))}
+              </div>
+            ) : null}
+            {tab === "checks" && adapter.checks ? <InboxChecks load={adapter.checks} /> : isPr && tab === "code" ? (
+              diffLoading ? (
+                <div className="flex justify-center py-10 text-content/40">
+                  <LoaderCircle
+                    className="size-4 animate-spin"
+                    strokeWidth={1.75}
+                  />
+                </div>
+              ) : diffError ? (
+                <p className="text-[13px] text-content/50">{diffError}</p>
+              ) : prDiff ? (
+                <InboxPrDiff
+                  key={`${item.projectPath}:${item.number}:${revision}:${diffMode}`}
+                  diff={prDiff}
+                  fullFile={fullFile}
                 />
               ) : (
-                <p className="text-[13px] text-content/45">No description</p>
-              )}
-              {(jira || azure) && galleryAttachments.length ? (
-                <TicketImages
-                  key={`${item.site}:${item.id}:${revision}`}
-                  item={item}
-                  attachments={galleryAttachments}
+                <p className="text-[13px] text-content/45">No file changes</p>
+              )
+            ) : loading ? (
+              <div className="flex justify-center py-10 text-content/40">
+                <LoaderCircle
+                  className="size-4 animate-spin"
+                  strokeWidth={1.75}
                 />
-              ) : null}
-              <InboxRelated
-                key={`related:${inboxItemKey(item)}:${revision}`}
-                item={item}
-              />
-              <InboxComments
-                thread={thread}
-                loading={threadLoading}
-                error={threadError}
-                cwd={markdownCwd}
-                provider={item.provider}
-                replyMode={linear ? "parent" : gitlab ? undefined : "thread"}
-                onReply={jira || azure ? undefined : setReplyTo}
-              />
-              {(jira || azure) && threadError ? (
-                <button
-                  type="button"
-                  className={ACTION_GHOST}
-                  onClick={() => setRetry((value) => value + 1)}
-                >
-                  Retry comments
-                </button>
-              ) : null}
-              {jira || azure ? null : (
-                <InboxCommentForm
+              </div>
+            ) : error ? (
+              <p className="text-[13px] text-content/50">{error}</p>
+            ) : (
+              <>
+                {details?.body.trim() ? (
+                  <AgentMarkdown
+                    text={details.body}
+                    cwd={markdownCwd}
+                    allowRemoteMedia
+                  />
+                ) : (
+                  <p className="text-[13px] text-content/45">No description</p>
+                )}
+                {details?.attachments?.length ? <TicketImages item={item} attachments={details.attachments} /> : null}
+                <InboxComments
+                  thread={thread}
+                  loading={threadLoading}
+                  error={threadError}
+                  cwd={markdownCwd}
+                  provider={item.provider}
+                  replyMode={adapter.replyMode}
+                  onReply={adapter.comment ? setReplyTo : undefined}
+                />
+                {adapter.comment ? <InboxCommentForm
                   replyTo={replyTo}
                   posting={posting}
                   error={postError}
@@ -3239,13 +2458,51 @@ export function InboxDetail({
                     setPostError(null);
                   }}
                   onSubmit={postComment}
-                />
-              )}
-            </>
-          )}
+                /> : null}
+              </>
+            )}
+          </div>
         </div>
       </div>
-    </InboxDetailShell>
+    </div>
+  );
+}
+
+function CopyBranchNameButton({ branch }: { branch: string }) {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<number | null>(null);
+
+  useEffect(() => {
+    setCopied(false);
+    return () => {
+      if (timer.current != null) window.clearTimeout(timer.current);
+    };
+  }, [branch]);
+
+  return (
+    <button
+      type="button"
+      title={copied ? "Copied" : "Copy branch name"}
+      aria-label={copied ? "Copied" : "Copy branch name"}
+      className="shrink-0 rounded p-0.5 text-content/40 hover:bg-content/8 hover:text-content/70"
+      onClick={() => {
+        void copyText(branch).then(
+          () => {
+            playCue("copy");
+            setCopied(true);
+            if (timer.current != null) window.clearTimeout(timer.current);
+            timer.current = window.setTimeout(() => setCopied(false), 2000);
+          },
+          () => {},
+        );
+      }}
+    >
+      {copied ? (
+        <Check className="size-3" strokeWidth={1.75} />
+      ) : (
+        <Copy className="size-3" strokeWidth={1.75} />
+      )}
+    </button>
   );
 }
 
@@ -3299,6 +2556,100 @@ function InboxPerson({
   );
 }
 
+function InboxProjectPicker({
+  projects,
+  value,
+  onChange,
+}: {
+  projects: InboxProjectOption[];
+  value: string;
+  onChange: (path: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const button = useRef<HTMLButtonElement>(null);
+  const menu = useRef<HTMLDivElement>(null);
+  const selected =
+    projects.find((project) => sameProjectPath(project.path, value)) ??
+    projects[0] ??
+    null;
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (button.current?.contains(target) || menu.current?.contains(target)) {
+        return;
+      }
+      setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, [open]);
+
+  return (
+    <div className="relative">
+      <button
+        ref={button}
+        type="button"
+        disabled={projects.length === 0}
+        onClick={() => setOpen((next) => !next)}
+        className="inline-flex h-7 max-w-48 items-center gap-1.5 rounded-md border border-content/10 bg-content/5 px-2 text-[12px] text-content/80 hover:bg-content/10 hover:text-content disabled:cursor-default disabled:opacity-40"
+      >
+        {selected ? <InboxProjectMark project={selected} /> : null}
+        <span className="min-w-0 truncate">
+          {selected?.name ?? "Choose project"}
+        </span>
+        <ChevronDown
+          className="size-3 shrink-0 text-content/45"
+          strokeWidth={1.75}
+        />
+      </button>
+      {open ? (
+        <div
+          ref={menu}
+          role="listbox"
+          className="absolute left-0 top-full z-30 mt-1 max-h-64 min-w-full max-w-64 overflow-y-auto rounded-lg border border-content/10 bg-content/10 p-1 shadow-xl backdrop-blur-xl outline-none"
+        >
+          {projects.map((project) => {
+            const active = selected
+              ? sameProjectPath(project.path, selected.path)
+              : false;
+            return (
+              <button
+                key={project.path}
+                type="button"
+                role="option"
+                aria-selected={active}
+                onClick={() => {
+                  onChange(project.path);
+                  setOpen(false);
+                }}
+                className={`flex h-7 w-full items-center gap-1.5 rounded-md px-2 text-left text-[12px] ${
+                  active
+                    ? "bg-selection text-content"
+                    : "text-content/80 hover:bg-content/5 hover:text-content"
+                }`}
+              >
+                <InboxProjectMark project={project} />
+                <span className="min-w-0 truncate">{project.name}</span>
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function InboxLabel({
   label,
   compact = false,
@@ -3330,4 +2681,3 @@ function labelColor(value: string): string | null {
   if (!/^[0-9a-fA-F]{6}$/.test(hex)) return null;
   return `#${hex}`;
 }
-

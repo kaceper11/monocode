@@ -9,11 +9,7 @@ import { listen } from "@tauri-apps/api/event";
 // ── IPC types (camelCase mirrors of the Rust structs) ───────────────────────
 
 export type MicPermission =
-  | "unknown"
-  | "not-determined"
-  | "restricted"
-  | "denied"
-  | "authorized";
+  "unknown" | "not-determined" | "restricted" | "denied" | "authorized";
 
 export type DictationModelInfo = {
   id: string;
@@ -21,6 +17,7 @@ export type DictationModelInfo = {
   tier: string;
   sizeBytes: number;
   installed: boolean;
+  removable: boolean;
   /** Bytes of a resumable `.part` download on disk. */
   partialBytes: number;
   downloading: boolean;
@@ -33,6 +30,7 @@ export type DictationStatus = {
   recording: boolean;
   sessionId: number | null;
   modelId: string | null;
+  ownedByWindow: boolean;
 };
 
 export type DictationStarted = {
@@ -105,12 +103,18 @@ export function dictationOpenMicSettings() {
   return invoke<void>("dictation_open_mic_settings");
 }
 
+export function dictationPrepare() {
+  return invoke<number>("dictation_prepare");
+}
+
 export function dictationStart(
+  sessionId: number,
   modelId: string,
   language: string | null,
   translate: boolean,
 ) {
   return invoke<DictationStarted>("dictation_start", {
+    sessionId,
     modelId,
     language,
     translate,
@@ -125,8 +129,8 @@ export function dictationStop(sessionId: number) {
   return invoke<DictationResult>("dictation_stop", { sessionId });
 }
 
-export function dictationCancel(sessionId?: number) {
-  return invoke<void>("dictation_cancel", { sessionId: sessionId ?? null });
+export function dictationCancel(sessionId: number, takeover = false) {
+  return invoke<void>("dictation_cancel", { sessionId, takeover });
 }
 
 export function listenDictationPartial(
@@ -148,15 +152,15 @@ export function listenDictationSession(
 export function listenDictationModelProgress(
   handler: (payload: DictationModelProgress) => void,
 ) {
-  return listen<DictationModelProgress>(
-    "dictation:model-progress",
-    (event) => handler(event.payload),
+  return listen<DictationModelProgress>("dictation:model-progress", (event) =>
+    handler(event.payload),
   );
 }
 
 // ── Preferences ─────────────────────────────────────────────────────────────
 
-const PREFS_KEY = "monocode.dictation";
+export const DICTATION_PREFS_KEY = "monocode.dictation.v1";
+export const LEGACY_DICTATION_PREFS_KEY = "monocode.dictation";
 
 /** Whisper's full multilingual set; `null` auto-detects the spoken language.
  * Auto, English and Polish are pinned ahead of the alphabetical rest. */
@@ -165,39 +169,104 @@ export const DICTATION_LANGUAGES: { id: string | null; label: string }[] = [
   { id: "en", label: "English" },
   { id: "pl", label: "Polish" },
   ...[
-    ["af", "Afrikaans"], ["am", "Amharic"], ["ar", "Arabic"],
-    ["as", "Assamese"], ["az", "Azerbaijani"], ["ba", "Bashkir"],
-    ["be", "Belarusian"], ["bg", "Bulgarian"], ["bn", "Bengali"],
-    ["bo", "Tibetan"], ["br", "Breton"], ["bs", "Bosnian"],
-    ["ca", "Catalan"], ["cs", "Czech"], ["cy", "Welsh"],
-    ["da", "Danish"], ["de", "German"], ["el", "Greek"],
-    ["es", "Spanish"], ["et", "Estonian"], ["eu", "Basque"],
-    ["fa", "Persian"], ["fi", "Finnish"], ["fo", "Faroese"],
-    ["fr", "French"], ["gl", "Galician"], ["gu", "Gujarati"],
-    ["ha", "Hausa"], ["haw", "Hawaiian"], ["he", "Hebrew"],
-    ["hi", "Hindi"], ["hr", "Croatian"], ["ht", "Haitian Creole"],
-    ["hu", "Hungarian"], ["hy", "Armenian"], ["id", "Indonesian"],
-    ["is", "Icelandic"], ["it", "Italian"], ["ja", "Japanese"],
-    ["jw", "Javanese"], ["ka", "Georgian"], ["kk", "Kazakh"],
-    ["km", "Khmer"], ["kn", "Kannada"], ["ko", "Korean"],
-    ["la", "Latin"], ["lb", "Luxembourgish"], ["ln", "Lingala"],
-    ["lo", "Lao"], ["lt", "Lithuanian"], ["lv", "Latvian"],
-    ["mg", "Malagasy"], ["mi", "Māori"], ["mk", "Macedonian"],
-    ["ml", "Malayalam"], ["mn", "Mongolian"], ["mr", "Marathi"],
-    ["ms", "Malay"], ["mt", "Maltese"], ["my", "Burmese"],
-    ["ne", "Nepali"], ["nl", "Dutch"], ["nn", "Norwegian Nynorsk"],
-    ["no", "Norwegian"], ["oc", "Occitan"], ["pa", "Punjabi"],
-    ["ps", "Pashto"], ["pt", "Portuguese"], ["ro", "Romanian"],
-    ["ru", "Russian"], ["sa", "Sanskrit"], ["sd", "Sindhi"],
-    ["si", "Sinhala"], ["sk", "Slovak"], ["sl", "Slovenian"],
-    ["sn", "Shona"], ["so", "Somali"], ["sq", "Albanian"],
-    ["sr", "Serbian"], ["su", "Sundanese"], ["sv", "Swedish"],
-    ["sw", "Swahili"], ["ta", "Tamil"], ["te", "Telugu"],
-    ["tg", "Tajik"], ["th", "Thai"], ["tk", "Turkmen"],
-    ["tl", "Tagalog"], ["tr", "Turkish"], ["tt", "Tatar"],
-    ["uk", "Ukrainian"], ["ur", "Urdu"], ["uz", "Uzbek"],
-    ["vi", "Vietnamese"], ["yi", "Yiddish"], ["yo", "Yoruba"],
-    ["yue", "Cantonese"], ["zh", "Chinese"],
+    ["af", "Afrikaans"],
+    ["am", "Amharic"],
+    ["ar", "Arabic"],
+    ["as", "Assamese"],
+    ["az", "Azerbaijani"],
+    ["ba", "Bashkir"],
+    ["be", "Belarusian"],
+    ["bg", "Bulgarian"],
+    ["bn", "Bengali"],
+    ["bo", "Tibetan"],
+    ["br", "Breton"],
+    ["bs", "Bosnian"],
+    ["ca", "Catalan"],
+    ["cs", "Czech"],
+    ["cy", "Welsh"],
+    ["da", "Danish"],
+    ["de", "German"],
+    ["el", "Greek"],
+    ["es", "Spanish"],
+    ["et", "Estonian"],
+    ["eu", "Basque"],
+    ["fa", "Persian"],
+    ["fi", "Finnish"],
+    ["fo", "Faroese"],
+    ["fr", "French"],
+    ["gl", "Galician"],
+    ["gu", "Gujarati"],
+    ["ha", "Hausa"],
+    ["haw", "Hawaiian"],
+    ["he", "Hebrew"],
+    ["hi", "Hindi"],
+    ["hr", "Croatian"],
+    ["ht", "Haitian Creole"],
+    ["hu", "Hungarian"],
+    ["hy", "Armenian"],
+    ["id", "Indonesian"],
+    ["is", "Icelandic"],
+    ["it", "Italian"],
+    ["ja", "Japanese"],
+    ["jw", "Javanese"],
+    ["ka", "Georgian"],
+    ["kk", "Kazakh"],
+    ["km", "Khmer"],
+    ["kn", "Kannada"],
+    ["ko", "Korean"],
+    ["la", "Latin"],
+    ["lb", "Luxembourgish"],
+    ["ln", "Lingala"],
+    ["lo", "Lao"],
+    ["lt", "Lithuanian"],
+    ["lv", "Latvian"],
+    ["mg", "Malagasy"],
+    ["mi", "Māori"],
+    ["mk", "Macedonian"],
+    ["ml", "Malayalam"],
+    ["mn", "Mongolian"],
+    ["mr", "Marathi"],
+    ["ms", "Malay"],
+    ["mt", "Maltese"],
+    ["my", "Burmese"],
+    ["ne", "Nepali"],
+    ["nl", "Dutch"],
+    ["nn", "Norwegian Nynorsk"],
+    ["no", "Norwegian"],
+    ["oc", "Occitan"],
+    ["pa", "Punjabi"],
+    ["ps", "Pashto"],
+    ["pt", "Portuguese"],
+    ["ro", "Romanian"],
+    ["ru", "Russian"],
+    ["sa", "Sanskrit"],
+    ["sd", "Sindhi"],
+    ["si", "Sinhala"],
+    ["sk", "Slovak"],
+    ["sl", "Slovenian"],
+    ["sn", "Shona"],
+    ["so", "Somali"],
+    ["sq", "Albanian"],
+    ["sr", "Serbian"],
+    ["su", "Sundanese"],
+    ["sv", "Swedish"],
+    ["sw", "Swahili"],
+    ["ta", "Tamil"],
+    ["te", "Telugu"],
+    ["tg", "Tajik"],
+    ["th", "Thai"],
+    ["tk", "Turkmen"],
+    ["tl", "Tagalog"],
+    ["tr", "Turkish"],
+    ["tt", "Tatar"],
+    ["uk", "Ukrainian"],
+    ["ur", "Urdu"],
+    ["uz", "Uzbek"],
+    ["vi", "Vietnamese"],
+    ["yi", "Yiddish"],
+    ["yo", "Yoruba"],
+    ["yue", "Cantonese"],
+    ["zh", "Chinese"],
   ].map(([id, label]) => ({ id, label })),
 ];
 
@@ -250,7 +319,9 @@ export function isDictationLanguage(value: unknown): value is string | null {
 
 export function loadDictationPrefs(): DictationPrefs {
   try {
-    const raw = localStorage.getItem(PREFS_KEY);
+    const raw =
+      localStorage.getItem(DICTATION_PREFS_KEY) ??
+      localStorage.getItem(LEGACY_DICTATION_PREFS_KEY);
     if (!raw) return DICTATION_PREFS_DEFAULT;
     const parsed = JSON.parse(raw) as Partial<DictationPrefs>;
     return {
@@ -266,12 +337,10 @@ export function loadDictationPrefs(): DictationPrefs {
   }
 }
 
+/** Explicit writes use an owned versioned key. Legacy bytes stay recoverable;
+ * quota/access failures must be shown by the control, not silently ignored. */
 export function saveDictationPrefs(prefs: DictationPrefs) {
-  try {
-    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
-  } catch {
-    // private mode / quota
-  }
+  localStorage.setItem(DICTATION_PREFS_KEY, JSON.stringify(prefs));
 }
 
 // ── Errors ──────────────────────────────────────────────────────────────────
@@ -467,6 +536,26 @@ export function adjustDictationRange(
   };
 }
 
+/** User edits inside the dictated span take ownership of that text. Only
+ * edits wholly outside it may move the anchor for subsequent transcription. */
+export function alignDictationRange(
+  range: DictationRange,
+  prev: string,
+  next: string,
+): DictationRange | null {
+  if (prev === next) return range;
+  const edit = draftEditSpan(prev, next);
+  if (
+    range.start === range.end &&
+    edit.start <= range.start &&
+    edit.prevEnd >= range.end
+  )
+    return null;
+  if (edit.prevEnd <= range.start || edit.start >= range.end)
+    return adjustDictationRange(range, prev, next);
+  return null;
+}
+
 /** Splice `text` into `value` at `range`; the result's range covers exactly
  * the inserted text. */
 export function spliceDictationText(
@@ -474,6 +563,14 @@ export function spliceDictationText(
   range: DictationRange,
   text: string,
 ): { value: string; range: DictationRange } {
+  if (
+    !Number.isInteger(range.start) ||
+    !Number.isInteger(range.end) ||
+    range.start < 0 ||
+    range.end < range.start ||
+    range.end > value.length
+  )
+    throw new Error("Dictation draft range is no longer valid.");
   return {
     value: value.slice(0, range.start) + text + value.slice(range.end),
     range: { start: range.start, end: range.start + text.length },
@@ -495,35 +592,25 @@ export function caretAfterSplice(
   return range.start + insertedLength;
 }
 
-/** Re-anchor a stale range before splicing. User edits keep the range
- * accurate via `adjustDictationRange`, but programmatic writes (submit clears
- * the field, quote/skill insertions) bypass input events — relocate by the
- * last dictated text, preferring the occurrence nearest the recorded start,
- * and fall back to clamping the recorded range into bounds. */
+/** Recover only an unambiguous dictated span. A missing or duplicated span
+ * means ownership was lost: the caller must stop writing, never clamp over
+ * unrelated text or insert a late result into a cleared/new draft. */
 export function reanchorDictationRange(
   value: string,
   range: DictationRange,
   expected: string,
-): DictationRange {
-  if (value.slice(range.start, range.end) === expected) return range;
-  if (expected) {
-    let at = -1;
-    let best = Number.POSITIVE_INFINITY;
-    for (
-      let i = value.indexOf(expected);
-      i >= 0;
-      i = value.indexOf(expected, i + 1)
-    ) {
-      const distance = Math.abs(i - range.start);
-      if (distance < best) {
-        best = distance;
-        at = i;
-      }
-    }
-    if (at >= 0) return { start: at, end: at + expected.length };
-  }
-  const start = Math.min(range.start, value.length);
-  return { start, end: Math.min(range.end, value.length) };
+): DictationRange | null {
+  const valid =
+    Number.isInteger(range.start) &&
+    Number.isInteger(range.end) &&
+    range.start >= 0 &&
+    range.end >= range.start &&
+    range.end <= value.length;
+  if (valid && value.slice(range.start, range.end) === expected) return range;
+  if (!expected) return null;
+  const at = value.indexOf(expected);
+  if (at < 0 || value.indexOf(expected, at + 1) >= 0) return null;
+  return { start: at, end: at + expected.length };
 }
 
 // ── Formatting ──────────────────────────────────────────────────────────────

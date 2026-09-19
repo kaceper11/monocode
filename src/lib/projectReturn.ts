@@ -1,5 +1,5 @@
 import { leafIds, type WorkspaceTab } from "./layout";
-import { isBlankSession, type Session } from "./session";
+import type { Session } from "./session";
 import { pathKey } from "./paths";
 import { sameProjectPath } from "./recents";
 
@@ -19,6 +19,11 @@ export type ProjectReturnDecision =
   | { action: "activate"; tabId: string; paneId?: string }
   | { action: "reuse-blank"; sessionId: string }
   | { action: "create" };
+
+export function isBlankSession(session: Session | undefined): boolean {
+  if (!session || session.busy) return false;
+  return !session.blocks.some((block) => block.role === "user");
+}
 
 function paneProjects(
   tabs: readonly WorkspaceTab[],
@@ -40,14 +45,14 @@ function paneProjects(
     for (const pane of tab.editorPanes) {
       const active = pane.files.find((file) => file.id === pane.activeFileId);
       if (active && active.cwd !== "~") {
-        result.set(pane.id, pathKey(active.cwd));
+        result.set(pane.id, pathKey(active.projectCwd ?? active.cwd));
       }
     }
 
     for (const pane of tab.terminalPanes ?? []) {
       const active = pane.files.find((file) => file.id === pane.activeFileId);
       if (active && active.cwd !== "~") {
-        result.set(pane.id, pathKey(active.cwd));
+        result.set(pane.id, pathKey(active.projectCwd ?? active.cwd));
       }
     }
   }

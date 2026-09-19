@@ -10,7 +10,6 @@ import {
   type LinkedWorkItemActivityEntry,
   type LinkedWorkItemUpdateCard,
 } from "../lib/linkedWorkItemActivity";
-import { InboxProviderMark } from "./InboxProviderMark";
 import { formatRelativeTime } from "../lib/githubTasks";
 import { announceLinkedActivity } from "../lib/sounds";
 import { GlassBackdrop } from "./GlassBackdrop";
@@ -86,7 +85,8 @@ export function LinkedWorkItemUpdateNotice({
   const kindLabel =
     linkedWorkItemNoun(provider, card.kind).charAt(0).toUpperCase() +
     linkedWorkItemNoun(provider, card.kind).slice(1);
-  const itemRef = card.identifier ?? `#${card.number}`;
+  const itemRef = provider === "github" ? `#${card.number}` : card.identifier ?? `#${card.number}`;
+  const accessibleRef = provider === "github" ? card.number : itemRef;
   const latest = card.entries[0];
   const discussion =
     latest?.kind === "comment" ||
@@ -156,7 +156,7 @@ export function LinkedWorkItemUpdateNotice({
 
   return (
     <section
-      aria-label={`New activity on ${kindLabel} ${itemRef}`}
+      aria-label={`New activity on ${kindLabel} ${accessibleRef}`}
       aria-live="polite"
       className="pointer-events-auto absolute top-3 right-3 z-40 isolate w-[min(320px,calc(100%_-_24px))] overflow-hidden rounded-xl border border-content/10 text-content shadow-xl"
     >
@@ -166,10 +166,6 @@ export function LinkedWorkItemUpdateNotice({
           <div className="flex items-center gap-1.5">
             <span className="size-2 shrink-0 rounded-full bg-accent" />
             <KindIcon className="size-3.5 text-content/55" strokeWidth={1.75} />
-            <InboxProviderMark
-              provider={provider}
-              className="size-3.5 shrink-0 text-content/55"
-            />
             <span className="min-w-0 flex-1 truncate text-[12px] font-semibold">
               {providerName} activity
             </span>
@@ -177,7 +173,7 @@ export function LinkedWorkItemUpdateNotice({
           <button
             type="button"
             title="Dismiss"
-            aria-label={`Dismiss updates for ${kindLabel} ${itemRef}`}
+            aria-label={`Dismiss updates for ${kindLabel} ${accessibleRef}`}
             onClick={dismiss}
             className="grid size-6 shrink-0 place-items-center rounded-md text-content/40 hover:bg-content/10 hover:text-content"
           >
@@ -195,10 +191,9 @@ export function LinkedWorkItemUpdateNotice({
             className="block w-full text-left"
           >
             <span className="block text-[11px] text-content/50">
-              {card.identifier ? itemRef : `${kindLabel} ${itemRef}`}
-              {card.project || card.repo
-                ? ` · ${card.project || card.repo}`
-                : ""}
+              {provider === "github"
+                ? `${kindLabel} #${card.number} · ${card.repo}`
+                : `${card.identifier ? itemRef : `${kindLabel} ${itemRef}`}${card.project || card.repo ? ` · ${card.project || card.repo}` : ""}`}
             </span>
             <span className="mt-0.5 block truncate text-[13px] font-medium hover:underline">
               {card.title}
@@ -247,13 +242,6 @@ export function LinkedWorkItemUpdateNotice({
                 </span>
               </button>
             ))}
-            {card.entries.length > 3 || card.truncated ? (
-              <div className="px-3 py-1.5 text-[11px] text-content/40">
-                {card.truncated
-                  ? `More on ${providerName} — open the ${linkedWorkItemNoun(provider, card.kind)}`
-                  : `+${card.entries.length - 3} more`}
-              </div>
-            ) : null}
           </div>
         ) : null}
 

@@ -51,6 +51,7 @@ describe("grok protocol", () => {
       grokSpawnArgs({
         model: "grok:grok-4.6",
         effort: "high",
+        fullAccess: true,
       }),
     ).toEqual([
       "--no-auto-update",
@@ -60,6 +61,7 @@ describe("grok protocol", () => {
       "grok-4.6",
       "--reasoning-effort",
       "high",
+      "--always-approve",
       "stdio",
     ]);
     expect(grokTextSpawnArgs()[0]).toBe("--no-auto-update");
@@ -77,7 +79,7 @@ describe("grok protocol", () => {
     ]);
   });
 
-  it("sets yoloMode for full-access and autoMode only for auto", () => {
+  it("sets yoloMode only for full access", () => {
     expect(grokSessionNewParams("/repo", "supervised")).toEqual({
       cwd: "/repo",
       mcpServers: [],

@@ -1,27 +1,5 @@
 import { modelsFor, type AgentModel } from "../models";
-import {
-  acpAuthError,
-  acpAutoOption,
-  acpCommandsFromUpdate,
-  acpConfigOptions,
-  acpCurrentModelId,
-  acpElicitation,
-  acpElicitationResult,
-  acpEventsFromUpdate,
-  acpModeId,
-  acpModeIdsFromConfig,
-  acpModesFromSetup,
-  acpModelConfigId,
-  acpPermissionOptionId,
-  acpPermissionRequest,
-  acpPromptBlocks,
-  acpStopReasonMessage,
-  asRecord,
-  sessionIdFromResult,
-  stringField,
-  type AcpConfigOption,
-  type AcpElicitField,
-} from "./acp";
+import { acpAuthError, acpAutoOption, acpCommandsFromUpdate, acpConfigOptions, acpCurrentModelId, acpElicitation, acpElicitationResult, acpEventsFromUpdate, acpModeId, acpModeIdsFromConfig, acpModesFromSetup, acpModelConfigId, acpPermissionOptionId, acpPermissionRequest, acpPromptBlocks, acpStopReasonMessage, asRecord, sessionIdFromResult, stringField, type AcpConfigOption, type AcpElicitField } from "./acpProtocol";
 
 export { asRecord, sessionIdFromResult, stringField };
 

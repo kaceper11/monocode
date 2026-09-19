@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatEditorSelectionReference, formatEditorSelectionContext, formatCodeBlock, languageFromFileName } from "./editorSelection";
+import { formatEditorSelectionReference } from "./editorSelection";
 
 describe("formatEditorSelectionReference", () => {
   it("includes a mentionable file and line range without copying its contents", () => {
@@ -31,12 +31,4 @@ describe("formatEditorSelectionReference", () => {
       }),
     ).toBe("`docs/read me.md` (lines 3-5)");
   });
-});
-
-
-it("includes selected code with the source language and safely fences embedded backticks", () => {
-  expect(formatEditorSelectionContext({ path: "src/example.tsx", startLine: 3, endLine: 4, text: "const view = <div />;" })).toBe("@src/example.tsx (lines 3-4)\n\n```tsx\nconst view = <div />;\n```");
-  expect(languageFromFileName("src/example.py")).toBe("python");
-  expect(languageFromFileName("src/Dockerfile")).toBe("dockerfile");
-  expect(formatCodeBlock("```literal```", "typescript")).toBe("````typescript\n```literal```\n````");
 });

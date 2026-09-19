@@ -201,11 +201,7 @@ export function SecondOpinionButton({
   useEffect(() => {
     if (!open) return;
     void probeHarnessAvailability({ cwd });
-  }, [open, cwd]);
-
-  useEffect(() => {
-    if (open && !hasProbedHarnessAvailability(cwd)) void probeHarnessAvailability({ cwd });
-  }, [open, cwd, availabilityVersion]);
+  }, [open, cwd, probed]);
 
   useEffect(() => {
     if (!open || !activeHarness) return;
@@ -434,7 +430,7 @@ export function SecondOpinionButton({
                     onClick={() => {
                       if (!available && probed) return;
                       setActive(index);
-                      if (modelsFor(harness).length > 0) setMenuLevel("models");
+                      if (modelsFor(harness, cwd).length > 0) setMenuLevel("models");
                     }}
                     className={`flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] leading-none ${
                       !available && probed

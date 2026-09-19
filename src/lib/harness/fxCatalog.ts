@@ -8,7 +8,7 @@ import {
 } from "./fxProtocol";
 
 export function refreshFxCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("fx", cwd, () => discoverFxModels(cwd));
+  return refreshModelCatalog("fx", cwd, discoverFxModels);
 }
 
 async function discoverFxModels(projectCwd?: string) {

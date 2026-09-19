@@ -1,5 +1,3 @@
-import { hotkeyBlockedByTarget } from "./hotkeyTarget";
-
 type ArchiveContext = {
   activeTabId: string;
   tabs: readonly { id: string; focusedId: string; diffFocused?: boolean }[];
@@ -26,7 +24,27 @@ export function archiveFocusedSession(
   const session = context.sessions.find((entry) => entry.id === tab.focusedId);
   if (!session) return;
 
-  if (hotkeyBlockedByTarget(event.target)) return;
+  const target = event.target instanceof Element ? event.target : null;
+  if (target?.closest(".cm-editor, .monocode-terminal")) return;
+  if (
+    target?.closest('input, textarea, select, [contenteditable="true"]') &&
+    !target.closest("[data-composer]")
+  )
+    return;
+
+  // Popovers can leave focus in the composer. Check the whole document,
+  // excluding overlays in hidden or inactive surfaces.
+  const overlayOpen = Array.from(
+    document.querySelectorAll(
+      '[data-popover-side], [role="dialog"], [role="alertdialog"], [role="menu"], [data-skill-picker], [data-mention-picker]',
+    ),
+  ).some(
+    (element) =>
+      element.getClientRects().length > 0 &&
+      getComputedStyle(element).visibility !== "hidden" &&
+      !element.closest('[hidden], [inert], [aria-hidden="true"]'),
+  );
+  if (overlayOpen) return;
 
   event.preventDefault();
   event.stopPropagation();

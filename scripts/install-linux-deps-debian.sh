@@ -30,9 +30,11 @@ fi
 ${SUDO[@]+"${SUDO[@]}"} apt-get ${APT_SOURCES[@]+"${APT_SOURCES[@]}"} update
 ${SUDO[@]+"${SUDO[@]}"} env DEBIAN_FRONTEND=noninteractive apt-get ${APT_SOURCES[@]+"${APT_SOURCES[@]}"} install -y \
   build-essential \
+  cmake \
+  libclang-dev \
+  libasound2-dev \
   curl \
   file \
-  libasound2-dev \
   libayatana-appindicator3-dev \
   libgtk-3-dev \
   libssl-dev \

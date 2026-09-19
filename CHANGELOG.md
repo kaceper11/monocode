@@ -7,71 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-09-14
+## [0.1.51] - 2026-09-18
 
 ### Added
 
-- In-app browser tabs: a contextual preview pane, a title-bar globe button and keyboard shortcut, an expand mode that zooms the page over the whole workspace while keeping the agent docked, a bookmarks bar, a new-tab button, and clipboard URL prefill. Send the current page to an agent as context, and record browser steps so agents can describe the viewport.
-- Multi-repository tasks: a task spans several repositories with one session per repository, per-attempt checkouts, task-scoped worktrees, branch suggestions, and its own rail section with activity and repository scope. Link issues and inbox items to a task, send a changes selection to a task, track delivery status across repositories, and create GitHub or Azure pull requests per task repository.
-- Attention queue and provider watchers: assigned inbox tickets show your in-flight work, and produced pull requests and CI runs are watched automatically and retired on completion.
-- Dedicated pull-request review surfaces: GitHub pull requests support submitting reviews and preparing isolated checkouts for repairs, and GitLab merge requests get a review surface with full discussion paging.
-- One-shot and recurring schedules for agent sessions.
-- Local dictation: Whisper-based capture with hold-to-talk, the Cmd+Shift+D shortcut, and a filterable picker covering the full Whisper language set.
-- New agent providers: Devin CLI over ACP, GitHub Copilot CLI, and Muse Code via its MSP session host.
-- Configurable agent actions and saved project commands that run as host-aware sequential steps, including recovering failed runs.
-- Keep the computer awake while agents work, with automatic retry and helper handoff.
-- Related work items and Confluence pages can be attached as agent context, and sessions surface linked work-item activity across providers.
-- Notes: tag notes and save transcript selections directly as notes.
-- Multi-worktree management: create and switch worktrees from repository rows, safely remove the active worktree, task-aware cleanup with attention scoped to reachable families, and a warning when live worktrees change the same files.
-- Durable projects: repository membership, saved repository sets, pure group projects without a folder anchor, a streamlined add flow with deferred creation and multi-select picking, and the option to save the import queue as a set.
-- Settings → Extensions page with a provider-aware inventory, collapsible groups, toggles, and entry removal.
-- Terminal resource manager in the usage footer.
-- Session defaults honor configured models and support both default and live access modes.
-- Post-turn verification can run project checks automatically when a turn finishes, with check configuration opened directly from Automations rows.
-- Session reminders shown in the session menu, and nested context menus in the explorer.
-- Subagent transcript trails for Muse, Devin, and Copilot sessions.
-- Title-bar terminal and browser toggle buttons.
+- Git worktrees provide independent working copies for parallel sessions. The working-copy picker can create a worktree from a new or existing branch, open another working copy in a new session, and recover sessions whose worktree was removed. Settings → Worktrees lists branch, status, unpublished commits, and associated sessions, with guarded deletion that preserves branches and sessions by default. In #319.
+- Settings → Providers can rename and remove named Claude Code and Codex accounts. Removing an account deletes its stored credentials, stops its running turns, and retains existing conversations with a clear prompt to switch accounts before continuing.
+- The Go to File dialog now doubles as a fuzzy command palette when opened with Command/Ctrl+Shift+P or a leading `>`. Its first action reloads MonoCode, also available with Command/Ctrl+Shift+R, with confirmation before discarding unsaved files. In #296 by @MichaelOgunjimi.
+- User messages can be copied with their attachments or saved directly to Notes, and selected transcript text offers the same Notes action with success and error feedback. Message timestamps remain visible even for prompts that contain only a note, handoff, or second-opinion card. In #291 and #320 by @ognjeeen.
+- Agent question options support full keyboard navigation with Arrow keys, Home, End, number shortcuts, Enter, and Space for both single- and multi-select prompts.
 
 ### Changed
 
-- macOS builds now require macOS 10.15 or later; the bundled Whisper engine uses C++ `std::filesystem`.
-- Selecting files in Changes now opens a floating action card that sends the selection to a task rather than a session picker.
-- Creating a task prepares it and reveals the rail without starting agent sessions.
-- Includes all upstream 0.1.45 changes, which were merged after 0.2.1.
+- Add-to-chat actions from file-only workspaces open a new session pane and seed its focused Composer with the quoted or plain text, leaving the caret ready at the end.
 
 ### Fixed
 
-- Remount ghosts no longer kill live PTYs, and provider harness lifecycle and protocol handling are hardened.
-- GitLab merge-request review: pinned fetched SHAs, deadline-split WSL Git timeouts, fresh-state aborts, coverage-aware teardown, and correct identity binding.
-- The paste-URL action reads the pasteboard natively without a consent bubble, and only on an explicit click.
-- The worktree-removal batch stays staged across row review, and skip rows pass through the batch Review handoff.
-- Worktree panel flicker, close, and overflow issues; repositories sheet and import-queue polish.
-- Config mutations are hardened against third-party review findings.
-- Dictation start-phase leaks, window-teardown leaks, hold lifecycle, and insertion edge cases.
+- Open editors reliably reload after agent edits and external file changes, including updates that race the initial file watch or preserve the previous modification time.
+- Stopping a turn or beginning the next one cancels unresolved approval requests, removes stale approval controls, and marks their unfinished tools as cancelled.
+- Conversations created before named Claude Code and Codex accounts were introduced continue under the default account instead of losing their provider session association.
+- Composer focus follows the visible active session in split layouts instead of being captured by a hidden session.
 
-## [0.2.1] - 2026-09-11
-
-### Fixed
-
-- Discover WSL agents installed through Linux shell managers and keep model catalogs, defaults, settings and worktree sessions tied to their execution location.
-- Refresh provider discovery after reconnect and show discovery errors without misreporting missing installations.
-- Fix duplicate WSL project labels, worktree menu placement, execution-location menu styling and Linux path presentation.
-- Avoid unrelated Git refreshes and repeated host validation when switching connected WSL projects.
-- Preserve stale-diff guards when staging or reverting reviewed changes.
-
-### Known limitations
-
-- Live Windows-to-WSL and authenticated-provider acceptance remains unverified. OpenCode's WSL transport remains unsupported.
-
-## [0.2.0] - 2026-09-11
+## [0.1.50] - 2026-09-17
 
 ### Added
 
-- Public macOS, Linux and Windows builds are published from this repository with a repository-owned automatic update channel.
+- Hermes Agent is available as an ACP harness with live model discovery, image and file attachments, permission prompts, in-flight redirects, and persisted session resume. Install Hermes, configure a provider with `hermes model`, and MonoCode will add it to the model picker. In #282.
+- Projects can be organized into persistent, collapsible groups in the project rail, with custom names, colors, and mascots. Projects can be assigned or returned to the ungrouped section from their context menu.
+- On Windows, closing a window can hide it to the system tray so running agents continue; the behavior is enabled by default, configurable in Settings, and paired with tray actions to reopen or fully quit MonoCode. Full quits coordinate every window, count all running turns, ask once, wait for workspace saves, recover from stale confirmations, and abort safely if required persistence fails. In #224 by @goujandev.
+- Claude Code and Codex support multiple named accounts. Add or switch accounts from the usage footer; each project remembers its selection, and existing conversations remain pinned to the account that started them. In #280.
+- OpenCode Go usage appears in the status-bar footer with five-hour, weekly, and monthly limits and reset countdowns. Credential discovery supports environment overrides, JSON and JSONC configuration, and XDG data directories. In #263 by @D3nnis72.
+- The branch picker can create a branch through a dedicated name dialog, with the new branch immediately available for selection.
+- Files can be dragged from the Explorer into the Composer, with a drag preview and the same attachment handling as files added through the picker.
+- Project menus can open a project in a detected external editor on macOS, Windows, and Linux.
+- Binary and image viewers can copy the original file to the macOS clipboard from their toolbar or context menu, with temporary success feedback.
+- GitHub pull-request headers include an action to copy the head branch name. Closes #248 in #273 by @bluzername.
+- Contributors can set `MONOCODE_DEV_APP_NAME` to run a separately named macOS development app without changing the default bundle identity. Invalid names and path traversal are rejected. In #284 by @MichaelOgunjimi.
 
 ### Changed
 
-- Packaged builds and development dialogs use the MonoCode name without a downstream-distribution suffix.
+- Workspace and file tabs have more consistent alignment, spacing, active-state highlighting, rounded corners, and cursor behavior, while the terminal dock uses a simpler trailing layout.
+- Changing an OpenCode session's access mode updates its live permissions immediately, and switching to Full Access automatically resolves residual approval prompts.
+- Orchestrated workers use private scratch directories and canonical write-path checks. Paused runs remain inspectable, interrupted work can be retried after resuming, and invalid orchestration proposals are repaired before results are published.
+
+### Fixed
+
+- Pasting or dropping files from Finder into the file tree works reliably on macOS, including safe handling of symlink aliases; drop targeting also accounts for Windows display scaling. In #264 by @kartava.
+- The Composer regains focus after answering a question, finishing an agent turn, or returning to the MonoCode window without stealing focus from another Composer or an open picker. In #292 by @MichaelOgunjimi.
+- Context menus can use their intrinsic height, tab-group menus open on the correct side, light-theme popovers remain opaque, and reorderable tabs use the default cursor.
+- Unix orchestration scratch directories retain restrictive `0700` permissions when their ownership is transferred to the worker.
 
 ## [0.1.49] - 2026-09-16
 
@@ -914,9 +898,7 @@ First public release. macOS (Apple Silicon) only.
 - Updater endpoint and minisign public key are injected at release time rather than committed, so forks do not inherit the maintainer's update channel.
 - macOS release builds sign with `APPLE_SIGNING_IDENTITY` via a config overlay; the committed default remains ad-hoc `-` for community builds.
 
-[Unreleased]: https://github.com/kaceper11/monocode/compare/v0.2.1...HEAD
-[0.2.1]: https://github.com/kaceper11/monocode/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/kaceper11/monocode/releases/tag/v0.2.0
+[Unreleased]: https://github.com/hardbeat920/monocode/compare/v0.1.49...HEAD
 [0.1.49]: https://github.com/hardbeat920/monocode/compare/v0.1.48...v0.1.49
 [0.1.48]: https://github.com/hardbeat920/monocode/compare/v0.1.47...v0.1.48
 [0.1.47]: https://github.com/hardbeat920/monocode/compare/v0.1.46...v0.1.47

@@ -1,4 +1,3 @@
-import { useLayoutEffect, useRef } from "react";
 import { CircleAlert } from "./icons";
 import { useState } from "react";
 import { createPortal } from "react-dom";
@@ -26,7 +25,6 @@ type Props = {
     requestId: number,
     decision: ApprovalDecision,
   ) => void;
-  onHeightChange?: (height: number) => void;
 };
 
 export function ApprovalToasts({
@@ -34,30 +32,13 @@ export function ApprovalToasts({
   onFocusSession,
   onApproval,
   topOffset = 12,
-  onHeightChange,
 }: Props) {
-  const columnRef = useRef<HTMLDivElement>(null);
-  const visible = notices.length > 0;
-  useLayoutEffect(() => {
-    const column = columnRef.current;
-    if (!column || !onHeightChange) return;
-    const measure = () => onHeightChange(column.offsetHeight);
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(column);
-    return () => {
-      observer.disconnect();
-      onHeightChange(0);
-    };
-  }, [visible, onHeightChange]);
   useProjectNotificationPreferences();
-  if (!visible) return null;
+  if (notices.length === 0) return null;
 
   return createPortal(
     <div
-      ref={columnRef}
       aria-live="polite"
-      data-app-overlay
       style={{ zIndex: LAYER.toast, top: topOffset }}
       className="pointer-events-none fixed right-3 flex w-[min(360px,calc(100vw-24px))] flex-col gap-2"
     >

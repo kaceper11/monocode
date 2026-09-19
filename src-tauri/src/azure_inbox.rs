@@ -28,7 +28,7 @@ fn pr_item(value: &Value, site: &str, account: &str) -> Option<Value> {
     Some(json!({
         "kind":"pr", "number":number, "title":text(value,"title"),
         "url":format!("{}/{}/_git/{}/pullrequest/{number}",site,component(&project_id),component(&repository)),
-        "state":match value["status"].as_str() { Some("completed")=>"merged",Some("abandoned")=>"closed",_=>"open" },
+        "state":match value["status"].as_str() { Some("completed")=>"merged",Some("abandoned")=>"closed",Some("active")=>"open",_=>"unknown" },
         "draft":value["isDraft"].as_bool().unwrap_or(false),
         "updatedAt":value["closedDate"].as_str().or(value["creationDate"].as_str()).unwrap_or(""),
         "repo":text(repo,"name"), "projectId":project_id, "projectName":text(project,"name"),
@@ -73,7 +73,7 @@ pub async fn azure_delivery_inbox(
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
-        if config.account_id != account_id {
+        if account_id.is_empty() || config.account_id != account_id {
             return Err("Azure account changed. Refresh Inbox.".into());
         }
         if project.is_empty()
@@ -192,6 +192,12 @@ mod tests {
         success["result"] = json!("succeeded");
         assert!(ci_item(&success, "https://dev.azure.com/team", "account").is_none());
         assert!(pr_item(&json!({"pullRequestId":0}), "site", "account").is_none());
+        let mut unknown = pr.clone();
+        unknown["status"] = json!("future");
+        assert_eq!(
+            pr_item(&unknown, "site", "account").unwrap()["state"],
+            "unknown"
+        );
     }
 }
 
@@ -205,7 +211,7 @@ pub async fn azure_ci_inbox_summary(
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
-        if config.account_id != account_id {
+        if account_id.is_empty() || config.account_id != account_id {
             return Err("Azure account changed. Refresh Inbox.".into());
         }
         if number == 0
@@ -225,8 +231,14 @@ pub async fn azure_ci_inbox_summary(
         if run["id"] != number || run["project"]["id"] != project {
             return Err("Azure returned a different run.".into());
         }
-        let result =
+        let mut result =
             ci_item(&run, &site, &account_id).ok_or("Run state changed. Refresh Inbox.")?;
+        result["evidence"] = json!({
+            "target": {"site":site,"accountId":account_id,"project":project,
+                "definition":run["definition"]["id"],"repositoryId":run["repository"]["id"],
+                "repositoryType":run["repository"]["type"],"repositoryUrl":""},
+            "run": {"id":number,"revision":crate::azure_pipelines::revision(&run)}
+        });
         if require_config(&app, &site)?.account_id != account_id {
             return Err("Azure account changed. Refresh Inbox.".into());
         }

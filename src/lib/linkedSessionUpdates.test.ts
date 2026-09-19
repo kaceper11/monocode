@@ -5,7 +5,6 @@ import type { SessionSummary } from "./sessionStore";
 import {
   linkedSessionUpdateIds,
   linkedSessionUpdates,
-  linkedWorkItemIdentityChanged,
   linkedWorkItemTargets,
   linkedWorkItemUpdateKey,
 } from "./linkedSessionUpdates";
@@ -97,6 +96,7 @@ describe("linked session updates", () => {
   it("flags a session when a secondary linked item changes", () => {
     const secondary: LinkedWorkItem = {
       provider: "jira",
+      account: "original-account",
       kind: "issue",
       repo: "",
       number: 123,
@@ -110,6 +110,7 @@ describe("linked session updates", () => {
         linkedWorkItemUpdateKey(secondary),
         remote(200, {
           provider: "jira",
+          account: "original-account",
           kind: "jira",
           repo: "",
           url: secondary.url,
@@ -123,7 +124,6 @@ describe("linked session updates", () => {
       linkedWorkItem: { ...linked, additionalItems: [secondary] },
     });
     const updates = linkedSessionUpdates([target], snapshots);
-    expect(updates.get("multi")?.linked).toEqual(secondary);
     expect(updates.get("multi")?.item.provider).toBe("jira");
   });
 
@@ -164,6 +164,7 @@ describe("linked session updates", () => {
 describe("provider-aware update keys", () => {
   const jiraLinked: LinkedWorkItem = {
     provider: "jira",
+    account: "original-account",
     kind: "issue",
     repo: "",
     number: 123,
@@ -204,21 +205,10 @@ describe("provider-aware update keys", () => {
     ).toHaveLength(2);
   });
 
-  it("detects primary-link replacement for card invalidation", () => {
-    expect(
-      linkedWorkItemIdentityChanged(linked, { ...linked, number: 43 }),
-    ).toBe(true);
-    expect(linkedWorkItemIdentityChanged(linked, undefined)).toBe(true);
-    expect(linkedWorkItemIdentityChanged(undefined, linked)).toBe(true);
-    expect(linkedWorkItemIdentityChanged(undefined, undefined)).toBe(false);
-    expect(
-      linkedWorkItemIdentityChanged(linked, { ...linked, title: "renamed" }),
-    ).toBe(false);
-  });
-
   it("matches a Jira snapshot stored under its own key", () => {
     const item = remote(200, {
       provider: "jira",
+      account: "original-account",
       kind: "jira",
       repo: "",
       url: jiraLinked.url,
@@ -234,4 +224,13 @@ describe("provider-aware update keys", () => {
       ).has("jira"),
     ).toBe(true);
   });
+});
+
+
+it.each(["jira", "azure"] as const)("ignores unbound legacy %s targets and any old unscoped activity cache", provider => {
+  const legacy = { ...linked, provider, account: undefined };
+  const saved = session("legacy", 100, { linkedWorkItem: legacy });
+  const snapshots = new Map([[linkedWorkItemUpdateKey(legacy), remote(200, { provider, account: "current-account" })]]);
+  expect(linkedWorkItemTargets([saved])).toEqual([]);
+  expect(linkedSessionUpdates([saved], snapshots).size).toBe(0);
 });

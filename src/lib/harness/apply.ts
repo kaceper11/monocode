@@ -7,6 +7,7 @@ import type {
   TaskListItem,
   ToolPreview,
 } from "../session";
+import { sessionWorkCwd } from "../session";
 import { mergeContextUsage } from "../contextUsage";
 import { displayPath } from "../paths";
 import {
@@ -22,50 +23,11 @@ import { isReviewablePlan } from "../plan";
 import { resolveModel } from "../models";
 import type { HarnessEvent } from "./types";
 
-/** Apply one UI batch without copying the transcript for every text chunk. */
-export function applyHarnessEvents(
-  session: Session,
-  events: readonly HarnessEvent[],
-): Session {
-  if (events.length === 1) return applyHarnessEvent(session, events[0]);
-  for (let index = 0; index < events.length; index += 1) {
-    const event = events[index];
-    session = applyHarnessEvent(session, event);
-    if (event.type !== "message.delta" && event.type !== "reasoning.delta") continue;
-    const role = event.type === "message.delta" ? "assistant" : "reasoning";
-    const last = session.blocks[session.blocks.length - 1];
-    // Empty reasoning deltas do not open a block. Let the next event do so.
-    if (last?.role !== role || !last.streaming) continue;
-    let text = last.text;
-    while (index + 1 < events.length) {
-      const next = events[index + 1];
-      if (next.type !== event.type) break;
-      // Join against the accumulated text: joining raw chunks first changes
-      // the meaning of snapshots, repeated tokens and Markdown whitespace.
-      text = joinStreamText(text, next.text);
-      index += 1;
-    }
-    if (text !== last.text) {
-      const blocks = session.blocks.slice();
-      blocks[blocks.length - 1] = { ...last, text };
-      session = { ...session, blocks };
-    }
-  }
-  return session;
-}
-
 export function applyHarnessEvent(
   session: Session,
   event: HarnessEvent,
 ): Session {
-  if (session.activity && (
-    event.type === "message.delta" || event.type === "reasoning.delta" ||
-    event.type === "tool.started" || event.type === "question.asked" ||
-    event.type === "approval.requested"
-  )) session = { ...session, activity: undefined };
   switch (event.type) {
-    case "session.activity":
-      return session.activity === event.text ? session : { ...session, activity: event.text };
     case "message.delta":
       return patchStreaming(session, "assistant", event.text, true);
     case "message.completed":
@@ -166,20 +128,11 @@ export function applyHarnessEvent(
       });
     case "session.providerBound":
       return { ...session, providerSessionId: event.providerSessionId };
-    case "session.configChanged": {
-      const active = session.activeTurnModel;
-      const preserveNextChoice = !!active && !matchesActiveTurnModel(session);
-      const actual = active && {
-        harness: active.harness,
-        id: event.model ?? active.id,
-        name: event.model ? resolveModel(active.harness, event.model, session.cwd).name : active.name,
-      };
-      const start = lastMatchingBlock(session.blocks, (block) =>
-        block.role === "user" && block.startedAt != null && block.durationMs == null);
+    case "session.configChanged":
       return {
         ...session,
-        ...(!preserveNextChoice && event.model ? { model: event.model } : {}),
-        ...(!preserveNextChoice && event.modelSettings
+        ...(event.model ? { model: event.model } : {}),
+        ...(event.modelSettings
           ? {
               modelSettings: {
                 ...session.modelSettings,
@@ -187,13 +140,7 @@ export function applyHarnessEvent(
               },
             }
           : {}),
-        ...(active && actual ? {
-          activeTurnModel: { ...actual, settings: { ...active.settings, ...event.modelSettings } },
-          blocks: session.blocks.map((block, index) => start >= 0 && index >= start && block.role === "user"
-            ? { ...block, turnModel: actual } : block),
-        } : {}),
       };
-    }
     case "status":
       return appendStatus(session, event.text);
     case "interjection":
@@ -416,7 +363,6 @@ function lastMatchingBlock(
 type UserTurnExtra = {
   secondOpinion?: Block["secondOpinion"];
   noteCard?: Block["noteCard"];
-  action?: Block["action"];
   internal?: boolean;
 };
 
@@ -424,13 +370,12 @@ function userTurnFields(extra?: UserTurnExtra) {
   return {
     ...(extra?.secondOpinion ? { secondOpinion: extra.secondOpinion } : {}),
     ...(extra?.noteCard ? { noteCard: extra.noteCard } : {}),
-    ...(extra?.action ? { action: extra.action } : {}),
     ...(extra?.internal ? { internal: true } : {}),
   };
 }
 
 function turnModelFields(session: Session) {
-  const model = resolveModel(session.harness, session.model);
+  const model = resolveModel(session.harness, session.model, sessionWorkCwd(session));
   return {
     turnModel: {
       harness: session.harness,
@@ -440,33 +385,15 @@ function turnModelFields(session: Session) {
   };
 }
 
-/** Capture the settings owned by a turn or manual compaction before IO starts. */
-export function startSessionActivity(session: Session): Session {
-  return {
-    ...session,
-    busy: true,
-    activity: undefined,
-    activeTurnModel: { ...turnModelFields(session).turnModel, settings: { ...session.modelSettings } },
-  };
-}
-
-/** A steer continues the running model; changed picker settings need a new turn. */
-export function matchesActiveTurnModel(session: Session): boolean {
-  const active = session.activeTurnModel;
-  if (!active || active.harness !== session.harness || active.id !== session.model) return false;
-  const selected = session.modelSettings ?? {};
-  return [...new Set([...Object.keys(active.settings), ...Object.keys(selected)])]
-    .every((key) => active.settings[key] === selected[key]);
-}
-
 export function appendUser(
   session: Session,
   text: string,
   attachments: Attachment[] = [],
   extra?: UserTurnExtra,
 ): Session {
+  session = settlePendingApprovals(session);
   return appendBlock(
-    startSessionActivity(session),
+    { ...session, busy: true },
     {
       id: crypto.randomUUID(),
       role: "user",
@@ -486,7 +413,6 @@ export function appendSteerUser(
   attachments: Attachment[] = [],
   extra?: UserTurnExtra,
 ): Session {
-  const active = session.activeTurnModel;
   return {
     ...session,
     busy: true,
@@ -496,7 +422,7 @@ export function appendSteerUser(
         id: crypto.randomUUID(),
         role: "user",
         text,
-        ...(active ? { turnModel: { harness: active.harness, id: active.id, name: active.name } } : {}),
+        ...turnModelFields(session),
         ...(attachments.length > 0 ? { attachments } : {}),
         ...userTurnFields(extra),
       },
@@ -505,14 +431,47 @@ export function appendSteerUser(
 }
 
 export function stopStreaming(session: Session): Session {
+  const settled = settlePendingApprovals(session);
   return {
-    ...session,
+    ...settled,
     busy: false,
-    activeTurnModel: undefined,
-    activity: undefined,
     pendingQuestion: undefined,
-    blocks: stampTurnDuration(session.blocks.map(stopBlockProgress)),
+    blocks: stampTurnDuration(settled.blocks.map(stopBlockProgress)),
   };
+}
+
+/**
+ * Approval request ids are live only for the turn that produced them. Once
+ * that turn has stopped (or a later turn is about to start), leaving one
+ * undecided makes its old Allow/Deny controls and notification actionable
+ * even though the harness can no longer receive the response.
+ */
+function settlePendingApprovals(session: Session): Session {
+  let changed = false;
+  const blocks = session.blocks.flatMap((block) => {
+    if (!block.approval || block.approval.decided) return [block];
+    changed = true;
+    if (block.role === "approval") return [];
+    const status = block.tool?.status?.toLowerCase() ?? "";
+    const toolFinished =
+      status === "completed" ||
+      status === "success" ||
+      status === "failed" ||
+      status === "error" ||
+      status === "cancelled" ||
+      status === "canceled";
+    return [
+      {
+        ...block,
+        streaming: false,
+        ...(block.tool && !toolFinished
+          ? { tool: { ...block.tool, status: "cancelled" } }
+          : {}),
+        approval: { ...block.approval, decided: "cancelled" as const },
+      },
+    ];
+  });
+  return changed ? { ...session, blocks } : session;
 }
 
 /**
@@ -669,10 +628,9 @@ function stampTurnDuration(blocks: Block[]): Block[] {
 function appendStatus(session: Session, text: string): Session {
   const trimmed = text.trim();
   if (!trimmed) return session;
-  const last = session.blocks[lastMatchingBlock(
-    session.blocks,
-    (block) => block.role !== "reasoning",
-  )];
+  const last = [...session.blocks]
+    .reverse()
+    .find((block) => block.role !== "reasoning");
   if (last?.role === "system" && last.text === trimmed) return session;
   return appendBlock(session, {
     id: crypto.randomUUID(),
@@ -682,12 +640,10 @@ function appendStatus(session: Session, text: string): Session {
 }
 
 function appendBlock(session: Session, block: Block): Session {
-  const blocks =
-    block.role === "system" && !block.interjection
-      ? [...session.blocks]
-      : sealLastStream(session.blocks);
-  blocks.push(block);
-  return { ...session, blocks };
+  return {
+    ...session,
+    blocks: [...(block.role === "system" && !block.interjection ? session.blocks : sealLastStream(session.blocks)), block],
+  };
 }
 
 /** Only ordinary status rows leave an open prose stream intact. */

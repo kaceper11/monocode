@@ -18,6 +18,7 @@ vi.mock("cuelume", () => ({
 }));
 
 const baseCard: LinkedWorkItemUpdateCard = {
+  key: "github:acme/app:pr:42:1",
   provider: "github",
   kind: "pr",
   repo: "acme/app",
@@ -206,7 +207,7 @@ describe("linked work item update notice", () => {
     });
 
     const notice = document.body.querySelector<HTMLElement>(
-      'section[aria-label="New activity on Pull request #42"]',
+      'section[aria-label="New activity on Pull request 42"]',
     );
     expect(notice?.parentElement).toBe(container);
     expect(notice?.classList.contains("absolute")).toBe(true);
@@ -218,9 +219,11 @@ describe("linked work item update notice", () => {
     expect(document.body.textContent).toContain("1 new comment");
     expect(
       notice?.querySelector(
-        'button[aria-label="Dismiss updates for Pull request #42"]',
+        'button[aria-label="Dismiss updates for Pull request 42"]',
       ),
     ).not.toBeNull();
+    expect(notice?.querySelector(".linked-activity-notice > div")?.querySelectorAll("svg")).toHaveLength(2);
+    expect(notice?.textContent).toContain("Pull request #42 · acme/app");
     expect(button("Open PR").classList.contains("truncate")).toBe(true);
     expect(button("Address with agent").classList).toContain(
       "whitespace-nowrap",

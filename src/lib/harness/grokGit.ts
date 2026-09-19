@@ -36,9 +36,8 @@ export async function generateGrokCommitMessage(cwd: string): Promise<string> {
 
 export async function generateGrokPrContent(
   cwd: string,
-  base?: string,
 ): Promise<(PrContent & { base: string; head: string }) | null> {
-  const range = await gitRangeContext(cwd, base);
+  const range = await gitRangeContext(cwd);
   let parsed: PrContent | null = null;
   try {
     const output = await runGrokTextPrompt({

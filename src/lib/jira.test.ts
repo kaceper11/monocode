@@ -3,6 +3,7 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import {
   jiraIssue,
+  jiraOptions,
   jiraMarkdown,
   loadJiraFilter,
   saveJiraFilter,
@@ -85,6 +86,20 @@ it("keeps site/project identity and actual statuses without inventing a code hos
     "untrusted reference data",
   ])
     expect(card.prompt).toContain(text);
+});
+
+it.each(["jira", "azure"] as const)("keeps %s Inbox selection and deduplication account-scoped", provider => {
+  const first = { ...item, provider, account: "account-a" };
+  const second = { ...first, account: "account-b" };
+  expect(inboxItemKey(first)).not.toBe(inboxItemKey(second));
+  expect(inboxAskKey(first)).not.toBe(inboxAskKey(second));
+  expect(dedupeInboxItems([first, second])).toHaveLength(2);
+});
+
+it.each([
+  ["jira", undefined], ["jira", "future"], ["ci", undefined],
+] as const)("keeps unknown %s states unknown (%s)", (kind, stateType) => {
+  expect(inboxItemStatus({ ...item, kind, state: "unknown", stateType })).toBe("Unknown");
 });
 
 it("remembers favorite filters only for their site and defaults to assigned", () => {
@@ -174,7 +189,7 @@ it("passes the selected saved filter and preserves other providers on Jira failu
     if (cmd === "linear_status" || cmd === "gitlab_status")
       return { connected: false };
     if (cmd === "jira_status")
-      return { connected: true, site: item.site, account: "Ada" };
+      return { connected: true, site: item.site, account: "Ada", accountId: "email:ada@example.test" };
     if (cmd === "jira_list_issues") throw new Error("Jira denied access");
     throw new Error(`Unexpected ${cmd}`);
   });
@@ -185,6 +200,7 @@ it("passes the selected saved filter and preserves other providers on Jira failu
   });
   expect(call).toHaveBeenCalledWith("jira_list_issues", {
     site: item.site,
+    accountId: "email:ada@example.test",
     project: "12",
     filter: "34",
     assigned: false,
@@ -207,4 +223,22 @@ it("drops old detail results after disconnect instead of refilling the cache", a
   finish({ fields: { description: "Old private description" } });
   await expect(pending).rejects.toThrow("connection changed");
   expect(peekJiraDetails(item)).toBeNull();
+});
+
+it("separates detail caches and reads by the credential account", async () => {
+  call.mockResolvedValue({ fields: { description: "Private issue" } });
+  const owned = { ...item, account: "email:ada@example.test" };
+  await jiraDetails(owned);
+  expect(call).toHaveBeenLastCalledWith("jira_issue_content", { site: owned.site, id: owned.id, accountId: owned.account, comments: false });
+  expect(peekJiraDetails(owned)).not.toBeNull();
+  expect(peekJiraDetails({ ...owned, account: "email:other@example.test" })).toBeNull();
+});
+
+
+it("binds Jira filter options to the selected account", async () => {
+  call.mockResolvedValue([]);
+  await jiraOptions("https://team.atlassian.net", false, "email:ada@example.test");
+  expect(call).toHaveBeenLastCalledWith("jira_options", {
+    site: "https://team.atlassian.net", favorites: false, accountId: "email:ada@example.test",
+  });
 });

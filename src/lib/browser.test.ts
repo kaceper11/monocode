@@ -21,11 +21,15 @@ import {
 } from "./browser";
 import {
   isBrowserTab,
+  isFilesystemTab,
+  editorTabKey,
   leaf,
-  newBrowserTab,
   newTab,
-  updateBrowserTab,
+  newFileTab,
+  openEditorTab,
+  leafIds,
 } from "./layout";
+import { newBrowserTab, updateBrowserTab, restoreBrowserTab, openBrowserTab, closeBrowserTabs, browserDockBand } from "./browserWorkspace";
 import { parseWorkspaceSnapshot } from "./workspaceSnapshot";
 
 describe("normalizeBrowserUrl", () => {
@@ -664,5 +668,74 @@ describe("browserAgentContext", () => {
     expect(context.entries[0].text).toContain(
       "Opened http://localhost:3000/app",
     );
+  });
+});
+
+it("keeps browser pages out of filesystem operations and private tabs apart", () => {
+  const persistent = newBrowserTab("/repo", "https://example.test");
+  const privateTab = newBrowserTab("/repo", "https://example.test", false);
+  expect(isFilesystemTab(persistent)).toBe(false);
+  expect(editorTabKey(persistent)).not.toBe(editorTabKey(privateTab));
+});
+
+it("restores blank browser tabs and owning worktree metadata", () => {
+  const raw = { ...newBrowserTab("/repo/worktree", "", false), projectCwd: "/repo" };
+  expect(restoreBrowserTab(raw)).toEqual(raw);
+});
+
+it.each([{ agent: { sessionId: "s", leadId: "l", harness: "codex" } }, { changeKind: "staged" }])("rejects conflicting browser snapshot kinds: %j", conflict => {
+  expect(restoreBrowserTab({ ...newBrowserTab("/repo", "https://example.test"), ...conflict })).toBeNull();
+});
+
+it("rejects malformed persisted web addresses", () => {
+  expect(restoreBrowserTab({ ...newBrowserTab("/repo", "https://[broken") })).toBeNull();
+});
+
+
+describe("browser workspace isolation", () => {
+  it("keeps existing file identity and restores session focus when closing a browser-only pane", () => {
+    const original = newTab("conversation");
+    const browser = newBrowserTab("/repo", "https://example.test");
+    const opened = openBrowserTab(original, browser);
+    expect(leafIds(opened.layout)).toContain("conversation");
+    const closed = closeBrowserTabs(opened)!;
+    expect(closed.layout).toEqual(original.layout);
+    expect(closed.focusedId).toBe("conversation");
+    expect(closed.terminalPanes).toBe(original.terminalPanes);
+    expect(closed.editorPanes).toEqual([]);
+
+    const file = newFileTab("/repo/a.ts", "/repo");
+    const withFile = openEditorTab(original, file);
+    const mixed = openBrowserTab(withFile, browser);
+    const result = closeBrowserTabs(mixed)!;
+    expect(result.editorPanes[0].files).toEqual([file]);
+    expect(result.editorPanes[0].files[0]).toBe(file);
+    expect(result.editorPanes[0].activeFileId).toBe(file.id);
+    expect(result.layout).toBe(mixed.layout);
+  });
+
+  it("keeps unrelated empty panes and permits more than one blank browser tab", () => {
+    const original = newTab("conversation");
+    const first = newBrowserTab("/repo", "");
+    const second = newBrowserTab("/repo", "");
+    const opened = openBrowserTab(openBrowserTab(original, first), second);
+    expect(opened.editorPanes[0].files).toEqual([first, second]);
+    const empty = { id: "empty", activeFileId: "", files: [] };
+    const withEmpty = { ...original, layout: leaf("empty"), focusedId: "empty", editorPanes: [empty] };
+    expect(closeBrowserTabs(withEmpty)?.editorPanes[0]).toBe(empty);
+    expect(closeBrowserTabs({ ...opened, layout: leaf(opened.focusedId) })).toBeNull();
+  });
+
+  it("keeps the conversation on its existing edge when expanding the browser", () => {
+    const left = browserDockBand({ x: 0, y: 0, w: 0.5, h: 1 }, { w: 1200, h: 800 });
+    expect(left.side).toBe("left");
+    expect(left.agent).toEqual({ x: 0, y: 0, w: 0.32, h: 1 });
+    expect(left.rest.x).toBe(left.agent.w);
+    expect(left.rest.w + left.agent.w).toBeCloseTo(1);
+    const bottom = browserDockBand({ x: 0, y: 0.7, w: 1, h: 0.3 }, { w: 800, h: 600 });
+    expect(bottom.side).toBe("bottom");
+    expect(bottom.agent.h).toBe(0.3);
+    expect(bottom.agent.y + bottom.agent.h).toBe(1);
+    expect(bottom.rest.h + bottom.agent.h).toBe(1);
   });
 });

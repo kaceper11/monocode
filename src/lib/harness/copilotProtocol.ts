@@ -1,12 +1,5 @@
 import type { AgentModel } from "../models";
-import {
-  acpConfigOptions,
-  acpModelConfigId,
-  acpStopReasonMessage,
-  asRecord,
-  stringField,
-  type AcpConfigOption,
-} from "./acp";
+import { acpConfigOptions, acpModelConfigId, acpStopReasonMessage, asRecord, stringField, type AcpConfigOption } from "./acpProtocol";
 import {
   COPILOT_EFFORT_OPTIONS,
   copilotEffortSetting,

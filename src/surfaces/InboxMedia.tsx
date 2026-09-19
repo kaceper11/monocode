@@ -60,6 +60,7 @@ export function InboxMedia({ src, alt, load }: Props) {
   }
 
   if (state.status === "error") {
+    if (!load) return <MediaFallback src={src} alt={alt} />;
     return (
       <span className="inline-flex items-center gap-2 text-xs">
         <MediaFallback src={src} alt={alt} />
@@ -164,11 +165,12 @@ function TicketImage({
       new Uint8Array(
         await invoke<ArrayBuffer>(item.provider === "azure" ? "azure_image" : "jira_image", {
           site: item.site,
+          accountId: item.account ?? "",
           id: item.id,
           attachmentId: file.id,
         }),
       ),
-    [item.provider, item.site, item.id, file.id],
+    [item.provider, item.site, item.account, item.id, file.id],
   );
   return (
     <figure className="min-w-0">

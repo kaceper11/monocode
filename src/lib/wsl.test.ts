@@ -150,3 +150,15 @@ it("a superseded probe cannot overwrite a newer result", async () => {
   // The stale result is discarded — peek keeps the refresh's answer.
   expect(wslDistributionsPeek()).toEqual(["Debian"]);
 });
+
+it("does not let an older failed connection overwrite a newer success", async () => {
+  let fail!: (error: Error) => void;
+  vi.mocked(invoke).mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
+  const old = connectWslProject("//wsl.localhost/Ubuntu/old");
+  const rejected = expect(old).rejects.toThrow("old request");
+  vi.mocked(invoke).mockResolvedValueOnce({ distribution: "Ubuntu", path: "/new", generation: 2 });
+  await connectWslProject("//wsl.localhost/Ubuntu/new");
+  fail(new Error("old request"));
+  await rejected;
+  expect(wslStatusFor("Ubuntu").state).toBe("connected");
+});

@@ -1,7 +1,7 @@
 import type { LinkedWorkItem } from "./session";
 import type { InboxItem } from "./githubTasks";
 import type { SessionSummary } from "./sessionStore";
-import { sessionWorkItems } from "./sessionWorkItem";
+import { linkedWorkItemNeedsAccount, sessionWorkItems } from "./sessionWorkItem";
 
 export type LinkedWorkItemTarget = {
   key: string;
@@ -12,8 +12,6 @@ export type LinkedSessionUpdate = {
   sessionId: string;
   /** The remote snapshot that triggered the update. */
   item: InboxItem;
-  /** The linked work item it matched — the thread fetch uses this identity. */
-  linked: LinkedWorkItem;
   /** The last local turn or acknowledged remote snapshot, whichever is newer. */
   since: number;
   updatedAt: number;
@@ -46,6 +44,8 @@ export function linkedWorkItemTargets(
   for (const session of sessions) {
     if (session.archived) continue;
     for (const linked of sessionWorkItems(session)) {
+      if (linkedWorkItemNeedsAccount(linked)) continue;
+      if (linked.provider && !["github", "jira", "azure"].includes(linked.provider)) continue;
       const key = linkedWorkItemUpdateKey(linked);
       if (!targets.has(key)) targets.set(key, linked);
     }
@@ -64,6 +64,7 @@ export function linkedSessionUpdates(
     if (session.archived) continue;
     const since = Math.max(session.updatedAt, seenAt(session.id));
     for (const linked of sessionWorkItems(session)) {
+      if (linkedWorkItemNeedsAccount(linked)) continue;
       const item = workItems.get(linkedWorkItemUpdateKey(linked));
       if (!item) continue;
       const remoteUpdatedAt = Date.parse(item.updatedAt);
@@ -75,22 +76,12 @@ export function linkedSessionUpdates(
       updates.set(session.id, {
         sessionId: session.id,
         item,
-        linked,
         since,
         updatedAt: remoteUpdatedAt,
       });
     }
   }
   return updates;
-}
-
-/** A replaced primary link — any activity card belongs to the old item. */
-export function linkedWorkItemIdentityChanged(
-  before: LinkedWorkItem | undefined,
-  after: LinkedWorkItem | undefined,
-): boolean {
-  if (!before || !after) return before !== after;
-  return linkedWorkItemUpdateKey(before) !== linkedWorkItemUpdateKey(after);
 }
 
 export function linkedSessionUpdateIds(

@@ -1,4 +1,4 @@
-import { ALT, IS_MAC, MOD, SHIFT } from "./platform";
+import { ALT, IS_MAC, IS_WIN, MOD, SHIFT } from "./platform";
 
 const SECTION_KEY = "monocode.settingsSection";
 
@@ -8,9 +8,9 @@ export type SettingsSectionId =
   | "keybindings"
   | "chat"
   | "providers"
-  | "automations"
   | "skills"
   | "inbox"
+  | "worktrees"
   | "archive";
 
 /** Rail buckets. Sections list in order under their group label. */
@@ -69,30 +69,24 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     group: "agents",
     label: "Providers",
     description:
-      "Agent CLIs MonoCode can drive, and the model new sessions start with.",
-    keywords: "model harness claude codex gemini cli default hooks",
-  },
-  {
-    id: "automations",
-    group: "agents",
-    label: "Automations",
-    description:
-      "Watchers and schedules that run while MonoCode is open, and the attention they raise.",
-    keywords: "watcher schedule reminder automation task check",
+      "Provider accounts, agent CLIs MonoCode can drive, and the model new sessions start with.",
+    keywords:
+      "account sign in login model harness claude codex gemini cli default hooks",
   },
   {
     id: "skills",
     group: "agents",
-    label: "Extensions",
+    label: "Skills",
     description:
-      "Skills, MCP servers, plugins, instruction files, and hooks discovered across agent providers.",
-    keywords: "skill instructions prompt mcp server plugin hook",
+      "Discover and manage file skills from project, personal, and harness folders.",
+    keywords: "skill instructions prompt",
   },
   {
     id: "inbox",
     group: "workspace",
     label: "Inbox",
-    description: "Manage Inbox services and notification preferences for each project.",
+    description:
+      "Manage Inbox services and notification preferences for each project.",
     keywords: "github gitlab linear connect token integration",
   },
   {
@@ -101,6 +95,13 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     label: "Archive",
     description: "Projects and conversations you have archived.",
     keywords: "archived restore delete hidden",
+  },
+  {
+    id: "worktrees",
+    group: "workspace",
+    label: "Worktrees",
+    description: "Manage additional worktrees for each project.",
+    keywords: "git branch worktree working copy project create delete",
   },
 ];
 
@@ -128,6 +129,12 @@ export type SettingsEntry = {
 
 export const SETTINGS_INDEX: SettingsEntry[] = [
   {
+    id: "project-worktrees",
+    section: "worktrees",
+    label: "Project worktrees",
+    keywords: "git branch working copy create delete manage",
+  },
+  {
     id: "update",
     section: "general",
     label: "Version",
@@ -152,17 +159,27 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     keywords: "notebook markdown rail scratchpad",
   },
   {
+    id: "keep-awake",
+    section: "general",
+    label: "Keep computer awake while agents work",
+    keywords: "sleep power battery awake",
+  },
+  {
     id: "working-agents",
     section: "general",
     label: "Working agents",
     keywords: "live running sessions rail card",
   },
-  {
-    id: "keep-awake",
-    section: "general",
-    label: "Keep computer awake while agents work",
-    keywords: "sleep idle power battery display",
-  },
+  ...(IS_WIN
+    ? [
+        {
+          id: "close-to-tray",
+          section: "general" as const,
+          label: "Close to tray",
+          keywords: "minimize background quit exit window taskbar windows",
+        },
+      ]
+    : []),
   {
     id: "theme",
     section: "appearance",
@@ -242,16 +259,10 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     keywords: "queue steer interrupt send while running",
   },
   {
-    id: "new-conversation-access",
+    id: "model-controls",
     section: "chat",
-    label: "New conversation access",
-    keywords: "default access mode permission runtime new conversation",
-  },
-  {
-    id: "effort-control",
-    section: "chat",
-    label: "Effort control",
-    keywords: "thinking reasoning model picker composer",
+    label: "Model controls",
+    keywords: "effort thinking reasoning fast service tier model picker composer",
   },
   {
     id: "composer-mascot",
@@ -270,6 +281,12 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     section: "chat",
     label: "Empty session games",
     keywords: "pacman snake arcade grid fun",
+  },
+  {
+    id: "provider-accounts",
+    section: "providers",
+    label: "Provider accounts",
+    keywords: "account sign in login rename remove delete credentials profile",
   },
   {
     id: "claude-hooks",
@@ -435,6 +452,8 @@ const FOLLOW_UP_BEHAVIOR_KEY = "monocode.followUpBehavior";
 
 const COMPOSER_EFFORT_VISIBLE_KEY = "monocode.composerEffortVisible";
 
+const MODEL_CONTROLS_KEY = "monocode.modelControls";
+
 export type FollowUpBehavior = "steer" | "queue";
 
 export const FOLLOW_UP_BEHAVIOR_DEFAULT: FollowUpBehavior = "steer";
@@ -458,44 +477,47 @@ export function saveFollowUpBehavior(value: FollowUpBehavior) {
   }
 }
 
-export const COMPOSER_EFFORT_VISIBLE_DEFAULT = false;
+export type ModelControls = "menu" | "beside";
 
-/** Fired on `window` when the standalone composer effort control setting flips. */
-export const COMPOSER_EFFORT_VISIBLE_CHANGE_EVENT =
-  "monocode:composer-effort-visible-change";
+export const MODEL_CONTROLS_DEFAULT: ModelControls = "menu";
 
-export function loadComposerEffortVisible(): boolean {
+/** Fired on `window` when the composer model controls setting flips. */
+export const MODEL_CONTROLS_CHANGE_EVENT = "monocode:model-controls-change";
+
+export function loadModelControls(): ModelControls {
   try {
-    const raw = localStorage.getItem(COMPOSER_EFFORT_VISIBLE_KEY);
-    if (raw == null) return COMPOSER_EFFORT_VISIBLE_DEFAULT;
-    return raw === "1" || raw === "true";
+    const raw = localStorage.getItem(MODEL_CONTROLS_KEY);
+    if (raw === "menu" || raw === "beside") return raw;
+    if (raw == null) {
+      // Migrate the previous effort-control toggle: on means beside the picker.
+      const legacy = localStorage.getItem(COMPOSER_EFFORT_VISIBLE_KEY);
+      if (legacy === "1" || legacy === "true") return "beside";
+    }
   } catch {
-    return COMPOSER_EFFORT_VISIBLE_DEFAULT;
+    // private mode / quota
   }
+  return MODEL_CONTROLS_DEFAULT;
 }
 
-export function saveComposerEffortVisible(value: boolean) {
+export function saveModelControls(value: ModelControls) {
   try {
-    localStorage.setItem(COMPOSER_EFFORT_VISIBLE_KEY, value ? "1" : "0");
+    localStorage.setItem(MODEL_CONTROLS_KEY, value);
   } catch {
     // private mode / quota
   }
   if (typeof window === "undefined") return;
   window.dispatchEvent(
-    new CustomEvent<boolean>(COMPOSER_EFFORT_VISIBLE_CHANGE_EVENT, {
+    new CustomEvent<ModelControls>(MODEL_CONTROLS_CHANGE_EVENT, {
       detail: value,
     }),
   );
 }
 
-export function subscribeComposerEffortVisible(onStoreChange: () => void) {
+export function subscribeModelControls(onStoreChange: () => void) {
   if (typeof window === "undefined") return () => {};
-  window.addEventListener(COMPOSER_EFFORT_VISIBLE_CHANGE_EVENT, onStoreChange);
+  window.addEventListener(MODEL_CONTROLS_CHANGE_EVENT, onStoreChange);
   return () =>
-    window.removeEventListener(
-      COMPOSER_EFFORT_VISIBLE_CHANGE_EVENT,
-      onStoreChange,
-    );
+    window.removeEventListener(MODEL_CONTROLS_CHANGE_EVENT, onStoreChange);
 }
 
 export const COMPOSER_RUNNER_DEFAULT = true;
@@ -600,47 +622,28 @@ export function subscribeLiveAgentsEnabled(onStoreChange: () => void) {
     window.removeEventListener(LIVE_AGENTS_ENABLED_CHANGE_EVENT, onStoreChange);
 }
 
-const KEEP_AWAKE_KEY = "monocode.keepAwake";
+const CLOSE_TO_TRAY_KEY = "monocode.closeToTray";
 
-export const KEEP_AWAKE_DEFAULT = false;
+export const CLOSE_TO_TRAY_DEFAULT = true;
 
-/** Fired on `window` when the idle-sleep setting flips. */
-export const KEEP_AWAKE_CHANGE_EVENT = "monocode:keep-awake-change";
-
-export function loadKeepAwakeEnabled(): boolean {
+export function loadCloseToTray(): boolean {
+  // Close to tray is Windows-only: nowhere else installs a tray icon.
+  if (!IS_WIN) return false;
   try {
-    const raw = localStorage.getItem(KEEP_AWAKE_KEY);
-    if (raw == null) return KEEP_AWAKE_DEFAULT;
+    const raw = localStorage.getItem(CLOSE_TO_TRAY_KEY);
+    if (raw == null) return CLOSE_TO_TRAY_DEFAULT;
     return raw === "1" || raw === "true";
   } catch {
-    return KEEP_AWAKE_DEFAULT;
+    return CLOSE_TO_TRAY_DEFAULT;
   }
 }
 
-export function saveKeepAwakeEnabled(value: boolean) {
+export function saveCloseToTray(value: boolean) {
   try {
-    localStorage.setItem(KEEP_AWAKE_KEY, value ? "1" : "0");
+    localStorage.setItem(CLOSE_TO_TRAY_KEY, value ? "1" : "0");
   } catch {
     // private mode / quota
   }
-  if (typeof window === "undefined") return;
-  window.dispatchEvent(
-    new CustomEvent<boolean>(KEEP_AWAKE_CHANGE_EVENT, { detail: value }),
-  );
-}
-
-export function subscribeKeepAwakeEnabled(onStoreChange: () => void) {
-  if (typeof window === "undefined") return () => {};
-  // The storage event converges the other open windows onto the same value.
-  const onStorage = (event: StorageEvent) => {
-    if (event.key === null || event.key === KEEP_AWAKE_KEY) onStoreChange();
-  };
-  window.addEventListener(KEEP_AWAKE_CHANGE_EVENT, onStoreChange);
-  window.addEventListener("storage", onStorage);
-  return () => {
-    window.removeEventListener(KEEP_AWAKE_CHANGE_EVENT, onStoreChange);
-    window.removeEventListener("storage", onStorage);
-  };
 }
 
 const GRID_ARCADE_ENABLED_KEY = "monocode.gridArcadeEnabled";
@@ -756,16 +759,26 @@ export type KeybindingRow = {
 
 /**
  * Mirrors the bindings we actually handle: the native menu accelerators in
- * `src-tauri/src/menu.rs`, `tabCommand`, and the window key handler in App.
+ * `src-tauri/src/menu.rs`, `tabCommand`, the window key handler in App, and
+ * focused surface handlers such as the draft composer workspace toggle.
  */
 export const KEYBINDINGS: KeybindingRow[] = [
   { command: "App: Search", keys: `${MOD}K`, when: "Always" },
   { command: "App: Go to File", keys: `${MOD}P`, when: "Always" },
+  { command: "App: Command Palette", keys: `${MOD}${SHIFT}P`, when: "Always" },
   { command: "App: Find in Files", keys: `${MOD}${SHIFT}F`, when: "Always" },
   { command: "App: Open Project", keys: `${MOD}O`, when: "Always" },
   { command: "App: New Window", keys: `${MOD}${SHIFT}N`, when: "Always" },
   { command: "App: Toggle Sidebar", keys: `${MOD}B`, when: "Always" },
   { command: "App: Switch Model", keys: `${MOD}.`, when: "Always" },
+  {
+    command: "Composer: Toggle Workspace",
+    keys: `${MOD}${SHIFT}G`,
+    when: "Draft session composer",
+  },
+  { command: "Composer: Dictate", keys: `${MOD}${SHIFT}M`, when: "Focused composer, no overlay" },
+  { command: "Composer: Hold to dictate", keys: `Hold ${MOD}${SHIFT}M`, when: "Focused composer, hold mode, no overlay" },
+  { command: "View: Reload", keys: `${MOD}${SHIFT}R`, when: "Always" },
   { command: "View: Zoom In", keys: `${MOD}+`, when: "Always" },
   { command: "View: Zoom Out", keys: `${MOD}-`, when: "Always" },
   { command: "View: Reset Zoom", keys: `${MOD}0`, when: "Always" },
@@ -825,16 +838,6 @@ export const KEYBINDINGS: KeybindingRow[] = [
   { command: "Terminal: Toggle Dock", keys: `${MOD}J`, when: "Always" },
   { command: "Editor: Find", keys: `${MOD}F`, when: "editorFocus" },
   { command: "Editor: Replace", keys: `${MOD}${ALT}F`, when: "editorFocus" },
-  {
-    command: "Composer: Dictate",
-    keys: `${MOD}${SHIFT}M`,
-    when: "paneFocus && !blockingOverlay",
-  },
-  {
-    command: "Composer: Hold to dictate",
-    keys: `Hold ${MOD}${SHIFT}M`,
-    when: "dictationMode=hold",
-  },
 ];
 
 export function filterKeybindings(

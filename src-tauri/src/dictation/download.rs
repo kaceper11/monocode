@@ -50,6 +50,33 @@ pub fn final_path(dir: &Path, spec: &ModelSpec) -> PathBuf {
     dir.join(spec.file)
 }
 
+pub struct ModelLock(std::fs::File);
+
+impl Drop for ModelLock {
+    fn drop(&mut self) {
+        // Closing only our descriptor can leave a lock held by a forked child
+        // until exec. Release it when the owning operation actually finishes.
+        let _ = self.0.unlock();
+    }
+}
+
+/// All app instances use the same OS file lock; no persistent ownership marker.
+pub fn model_lock(dir: &Path, spec: &ModelSpec) -> Result<ModelLock, String> {
+    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    let path = dir.join(format!("{}.lock", spec.file));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| format!("Cannot lock model: {error}"))?;
+    file.try_lock().map_err(|error| {
+        format!("This model is being changed by another window or app: {error}")
+    })?;
+    Ok(ModelLock(file))
+}
+
 /// Download `spec` into `dir`, resuming any `.part` file. Blocking — run on a
 /// worker thread. Emits progress events throughout.
 pub fn download_model(
@@ -109,8 +136,12 @@ fn download_from(
     cancel: &AtomicBool,
     app: Option<&AppHandle>,
 ) -> Result<(), DownloadError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(DownloadError::new("cancelled", 0));
+    }
     std::fs::create_dir_all(dir)
         .map_err(|e| DownloadError::new(format!("Cannot create model directory: {e}"), 0))?;
+    let _lock = model_lock(dir, spec).map_err(|error| DownloadError::new(error, 0))?;
     let part = part_path(dir, spec);
     let final_path = final_path(dir, spec);
 
@@ -125,11 +156,14 @@ fn download_from(
     if downloaded > 0 {
         emit(app, spec, "verifying", downloaded);
         // Hash the resumed prefix so the final digest covers the whole file.
-        hash_prefix(&part, downloaded, &mut hasher)
+        hash_prefix(&part, downloaded, &mut hasher, cancel)
             .map_err(|e| DownloadError::new(e, downloaded))?;
         if downloaded == spec.size_bytes {
             // Fetched previously but the process died before the rename —
             // requesting `Range: bytes=<size>-` would just get a 416.
+            if cancel.load(Ordering::Relaxed) {
+                return Err(DownloadError::new("cancelled", downloaded));
+            }
             return verify_and_install(&part, &final_path, spec, hasher, downloaded);
         }
     }
@@ -168,11 +202,43 @@ fn download_from(
         hasher = Sha256::new();
         downloaded = 0;
     }
-    let total = response
-        .header("Content-Length")
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|len| len + downloaded)
-        .unwrap_or(spec.size_bytes);
+    if !matches!(response.status(), 200 | 206) {
+        return Err(DownloadError::new(
+            "Unexpected model download response",
+            downloaded,
+        ));
+    }
+    if response.status() == 206 {
+        let expected = format!(
+            "bytes {}-{}/{}",
+            downloaded,
+            spec.size_bytes - 1,
+            spec.size_bytes
+        );
+        if response.header("Content-Range") != Some(expected.as_str()) {
+            return Err(DownloadError::new(
+                "Model resume range changed; partial download was preserved",
+                downloaded,
+            ));
+        }
+    }
+    if let Some(encoding) = response.header("Content-Encoding") {
+        if encoding != "identity" {
+            return Err(DownloadError::new(
+                "Unexpected model content encoding",
+                downloaded,
+            ));
+        }
+    }
+    if let Some(length) = response.header("Content-Length") {
+        if length.parse::<u64>().ok() != Some(spec.size_bytes - downloaded) {
+            return Err(DownloadError::new(
+                "Model download size does not match the pinned model",
+                downloaded,
+            ));
+        }
+    }
+    let total = spec.size_bytes;
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -194,6 +260,12 @@ fn download_from(
         })?;
         if n == 0 {
             break;
+        }
+        if n as u64 > spec.size_bytes.saturating_sub(downloaded) {
+            return Err(DownloadError::new(
+                "Model download exceeded the pinned size",
+                downloaded,
+            ));
         }
         file.write_all(&buf[..n])
             .map_err(|e| DownloadError::new(format!("Cannot write model file: {e}"), downloaded))?;
@@ -270,19 +342,37 @@ fn verify_and_install(
             downloaded,
         ));
     }
-    // fs::rename does not replace an existing destination on Windows.
-    let _ = std::fs::remove_file(final_path);
-    std::fs::rename(part, final_path)
-        .map_err(|e| DownloadError::new(format!("Cannot store model: {e}"), downloaded))?;
+    // Atomic no-clobber publication: an existing installation is preserved,
+    // even when another app process finished installing the same model first.
+    std::fs::hard_link(part, final_path).map_err(|e| {
+        DownloadError::new(
+            format!("Cannot store model (existing files are preserved): {e}"),
+            downloaded,
+        )
+    })?;
+    std::fs::remove_file(part).map_err(|e| {
+        DownloadError::new(
+            format!("Model installed, but partial cleanup failed: {e}"),
+            downloaded,
+        )
+    })?;
     Ok(())
 }
 
-fn hash_prefix(path: &Path, bytes: u64, hasher: &mut Sha256) -> Result<(), String> {
+fn hash_prefix(
+    path: &Path,
+    bytes: u64,
+    hasher: &mut Sha256,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
     let mut file =
         std::fs::File::open(path).map_err(|e| format!("Cannot read partial download: {e}"))?;
     let mut remaining = bytes;
     let mut buf = vec![0u8; CHUNK];
     while remaining > 0 {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
         let want = remaining.min(buf.len() as u64) as usize;
         let n = file
             .read(&mut buf[..want])
@@ -308,6 +398,7 @@ mod tests {
         body: Vec<u8>,
         requests: Arc<Mutex<Vec<String>>>,
         join: Option<std::thread::JoinHandle<()>>,
+        stop: Arc<AtomicBool>,
     }
 
     impl TestServer {
@@ -317,9 +408,20 @@ mod tests {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let requests_thread = Arc::clone(&requests);
             let serve_body = body.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = stop.clone();
             let join = std::thread::spawn(move || {
                 let body = serve_body;
                 while let Ok((mut stream, _)) = listener.accept() {
+                    if stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
                     let mut buf = [0u8; 4096];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let request = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -332,8 +434,8 @@ mod tests {
                         Some(start) if start < body.len() => {
                             let tail = &body[start..];
                             let head = format!(
-                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                tail.len()
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                                tail.len(), start, body.len()-1, body.len()
                             );
                             let _ = stream.write_all(head.as_bytes());
                             let _ = stream.write_all(tail);
@@ -354,15 +456,18 @@ mod tests {
                 body,
                 requests,
                 join: Some(join),
+                stop,
             }
         }
     }
 
     impl Drop for TestServer {
         fn drop(&mut self) {
-            // The accept loop ends with the test process; joining would block
-            // forever on a listener that never stops accepting.
-            let _ = self.join.take();
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = std::net::TcpStream::connect(self.base.trim_start_matches("http://"));
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
         }
     }
 
@@ -493,16 +598,114 @@ mod tests {
         assert!(!part_path(&dir, spec).exists());
     }
 
-    fn tempfile_dir() -> PathBuf {
+    #[test]
+    fn oversized_response_never_grows_the_partial_file_past_the_pin() {
+        let body = vec![9u8; 20];
+        let spec = Box::leak(Box::new(ModelSpec {
+            id: "bounded",
+            file: "bounded.bin",
+            label: "Test",
+            tier: "test",
+            size_bytes: 10,
+            sha256: "unused",
+            supports_translate: true,
+        }));
+        let directory = tempfile_dir();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            // EOF-delimited, no Content-Length: the streamed-byte guard must
+            // enforce the bound even when no trustworthy header is available.
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let _ = stream.write_all(&body);
+        });
+        let error = download_test_model(
+            &format!("http://{address}/model"),
+            spec,
+            &directory,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(error.contains("exceeded"), "{error}");
+        assert!(
+            std::fs::metadata(part_path(&directory, spec))
+                .unwrap()
+                .len()
+                <= 10
+        );
+        assert!(!final_path(&directory, spec).exists());
+    }
+
+    #[test]
+    fn concurrent_writers_existing_install_and_cancelled_prefix_are_preserved() {
+        let body = vec![1u8; 64];
+        let server = TestServer::serve(body.clone());
+        let spec = spec_for(&server);
+        let directory = tempfile_dir();
+        let lock = model_lock(&directory, spec).unwrap();
+        assert!(
+            download_test_model(&server.base, spec, &directory, &AtomicBool::new(false))
+                .unwrap_err()
+                .contains("another window or app")
+        );
+        assert!(server.requests.lock().unwrap().is_empty());
+        // A child process can briefly inherit this open file description before
+        // exec closes it. Completing our operation must release the lock even
+        // while that descriptor still exists.
+        let inherited_descriptor = lock.0.try_clone().unwrap();
+        drop(lock);
+        std::fs::write(part_path(&directory, spec), &body).unwrap();
+        std::fs::write(final_path(&directory, spec), b"existing-install").unwrap();
+        let error = download_test_model(&server.base, spec, &directory, &AtomicBool::new(false))
+            .unwrap_err();
+        assert!(error.contains("existing files are preserved"), "{error}");
+        assert_eq!(
+            std::fs::read(final_path(&directory, spec)).unwrap(),
+            b"existing-install"
+        );
+        assert_eq!(std::fs::read(part_path(&directory, spec)).unwrap(), body);
+        drop(inherited_descriptor);
+        let mut hash = Sha256::new();
+        assert_eq!(
+            hash_prefix(
+                &part_path(&directory, spec),
+                64,
+                &mut hash,
+                &AtomicBool::new(true)
+            )
+            .unwrap_err(),
+            "cancelled"
+        );
+    }
+
+    struct TestDir(PathBuf);
+    impl std::ops::Deref for TestDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn tempfile_dir() -> TestDir {
         let dir = std::env::temp_dir().join(format!(
             "monocode-dictation-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TestDir(dir)
     }
 }

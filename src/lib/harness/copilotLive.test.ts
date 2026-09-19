@@ -5,6 +5,7 @@ const spawned: { command: string; args: string[]; cwd: string }[] = [];
 const killed: string[] = [];
 let onLine: ((line: string) => void) | undefined;
 let onExit: ((code: number | null) => void) | undefined;
+let onStderr: ((line: string) => void) | undefined;
 
 vi.mock("./child", () => ({
   resolveCopilotBinary: async () => ({ path: "/fake/copilot" }),
@@ -24,9 +25,11 @@ vi.mock("./child", () => ({
     _id: string,
     line: (l: string) => void,
     exit: (c: number | null) => void,
+    stderr?: (line: string) => void,
   ) => {
     onLine = line;
     onExit = exit;
+    onStderr = stderr;
   },
   writeChild: async (_id: string, line: string) => {
     sent.push(line);
@@ -129,7 +132,7 @@ async function startTurn(
   });
   await waitFor(() => byMethod("session/new").length > 0, "session/new");
   const newMsg = lastByMethod("session/new")!;
-  expect(newMsg.params.cwd).toBe("/repo");
+  expect(newMsg.params.cwd).toBe(overrides.cwd ?? "/repo");
   reply(newMsg.id, SETUP);
   return { turn };
 }
@@ -414,7 +417,7 @@ describe("copilot live turn", () => {
       () => events.some((e) => e.type === "approval.requested"),
       "approval.requested",
     );
-    respondCopilotApproval("t6", 77, "allow");
+    respondCopilotApproval("t6", events.find((e) => e.type === "approval.requested")!.requestId, "allow");
     await waitFor(
       () => parse().some((m) => m.id === 77 && m.result),
       "permission response",
@@ -523,7 +526,7 @@ describe("copilot live turn", () => {
       () => events.some((e) => e.type === "question.asked"),
       "question.asked",
     );
-    respondCopilotQuestion("t7", 91, {
+    respondCopilotQuestion("t7", events.find((e) => e.type === "question.asked")!.requestId, {
       kind: "answered",
       answers: { target: ["prod"] },
     });
@@ -909,6 +912,35 @@ describe("copilot live turn", () => {
     await stopCopilotSession("t28");
   });
 
+  it("keeps string and numeric wire approvals distinct in the UI", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startTurn(events, "approval-id-collision");
+    await waitFor(() => byMethod("session/set_mode").length > 0, "set_mode");
+    reply(lastByMethod("session/set_mode")!.id, {});
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
+    for (const id of ["opaque-request", 1_000_000_001]) {
+      onLine!(JSON.stringify({
+        jsonrpc: "2.0", id, method: "session/request_permission",
+        params: {
+          sessionId: "C1",
+          toolCall: { toolCallId: String(id), title: "Run command", kind: "execute" },
+          options: [{ optionId: "allow_once" }, { optionId: "reject_once" }],
+        },
+      }));
+    }
+    await waitFor(() => events.filter((e) => e.type === "approval.requested").length === 2, "two approvals");
+    const requests = events.filter((e) => e.type === "approval.requested");
+    expect(requests[0].requestId).not.toBe(requests[1].requestId);
+    respondCopilotApproval("approval-id-collision", requests[1].requestId, "deny");
+    respondCopilotApproval("approval-id-collision", requests[0].requestId, "allow");
+    await waitFor(() => parse().filter((m) => m.result?.outcome).length === 2, "distinct responses");
+    expect(parse().find((m) => m.id === "opaque-request")?.result.outcome.optionId).toBe("allow_once");
+    expect(parse().find((m) => m.id === 1_000_000_001)?.result.outcome.optionId).toBe("reject_once");
+    reply(lastByMethod("session/prompt")!.id, { stopReason: "end_turn" });
+    await turn;
+    await stopCopilotSession("approval-id-collision");
+  });
+
   it("retries without --effort when the CLI rejects the flag", async () => {
     const events: HarnessEvent[] = [];
     const turn = sendCopilotTurn({
@@ -923,7 +955,8 @@ describe("copilot live turn", () => {
     } as never);
     await waitFor(() => spawned.length === 1, "spawn");
     expect(spawned[0].args).toContain("--effort=high");
-    // The build exits on the unknown flag.
+    // Only explicit flag rejection permits retrying with default effort.
+    onStderr!("error: unknown option '--effort=high'");
     onExit!(2);
     await waitFor(() => spawned.length === 2, "respawn");
     expect(spawned[1].args).toEqual(["--acp", "--stdio"]);
@@ -948,6 +981,17 @@ describe("copilot live turn", () => {
     await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
     reply(lastByMethod("session/prompt")!.id, { stopReason: "end_turn" });
     await turn;
+    await stopCopilotSession("t24");
+
+    // A later checkout/host must try its own CLI capabilities.
+    sent.length = 0;
+    const next = await startTurn(events, "t24", { cwd: "/other-repo", modelSettings: { effort: "high" } });
+    expect(spawned.at(-1)!.args).toContain("--effort=high");
+    await waitFor(() => byMethod("session/set_mode").length > 0, "mode on new host");
+    reply(lastByMethod("session/set_mode")!.id, {});
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt on new host");
+    reply(lastByMethod("session/prompt")!.id, { stopReason: "end_turn" });
+    await next.turn;
     await stopCopilotSession("t24");
   });
 
@@ -977,6 +1021,24 @@ describe("copilot live turn", () => {
       ),
     ).toBe(false);
     await stopCopilotSession("t25");
+  });
+
+  it("preserves explicit effort when an unrelated startup failure kills the child", async () => {
+    const events: HarnessEvent[] = [];
+    const turn = sendCopilotTurn({
+      sessionId: "unrelated-startup-exit", cwd: "/repo", model: "copilot:default",
+      modelSettings: { effort: "high" }, runtimeMode: "supervised", text: "hello",
+      attachments: [], onEvent: (event) => events.push(event),
+    });
+    void turn.catch(() => undefined);
+    await waitFor(() => byMethod("initialize").length > 0, "initialize");
+    onStderr!("Authentication required");
+    onExit!(1);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(spawned).toHaveLength(1);
+    await expect(turn).rejects.toThrow(/exited/);
+    expect(events.some((event) => event.type === "session.error" && /does not support --effort/.test(event.message))).toBe(false);
+    await stopCopilotSession("unrelated-startup-exit");
   });
 
   it("does not retry the turn when a cancel lands during a failed handshake", async () => {
@@ -1093,7 +1155,7 @@ describe("copilot live turn", () => {
       "approval.requested",
     );
     expect(parse().some((m) => m.id === 91)).toBe(false);
-    respondCopilotApproval("t29", 91, "deny");
+    respondCopilotApproval("t29", events.find((e) => e.type === "approval.requested")!.requestId, "deny");
     await waitFor(
       () => parse().some((m) => m.id === 91 && m.result),
       "permission response",

@@ -175,13 +175,14 @@ describe("confluenceSections", () => {
 
 describe("confluencePageContext", () => {
   it("records site/space/page/version/URL provenance per entry", () => {
-    const context = confluencePageContext(site, [
+    const context = confluencePageContext({ site, accountId: "email:ada@example.test" }, [
       { page: page("<p>Body</p>"), sections: null },
     ]);
     const entry = context.entries[0];
     expect(entry.title).toBe("ENG: Rollout plan");
     for (const part of [
       site,
+      "email:ada@example.test",
       "space ENG",
       "page 123456",
       "v7",
@@ -193,7 +194,7 @@ describe("confluencePageContext", () => {
   });
 
   it("keeps only selected sections and notes the section count", () => {
-    const context = confluencePageContext(site, [
+    const context = confluencePageContext({ site, accountId: "email:ada@example.test" }, [
       {
         page: page("<h2>Keep</h2><p>Keep body</p><h2>Skip</h2><p>Skip body</p>"),
         sections: ["s0"],
@@ -206,11 +207,22 @@ describe("confluencePageContext", () => {
   });
 
   it("bounds entry text and marks truncation", () => {
-    const context = confluencePageContext(site, [
+    const context = confluencePageContext({ site, accountId: "email:ada@example.test" }, [
       { page: page(`<p>${"x".repeat(MAX_CONTEXT_TEXT + 100)}</p>`), sections: null },
     ]);
     const entry = context.entries[0];
     expect(entry.truncated).toBe(true);
     expect(entry.text.length).toBeLessThanOrEqual(MAX_CONTEXT_TEXT);
   });
+});
+
+
+it("does not silently clip a selected section before the shared context budget", () => {
+  const context = confluencePageContext({ site, accountId: "email:ada@example.test" }, [
+    { page: page(`<h2>Long</h2><p>${"x".repeat(20_000)}</p>`), sections: ["s0"] },
+  ]);
+  expect(context.entries[0].text).toContain("x".repeat(20_000));
+  expect(context.entries[0].truncated).toBe(false);
+  expect(confluenceMarkdown(`<pre>${"x".repeat(33_000)}</pre>`).truncated).toBe(true);
+  expect(() => confluencePageContext({ site, accountId: "a" }, [{ page: page("<p>No sections</p>"), sections: ["s0"] }])).toThrow("sections changed");
 });

@@ -11,14 +11,12 @@ let rememberedWidth = 440;
 /** Only a destination for the regular session pane; it owns no chat state. */
 export function InboxDiscussionPanel({
   item,
-  sessionId,
   onClose,
   onOpen,
   onRestart,
   onMount,
 }: {
-  item?: InboxItem;
-  sessionId?: string;
+  item: InboxItem;
   onClose: () => void;
   onOpen: (item: InboxItem) => Promise<string>;
   onRestart: (item: InboxItem) => Promise<string>;
@@ -37,14 +35,8 @@ export function InboxDiscussionPanel({
       rememberedWidth = width;
     },
   });
-  const key = sessionId ?? (item ? inboxAskKey(item) : "");
+  const key = inboxAskKey(item);
   useEffect(() => {
-    if (sessionId) {
-      if (host.current) onMount({ sessionId, host: host.current });
-      setLoading(false);
-      return () => onMount(null);
-    }
-    if (!item) return;
     let active = true;
     setError(null);
     setLoading(true);
@@ -69,19 +61,10 @@ export function InboxDiscussionPanel({
   return (
     <aside
       ref={resize.setPaneRef}
-      aria-label={
-        sessionId
-          ? "Conversation"
-          : `Ask about ${item ? inboxItemRef(item) : "ticket"}`
-      }
-      className={
-        sessionId
-          ? "relative flex min-h-0 min-w-0 flex-1 flex-col"
-          : "relative flex min-h-0 shrink-0 flex-col border-l border-stroke max-[1100px]:absolute max-[1100px]:inset-0 max-[1100px]:z-10 max-[1100px]:!w-auto"
-      }
+      aria-label={`Ask about ${inboxItemRef(item)}`}
+      className="relative flex min-h-0 shrink-0 flex-col border-l border-stroke max-[1100px]:absolute max-[1100px]:inset-0 max-[1100px]:z-10 max-[1100px]:!w-auto"
     >
       <div
-        hidden={!!sessionId}
         role="separator"
         aria-label="Resize discussion"
         aria-orientation="vertical"
@@ -91,28 +74,24 @@ export function InboxDiscussionPanel({
       />
       <header className="flex h-11 shrink-0 items-center border-b border-stroke px-3">
         <span className="min-w-0 flex-1 truncate text-[13px] font-medium">
-          {sessionId
-            ? "Conversation"
-            : `Ask · ${item ? inboxItemRef(item) : "ticket"}`}
+          Ask · {inboxItemRef(item)}
         </span>
-        {!sessionId && item ? (
-          <IconButton
-            label="Restart conversation"
-            disabled={loading}
-            onClick={() => {
-              setLoading(true);
-              setError(null);
-              void onRestart(item)
-                .then((sessionId) => {
-                  if (host.current) onMount({ sessionId, host: host.current });
-                })
-                .catch((reason) => setError(String(reason)))
-                .finally(() => setLoading(false));
-            }}
-          >
-            <RotateCcw className="size-3.5" />
-          </IconButton>
-        ) : null}
+        <IconButton
+          label="Restart conversation"
+          disabled={loading}
+          onClick={() => {
+            setLoading(true);
+            setError(null);
+            void onRestart(item)
+              .then(sessionId => {
+                if (host.current) onMount({ sessionId, host: host.current });
+              })
+              .catch(reason => setError(String(reason)))
+              .finally(() => setLoading(false));
+          }}
+        >
+          <RotateCcw className="size-3.5" />
+        </IconButton>
         <IconButton label="Close panel" onClick={onClose}>
           <PanelLeft className="size-3.5" />
         </IconButton>

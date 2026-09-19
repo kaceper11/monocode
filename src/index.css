@@ -287,6 +287,39 @@ html.chat-background-empty-only
   content-visibility: visible;
 }
 
+/* Touch layouts keep actions in flow. Desktop places them in the existing
+ * turn gap so revealing the controls never shifts or over-spaces the chat. */
+.user-message-actions {
+  width: fit-content;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .user-message-hover-zone {
+    position: relative;
+    isolation: isolate;
+  }
+
+  .user-message-actions {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    z-index: 1;
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+
+  .user-message-row:hover .user-message-actions,
+  .user-message-row:focus-within .user-message-actions {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .user-message-actions {
+    transition: none;
+  }
+}
+
 .user-message-with-link {
   display: block;
 }
@@ -294,6 +327,15 @@ html.chat-background-empty-only
 html.has-user-accent .user-message-bubble {
   background: color-mix(in srgb, var(--user-accent-color) 24%, transparent);
   border-color: color-mix(in srgb, var(--user-accent-color) 30%, transparent);
+}
+
+.user-message-bubble[data-draft="true"] {
+  background: color-mix(in srgb, var(--color-content) 4%, transparent);
+}
+
+html.has-user-accent .user-message-bubble[data-draft="true"] {
+  background: color-mix(in srgb, var(--user-accent-color) 8%, transparent);
+  border-color: color-mix(in srgb, var(--user-accent-color) 38%, transparent);
 }
 
 .user-link-preview {
@@ -390,6 +432,55 @@ html.is-reordering,
 html.is-reordering * {
   -webkit-user-select: none !important;
   user-select: none !important;
+}
+
+html.is-explorer-file-dragging,
+html.is-explorer-file-dragging * {
+  cursor: grabbing !important;
+}
+
+.explorer-file-drag-preview {
+  position: fixed !important;
+  inset: 0 auto auto 0 !important;
+  z-index: 2147483647;
+  display: flex !important;
+  width: max-content !important;
+  max-width: min(280px, calc(100vw - 16px));
+  height: 26px !important;
+  align-items: center;
+  gap: 6px;
+  margin: 0 !important;
+  padding: 0 9px 0 7px !important;
+  overflow: hidden;
+  pointer-events: none !important;
+  border: 1px solid color-mix(in srgb, var(--color-content) 12%, transparent);
+  border-radius: 5px;
+  background: color-mix(
+    in srgb,
+    var(--color-background-base) 96%,
+    var(--color-content) 4%
+  ) !important;
+  box-shadow:
+    0 4px 12px rgb(0 0 0 / 18%),
+    0 1px 2px rgb(0 0 0 / 20%);
+  color: var(--color-content) !important;
+  font-size: 12px !important;
+  line-height: 1 !important;
+  white-space: nowrap;
+  opacity: 0.94 !important;
+  will-change: transform;
+  contain: paint;
+}
+
+.explorer-file-drag-preview > span {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+html.theme-light .explorer-file-drag-preview {
+  background: var(--color-background-base) !important;
+  opacity: 1 !important;
 }
 
 html.is-resizing,
@@ -1418,12 +1509,14 @@ header[data-tauri-drag-region] button {
   }
 }
 
-/* Frosted glass needs a floor: WebKit occasionally fails to paint
-   backdrop-filter, and a pure tint leaves the menu see-through over text.
-   The base color at half opacity keeps it glassy when the blur paints and
-   readable when it doesn't — same floor Modal uses. */
+/* Keep the original glass tint in dark mode. Light popovers use an opaque
+   surface so underlying content cannot show through. */
 .popover-backdrop {
-  background: color-mix(in srgb, var(--color-background-base) 55%, transparent);
+  background: color-mix(in srgb, var(--color-content) 2%, transparent);
+}
+
+html.theme-light .popover-backdrop {
+  background: var(--color-background-base);
 }
 
 /* Animate content only; its sibling glass stays still. Finish at `none` and
@@ -1502,12 +1595,6 @@ header[data-tauri-drag-region] button {
   animation: reset-mascot-happy-in 720ms cubic-bezier(0.2, 0.9, 0.25, 1) both;
 }
 
-.reset-mascot-scene[data-reset-mascot-mood="sad"] .reset-mascot-sprite {
-  transform: translateX(-3px) rotate(-3deg);
-  animation: reset-mascot-sad-in 760ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  opacity: 0.68;
-}
-
 .reset-mascot-spark {
   position: absolute;
   width: 5px;
@@ -1530,20 +1617,6 @@ header[data-tauri-drag-region] button {
   width: 3px;
   height: 3px;
   animation-delay: 360ms;
-}
-
-.reset-mascot-tear {
-  position: absolute;
-  top: 31px;
-  left: 19px;
-  width: 4px;
-  height: 6px;
-  border-radius: 999px 999px 999px 2px;
-  background: #60a5fa;
-  opacity: 0.75;
-  transform: rotate(12deg);
-  animation: reset-mascot-tear-in 680ms 300ms cubic-bezier(0.22, 1, 0.36, 1)
-    both;
 }
 
 @keyframes reset-mascot-happy-in {
@@ -1570,24 +1643,6 @@ header[data-tauri-drag-region] button {
   }
 }
 
-@keyframes reset-mascot-sad-in {
-  0% {
-    opacity: 0;
-    transform: translateX(8px) rotate(5deg) scale(0.9);
-  }
-  42% {
-    opacity: 0.68;
-    transform: translateX(0) rotate(0);
-  }
-  68% {
-    transform: translateX(-5px) rotate(-5deg);
-  }
-  100% {
-    opacity: 0.68;
-    transform: translateX(-3px) rotate(-3deg);
-  }
-}
-
 @keyframes reset-mascot-spark-in {
   from {
     opacity: 0;
@@ -1599,21 +1654,9 @@ header[data-tauri-drag-region] button {
   }
 }
 
-@keyframes reset-mascot-tear-in {
-  from {
-    opacity: 0;
-    transform: translateY(-4px) rotate(12deg) scale(0.5);
-  }
-  to {
-    opacity: 0.75;
-    transform: translateY(0) rotate(12deg) scale(1);
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
   .reset-mascot-sprite,
-  .reset-mascot-spark,
-  .reset-mascot-tear {
+  .reset-mascot-spark {
     animation: none !important;
   }
 }
@@ -1645,13 +1688,6 @@ header[data-tauri-drag-region] button {
 
 .modal-panel {
   animation: modal-panel-in 200ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
-}
-
-/* A modal swapped in for a just-closed one skips the entrance — replaying it
-   would flash the screen undimmed for a frame between the two backdrops. */
-.modal-swap .modal-backdrop,
-.modal-swap .modal-panel {
-  animation: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1775,17 +1811,4 @@ header[data-tauri-drag-region] button {
     var(--color-content) 10%,
     var(--color-background-base)
   );
-}
-
-/* Interactive controls use a pointer; disabled controls retain the default cursor. */
-button:not(:disabled):not([aria-disabled="true"]),
-a[href],
-summary,
-[role="button"]:not([aria-disabled="true"]),
-[role="menuitem"]:not([aria-disabled="true"]) {
-  cursor: pointer;
-}
-
-header[data-tauri-drag-region] button:not(:disabled):not([aria-disabled="true"]) {
-  cursor: pointer !important;
 }

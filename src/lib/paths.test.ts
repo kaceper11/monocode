@@ -16,6 +16,13 @@ import {
 } from "./paths";
 
 describe("WSL identities", () => {
+  it("does not lexically collapse native symlinks or switch WSL distributions through parent segments", () => {
+    expect(pathKey("/repo/link/../file")).toBe("/repo/link/../file");
+    expect(pathKey("//wsl.localhost/Ubuntu/../Debian/file")).not.toBe(
+      pathKey("//wsl.localhost/Debian/file"),
+    );
+  });
+
   it("keeps Linux case and distribution identity through aliases, links and rebasing", () => {
     const root = wslPath("Ubuntu Work", "/home/me/Zażółć Repo");
     const alias = "\\\\wsl$\\Ubuntu Work\\home\\me\\Zażółć Repo";

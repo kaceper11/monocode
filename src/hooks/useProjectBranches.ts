@@ -36,8 +36,7 @@ function branchesEqual(a: GitBranches | null, b: GitBranches | null): boolean {
       other != null &&
       branch.name === other.name &&
       branch.current === other.current &&
-      branch.remote === other.remote &&
-      branch.worktree === other.worktree
+      branch.remote === other.remote
     );
   });
 }
@@ -87,7 +86,7 @@ function start(entry: Entry) {
   };
   window.addEventListener("focus", entry.onResume);
   document.addEventListener("visibilitychange", entry.onResume);
-  entry.unsubscribeGit = subscribeGitChanged(entry.onResume, entry.cwd);
+  entry.unsubscribeGit = subscribeGitChanged(entry.onResume);
 }
 
 function stop(entry: Entry) {

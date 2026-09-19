@@ -22,7 +22,7 @@ const DISCOVERY_TIMEOUT_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 12_000;
 
 export function refreshDevinCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("devin", cwd, () => discoverDevinModels(cwd));
+  return refreshModelCatalog("devin", cwd, discoverDevinModels);
 }
 
 /**

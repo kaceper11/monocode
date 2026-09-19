@@ -23,7 +23,7 @@ const SSE_END_EVENT: &str = "harness-sse-end";
 
 const DEFAULT_PROVIDER_ACCOUNT_ID: &str = "default";
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessAccount {
     provider: String,
@@ -77,12 +77,12 @@ pub struct CursorBinary {
 }
 
 struct LiveChild {
-    generation: u64,
+    cwd: PathBuf,
     stdin: Mutex<ChildStdin>,
     pid: u32,
+    account: Option<HarnessAccount>,
+    generation: u64,
     linux: Option<crate::wsl::LinuxProcess>,
-    /// Spawn-time working directory — worktree-removal binding evidence.
-    cwd: String,
 }
 
 impl LiveChild {
@@ -135,6 +135,13 @@ pub struct HarnessHost {
 }
 
 impl HarnessHost {
+    pub(crate) fn has_working_dir(&self, path: &Path) -> bool {
+        self.lock_inner()
+            .children
+            .values()
+            .any(|child| crate::worktrees::contains_working_dir(path, &child.cwd))
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HarnessInner {
@@ -215,27 +222,6 @@ impl HarnessHost {
         None
     }
 
-    /// (session id, spawn cwd) of every live agent child — removal binding
-    /// evidence at the owning boundary.
-    pub(crate) fn live_cwds(&self) -> Vec<(String, String)> {
-        self.lock_inner()
-            .children
-            .iter()
-            .map(|(id, live)| (id.clone(), live.cwd.clone()))
-            .collect()
-    }
-
-    /// Sessions with a live SSE reader but possibly no local child — their
-    /// binding is resolved through the saved session's checkout.
-    pub(crate) fn sse_sessions(&self) -> Vec<String> {
-        self.sse
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .cloned()
-            .collect()
-    }
-
     /// `harness_kill` by id — also stops only the agent proven to belong to a
     /// reviewed worktree. Returns the stopped child's pid so callers can wait
     /// out the TERM→KILL escalation and report survivors.
@@ -300,6 +286,42 @@ impl HarnessHost {
         // Keep child removal and its stream close atomic with replacement.
         // All operations that take both locks use inner -> sse ordering.
         self.stop_sse(session_id);
+    }
+
+    fn kill_account(&self, provider: &str, account_id: &str) {
+        let children: Vec<(String, Arc<LiveChild>)> = {
+            let mut inner = self.lock_inner();
+            let session_ids: Vec<String> = inner
+                .children
+                .iter()
+                .filter_map(|(session_id, live)| {
+                    let account = live.account.as_ref()?;
+                    (account.provider == provider && account.id == account_id)
+                        .then(|| session_id.clone())
+                })
+                .collect();
+            session_ids
+                .into_iter()
+                .filter_map(|session_id| {
+                    *inner.epochs.entry(session_id.clone()).or_insert(0) += 1;
+                    inner
+                        .children
+                        .remove(&session_id)
+                        .map(|child| (session_id, child))
+                })
+                .collect()
+        };
+        for (session_id, _) in &children {
+            self.stop_sse(session_id);
+        }
+        let pids: Vec<u32> = children.iter().map(|(_, child)| child.pid).collect();
+        for (_, child) in &children {
+            if let Some(linux) = &child.linux {
+                let _ = linux.stop();
+            }
+        }
+        drop(children);
+        terminate_all(&pids);
     }
 
     pub(crate) fn kill_all(&self) {
@@ -395,21 +417,15 @@ impl HarnessHost {
         self.lock_inner().children.insert(
             session_id.into(),
             Arc::new(LiveChild {
+                account: None,
                 generation: 0,
                 stdin: Mutex::new(stdin),
                 pid,
                 linux: None,
-                cwd: cwd.into(),
+                cwd: expand_home(cwd),
             }),
         );
         child
-    }
-
-    /// A live SSE entry without a child, for tests covering stream-only
-    /// session attribution.
-    #[cfg(all(test, unix))]
-    pub(crate) fn add_test_sse(&self, session_id: &str) {
-        self.insert_sse(session_id.into(), Arc::new(LiveSse::default()));
     }
 }
 
@@ -518,6 +534,19 @@ pub fn harness_resolve_grok() -> Result<CursorBinary, String> {
         })
 }
 
+/// Resolve Nous Research Hermes Agent (`hermes`).
+#[tauri::command(async)]
+pub fn harness_resolve_hermes() -> Result<CursorBinary, String> {
+    resolve_hermes()
+        .map(|path| CursorBinary {
+            path: path.to_string_lossy().into_owned(),
+        })
+        .ok_or_else(|| {
+            "Hermes Agent CLI not found. Install it from https://hermes-agent.nousresearch.com, run `hermes model`, then retry."
+                .into()
+        })
+}
+
 /// Resolve the Devin CLI (`devin`).
 #[tauri::command(async)]
 pub fn harness_resolve_devin() -> Result<CursorBinary, String> {
@@ -579,9 +608,9 @@ pub fn harness_spawn(
     account: Option<HarnessAccount>,
 ) -> Result<u32, String> {
     let location = crate::wsl::location(&cwd)?;
-    let _worktree_guard = crate::fs::worktrees::LIFECYCLE
-        .try_read()
-        .map_err(|_| "Worktree operation in progress; retry startup after it completes")?;
+    validate_account_host(account.as_ref(), location.as_ref())?;
+    let workdir = expand_home(&cwd);
+    let _reservation = crate::worktree_lifecycle::reserve_spawn(&workdir)?;
     let (epoch, kill_all, prev) = host.begin_spawn(&session_id, Some(generation))?;
     if let Some(prev) = prev {
         if let Err(error) = prev.terminate() {
@@ -594,7 +623,6 @@ pub fn harness_spawn(
         let (cmd, nonce, acknowledgement) = crate::wsl::agent_command(location, &command, &args)?;
         (cmd, Some(nonce), Some(acknowledgement))
     } else {
-        let workdir = expand_home(&cwd);
         if !workdir.is_dir() {
             return Err(format!(
                 "Working directory does not exist: {}",
@@ -612,6 +640,9 @@ pub fn harness_spawn(
     apply_provider_account(&app, &mut cmd, account.as_ref())?;
 
     crate::control::configure_child(&app, &session_id, &mut cmd);
+    let acknowledgement = acknowledgement
+        .map(|message| crate::wsl::agent_acknowledgement(&message, &cmd))
+        .transpose()?;
 
     let mut child =
         spawn_managed(&mut cmd).map_err(|e| format!("Failed to start {command}: {e}"))?;
@@ -647,11 +678,12 @@ pub fn harness_spawn(
     };
 
     let live = Arc::new(LiveChild {
+        account,
         generation,
         stdin: Mutex::new(stdin),
         pid,
         linux,
-        cwd,
+        cwd: workdir,
     });
     if let Some(rejected) = host.install_spawn(session_id.clone(), epoch, kill_all, live.clone()) {
         // A kill, or a newer spawn, won the race while this one was forking.
@@ -799,8 +831,26 @@ pub(crate) fn provider_account_dir(
     let Some(account_id) = account_id.filter(|id| *id != DEFAULT_PROVIDER_ACCOUNT_ID) else {
         return Ok(None);
     };
+    let dir = provider_account_path(app, provider, account_id)?;
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        format!(
+            "Could not create the {provider} account directory {}: {error}",
+            dir.display()
+        )
+    })?;
+    Ok(Some(dir))
+}
+
+fn provider_account_path(
+    app: &AppHandle,
+    provider: &str,
+    account_id: &str,
+) -> Result<PathBuf, String> {
     if provider != "claude" && provider != "codex" {
-        return Err("Provider account profiles are only supported for Claude and Codex".into());
+        return Err("Provider account profiles are not supported for this provider".into());
+    }
+    if account_id == DEFAULT_PROVIDER_ACCOUNT_ID {
+        return Err("The default provider account cannot be removed".into());
     }
     if account_id.is_empty()
         || account_id.len() > 80
@@ -810,20 +860,63 @@ pub(crate) fn provider_account_dir(
     {
         return Err("Invalid provider account id".into());
     }
-    let dir = app
+    Ok(app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?
         .join("provider-accounts")
         .join(provider)
-        .join(account_id);
-    std::fs::create_dir_all(&dir).map_err(|error| {
+        .join(account_id))
+}
+
+#[tauri::command(async)]
+pub fn provider_account_remove(
+    app: AppHandle,
+    host: State<'_, HarnessHost>,
+    provider: String,
+    account_id: String,
+) -> Result<(), String> {
+    let dir = provider_account_path(&app, &provider, &account_id)?;
+    host.kill_account(&provider, &account_id);
+
+    #[cfg(target_os = "macos")]
+    if provider == "claude" {
+        crate::rate_limits::delete_claude_keychain_credentials(&dir)?;
+    }
+
+    let metadata = match std::fs::symlink_metadata(&dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect the {provider} account directory {}: {error}",
+                dir.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        std::fs::remove_file(&dir)
+    } else {
+        std::fs::remove_dir_all(&dir)
+    }
+    .map_err(|error| {
         format!(
-            "Could not create the {provider} account directory {}: {error}",
+            "Could not remove the {provider} account directory {}: {error}",
             dir.display()
         )
-    })?;
-    Ok(Some(dir))
+    })
+}
+
+fn validate_account_host(
+    account: Option<&HarnessAccount>,
+    location: Option<&crate::wsl::Location>,
+) -> Result<(), String> {
+    if location.is_some()
+        && account.is_some_and(|account| account.id != DEFAULT_PROVIDER_ACCOUNT_ID)
+    {
+        return Err("This account profile belongs to the native app and cannot be used by a WSL agent. Select the default account and sign in inside the chosen WSL distribution; no fallback account was started.".into());
+    }
+    Ok(())
 }
 
 fn apply_provider_account(
@@ -892,9 +985,11 @@ pub fn harness_write(
 pub fn harness_kill(
     host: State<HarnessHost>,
     session_id: String,
-    generation: u64,
+    generation: Option<u64>,
 ) -> Result<(), String> {
-    host.kill_client(&session_id, Some(generation)).map(|_| ())
+    // Upstream orchestration can stop workers after renderer reload without a token.
+    // Child transport calls still supply a generation to fence stale cleanup.
+    host.kill_client(&session_id, generation).map(|_| ())
 }
 
 const MAX_HARNESS_LINE_BYTES: u64 = 32 * 1024 * 1024;
@@ -1023,11 +1118,6 @@ pub fn harness_sse_open(
     generation: u64,
 ) -> Result<(), String> {
     assert_loopback(&url)?;
-    // A stream-only session is removal-binding evidence; registration must
-    // not slip between a removal's occupancy check and its stop.
-    let _worktree_guard = crate::fs::worktrees::LIFECYCLE
-        .try_read()
-        .map_err(|_| "Worktree operation in progress; retry startup after it completes")?;
     let live = Arc::new(LiveSse::default());
     host.replace_client_sse(session_id.clone(), generation, Some(live.clone()))?;
 
@@ -1218,6 +1308,7 @@ fn is_resolved_harness_binary(command: &str) -> bool {
         resolve_pi(),
         resolve_omp(),
         resolve_fx(),
+        resolve_hermes(),
         resolve_grok(),
         resolve_devin(),
         resolve_copilot(),
@@ -1424,27 +1515,6 @@ fn wait_until_dead(pids: &[u32], until: Instant) {
     }
 }
 
-/// Bounded wait for just-signaled trees — outlasts the TERM→KILL escalation,
-/// then reports the pids still answering so callers can fail closed instead
-/// of removing a directory under a live process.
-#[cfg(not(windows))]
-pub(crate) fn await_stopped(pids: &[u32]) -> Vec<u32> {
-    wait_until_dead(
-        pids,
-        Instant::now() + KILL_ESCALATE + Duration::from_millis(500),
-    );
-    pids.iter()
-        .copied()
-        .filter(|pid| tree_alive(*pid))
-        .collect()
-}
-
-/// `taskkill /F` is synchronous — nothing to wait on.
-#[cfg(windows)]
-pub(crate) fn await_stopped(_pids: &[u32]) -> Vec<u32> {
-    Vec::new()
-}
-
 enum TreeSignal {
     #[cfg(not(windows))]
     Term,
@@ -1597,6 +1667,7 @@ fn is_harness_argv_token(part: &str) -> bool {
             | "claude"
             | "codex"
             | "opencode"
+            | "hermes"
             | "grok"
             | "omp"
             | "fx"
@@ -2009,6 +2080,38 @@ fn resolve_grok() -> Option<PathBuf> {
     first_binary_matching(candidates, is_grok_agent)
 }
 
+fn resolve_hermes() -> Option<PathBuf> {
+    let home = dirs_home().map(PathBuf::from);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(home) = &home {
+        // Official per-user installer, then its underlying virtualenv in case
+        // the launcher symlink has not been added to PATH yet.
+        candidates.push(home.join(".local/bin/hermes"));
+        candidates.push(home.join(".hermes/hermes-agent/venv/bin/hermes"));
+        candidates.push(home.join(".hermes/hermes-agent/.venv/bin/hermes"));
+        candidates.push(home.join(".npm-global/bin/hermes"));
+        candidates.push(home.join(".cargo/bin/hermes"));
+        candidates.push(home.join("n/bin/hermes"));
+    }
+    #[cfg(windows)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        // Native Windows installer launchers, then the underlying virtualenv.
+        candidates.push(local_app_data.join("hermes/bin/hermes"));
+        candidates.push(local_app_data.join("hermes/hermes-agent/venv/Scripts/hermes"));
+    }
+    #[cfg(target_os = "macos")]
+    candidates.push(PathBuf::from("/opt/homebrew/bin/hermes"));
+    candidates.push(PathBuf::from("/usr/local/bin/hermes"));
+    candidates.push(PathBuf::from("/usr/bin/hermes"));
+    candidates.push(PathBuf::from("/snap/bin/hermes"));
+    if let Some(from_shell) = which_via_login_shell("hermes") {
+        candidates.push(from_shell);
+    }
+
+    first_binary(candidates)
+}
+
 fn resolve_devin() -> Option<PathBuf> {
     let home = dirs_home().map(PathBuf::from);
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -2069,20 +2172,47 @@ fn resolve_copilot() -> Option<PathBuf> {
     first_binary_matching(candidates, is_copilot_agent)
 }
 
-/// `is_*_agent` verdicts are stable for the life of the process and the
-/// marker scan / `--help` probe behind them is expensive, so memoize per
-/// (agent, path): the resolvers populate the cache and `prepare_child`
-/// reuses it instead of re-probing on every spawn.
-static AGENT_VERDICTS: LazyLock<Mutex<HashMap<(String, PathBuf), bool>>> =
+/// Reuse expensive positive probes only while the executable is unchanged.
+/// Installers can replace a launcher or its symlink target while the app runs.
+#[derive(PartialEq)]
+struct AgentExecutable {
+    canonical: PathBuf,
+    bytes: u64,
+    modified: std::time::SystemTime,
+}
+
+static AGENT_VERDICTS: LazyLock<Mutex<HashMap<(String, PathBuf), AgentExecutable>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn agent_verdict(agent: &str, path: &Path, check: impl FnOnce(&Path) -> bool) -> bool {
+    let Ok(canonical) = path.canonicalize() else {
+        return check(path);
+    };
+    let Ok(metadata) = canonical.metadata() else {
+        return check(path);
+    };
+    let Ok(modified) = metadata.modified() else {
+        return check(path);
+    };
     let key = (agent.to_string(), path.to_path_buf());
-    if let Some(hit) = AGENT_VERDICTS.lock().unwrap().get(&key) {
-        return *hit;
+    let stamp = AgentExecutable {
+        canonical,
+        bytes: metadata.len(),
+        modified,
+    };
+    if AGENT_VERDICTS.lock().unwrap().get(&key) == Some(&stamp) {
+        return true;
     }
     let verdict = check(path);
-    AGENT_VERDICTS.lock().unwrap().insert(key, verdict);
+    let mut cache = AGENT_VERDICTS.lock().unwrap();
+    if verdict {
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(key, stamp);
+    } else {
+        cache.remove(&key);
+    }
     verdict
 }
 
@@ -2126,7 +2256,7 @@ fn file_mentions_copilot_agent(path: &Path) -> bool {
 }
 
 fn copilot_help_mentions_acp(path: &Path) -> bool {
-    help_probe_output(path).is_some_and(|text| {
+    help_probe_output(path, HELP_PROBE_TIMEOUT).is_some_and(|text| {
         // AWS's `copilot` CLI also exists, so a bare "acp" trigram is not
         // enough; GitHub Copilot documents `--acp` verbatim.
         text.contains("copilot")
@@ -2139,13 +2269,13 @@ fn copilot_help_mentions_acp(path: &Path) -> bool {
 /// `--help` probe budget. On Windows a `.cmd` shim chains cmd.exe → node →
 /// the real CLI, and Copilot's binary is a 144MB Node SEA that cold-starts
 /// slowly under antivirus scanning; 2s killed valid probes before they
-/// answered. A wrong binary that hangs still terminates, once per path.
+/// answered. Upstream providers retain their two-second budget.
 const HELP_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Lowercased stdout+stderr of `<cli> --help`, or `None` on spawn
 /// failure/timeout. npm-installed harnesses are `#!/usr/bin/env node`
 /// scripts, so this probe fails outright without a PATH that has node on it.
-fn help_probe_output(path: &Path) -> Option<String> {
+fn help_probe_output(path: &Path, timeout: Duration) -> Option<String> {
     let mut cmd = Command::new(path);
     cmd.arg("--help")
         .stdin(Stdio::null())
@@ -2159,7 +2289,7 @@ fn help_probe_output(path: &Path) -> Option<String> {
     thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
-    match rx.recv_timeout(HELP_PROBE_TIMEOUT) {
+    match rx.recv_timeout(timeout) {
         Ok(Ok(output)) => Some(
             format!(
                 "{}{}",
@@ -2237,7 +2367,8 @@ fn file_mentions_pi_coding_agent(path: &Path) -> bool {
 }
 
 fn help_mentions_rpc_mode(path: &Path) -> bool {
-    help_probe_output(path).is_some_and(|text| text.contains("--mode") && text.contains("rpc"))
+    help_probe_output(path, Duration::from_secs(2))
+        .is_some_and(|text| text.contains("--mode") && text.contains("rpc"))
 }
 
 fn is_fx_agent(path: &Path) -> bool {
@@ -2318,7 +2449,7 @@ fn file_mentions_fx_agent(path: &Path) -> bool {
 }
 
 fn fx_help_mentions_acp(path: &Path) -> bool {
-    help_probe_output(path).is_some_and(|text| {
+    help_probe_output(path, Duration::from_secs(2)).is_some_and(|text| {
         text.contains("acp") && (text.contains("ask") || text.contains("gateway"))
     })
 }
@@ -2361,7 +2492,7 @@ fn file_mentions_devin_agent(path: &Path) -> bool {
 }
 
 fn devin_help_mentions_acp(path: &Path) -> bool {
-    help_probe_output(path).is_some_and(|text| {
+    help_probe_output(path, HELP_PROBE_TIMEOUT).is_some_and(|text| {
         text.contains("acp") && (text.contains("devin") || text.contains("agent client protocol"))
     })
 }
@@ -2397,13 +2528,13 @@ fn file_mentions_muse_agent(path: &Path) -> bool {
 }
 
 fn muse_help_mentions_serve(path: &Path) -> bool {
-    help_probe_output(path).is_some_and(|text| {
+    help_probe_output(path, HELP_PROBE_TIMEOUT).is_some_and(|text| {
         text.contains("serve") && (text.contains("msp") || text.contains("session host"))
     })
 }
 
 fn grok_help_mentions_agent(path: &Path) -> bool {
-    help_probe_output(path).is_some_and(|text| {
+    help_probe_output(path, Duration::from_secs(2)).is_some_and(|text| {
         text.contains("grok build") || (text.contains("agent") && text.contains("stdio"))
     })
 }
@@ -2967,6 +3098,24 @@ fn command_basename(command: &str) -> &str {
 #[cfg(unix)]
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wsl_accounts_never_silently_fall_back_to_the_linux_default() {
+        let location = crate::wsl::Location::new("Ubuntu", "/home/me/repo").unwrap();
+        for provider in ["codex", "claude"] {
+            let profile = super::HarnessAccount {
+                provider: provider.into(),
+                id: "work".into(),
+            };
+            assert!(super::validate_account_host(Some(&profile), Some(&location)).is_err());
+            assert!(super::validate_account_host(Some(&profile), None).is_ok());
+            let default = super::HarnessAccount {
+                provider: provider.into(),
+                id: "default".into(),
+            };
+            assert!(super::validate_account_host(Some(&default), Some(&location)).is_ok());
+        }
+        assert!(super::validate_account_host(None, Some(&location)).is_ok());
+    }
     use super::*;
     use std::os::unix::process::CommandExt;
 
@@ -3008,11 +3157,12 @@ mod tests {
         let stdin = child.stdin.take().expect("test child stdin");
         (
             Arc::new(LiveChild {
+                account: None,
                 generation: 0,
                 linux: None,
                 stdin: Mutex::new(stdin),
                 pid,
-                cwd: String::new(),
+                cwd: PathBuf::from("/test"),
             }),
             child,
         )
@@ -3021,6 +3171,26 @@ mod tests {
     fn reap(mut child: std::process::Child) {
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn upstream_stop_without_generation_cancels_pending_and_live_children() {
+        // Upstream orchestration sends only sessionId, including after renderer reload.
+        let _command: fn(State<'_, HarnessHost>, String, Option<u64>) -> Result<(), String> =
+            harness_kill;
+        let host = HarnessHost::new();
+        let (epoch, all, _) = host.begin_spawn("worker", Some(7)).unwrap();
+        host.kill_client("worker", None).unwrap();
+        assert!(!host.spawn_stamp_current("worker", epoch, all));
+        let (epoch, all, _) = host.begin_spawn("worker", Some(8)).unwrap();
+        let (live, child) = live_child();
+        let pid = live.pid;
+        assert!(host
+            .install_spawn("worker".into(), epoch, all, live)
+            .is_none());
+        assert_eq!(host.kill_client("worker", None).unwrap(), Some(pid));
+        assert!(host.get("worker").is_none());
+        reap(child);
     }
 
     #[test]
@@ -3520,11 +3690,12 @@ mod tests {
         let stdin = child.stdin.take().expect("grouped child stdin");
         (
             Arc::new(LiveChild {
+                account: None,
                 generation: 0,
                 linux: None,
                 stdin: Mutex::new(stdin),
                 pid,
-                cwd: String::new(),
+                cwd: PathBuf::from("/test"),
             }),
             child,
         )
@@ -3777,10 +3948,7 @@ mod tests {
         std::fs::write(&viewer, b"#!/bin/sh\necho Terminal JSON viewer\n").unwrap();
         assert!(!is_fx_agent(&viewer));
 
-        // A distinct path: verdicts are memoized per path.
-        let other_dir = dir.join("other");
-        std::fs::create_dir_all(&other_dir).unwrap();
-        let other = other_dir.join("fx");
+        let other = dir.join("fx");
         std::fs::write(&other, b"#!/bin/sh\necho json viewer\n").unwrap();
         assert!(!file_mentions_fx_agent(&other));
         assert!(!is_fx_agent(&other));
@@ -3858,6 +4026,12 @@ mod tests {
         .unwrap();
         assert!(!file_mentions_copilot_agent(&aws));
         assert!(!is_copilot_agent(&aws));
+
+        // An installer can replace the same path while MonoCode is open.
+        std::fs::write(&agent, b"#!/bin/sh\n# AWS Copilot CLI\n").unwrap();
+        assert!(!is_copilot_agent(&agent));
+        std::fs::write(&agent, b"#!/bin/sh\n# @github/copilot shim\n").unwrap();
+        assert!(is_copilot_agent(&agent));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4104,6 +4278,7 @@ mod reap_logic_tests {
             "/opt/homebrew/bin/node /Users/n/.local/share/cursor-agent/versions/x/index.js worker-server"
         ));
         assert!(looks_like_harness_argv("/Users/n/.local/bin/claude --help"));
+        assert!(looks_like_harness_argv("/Users/n/.local/bin/hermes acp"));
         assert!(!looks_like_harness_argv("tmux new -s work"));
         assert!(!looks_like_harness_argv("npm start"));
         assert!(!looks_like_harness_argv(

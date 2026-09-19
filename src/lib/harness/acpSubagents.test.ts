@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AcpSubagents } from "./acpSubagents";
-import { acpEventsFromUpdate } from "./acp";
+import { acpEventsFromUpdate } from "./acpProtocol";
 import { eventsFromAcpUpdate as fxEvents } from "./fxProtocol";
 import { eventsFromAcpUpdate as grokEvents } from "./grokProtocol";
 import { applyHarnessEvent } from "./apply";

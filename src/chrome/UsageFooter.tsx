@@ -1,11 +1,11 @@
-import { RefreshCw, Stop, Terminal, X } from "./icons";
+import { Globe, RefreshCw, Terminal } from "./icons";
 import {
   useCallback,
   useEffect,
   useRef,
   useState,
   type Dispatch,
-  type RefObject,
+  type ReactNode,
   type SetStateAction,
 } from "react";
 import { HarnessIcon } from "./HarnessIcon";
@@ -14,6 +14,7 @@ import {
   consumeCodexRateLimitResetCredit,
   fetchClaudeRateLimits,
   fetchCodexRateLimits,
+  fetchOpencodeGoRateLimits,
 } from "../lib/rateLimitsFetch";
 import {
   errorRateLimits,
@@ -21,23 +22,16 @@ import {
   idleRateLimits,
   RATE_LIMIT_POLL_MS,
   shouldFetchProvider,
+  unavailableRateLimits,
   type ProviderRateLimits,
   type RateLimitProvider,
 } from "../lib/rateLimits";
 import { HARNESS_LABEL, HARNESS_TITLE, type HarnessId } from "../lib/session";
-import { runningTerminalChipLabel } from "../lib/terminalTab";
 import { loginHarness, supportsHarnessLogin } from "../lib/harness/auth";
 import {
-  getPtyResources,
-  killPtyWorkload,
-  type PtyResource,
-} from "../lib/pty";
-import {
-  formatCpu,
-  formatMem,
-  mergeTerminalRows,
-  type FooterTerminal,
-} from "../lib/terminalResources";
+  runningTerminalChipLabel,
+  type RunningTerminal,
+} from "../lib/terminalTab";
 import { MOD } from "../lib/platform";
 import { UsageProviderChip } from "./UsageProviderChip";
 import {
@@ -46,11 +40,13 @@ import {
 } from "./ProviderSignInPanel";
 import {
   newProviderAccount,
+  providerAccountExists,
   providerAccounts,
   saveProviderAccount,
   selectProviderAccount,
   selectedProviderAccountId,
   subscribeProviderAccounts,
+  type ProviderAccountProvider,
 } from "../lib/providerAccounts";
 
 const CLOCK_MS = 30_000;
@@ -67,34 +63,46 @@ export function UsageFooter({
   session,
   project,
   terminals = [],
-  onOpenTerminal,
-  onCloseTerminal,
+  terminalOpen = false,
+  onToggleTerminal,
   onNewTerminal,
   onShowTerminal,
   projectTerminalActive = false,
-  projectTerminalExists = false,
+  onToggleBrowser,
+  commandsControl,
+  resourcesControl,
   onSelectAccount,
+  onManageAccounts,
 }: {
   providers: RateLimitProvider[];
   session?: UsageFooterSession;
   project?: string;
-  terminals?: FooterTerminal[];
-  onOpenTerminal?: (fileId: string) => void;
-  onCloseTerminal?: (fileId: string) => void;
+  terminals?: RunningTerminal[];
+  terminalOpen?: boolean;
+  onToggleTerminal?: (fileId: string) => void;
   onNewTerminal?: () => void;
   onShowTerminal?: () => void;
   projectTerminalActive?: boolean;
-  /** The project terminal dock exists (open or hidden). */
-  projectTerminalExists?: boolean;
-  onSelectAccount?: (provider: RateLimitProvider, accountId: string) => void;
+  onToggleBrowser?: () => void;
+  commandsControl?: ReactNode;
+  resourcesControl?: ReactNode;
+  onSelectAccount?: (
+    provider: ProviderAccountProvider,
+    accountId: string,
+  ) => void;
+  onManageAccounts?: (provider: ProviderAccountProvider) => void;
 }) {
   const wantClaude = providers.includes("claude");
   const wantCodex = providers.includes("codex");
+  const wantOpencode = providers.includes("opencode");
   const [claude, setClaude] = useState<ProviderRateLimits>(() =>
     idleRateLimits("claude"),
   );
   const [codex, setCodex] = useState<ProviderRateLimits>(() =>
     idleRateLimits("codex"),
+  );
+  const [opencode, setOpencode] = useState<ProviderRateLimits>(() =>
+    idleRateLimits("opencode"),
   );
   const [now, setNow] = useState(() => Date.now());
   const [refreshing, setRefreshing] = useState(false);
@@ -102,8 +110,10 @@ export function UsageFooter({
   const inflight = useRef<Promise<void> | null>(null);
   const claudeRef = useRef(claude);
   const codexRef = useRef(codex);
+  const opencodeRef = useRef(opencode);
   claudeRef.current = claude;
   codexRef.current = codex;
+  opencodeRef.current = opencode;
   const claudeAccountId =
     session?.harness === "claude" && session.providerAccountId
       ? session.providerAccountId
@@ -114,6 +124,11 @@ export function UsageFooter({
       : selectedProviderAccountId("codex", project);
   const claudeAccounts = providerAccounts("claude");
   const codexAccounts = providerAccounts("codex");
+  const claudeAccountAvailable = providerAccountExists(
+    "claude",
+    claudeAccountId,
+  );
+  const codexAccountAvailable = providerAccountExists("codex", codexAccountId);
   const claudeAccountRef = useRef(claudeAccountId);
   const codexAccountRef = useRef(codexAccountId);
   claudeAccountRef.current = claudeAccountId;
@@ -131,10 +146,16 @@ export function UsageFooter({
       const visible = document.visibilityState === "visible";
       const fetchClaude =
         wantClaude &&
+        claudeAccountAvailable &&
         shouldFetchProvider(claudeRef.current, { force, visible });
       const fetchCodex =
-        wantCodex && shouldFetchProvider(codexRef.current, { force, visible });
-      if (!fetchClaude && !fetchCodex) return;
+        wantCodex &&
+        codexAccountAvailable &&
+        shouldFetchProvider(codexRef.current, { force, visible });
+      const fetchOpencode =
+        wantOpencode &&
+        shouldFetchProvider(opencodeRef.current, { force, visible });
+      if (!fetchClaude && !fetchCodex && !fetchOpencode) return;
       if (force) setRefreshing(true);
       const jobs: Promise<void>[] = [];
       if (fetchClaude) {
@@ -155,6 +176,14 @@ export function UsageFooter({
           }),
         );
       }
+      if (fetchOpencode) {
+        setOpencode((current) => fetchingRateLimits("opencode", current));
+        jobs.push(
+          fetchOpencodeGoRateLimits().then((value) => {
+            setOpencode(value);
+          }),
+        );
+      }
       const run = Promise.allSettled(jobs)
         .then(() => undefined)
         .finally(() => {
@@ -164,24 +193,42 @@ export function UsageFooter({
       inflight.current = run;
       return run;
     },
-    [claudeAccountId, codexAccountId, wantClaude, wantCodex],
+    [
+      claudeAccountAvailable,
+      claudeAccountId,
+      codexAccountAvailable,
+      codexAccountId,
+      wantClaude,
+      wantCodex,
+      wantOpencode,
+    ],
   );
 
   useEffect(() => {
-    const idle = idleRateLimits("claude");
-    claudeRef.current = idle;
-    setClaude(idle);
+    const next = claudeAccountAvailable
+      ? idleRateLimits("claude")
+      : unavailableRateLimits(
+          "claude",
+          "This conversation uses a removed account",
+        );
+    claudeRef.current = next;
+    setClaude(next);
     const pending = inflight.current;
     if (pending) void pending.finally(() => refresh(true));
-  }, [claudeAccountId]);
+  }, [claudeAccountAvailable, claudeAccountId, refresh]);
 
   useEffect(() => {
-    const idle = idleRateLimits("codex");
-    codexRef.current = idle;
-    setCodex(idle);
+    const next = codexAccountAvailable
+      ? idleRateLimits("codex")
+      : unavailableRateLimits(
+          "codex",
+          "This conversation uses a removed account",
+        );
+    codexRef.current = next;
+    setCodex(next);
     const pending = inflight.current;
     if (pending) void pending.finally(() => refresh(true));
-  }, [codexAccountId]);
+  }, [codexAccountAvailable, codexAccountId, refresh]);
 
   useEffect(() => {
     void refresh();
@@ -299,7 +346,7 @@ export function UsageFooter({
   );
 
   const selectAccount = useCallback(
-    (provider: RateLimitProvider, accountId: string) => {
+    (provider: ProviderAccountProvider, accountId: string) => {
       selectProviderAccount(provider, project, accountId);
       onSelectAccount?.(provider, accountId);
     },
@@ -307,7 +354,7 @@ export function UsageFooter({
   );
 
   const addAccount = useCallback(
-    async (provider: RateLimitProvider, label: string) => {
+    async (provider: ProviderAccountProvider, label: string) => {
       const account = newProviderAccount(provider, label);
       await loginHarness(provider, account.id);
       saveProviderAccount(account);
@@ -317,15 +364,14 @@ export function UsageFooter({
     [selectAccount],
   );
 
-  const showUsage = wantClaude || wantCodex;
+  const showOpencodeChip = wantOpencode && opencode.status !== "unavailable";
+  const showUsage = wantClaude || wantCodex || showOpencodeChip;
   const showTerminals = terminals.length > 0;
   const showTerminalButton = Boolean(onNewTerminal || onShowTerminal);
   const terminalLabel = projectTerminalActive
-    ? "Hide Terminal"
-    : projectTerminalExists
-      ? "Show Terminal"
-      : `New Terminal (${MOD}\`)`;
-  const onTerminalClick = projectTerminalExists
+    ? "Terminal"
+    : `New Terminal (${MOD}\`)`;
+  const onTerminalClick = projectTerminalActive
     ? (onShowTerminal ?? onNewTerminal)
     : (onNewTerminal ?? onShowTerminal);
   const ariaLabel = showUsage
@@ -353,6 +399,9 @@ export function UsageFooter({
                 selectAccount("claude", accountId)
               }
               onAddAccount={(label) => addAccount("claude", label)}
+              onManageAccounts={
+                onManageAccounts ? () => onManageAccounts("claude") : undefined
+              }
               onReconnect={reconnectClaude}
             />
           ) : null}
@@ -365,9 +414,15 @@ export function UsageFooter({
               accountId={codexAccountId}
               onSelectAccount={(accountId) => selectAccount("codex", accountId)}
               onAddAccount={(label) => addAccount("codex", label)}
+              onManageAccounts={
+                onManageAccounts ? () => onManageAccounts("codex") : undefined
+              }
               onConsumeReset={consumeCodexReset}
               onReconnect={reconnectCodex}
             />
+          ) : null}
+          {showOpencodeChip ? (
+            <UsageProviderChip limits={opencode} now={now} project={project} />
           ) : null}
           <button
             type="button"
@@ -387,13 +442,13 @@ export function UsageFooter({
       ) : session ? (
         <SessionChip key={session.id ?? session.harness} session={session} />
       ) : null}
-      {showTerminals || showTerminalButton ? (
+      {showTerminals || showTerminalButton || resourcesControl ? (
         <div className="ml-auto flex shrink-0 items-center gap-2">
           {showTerminals ? (
-            <TerminalChip
+            <RunningTerminalChip
               terminals={terminals}
-              onOpen={onOpenTerminal}
-              onClose={onCloseTerminal}
+              open={terminalOpen}
+              onToggle={onToggleTerminal}
             />
           ) : showTerminalButton ? (
             <button
@@ -412,6 +467,11 @@ export function UsageFooter({
               <span>Terminal</span>
             </button>
           ) : null}
+          {onToggleBrowser ? <button type="button" aria-label="Toggle browser panel" title="Toggle browser panel" onClick={onToggleBrowser} className="inline-flex h-5 shrink-0 items-center gap-1.5 whitespace-nowrap rounded px-1.5 text-content/60 hover:bg-content/10 hover:text-content focus-visible:outline-2 focus-visible:outline-content">
+            <Globe className="size-3.5" strokeWidth={1.75} aria-hidden /><span>Browser</span>
+          </button> : null}
+          {commandsControl}
+          {resourcesControl}
         </div>
       ) : null}
     </footer>
@@ -524,34 +584,34 @@ function SessionChip({ session }: { session: UsageFooterSession }) {
   );
 }
 
-const RESOURCE_POLL_MS = 1500;
-
-function TerminalChip({
+function RunningTerminalChip({
   terminals,
-  onOpen,
-  onClose,
+  open: panelOpen,
+  onToggle,
 }: {
-  terminals: FooterTerminal[];
-  onOpen?: (fileId: string) => void;
-  onClose?: (fileId: string) => void;
+  terminals: RunningTerminal[];
+  open: boolean;
+  onToggle?: (fileId: string) => void;
 }) {
   const root = useRef<HTMLButtonElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
-  const processes = terminals.flatMap((terminal) =>
-    terminal.foreground ? [terminal.foreground] : [],
-  );
-  const label = processes.length
-    ? runningTerminalChipLabel(processes)
-    : terminals.length === 1
-      ? "1 terminal"
-      : `${terminals.length} terminals`;
-  const ariaLabel = menuOpen
-    ? "Hide terminal manager"
-    : `${terminals.length} terminal${terminals.length === 1 ? "" : "s"}`;
+  const label = runningTerminalChipLabel(terminals);
+  const many = terminals.length > 1;
+  const title = terminals
+    .map((terminal) => `"${terminal.process}" in ${terminal.label}`)
+    .join("\n");
+  const ariaLabel =
+    terminals.length === 1
+      ? panelOpen
+        ? `Hide ${terminals[0]?.process}`
+        : `Show ${terminals[0]?.process}`
+      : panelOpen
+        ? "Hide running terminals"
+        : `${terminals.length} terminals are running processes`;
 
-  const open = (fileId: string) => {
+  const toggle = (fileId: string) => {
     setMenuOpen(false);
-    onOpen?.(fileId);
+    onToggle?.(fileId);
   };
 
   return (
@@ -561,194 +621,54 @@ function TerminalChip({
         type="button"
         className="inline-flex min-w-0 max-w-[16rem] items-center gap-1.5 whitespace-nowrap rounded px-1 -mx-1 hover:bg-content/10 hover:text-content"
         aria-label={ariaLabel}
-        aria-expanded={menuOpen}
-        aria-haspopup="dialog"
-        title="Terminals"
-        onClick={() => setMenuOpen((value) => !value)}
+        aria-pressed={panelOpen}
+        aria-expanded={many && !panelOpen ? menuOpen : undefined}
+        aria-haspopup={many && !panelOpen ? "menu" : undefined}
+        title={title}
+        onClick={() => {
+          if (panelOpen || !many) {
+            const target = terminals[0];
+            if (target) toggle(target.id);
+            return;
+          }
+          setMenuOpen((value) => !value);
+        }}
       >
-        {processes.length ? <TerminalLiveMark /> : null}
+        <TerminalLiveMark />
         <span className="truncate font-mono text-[10px] tabular-nums">
           {label}
         </span>
       </button>
-      {menuOpen ? (
-        <TerminalManager
+      {menuOpen && many && !panelOpen ? (
+        <Popover
           anchor={root}
-          terminals={terminals}
-          onOpen={open}
-          onClose={onClose}
+          side="top"
+          align="end"
+          autoFocus
           onDismiss={() => setMenuOpen(false)}
-        />
+          role="menu"
+          aria-label="Running terminals"
+          className="min-w-[12rem] p-1"
+        >
+          {terminals.map((terminal) => (
+            <button
+              key={terminal.id}
+              type="button"
+              role="menuitem"
+              className="flex h-7 w-full items-center gap-2 rounded-lg px-2 text-left text-[12px] leading-none text-content hover:bg-content/10"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => toggle(terminal.id)}
+            >
+              <span className="min-w-0 flex-1 truncate">
+                {terminal.process}
+              </span>
+              <span className="max-w-[7rem] shrink-0 truncate text-[11px] text-content/40">
+                {terminal.label}
+              </span>
+            </button>
+          ))}
+        </Popover>
       ) : null}
     </>
   );
 }
-
-/** Compact activity monitor for the window's terminals. Polls one shared
- * process sample while open — closing the panel stops all sampling. */
-function TerminalManager({
-  anchor,
-  terminals,
-  onOpen,
-  onClose,
-  onDismiss,
-}: {
-  anchor: RefObject<HTMLButtonElement | null>;
-  terminals: FooterTerminal[];
-  onOpen: (fileId: string) => void;
-  onClose?: (fileId: string) => void;
-  onDismiss: () => void;
-}) {
-  const [resources, setResources] = useState<PtyResource[] | null>(null);
-  const [killing, setKilling] = useState<ReadonlySet<string>>(new Set());
-  const inFlight = useRef(false);
-  /** Bumped by every request — a slower earlier response never overwrites
-   * a newer one (e.g. a pre-kill poll landing after the kill refresh),
-   * and only the newest request may clear the in-flight guard. */
-  const seq = useRef(0);
-
-  useEffect(() => {
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const poll = () => {
-      if (stopped) return;
-      // Hidden: stop the chain — visibilitychange re-arms it. In-flight:
-      // the active request's finally already schedules the next tick.
-      if (document.visibilityState !== "visible") return;
-      if (inFlight.current) {
-        timer = setTimeout(poll, RESOURCE_POLL_MS);
-        return;
-      }
-      inFlight.current = true;
-      const my = ++seq.current;
-      void getPtyResources()
-        .then((found) => {
-          if (seq.current === my) setResources(found);
-        })
-        .catch(() => undefined)
-        .finally(() => {
-          if (seq.current === my) inFlight.current = false;
-          if (!stopped) timer = setTimeout(poll, RESOURCE_POLL_MS);
-        });
-    };
-    const onVisible = () => {
-      if (document.visibilityState === "visible") poll();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    poll();
-    return () => {
-      stopped = true;
-      document.removeEventListener("visibilitychange", onVisible);
-      if (timer) clearTimeout(timer);
-    };
-  }, []);
-
-  const rows = mergeTerminalRows(terminals, resources);
-
-  const kill = (fileId: string) => {
-    inFlight.current = true;
-    const my = ++seq.current;
-    setKilling((prev) => new Set(prev).add(fileId));
-    void killPtyWorkload(fileId)
-      .then(() => getPtyResources())
-      .then((found) => {
-        if (seq.current === my) setResources(found);
-      })
-      .catch((error) => console.warn("Kill workload failed:", error))
-      .finally(() => {
-        if (seq.current === my) inFlight.current = false;
-        setKilling((prev) => {
-          const next = new Set(prev);
-          next.delete(fileId);
-          return next;
-        });
-      });
-  };
-
-  return (
-    <Popover
-      anchor={anchor}
-      side="top"
-      align="end"
-      autoFocus
-      tabIndex={-1}
-      onDismiss={onDismiss}
-      role="dialog"
-      aria-label="Terminals"
-      className="w-[22rem] overflow-y-auto overscroll-none p-1"
-    >
-      <div className="flex h-6 items-center px-2 text-[10px] font-medium uppercase tracking-wide text-content/40">
-        Terminals
-      </div>
-      {rows.map((row) => {
-        const process = row.top ?? row.foreground;
-        return (
-          <div
-            key={row.id}
-            className="flex h-8 items-center gap-2 rounded-lg px-2 text-[12px] leading-none text-content hover:bg-content/10"
-          >
-            <button
-              type="button"
-              className="flex min-w-0 flex-1 items-center gap-2 text-left"
-              title={
-                row.alive
-                  ? `${row.title} — ${row.cwd}` +
-                    (row.host === "wsl"
-                      ? ` · WSL ${row.distro ?? ""}`
-                      : "") +
-                    (row.processes ? ` · ${row.processes} processes` : "")
-                  : `${row.title} — exited`
-              }
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={() => onOpen(row.id)}
-            >
-              <span
-                className={`size-1.5 shrink-0 rounded-full ${
-                  row.alive
-                    ? row.workload
-                      ? "bg-emerald-400"
-                      : "bg-content/30"
-                    : "bg-content/15"
-                }`}
-                aria-hidden
-              />
-              <span className="min-w-0 flex-1 truncate">{row.title}</span>
-              {process ? (
-                <span className="max-w-[7rem] shrink-0 truncate font-mono text-[10px] text-content/50">
-                  {process}
-                </span>
-              ) : null}
-              <span className="min-w-24 shrink-0 text-right font-mono text-[10px] tabular-nums text-content/50">
-                {row.alive
-                  ? `${formatCpu(row.cpuPct)} · ${formatMem(row.rssBytes)}`
-                  : "exited"}
-              </span>
-            </button>
-            <span className="flex shrink-0 items-center gap-0.5 text-content/40">
-              <button
-                type="button"
-                className="grid size-5 place-items-center rounded hover:bg-content/15 hover:text-content disabled:opacity-30"
-                aria-label={`Stop processes in ${row.title}`}
-                title="Kill processes"
-                disabled={!row.workload || killing.has(row.id)}
-                onClick={() => kill(row.id)}
-              >
-                <Stop className="size-2.5" aria-hidden />
-              </button>
-              <button
-                type="button"
-                className="grid size-5 place-items-center rounded hover:bg-content/15 hover:text-content"
-                aria-label={`Close ${row.title}`}
-                title="Close terminal"
-                onClick={() => onClose?.(row.id)}
-              >
-                <X className="size-3" strokeWidth={1.75} aria-hidden />
-              </button>
-            </span>
-          </div>
-        );
-      })}
-    </Popover>
-  );
-}
-

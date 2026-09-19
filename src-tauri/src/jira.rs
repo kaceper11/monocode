@@ -7,10 +7,13 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
 static BACKOFF: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+static CONFIG_WRITES: crate::integration_config::ConfigWrites =
+    crate::integration_config::ConfigWrites::new();
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct JiraConfig {
@@ -25,19 +28,34 @@ pub(crate) struct JiraConfig {
 }
 
 #[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct JiraStatus {
     connected: bool,
     site: String,
     account: String,
+    account_id: String,
     capabilities: Vec<String>,
 }
 
 impl JiraConfig {
+    // Bind reads to the credential login, never the non-unique display name.
+    fn account_id(&self) -> String {
+        format!("email:{}", self.email.trim())
+    }
+
+    pub(crate) fn require_account(&self, expected: &str) -> Result<(), String> {
+        if expected != self.account_id() {
+            return Err("The Atlassian account changed. Refresh and reselect the item.".into());
+        }
+        Ok(())
+    }
+
     fn status(&self) -> JiraStatus {
         JiraStatus {
             connected: true,
             site: self.site.clone(),
             account: self.account.clone(),
+            account_id: self.account_id(),
             capabilities: self.capabilities.clone(),
         }
     }
@@ -104,14 +122,12 @@ pub async fn jira_set_config(
     email: String,
     token: String,
 ) -> Result<JiraStatus, String> {
+    let generation = CONFIG_WRITES.begin()?;
     tauri::async_runtime::spawn_blocking(move || {
         let path = config_path(&app)?;
         if token.is_empty() {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err("Cannot disconnect Jira".into()),
-            }
+            CONFIG_WRITES.commit(generation, &path, None)?;
+            let _ = app.emit("monocode:jira-change", ());
             return Ok(JiraStatus::default());
         }
         if email.trim().is_empty()
@@ -174,14 +190,9 @@ pub async fn jira_set_config(
             }
             (Err(jira_error), Err(_)) => return Err(jira_error.into()),
         }
-        fs::create_dir_all(path.parent().ok_or("Cannot locate Jira settings")?)
-            .map_err(|_| "Cannot create Jira settings")?;
         let raw = serde_json::to_string(&config).map_err(|_| "Cannot encode Jira settings")?;
-        // Same host-local credential storage as GitLab; never returned to the WebView.
-        let temporary = path.with_extension("tmp");
-        crate::gitlab::write_secret_file(&temporary, &raw)
-            .map_err(|_| "Cannot save Jira settings")?;
-        fs::rename(&temporary, path).map_err(|_| "Cannot save Jira settings")?;
+        CONFIG_WRITES.commit(generation, &path, Some(&raw))?;
+        let _ = app.emit("monocode:jira-change", ());
         Ok(config.status())
     })
     .await
@@ -355,9 +366,11 @@ fn issue_query(project: &str, filter: &str, assigned: bool, state: &str) -> Resu
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn jira_list_issues(
     app: AppHandle,
     site: String,
+    account_id: String,
     project: String,
     filter: String,
     assigned: bool,
@@ -365,6 +378,7 @@ pub async fn jira_list_issues(
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
+        config.require_account(&account_id)?;
         let jql = issue_query(&project, &filter, assigned, &state)?;
         let issues = issue_pages(|limit, token| {
             let mut query = vec![
@@ -380,6 +394,7 @@ pub async fn jira_list_issues(
             }
             request(&config, "search/jql", &query).map_err(String::from)
         })?;
+        require_config(&app, &site)?.require_account(&account_id)?;
         Ok(json!({ "site": config.site, "issues": issues }))
     })
     .await
@@ -416,9 +431,15 @@ fn issue_pages(
 }
 
 #[tauri::command]
-pub async fn jira_options(app: AppHandle, site: String, favorites: bool) -> Result<Value, String> {
+pub async fn jira_options(
+    app: AppHandle,
+    site: String,
+    account_id: String,
+    favorites: bool,
+) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
+        config.require_account(&account_id)?;
         let mut values = Vec::new();
         for _ in 0..10 {
             let mut query = vec![
@@ -455,6 +476,7 @@ pub async fn jira_options(app: AppHandle, site: String, favorites: bool) -> Resu
                 break;
             }
         }
+        require_config(&app, &site)?.require_account(&account_id)?;
         Ok(json!(values))
     })
     .await
@@ -465,15 +487,17 @@ pub async fn jira_options(app: AppHandle, site: String, favorites: bool) -> Resu
 pub async fn jira_issue_content(
     app: AppHandle,
     site: String,
+    account_id: String,
     id: String,
     comments: bool,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
+        config.require_account(&account_id)?;
         if !issue_ref(&id) {
             return Err("Invalid Jira issue identity".into());
         }
-        if comments {
+        let result = if comments {
             request(
                 &config,
                 &format!("issue/{id}/comment"),
@@ -486,7 +510,9 @@ pub async fn jira_issue_content(
                 &[("fields", "description,creator,attachment".into())],
             )
         }
-        .map_err(String::from)
+        .map_err(String::from)?;
+        require_config(&app, &site)?.require_account(&account_id)?;
+        Ok(result)
     })
     .await
     .map_err(|_| "Jira details task failed")?
@@ -496,14 +522,16 @@ pub async fn jira_issue_content(
 pub async fn jira_issue_snapshot(
     app: AppHandle,
     site: String,
+    account_id: String,
     id: String,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
+        config.require_account(&account_id)?;
         if !issue_ref(&id) {
             return Err("Invalid Jira issue identity".into());
         }
-        request(
+        let result = request(
             &config,
             &format!("issue/{id}"),
             &[(
@@ -511,88 +539,12 @@ pub async fn jira_issue_snapshot(
                 "summary,status,updated,project,labels,assignee".into(),
             )],
         )
-        .map_err(String::from)
+        .map_err(String::from)?;
+        require_config(&app, &site)?.require_account(&account_id)?;
+        Ok(result)
     })
     .await
     .map_err(|_| "Jira snapshot task failed")?
-}
-
-/// Directional link wording stays provider-native; the key only picks a group.
-fn relation_key(name: &str, outward: bool) -> String {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "blocks" | "block" | "blocking" => if outward { "blocks" } else { "blocked-by" }.into(),
-        "duplicate" | "duplicates" | "duplicate of" => "duplicate".into(),
-        "relates" | "relates to" | "related" => "related".into(),
-        other => other.to_string(),
-    }
-}
-
-fn push_edge(edges: &mut Vec<Value>, key: &str, label: &str, issue: &Value) -> bool {
-    if edges.len() >= 50 {
-        return false;
-    }
-    edges.push(json!({
-        "key": key,
-        "label": label,
-        "ref": issue["key"].as_str().unwrap_or_default(),
-        "item": issue,
-    }));
-    true
-}
-
-fn relation_edges(fields: &Value) -> (Vec<Value>, bool) {
-    let mut edges = Vec::new();
-    let mut truncated = false;
-    if fields["parent"]["key"].is_string() {
-        truncated |= !push_edge(&mut edges, "parent", "Parent", &fields["parent"]);
-    }
-    if let Some(subtasks) = fields["subtasks"].as_array() {
-        truncated |= subtasks.len() > 50;
-        for subtask in subtasks.iter().take(50) {
-            truncated |= !push_edge(&mut edges, "children", "Sub-task", subtask);
-        }
-    }
-    if let Some(links) = fields["issuelinks"].as_array() {
-        truncated |= links.len() > 50;
-        for link in links.iter().take(50) {
-            let (outward, linked) = if link["outwardIssue"].is_object() {
-                (true, &link["outwardIssue"])
-            } else if link["inwardIssue"].is_object() {
-                (false, &link["inwardIssue"])
-            } else {
-                continue;
-            };
-            let name = link["type"]["name"].as_str().unwrap_or("Related");
-            let label = link["type"][if outward { "outward" } else { "inward" }]
-                .as_str()
-                .unwrap_or("related");
-            truncated |= !push_edge(&mut edges, &relation_key(name, outward), label, linked);
-        }
-    }
-    (edges, truncated)
-}
-
-#[tauri::command]
-pub async fn jira_issue_relations(
-    app: AppHandle,
-    site: String,
-    id: String,
-) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let config = require_config(&app, &site)?;
-        if !issue_ref(&id) {
-            return Err("Invalid Jira issue identity".into());
-        }
-        let issue = request(
-            &config,
-            &format!("issue/{id}"),
-            &[("fields", "parent,subtasks,issuelinks".into())],
-        )?;
-        let (edges, truncated) = relation_edges(&issue["fields"]);
-        Ok(json!({ "edges": edges, "truncated": truncated }))
-    })
-    .await
-    .map_err(|_| "Jira relations task failed")?
 }
 
 fn image_on_issue(issue: &Value, attachment_id: &str) -> bool {
@@ -613,11 +565,13 @@ fn image_on_issue(issue: &Value, attachment_id: &str) -> bool {
 pub async fn jira_image(
     app: AppHandle,
     site: String,
+    account_id: String,
     id: String,
     attachment_id: String,
 ) -> Result<tauri::ipc::Response, String> {
     let bytes = tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
+        config.require_account(&account_id)?;
         if !issue_ref(&id) || !numeric_id(&attachment_id) {
             return Err("Invalid Jira image identity".into());
         }
@@ -639,9 +593,10 @@ pub async fn jira_image(
                 ("height", "600".into()),
             ],
         )?;
-        if crate::inbox_context::image_mime(&bytes).is_none() {
+        if crate::inbox_media::image_mime(&bytes).is_none() {
             return Err("Jira did not return a supported image preview".into());
         }
+        require_config(&app, &site)?.require_account(&account_id)?;
         Ok::<_, String>(bytes)
     })
     .await
@@ -652,6 +607,21 @@ pub async fn jira_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_identity_uses_the_credential_login_not_display_name() {
+        let config: JiraConfig = serde_json::from_value(json!({
+            "site": "https://team.atlassian.net", "email": "ada@example.test",
+            "token": "test-only", "account": "Same Name"
+        }))
+        .unwrap();
+        assert_eq!(config.status().account_id, "email:ada@example.test");
+        assert!(config.require_account("email:ada@example.test").is_ok());
+        for foreign in ["", "Same Name", "email:other@example.test"] {
+            assert!(config.require_account(foreign).is_err());
+        }
+    }
+
     #[test]
     fn image_preview_requires_membership_and_image_type() {
         let issue = json!({"fields":{"attachment":[{"id":"12","mimeType":"image/png"},{"id":"13","mimeType":"text/html"}]}});
@@ -723,46 +693,5 @@ mod tests {
         }
         assert!(http_error(401).contains("Reconnect"));
         assert!(http_error(403).contains("permissions"));
-    }
-
-    #[test]
-    fn relation_edges_keep_direction_and_provider_labels() {
-        let fields = json!({
-            "parent": {"id":"1","key":"ENG-1","fields":{"summary":"Epic"}},
-            "subtasks": [{"id":"2","key":"ENG-2","fields":{"summary":"Sub"}}],
-            "issuelinks": [
-                {"type":{"name":"Blocks","inward":"is blocked by","outward":"blocks"},
-                 "outwardIssue":{"id":"3","key":"ENG-3","fields":{"summary":"Downstream"}}},
-                {"type":{"name":"Blocks","inward":"is blocked by","outward":"blocks"},
-                 "inwardIssue":{"id":"4","key":"ENG-4","fields":{"summary":"Upstream"}}},
-                {"type":{"name":"Cloners","inward":"is cloned by","outward":"clones"},
-                 "inwardIssue":{"id":"5","key":"ENG-5","fields":{"summary":"Clone"}}},
-                {"type":{"name":"Blocks","inward":"is blocked by","outward":"blocks"}}
-            ]
-        });
-        let (edges, truncated) = relation_edges(&fields);
-        assert!(!truncated);
-        let rows: Vec<(&str, &str, &str)> = edges
-            .iter()
-            .map(|e| {
-                (
-                    e["key"].as_str().unwrap(),
-                    e["label"].as_str().unwrap(),
-                    e["ref"].as_str().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            rows,
-            [
-                ("parent", "Parent", "ENG-1"),
-                ("children", "Sub-task", "ENG-2"),
-                ("blocks", "blocks", "ENG-3"),
-                ("blocked-by", "is blocked by", "ENG-4"),
-                ("cloners", "is cloned by", "ENG-5"),
-            ]
-        );
-        // A link with no readable issue is skipped, never faked.
-        assert_eq!(edges.len(), 5);
     }
 }

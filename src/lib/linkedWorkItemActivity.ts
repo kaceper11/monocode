@@ -1,9 +1,9 @@
 import {
   githubReviewStateLabel,
   type GithubWorkItemComment,
-  type GithubWorkItemThread,
   type InboxProvider,
 } from "./githubTasks";
+import type { InboxThread } from "./inboxProvider";
 import type { LinkedSessionUpdate } from "./linkedSessionUpdates";
 
 export type LinkedWorkItemActivityKind =
@@ -29,6 +29,7 @@ export type LinkedWorkItemTerminalState =
 
 /** In-memory, one-shot context shown when an updated linked session is opened. */
 export type LinkedWorkItemUpdateCard = {
+  key: string;
   provider: InboxProvider;
   kind: "issue" | "pr";
   repo: string;
@@ -53,7 +54,7 @@ const EMPTY_COUNTS: LinkedWorkItemActivityCounts = {
   commits: 0,
 };
 
-export const LINKED_PROVIDER_NAMES: Record<InboxProvider, string> = {
+const LINKED_PROVIDER_NAMES: Record<InboxProvider, string> = {
   github: "GitHub",
   gitlab: "GitLab",
   jira: "Jira",
@@ -88,10 +89,20 @@ export function linkedWorkItemNoun(
   return provider === "azure" ? "work item" : "issue";
 }
 
+/** Account, item and revision must still match when an async read finishes. */
+export function linkedWorkItemActivityKey(update: LinkedSessionUpdate): string {
+  const item = update.item;
+  return JSON.stringify([
+    item.provider ?? "github", item.account ?? "", item.repo, item.kind,
+    item.number, item.url, update.updatedAt,
+  ]);
+}
+
 export function pendingLinkedWorkItemUpdateCard(
   update: LinkedSessionUpdate,
 ): LinkedWorkItemUpdateCard {
   return {
+    key: linkedWorkItemActivityKey(update),
     provider: update.item.provider ?? "github",
     kind: update.item.kind === "pr" ? "pr" : "issue",
     repo: update.item.repo,
@@ -134,47 +145,33 @@ function flattenComments(
   ]);
 }
 
-/**
- * Provider comment kinds differ: GitHub keeps formal "review" and per-line
- * "review_comment"; every other provider's thread read emits plain
- * "comment" kinds only.
- */
-function entryKind(comment: GithubWorkItemComment): LinkedWorkItemActivityKind {
-  if (comment.kind === "review") return "review";
-  if (comment.kind === "review_comment") return "review_comment";
-  return "comment";
-}
-
-function entryText(
-  provider: InboxProvider,
-  comment: GithubWorkItemComment,
-): string {
-  if (provider === "github" && comment.kind === "review") {
-    return concise(
-      [githubReviewStateLabel(comment.state), comment.body]
-        .filter(Boolean)
-        .join(": "),
-    );
-  }
-  return concise(comment.body);
-}
-
 export function completeLinkedWorkItemUpdateCard(
   card: LinkedWorkItemUpdateCard,
-  thread: GithubWorkItemThread,
+  thread: InboxThread,
 ): LinkedWorkItemUpdateCard {
   const comments = flattenComments(thread.comments ?? []).filter((comment) =>
     after(comment.createdAt, card.since),
   );
-  const commits = (thread.commits ?? []).filter((commit) =>
+  const commits = (("commits" in thread ? thread.commits : []) ?? []).filter((commit) =>
     after(commit.committedDate, card.since),
   );
   const entries: LinkedWorkItemActivityEntry[] = [
     ...comments.map((comment) => ({
       id: comment.id,
-      kind: entryKind(comment),
+      kind: (comment.kind === "review"
+        ? "review"
+        : comment.kind === "review_comment"
+          ? "review_comment"
+          : "comment") as LinkedWorkItemActivityKind,
       author: comment.author,
-      text: entryText(card.provider, comment),
+      text:
+        comment.kind === "review"
+          ? concise(
+              [githubReviewStateLabel(comment.state), comment.body]
+                .filter(Boolean)
+                .join(": "),
+            )
+          : concise(comment.body),
       createdAt: comment.createdAt,
       url: comment.url,
     })),
@@ -194,11 +191,8 @@ export function completeLinkedWorkItemUpdateCard(
     ...card,
     status: "ready",
     counts: {
-      comments: comments.filter(
-        (comment) => entryKind(comment) !== "review",
-      ).length,
-      reviews: comments.filter((comment) => entryKind(comment) === "review")
-        .length,
+      comments: comments.filter((comment) => comment.kind !== "review").length,
+      reviews: comments.filter((comment) => comment.kind === "review").length,
       commits: commits.length,
     },
     entries,
@@ -237,8 +231,7 @@ export function linkedWorkItemTerminalState(card: {
         : undefined;
     }
     if (provider === "azure") {
-      return stateType === "completed" || state === "closed" ||
-          state === "done" || state === "resolved" || state === "removed"
+      return stateType === "completed" || stateType === "removed"
         ? "issue_closed"
         : undefined;
     }

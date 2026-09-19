@@ -1,14 +1,4 @@
-import { looksLikeProject, pathKey, slash } from "./paths";
-import {
-  groupRailProjectsByMembership,
-  loadProjects,
-  projectRailKey,
-  type ProjectRecord,
-  type RailProjectItem,
-} from "./projects";
-import { getVerifiedFamilies, groupRepositoryFamilies, type RepositoryFamily } from "./repositoryFamilies";
-
-export { looksLikeProject };
+import { pathKey, prettyCwd, slash } from "./paths";
 
 const KEY = "monocode.recentProjects";
 const RAIL_ORDER_KEY = "monocode.projectRailOrder";
@@ -39,17 +29,10 @@ export function sameProjectPath(a: string, b: string): boolean {
   return pathKey(a) === pathKey(b);
 }
 
-/** Cache on the raw storage string like loadProjects — the rail and
- * worktree panel call this on render paths and the parse is the same
- * every call until something saves. */
-let recentsCacheRaw: string | null | undefined;
-let recentsCache: RecentProject[] = [];
-
 export function loadRecents(): RecentProject[] {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return [];
-    if (raw === recentsCacheRaw) return recentsCache;
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
     const out: RecentProject[] = [];
@@ -63,9 +46,7 @@ export function loadRecents(): RecentProject[] {
           : 0;
       out.push({ path: normalize(rec.path), openedAt });
     }
-    recentsCache = out;
-    recentsCacheRaw = raw;
-    return recentsCache;
+    return out;
   } catch {
     return [];
   }
@@ -110,47 +91,6 @@ function dropFromRail(path: string): RecentProject[] {
 export function forgetProject(path: string): RecentProject[] {
   dropArchived(path);
   return dropFromRail(path);
-}
-
-type RemovedWorktree = { path: string; replacement: string };
-const removedWorktreeListeners = new Set<(change: RemovedWorktree) => void>();
-export function subscribeRemovedWorktree(
-  listener: (change: RemovedWorktree) => void,
-) {
-  removedWorktreeListeners.add(listener);
-  return () => {
-    removedWorktreeListeners.delete(listener);
-  };
-}
-
-/** After confirmed Git removal, retain the repository's rail slot and pin on a
- * surviving checkout. Session paths/history are deliberately untouched. */
-export function forgetRemovedWorktree(path: string, replacement: string) {
-  const replace = (value: string) =>
-    sameProjectPath(value, path) ? normalize(replacement) : value;
-  const remap = (paths: string[]) => {
-    const seen = new Set<string>();
-    return paths.map(replace).filter((value) => {
-      const key = pathKey(value);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  };
-  const recents = new Map<string, RecentProject>();
-  for (const item of loadRecents()) {
-    const target = replace(item.path);
-    const key = pathKey(target);
-    const previous = recents.get(key);
-    if (!previous) recents.set(key, { ...item, path: target });
-    else previous.openedAt = Math.max(previous.openedAt, item.openedAt);
-  }
-  save([...recents.values()]);
-  saveProjectRailOrder(remap(loadProjectRailOrder()));
-  savePinnedProjects(remap(loadPinnedProjects()));
-  dropArchived(path);
-  for (const listener of removedWorktreeListeners)
-    listener({ path, replacement });
 }
 
 /** Removes a project from the rail and files it in the archive (Archive). */
@@ -226,15 +166,9 @@ export function lastProjectPath(): string | null {
   return null;
 }
 
-/** Ask the app shell to open a project at `path` (e.g. a prepared PR checkout). */
-export const OPEN_PROJECT_PATH = "monocode:open-project-path";
-export function openProjectPath(path: string) {
-  window.dispatchEvent(new CustomEvent(OPEN_PROJECT_PATH, { detail: path }));
-}
-
 export type ProjectRailSections = {
-  pinned: RailProjectItem[];
-  projects: RailProjectItem[];
+  pinned: RecentProject[];
+  projects: RecentProject[];
 };
 
 function readPathList(key: string): string[] {
@@ -349,20 +283,8 @@ export function projectRailSections(
   currentCwd: string,
   order: string[],
   pinnedPaths: string[],
-  families: ReadonlyMap<string, RepositoryFamily> = getVerifiedFamilies(),
-  storedProjects: readonly ProjectRecord[] = loadProjects(),
 ): ProjectRailSections {
   const projects = collectRailProjects(recents, currentCwd);
-  // Stored projects keep their rail row from the anchor even when no member
-  // path is a recent; the anchor keys saved order, pins and appearance.
-  for (const project of storedProjects) {
-    const key = pathKey(project.anchor ?? projectRailKey(project.id));
-    if (!projects.has(key))
-      projects.set(key, {
-        path: project.anchor ?? projectRailKey(project.id),
-        openedAt: 0,
-      });
-  }
   const syncedOrder = syncProjectRailOrder(order, projects);
   const pinnedSet = new Set(pinnedPaths.map(pathKey));
   const pinned: RecentProject[] = [];
@@ -374,18 +296,14 @@ export function projectRailSections(
     if (pinnedSet.has(key)) pinned.push(item);
     else unpinned.push(item);
   }
-  return groupRailProjectsByMembership(
-    groupRepositoryFamilies({ pinned, projects: unpinned }, families),
-    families,
-    storedProjects,
-  );
+  return { pinned, projects: unpinned };
 }
 
 /** Recents plus the current folder when it is a project not yet remembered. */
 export function projectRailItems(
   recents: RecentProject[],
   currentCwd: string,
-): RailProjectItem[] {
+): RecentProject[] {
   const projects = collectRailProjects(recents, currentCwd);
   const order = syncProjectRailOrder(loadProjectRailOrder(), projects);
   const { pinned, projects: unpinned } = projectRailSections(
@@ -395,4 +313,16 @@ export function projectRailItems(
     loadPinnedProjects(),
   );
   return [...pinned, ...unpinned];
+}
+
+/** True if this looks like a user project, not an app bundle or system root. */
+export function looksLikeProject(path: string): boolean {
+  if (!path || path === "/" || path === "~") return false;
+  const normalized = slash(path).replace(/\/+$/, "") || "/";
+  if (/^[A-Za-z]:$/.test(normalized) || normalized === "/") return false;
+  // Home itself arrives expanded (`/Users/me`), so the `~` check above misses
+  // it. Indexing it walks `~/Library`, which trips the OS consent prompt.
+  if (prettyCwd(path) === "~") return false;
+  if (path.includes(".app/") || path.includes(".app\\")) return false;
+  return true;
 }

@@ -9,7 +9,7 @@ vi.mock("./pty", () => ({
   getPtyStatus: (...args: unknown[]) => getPtyStatus(...args),
 }));
 
-vi.mock("./dialogs", () => ({
+vi.mock("@tauri-apps/plugin-dialog", () => ({
   ask: (...args: unknown[]) => ask(...args),
 }));
 

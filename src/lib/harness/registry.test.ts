@@ -4,11 +4,9 @@ import type { HarnessId } from "../session";
 import {
   HARNESS_IDLE_PARK_MS,
   canCompactHarnessContext,
-  canSteerHarnessSession,
   compactHarnessContext,
   isLiveHarness,
   listHarnesses,
-  prewarmHarness,
   refreshHarnessCatalogs,
   registerHarness,
   resetHarnessIdlePark,
@@ -39,15 +37,6 @@ function stub(
 }
 
 describe("harness registry", () => {
-  it("requires explicit live-session readiness before steering", () => {
-    registerHarness(stub("claude"));
-    expect(canSteerHarnessSession("claude", "cold")).toBe(false);
-    registerHarness(stub("claude", { canSteerSession: (id) => id === "running" }));
-    expect(canSteerHarnessSession("claude", "cold")).toBe(false);
-    expect(canSteerHarnessSession("claude", "running")).toBe(true);
-    registerHarness(stub("claude", { canSteer: false, canSteerSession: () => true }));
-    expect(canSteerHarnessSession("claude", "running")).toBe(false);
-  });
   afterEach(() => {
     resetHarnessModelOverlays();
     resetHarnessIdlePark();
@@ -186,39 +175,7 @@ describe("harness registry", () => {
     expect(stopSession).toHaveBeenCalledWith("s1");
   });
 
-  it("prewarms through the adapter and parks the warmed child on idle", async () => {
-    vi.useFakeTimers();
-    const prewarm = vi.fn(async () => undefined);
-    const stopSession = vi.fn(async () => undefined);
-    registerHarness(stub("cursor", { prewarm, stopSession }));
 
-    await prewarmHarness({
-      harness: "cursor",
-      sessionId: "s2",
-      cwd: "/tmp",
-      model: "cursor:composer-2.5",
-      runtimeMode: "supervised",
-      onEvent: () => undefined,
-    });
-
-    expect(prewarm).toHaveBeenCalledOnce();
-    await vi.advanceTimersByTimeAsync(HARNESS_IDLE_PARK_MS);
-    expect(stopSession).toHaveBeenCalledWith("s2");
-  });
-
-  it("prewarm is a no-op for adapters without support", async () => {
-    registerHarness(stub("cursor"));
-    await expect(
-      prewarmHarness({
-        harness: "cursor",
-        sessionId: "s3",
-        cwd: "/tmp",
-        model: "cursor:composer-2.5",
-        runtimeMode: "supervised",
-        onEvent: () => undefined,
-      }),
-    ).resolves.toBeUndefined();
-  });
 
   it("a park timer armed mid-turn cannot kill the running session", async () => {
     vi.useFakeTimers();
@@ -254,7 +211,7 @@ describe("harness registry", () => {
     expect(stopSession).toHaveBeenCalledWith("s4");
   });
 
-  it.each(["prewarm", "compact", "steer"] as const)(
+  it.each(["compact", "steer"] as const)(
     "does not idle-park during a pending %s operation",
     async (operation) => {
       vi.useFakeTimers();
@@ -265,12 +222,6 @@ describe("harness registry", () => {
       const stopSession = vi.fn(async () => undefined);
       registerHarness(
         stub("codex", {
-          prewarm: vi
-            .fn()
-            .mockImplementationOnce(() =>
-              operation === "prewarm" ? pending : Promise.resolve(),
-            )
-            .mockResolvedValue(undefined),
           compactContext: () => pending,
           steerTurn: () => pending,
           stopSession,
@@ -285,19 +236,15 @@ describe("harness registry", () => {
         text: "follow up",
         onEvent: () => undefined,
       };
-      // A concurrent warmup can finish and arm the idle timer first.
-      const warmup = prewarmHarness(input);
-      const active =
-        operation === "prewarm"
-          ? warmup
-          : operation === "compact"
-            ? compactHarnessContext(input)
-            : steerHarnessTurn(input);
-      await prewarmHarness(input);
+      const active = operation === "compact"
+        ? compactHarnessContext(input)
+        : steerHarnessTurn(input);
+      // A concurrent send can finish and arm the idle timer first.
+      await sendHarnessTurn(input);
       await vi.advanceTimersByTimeAsync(HARNESS_IDLE_PARK_MS * 2);
       expect(stopSession).not.toHaveBeenCalled();
       finish();
-      await Promise.all([warmup, active]);
+      await active;
       await vi.advanceTimersByTimeAsync(HARNESS_IDLE_PARK_MS);
       expect(stopSession).toHaveBeenCalledExactlyOnceWith("busy-operation");
     },

@@ -1,3 +1,4 @@
+import { browserDockBand, type BrowserMetaPatch } from "../lib/browserWorkspace";
 import {
   memo,
   useCallback,
@@ -21,7 +22,6 @@ import {
   layoutLeaves,
   layoutSashes,
   setSplitRatio,
-  type BrowserMetaPatch,
   type EditorPane,
   type LayoutNode,
   type LayoutRect,
@@ -40,15 +40,15 @@ import {
   type PlanBuildTarget,
   type RuntimeMode,
   type Session,
+  type WorkspaceMode,
   type ComposerTurnOptions,
 } from "../lib/session";
 import { FilePane } from "./FilePane";
 import { SessionPane } from "./SessionPane";
-import { SessionSurface } from "./SessionSurface";
 import type { SessionFolderTarget } from "../lib/sessionFolders";
+import type { Worktree } from "../lib/worktrees";
 
 type Shared = {
-  sessionPortal?: { sessionId: string; host: HTMLElement };
   visible: boolean;
   sessions: Session[];
   editorPanes: EditorPane[];
@@ -57,6 +57,7 @@ type Shared = {
   focusedId: string;
   addToChatSessionId?: string;
   composerFocused: boolean;
+  composerFocusToken?: number;
   recents: RecentProject[];
   hideProjectPicker?: boolean;
   onFocus: (paneId: string) => void;
@@ -68,8 +69,16 @@ type Shared = {
   onFileDirtyChange: (fileId: string, dirty: boolean) => void;
   onFileErrorCountChange: (fileId: string, count: number) => void;
   onRatio: (splitId: string, index: number, ratio: number) => void;
-  onCwdChange: (sessionId: string, cwd: string, fresh?: boolean) => void;
+  onCwdChange: (sessionId: string, cwd: string) => void;
   onBranchChange: (sessionId: string) => void;
+  onWorktreeChange?: (sessionId: string, tree: Worktree) => Promise<void>;
+  onWorkspaceModeChange: (
+    sessionId: string,
+    mode: WorkspaceMode,
+    base?: string,
+  ) => void;
+  onWorktreeBaseChange: (sessionId: string, base: string) => void;
+  onManageWorktrees?: () => void;
   onModelChange: (sessionId: string, harness: HarnessId, model: string) => void;
   onModelSettingsChange: (
     sessionId: string,
@@ -81,7 +90,12 @@ type Shared = {
     text: string,
     attachments: Attachment[],
     options?: ComposerTurnOptions,
-  ) => boolean | Promise<boolean>;
+  ) => boolean | void;
+  onSaveDraft: (
+    sessionId: string,
+    text: string,
+    attachments: Attachment[],
+  ) => boolean | void;
   onStop: (sessionId: string) => void;
   onCompactContext: (sessionId: string) => boolean;
   onPlaceSessionInFolder: (
@@ -97,12 +111,7 @@ type Shared = {
   onQueuedMessageEditingChange: (sessionId: string, messageId?: string) => void;
   onSteerQueuedMessage: (sessionId: string, messageId: string) => void;
   onResumeQueue: (sessionId: string) => void;
-  onAddIssues?: (sessionId: string) => void;
-  onOpenTaskChild?: (taskId: string, childId: string) => void;
-  onRetryTaskChild?: (taskId: string, childId: string) => void;
-  onSetupTaskChild?: (taskId: string, childId: string) => void;
-  needsInputSessionIds?: ReadonlySet<string>;
-  onInboxCardDismiss?: (sessionId: string, fileId?: string) => void;
+  onInboxCardDismiss?: (sessionId: string) => void;
   onLinkedWorkItemUpdateCardDismiss?: (sessionId: string) => void;
   onNoteCardDismiss?: (sessionId: string) => void;
   onHandoffCardDismiss?: (sessionId: string) => void;
@@ -146,16 +155,8 @@ type Shared = {
     position: TitleTabDropPosition,
   ) => void;
   onNewTerminal: (sessionId: string) => void;
-  onTerminalMetaChange?: (fileId: string, patch: TerminalMetaPatch) => void;
   onBrowserMetaChange?: (fileId: string, patch: BrowserMetaPatch) => void;
-  onRunAgentAction?: (args: {
-    sourceSessionId: string;
-    cwd: string;
-    harness: HarnessId;
-    model: string;
-    text: string;
-    action: import("../lib/agentActions").ActionRunRef;
-  }) => void;
+  onTerminalMetaChange?: (fileId: string, patch: TerminalMetaPatch) => void;
 };
 
 type Props = Shared & { layout: LayoutNode };
@@ -167,75 +168,8 @@ type PaneDrag = {
 };
 
 const DRAG_THRESHOLD = 5;
-/** Compact dock size while a browser is expanded: ~24rem, capped at a
- * fraction of the pane area so the dock never dominates a small window. */
-const DOCK_PX = 24 * 16;
-const DOCK_FRAC = 0.4;
-
-/** A leaf docked while a browser is expanded keeps the edge it already
- * hugs, shrunk to a compact band; the expanded pane fills the rest. */
-type DockBand = {
-  side: "left" | "right" | "top" | "bottom";
-  agent: LayoutRect;
-  rest: LayoutRect;
-};
-
-function dockBand(
-  rect: LayoutRect,
-  tree: { w: number; h: number },
-): DockBand {
-  const E = 1e-3;
-  let side: DockBand["side"];
-  if (rect.h > 1 - E && rect.y < E) {
-    side = rect.x + rect.w / 2 < 0.5 ? "left" : "right";
-  } else if (rect.w > 1 - E && rect.x < E) {
-    side = rect.y + rect.h / 2 < 0.5 ? "top" : "bottom";
-  } else {
-    const d = {
-      left: rect.x,
-      right: 1 - rect.x - rect.w,
-      top: rect.y,
-      bottom: 1 - rect.y - rect.h,
-    };
-    side = (Object.keys(d) as DockBand["side"][]).reduce((a, b) =>
-      d[a] <= d[b] ? a : b,
-    );
-  }
-  const span = tree.w > 0 ? Math.min(DOCK_PX / tree.w, DOCK_FRAC) : DOCK_FRAC;
-  const spanY =
-    tree.h > 0 ? Math.min(DOCK_PX / tree.h, DOCK_FRAC) : DOCK_FRAC;
-  const w = Math.min(rect.w, span);
-  const h = Math.min(rect.h, spanY);
-  switch (side) {
-    case "left":
-      return {
-        side,
-        agent: { x: 0, y: 0, w, h: 1 },
-        rest: { x: w, y: 0, w: 1 - w, h: 1 },
-      };
-    case "right":
-      return {
-        side,
-        agent: { x: 1 - w, y: 0, w, h: 1 },
-        rest: { x: 0, y: 0, w: 1 - w, h: 1 },
-      };
-    case "top":
-      return {
-        side,
-        agent: { x: 0, y: 0, w: 1, h },
-        rest: { x: 0, y: h, w: 1, h: 1 - h },
-      };
-    default:
-      return {
-        side,
-        agent: { x: 0, y: 1 - h, w: 1, h },
-        rest: { x: 0, y: 0, w: 1, h: 1 - h },
-      };
-  }
-}
 
 function PaneTreeComponent({
-  sessionPortal,
   visible,
   layout,
   sessions,
@@ -245,6 +179,7 @@ function PaneTreeComponent({
   focusedId,
   addToChatSessionId,
   composerFocused,
+  composerFocusToken,
   recents,
   hideProjectPicker,
   onFocus,
@@ -258,9 +193,14 @@ function PaneTreeComponent({
   onRatio,
   onCwdChange,
   onBranchChange,
+  onWorktreeChange,
+  onWorkspaceModeChange,
+  onWorktreeBaseChange,
+  onManageWorktrees,
   onModelChange,
   onModelSettingsChange,
   onRuntimeModeChange,
+  onSaveDraft,
   onSubmit,
   onStop,
   onCompactContext,
@@ -270,11 +210,6 @@ function PaneTreeComponent({
   onQueuedMessageEditingChange,
   onSteerQueuedMessage,
   onResumeQueue,
-  onAddIssues,
-  onOpenTaskChild,
-  onRetryTaskChild,
-  onSetupTaskChild,
-  needsInputSessionIds,
   onInboxCardDismiss,
   onLinkedWorkItemUpdateCardDismiss,
   onNoteCardDismiss,
@@ -298,7 +233,6 @@ function PaneTreeComponent({
   onNewTerminal,
   onTerminalMetaChange,
   onBrowserMetaChange,
-  onRunAgentAction,
 }: Props) {
   const treeRef = useRef<HTMLDivElement>(null);
   const layoutRef = useRef(layout);
@@ -317,19 +251,6 @@ function PaneTreeComponent({
   useEffect(() => {
     setDraft(null);
   }, [layout]);
-
-  // The expanded-browser dock needs pixel bounds; rects stay fractional.
-  const [treeSize, setTreeSize] = useState({ w: 0, h: 0 });
-  useEffect(() => {
-    const el = treeRef.current;
-    if (!el) return;
-    const update = () =>
-      setTreeSize({ w: el.clientWidth, h: el.clientHeight });
-    update();
-    const observer = new ResizeObserver(update);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
 
   // A sash drag re-renders this tree every frame. `SessionPane` compares props
   // shallowly, so handing it a fresh drag handler each frame would re-render
@@ -350,6 +271,8 @@ function PaneTreeComponent({
   const leaves = layoutLeaves(tree);
   const sashes = layoutSashes(tree);
   const inSplit = leaves.length > 1;
+
+  const [treeSize, setTreeSize] = useState({ w: 0, h: 0 });
   // A browser tab flagged `expanded` zooms its leaf over the tree —
   // tmux-style pane zoom — while the focused session keeps its own edge,
   // shrunk to a compact dock band; everything else stays covered.
@@ -371,7 +294,7 @@ function PaneTreeComponent({
     : undefined;
   const chatRect = leaves.find((leaf) => leaf.id === chatLeafId)?.rect;
   const band =
-    expandedLeafId && chatRect ? dockBand(chatRect, treeSize) : null;
+    expandedLeafId && chatRect ? browserDockBand(chatRect, treeSize) : null;
   // A session spanning nearly the whole area leaves a useless sliver —
   // expand fully and let it stay covered instead.
   const dock = band && band.rest.w > 0.05 && band.rest.h > 0.05 ? band : null;
@@ -383,6 +306,20 @@ function PaneTreeComponent({
         bottom: "border-t",
       }[dock.side]
     : "";
+
+  // The expanded-browser dock needs pixel bounds; rects stay fractional.
+  useEffect(() => {
+    if (!expandedLeafId || !visible) return;
+    const el = treeRef.current;
+    if (!el) return;
+    const update = () =>
+      setTreeSize({ w: el.clientWidth, h: el.clientHeight });
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [expandedLeafId, visible]);
+
 
   const startPaneDrag = useCallback(
     (fromId: string, event: ReactPointerEvent<HTMLElement>) => {
@@ -517,7 +454,8 @@ function PaneTreeComponent({
               <FilePane
                 pane={editorPane}
                 visible={visible}
-                occluded={!!expandedLeafId && !expanded}
+                browserOccluded={!!expandedLeafId && !expanded}
+                onBrowserMetaChange={onBrowserMetaChange}
                 focused={focusedId === editorPane.id}
                 dirtyFileIds={dirtyFileIds}
                 fileErrorCounts={fileErrorCounts}
@@ -535,10 +473,8 @@ function PaneTreeComponent({
                 editorNavigation={editorNavigation}
                 onPaneDragStart={onPaneDragStart}
                 onTerminalMetaChange={onTerminalMetaChange}
-                onBrowserMetaChange={onBrowserMetaChange}
               />
             ) : session ? (
-              <SessionSurface host={sessionPortal?.sessionId === session.id ? sessionPortal.host : undefined}>
               <SessionPane
                 session={session}
                 reviewUndoLocked={sessions.some(
@@ -550,20 +486,26 @@ function PaneTreeComponent({
                       sessionWorkCwd(session),
                     ),
                 )}
-                visible={visible || sessionPortal?.sessionId === session.id}
-                focused={focusedId === session.id || sessionPortal?.sessionId === session.id}
+                visible={visible}
+                focused={focusedId === session.id}
                 addToChatTarget={addToChatSessionId === session.id}
                 inSplit={inSplit}
                 composerFocused={composerFocused}
+                composerFocusToken={composerFocusToken}
                 recents={recents}
                 hideProjectPicker={hideProjectPicker}
                 onFocus={onFocus}
                 onClose={onClose}
                 onCwdChange={onCwdChange}
                 onBranchChange={onBranchChange}
+                onWorktreeChange={onWorktreeChange}
+                onWorkspaceModeChange={onWorkspaceModeChange}
+                onWorktreeBaseChange={onWorktreeBaseChange}
+                onManageWorktrees={onManageWorktrees}
                 onModelChange={onModelChange}
                 onModelSettingsChange={onModelSettingsChange}
                 onRuntimeModeChange={onRuntimeModeChange}
+                onSaveDraft={onSaveDraft}
                 onSubmit={onSubmit}
                 onStop={onStop}
                 onCompactContext={onCompactContext}
@@ -573,11 +515,6 @@ function PaneTreeComponent({
                 onQueuedMessageEditingChange={onQueuedMessageEditingChange}
                 onSteerQueuedMessage={onSteerQueuedMessage}
                 onResumeQueue={onResumeQueue}
-                onAddIssues={onAddIssues}
-                onOpenTaskChild={onOpenTaskChild}
-                onRetryTaskChild={onRetryTaskChild}
-                onSetupTaskChild={onSetupTaskChild}
-                needsInputSessionIds={needsInputSessionIds}
                 onInboxCardDismiss={onInboxCardDismiss}
                 onLinkedWorkItemUpdateCardDismiss={
                   onLinkedWorkItemUpdateCardDismiss
@@ -598,9 +535,7 @@ function PaneTreeComponent({
                 onHandoff={onHandoff}
                 onNewTerminal={onNewTerminal}
                 onPaneDragStart={onPaneDragStart}
-                onRunAgentAction={onRunAgentAction}
               />
-              </SessionSurface>
             ) : null}
           </div>
         );
@@ -628,7 +563,7 @@ function PaneTreeComponent({
 
 export const PaneTree = memo(
   PaneTreeComponent,
-  (previous, next) => !previous.visible && !next.visible && !previous.sessionPortal && !next.sessionPortal,
+  (previous, next) => !previous.visible && !next.visible,
 );
 
 function PaneDropHint({ edge }: { edge: PaneEdge }) {
@@ -683,9 +618,7 @@ function Sash({
       aria-valuemax={100}
       aria-valuenow={Math.round(boundary * 100)}
       className={
-        row
-          ? "absolute z-10 w-px bg-stroke"
-          : "absolute z-10 h-px bg-stroke"
+        row ? "absolute z-10 w-px bg-stroke" : "absolute z-10 h-px bg-stroke"
       }
       style={
         row

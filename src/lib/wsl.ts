@@ -53,6 +53,7 @@ export function __wslDistributionsReset() {
 }
 
 const generations = new Map<string, number>();
+const connectionRequests = new Map<string, symbol>();
 export function invalidateWslDiscovery(path: string) {
   invalidateHarnessAvailability(path);
   invalidateModelCatalogs(path);
@@ -68,6 +69,9 @@ export async function connectWslProject(
   const location = wslLocation(path);
   if (!location)
     throw new Error("Choose a folder inside the selected WSL distribution");
+  const host = location.distribution.toLowerCase();
+  const request = Symbol();
+  connectionRequests.set(host, request);
   setWslStatus(location.distribution, { state: "connecting" });
   let connected: { distribution: string; path: string; generation?: number };
   try {
@@ -79,21 +83,23 @@ export async function connectWslProject(
   } catch (error) {
     // An aborted request leaves the link's true state unknown, but it must
     // not sit in "connecting" forever — treat it as not connected.
-    setWslStatus(
+    if (connectionRequests.get(host) === request) setWslStatus(
       location.distribution,
       signal?.aborted
         ? { state: "disconnected" }
         : { state: "error", error: String(error) },
     );
+    if (connectionRequests.get(host) === request) connectionRequests.delete(host);
     throw error;
   }
+  const current = connectionRequests.get(host) === request;
+  if (current) connectionRequests.delete(host);
   // The link is up even when the caller walked away mid-request.
-  setWslStatus(connected.distribution, { state: "connected" });
-  signal?.throwIfAborted();
+  if (current) setWslStatus(connected.distribution, { state: "connected" });
   if (
     connected.distribution.toLowerCase() !== location.distribution.toLowerCase()
   ) {
-    setWslStatus(location.distribution, {
+    if (current) setWslStatus(location.distribution, {
       state: "error",
       error: "WSL returned a different distribution",
     });
@@ -101,17 +107,17 @@ export async function connectWslProject(
       "WSL returned a different distribution; the project was not opened",
     );
   }
-  const host = connected.distribution.toLowerCase();
-  if (
+  if (current && (
     refresh ||
     connected.generation == null ||
     generations.get(host) !== connected.generation
-  ) {
+  )) {
     invalidateWslDiscovery(path);
     if (generations.size >= 4)
       generations.delete(generations.keys().next().value!);
     if (connected.generation != null)
       generations.set(host, connected.generation);
   }
+  signal?.throwIfAborted();
   return wslPath(connected.distribution, connected.path);
 }

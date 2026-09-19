@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   GithubWorkItemDetails,
   GithubWorkItemThread,
@@ -20,21 +21,37 @@ const FILTER_KEY = "monocode.azureFilter";
 let generation = 0;
 const details = new Map<string, GithubWorkItemDetails>();
 const threads = new Map<string, GithubWorkItemThread>();
-export const azureConnected = () => invoke<AzureStatus>("azure_status");
+function connectionChanged() {
+  generation++;
+  details.clear();
+  threads.clear();
+  window.dispatchEvent(new CustomEvent(AZURE_CHANGE_EVENT, { detail: "connection" }));
+}
+let connectionBridge: Promise<UnlistenFn | null> | null = null;
+function watchConnection() {
+  return connectionBridge ??= listen(AZURE_CHANGE_EVENT, connectionChanged).catch(() => {
+    connectionBridge = null;
+    return null;
+  });
+}
+import.meta.hot?.dispose(() => { void connectionBridge?.then(unlisten => unlisten?.()); });
+export async function azureConnected() {
+  await watchConnection();
+  return invoke<AzureStatus>("azure_status");
+}
 export async function saveAzureConfig(
   site: string,
   project: string,
   token: string,
 ) {
+  const observing = await watchConnection();
   const status = await invoke<AzureStatus>("azure_set_config", {
     site,
     project,
     token,
   });
-  generation++;
-  details.clear();
-  threads.clear();
-  window.dispatchEvent(new Event(AZURE_CHANGE_EVENT));
+  // Native broadcasts invalidate every window, including the caller.
+  if (!observing) connectionChanged();
   return status;
 }
 export function azureFilterCacheKey() {
@@ -78,8 +95,8 @@ export function saveAzureFilter(site: string, filter: AzureFilter) {
   }
   window.dispatchEvent(new Event(AZURE_CHANGE_EVENT));
 }
-export function azureOptions(site: string, project: string, queries: boolean) {
-  return invoke<AzureOption[]>("azure_options", { site, project, queries });
+export function azureOptions(site: string, project: string, queries: boolean, accountId: string) {
+  return invoke<AzureOption[]>("azure_options", { site, project, queries, accountId });
 }
 
 /** Template contents stay inert, including image/frame loads; never attach this template. */
@@ -200,22 +217,26 @@ export async function listAzureItems(
     "azure_list_items",
     {
       site: status.site,
+      accountId: status.accountId ?? "",
       ...(filter ?? loadAzureFilter(status.site, status.project)),
     },
   );
   if (generation !== before)
     throw new Error("Azure connection changed. Refresh and retry.");
-  return result.items.map((item) => azureItem(result.site, item));
+  return result.items.map((item) => ({ ...azureItem(result.site, item), account: status.accountId }));
 }
 function retain<T>(cache: Map<string, T>, key: string, value: T) {
   cache.delete(key);
   cache.set(key, value);
   if (cache.size > 40) cache.delete(cache.keys().next().value!);
 }
+function itemCacheKey(item: Pick<InboxItem, "account" | "url">): string {
+  return JSON.stringify([item.account, item.url]);
+}
 export const peekAzureDetails = (item: InboxItem) =>
-  details.get(item.url) ?? null;
+  details.get(itemCacheKey(item)) ?? null;
 export const peekAzureThread = (item: InboxItem) =>
-  threads.get(item.url) ?? null;
+  threads.get(itemCacheKey(item)) ?? null;
 export function azureDescription(item: WorkItem) {
   return [
     "System.Description",
@@ -235,16 +256,18 @@ export function azureDescription(item: WorkItem) {
 export async function azureItemSnapshot(
   site: string,
   id: string,
+  accountId: string,
 ): Promise<InboxItem> {
   const before = generation;
   const raw = await invoke<WorkItem>("azure_item_content", {
     site,
     id,
+    accountId,
     discussion: false,
   });
   if (before !== generation)
     throw new Error("Azure connection changed. Refresh and retry.");
-  return azureItem(site, raw);
+  return { ...azureItem(site, raw), account: accountId };
 }
 
 export async function azureDetails(
@@ -254,6 +277,7 @@ export async function azureDetails(
   const raw = await invoke<WorkItem>("azure_item_content", {
     site: item.site,
     id: item.id,
+    accountId: item.account ?? "",
     discussion: false,
   });
   if (before !== generation)
@@ -265,11 +289,11 @@ export async function azureDetails(
         ?.displayName ?? "",
     attachments: raw.attachments ?? [],
   };
-  retain(details, item.url, result);
+  retain(details, itemCacheKey(item), result);
   return result;
 }
 export async function azureThread(
-  item: Pick<InboxItem, "site" | "id" | "url">,
+  item: Pick<InboxItem, "site" | "id" | "url" | "account">,
 ): Promise<GithubWorkItemThread> {
   const before = generation;
   const raw = await invoke<{
@@ -284,7 +308,7 @@ export async function azureThread(
       createdBy?: { displayName?: string };
       createdDate: string;
     }[];
-  }>("azure_item_content", { site: item.site, id: item.id, discussion: true });
+  }>("azure_item_content", { site: item.site, id: item.id, accountId: item.account ?? "", discussion: true });
   if (before !== generation)
     throw new Error("Azure connection changed. Refresh and retry.");
   const result: GithubWorkItemThread = {
@@ -315,6 +339,6 @@ export async function azureThread(
     baseRefName: "",
     headRefName: "",
   };
-  retain(threads, item.url, result);
+  retain(threads, itemCacheKey(item), result);
   return result;
 }

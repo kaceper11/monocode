@@ -40,6 +40,7 @@ function model(partial: Partial<DictationModelInfo>): DictationModelInfo {
     tier: "fast",
     sizeBytes: 100,
     installed: false,
+    removable: false,
     partialBytes: 0,
     downloading: false,
     supportsTranslate: true,
@@ -133,7 +134,11 @@ describe("adjustDictationRange", () => {
 describe("spliceDictationText", () => {
   it("replaces the range and reports the inserted span", () => {
     expect(
-      spliceDictationText("say something here", { start: 4, end: 13 }, "dictated"),
+      spliceDictationText(
+        "say something here",
+        { start: 4, end: 13 },
+        "dictated",
+      ),
     ).toEqual({
       value: "say dictated here",
       range: { start: 4, end: 12 },
@@ -169,21 +174,40 @@ describe("caretAfterSplice", () => {
 describe("reanchorDictationRange", () => {
   it("keeps the range when the slice still matches", () => {
     const value = "hi hello world";
-    expect(reanchorDictationRange(value, { start: 3, end: 14 }, "hello world"))
-      .toEqual({ start: 3, end: 14 });
+    expect(
+      reanchorDictationRange(value, { start: 3, end: 14 }, "hello world"),
+    ).toEqual({ start: 3, end: 14 });
   });
 
-  it("relocates to the occurrence nearest the recorded start", () => {
-    const value = "hello world … hello world";
-    expect(reanchorDictationRange(value, { start: 15, end: 26 }, "hello world"))
-      .toEqual({ start: 14, end: 25 });
+  it("relocates only one unambiguous occurrence", () => {
+    expect(
+      reanchorDictationRange(
+        "prefix hello world",
+        { start: 3, end: 14 },
+        "hello world",
+      ),
+    ).toEqual({ start: 7, end: 18 });
+    expect(
+      reanchorDictationRange(
+        "hello world … hello world",
+        { start: 15, end: 26 },
+        "hello world",
+      ),
+    ).toBeNull();
   });
-
-  it("clamps into bounds when the dictated text vanished", () => {
-    expect(reanchorDictationRange("short", { start: 3, end: 14 }, "gone"))
-      .toEqual({ start: 3, end: 5 });
-    expect(reanchorDictationRange("", { start: 3, end: 14 }, "gone"))
-      .toEqual({ start: 0, end: 0 });
+  it("refuses to overwrite unrelated text or insert into a cleared draft", () => {
+    expect(
+      reanchorDictationRange("short", { start: 3, end: 14 }, "gone"),
+    ).toBeNull();
+    expect(
+      reanchorDictationRange("", { start: 3, end: 14 }, "gone"),
+    ).toBeNull();
+    expect(
+      reanchorDictationRange("new draft", { start: 20, end: 20 }, ""),
+    ).toBeNull();
+    expect(() =>
+      spliceDictationText("new", { start: -1, end: 1 }, "bad"),
+    ).toThrow("range");
   });
 });
 
@@ -201,15 +225,15 @@ describe("reduceSessionEvent", () => {
   });
 
   it("maps each state for the live session", () => {
-    expect(
-      reduceSessionEvent(7, { sessionId: 7, state: "recording" }),
-    ).toEqual({ kind: "recording" });
-    expect(
-      reduceSessionEvent(7, { sessionId: 7, state: "finished" }),
-    ).toEqual({ kind: "finished" });
-    expect(
-      reduceSessionEvent(7, { sessionId: 7, state: "cancelled" }),
-    ).toEqual({ kind: "cancelled" });
+    expect(reduceSessionEvent(7, { sessionId: 7, state: "recording" })).toEqual(
+      { kind: "recording" },
+    );
+    expect(reduceSessionEvent(7, { sessionId: 7, state: "finished" })).toEqual({
+      kind: "finished",
+    });
+    expect(reduceSessionEvent(7, { sessionId: 7, state: "cancelled" })).toEqual(
+      { kind: "cancelled" },
+    );
   });
 
   it("carries the error message, with a default", () => {
@@ -372,6 +396,33 @@ describe("permission transitions", () => {
 describe("dictation prefs", () => {
   beforeEach(() => localStorage.clear());
 
+  it("keeps legacy bytes after an explicit preference change and exposes write failures", () => {
+    const legacy = JSON.stringify({
+      modelId: "small",
+      language: "pl",
+      translate: true,
+      mode: "hold",
+    });
+    localStorage.setItem("monocode.dictation", legacy);
+    saveDictationPrefs({ ...loadDictationPrefs(), mode: "toggle" });
+    expect(localStorage.getItem("monocode.dictation")).toBe(legacy);
+    expect(loadDictationPrefs().mode).toBe("toggle");
+    const storage = localStorage;
+    vi.stubGlobal("localStorage", {
+      getItem: storage.getItem.bind(storage),
+      setItem: () => {
+        throw new Error("quota");
+      },
+    });
+    try {
+      expect(() =>
+        saveDictationPrefs({ ...loadDictationPrefs(), language: "en" }),
+      ).toThrow("quota");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("round-trips saved preferences", () => {
     saveDictationPrefs({
       modelId: "small",
@@ -435,9 +486,7 @@ describe("dictation languages", () => {
 
   it("filters languages case-insensitively by label", () => {
     expect(filterDictationLanguages("pol").map((l) => l.id)).toEqual(["pl"]);
-    expect(filterDictationLanguages("GERMAN").map((l) => l.id)).toEqual([
-      "de",
-    ]);
+    expect(filterDictationLanguages("GERMAN").map((l) => l.id)).toEqual(["de"]);
     expect(filterDictationLanguages("").length).toBe(
       DICTATION_LANGUAGES.length,
     );

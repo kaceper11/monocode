@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use crate::wsl;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::dirs_home;
 use crate::fs::expand_home;
 
+const MAX_CONFIG_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SKILLS: usize = 300;
 const MAX_FRONTMATTER_BYTES: usize = 16 * 1024;
 
@@ -17,6 +20,135 @@ pub struct DiscoveredSkill {
     pub path: String,
     pub scope: String,
     pub source: String,
+}
+
+fn read_config_text(path: &Path) -> Option<String> {
+    match wsl::path_location(path) {
+        Ok(Some(location)) => {
+            return wsl::request::<String>(&location, "read_text", json!({}))
+                .ok()
+                .map(|text| strip_bom(&text).to_string());
+        }
+        Ok(None) => {}
+        // A WSL-prefixed path that failed validation must not fall back to
+        // host UNC I/O.
+        Err(_) => return None,
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| strip_bom(&text).to_string())
+}
+
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct InspectEntry {
+    path: String,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    is_dir: bool,
+}
+
+/// Existence + size + isDir for many paths; WSL paths go in one bridge batch.
+fn inspect_all(paths: &[PathBuf]) -> HashMap<String, (u64, bool)> {
+    let mut out = HashMap::new();
+    let strings: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    // A single malformed WSL identity must not poison the whole batch.
+    let valid: Vec<String> = strings
+        .iter()
+        .filter(|s| wsl::location(s).is_ok())
+        .cloned()
+        .collect();
+    if let Ok(entries) = wsl::file_batches::<InspectEntry>(&valid, "inspect") {
+        for entry in entries {
+            out.insert(entry.path, (entry.size.unwrap_or(0), entry.is_dir));
+        }
+    }
+    for (i, path) in paths.iter().enumerate() {
+        let key = &strings[i];
+        if out.contains_key(key) || !matches!(wsl::location(key), Ok(None)) {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(path) {
+            out.insert(key.clone(), (meta.len(), meta.is_dir()));
+        }
+    }
+    out
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct DirListEntry {
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub is_dir: bool,
+}
+
+/// List one directory (names only used); missing/empty → empty vec.
+fn list_dir(path: &Path) -> Vec<DirListEntry> {
+    match wsl::path_location(path) {
+        Ok(Some(location)) => {
+            return wsl::files_request::<Vec<DirListEntry>>(&location, "list", json!({}))
+                .unwrap_or_default();
+        }
+        Ok(None) => {}
+        Err(_) => return Vec::new(),
+    }
+    let Ok(reader) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
+    reader
+        .flatten()
+        .filter_map(|ent| {
+            let name = ent.file_name().to_str()?.to_string();
+            Some(DirListEntry {
+                path: crate::fs::path_to_js(&ent.path()),
+                is_dir: ent.file_type().map(|t| t.is_dir()).unwrap_or(false),
+                name,
+            })
+        })
+        .collect()
+}
+
+fn managed_settings_root() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        return Some(PathBuf::from("/Library/Application Support/ClaudeCode"));
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        return Some(PathBuf::from("/etc/claude-code"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Some(PathBuf::from(r"C:\Program Files\ClaudeCode"));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// The Claude managed-policy root on the project's execution host —
+/// /etc/claude-code inside a WSL guest, the platform folder on the host.
+fn claude_managed_root(location: Option<&wsl::Location>) -> Option<PathBuf> {
+    match location {
+        Some(location) => location
+            .with_path("/etc/claude-code")
+            .ok()
+            .map(|root| PathBuf::from(root.identity())),
+        None => managed_settings_root(),
+    }
 }
 
 struct DisabledFilter {
@@ -68,20 +200,26 @@ fn is_wsl_identity(path: &str) -> bool {
     !matches!(crate::wsl::location(path), Ok(None))
 }
 
-#[cfg(windows)]
 fn normalize_path_for_compare(path: &str) -> String {
-    let mut s = path.replace('\\', "/");
-    if let Some(stripped) = s.strip_prefix("//?/") {
-        s = stripped.to_string();
+    if let Ok(Some(location)) = wsl::location(path) {
+        return format!(
+            "//wsl.localhost/{}{}",
+            location.distribution.to_lowercase(),
+            location.path
+        );
     }
-    while s.contains("//") {
-        s = s.replace("//", "/");
+    #[cfg(windows)]
+    {
+        let mut s = path.replace('\\', "/");
+        if let Some(stripped) = s.strip_prefix("//?/") {
+            s = stripped.to_string();
+        }
+        while s.contains("//") {
+            s = s.replace("//", "/");
+        }
+        s.to_lowercase()
     }
-    s.to_lowercase()
-}
-
-#[cfg(not(windows))]
-fn normalize_path_for_compare(path: &str) -> String {
+    #[cfg(not(windows))]
     path.to_string()
 }
 
@@ -128,7 +266,8 @@ pub(crate) fn list_skills_from(
         // of the same guest dir cannot trigger a second bridge scan.
         let key = match crate::wsl::path_location(&root) {
             Ok(Some(location)) => location.identity(),
-            _ => std::fs::canonicalize(&root)
+            Err(_) => return,
+            Ok(None) => std::fs::canonicalize(&root)
                 .unwrap_or_else(|_| root.clone())
                 .to_string_lossy()
                 .into_owned(),
@@ -161,11 +300,11 @@ pub(crate) fn list_skills_from(
         (".cursor/skills", "cursor"),
         (".codex/skills", "codex"),
         (".opencode/skills", "opencode"),
-        (".config/opencode/skills", "opencode"),
         (".pi/skills", "pi"),
         (".omp/skills", "omp"),
         (".fx/skills", "fx"),
         (".grok/skills", "grok"),
+        (".hermes/skills", "hermes"),
         (".devin/skills", "devin"),
         (".windsurf/skills", "devin"),
     ] {
@@ -225,9 +364,7 @@ fn add_namespaced_root(
 
 fn claude_plugin_skill_roots(home: &Path, project: &Path) -> Vec<(PathBuf, &'static str, String)> {
     let location = crate::wsl::path_location(project).ok().flatten();
-    let Some(raw) =
-        crate::agent_config::read_config_text(&home.join(".claude/plugins/installed_plugins.json"))
-    else {
+    let Some(raw) = read_config_text(&home.join(".claude/plugins/installed_plugins.json")) else {
         return Vec::new();
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -302,7 +439,7 @@ fn resolve_plugin_path(
     location: Option<&crate::wsl::Location>,
 ) -> Option<PathBuf> {
     let Some(location) = location else {
-        return resolve_home_path(raw, home);
+        return Some(resolve_home_path(raw, home));
     };
     let home = crate::wsl::path_location(home).ok().flatten()?;
     let linux = if raw == "~" {
@@ -317,23 +454,19 @@ fn resolve_plugin_path(
     Some(PathBuf::from(location.with_path(&linux).ok()?.identity()))
 }
 
-fn resolve_home_path(raw: &str, home: &Path) -> Option<PathBuf> {
+fn resolve_home_path(raw: &str, home: &Path) -> PathBuf {
     if raw == "~" {
-        return Some(home.to_path_buf());
-    }
-    // Reject traversal like the WSL arm does through Location::new.
-    if raw.split('/').any(|part| part == "..") {
-        return None;
+        return home.to_path_buf();
     }
     if let Some(rest) = raw.strip_prefix("~/") {
-        return Some(home.join(rest));
+        return home.join(rest);
     }
     let path = PathBuf::from(raw);
-    Some(if path.is_absolute() {
+    if path.is_absolute() {
         path
     } else {
         home.join(path)
-    })
+    }
 }
 
 /// Nearest project ancestor containing a `.claude` settings file. All probes
@@ -388,7 +521,7 @@ fn claude_settings_project_root(
         .iter()
         .flat_map(|(_, probes)| probes.iter().cloned())
         .collect();
-    let found = crate::agent_config::inspect_all(&probes);
+    let found = inspect_all(&probes);
     for (root, probes) in pairs {
         if probes.iter().any(|probe| {
             found
@@ -405,7 +538,7 @@ fn claude_settings_project_root(
 /// then a map lookup instead of a bridge round-trip per installed plugin.
 fn plugin_setting_map(path: &Path) -> HashMap<String, bool> {
     let mut map = HashMap::new();
-    let Some(raw) = crate::agent_config::read_config_text(path) else {
+    let Some(raw) = read_config_text(path) else {
         return map;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -426,7 +559,7 @@ fn plugin_setting_map(path: &Path) -> HashMap<String, bool> {
 /// inside the WSL guest for a WSL project, not the host's ClaudeCode folder.
 fn managed_plugin_map(root: &Path) -> HashMap<String, bool> {
     let mut out = plugin_setting_map(&root.join("managed-settings.json"));
-    let mut files: Vec<PathBuf> = crate::agent_config::list_dir(&root.join("managed-settings.d"))
+    let mut files: Vec<PathBuf> = list_dir(&root.join("managed-settings.d"))
         .into_iter()
         .filter(|entry| {
             !entry.is_dir && entry.name.ends_with(".json") && !entry.name.starts_with('.')
@@ -447,7 +580,7 @@ fn claude_plugin_policy(
     project: &Path,
     location: Option<&crate::wsl::Location>,
 ) -> impl Fn(&str) -> bool {
-    let managed = crate::agent_config::claude_managed_root(location)
+    let managed = claude_managed_root(location)
         .map(|root| managed_plugin_map(&root))
         .unwrap_or_default();
     let project_root = claude_settings_project_root(project, location);
@@ -772,6 +905,42 @@ mod tests {
         std::fs::write(dir.join("SKILL.md"), body).unwrap();
     }
 
+    #[test]
+    fn guest_disabled_skills_match_aliases_without_folding_linux_case() {
+        let filter =
+            DisabledFilter::new(Some(&["\\\\wsl$\\UBUNTU\\repo\\Review\\SKILL.md".into()]))
+                .unwrap();
+        assert!(filter.is_disabled("//wsl.localhost/Ubuntu/repo/Review/SKILL.md"));
+        assert!(!filter.is_disabled("//wsl.localhost/Ubuntu/repo/review/SKILL.md"));
+        assert!(!filter.is_disabled("//wsl.localhost/Debian/repo/Review/SKILL.md"));
+    }
+
+    #[test]
+    fn native_registry_paths_keep_upstream_parent_segments() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            resolve_plugin_path("../shared/plugin", home, None),
+            Some(home.join("../shared/plugin"))
+        );
+    }
+
+    #[test]
+    fn config_reads_are_bounded_and_malformed_guest_paths_fail_closed() {
+        let root = tmp("config-read");
+        let path = root.0.join("settings.json");
+        std::fs::write(&path, "\u{feff}{}").unwrap();
+        assert_eq!(read_config_text(&path).as_deref(), Some("{}"));
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_CONFIG_BYTES + 1)
+            .unwrap();
+        assert!(read_config_text(&path).is_none());
+        let invalid = PathBuf::from("//wsl.localhost/Ubuntu/../etc/settings.json");
+        assert!(read_config_text(&invalid).is_none());
+        assert!(list_dir(&invalid).is_empty());
+        assert!(inspect_all(&[invalid]).is_empty());
+    }
+
     fn write_plugin_setting(root: &Path, file: &str, plugin_id: &str, enabled: bool) {
         let dir = root.join(".claude");
         std::fs::create_dir_all(&dir).unwrap();
@@ -907,6 +1076,30 @@ mod tests {
         assert_eq!(project_skill.scope, "project");
         let user_skill = skills.iter().find(|s| s.name == "grok-global").unwrap();
         assert_eq!(user_skill.source, "grok");
+        assert_eq!(user_skill.scope, "user");
+    }
+
+    #[test]
+    fn discovers_hermes_project_and_user_skills() {
+        let project = tmp("proj-hermes");
+        let home = tmp("home-hermes");
+        write_skill(
+            &project.0.join(".hermes/skills"),
+            "hermes-review",
+            "---\nname: hermes-review\ndescription: Hermes project skill\n---\n",
+        );
+        write_skill(
+            &home.0.join(".hermes/skills"),
+            "hermes-global",
+            "---\nname: hermes-global\ndescription: Hermes user skill\n---\n",
+        );
+
+        let skills = list_skills_from(&project.0, Some(&home.0), None);
+        let project_skill = skills.iter().find(|s| s.name == "hermes-review").unwrap();
+        assert_eq!(project_skill.source, "hermes");
+        assert_eq!(project_skill.scope, "project");
+        let user_skill = skills.iter().find(|s| s.name == "hermes-global").unwrap();
+        assert_eq!(user_skill.source, "hermes");
         assert_eq!(user_skill.scope, "user");
     }
 
@@ -1366,7 +1559,7 @@ mod tests {
     #[test]
     fn managed_policy_root_stays_inside_the_distribution() {
         let location = crate::wsl::Location::new("Ubuntu", "/home/me/repo").unwrap();
-        let root = crate::agent_config::claude_managed_root(Some(&location)).unwrap();
+        let root = claude_managed_root(Some(&location)).unwrap();
         assert_eq!(
             root,
             PathBuf::from("//wsl.localhost/Ubuntu/etc/claude-code")

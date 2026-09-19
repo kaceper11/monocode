@@ -8,27 +8,21 @@ import {
   formatGithubQuery,
   formatRelativeTime,
   githubAvatarUrl,
-  githubReviewAnchor,
   githubReviewDecisionLabel,
   githubReviewStateLabel,
   gitlabAttentionLabel,
   groupProjectsByRepo,
   inboxComposerCard,
-  inboxFetchPaths,
   inboxItemKey,
   inboxListCacheKey,
   inboxPersonAvatarUrl,
   inboxProjectsForRail,
-  inboxRailKeyResolver,
   inboxStartDraft,
   prDiffCacheKey,
   sortInboxItems,
   uniqueInboxProjects,
   type InboxItem,
 } from "./githubTasks";
-import { pathKey } from "./paths";
-import type { ProjectRecord } from "./projects";
-import type { RepositoryFamily } from "./repositoryFamilies";
 
 function item(
   overrides: Partial<InboxItem> & Pick<InboxItem, "number" | "updatedAt">,
@@ -153,51 +147,6 @@ describe("githubReviewStateLabel", () => {
     expect(githubReviewStateLabel("APPROVED")).toBe("Approved");
     expect(githubReviewStateLabel("COMMENTED")).toBe("Commented");
     expect(githubReviewStateLabel("PENDING")).toBe("");
-  });
-});
-
-describe("githubReviewAnchor", () => {
-  it("anchors deletions on the old side and other lines on the new", () => {
-    expect(
-      githubReviewAnchor({
-        kind: "del",
-        text: "-old",
-        oldNumber: 9,
-        newNumber: null,
-      }),
-    ).toEqual({ line: 9, side: "LEFT" });
-    expect(
-      githubReviewAnchor({
-        kind: "add",
-        text: "+new",
-        oldNumber: null,
-        newNumber: 4,
-      }),
-    ).toEqual({ line: 4, side: "RIGHT" });
-    expect(
-      githubReviewAnchor({
-        kind: "context",
-        text: " same",
-        oldNumber: 3,
-        newNumber: 3,
-      }),
-    ).toEqual({ line: 3, side: "RIGHT" });
-    expect(
-      githubReviewAnchor({
-        kind: "hunk",
-        text: "@@ -1 +1 @@",
-        oldNumber: null,
-        newNumber: null,
-      }),
-    ).toBeNull();
-    expect(
-      githubReviewAnchor({
-        kind: "del",
-        text: "-old",
-        oldNumber: null,
-        newNumber: null,
-      }),
-    ).toBeNull();
   });
 });
 
@@ -362,21 +311,6 @@ describe("uniqueInboxProjects", () => {
 });
 
 describe("inboxProjectsForRail", () => {
-  const project = (
-    overrides: Partial<ProjectRecord> & Pick<ProjectRecord, "id">,
-  ): ProjectRecord => ({
-    repositories: [],
-    sets: [],
-    commands: [],
-    commandGroups: [],
-    ...overrides,
-  });
-  const family = (commonDir: string, checkout: string): RepositoryFamily => ({
-    commonDir,
-    checkout,
-    worktrees: [],
-  });
-
   it("puts the current project first", () => {
     expect(
       inboxProjectsForRail(
@@ -385,105 +319,8 @@ describe("inboxProjectsForRail", () => {
           { path: "/tmp/web", openedAt: 2 },
         ],
         "/tmp/web",
-        [],
-        new Map(),
-      ).map((project) => project.key),
+      ).map((project) => project.path),
     ).toEqual(["/tmp/web", "/tmp/docs"]);
-  });
-
-  it("lists a stored project by name and fetches all its repositories", () => {
-    const stored = project({
-      id: "p1",
-      name: "Monorepo",
-      anchor: "/tmp/app",
-      repositories: [
-        { id: "r1", commonDir: "/tmp/app/.git", anchor: "/tmp/app" },
-        { id: "r2", commonDir: "/tmp/docs/.git", anchor: "/tmp/docs" },
-      ],
-    });
-    const rows = inboxProjectsForRail(
-      [{ path: "/tmp/other", openedAt: 1 }],
-      "",
-      [stored],
-      new Map(),
-    );
-    const row = rows.find((entry) => entry.project?.id === "p1");
-    expect(row?.key).toBe("/tmp/app");
-    expect(row?.name).toBe("Monorepo");
-    expect(row?.paths).toEqual(["/tmp/app", "/tmp/docs"]);
-    expect(row?.cwd).toBe("/tmp/app");
-    expect(
-      inboxFetchPaths(rows).map((entry) => entry.path),
-    ).toEqual(["/tmp/other", "/tmp/app", "/tmp/docs"]);
-  });
-
-  it("keeps a repository-only group on its project key", () => {
-    const stored = project({
-      id: "g1",
-      name: "Suite",
-      repositories: [
-        { id: "r1", commonDir: "/tmp/api/.git", anchor: "/tmp/api" },
-        { id: "r2", commonDir: "/tmp/web/.git", anchor: "/tmp/web" },
-      ],
-    });
-    const rows = inboxProjectsForRail([], "", [stored], new Map());
-    expect(rows).toHaveLength(1);
-    expect(rows[0].key).toBe("project:g1");
-    expect(rows[0].name).toBe("Suite");
-    expect(rows[0].paths).toEqual(["/tmp/api", "/tmp/web"]);
-    expect(rows[0].cwd).toBe("/tmp/api");
-  });
-
-  it("skips a group that owns no repositories yet", () => {
-    const stored = project({ id: "empty", name: "Empty" });
-    expect(inboxProjectsForRail([], "", [stored], new Map())).toEqual([]);
-  });
-
-  it("collapses a member worktree recent into the project row", () => {
-    const stored = project({
-      id: "p1",
-      anchor: "/tmp/app",
-      repositories: [
-        { id: "r1", commonDir: "/tmp/app/.git", anchor: "/tmp/app" },
-      ],
-    });
-    const families = new Map([
-      [pathKey("/tmp/app-worktree"), family("/tmp/app/.git", "/tmp/app")],
-    ]);
-    const rows = inboxProjectsForRail(
-      [{ path: "/tmp/app-worktree", openedAt: 5 }],
-      "",
-      [stored],
-      families,
-    );
-    expect(rows).toHaveLength(1);
-    expect(rows[0].key).toBe("/tmp/app");
-    expect(rows[0].project?.id).toBe("p1");
-  });
-});
-
-describe("inboxRailKeyResolver", () => {
-  it("maps member fetch paths to the project key", () => {
-    const projects = inboxProjectsForRail(
-      [],
-      "",
-      [
-        {
-          id: "g1",
-          repositories: [
-            { id: "r1", commonDir: "/tmp/api/.git", anchor: "/tmp/api" },
-          ],
-          sets: [],
-          commands: [],
-          commandGroups: [],
-        },
-      ],
-      new Map(),
-    );
-    const keyOf = inboxRailKeyResolver(projects);
-    expect(keyOf("/tmp/api")).toBe("project:g1");
-    expect(keyOf("/tmp/elsewhere")).toBe("/tmp/elsewhere");
-    expect(keyOf("")).toBe("/");
   });
 });
 

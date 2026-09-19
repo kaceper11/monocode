@@ -1,12 +1,4 @@
-export const AZURE_PR_ASSOCIATIONS_CHANGED = "monocode:azure-pr-associations";
 import { invoke } from "@tauri-apps/api/core";
-import { contextFromText, type AgentContext } from "./agentContext";
-import type { LinkedWorkItem } from "./session";
-import { sessionWorkItems } from "./sessionWorkItem";
-import { pathKey } from "./paths";
-import { ensureDeliveryWatcher, unwatchAzurePrDelivery } from "./watchers";
-import type { AzureStatus } from "./azure";
-import type { UnifiedLine } from "./unifiedDiff";
 
 export type AzurePrTarget = {
   site: string;
@@ -71,176 +63,6 @@ export type AzurePrThread = {
     author?: { displayName: string };
   }[];
 };
-export type AzurePrAssociation = {
-  target: AzurePrTarget;
-  pr: AzurePr;
-  revision: string;
-  account: string;
-  projectName: string;
-  repositoryName: string;
-  cwd: string;
-  branch: string;
-  sourceSessionId?: string;
-};
-
-export const azurePrKey = (target: AzurePrTarget) =>
-  JSON.stringify([
-    target.site,
-    target.accountId,
-    target.project,
-    target.repository,
-    target.number,
-  ]);
-export type AzurePrDiscoveryGroup = Awaited<ReturnType<typeof findAzurePrs>> & {
-  origins: string[];
-};
-
-/** Only explicit story references and configured remotes; never infer a repo from its issue provider. */
-export async function discoverAzurePrs(
-  cwd: string,
-  branch: string,
-  status: AzureStatus,
-  linkedWorkItem?: LinkedWorkItem,
-  current: () => boolean = () => true,
-) {
-  if (!status.connected || !status.accountId)
-    throw new Error("Connect Azure DevOps before discovering PRs.");
-  const accountId = status.accountId;
-  const errors: string[] = [];
-  const sources = new Map<
-    string,
-    { target: AzurePrTarget; origins: string[]; branch: string }
-  >();
-  const add = (raw: string, origin: string, lookupBranch = "") => {
-    let location: Omit<AzurePrTarget, "accountId">;
-    try {
-      location = parseAzurePrLocation(raw);
-    } catch {
-      return;
-    }
-    if (!location.number && !lookupBranch) return;
-    if (location.site !== status.site) {
-      errors.push(
-        `${origin}: PRs in ${location.site} need that Azure connection.`,
-      );
-      return;
-    }
-    const target = { ...location, accountId };
-    const key = azurePrKey(target);
-    const previous = sources.get(key);
-    if (previous) {
-      if (!previous.origins.includes(origin)) previous.origins.push(origin);
-    } else
-      sources.set(key, { target, origins: [origin], branch: lookupBranch });
-  };
-  const stories = sessionWorkItems({ linkedWorkItem }).slice(0, 20);
-  // Bound concurrent story reads and repository lookups; closing the dialog stops subsequent batches.
-  for (let start = 0; start < stories.length && current(); start += 2) {
-    await Promise.all(
-      stories.slice(start, start + 2).map(async (story) => {
-        const label =
-          story.identifier ||
-          story.title ||
-          `${story.provider ?? "GitHub"} #${story.number}`;
-        add(story.url, `Linked to session · ${label}`);
-        for (const url of (story.context ?? "")
-          .slice(0, 32_000)
-          .match(/https:\/\/[^\s<>"')\]]+/g) ?? []) {
-          add(url, `Captured reference · ${label}`);
-        }
-        if (
-          story.kind !== "issue" ||
-          !["azure", "jira"].includes(story.provider ?? "")
-        )
-          return;
-        try {
-          const result = await invoke<{ links: string[]; more: boolean }>(
-            "azure_pr_story_links",
-            {
-              provider: story.provider,
-              url: story.url,
-              site: status.site,
-              accountId: status.accountId,
-            },
-          );
-          for (const url of result.links) add(url, `Story link · ${label}`);
-          if (result.more)
-            errors.push(
-              `${label}: first 50 story links shown; open the story for more.`,
-            );
-        } catch (error) {
-          errors.push(`${label}: ${String(error)}`);
-        }
-      }),
-    );
-  }
-  if (branch && current()) {
-    try {
-      const remotes = await invoke<{
-        items: { name: string; url: string }[];
-        more: boolean;
-      }>("azure_pr_remotes", { cwd, branch });
-      for (const remote of remotes.items)
-        add(remote.url, `Branch ${branch} · remote ${remote.name}`, branch);
-      if (remotes.more)
-        errors.push(
-          "First 20 Azure remotes shown; link another repository manually.",
-        );
-    } catch (error) {
-      errors.push(`Branch discovery: ${String(error)}`);
-    }
-  }
-  const priority = (source: { origins: string[] }) =>
-    source.origins.some(
-      (origin) =>
-        origin.startsWith("Story link") ||
-        origin.startsWith("Linked to session"),
-    )
-      ? 0
-      : source.origins.some((origin) => origin.startsWith("Captured reference"))
-        ? 1
-        : 2;
-  const bounded = [...sources.values()]
-    .sort((a, b) => priority(a) - priority(b))
-    .slice(0, 20);
-  if (sources.size > 20)
-    errors.push(
-      "First 20 PR/repository sources inspected; open the story or link another PR manually.",
-    );
-  const groups: AzurePrDiscoveryGroup[] = [];
-  for (let start = 0; start < bounded.length && current(); start += 2) {
-    const results = await Promise.all(
-      bounded.slice(start, start + 2).map(async (source) => {
-        try {
-          return {
-            ...(await findAzurePrs(source.target, source.branch, 0)),
-            origins: source.origins,
-          };
-        } catch (error) {
-          errors.push(`${source.origins.join(", ")}: ${String(error)}`);
-          return null;
-        }
-      }),
-    );
-    for (const result of results) if (result) groups.push(result);
-  }
-  // A PR can be linked to several stories and also match the branch. Keep one row, all provenance.
-  const seen = new Map<string, { group: AzurePrDiscoveryGroup; pr: AzurePr }>();
-  for (const group of groups)
-    group.items = group.items.filter((pr) => {
-      const key = azurePrKey({ ...group.target, number: pr.pullRequestId });
-      const previous = seen.get(key);
-      if (!previous) {
-        seen.set(key, { group, pr });
-        return true;
-      }
-      for (const origin of group.origins)
-        if (!previous.group.origins.includes(origin))
-          previous.group.origins.push(origin);
-      return false;
-    });
-  return { groups, errors: [...new Set(errors)] };
-}
 
 /** Accept a PR URL or HTTPS/SSH repo remote. The caller still chooses a candidate. */
 export function parseAzurePrLocation(
@@ -378,12 +200,6 @@ export function azurePrCreate(
     draft,
   });
 }
-export function azurePrUpdate(target: AzurePrTarget, description: string) {
-  return invoke<{ pr: AzurePr; revision: string }>("azure_pr_update", {
-    target,
-    description,
-  });
-}
 export function readAzurePr(
   target: AzurePrTarget,
   expectedRevision: string | null = null,
@@ -409,6 +225,15 @@ export function readAzurePrSection<T>(
     expectedRevision: revision,
     iteration,
     skip,
+  });
+}
+export function readAzurePrActivity(target: AzurePrTarget) {
+  return invoke<{ pr: AzurePr; revision: string; activityDates: string[] }>("azure_pr_read", {
+    target,
+    section: "activity",
+    expectedRevision: null,
+    iteration: null,
+    skip: 0,
   });
 }
 export type AzurePrDiffItem = {
@@ -453,22 +278,6 @@ export type AzureReviewCommentDraft = {
   body: string;
 };
 
-/** A rendered diff line's Azure anchor: deletions anchor on the left side,
- * additions and context lines on the right. Hunk headers can't anchor. */
-export function azureReviewAnchor(
-  line: UnifiedLine,
-): Pick<AzureReviewCommentDraft, "line" | "side" | "offset"> | null {
-  const offset = Math.max(1, line.text.length);
-  if (line.kind === "del") {
-    return line.oldNumber == null
-      ? null
-      : { line: line.oldNumber, side: "left", offset };
-  }
-  return line.newNumber == null
-    ? null
-    : { line: line.newNumber, side: "right", offset };
-}
-
 export function azurePrThreadComment(
   target: AzurePrTarget,
   revision: string,
@@ -480,20 +289,6 @@ export function azurePrThreadComment(
     expectedRevision: revision,
     threadId,
     body,
-  });
-}
-
-export function azurePrThreadStatus(
-  target: AzurePrTarget,
-  revision: string,
-  threadId: number,
-  status: "active" | "fixed",
-) {
-  return invoke<{ revision: string }>("azure_pr_thread_status", {
-    target,
-    expectedRevision: revision,
-    threadId,
-    status,
   });
 }
 
@@ -517,255 +312,4 @@ export function azurePrSubmitReview(
     body: review.body,
     comments: review.comments,
   });
-}
-
-export function azurePrContext(
-  association: AzurePrAssociation,
-  thread: AzurePrThread,
-): AgentContext {
-  const { target, pr, revision, cwd, sourceSessionId } = association;
-  const origin = `${azurePrUrl(target)} · account ${association.account} (${target.accountId}) · repository ${target.repository} · revision ${revision} · checkout ${cwd} · session ${sourceSessionId ?? "not assigned"}`;
-  const file = thread.threadContext;
-  const iteration = thread.pullRequestThreadContext?.iterationContext;
-  const comments = thread.comments
-    .filter((comment) => !comment.isDeleted)
-    .slice(0, 50)
-    .map(
-      (comment) =>
-        `${comment.author?.displayName ?? "Unknown author"} (comment ${comment.id}):\n${comment.content ?? ""}`,
-    )
-    .join("\n\n");
-  const context = contextFromText(
-    `Azure PR #${pr.pullRequestId}: ${pr.title} · thread ${thread.id}`,
-    [
-      `PR state: ${pr.status}. Thread state: ${thread.status}.`,
-      `Branches: ${pr.sourceRefName} → ${pr.targetRefName}`,
-      `Revision: ${revision}`,
-      file
-        ? `File: ${file.filePath}; right line ${file.rightFileStart?.line ?? "unknown"}; left line ${file.leftFileStart?.line ?? "unknown"}`
-        : "General discussion",
-      iteration
-        ? `Thread iterations: ${iteration.firstComparingIteration} → ${iteration.secondComparingIteration}`
-        : "Thread iteration not supplied by Azure",
-      comments,
-    ].join("\n\n"),
-    origin,
-  );
-  context.entries[0].truncated = thread.comments.length > 50;
-  return context;
-}
-
-const ASSOCIATIONS_KEY = "monocode.azurePrAssociations.v1";
-export const azurePrScope = (cwd: string, branch: string, session?: string) =>
-  JSON.stringify([cwd, branch, session ?? null]);
-/** Every saved association, validated — one storage read for callers that
- * aggregate several scopes (e.g. a task's repository children). */
-// Validated rows keyed on the raw snapshot — task delivery badges call this
-// per child per row, so repeated parses of the same blob are the hot path.
-let associationsCacheRaw: string | undefined;
-let associationsCache: AzurePrAssociation[] = [];
-
-export function allAzurePrAssociations(): AzurePrAssociation[] {
-  try {
-    const raw = localStorage.getItem(ASSOCIATIONS_KEY) ?? "[]";
-    if (raw === associationsCacheRaw) return associationsCache;
-    const rows: unknown = JSON.parse(raw);
-    if (!Array.isArray(rows)) return [];
-    associationsCache = rows.slice(0, 100).filter((value) => {
-      try {
-        if (
-          !value ||
-          !value.target ||
-          typeof value.target.accountId !== "string" ||
-          typeof value.revision !== "string" ||
-          ![
-            value.account,
-            value.projectName,
-            value.repositoryName,
-            value.target.site,
-            value.target.project,
-            value.target.repository,
-          ].every((field) => typeof field === "string") ||
-          !Number.isInteger(value.target.number) ||
-          !value.pr ||
-          ![
-            value.pr.title,
-            value.pr.status,
-            value.pr.sourceRefName,
-            value.pr.targetRefName,
-          ].every((field) => typeof field === "string") ||
-          value.pr.pullRequestId !== value.target.number ||
-          !Array.isArray(value.pr.reviewers) ||
-          !value.pr.reviewers.every(
-            (reviewer: AzurePr["reviewers"][number]) =>
-              reviewer &&
-              typeof reviewer.displayName === "string" &&
-              typeof reviewer.id === "string" &&
-              Number.isFinite(reviewer.vote),
-          )
-        )
-          return false;
-        azurePrUrl(value.target);
-        return true;
-      } catch {
-        return false;
-      }
-    });
-    associationsCacheRaw = raw;
-    return associationsCache;
-  } catch {
-    return [];
-  }
-}
-export function loadAzurePrAssociations(
-  cwd: string,
-  branch: string,
-  session?: string,
-): AzurePrAssociation[] {
-  return allAzurePrAssociations().filter(
-    (row) =>
-      row.cwd === cwd &&
-      row.branch === branch &&
-      // A session-scoped view also owns session-less rows — they were linked
-      // at the checkout itself, so a pane must see (and be able to unlink)
-      // them instead of stacking a second row.
-      (row.sourceSessionId === session ||
-        (session !== undefined && row.sourceSessionId === undefined)),
-  );
-}
-export const loadAzurePrAssociation = (
-  cwd: string,
-  branch: string,
-  session?: string,
-) => loadAzurePrAssociations(cwd, branch, session)[0] ?? null;
-/** A deleted session can no longer own a link — the row stays (the PR still
- * belongs to the checkout) but drops the dead owner so coverage and watcher
- * rebinds never point at it. Session-less twins collapse. */
-export function unbindAzurePrSession(sessionId: string) {
-  const rows = allAzurePrAssociations();
-  if (!rows.some((row) => row.sourceSessionId === sessionId)) return;
-  const seen = new Set<string>();
-  const next = rows
-    .map((row) =>
-      row.sourceSessionId === sessionId
-        ? { ...row, sourceSessionId: undefined }
-        : row,
-    )
-    .filter((row) => {
-      const key = JSON.stringify([
-        azurePrKey(row.target),
-        pathKey(row.cwd),
-        row.branch,
-        row.sourceSessionId ?? "",
-      ]);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  try {
-    localStorage.setItem(ASSOCIATIONS_KEY, JSON.stringify(next));
-  } catch {
-    /* Quota/denied storage — teardown must not abort on a dropped unbind. */
-    return;
-  }
-  if (typeof window !== "undefined")
-    window.dispatchEvent(new Event(AZURE_PR_ASSOCIATIONS_CHANGED));
-}
-export function saveAzurePrAssociation(
-  value: AzurePrAssociation | null,
-  cwd: string,
-  branch: string,
-  session?: string,
-  removeTarget?: AzurePrTarget,
-) {
-  // Merge against validated rows — a raw parse would keep malformed entries
-  // alive through every rewrite.
-  let rows = allAzurePrAssociations();
-  // The in-scope rows this write can drop or replace — captured before
-  // filtering so a departed link can lift its watcher below. A session-scoped
-  // write also owns session-less rows at this checkout: they get adopted into
-  // the session's scope instead of stacking a duplicate.
-  const scope = azurePrScope(cwd, branch, session);
-  const inScope = (row: AzurePrAssociation) =>
-    row?.target &&
-    (azurePrScope(row.cwd, row.branch, row.sourceSessionId) === scope ||
-      (session !== undefined &&
-        row.sourceSessionId === undefined &&
-        row.cwd === cwd &&
-        row.branch === branch));
-  const scopeRows = rows.filter(inScope);
-  // A re-save of an already-linked PR is a refresh — only a first-time link
-  // registers a watcher, so removing that watcher by hand sticks.
-  const linked = value?.target
-    ? scopeRows.some(
-        (row) => azurePrKey(row.target) === azurePrKey(value.target),
-      )
-    : false;
-  rows = rows.filter(
-    (row) =>
-      row &&
-      (!inScope(row) ||
-        (!!(value?.target ?? removeTarget) &&
-          !!row.target &&
-          azurePrKey(row.target) !==
-            azurePrKey((value?.target ?? removeTarget)!))),
-  );
-  // Store only the bounded summary and exact association, never thread bodies or credentials.
-  if (value)
-    rows.unshift({
-      ...value,
-      pr: {
-        ...value.pr,
-        description: undefined,
-        title: value.pr.title.slice(0, 500),
-        reviewers: value.pr.reviewers.slice(0, 50),
-      },
-    });
-  const kept = rows.slice(0, 100);
-  try {
-    localStorage.setItem(ASSOCIATIONS_KEY, JSON.stringify(kept));
-  } catch {
-    /* Quota/denied storage — report the drop, don't crash the handler. */
-    return;
-  }
-  if (typeof window !== "undefined")
-    window.dispatchEvent(new Event(AZURE_PR_ASSOCIATIONS_CHANGED));
-  // A saved link owns a review watcher: registered on first link, lifted only
-  // when no remaining row — in any session scope — still covers the delivery
-  // at this checkout+branch. Switching the displayed PR keeps the old link's
-  // row, so its watcher stays too. A terminal re-save also keeps the row —
-  // the next poll retires the watcher with its goodbye row instead.
-  const covered = (target: AzurePrTarget, atCwd: string, atBranch: string) =>
-    kept.some(
-      (row) =>
-        row?.target &&
-        azurePrKey(row.target) === azurePrKey(target) &&
-        pathKey(row.cwd) === pathKey(atCwd) &&
-        row.branch === atBranch,
-    );
-  for (const row of scopeRows)
-    if (!covered(row.target, cwd, branch))
-      unwatchAzurePrDelivery(row.target, cwd, branch);
-  // Rows the cap pushed out can orphan a watcher — lift it when nothing
-  // kept still covers their delivery.
-  for (const row of rows.slice(100))
-    if (
-      row?.target &&
-      typeof row.cwd === "string" &&
-      typeof row.branch === "string" &&
-      !covered(row.target, row.cwd, row.branch)
-    )
-      unwatchAzurePrDelivery(row.target, row.cwd, row.branch);
-  if (value && value.pr.status === "active" && !linked) {
-    const sessionId = session ?? value.sourceSessionId;
-    ensureDeliveryWatcher({
-      kind: "azure-pr",
-      target: value.target,
-      projectName: value.projectName,
-      repositoryName: value.repositoryName,
-      cwd,
-      branch,
-      ...(sessionId ? { sessionId } : {}),
-    });
-  }
 }

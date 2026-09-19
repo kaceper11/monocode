@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use super::resample::{to_mono, Resampler, WHISPER_RATE};
+use super::resample::{Resampler, WHISPER_RATE};
 
 /// Diagnostics are for short clips; bound decoded duration so a large file
 /// can't OOM the process through an IPC-reachable command.
@@ -18,31 +18,58 @@ pub fn read_wav_mono(path: &Path) -> Result<Vec<f32>, String> {
     if !(4_000..=768_000).contains(&spec.sample_rate) {
         return Err(format!("Unsupported sample rate {} Hz", spec.sample_rate));
     }
-    let channels = spec.channels.max(1) as usize;
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("Cannot decode audio: {e}"))?,
-        hound::SampleFormat::Int => {
-            let scale = (1i64 << (spec.bits_per_sample.saturating_sub(1) as i64)) as f32;
-            reader
-                .samples::<i32>()
-                .collect::<Result<Vec<i32>, _>>()
-                .map_err(|e| format!("Cannot decode audio: {e}"))?
-                .into_iter()
-                .map(|s| s as f32 / scale)
-                .collect()
-        }
-    };
-    if samples.len() as u64 / channels as u64 > spec.sample_rate as u64 * MAX_FILE_SECONDS {
-        return Err("Audio file is too long for the dictation diagnostics path".into());
+    let channels = spec.channels as usize;
+    if !(1..=32).contains(&channels) {
+        return Err("Unsupported audio channel count".into());
     }
-    let mut mono = Vec::with_capacity(samples.len() / channels);
-    to_mono(&samples, channels, &mut mono);
+    let max_frames = spec.sample_rate as u64 * MAX_FILE_SECONDS;
+    if reader.duration() as u64 > max_frames {
+        return Err("Audio file is too long for dictation diagnostics".into());
+    }
+    let samples: Box<dyn Iterator<Item = Result<f32, hound::Error>> + '_> = match spec.sample_format
+    {
+        hound::SampleFormat::Float if spec.bits_per_sample == 32 => {
+            Box::new(reader.samples::<f32>())
+        }
+        hound::SampleFormat::Int if (1..=32).contains(&spec.bits_per_sample) => {
+            let scale = (1u64 << (spec.bits_per_sample - 1)) as f32;
+            Box::new(
+                reader
+                    .samples::<i32>()
+                    .map(move |sample| sample.map(|value| value as f32 / scale)),
+            )
+        }
+        _ => return Err("Unsupported audio sample format".into()),
+    };
+    // Stream/downmix before resampling: high-rate multichannel files never
+    // require a whole decoded input buffer in addition to the 16kHz output.
+    let mut mono = Vec::with_capacity(2048);
+    let mut out = Vec::new();
     let mut resampler = Resampler::new(spec.sample_rate, WHISPER_RATE);
-    let mut out =
-        Vec::with_capacity(mono.len() * WHISPER_RATE as usize / spec.sample_rate as usize + 64);
+    let mut sum = 0.0f32;
+    let mut count = 0u64;
+    for sample in samples {
+        let sample = sample.map_err(|error| format!("Cannot decode audio: {error}"))?;
+        if !sample.is_finite() {
+            return Err("Audio contains non-finite samples".into());
+        }
+        count += 1;
+        if count > max_frames * channels as u64 {
+            return Err("Audio file is too long for dictation diagnostics".into());
+        }
+        sum += sample.clamp(-1.0, 1.0);
+        if count.is_multiple_of(channels as u64) {
+            mono.push(sum / channels as f32);
+            sum = 0.0;
+            if mono.len() == 2048 {
+                resampler.process(&mono, &mut out);
+                mono.clear();
+            }
+        }
+    }
+    if !count.is_multiple_of(channels as u64) {
+        return Err("Audio ends in an incomplete frame".into());
+    }
     resampler.process(&mono, &mut out);
     resampler.finish(&mut out);
     Ok(out)
@@ -98,5 +125,6 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_err < 1.0 / 2048.0, "max_err {max_err}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

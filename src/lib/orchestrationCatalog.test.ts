@@ -23,6 +23,18 @@ afterEach(() => {
 });
 
 describe("automatic orchestration catalog", () => {
+  it("discovers models on the requested WSL host without using the native catalog", async () => {
+    const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
+    setHarnessModels("codex", [{ id: "codex:native-only", harness: "codex", name: "Native" }]);
+    vi.mocked(isHarnessAvailable).mockImplementation((id, host) => id === "codex" && host === cwd);
+    vi.mocked(refreshHarnessCatalogs).mockImplementationOnce(async (_ids, host) => {
+      setHarnessModels("codex", [{ id: "codex:linux-only", harness: "codex", name: "Linux" }], host);
+    });
+    const settings = await discoverOrchestrationSettings(cwd);
+    expect(probeHarnessAvailability).toHaveBeenCalledWith({ cwd });
+    expect(refreshHarnessCatalogs).toHaveBeenCalledWith(["codex"], cwd);
+    expect(settings.choices).toEqual([{ harness: "codex", model: "codex:linux-only", name: "Linux" }]);
+  });
   it("discovers every installed harness and reads its refreshed models without a user-selected pool", async () => {
     vi.mocked(refreshHarnessCatalogs).mockImplementationOnce(async () => {
       setHarnessModels("codex", [
@@ -31,7 +43,7 @@ describe("automatic orchestration catalog", () => {
     });
     const settings = await discoverOrchestrationSettings();
     expect(probeHarnessAvailability).toHaveBeenCalledOnce();
-    expect(refreshHarnessCatalogs).toHaveBeenCalledWith(["claude", "codex"]);
+    expect(refreshHarnessCatalogs).toHaveBeenCalledWith(["claude", "codex"], undefined);
     expect(settings.choices).toContainEqual({
       harness: "codex",
       model: "codex:live",

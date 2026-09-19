@@ -3,6 +3,7 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import {
   azureItem,
+  azureOptions,
   azureMarkdown,
   azureDetails,
   peekAzureDetails,
@@ -19,7 +20,6 @@ import {
   listInboxItems,
 } from "./githubTasks";
 import { inboxAskKey } from "./inboxAsk";
-import { readContext } from "./inboxContext";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const call = vi.mocked(invoke);
 const site = "https://dev.azure.com/team";
@@ -56,6 +56,7 @@ it("keeps colliding IDs separate, custom states readable, and Git independent", 
   expect(item.state).toBe("Released to users");
   expect(inboxItemStatus(item)).toBe("Closed");
   expect(inboxItemStatus({ ...item, stateType: "unknown" })).toBe("Unknown");
+  expect(inboxItemStatus({ ...item, kind: "pr", state: "unknown" })).toBe("Unknown");
   expect(item.repo).toBe("");
   expect(item.projectPath).toBe("");
   expect(
@@ -97,10 +98,12 @@ it("remembers organization-specific project and query choices", async () => {
     site,
     project: "Product",
     account: "Ada",
+    accountId: "account-a",
     capabilities: ["Boards"],
   });
   expect(call).toHaveBeenCalledWith("azure_list_items", {
     site,
+    accountId: "account-a",
     project: "Operations",
     query: "chosen-query",
     assigned: false,
@@ -148,24 +151,34 @@ it("discards a pending detail read after disconnect", async () => {
   await expect(pending).rejects.toThrow("connection changed");
   expect(peekAzureDetails(item)).toBeNull();
 });
-it("normalizes Azure selected context through the shared reader without losing file choices", async () => {
-  call.mockResolvedValue({
-    owner: "azure:team:Ada",
-    html: true,
-    adf: false,
-    description: "<p>Description</p>",
-    comments: [
-      { id: "1", body: "**Markdown comment**", markdown: true },
-      { id: "2", body: "<b>HTML comment</b>" },
-    ],
-    files: [{ id: "file", name: "screenshot.png" }],
-    more: true,
-  });
-  const context = await readContext(item);
-  expect(context.description).toBe("Description");
-  expect(context.comments.map((c) => c.body)).toEqual([
-    "**Markdown comment**",
-    "**HTML comment**",
-  ]);
-  expect(context.files[0].id).toBe("file");
+
+it("starts Azure discovery while Jira discovery is still pending", async () => {
+  let finish!: (value: unknown) => void;
+  call.mockImplementation(async command => command === "jira_status"
+    ? new Promise(resolve => { finish = resolve; })
+    : { connected: false });
+  const pending = listInboxItems([], { assignedToMe: false, state: "all", search: "" });
+  try {
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    expect(call.mock.calls.some(([command]) => command === "azure_status")).toBe(true);
+  } finally {
+    finish({ connected: false });
+    await pending;
+  }
+});
+
+it("separates detail caches and reads by the displayed account", async () => {
+  call.mockResolvedValue(raw);
+  const owned = { ...item, account: "account-a" };
+  await azureDetails(owned);
+  expect(call).toHaveBeenLastCalledWith("azure_item_content", { site: owned.site, id: owned.id, accountId: "account-a", discussion: false });
+  expect(peekAzureDetails(owned)).not.toBeNull();
+  expect(peekAzureDetails({ ...owned, account: "account-b" })).toBeNull();
+});
+
+
+it("binds project and saved-query options to the displayed account", async () => {
+  call.mockResolvedValue([]);
+  await azureOptions(site, "Product", true, "account-a");
+  expect(call).toHaveBeenLastCalledWith("azure_options", { site, project: "Product", queries: true, accountId: "account-a" });
 });

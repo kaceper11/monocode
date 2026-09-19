@@ -1,25 +1,30 @@
-use std::collections::{HashMap, HashSet};
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffGuard {
+    kind: String,
+    status: String,
+    original: String,
+    current: String,
+}
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::wsl;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use tauri::Manager;
 
 use crate::dirs_home;
-
-pub mod occupancy;
-pub mod worktrees;
+use crate::wsl;
+use serde_json::json;
 
 pub(crate) const MAX_TEXT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_ATTACHMENT_EMBED_BYTES: u64 = 20 * 1024 * 1024;
 pub(crate) const MAX_PREVIEW_BYTES: u64 = 25 * 1024 * 1024;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirEntry {
     name: String,
@@ -378,7 +383,7 @@ pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
 const MAX_PROJECT_FILES: usize = 20_000;
 const MAX_WALK_DIRS: usize = 4_000;
 
-#[derive(Serialize, Clone, Debug, Deserialize)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectFile {
     pub(crate) name: String,
@@ -507,10 +512,6 @@ pub struct GitDiffStats {
     pub files: i64,
     pub additions: i64,
     pub deletions: i64,
-    /// Head branch (or short HEAD when detached) — same value as
-    /// `GitDiffIndex.branch`, kept here so stats-only callers avoid the
-    /// heavier index call.
-    pub branch: Option<String>,
 }
 
 /// Uncommitted line counts for the opened folder: staged + unstaged vs HEAD,
@@ -537,10 +538,8 @@ pub struct GitChangedFile {
 #[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitDiffIndex {
-    /// The cwd sits inside a Git work tree — distinguishes a clean repo from
-    /// a plain folder, which otherwise produces the same empty index.
-    pub is_repo: bool,
     pub branch: Option<String>,
+    pub head: Option<String>,
     pub files: Vec<GitChangedFile>,
     pub additions: i64,
     pub deletions: i64,
@@ -550,22 +549,7 @@ pub struct GitDiffIndex {
     pub ahead: i64,
     pub behind: i64,
     pub ahead_of_default: i64,
-    /// A merge, rebase, patch apply (`git am`), cherry-pick or revert is
-    /// in progress — conflicts or not, the checkout is mid-operation and
-    /// must not be synced.
-    pub op_in_progress: bool,
-    /// "merge" | "rebase" | "am" | "cherry-pick" | "revert" — "" when none.
-    pub op: String,
-    /// Unmerged paths while an operation is in progress (bounded).
-    pub conflicts: Vec<String>,
-    /// Short SHA of MERGE_HEAD (or the rebased head) when known.
-    pub merge_head: Option<String>,
-    /// HEAD is detached — `branch` then holds a short SHA, not a branch.
-    pub detached: bool,
-    /// "Keep local" files — skip-worktree index entries git itself refuses
-    /// to stage or commit until the flag is removed. Tracked entries carry
-    /// local edits; untracked ones are parked intent-to-add entries.
-    pub local_only: Vec<GitChangedFile>,
+    pub head_pushed: bool,
 }
 
 /// Changed files in the opened folder, with per-file line counts and status.
@@ -594,15 +578,6 @@ pub struct GitFileDiff {
     pub current: String,
     pub binary: bool,
     pub too_large: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GitDiffGuard {
-    kind: String,
-    status: String,
-    original: String,
-    current: String,
 }
 
 /// Contents for one changed file. Staged diffs compare HEAD to the index;
@@ -709,28 +684,6 @@ pub async fn git_stage_contents(
     .map_err(|e| e.to_string())?
 }
 
-/// Keep a file's local state out of commits: the index entry is marked
-/// skip-worktree so status, diff, `add -A` and commit ignore it until it is
-/// un-kept. Tracked files are unstaged first (the flag does not unstage),
-/// untracked files are parked as intent-to-add entries under the same flag.
-#[tauri::command]
-pub async fn git_keep_local(cwd: String, relative: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || git_keep_local_for(&expand_home(&cwd), &relative))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// Remove the keep-local flag so the file's real state shows again —
-/// tracked files resurface their edits, parked entries return to untracked.
-#[tauri::command]
-pub async fn git_unkeep_local(cwd: String, relative: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        git_unkeep_local_for(&expand_home(&cwd), &relative)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
 /// Unstage a file (`git restore --staged`).
 #[tauri::command]
 pub async fn git_unstage_file(cwd: String, relative: String) -> Result<(), String> {
@@ -795,10 +748,25 @@ pub async fn git_staged_context(cwd: String) -> Result<GitStagedContext, String>
         .map_err(|e| e.to_string())?
 }
 
-/// Create a commit from the current index.
+/// Create a commit from the current index, or rewrite HEAD with it when `amend` is set.
 #[tauri::command]
-pub async fn git_commit(cwd: String, message: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || git_commit_for(&expand_home(&cwd), &message))
+pub async fn git_commit(cwd: String, message: String, amend: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        if amend {
+            git_commit_amend_for(&root, &message)
+        } else {
+            git_commit_for(&root, &message)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Full message (subject and body) of the commit at HEAD.
+#[tauri::command]
+pub async fn git_head_message(cwd: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || git_head_message_for(&expand_home(&cwd)))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -831,922 +799,6 @@ pub async fn git_sync(cwd: String) -> Result<(), String> {
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct GitUpdateResult {
-    /// "updated" | "up-to-date" | "conflicts"
-    pub outcome: String,
-    pub branch: String,
-    /// The remote ref merged or rebased onto, e.g. "origin/main".
-    pub updated_from: String,
-    /// Conflicted paths when the update stopped on conflicts; the merge or
-    /// rebase is left in progress so resolution keeps both sides.
-    pub conflicts: Vec<String>,
-}
-
-/// Fetch `base` (the PR's target branch — falling back to the remote
-/// default) and merge or rebase it into the current checkout. Refuses a
-/// dirty tree up front and never pushes; conflicts are left in place with
-/// their file list for explicit or agent-assisted resolution.
-#[tauri::command]
-pub async fn git_update_from_default(
-    cwd: String,
-    mode: String,
-    base: Option<String>,
-    expected_branch: Option<String>,
-) -> Result<GitUpdateResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let outcome = git_merge_incoming(
-            &expand_home(&cwd),
-            &mode,
-            base.as_deref(),
-            expected_branch.as_deref(),
-        )?;
-        if outcome.outcome == "refused" {
-            return Err(outcome.reason);
-        }
-        Ok(GitUpdateResult {
-            outcome: match outcome.outcome {
-                "merged" => "updated",
-                "conflicted" => "conflicts",
-                other => other,
-            }
-            .to_string(),
-            branch: outcome.branch,
-            updated_from: outcome.synced_with,
-            conflicts: outcome.conflicts,
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct GitSyncResult {
-    /// "merged" | "up-to-date" | "conflicted" | "refused"
-    pub outcome: String,
-    pub branch: String,
-    /// The remote ref merged, e.g. "origin/main".
-    pub synced_with: String,
-    /// Subjects of the incoming commits the merge brought in (bounded).
-    pub commits: Vec<String>,
-    /// Total incoming commits — `commits` may be truncated.
-    pub commit_count: i64,
-    /// Conflicted paths when the merge stopped; left in progress.
-    pub conflicts: Vec<String>,
-    /// Why a refused sync did not run.
-    pub reason: String,
-}
-
-/// Sync the current branch with the remote default branch: fetch, then
-/// merge `remote/<default>` into this exact working copy on its own host.
-/// Merge is the only strategy here; a dirty tree, a branch that moved
-/// since the confirmation (`expected_branch`), or a second concurrent run
-/// is refused as data — never silently stashed or queued.
-#[tauri::command]
-pub async fn git_sync_branch(
-    cwd: String,
-    expected_branch: Option<String>,
-) -> Result<GitSyncResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let outcome = git_merge_incoming(
-            &expand_home(&cwd),
-            "merge",
-            None,
-            expected_branch.as_deref(),
-        )?;
-        Ok(GitSyncResult {
-            outcome: outcome.outcome.to_string(),
-            branch: outcome.branch,
-            synced_with: outcome.synced_with,
-            commits: outcome.commits,
-            commit_count: outcome.commit_count,
-            conflicts: outcome.conflicts,
-            reason: outcome.reason,
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct GitMergeContext {
-    /// A merge, rebase, patch apply (`git am`), cherry-pick or revert is in
-    /// progress.
-    pub merging: bool,
-    /// "merge" | "rebase" | "am" | "cherry-pick" | "revert" — "" when none.
-    pub op: String,
-    /// Unmerged paths (bounded).
-    pub conflicts: Vec<String>,
-    /// Short SHA of the head being applied (MERGE_HEAD…) when known.
-    pub merge_head: Option<String>,
-    /// A remote-tracking ref verified to name the incoming head, e.g.
-    /// "origin/main" — never guessed from the default branch.
-    pub incoming_ref: Option<String>,
-    /// Bounded combined diff of the conflicted paths — both sides.
-    pub diff: String,
-}
-
-/// Live merge state for routing conflicts to an agent: honest at click
-/// time and after an app restart, unlike the sync result that produced it.
-#[tauri::command]
-pub async fn git_merge_context(cwd: String) -> Result<GitMergeContext, String> {
-    tauri::async_runtime::spawn_blocking(move || git_merge_context_for(&expand_home(&cwd)))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-fn git_merge_context_for(root: &Path) -> Result<GitMergeContext, String> {
-    if !git_is_work_tree(root) {
-        return Err("Not a git repository".into());
-    }
-    let state = git_op_state_uncached(root);
-    let conflicts = git_unmerged_paths(root);
-    // The ref the operation is actually applying — a merge's MERGE_HEAD, a
-    // rebase's recorded onto commit, a pick/revert's recorded head —
-    // resolved from live state, never assumed to be the remote default.
-    let incoming_head: Option<String> = match state.op {
-        "merge" => git_stdout(root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]),
-        "rebase" => GitDir::resolve(root).and_then(|dir| git_rebase_onto(&dir)),
-        "cherry-pick" => git_stdout(root, &["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"]),
-        "revert" => git_stdout(root, &["rev-parse", "-q", "--verify", "REVERT_HEAD"]),
-        _ => None,
-    };
-    let incoming_ref = incoming_head.and_then(|head| {
-        git_run(
-            root,
-            &[
-                "for-each-ref",
-                "--format=%(refname:short)",
-                "--points-at",
-                &head,
-                "refs/remotes/",
-            ],
-        )
-        .and_then(|text| text.lines().next().map(str::to_string))
-    });
-    let diff = if conflicts.is_empty() {
-        String::new()
-    } else {
-        // `:(top,literal)` anchors each pathspec at the repository root —
-        // `conflicts` is root-relative while the checkout may be a
-        // subdirectory — and matches the name literally so glob magic or
-        // a leading `:(` in a filename cannot misfire.
-        let specs: Vec<String> = conflicts
-            .iter()
-            .take(40)
-            .map(|path| format!(":(top,literal){path}"))
-            .collect();
-        let mut args = vec!["diff", "--"];
-        args.extend(specs.iter().map(String::as_str));
-        git_run(root, &args)
-            .map(|text| {
-                let mut text = text;
-                if text.len() > MAX_MERGE_DIFF_BYTES {
-                    let mut end = MAX_MERGE_DIFF_BYTES;
-                    while !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    text.truncate(end);
-                    text.push_str("\n… diff truncated\n");
-                }
-                text
-            })
-            .unwrap_or_default()
-    };
-    Ok(GitMergeContext {
-        merging: state.in_progress(),
-        op: state.op.to_string(),
-        conflicts,
-        merge_head: state.head,
-        incoming_ref,
-        diff,
-    })
-}
-
-/// Which in-progress operation a checkout carries — merge, rebase,
-/// cherry-pick or revert — with the head it is applying when git exposes
-/// one. Detection only; nothing here decides anything.
-#[derive(Clone, Default)]
-struct GitOpState {
-    /// "" or "merge" | "rebase" | "am" | "cherry-pick" | "revert".
-    op: &'static str,
-    /// Short SHA of the head being applied (MERGE_HEAD, REBASE_HEAD…).
-    head: Option<String>,
-}
-
-impl GitOpState {
-    fn in_progress(&self) -> bool {
-        !self.op.is_empty()
-    }
-}
-
-/// Probes git for the operation in progress — a few subprocess calls plus
-/// gitdir file probes, and on WSL each is a serialized bridge round-trip.
-/// Callers that decide or mutate use this directly; the polled
-/// `git_diff_index` path uses the briefly cached `git_op_state` instead.
-fn git_op_state_uncached(root: &Path) -> GitOpState {
-    let head = |name: &str| git_stdout(root, &["rev-parse", "-q", "--verify", "--short", name]);
-    if let Some(sha) = head("MERGE_HEAD") {
-        return GitOpState {
-            op: "merge",
-            head: Some(sha),
-        };
-    }
-    // Rebase before cherry-pick/revert: the sequencer can share those head
-    // files, and a rebase must be aborted as a rebase. Directory existence
-    // is the reliable signal — a rebase stopped at `break`/`exec` and a
-    // mid-run `git am` carry neither REBASE_HEAD nor a current patch.
-    let rebase_head = head("REBASE_HEAD");
-    let dir = GitDir::resolve(root);
-    let (merge_dir, apply_dir) = dir.as_ref().map(git_rebase_dirs).unwrap_or_default();
-    if rebase_head.is_some() || merge_dir || apply_dir {
-        // `git am` shares rebase-apply but is a different operation — the
-        // `applying` marker distinguishes it, and it aborts differently.
-        let op = if apply_dir && !merge_dir && dir.as_ref().is_some_and(git_rebase_apply_is_am) {
-            "am"
-        } else {
-            "rebase"
-        };
-        return GitOpState {
-            op,
-            head: rebase_head,
-        };
-    }
-    if let Some(sha) = head("CHERRY_PICK_HEAD") {
-        return GitOpState {
-            op: "cherry-pick",
-            head: Some(sha),
-        };
-    }
-    if let Some(sha) = head("REVERT_HEAD") {
-        return GitOpState {
-            op: "revert",
-            head: Some(sha),
-        };
-    }
-    GitOpState::default()
-}
-
-/// Operation state changes on a human timescale while `git_diff_index` is
-/// polled every couple of seconds per panel — cache it briefly so bursts
-/// and multiple panels share one probe. The TTL stays under the poll
-/// interval so a state change is reflected within a poll or two; the
-/// traded-away cost is that a lone panel still probes each poll.
-const GIT_OP_TTL: Duration = Duration::from_millis(1500);
-
-static GIT_OP_CACHE: Mutex<Option<HashMap<PathBuf, (Instant, GitOpState)>>> = Mutex::new(None);
-
-fn git_op_state(root: &Path) -> GitOpState {
-    if let Ok(mut guard) = GIT_OP_CACHE.lock() {
-        let cache = guard.get_or_insert_with(HashMap::new);
-        cache.retain(|_, (at, _)| at.elapsed() < GIT_OP_TTL);
-        if let Some((_, state)) = cache.get(root) {
-            return state.clone();
-        }
-    }
-    let state = git_op_state_uncached(root);
-    if let Ok(mut guard) = GIT_OP_CACHE.lock() {
-        guard
-            .get_or_insert_with(HashMap::new)
-            .insert(root.to_path_buf(), (Instant::now(), state.clone()));
-    }
-    state
-}
-
-/// Fresh check for callers that act on the answer — a sync's preconditions
-/// and an abort must never see a cached state.
-fn git_op_in_progress(root: &Path) -> bool {
-    git_op_state_uncached(root).in_progress()
-}
-
-/// A mutation through our own commands (a merge we ran, an abort we just
-/// performed) changed the state — drop the poll-cached answer so the next
-/// `git_diff_index` doesn't replay it.
-fn git_op_cache_forget(root: &Path) {
-    if let Ok(mut guard) = GIT_OP_CACHE.lock() {
-        if let Some(cache) = guard.as_mut() {
-            cache.remove(root);
-        }
-    }
-}
-
-/// A killed fetch/merge can orphan `*.lock` files — ref locks,
-/// packed-refs.lock, index.lock, shallow.lock. The next git command then
-/// fails on the lock, not the operation; say what to remove.
-fn git_lock_hint(error: String) -> String {
-    if error.contains(".lock") || error.contains("Unable to create") {
-        format!("{error} — a previous git process may have been killed; remove the stale lock in the repository's .git directory and retry.")
-    } else {
-        error
-    }
-}
-
-/// Abort whichever git operation is in progress; error when nothing is.
-fn git_abort_in_progress(root: &Path) -> Result<(), String> {
-    let result = git_abort_in_progress_inner(root);
-    git_op_cache_forget(root);
-    result
-}
-
-fn git_abort_in_progress_inner(root: &Path) -> Result<(), String> {
-    // Detection lives in one place — `git_op_state_uncached` orders the
-    // probes (rebase before the sequencer heads, `am` via the `applying`
-    // marker) and the same ordering picks the abort command.
-    let args: &[&str] = match git_op_state_uncached(root).op {
-        "merge" => &["merge", "--abort"],
-        "am" => &["am", "--abort"],
-        "rebase" => &["rebase", "--abort"],
-        "cherry-pick" => &["cherry-pick", "--abort"],
-        "revert" => &["revert", "--abort"],
-        _ => {
-            return Err("No merge, rebase, patch apply, cherry-pick or revert in progress.".into())
-        }
-    };
-    git_checked(root, args).map_err(|error| {
-        // A crashed operation can leave rebase-merge/rebase-apply state
-        // behind — detection keeps reporting it while git says nothing is
-        // running; say how to clear it rather than looping on the banner.
-        if error.contains("no rebase in progress")
-            || error.contains("No rebase in progress")
-            || error.contains("not in progress")
-        {
-            format!("{error} — the operation state looks stale; remove the rebase-merge/rebase-apply state in the repository's .git directory.")
-        } else {
-            error
-        }
-    })
-}
-
-/// One merge-into-checkout run per working copy across `git_sync_branch`,
-/// `git_update_from_default` and `git_merge_abort` — a second request is
-/// refused, not queued.
-static MERGE_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
-/// The guard keys on the worktree, not the spelling: a subdirectory of the
-/// checkout, a symlinked path, or a different WSL share form all name the
-/// same working copy and must share one in-flight slot.
-fn merge_guard_key(root: &Path) -> String {
-    let location = wsl::path_location(root).ok().flatten();
-    if let Some(top) = git_stdout(root, &["rev-parse", "--show-toplevel"]) {
-        if let Some(host) = &location {
-            if let Ok(at) = host.with_path(&top) {
-                return at.identity();
-            }
-        } else if let Ok(real) = std::fs::canonicalize(&top) {
-            return real.to_string_lossy().into_owned();
-        } else {
-            return top;
-        }
-    }
-    if let Some(host) = &location {
-        return host.identity();
-    }
-    root.to_string_lossy().trim_end_matches('/').to_string()
-}
-
-struct MergeGuard(Vec<String>);
-
-impl MergeGuard {
-    fn acquire(root: &Path) -> Option<Self> {
-        // Cheap pre-check on the caller's spelling — a refused retry skips
-        // the canonicalizing `rev-parse`, which on WSL would otherwise
-        // stall behind the in-flight fetch on the serialized bridge.
-        let raw = root.to_string_lossy().into_owned();
-        {
-            let set = MERGE_IN_FLIGHT
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if set.contains(&raw) {
-                return None;
-            }
-        }
-        let key = merge_guard_key(root);
-        let mut set = MERGE_IN_FLIGHT
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if set.contains(&raw) || set.contains(&key) {
-            return None;
-        }
-        set.insert(raw.clone());
-        set.insert(key.clone());
-        Some(Self(vec![raw, key]))
-    }
-}
-
-impl Drop for MergeGuard {
-    fn drop(&mut self) {
-        let mut set = MERGE_IN_FLIGHT
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        for key in &self.0 {
-            set.remove(key);
-        }
-    }
-}
-
-/// Bound on the combined conflict diff shipped to an agent — the full
-/// patch stays in the checkout for `git diff` to produce.
-const MAX_MERGE_DIFF_BYTES: usize = 24 * 1024;
-
-/// Shared result of fetch + merge/rebase `FETCH_HEAD` into a checkout.
-/// Precondition failures are `refused` outcomes with a user-facing reason;
-/// `Err` is reserved for git commands that genuinely failed.
-#[derive(Debug)]
-struct GitMergeOutcome {
-    /// "merged" | "up-to-date" | "conflicted" | "refused"
-    outcome: &'static str,
-    branch: String,
-    synced_with: String,
-    /// Subjects of the incoming commits (bounded at 50).
-    commits: Vec<String>,
-    /// Total incoming commits — `commits` may be truncated.
-    commit_count: i64,
-    conflicts: Vec<String>,
-    reason: String,
-}
-
-impl GitMergeOutcome {
-    fn refused(reason: impl Into<String>) -> Self {
-        Self {
-            outcome: "refused",
-            branch: String::new(),
-            synced_with: String::new(),
-            commits: Vec::new(),
-            commit_count: 0,
-            conflicts: Vec::new(),
-            reason: reason.into(),
-        }
-    }
-}
-
-/// Fetch and merge/rebase can stall on a dead network or a signing prompt;
-/// a stall must not hold the merge guard — and refuse the checkout —
-/// forever. The same limit reaches the WSL bridge so the guest kills the
-/// child group rather than the request watchdog killing the connection.
-const GIT_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
-const GIT_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// A worktree's resolved gitdir, on the host or inside WSL — resolving
-/// `--absolute-git-dir` once per probe keeps serialized bridge round-trips
-/// off the per-file helpers.
-enum GitDir {
-    Host(PathBuf),
-    Wsl(wsl::Location),
-}
-
-/// An entry inside a `GitDir` — host path or WSL guest location.
-enum GitDirEntry {
-    Host(PathBuf),
-    Wsl(wsl::Location),
-}
-
-impl GitDir {
-    fn resolve(root: &Path) -> Option<Self> {
-        let gitdir = git_stdout(root, &["rev-parse", "--absolute-git-dir"])?;
-        match wsl::path_location(root).ok().flatten() {
-            Some(location) => location.with_path(&gitdir).ok().map(GitDir::Wsl),
-            None => Some(GitDir::Host(PathBuf::from(gitdir))),
-        }
-    }
-
-    fn entry(&self, name: &str) -> Option<GitDirEntry> {
-        match self {
-            GitDir::Host(dir) => Some(GitDirEntry::Host(dir.join(name))),
-            GitDir::Wsl(dir) => dir
-                .with_path(&format!("{}/{name}", dir.path))
-                .ok()
-                .map(GitDirEntry::Wsl),
-        }
-    }
-}
-
-/// The commit an in-progress rebase was started onto — git records it in
-/// `rebase-merge/onto` (or `rebase-apply/onto`) inside the worktree's own
-/// gitdir.
-fn git_rebase_onto(dir: &GitDir) -> Option<String> {
-    for name in ["rebase-merge/onto", "rebase-apply/onto"] {
-        let Some(entry) = dir.entry(name) else {
-            continue;
-        };
-        let text = match entry {
-            GitDirEntry::Host(path) => std::fs::read_to_string(path).ok(),
-            GitDirEntry::Wsl(file) => wsl::request::<String>(&file, "read_text", json!({})).ok(),
-        };
-        if let Some(text) = text {
-            return Some(text.trim().to_string());
-        }
-    }
-    None
-}
-
-/// Rebase state directories — `rebase-merge` for the merge backend,
-/// `rebase-apply` for `git am` and the apply backend. Existence is the
-/// reliable signal: a rebase stopped at `break`/`exec` or a mid-run
-/// `git am` carries neither `REBASE_HEAD` nor a current patch, so
-/// `rebase --show-current-patch` misses it entirely.
-fn git_rebase_dirs(dir: &GitDir) -> (bool, bool) {
-    let exists = |name: &str| match dir.entry(name) {
-        Some(GitDirEntry::Host(path)) => path.is_dir(),
-        // `canonical` resolves only when the guest path exists.
-        Some(GitDirEntry::Wsl(entry)) => wsl::path_request(&entry, "canonical", json!({})).is_ok(),
-        None => false,
-    };
-    (exists("rebase-merge"), exists("rebase-apply"))
-}
-
-/// Which apply lane a `rebase-apply` state belongs to — `git am` sets the
-/// `applying` marker and must be aborted with `am --abort`; a rebase-apply
-/// rebase leaves it absent.
-fn git_rebase_apply_is_am(dir: &GitDir) -> bool {
-    match dir.entry("rebase-apply/applying") {
-        Some(GitDirEntry::Host(path)) => path.is_file(),
-        Some(GitDirEntry::Wsl(file)) => wsl::path_request(&file, "canonical", json!({})).is_ok(),
-        None => false,
-    }
-}
-
-/// Modification time of a gitdir entry — distinguishes an operation file
-/// written by this run from one a foreign process wrote first.
-fn git_dir_entry_mtime(dir: &GitDir, name: &str) -> Option<SystemTime> {
-    match dir.entry(name)? {
-        GitDirEntry::Host(path) => path.metadata().ok()?.modified().ok(),
-        GitDirEntry::Wsl(file) => {
-            #[derive(Deserialize)]
-            struct Stat {
-                #[serde(rename = "mtimeMs")]
-                mtime_ms: Option<i64>,
-            }
-            let stats: Vec<Stat> =
-                wsl::request(&file, "stat", json!({"paths": [file.path]})).ok()?;
-            let ms = stats.first()?.mtime_ms?;
-            Some(UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64))
-        }
-    }
-}
-
-/// True only when the operation in progress is provably the one this run
-/// just started — a merge of ours records the pinned `fetched` SHA as
-/// MERGE_HEAD, a rebase of ours records it as the onto commit, and the
-/// marker file must be no older than FETCH_HEAD itself (a same-commit op
-/// begun by the user before our fetch wrote its marker earlier — foreign,
-/// left alone). Comparing against FETCH_HEAD's mtime keeps the whole check
-/// on one clock and one filesystem — a WSL guest's drifted clock or a
-/// coarse host filesystem can't flip the answer. Residual: a foreign op on
-/// the same commit started *after* our fetch is indistinguishable and is
-/// treated as ours. Anything else belongs to the user and is untouched.
-fn git_own_op_in_progress(root: &Path, mode: &str, fetched: &str) -> bool {
-    let verify = |name: &str| git_stdout(root, &["rev-parse", "-q", "--verify", name]);
-    let Some(dir) = GitDir::resolve(root) else {
-        return false;
-    };
-    let Some(fetch_mtime) = git_dir_entry_mtime(&dir, "FETCH_HEAD") else {
-        return false;
-    };
-    if mode == "merge" {
-        verify("MERGE_HEAD").as_deref() == Some(fetched)
-            && git_dir_entry_mtime(&dir, "MERGE_HEAD")
-                .map(|mtime| mtime >= fetch_mtime)
-                .unwrap_or(false)
-    } else {
-        git_rebase_onto(&dir).as_deref() == Some(fetched)
-            && ["rebase-merge/onto", "rebase-apply/onto"]
-                .iter()
-                .any(|name| {
-                    git_dir_entry_mtime(&dir, name)
-                        .map(|mtime| mtime >= fetch_mtime)
-                        .unwrap_or(false)
-                })
-    }
-}
-
-fn git_merge_incoming(
-    root: &Path,
-    mode: &str,
-    base: Option<&str>,
-    expect_branch: Option<&str>,
-) -> Result<GitMergeOutcome, String> {
-    if mode != "merge" && mode != "rebase" {
-        return Err("Choose merge or rebase.".into());
-    }
-    let Some(_guard) = MergeGuard::acquire(root) else {
-        return Ok(GitMergeOutcome::refused(
-            "A sync or update is already running on this working copy.",
-        ));
-    };
-    if !git_is_work_tree(root) {
-        return Ok(GitMergeOutcome::refused("Not a git repository"));
-    }
-    if git_op_in_progress(root) {
-        return Ok(GitMergeOutcome::refused(
-            "A merge, rebase, patch apply, cherry-pick or revert is already in progress. Resolve or abort it first.",
-        ));
-    }
-    let Some(branch) = git_head_branch(root) else {
-        return Ok(GitMergeOutcome::refused(
-            "Check out a branch before syncing with the default branch.",
-        ));
-    };
-    // The branch the user confirmed — a checkout that moved while the
-    // confirmation was open must not absorb the merge.
-    if let Some(expected) = expect_branch {
-        if expected != branch {
-            return Ok(GitMergeOutcome::refused(format!(
-                "The checkout moved from {expected} to {branch} — confirm the sync again on the right branch."
-            )));
-        }
-    }
-    let Some(remote) = git_remote_name(root) else {
-        return Ok(GitMergeOutcome::refused(
-            "No remote configured for this checkout.",
-        ));
-    };
-    // The name becomes `git fetch <remote>` argv — a leading dash would be
-    // flag injection; git itself cannot create such a remote, but refuse
-    // rather than forward it.
-    if remote.starts_with('-') {
-        return Ok(GitMergeOutcome::refused("The remote name is not usable."));
-    }
-    // `base` arrives as the PR's target branch — provider data, not trusted
-    // argv. "refs/heads/main" and "origin/main" normalize to the remote
-    // branch; a prefix naming another configured remote ("upstream/main")
-    // is honored rather than fetching a same-named branch from the wrong
-    // remote.
-    let (fetch_remote, base_name) = match base {
-        Some(raw) => {
-            let name = raw.trim().trim_start_matches("refs/heads/");
-            let remotes = git_remote_names(root);
-            // A branch name that merely begins with another remote's name
-            // ("release/1.0" beside a "release" remote) stays on the default
-            // remote when its tracking ref exists; otherwise the longest
-            // configured remote prefix wins so "a/b/main" parses when the
-            // remote itself is "a/b". Residual ambiguity: a tracking ref
-            // that was never fetched (custom refspecs) can't prove the
-            // branch interpretation — the remote prefix then wins.
-            let on_default = git_ref_exists(root, &format!("refs/remotes/{remote}/{name}"));
-            let (remote, name) = if on_default {
-                (remote.clone(), name.to_string())
-            } else if let Some((prefix, rest)) = remotes
-                .iter()
-                .filter_map(|item| {
-                    name.strip_prefix(&format!("{item}/"))
-                        .map(|rest| (item, rest))
-                })
-                .filter(|(_, rest)| !rest.is_empty())
-                .max_by_key(|(item, _)| item.len())
-            {
-                (prefix.clone(), rest.to_string())
-            } else {
-                (remote.clone(), name.to_string())
-            };
-            // It becomes `git fetch <remote> <name>` argv — ":" is a refspec,
-            // a leading "-" or "+" mangles the fetch semantics, and "@{…}"
-            // expands to local reflog state, not the provider's branch.
-            if name.is_empty() {
-                return Ok(GitMergeOutcome::refused("The base branch is empty."));
-            }
-            if name.starts_with('-')
-                || name.starts_with('+')
-                || name.contains(':')
-                || name.contains("@{")
-            {
-                return Ok(GitMergeOutcome::refused(format!(
-                    "'{name}' is not a remote branch name."
-                )));
-            }
-            match git_branch_name(root, &name) {
-                Ok(name) => (remote, name),
-                Err(reason) => return Ok(GitMergeOutcome::refused(reason)),
-            }
-        }
-        None => match git_default_branch(root, Some(&remote)) {
-            Some(name) => (remote.clone(), name),
-            None => {
-                return Ok(GitMergeOutcome::refused(
-                    "Cannot resolve the remote default branch.",
-                ));
-            }
-        },
-    };
-    // A remote picked by prefix matching also becomes `git fetch` argv —
-    // apply the same leading-dash/plus refusal as the default remote.
-    if fetch_remote.starts_with('-') || fetch_remote.starts_with('+') {
-        return Ok(GitMergeOutcome::refused("The remote name is not usable."));
-    }
-    // No pathspec — a checkout rooted below the repository root must still
-    // refuse when files elsewhere in the worktree are dirty. The flag keeps
-    // a `status.showUntrackedFiles=no` user config from hiding changes.
-    let dirty_count = || -> Result<usize, String> {
-        let Some(status) = git_run(root, &["status", "--porcelain", "--untracked-files=normal"])
-        else {
-            return Err("git status failed — cannot verify the tree is clean.".into());
-        };
-        Ok(status
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count())
-    };
-    let dirty = dirty_count()?;
-    if dirty > 0 {
-        return Ok(GitMergeOutcome::refused(format!(
-            "{dirty} uncommitted change{}. Commit or stash before syncing — nothing is stashed automatically.",
-            if dirty == 1 { "" } else { "s" }
-        )));
-    }
-    git_checked_bounded(
-        root,
-        &["fetch", &fetch_remote, &base_name],
-        GIT_FETCH_TIMEOUT,
-    )
-    .map_err(git_lock_hint)?;
-    // Custom fetch refspecs can leave `remote/base` stale or missing —
-    // FETCH_HEAD always names the commit this fetch wrote. Pin it to a SHA
-    // immediately: FETCH_HEAD is rewritten by every fetch/pull, and a
-    // foreign one landing between our fetch and merge must never change
-    // what we merge.
-    let synced_with = format!("{fetch_remote}/{base_name}");
-    let Some(fetched) = git_stdout(
-        root,
-        &["rev-parse", "-q", "--verify", "FETCH_HEAD^{commit}"],
-    ) else {
-        return Err(format!(
-            "git fetch {fetch_remote} {base_name} produced no FETCH_HEAD — cannot verify what was fetched; nothing was merged."
-        ));
-    };
-    // On an unborn branch HEAD does not resolve and the rev-list range
-    // fails; the merge still fast-forwards, exactly like `git pull` into an
-    // empty clone.
-    let head_exists = git_stdout(root, &["rev-parse", "-q", "--verify", "HEAD"]).is_some();
-    let incoming = if head_exists {
-        format!("HEAD..{fetched}")
-    } else {
-        fetched.clone()
-    };
-    if head_exists {
-        // Count incoming commits directly so a rev-list failure is an
-        // error, never a false "0 behind".
-        let behind = git_stdout(root, &["rev-list", "--count", &incoming])
-            .and_then(|text| text.parse::<i64>().ok());
-        let Some(behind) = behind else {
-            return Err(format!(
-                "Cannot compare {branch} with the fetched {synced_with} — nothing was merged."
-            ));
-        };
-        if behind <= 0 {
-            return Ok(GitMergeOutcome {
-                outcome: "up-to-date",
-                branch,
-                synced_with,
-                commits: Vec::new(),
-                commit_count: 0,
-                conflicts: Vec::new(),
-                reason: String::new(),
-            });
-        }
-    }
-    let commits = git_run(root, &["log", "--format=%s", "-n", "50", &incoming])
-        .map(|text| {
-            text.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(|line| line.chars().take(200).collect::<String>())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let commit_count = git_stdout(root, &["rev-list", "--count", &incoming])
-        .and_then(|text| text.parse().ok())
-        .unwrap_or(commits.len() as i64);
-    // The fetch window is long — re-verify right before merging: an
-    // operation started in a terminal meanwhile must not be absorbed or
-    // unwound, the confirmed branch may have moved, and the owning agent
-    // may have dirtied the tree — the contract refuses to merge into any
-    // of those.
-    if git_op_in_progress(root) {
-        return Ok(GitMergeOutcome::refused(
-            "An operation started in this working copy while fetching — nothing was merged. Resolve or abort it, then sync again.",
-        ));
-    }
-    if git_head_branch(root).as_deref() != Some(branch.as_str()) {
-        return Ok(GitMergeOutcome::refused(format!(
-            "The checkout moved off {branch} while fetching — nothing was merged. Confirm the sync again on the right branch."
-        )));
-    }
-    let dirty = dirty_count()?;
-    if dirty > 0 {
-        return Ok(GitMergeOutcome::refused(format!(
-            "{dirty} uncommitted change{} appeared while fetching — nothing was merged. Commit or stash, then sync again.",
-            if dirty == 1 { "" } else { "s" }
-        )));
-    }
-    // `--no-autostash` overrides a user's merge.autoStash/rebase.autoStash
-    // — the contract is to refuse a dirty tree, never to stash one. The
-    // pinned SHA is merged, not the FETCH_HEAD name.
-    let result = if mode == "merge" {
-        git_command_output_bounded(
-            root,
-            &["merge", "--no-edit", "--no-autostash", &fetched],
-            GIT_MERGE_TIMEOUT,
-        )
-    } else {
-        git_command_output_bounded(
-            root,
-            &["rebase", "--no-autostash", &fetched],
-            GIT_MERGE_TIMEOUT,
-        )
-    };
-    // A timed-out or killed run can leave op state behind — drop the
-    // cached answer before looking at the result.
-    git_op_cache_forget(root);
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            // A timed-out or output-capped merge can still have left real
-            // conflict state — report it as conflicted instead of failing.
-            let conflicts = git_unmerged_paths(root);
-            if !conflicts.is_empty() {
-                return Ok(GitMergeOutcome {
-                    outcome: "conflicted",
-                    branch,
-                    synced_with,
-                    commits,
-                    commit_count,
-                    conflicts,
-                    reason: String::new(),
-                });
-            }
-            return Err(error);
-        }
-    };
-    if result.status.success() {
-        return Ok(GitMergeOutcome {
-            outcome: "merged",
-            branch,
-            synced_with,
-            commits,
-            commit_count,
-            conflicts: Vec::new(),
-            reason: String::new(),
-        });
-    }
-    let conflicts = git_unmerged_paths(root);
-    if conflicts.is_empty() {
-        // A merge/rebase can fail with an operation in progress but no
-        // unmerged paths — there is nothing to resolve, so a failed run we
-        // started is unwound to a clean tree. An operation someone else
-        // started is reported and left alone — never auto-aborted.
-        let detail = String::from_utf8_lossy(&result.stderr).trim().to_string();
-        if git_own_op_in_progress(root, mode, &fetched) {
-            let _ = git_abort_in_progress(root);
-            return Err(if detail.is_empty() {
-                format!("git {mode} {synced_with} failed — aborted to a clean tree")
-            } else {
-                format!("{detail} — the {mode} was aborted")
-            });
-        }
-        return Err(if detail.is_empty() {
-            format!("git {mode} {synced_with} failed")
-        } else {
-            git_lock_hint(detail)
-        });
-    }
-    Ok(GitMergeOutcome {
-        outcome: "conflicted",
-        branch,
-        synced_with,
-        commits,
-        commit_count,
-        conflicts,
-        reason: String::new(),
-    })
-}
-
-/// Abort an in-progress merge, rebase, `git am`, cherry-pick or revert,
-/// leaving the checkout clean.
-#[tauri::command]
-pub async fn git_merge_abort(cwd: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || git_merge_abort_for(&expand_home(&cwd)))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-fn git_merge_abort_for(root: &Path) -> Result<(), String> {
-    // Aborting under a running fetch/merge would race it on the index —
-    // the guard is held for the whole abort, mirroring the sync.
-    let Some(_guard) = MergeGuard::acquire(root) else {
-        return Err(
-            "A sync is running on this working copy — wait for it to finish before aborting."
-                .into(),
-        );
-    };
-    if !git_is_work_tree(root) {
-        return Err("Not a git repository".into());
-    }
-    git_abort_in_progress(root).map_err(git_lock_hint)
-}
-
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct GitRangeContext {
     pub base: String,
     pub head: String,
@@ -1757,15 +809,10 @@ pub struct GitRangeContext {
 
 /// Commits and diff between the default branch and HEAD, for PR text generation.
 #[tauri::command]
-pub async fn git_range_context(
-    cwd: String,
-    base: Option<String>,
-) -> Result<GitRangeContext, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        git_range_context_for(&expand_home(&cwd), base.as_deref())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+pub async fn git_range_context(cwd: String) -> Result<GitRangeContext, String> {
+    tauri::async_runtime::spawn_blocking(move || git_range_context_for(&expand_home(&cwd)))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -1775,8 +822,6 @@ pub struct GitPr {
     pub title: String,
     pub url: String,
     pub state: String,
-    #[serde(default)]
-    pub base: Option<String>,
 }
 
 /// Latest pull request for the current branch, if `gh` can see one.
@@ -1793,7 +838,6 @@ struct GitPrCreateInput {
     body: String,
     base: String,
     head: String,
-    draft: bool,
 }
 
 /// Create a GitHub pull request with `gh` and return its URL.
@@ -1804,7 +848,6 @@ pub async fn git_pr_create(
     body: String,
     base: String,
     head: String,
-    draft: bool,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         git_pr_create_for(
@@ -1814,64 +857,11 @@ pub async fn git_pr_create(
                 body,
                 base,
                 head,
-                draft,
             },
         )
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-/// Read a GitHub pull request's current description with `gh pr view`.
-#[tauri::command]
-pub async fn git_pr_body(cwd: String, url: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let url = url.trim();
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
-            return Err("Invalid pull request URL".into());
-        }
-        gh_checked(
-            &expand_home(&cwd),
-            &["pr", "view", url, "--json", "body", "--jq", ".body"],
-        )
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// Replace a GitHub pull request's description with `gh pr edit`.
-#[tauri::command]
-pub async fn git_pr_update(cwd: String, url: String, body: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || git_pr_update_for(&expand_home(&cwd), &url, &body))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct GitPrCheck {
-    pub branch: Option<String>,
-    pub remote: Option<String>,
-    pub upstream: Option<String>,
-    pub default_branch: Option<String>,
-    pub dirty_files: u32,
-    /// True when the dirty-file count hit the scan limit (display "500+").
-    pub dirty_limited: bool,
-    pub published: bool,
-    pub ahead_of_remote: i64,
-    pub target_exists: bool,
-    pub ahead: i64,
-    pub behind: i64,
-    pub commits: Vec<String>,
-}
-
-/// Local state for one PR candidate: branch, publish state, and the range to a
-/// chosen target branch. Local-only; no network.
-#[tauri::command]
-pub async fn git_pr_check(cwd: String, target: String) -> Result<GitPrCheck, String> {
-    tauri::async_runtime::spawn_blocking(move || git_pr_check_for(&expand_home(&cwd), &target))
-        .await
-        .map_err(|e| e.to_string())?
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -1891,7 +881,6 @@ pub struct GitHubAssignee {
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHubWorkItem {
-    pub account: String,
     pub kind: String,
     pub number: i64,
     pub title: String,
@@ -1912,6 +901,16 @@ pub struct GitHubStatus {
     pub installed: bool,
     pub authenticated: bool,
 }
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GitHubStarStatus {
+    Starred,
+    NotStarred,
+    Unavailable,
+}
+
+const MONOCODE_STAR_ENDPOINT: &str = "/user/starred/hardbeat920/monocode";
 
 /// Whether the GitHub CLI is installed and has an active authenticated account.
 #[tauri::command]
@@ -1948,12 +947,60 @@ fn git_github_status_for() -> GitHubStatus {
     }
 }
 
+/// Whether the active GitHub CLI account has starred the MonoCode repository.
+#[tauri::command]
+pub async fn github_monocode_star_status() -> Result<GitHubStarStatus, String> {
+    tauri::async_runtime::spawn_blocking(github_monocode_star_status_for)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn github_monocode_star_status_for() -> GitHubStarStatus {
+    let result = gh_run(
+        Path::new("."),
+        &["api", "--silent", MONOCODE_STAR_ENDPOINT],
+        true,
+    );
+    github_star_status_from_result(result)
+}
+
+fn github_star_status_from_result(result: Result<String, String>) -> GitHubStarStatus {
+    match result {
+        Ok(_) => GitHubStarStatus::Starred,
+        Err(error) if error.contains("HTTP 404") => GitHubStarStatus::NotStarred,
+        Err(_) => GitHubStarStatus::Unavailable,
+    }
+}
+
+/// Star the MonoCode repository for the active GitHub CLI account.
+#[tauri::command]
+pub async fn github_star_monocode() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        gh_run(
+            Path::new("."),
+            &["api", "--silent", "--method", "PUT", MONOCODE_STAR_ENDPOINT],
+            true,
+        )
+        .map(|_| ())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// `owner/repo` for the GitHub remote of this working copy, via `gh`.
 #[tauri::command]
-pub async fn git_github_repo(cwd: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || git_github_repo_for(&expand_home(&cwd)))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn git_github_repo(cwd: String, url: Option<bool>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        if url.unwrap_or(false) {
+            gh_checked(&root, &["repo", "view", "--json", "url", "--jq", ".url"])
+                .map(|value| value.trim().to_string())
+        } else {
+            git_github_repo_for(&root)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The GitHub remote of this working copy and, when it is a fork, its parent.
@@ -2050,20 +1097,6 @@ pub struct GitHubWorkItemComment {
     pub replies: Vec<GitHubWorkItemComment>,
 }
 
-/// Issue sub-issues and parent for the inbox detail pane, via GraphQL.
-#[tauri::command]
-pub async fn git_github_issue_relations(
-    cwd: String,
-    kind: String,
-    number: i64,
-) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        git_github_issue_relations_for(&expand_home(&cwd), &kind, number)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHubWorkItemCommit {
@@ -2086,7 +1119,6 @@ pub struct GitHubWorkItemThread {
 }
 
 /// Conversation for the inbox detail pane: comments, reviews, and review threads.
-/// `repo` pins the repository for cross-repo linked items; empty resolves from cwd.
 #[tauri::command]
 pub async fn git_github_work_item_thread(
     cwd: String,
@@ -2140,183 +1172,6 @@ pub async fn git_github_pr_action(
     .map_err(|e| e.to_string())?
 }
 
-#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct GitHubPrCheck {
-    pub name: String,
-    pub status: String,
-    pub conclusion: String,
-    /// Browser link for the check run (html_url preferred, details_url next).
-    pub url: String,
-    /// Sanitized, bounded failure summary — only populated for failing runs.
-    pub output_title: String,
-    pub output_text: String,
-}
-
-#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct GitHubPrState {
-    pub number: i64,
-    pub title: String,
-    pub url: String,
-    pub state: String,
-    pub head_ref_oid: String,
-    pub head_ref_name: String,
-    pub base_ref_name: String,
-    /// GitHub's merge verdict: BEHIND, DIRTY (conflicts), CLEAN, BLOCKED…
-    pub merge_state_status: String,
-    pub review_decision: String,
-    pub is_draft: bool,
-    pub checks: Vec<GitHubPrCheck>,
-}
-
-/// One read of a GitHub PR's review/merge/check state for watchers, queue
-/// rows and repair evidence. Check-run output is bounded and sanitized; it is
-/// evidence text, not a log download.
-#[tauri::command]
-pub async fn git_github_pr_state(cwd: String, number: i64) -> Result<GitHubPrState, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        git_github_pr_state_for(&expand_home(&cwd), number)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-fn git_github_pr_state_for(root: &Path, number: i64) -> Result<GitHubPrState, String> {
-    if number <= 0 {
-        return Err("Invalid GitHub PR number".into());
-    }
-    let repo = git_github_repo_for(root)?;
-    let number_arg = number.to_string();
-    let json = gh_checked(
-        root,
-        &[
-            "pr",
-            "view",
-            &number_arg,
-            "--repo",
-            &repo,
-            "--json",
-            "number,title,url,state,headRefOid,headRefName,baseRefName,mergeStateStatus,reviewDecision,isDraft",
-        ],
-    )?;
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct View {
-        number: i64,
-        #[serde(default)]
-        title: String,
-        #[serde(default)]
-        url: String,
-        #[serde(default)]
-        state: String,
-        #[serde(default)]
-        head_ref_oid: String,
-        #[serde(default)]
-        head_ref_name: String,
-        #[serde(default)]
-        base_ref_name: String,
-        #[serde(default)]
-        merge_state_status: String,
-        #[serde(default)]
-        review_decision: Option<String>,
-        #[serde(default)]
-        is_draft: bool,
-    }
-    let view: View = serde_json::from_str(&json).map_err(|error| error.to_string())?;
-    if view.number != number {
-        return Err("GitHub returned a different PR. Refresh and retry.".into());
-    }
-    let checks = github_check_runs(root, &repo, &view.head_ref_oid).unwrap_or_default();
-    Ok(GitHubPrState {
-        number: view.number,
-        title: clean_field(&view.title, 500),
-        url: clean_field(&view.url, 2000),
-        state: view.state,
-        head_ref_oid: view.head_ref_oid,
-        head_ref_name: view.head_ref_name,
-        base_ref_name: view.base_ref_name,
-        merge_state_status: view.merge_state_status,
-        review_decision: view.review_decision.unwrap_or_default(),
-        is_draft: view.is_draft,
-        checks,
-    })
-}
-
-/// Strip control characters and bound length — check names, titles and URLs
-/// are untrusted provider data rendered in the queue and sent to agents.
-pub(crate) fn clean_field(raw: &str, max: usize) -> String {
-    raw.chars()
-        .filter(|c| !c.is_control() || *c == '\n')
-        .take(max)
-        .collect()
-}
-
-/// Check runs on a commit — `gh api` caps at 50 runs and per-run output is
-/// sanitized + truncated so the response stays a bounded evidence summary.
-fn github_check_runs(root: &Path, repo: &str, sha: &str) -> Result<Vec<GitHubPrCheck>, String> {
-    let sha = sha.trim();
-    if sha.is_empty() || sha.len() > 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Ok(Vec::new());
-    }
-    let json = gh_checked(
-        root,
-        &[
-            "api",
-            &format!("repos/{repo}/commits/{sha}/check-runs?per_page=50"),
-        ],
-    )?;
-    let value: serde_json::Value =
-        serde_json::from_str(&json).map_err(|error| error.to_string())?;
-    let Some(runs) = value["check_runs"].as_array() else {
-        return Ok(Vec::new());
-    };
-    Ok(runs
-        .iter()
-        .take(50)
-        .map(|run| {
-            let conclusion = run["conclusion"].as_str().unwrap_or("").to_string();
-            let failing = matches!(
-                conclusion.as_str(),
-                "failure" | "timed_out" | "action_required" | "startup_failure" | "cancelled"
-            );
-            let url = clean_field(
-                run["html_url"]
-                    .as_str()
-                    .or_else(|| run["details_url"].as_str())
-                    .unwrap_or(""),
-                2000,
-            );
-            let (output_title, output_text) = if failing {
-                let title = run["output"]["title"].as_str().unwrap_or("");
-                let summary = run["output"]["summary"].as_str().unwrap_or("");
-                let text = run["output"]["text"].as_str().unwrap_or("");
-                (
-                    clean_field(title, 500),
-                    crate::azure_pipelines::sanitize_log(&format!("{summary}\n{text}")),
-                )
-            } else {
-                (String::new(), String::new())
-            };
-            GitHubPrCheck {
-                name: {
-                    let name = clean_field(run["name"].as_str().unwrap_or("check"), 200);
-                    if name.is_empty() {
-                        "check".to_string()
-                    } else {
-                        name
-                    }
-                },
-                status: clean_field(run["status"].as_str().unwrap_or(""), 64),
-                conclusion: clean_field(&conclusion, 64),
-                url,
-                output_title,
-                output_text,
-            }
-        })
-        .collect())
-}
-
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHubPrFile {
@@ -2333,140 +1188,6 @@ pub struct GitHubPrDiff {
     pub files: Vec<GitHubPrFile>,
     pub patch: String,
     pub truncated: bool,
-}
-
-/// Prepare an isolated checkout at the GitHub PR head — repair evidence must
-/// bind to the exact head commit, and a repair never mutates the user's
-/// working copy. Fetches the head ref over https with the `gh` token; the
-/// clone stores no credentials. One preparation runs at a time, shared with
-/// Azure through the checkout module's request slot.
-#[tauri::command]
-pub async fn github_pr_prepare_checkout(
-    app: tauri::AppHandle,
-    cwd: String,
-    repo: String,
-    number: i64,
-    expected_revision: String,
-    request_id: String,
-) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let _preparation = crate::checkout::begin_checkout(&request_id)?;
-        if wsl::location(&cwd)?.is_some() {
-            return Err("Automatic cloning requires a local execution host. Open a matching checkout in this WSL distribution to keep the agent on its selected host.".into());
-        }
-        if number <= 0 {
-            return Err("Invalid GitHub PR number".into());
-        }
-        let (owner, name) = split_github_repo(&repo)?;
-        let repo = format!("{owner}/{name}");
-        // `--repo` pins the read — `gh` needs no checkout context, so run it
-        // from home and survive a deleted working copy.
-        let gh_root = dirs_home()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| expand_home(&cwd));
-        let number_arg = number.to_string();
-        let read_head = || -> Result<(String, String, String, bool), String> {
-            let json = gh_checked(
-                &gh_root,
-                &[
-                    "pr",
-                    "view",
-                    &number_arg,
-                    "--repo",
-                    &repo,
-                    "--json",
-                    "state,headRefOid,headRefName,isCrossRepository",
-                ],
-            )?;
-            #[derive(Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct View {
-                #[serde(default)]
-                state: String,
-                #[serde(default)]
-                head_ref_oid: String,
-                #[serde(default)]
-                head_ref_name: String,
-                #[serde(default)]
-                is_cross_repository: bool,
-            }
-            let view: View = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-            Ok((
-                view.state,
-                view.head_ref_oid,
-                view.head_ref_name,
-                view.is_cross_repository,
-            ))
-        };
-        let verified_head = |expected: &str| -> Result<(String, String), String> {
-            let (state, head_oid, head_name, cross) = read_head()?;
-            if !state.eq_ignore_ascii_case("open") || head_oid != expected {
-                return Err(
-                    "PR changed or is no longer open. Refresh before preparing its checkout."
-                        .into(),
-                );
-            }
-            if head_name.is_empty() {
-                return Err("GitHub did not report the PR head. Refresh and retry.".into());
-            }
-            if cross {
-                return Err(
-                    "Fork PR checkouts require opening the source repository explicitly.".into(),
-                );
-            }
-            Ok((head_name, head_oid))
-        };
-        let (branch, commit) = verified_head(&expected_revision)?;
-        let remote = format!("https://github.com/{repo}");
-        let auth = crate::inbox_media::github_auth_token().map(|token| {
-            format!(
-                "Basic {}",
-                base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    format!("x-access-token:{token}"),
-                )
-            )
-        });
-        use std::hash::{Hash, Hasher};
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        (&repo, number, &branch, &commit).hash(&mut hash);
-        let key = format!("pr-{number}-{:016x}", hash.finish());
-        let base = app
-            .path()
-            .app_data_dir()
-            .map_err(|_| "Cannot locate PR checkouts")?
-            .join("checkouts")
-            .join("github");
-        crate::checkout::prepare_checkout(
-            &base,
-            &key,
-            &remote,
-            &branch,
-            &commit,
-            auth.as_deref(),
-            || {
-                if crate::checkout::checkout_cancelled() {
-                    return Err("Checkout preparation cancelled.".into());
-                }
-                let (verified_branch, _) = verified_head(&expected_revision)?;
-                if verified_branch != branch {
-                    return Err(
-                        "PR changed during checkout preparation. Refresh and retry.".into(),
-                    );
-                }
-                Ok(())
-            },
-        )
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// Cancel an in-flight PR-checkout preparation — a dismissed review panel
-/// must not leave a clone running in the background.
-#[tauri::command]
-pub fn github_pr_cancel_checkout(request_id: String) {
-    crate::checkout::cancel_checkout(&request_id);
 }
 
 const MAX_PR_DIFF_BYTES: usize = 2 * 1024 * 1024;
@@ -2488,42 +1209,6 @@ pub async fn git_github_pr_diff(
     .map_err(|e| e.to_string())?
 }
 
-#[derive(Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct GitHubReviewCommentInput {
-    pub path: String,
-    pub line: i64,
-    pub side: String,
-    pub body: String,
-}
-
-/// Submit a formal pull-request review — approve, request changes, or comment —
-/// with optional inline comments, pinned to the head revision the reviewer saw.
-#[tauri::command]
-pub async fn git_github_submit_review(
-    cwd: String,
-    repo: String,
-    number: i64,
-    commit_id: String,
-    event: String,
-    body: String,
-    comments: Vec<GitHubReviewCommentInput>,
-) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        git_github_submit_review_for(
-            &expand_home(&cwd),
-            &repo,
-            number,
-            &commit_id,
-            &event,
-            &body,
-            &comments,
-        )
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
 #[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitBranches {
@@ -2538,14 +1223,6 @@ pub struct GitBranchEntry {
     pub name: String,
     pub current: bool,
     pub remote: Option<String>,
-    pub worktree: Option<String>,
-}
-
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct GitCheckout {
-    pub branch: String,
-    pub worktree: Option<String>,
 }
 
 /// Local branches, plus remote-only branches that can be checked out.
@@ -2562,9 +1239,9 @@ pub async fn git_checkout(
     cwd: String,
     name: String,
     remote: Option<String>,
-) -> Result<GitCheckout, String> {
+) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        git_checkout_target_for(&expand_home(&cwd), &name, remote.as_deref())
+        git_checkout_for(&expand_home(&cwd), &name, remote.as_deref())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2610,12 +1287,6 @@ fn git_diff_stats_for(root: &Path) -> GitDiffStats {
         }
     }
     add_untracked_map(root, &mut files, true);
-    // Parked keep-local entries leave `0 0` rows in `diff HEAD --numstat` —
-    // drop them so these counts agree with the Changes panel's file list.
-    let kept = local_only_paths(root);
-    if !kept.is_empty() {
-        files.retain(|relative, _| !kept.contains(relative));
-    }
     let mut additions = 0i64;
     let mut deletions = 0i64;
     for acc in files.values() {
@@ -2626,7 +1297,6 @@ fn git_diff_stats_for(root: &Path) -> GitDiffStats {
         files: files.len() as i64,
         additions,
         deletions,
-        branch: git_branch(root),
     }
 }
 
@@ -2646,39 +1316,6 @@ pub(crate) fn git_diff_index_for(root: &Path) -> GitDiffIndex {
 /// File list + counts only. Skips ahead/behind/remote lookups used by Git chrome.
 pub(crate) fn git_diff_files_for(root: &Path) -> GitDiffIndex {
     git_diff_index_with(root, false)
-}
-
-/// The checkpoint needs paths, not diff statistics or branch metadata.
-pub(crate) fn git_checkpoint_paths(root: &Path) -> Vec<String> {
-    let mut files: HashMap<String, FileAcc> = HashMap::new();
-    for staged in [false, true] {
-        let mut args = vec![
-            "diff",
-            "--no-ext-diff",
-            "--name-only",
-            "--no-renames",
-            "--relative",
-            "-z",
-        ];
-        if staged {
-            args.push("--cached");
-        }
-        args.extend(["--", "."]);
-        if let Some(names) = git_run(root, &args) {
-            for path in names.split('\0').filter(|path| !path.is_empty()) {
-                files.entry(path_to_js(Path::new(path))).or_default().staged |= staged;
-            }
-        }
-    }
-    add_untracked_map(root, &mut files, false);
-    let kept = local_only_paths(root);
-    let mut paths: Vec<_> = files
-        .into_iter()
-        .filter(|(path, file)| file.staged || !kept.contains(path))
-        .map(|(path, _)| path)
-        .collect();
-    paths.sort();
-    paths
 }
 
 fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
@@ -2777,35 +1414,9 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
     } else {
         GitSync::default()
     };
-    let head_branch = git_head_branch(root);
-    let head_sha = if head_branch.is_none() {
-        git_stdout(root, &["rev-parse", "--short", "HEAD"])
-    } else {
-        None
-    };
-    // Kept-local paths leave traces in `diff HEAD` (intent-to-add entries) —
-    // strip them from the ordinary list unless they are staged: a staged
-    // entry stays committable under skip-worktree, so it belongs in the
-    // staged list where it can still be acted on, not in "Local only".
-    let kept = local_only_paths(root);
-    if !kept.is_empty() {
-        out.retain(|file| file.staged || !kept.contains(&file.relative));
-    }
-    let staged_paths: HashSet<&str> = out
-        .iter()
-        .filter(|file| file.staged)
-        .map(|file| file.relative.as_str())
-        .collect();
-    let local_only: Vec<GitChangedFile> = local_only_files(root, kept)
-        .into_iter()
-        .filter(|file| !staged_paths.contains(file.relative.as_str()))
-        .collect();
-
     GitDiffIndex {
-        // Any resolvable HEAD — a branch (symbolic-ref answers even on an
-        // unborn one) or a detached SHA — means a work tree.
-        is_repo: head_branch.is_some() || head_sha.is_some(),
-        branch: head_branch.clone().or(head_sha.clone()),
+        branch: git_branch(root),
+        head: git_stdout(root, &["rev-parse", "HEAD"]),
         files: out,
         additions,
         deletions,
@@ -2815,141 +1426,8 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
         ahead: sync.ahead,
         behind: sync.behind,
         ahead_of_default: sync.ahead_of_default,
-        op_in_progress: sync.op_in_progress,
-        op: sync.op,
-        conflicts: sync.conflicts,
-        merge_head: sync.merge_head,
-        detached: head_branch.is_none() && head_sha.is_some(),
-        local_only,
+        head_pushed: sync.head_pushed,
     }
-}
-
-/// Paths carrying the skip-worktree bit — "keep local" entries git itself
-/// hides from status/diff and refuses to stage until the flag is removed.
-fn local_only_paths(root: &Path) -> HashSet<String> {
-    local_only_paths_scoped(root, true)
-}
-
-/// Whole-index variant — a commit lands the full index regardless of the
-/// opened folder, so the commit guard must see kept paths outside `cwd`.
-fn local_only_paths_repo(root: &Path) -> HashSet<String> {
-    local_only_paths_scoped(root, false)
-}
-
-fn local_only_paths_scoped(root: &Path, cwd_only: bool) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let mut args = vec!["ls-files", "-v", "-z"];
-    if cwd_only {
-        args.extend(["--", "."]);
-    }
-    let Some(text) = git_run(root, &args) else {
-        return out;
-    };
-    for entry in text.split('\0') {
-        let Some((tag, path)) = entry.split_once(' ') else {
-            continue;
-        };
-        // `S` is skip-worktree; lowercase means assume-unchanged is also set.
-        if tag.eq_ignore_ascii_case("s") {
-            let relative = normalize_diff_path(path);
-            if !relative.is_empty() {
-                out.insert(relative);
-            }
-        }
-    }
-    out
-}
-
-/// Whether each `relatives` path is a regular file in the working tree,
-/// keyed by its JS-form absolute path (host stat or batched WSL inspect).
-fn worktree_files_exist(root: &Path, relatives: &[String]) -> HashSet<String> {
-    let keys: Vec<String> = relatives
-        .iter()
-        .map(|relative| path_to_js(&host_path(root, relative)))
-        .collect();
-    if wsl::path_location(root).ok().flatten().is_some() {
-        #[derive(Deserialize)]
-        struct Entry {
-            path: String,
-            #[serde(rename = "isDir")]
-            is_dir: bool,
-        }
-        // `inspect` omits entries that fail to stat — no entry, no file.
-        return wsl::file_batches::<Entry>(&keys, "inspect")
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|entry| !entry.is_dir)
-            .map(|entry| entry.path)
-            .collect();
-    }
-    keys.into_iter()
-        .filter(|key| Path::new(key).is_file())
-        .collect()
-}
-
-/// Whether a sparse checkout is active — it marks every out-of-cone index
-/// entry skip-worktree, which must not crowd the "Local only" list.
-fn git_sparse_checkout(root: &Path) -> bool {
-    ["core.sparseCheckout", "core.sparseCheckoutCone"]
-        .iter()
-        .any(|key| {
-            git_stdout(root, &["config", "--bool", key]).is_some_and(|value| value.trim() == "true")
-        })
-}
-
-/// "Keep local" files for the index: tracked entries report "modified" (or
-/// "deleted" when the worktree copy is gone), parked intent-to-add entries
-/// report "untracked". Under sparse checkout, entries absent from disk are
-/// out-of-cone artifacts, not kept files — they are dropped from the list.
-fn local_only_files(root: &Path, kept: HashSet<String>) -> Vec<GitChangedFile> {
-    let mut paths: Vec<String> = kept.into_iter().collect();
-    paths.sort();
-    if paths.is_empty() {
-        return Vec::new();
-    }
-    let sparse = git_sparse_checkout(root);
-    let exists = worktree_files_exist(root, &paths);
-    let mut in_head: HashSet<String> = HashSet::new();
-    let mut args = vec!["ls-tree", "-z", "HEAD", "--"];
-    let specs: Vec<String> = paths
-        .iter()
-        .map(|path| format!(":(literal){path}"))
-        .collect();
-    args.extend(specs.iter().map(String::as_str));
-    if let Some(text) = git_run(root, &args) {
-        for entry in text.split('\0') {
-            let Some((meta, path)) = entry.split_once('\t') else {
-                continue;
-            };
-            // "<mode> <type> <sha>" — only blobs count as tracked files.
-            if meta.split(' ').nth(1) == Some("blob") {
-                in_head.insert(normalize_diff_path(path));
-            }
-        }
-    }
-    paths
-        .into_iter()
-        .filter(|relative| !sparse || exists.contains(&path_to_js(&host_path(root, relative))))
-        .map(|relative| {
-            let abs = host_path(root, &relative);
-            let status = if !in_head.contains(&relative) {
-                "untracked"
-            } else if !exists.contains(&path_to_js(&abs)) {
-                "deleted"
-            } else {
-                "modified"
-            };
-            GitChangedFile {
-                path: path_to_js(&abs),
-                relative,
-                status: status.to_string(),
-                additions: 0,
-                deletions: 0,
-                staged: false,
-                unstaged: false,
-            }
-        })
-        .collect()
 }
 
 fn add_numstat_map(text: &str, files: &mut HashMap<String, FileAcc>) {
@@ -3114,11 +1592,7 @@ fn git_file_diff_for(root: &Path, relative: &str, staged: bool) -> Result<GitFil
 
     let prefix = git_stdout(root, &["rev-parse", "--show-prefix"]).unwrap_or_default();
     let index_spec = format!(":{prefix}{relative}");
-    // Kept-local files have no staged/unstaged split — the useful diff is
-    // always local file against HEAD (a parked intent-to-add index blob
-    // would render a new local file as empty).
-    let kept = local_only_paths(root).contains(&relative);
-    let (original, current, large) = if staged && !kept {
+    let (original, current, large) = if staged {
         let head_spec = format!("HEAD:{prefix}{relative}");
         (
             git_blob(root, &head_spec),
@@ -3143,12 +1617,7 @@ fn git_file_diff_for(root: &Path, relative: &str, staged: bool) -> Result<GitFil
             };
             (current, false)
         };
-        let base = if kept {
-            git_blob(root, &format!("HEAD:{prefix}{relative}"))
-        } else {
-            git_blob(root, &index_spec)
-        };
-        (base, current, large)
+        (git_blob(root, &index_spec), current, large)
     };
     let had_original = original.is_some();
     let had_current = current.is_some();
@@ -3400,7 +1869,7 @@ fn git_commit_files_for(root: &Path, sha: &str) -> Result<Vec<GitChangedFile>, S
         seen.insert(relative.clone());
         let status = statuses.get(&relative).copied().unwrap_or("modified");
         out.push(GitChangedFile {
-            path: path_to_js(&host_path(root, &relative)),
+            path: path_to_js(&root.join(&relative)),
             relative,
             status: status.to_string(),
             additions: acc.additions,
@@ -3414,7 +1883,7 @@ fn git_commit_files_for(root: &Path, sha: &str) -> Result<Vec<GitChangedFile>, S
             continue;
         }
         out.push(GitChangedFile {
-            path: path_to_js(&host_path(root, &relative)),
+            path: path_to_js(&root.join(&relative)),
             relative,
             status: status.to_string(),
             additions: 0,
@@ -3458,7 +1927,7 @@ fn git_commit_file_diff_for(root: &Path, sha: &str, relative: &str) -> Result<Gi
         )
     };
     Ok(GitFileDiff {
-        path: path_to_js(&host_path(root, &relative)),
+        path: path_to_js(&root.join(&relative)),
         relative,
         status: status.to_string(),
         original,
@@ -3470,100 +1939,7 @@ fn git_commit_file_diff_for(root: &Path, sha: &str, relative: &str) -> Result<Gi
 
 fn git_stage_file_for(root: &Path, relative: &str) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
-    if local_only_paths(root).contains(&relative) {
-        return Err(format!(
-            "{relative} is kept local — stop keeping it local before staging"
-        ));
-    }
     git_checked(root, &["add", "--", &relative])
-}
-
-/// Whether the path exists on disk as a regular file (host or WSL guest).
-fn worktree_file_exists(root: &Path, relative: &str) -> Result<bool, String> {
-    let key = path_to_js(&host_path(root, relative));
-    Ok(worktree_files_exist(root, &[relative.to_string()]).contains(&key))
-}
-
-/// HEAD entry kind for a path — `Some("blob")` is a tracked file, `Some`
-/// with another type is a tree (directory) match, `None` is a parked
-/// intent-to-add, staged-never-committed, or untracked path.
-fn git_head_entry(root: &Path, relative: &str) -> Option<String> {
-    let spec = format!(":(literal){relative}");
-    let text = git_stdout(root, &["ls-tree", "-z", "HEAD", "--", &spec])?;
-    let (meta, _) = text.split('\0').next()?.split_once('\t')?;
-    meta.split(' ').nth(1).map(str::to_string)
-}
-
-/// Keep-local is best-effort: a mid-sequence failure (e.g. `add -N` works,
-/// `update-index` fails) leaves a git-consistent state — the file simply
-/// stays visible in the changes list, never silently committed.
-fn git_keep_local_for(root: &Path, relative: &str) -> Result<(), String> {
-    let relative = resolve_repo_path(root, relative)?;
-    // update-index takes literal paths; the pathspec commands need the
-    // explicit literal magic so glob metacharacters in a name stay literal.
-    let spec = format!(":(literal){relative}");
-    if local_only_paths(root).contains(&relative) {
-        // Already flagged — but a staged entry stays committable, so a
-        // re-keep still unstages it. `restore` drops the flag when it
-        // rewrites an entry, so the flag has to go off and back on.
-        if git_run(
-            root,
-            &["diff", "--cached", "--name-only", "-z", "--", &spec],
-        )
-        .is_some_and(|text| !text.trim().is_empty())
-        {
-            git_checked(
-                root,
-                &["update-index", "--no-skip-worktree", "--", &relative],
-            )?;
-            git_checked(root, &["restore", "--staged", "--", &spec])?;
-            git_checked(root, &["update-index", "--skip-worktree", "--", &relative])?;
-        }
-        return Ok(());
-    }
-    // A conflicted path carries stage-1/2/3 entries — unstaging it would
-    // silently resolve the conflict to HEAD.
-    if git_run(root, &["ls-files", "-u", "-z", "--", &spec])
-        .is_some_and(|text| !text.trim().is_empty())
-    {
-        return Err(format!("{relative} has unresolved merge conflicts"));
-    }
-    match git_head_entry(root, &relative).as_deref() {
-        Some("blob") => {
-            // The flag does not unstage — a staged entry stays committable.
-            git_checked(root, &["restore", "--staged", "--", &spec])?;
-            return git_checked(root, &["update-index", "--skip-worktree", "--", &relative]);
-        }
-        Some(_) => return Err(format!("{relative} is a directory, not a file")),
-        None => {}
-    }
-    if !worktree_file_exists(root, &relative)? {
-        return Err(format!("{relative} is not a file in the working tree"));
-    }
-    // An index-only entry (staged, never committed) drops back to untracked
-    // so `add -N` can park it under the same flag as a plain local file.
-    if git_checked(root, &["ls-files", "--error-unmatch", "--", &spec]).is_ok() {
-        git_checked(root, &["rm", "--cached", "-q", "--", &spec])?;
-    }
-    git_checked(root, &["add", "-N", "--", &spec])?;
-    git_checked(root, &["update-index", "--skip-worktree", "--", &relative])
-}
-
-fn git_unkeep_local_for(root: &Path, relative: &str) -> Result<(), String> {
-    let relative = resolve_repo_path(root, relative)?;
-    if !local_only_paths(root).contains(&relative) {
-        return Err(format!("{relative} is not kept local"));
-    }
-    git_checked(
-        root,
-        &["update-index", "--no-skip-worktree", "--", &relative],
-    )?;
-    if git_head_entry(root, &relative).is_none() {
-        // Drop the intent-to-add parking entry — plain untracked again.
-        let spec = format!(":(literal){relative}");
-        git_checked(root, &["rm", "--cached", "-q", "--", &spec])?;
-    }
-    Ok(())
 }
 
 fn git_stage_contents_for(
@@ -3573,11 +1949,6 @@ fn git_stage_contents_for(
     guard: Option<&GitDiffGuard>,
 ) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
-    if local_only_paths(root).contains(&relative) {
-        return Err(format!(
-            "{relative} is kept local — stop keeping it local before staging"
-        ));
-    }
     if contents.len() as u64 > MAX_TEXT_FILE_BYTES {
         return Err("File too large".into());
     }
@@ -3686,21 +2057,7 @@ fn git_unstage_file_for(root: &Path, relative: &str) -> Result<(), String> {
 }
 
 fn git_discard_file_for(root: &Path, relative: &str) -> Result<(), String> {
-    let kept = local_only_paths(root);
-    git_discard_file_guarded(root, relative, &kept)
-}
-
-fn git_discard_file_guarded(
-    root: &Path,
-    relative: &str,
-    kept: &HashSet<String>,
-) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
-    if kept.contains(&relative) {
-        return Err(format!(
-            "{relative} is kept local — stop keeping it local before discarding"
-        ));
-    }
     let abs = host_path(root, &relative);
     if git_checked(root, &["ls-files", "--error-unmatch", "--", &relative]).is_err() {
         if wsl::path_location(root)?.is_some() {
@@ -3723,10 +2080,8 @@ fn git_discard_all_for(root: &Path) -> Result<(), String> {
         .filter(|file| file.unstaged)
         .map(|file| file.relative)
         .collect();
-    // Hoist the kept-set lookup out of the per-file discard loop.
-    let kept = local_only_paths(root);
     for relative in files {
-        git_discard_file_guarded(root, &relative, &kept)?;
+        git_discard_file_for(root, &relative)?;
     }
     Ok(())
 }
@@ -3737,18 +2092,8 @@ fn git_staged_context_for(root: &Path) -> Result<GitStagedContext, String> {
         git_run(root, &["diff", "--cached", "--no-ext-diff", "--", "."]).unwrap_or_default();
 
     if summary.trim().is_empty() && patch.trim().is_empty() {
-        // Parked keep-local entries surface as `new file` headers in the
-        // HEAD fallback — exclude them so local-only names stay out of
-        // generated context.
-        let kept = local_only_paths(root);
-        let mut specs: Vec<String> = vec![".".into()];
-        specs.extend(kept.iter().map(|path| format!(":(exclude,literal){path}")));
-        let mut stat_args = vec!["diff", "HEAD", "--stat", "--"];
-        stat_args.extend(specs.iter().map(String::as_str));
-        let mut patch_args = vec!["diff", "HEAD", "--no-ext-diff", "--"];
-        patch_args.extend(specs.iter().map(String::as_str));
-        summary = git_run(root, &stat_args).unwrap_or_default();
-        patch = git_run(root, &patch_args).unwrap_or_default();
+        summary = git_run(root, &["diff", "HEAD", "--stat", "--", "."]).unwrap_or_default();
+        patch = git_run(root, &["diff", "HEAD", "--no-ext-diff", "--", "."]).unwrap_or_default();
         if let Some(untracked) = git_run(root, &["ls-files", "--others", "--exclude-standard"]) {
             let names = untracked.trim();
             if !names.is_empty() {
@@ -3773,34 +2118,26 @@ fn git_staged_context_for(root: &Path) -> Result<GitStagedContext, String> {
 }
 
 fn git_commit_for(root: &Path, message: &str) -> Result<(), String> {
+    git_commit_args(root, message, &[])
+}
+
+fn git_commit_amend_for(root: &Path, message: &str) -> Result<(), String> {
+    git_commit_args(root, message, &["--amend"])
+}
+
+fn git_commit_args(root: &Path, message: &str, extra: &[&str]) -> Result<(), String> {
     let message = message.trim();
     if message.is_empty() {
         return Err("Commit message cannot be empty".into());
     }
-    let kept = local_only_paths_repo(root);
-    if !kept.is_empty() {
-        // A path flagged while staged (bare `update-index` in a shell) stays
-        // committable — keep-local must not ship in a commit. A commit lands
-        // the whole index, so the check is repo-wide, not scoped to `cwd`.
-        if let Some(staged) = git_run(root, &["diff", "--cached", "--name-only", "-z"]) {
-            let blocked: Vec<String> = staged
-                .split('\0')
-                .map(normalize_diff_path)
-                .filter(|path| kept.contains(path))
-                .collect();
-            if !blocked.is_empty() {
-                return Err(format!(
-                    "Kept-local files are staged: {}. Unstage or stop keeping them local first.",
-                    blocked.join(", ")
-                ));
-            }
-        }
-    }
-    let result = git_checked(root, &["commit", "--cleanup=strip", "-m", message]);
-    // Committing during a merge concludes it — the poll cache would
-    // otherwise report an in-progress operation for up to its TTL.
-    git_op_cache_forget(root);
-    result
+    let mut args = vec!["commit"];
+    args.extend_from_slice(extra);
+    args.extend(["--cleanup=strip", "-m", message]);
+    git_checked(root, &args)
+}
+
+fn git_head_message_for(root: &Path) -> Result<String, String> {
+    git_stdout(root, &["log", "-1", "--pretty=%B"]).ok_or_else(|| "No commits yet".to_string())
 }
 
 fn git_push_for(root: &Path) -> Result<(), String> {
@@ -3819,17 +2156,19 @@ fn git_sync_changes_for(root: &Path) -> Result<(), String> {
     git_push_for(root)
 }
 
-fn git_range_context_for(root: &Path, base: Option<&str>) -> Result<GitRangeContext, String> {
+fn git_range_context_for(root: &Path) -> Result<GitRangeContext, String> {
     let head = git_branch(root).ok_or_else(|| "Not on a branch".to_string())?;
     let remote = git_remote_name(root);
-    let base_name = base
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .or_else(|| git_default_branch(root, remote.as_deref()))
+    let default_branch = git_default_branch(root, remote.as_deref())
         .ok_or_else(|| "Could not resolve the default branch".to_string())?;
-    let base_ref = git_target_ref(root, &base_name, remote.as_deref())
-        .ok_or_else(|| format!("No such base branch: {base_name}"))?;
+    let base_ref = match &remote {
+        Some(remote)
+            if git_ref_exists(root, &format!("refs/remotes/{remote}/{default_branch}")) =>
+        {
+            format!("{remote}/{default_branch}")
+        }
+        _ => default_branch.clone(),
+    };
     let spec = format!("{base_ref}...HEAD");
     let commit_summary =
         git_run(root, &["log", "--format=%s", &format!("{base_ref}..HEAD")]).unwrap_or_default();
@@ -3839,7 +2178,7 @@ fn git_range_context_for(root: &Path, base: Option<&str>) -> Result<GitRangeCont
         return Err("No commits to include in a pull request".into());
     }
     Ok(GitRangeContext {
-        base: base_name,
+        base: default_branch,
         head,
         commit_summary,
         diff_summary,
@@ -3859,7 +2198,7 @@ fn git_pr_status_for(root: &Path) -> Option<GitPr> {
             "--head",
             &head,
             "--json",
-            "number,title,url,state,baseRefName",
+            "number,title,url,state",
             "--limit",
             "20",
             "--state",
@@ -3975,23 +2314,7 @@ fn git_github_work_items_for(
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let json = gh_checked(root, &refs)?;
-    let mut items = parse_github_work_items(&json, kind, &repo)?;
-    if let Some(host) = items
-        .first()
-        .and_then(|item| tauri::Url::parse(&item.url).ok())
-        .and_then(|url| url.host_str().map(str::to_owned))
-    {
-        let account = gh_checked(
-            root,
-            &["api", "--hostname", &host, "user", "--jq", ".id | tostring"],
-        )
-        .map(|id| format!("{host}:{}", id.trim()))
-        .unwrap_or_default();
-        for item in &mut items {
-            item.account.clone_from(&account);
-        }
-    }
-    Ok(items)
+    parse_github_work_items(&json, kind, &repo)
 }
 
 fn git_github_work_item_for(
@@ -4208,26 +2531,6 @@ query InboxPullRequestThread($owner: String!, $name: String!, $number: Int!) {
 }
 "#;
 
-const GITHUB_ISSUE_RELATIONS_QUERY: &str = r#"
-query InboxIssueRelations($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) {
-    issue(number: $number) {
-      parent {
-        number title url state updatedAt
-        repository { nameWithOwner }
-      }
-      subIssues(first: 50) {
-        pageInfo { hasNextPage }
-        nodes {
-          number title url state updatedAt
-          repository { nameWithOwner }
-        }
-      }
-    }
-  }
-}
-"#;
-
 const GITHUB_REVIEW_REPLY_MUTATION: &str = r#"
 mutation InboxReviewReply($threadId: ID!, $body: String!) {
   addPullRequestReviewThreadReply(input: {
@@ -4252,12 +2555,7 @@ fn git_github_work_item_thread_for(
     if number <= 0 {
         return Err("Invalid GitHub item number".into());
     }
-    let repo = if repo.trim().is_empty() {
-        git_github_repo_for(root)?
-    } else {
-        repo.trim().to_string()
-    };
-    let (owner, name) = split_github_repo(&repo)?;
+    let (owner, name) = split_github_repo(repo)?;
     let query = if kind == "pr" {
         GITHUB_PR_THREAD_QUERY
     } else {
@@ -4282,112 +2580,6 @@ fn git_github_work_item_thread_for(
         ],
     )?;
     parse_github_work_item_thread(&json, kind)
-}
-
-fn graph_issue_item(node: &Value, fallback_repo: &str) -> Option<Value> {
-    let number = node.get("number").and_then(Value::as_i64)?;
-    if number <= 0 {
-        return None;
-    }
-    // Without the repository field the node cannot prove same-repo identity —
-    // mark it foreign so the row renders display-only instead of selectable.
-    let linked = node
-        .pointer("/repository/nameWithOwner")
-        .and_then(Value::as_str);
-    Some(json!({
-        "number": number,
-        "title": node.get("title").and_then(Value::as_str).unwrap_or_default(),
-        "url": node.get("url").and_then(Value::as_str).unwrap_or_default(),
-        "state": node.get("state").and_then(Value::as_str).unwrap_or_default().to_lowercase(),
-        "updatedAt": node.get("updatedAt").and_then(Value::as_str).unwrap_or_default(),
-        "repo": linked.unwrap_or(fallback_repo),
-        "foreign": linked.is_none_or(|repo| !repo.eq_ignore_ascii_case(fallback_repo)),
-    }))
-}
-
-fn parse_github_issue_relations(json: &str, repo: &str) -> Result<Value, String> {
-    let parsed: Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
-    if let Some(message) = parsed
-        .get("errors")
-        .and_then(Value::as_array)
-        .and_then(|errors| errors.first())
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-    {
-        return Err(message.to_string());
-    }
-    let issue = parsed
-        .pointer("/data/repository/issue")
-        .filter(|issue| issue.is_object())
-        .cloned()
-        .ok_or_else(|| "GitHub issue not found".to_string())?;
-    let mut edges = Vec::new();
-    let mut dropped = false;
-    let mut push = |key: &str, label: &str, node: &Value| {
-        if edges.len() >= 50 {
-            dropped = true;
-            return;
-        }
-        if let Some(item) = graph_issue_item(node, repo) {
-            let foreign = item["foreign"].as_bool().unwrap_or(true);
-            edges.push(json!({
-                "key": key,
-                "label": label,
-                "ref": format!("#{}", item["number"].as_i64().unwrap_or_default()),
-                "item": item,
-                "foreign": foreign,
-            }));
-        }
-    };
-    if let Some(parent) = issue.get("parent") {
-        push("parent", "Parent", parent);
-    }
-    if let Some(nodes) = issue.pointer("/subIssues/nodes").and_then(Value::as_array) {
-        for node in nodes {
-            push("children", "Sub-issue", node);
-        }
-    }
-    let truncated = dropped
-        || issue
-            .pointer("/subIssues/pageInfo/hasNextPage")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-    Ok(json!({ "edges": edges, "truncated": truncated }))
-}
-
-fn git_github_issue_relations_for(root: &Path, kind: &str, number: i64) -> Result<Value, String> {
-    let kind = kind.trim();
-    if kind != "issue" && kind != "pr" {
-        return Err("Unknown GitHub task kind".into());
-    }
-    if number <= 0 {
-        return Err("Invalid GitHub item number".into());
-    }
-    // Pull requests have no GitHub sub-issue or parent hierarchy.
-    if kind == "pr" {
-        return Ok(json!({ "edges": [], "truncated": false }));
-    }
-    let repo = git_github_repo_for(root)?;
-    let (owner, name) = split_github_repo(&repo)?;
-    let owner_field = format!("owner={owner}");
-    let name_field = format!("name={name}");
-    let number_field = format!("number={number}");
-    let json = gh_checked(
-        root,
-        &[
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={GITHUB_ISSUE_RELATIONS_QUERY}"),
-            "-F",
-            &owner_field,
-            "-F",
-            &name_field,
-            "-F",
-            &number_field,
-        ],
-    )?;
-    parse_github_issue_relations(&json, &repo)
 }
 
 fn github_comment_input<'a>(
@@ -4425,7 +2617,7 @@ fn git_github_work_item_comment_for(
         return git_github_review_reply_for(root, reply, body);
     }
     let number = number.to_string();
-    with_temp_body(body, |path| {
+    with_temp_markdown(body, |path| {
         let output = gh_checked(
             root,
             &[
@@ -4447,7 +2639,7 @@ fn git_github_review_reply_for(root: &Path, thread_id: &str, body: &str) -> Resu
         return Err("Invalid review thread".into());
     }
     let thread_field = format!("threadId={thread_id}");
-    with_temp_body(body, |path| {
+    with_temp_markdown(body, |path| {
         let body_field = format!("body=@{path}");
         let json = gh_checked(
             root,
@@ -4466,120 +2658,7 @@ fn git_github_review_reply_for(root: &Path, thread_id: &str, body: &str) -> Resu
     })
 }
 
-const MAX_REVIEW_COMMENTS: usize = 50;
-const MAX_REVIEW_BODY_BYTES: usize = 64_000;
-
-/// Validate and serialize the review request — pure, so every rejection
-/// lands before any Git or `gh` call runs.
-fn github_review_payload(
-    commit_id: &str,
-    event: &str,
-    body: &str,
-    comments: &[GitHubReviewCommentInput],
-) -> Result<String, String> {
-    let event = event.trim();
-    if !matches!(event, "APPROVE" | "REQUEST_CHANGES" | "COMMENT") {
-        return Err("Unknown review event".into());
-    }
-    let commit_id = commit_id.trim();
-    if commit_id.len() > 64
-        || commit_id.is_empty()
-        || !commit_id.chars().all(|ch| ch.is_ascii_hexdigit())
-    {
-        return Err("Reviews must pin the pull-request head revision".into());
-    }
-    if body.len() > MAX_REVIEW_BODY_BYTES {
-        return Err("Review body exceeds 64 KB".into());
-    }
-    if comments.len() > MAX_REVIEW_COMMENTS {
-        return Err("A review accepts at most 50 comments".into());
-    }
-    let mut payload_comments = Vec::with_capacity(comments.len());
-    for comment in comments {
-        let path = comment.path.trim();
-        let side = comment.side.trim();
-        let text = comment.body.trim();
-        if path.is_empty() || path.len() > 1024 || path.starts_with('/') {
-            return Err("Review comment has an invalid path".into());
-        }
-        if comment.line <= 0 {
-            return Err("Review comment has an invalid line".into());
-        }
-        if !matches!(side, "LEFT" | "RIGHT") {
-            return Err("Review comment has an invalid side".into());
-        }
-        if text.is_empty() || text.len() > MAX_REVIEW_BODY_BYTES {
-            return Err("Review comment body is empty or exceeds 64 KB".into());
-        }
-        payload_comments.push(json!({
-            "path": path,
-            "line": comment.line,
-            "side": side,
-            "body": text,
-        }));
-    }
-    // A bare approve or request-changes is a valid review; an empty COMMENT
-    // would carry nothing at all.
-    if event == "COMMENT" && payload_comments.is_empty() && body.trim().is_empty() {
-        return Err("A review needs a body or at least one comment".into());
-    }
-    Ok(json!({
-        "commit_id": commit_id,
-        "event": event,
-        "body": body,
-        "comments": payload_comments,
-    })
-    .to_string())
-}
-
-fn git_github_submit_review_for(
-    root: &Path,
-    repo: &str,
-    number: i64,
-    commit_id: &str,
-    event: &str,
-    body: &str,
-    comments: &[GitHubReviewCommentInput],
-) -> Result<String, String> {
-    if number <= 0 {
-        return Err("Invalid GitHub PR number".into());
-    }
-    let payload = github_review_payload(commit_id, event, body, comments)?;
-    let repo = if repo.trim().is_empty() {
-        git_github_repo_for(root)?
-    } else {
-        repo.trim().to_string()
-    };
-    let (owner, name) = split_github_repo(&repo)?;
-    let endpoint = format!("repos/{owner}/{name}/pulls/{number}/reviews");
-    with_temp_body(&payload, |path| {
-        let json = gh_checked(root, &["api", &endpoint, "-X", "POST", "--input", path])?;
-        parse_github_submit_review_url(&json)
-    })
-}
-
-fn parse_github_submit_review_url(json: &str) -> Result<String, String> {
-    let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
-    if let Some(message) = value
-        .get("message")
-        .and_then(|message| message.as_str())
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-    {
-        return Err(message.to_string());
-    }
-    let url = value
-        .get("html_url")
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .trim();
-    if url.starts_with("http://") || url.starts_with("https://") {
-        return Ok(url.to_string());
-    }
-    Err("GitHub did not return a review URL".into())
-}
-
-fn with_temp_body(
+fn with_temp_markdown(
     body: &str,
     run: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<String, String> {
@@ -5307,7 +3386,6 @@ fn parse_github_work_items(
     Ok(rows
         .into_iter()
         .map(|row| GitHubWorkItem {
-            account: String::new(),
             kind: kind.to_string(),
             number: row.number,
             title: row.title,
@@ -5352,8 +3430,6 @@ fn parse_gh_pr_list(json: &str) -> Option<GitPr> {
         title: String,
         url: String,
         state: String,
-        #[serde(default, rename = "baseRefName")]
-        base: Option<String>,
     }
     let rows: Vec<Row> = serde_json::from_str(json).ok()?;
     let mut best: Option<GitPr> = None;
@@ -5363,7 +3439,6 @@ fn parse_gh_pr_list(json: &str) -> Option<GitPr> {
             title: row.title,
             url: row.url,
             state: row.state.to_lowercase(),
-            base: row.base,
         };
         if pr.state == "open" {
             return Some(pr);
@@ -5375,39 +3450,32 @@ fn parse_gh_pr_list(json: &str) -> Option<GitPr> {
     best
 }
 
-fn write_pr_body(body: &str) -> Result<PathBuf, String> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let body_path = std::env::temp_dir().join(format!("monocode-pr-{stamp}.md"));
-    std::fs::write(&body_path, body.trim()).map_err(|e| e.to_string())?;
-    Ok(body_path)
-}
-
 fn git_pr_create_for(root: &Path, input: &GitPrCreateInput) -> Result<String, String> {
     let title = input.title.trim();
     if title.is_empty() {
         return Err("Pull request title cannot be empty".into());
     }
-    let body_path = write_pr_body(&input.body)?;
-    let body_arg = body_path.to_string_lossy().to_string();
-    let mut args = vec![
-        "pr",
-        "create",
-        "--title",
-        title,
-        "--body-file",
-        body_arg.as_str(),
-        "--base",
-        input.base.trim(),
-        "--head",
-        input.head.trim(),
-    ];
-    if input.draft {
-        args.push("--draft");
-    }
-    let result = gh_checked(root, &args);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let body_path = std::env::temp_dir().join(format!("monocode-pr-{stamp}.md"));
+    std::fs::write(&body_path, input.body.trim()).map_err(|e| e.to_string())?;
+    let result = gh_checked(
+        root,
+        &[
+            "pr",
+            "create",
+            "--title",
+            title,
+            "--body-file",
+            &body_path.to_string_lossy(),
+            "--base",
+            input.base.trim(),
+            "--head",
+            input.head.trim(),
+        ],
+    );
     let _ = std::fs::remove_file(&body_path);
     result.and_then(|output| {
         output
@@ -5425,140 +3493,11 @@ fn git_pr_create_for(root: &Path, input: &GitPrCreateInput) -> Result<String, St
     })
 }
 
-fn git_pr_update_for(root: &Path, url: &str, body: &str) -> Result<(), String> {
-    let url = url.trim();
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err("Invalid pull request URL".into());
-    }
-    let body_path = write_pr_body(body)?;
-    let body_arg = body_path.to_string_lossy().to_string();
-    let result = gh_checked(root, &["pr", "edit", url, "--body-file", body_arg.as_str()]);
-    let _ = std::fs::remove_file(&body_path);
-    result.map(|_| ())
-}
-
-/// Resolve a target branch name to a base ref usable in `base...HEAD` ranges:
-/// the preferred remote's tracking ref first, then a local branch, then a
-/// uniquely-named remote branch.
-fn git_target_ref(root: &Path, target: &str, remote: Option<&str>) -> Option<String> {
-    let target = target.trim();
-    if target.is_empty() || target.len() > 200 || target.chars().any(|ch| ch.is_control()) {
-        return None;
-    }
-    let name = target.strip_prefix("refs/heads/").unwrap_or(target);
-    if let Some(rest) = name.strip_prefix("refs/remotes/") {
-        return git_ref_exists(root, &format!("refs/remotes/{rest}")).then(|| rest.to_string());
-    }
-    if let Some(remote) = remote {
-        if git_ref_exists(root, &format!("refs/remotes/{remote}/{name}")) {
-            return Some(format!("{remote}/{name}"));
-        }
-    }
-    if git_ref_exists(root, &format!("refs/heads/{name}")) {
-        return Some(name.to_string());
-    }
-    let text = git_run(
-        root,
-        &["for-each-ref", "--format=%(refname:short)", "refs/remotes"],
-    )?;
-    let mut found: Option<String> = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.ends_with("/HEAD") {
-            continue;
-        }
-        if line
-            .split_once('/')
-            .map(|(_, n)| n == name)
-            .unwrap_or(false)
-        {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(line.to_string());
-        }
-    }
-    found
-}
-
-fn git_pr_check_for(root: &Path, target: &str) -> Result<GitPrCheck, String> {
-    if !git_is_work_tree(root) {
-        return Err("Not a git repository".into());
-    }
-    let branch = git_head_branch(root);
-    let remote = git_remote_name(root);
-    let upstream = git_stdout(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
-    let default_branch = git_default_branch(root, remote.as_deref());
-    // Cap the scan at 500 dirty files; dirty_limited marks a truncated count.
-    let (dirty_files, dirty_limited) = git_run(root, &["status", "--porcelain", "--", "."])
-        .map(|text| {
-            let mut lines = text.lines();
-            let count = lines.by_ref().take(501).count();
-            (count.min(500) as u32, count > 500)
-        })
-        .unwrap_or((0, false));
-
-    let remote_ref = branch.as_deref().and_then(|name| {
-        upstream
-            .clone()
-            // A local branch can be the upstream — only a `remote/branch`
-            // upstream means the source exists on a remote.
-            .filter(|value| value.contains('/'))
-            .or_else(|| {
-                remote.as_deref().and_then(|remote| {
-                    git_ref_exists(root, &format!("refs/remotes/{remote}/{name}"))
-                        .then(|| format!("{remote}/{name}"))
-                })
-            })
-    });
-    let published = remote_ref.is_some();
-    let ahead_of_remote = remote_ref
-        .as_deref()
-        .map(|base| git_ahead_behind(root, base).0)
-        .unwrap_or(0);
-
-    let target_ref = git_target_ref(root, target, remote.as_deref());
-    let (target_exists, ahead, behind, commits) = match target_ref.as_deref() {
-        Some(base) => {
-            let (ahead, behind) = git_ahead_behind(root, base);
-            let commits = git_run(
-                root,
-                &["log", "--format=%s", "-n", "50", &format!("{base}..HEAD")],
-            )
-            .map(|text| {
-                text.lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-            (true, ahead, behind, commits)
-        }
-        None => (false, 0, 0, Vec::new()),
-    };
-
-    Ok(GitPrCheck {
-        branch,
-        remote,
-        upstream,
-        default_branch,
-        dirty_files,
-        dirty_limited,
-        published,
-        ahead_of_remote,
-        target_exists,
-        ahead,
-        behind,
-        commits,
-    })
-}
-
 fn gh_stdout(root: &Path, args: &[&str]) -> Option<String> {
     gh_run(root, args, false).ok()
 }
 
-pub(crate) fn gh_checked(root: &Path, args: &[&str]) -> Result<String, String> {
+fn gh_checked(root: &Path, args: &[&str]) -> Result<String, String> {
     gh_run(root, args, false)
 }
 
@@ -5643,19 +3582,6 @@ fn gh_run(root: &Path, args: &[&str], allow_empty: bool) -> Result<String, Strin
     Err(detail)
 }
 
-pub(crate) fn host_path(root: &Path, relative: &str) -> PathBuf {
-    if let Ok(Some(location)) = wsl::path_location(root) {
-        // Build the full identity before Windows parses it; a Linux leaf such
-        // as C:notes must never replace the repository with a Windows drive.
-        return PathBuf::from(format!(
-            "{}/{}",
-            location.identity().trim_end_matches('/'),
-            relative
-        ));
-    }
-    root.join(relative)
-}
-
 pub(crate) fn resolve_repo_path(root: &Path, relative: &str) -> Result<String, String> {
     let relative = normalize_diff_path(relative);
     if relative.is_empty()
@@ -5680,64 +3606,6 @@ fn git_cmd() -> Command {
     cmd
 }
 
-fn git_command(root: &Path, args: &[&str]) -> Command {
-    let mut command = git_cmd();
-    command
-        .arg("--no-pager")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0");
-    command
-}
-
-pub(crate) fn git_command_output(
-    root: &Path,
-    args: &[&str],
-) -> Result<std::process::Output, String> {
-    if let Some(location) = wsl::path_location(root)? {
-        return wsl::git(&location, args, None);
-    }
-    git_command(root, args).output().map_err(|e| e.to_string())
-}
-
-/// The same dispatch as `git_command_output`, but bounded: the host-side
-/// process is killed after `timeout` (a stalled fetch/merge cannot hold
-/// the merge guard forever), and the WSL bridge gets the same limit so a
-/// slow fetch isn't cut by the guest's 25s default.
-fn git_command_output_bounded(
-    root: &Path,
-    args: &[&str],
-    timeout: Duration,
-) -> Result<std::process::Output, String> {
-    if let Some(location) = wsl::path_location(root)? {
-        return wsl::git_bounded(&location, args, None, Some(timeout));
-    }
-    crate::bounded_process::output(&mut git_command(root, args), timeout, 256 * 1024)
-}
-
-fn git_check_output(output: std::process::Output, args: &[&str]) -> Result<(), String> {
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let msg = stderr.trim();
-    if !msg.is_empty() {
-        return Err(msg.to_string());
-    }
-    let msg = stdout.trim();
-    if !msg.is_empty() {
-        return Err(msg.to_string());
-    }
-    Err(format!("git {} failed", args.join(" ")))
-}
-
-fn git_checked_bounded(root: &Path, args: &[&str], timeout: Duration) -> Result<(), String> {
-    git_check_output(git_command_output_bounded(root, args, timeout)?, args)
-}
-
 pub(crate) fn git_checked(root: &Path, args: &[&str]) -> Result<(), String> {
     git_check_output(git_command_output(root, args)?, args)
 }
@@ -5759,6 +3627,12 @@ fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
 }
 
 fn git_output_capped(root: &Path, args: &[&str], max_bytes: usize) -> Option<(Vec<u8>, bool)> {
+    if wsl::path_location(root).ok().flatten().is_some() {
+        let mut bytes = git_output(root, args)?;
+        let capped = bytes.len() > max_bytes;
+        bytes.truncate(max_bytes);
+        return Some((bytes, capped));
+    }
     let mut child = git_cmd()
         .arg("--no-pager")
         .arg("-C")
@@ -5829,7 +3703,6 @@ fn git_branches_for(root: &Path) -> GitBranches {
 
     let mut branches = Vec::new();
     let mut local_names = HashSet::new();
-    let worktrees = worktrees::branch_paths(root).unwrap_or_default();
     if let Some(text) = git_run(
         root,
         &[
@@ -5852,7 +3725,6 @@ fn git_branches_for(root: &Path) -> GitBranches {
                 name: name.to_string(),
                 current: head.trim() == "*",
                 remote: None,
-                worktree: worktrees.get(&format!("refs/heads/{name}")).cloned(),
             });
         }
     }
@@ -5864,7 +3736,6 @@ fn git_branches_for(root: &Path) -> GitBranches {
                 name: name.clone(),
                 current: true,
                 remote: None,
-                worktree: worktrees.get(&format!("refs/heads/{name}")).cloned(),
             });
         }
     }
@@ -5891,7 +3762,6 @@ fn git_branches_for(root: &Path) -> GitBranches {
                 name: name.to_string(),
                 current: false,
                 remote: Some(remote.to_string()),
-                worktree: None,
             });
         }
     }
@@ -5913,35 +3783,6 @@ fn git_branches_for(root: &Path) -> GitBranches {
         detached,
         branches,
     }
-}
-
-fn git_checkout_target_for(
-    root: &Path,
-    name: &str,
-    remote: Option<&str>,
-) -> Result<GitCheckout, String> {
-    if !git_is_work_tree(root) {
-        return Err("Not a git repository".into());
-    }
-    let name = git_branch_name(root, name)?;
-    if remote.is_none() && git_head_branch(root).as_deref() != Some(name.as_str()) {
-        if let Some(path) = worktrees::branch_paths(root)?
-            .get(&format!("refs/heads/{name}"))
-            .cloned()
-        {
-            if !git_is_work_tree(Path::new(&path)) {
-                return Err(format!("Worktree unavailable at {path}. Restore its location or repair it in Git, then retry."));
-            }
-            return Ok(GitCheckout {
-                branch: name,
-                worktree: Some(path),
-            });
-        }
-    }
-    Ok(GitCheckout {
-        branch: git_checkout_for(root, &name, remote)?,
-        worktree: None,
-    })
 }
 
 fn git_checkout_for(root: &Path, name: &str, remote: Option<&str>) -> Result<String, String> {
@@ -6047,10 +3888,7 @@ struct GitSync {
     ahead: i64,
     behind: i64,
     ahead_of_default: i64,
-    op_in_progress: bool,
-    op: String,
-    conflicts: Vec<String>,
-    merge_head: Option<String>,
+    head_pushed: bool,
 }
 
 fn git_sync_for(root: &Path) -> GitSync {
@@ -6073,13 +3911,17 @@ fn git_sync_for(root: &Path) -> GitSync {
     } else {
         ahead
     };
-    // Polled every couple of seconds — the cached probe keeps this cheap.
-    let state = git_op_state(root);
-    let conflicts = if state.in_progress() {
-        git_unmerged_paths(root)
-    } else {
-        Vec::new()
-    };
+    let head_pushed = git_stdout(
+        root,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--contains",
+            "HEAD",
+            "refs/remotes",
+        ],
+    )
+    .is_some();
     GitSync {
         remote,
         upstream,
@@ -6087,26 +3929,8 @@ fn git_sync_for(root: &Path) -> GitSync {
         ahead,
         behind,
         ahead_of_default,
-        op_in_progress: state.in_progress(),
-        op: state.op.to_string(),
-        conflicts,
-        merge_head: state.head,
+        head_pushed,
     }
-}
-
-/// Unmerged (conflicted) paths, bounded — empty when nothing is
-/// mid-conflict. `-z` keeps names with spaces or quotes intact; the output
-/// is relative to the repository root even from a subdirectory checkout.
-fn git_unmerged_paths(root: &Path) -> Vec<String> {
-    git_run(root, &["diff", "--name-only", "--diff-filter=U", "-z"])
-        .map(|text| {
-            text.split('\0')
-                .filter(|name| !name.is_empty())
-                .take(100)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn git_remote_name(root: &Path) -> Option<String> {
@@ -6124,8 +3948,6 @@ fn git_remote_name(root: &Path) -> Option<String> {
 
 fn git_default_branch(root: &Path, remote: Option<&str>) -> Option<String> {
     if let Some(remote) = remote {
-        // Only evidence on that remote counts — a local main the remote
-        // lacks would fetch nothing, and a wrong guess is worse than none.
         if let Some(head) = git_stdout(
             root,
             &[
@@ -6134,19 +3956,16 @@ fn git_default_branch(root: &Path, remote: Option<&str>) -> Option<String> {
                 &format!("refs/remotes/{remote}/HEAD"),
             ],
         ) {
-            // Strip exactly this remote's prefix — remote names may contain
-            // "/" (e.g. "a/b/HEAD" → "a/b/main"), so a first-segment split
-            // would keep remote path segments in the branch name.
-            if let Some(name) = head.strip_prefix(&format!("{remote}/")) {
+            if let Some((_, name)) = head.split_once('/') {
                 return Some(name.to_string());
             }
+            return Some(head);
         }
         for name in ["main", "master"] {
             if git_ref_exists(root, &format!("refs/remotes/{remote}/{name}")) {
                 return Some(name.to_string());
             }
         }
-        return None;
     }
     for name in ["main", "master"] {
         if git_ref_exists(root, &format!("refs/heads/{name}")) {
@@ -6623,7 +4442,7 @@ pub fn read_file_preview(
 
 const MAX_STAT_FILES: usize = 64;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileMtime {
     path: String,
@@ -6643,31 +4462,29 @@ pub fn stat_files(paths: Vec<String>) -> Result<Vec<FileMtime>, String> {
     if paths.len() > MAX_STAT_FILES {
         return Err("Too many paths".into());
     }
-    let order: HashMap<_, _> = paths
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, path)| (path, index))
-        .collect();
-    let mut result = wsl::file_batches(&paths, "stat")?;
-    result.extend(
-        paths
-            .into_iter()
-            .filter(|path| matches!(wsl::location(path), Ok(None)))
-            .map(|path| {
-                let expanded = expand_home(&path);
-                let mtime_ms = std::fs::metadata(&expanded)
-                    .ok()
-                    .filter(|meta| meta.is_file())
-                    .and_then(|meta| file_mtime_ms(&meta));
-                FileMtime { path, mtime_ms }
-            }),
-    );
-    result.sort_by_key(|item| order.get(&item.path).copied().unwrap_or(usize::MAX));
+    let mut guest: HashMap<String, VecDeque<FileMtime>> = HashMap::new();
+    for item in wsl::file_batches::<FileMtime>(&paths, "stat")? {
+        guest.entry(item.path.clone()).or_default().push_back(item);
+    }
+    let mut result = Vec::with_capacity(paths.len());
+    for path in paths {
+        if wsl::location(&path)?.is_some() {
+            if let Some(item) = guest.get_mut(&path).and_then(VecDeque::pop_front) {
+                result.push(item);
+            }
+        } else {
+            let expanded = expand_home(&path);
+            let mtime_ms = std::fs::metadata(&expanded)
+                .ok()
+                .filter(|meta| meta.is_file())
+                .and_then(|meta| file_mtime_ms(&meta));
+            result.push(FileMtime { path, mtime_ms });
+        }
+    }
     Ok(result)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathInfo {
     pub path: String,
@@ -6679,27 +4496,21 @@ pub struct PathInfo {
 /// Metadata for files the composer is attaching (picker, drop, paste).
 #[tauri::command(async)]
 pub fn inspect_paths(paths: Vec<String>) -> Result<Vec<PathInfo>, String> {
-    if paths.len() > MAX_STAT_FILES {
-        return Err("Too many paths".into());
+    let mut guest: HashMap<String, VecDeque<PathInfo>> = HashMap::new();
+    for item in wsl::file_batches::<PathInfo>(&paths, "inspect")? {
+        guest.entry(item.path.clone()).or_default().push_back(item);
     }
-    let order: HashMap<_, _> = paths
-        .iter()
-        .enumerate()
-        .map(|(index, path)| (path_to_js(&expand_home(path)), index))
-        .collect();
-    let mut result = wsl::file_batches(&paths, "inspect")?;
-    result.extend(
-        paths
-            .into_iter()
-            .filter(|path| matches!(wsl::location(path), Ok(None)))
-            .filter_map(|path| inspect_path_sync(&path)),
-    );
-    result.sort_by_key(|item| {
-        order
-            .get(&path_to_js(&expand_home(&item.path)))
-            .copied()
-            .unwrap_or(usize::MAX)
-    });
+    let mut result = Vec::with_capacity(paths.len());
+    for path in paths {
+        let item = if wsl::location(&path)?.is_some() {
+            guest.get_mut(&path).and_then(VecDeque::pop_front)
+        } else {
+            inspect_path_sync(&path)
+        };
+        if let Some(item) = item {
+            result.push(item);
+        }
+    }
     Ok(result)
 }
 
@@ -6904,7 +4715,7 @@ pub async fn write_text_file(path: String, content: String) -> Result<(), String
         .map_err(|e| e.to_string())?
 }
 
-pub(crate) fn write_text_file_sync(path: &str, content: &str) -> Result<(), String> {
+fn write_text_file_sync(path: &str, content: &str) -> Result<(), String> {
     if content.len() as u64 > MAX_TEXT_FILE_BYTES {
         return Err(format!(
             "File is too large to save (maximum {} MB).",
@@ -7052,7 +4863,7 @@ fn copy_recursive(from: &Path, to: &Path) -> Result<(), String> {
     }
 }
 
-pub(crate) fn rename_path_sync(path: &str, name: &str) -> Result<String, String> {
+fn rename_path_sync(path: &str, name: &str) -> Result<String, String> {
     if let Some(location) = wsl::location(path)? {
         return wsl::path_request(&location, "rename", json!({"name":name}));
     }
@@ -7126,6 +4937,13 @@ pub async fn delete_path(path: String) -> Result<(), String> {
         .map_err(|e| e.to_string())?
 }
 
+fn dir_contains(dir: &Path, dest_parent: &Path) -> bool {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dest_parent =
+        std::fs::canonicalize(dest_parent).unwrap_or_else(|_| dest_parent.to_path_buf());
+    dest_parent.starts_with(&dir)
+}
+
 fn copy_path_sync(from: &str, dest_parent: &str) -> Result<String, String> {
     if let Some(path) = wsl::transfer_path(from, dest_parent, "copy")? {
         return Ok(path);
@@ -7138,7 +4956,7 @@ fn copy_path_sync(from: &str, dest_parent: &str) -> Result<String, String> {
     if !dest_parent.is_dir() {
         return Err(format!("{} is not a folder", dest_parent.display()));
     }
-    if from.is_dir() && dest_parent.starts_with(&from) {
+    if from.is_dir() && dir_contains(&from, &dest_parent) {
         return Err("Cannot paste a folder into itself.".into());
     }
     let name = unique_name_in(
@@ -7169,7 +4987,7 @@ fn move_path_sync(from: &str, dest_parent: &str) -> Result<String, String> {
     if !dest_parent.is_dir() {
         return Err(format!("{} is not a folder", dest_parent.display()));
     }
-    if from.is_dir() && dest_parent.starts_with(&from) {
+    if from.is_dir() && dir_contains(&from, &dest_parent) {
         return Err("Cannot paste a folder into itself.".into());
     }
     let name = file_label(&from, from.to_str().unwrap_or("item"));
@@ -7242,6 +5060,85 @@ pub fn reveal_path(path: String) -> Result<(), String> {
     }
 }
 
+pub(crate) fn host_path(root: &Path, relative: &str) -> PathBuf {
+    if let Ok(Some(location)) = wsl::path_location(root) {
+        // Build the full identity before Windows parses it; a Linux leaf such
+        // as C:notes must never replace the repository with a Windows drive.
+        return PathBuf::from(format!(
+            "{}/{}",
+            location.identity().trim_end_matches('/'),
+            relative
+        ));
+    }
+    root.join(relative)
+}
+
+fn git_command(root: &Path, args: &[&str]) -> Command {
+    let mut command = git_cmd();
+    command
+        .arg("--no-pager")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+pub(crate) fn git_command_output(
+    root: &Path,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
+    if let Some(location) = wsl::path_location(root)? {
+        return wsl::git(&location, args, None);
+    }
+    git_command(root, args).output().map_err(|e| e.to_string())
+}
+
+fn git_check_output(output: std::process::Output, args: &[&str]) -> Result<(), String> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let msg = stderr.trim();
+    if !msg.is_empty() {
+        return Err(msg.to_string());
+    }
+    let msg = stdout.trim();
+    if !msg.is_empty() {
+        return Err(msg.to_string());
+    }
+    Err(format!("git {} failed", args.join(" ")))
+}
+
+pub(crate) fn git_checkpoint_paths(root: &Path) -> Vec<String> {
+    let mut files: HashMap<String, FileAcc> = HashMap::new();
+    for staged in [false, true] {
+        let mut args = vec![
+            "diff",
+            "--no-ext-diff",
+            "--name-only",
+            "--no-renames",
+            "--relative",
+            "-z",
+        ];
+        if staged {
+            args.push("--cached");
+        }
+        args.extend(["--", "."]);
+        if let Some(names) = git_run(root, &args) {
+            for path in names.split('\0').filter(|path| !path.is_empty()) {
+                files.entry(path_to_js(Path::new(path))).or_default();
+            }
+        }
+    }
+    add_untracked_map(root, &mut files, false);
+    let mut paths: Vec<_> = files.into_keys().collect();
+    paths.sort();
+    paths
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7254,6 +5151,22 @@ mod tests {
             text: text.into(),
             concat: concat.into(),
         }
+    }
+
+    #[test]
+    fn github_star_status_distinguishes_a_missing_star_from_an_unavailable_check() {
+        assert_eq!(
+            github_star_status_from_result(Ok(String::new())),
+            GitHubStarStatus::Starred
+        );
+        assert_eq!(
+            github_star_status_from_result(Err("gh: Not Found (HTTP 404)".into())),
+            GitHubStarStatus::NotStarred
+        );
+        assert_eq!(
+            github_star_status_from_result(Err("GitHub CLI is not installed".into())),
+            GitHubStarStatus::Unavailable
+        );
     }
 
     #[test]
@@ -7482,6 +5395,49 @@ mod tests {
     }
 
     #[test]
+    fn native_metadata_preserves_input_order_and_attachment_batch_size() {
+        let dir = tmp("metadata-order");
+        let a = dir.0.join("a.txt");
+        let b = dir.0.join("b.txt");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let paths = vec![path_to_js(&a), path_to_js(&b), path_to_js(&a)];
+        assert_eq!(
+            stat_files(paths.clone())
+                .unwrap()
+                .into_iter()
+                .map(|x| x.path)
+                .collect::<Vec<_>>(),
+            paths,
+        );
+        assert_eq!(
+            inspect_paths(paths.clone())
+                .unwrap()
+                .into_iter()
+                .map(|x| x.path)
+                .collect::<Vec<_>>(),
+            paths,
+        );
+        assert_eq!(inspect_paths(vec![path_to_js(&a); 65]).unwrap().len(), 65);
+    }
+
+    #[test]
+    fn skip_worktree_preserves_upstream_index_and_head_diff_meaning() {
+        let dir = tmp("skip-worktree-diff");
+        assert!(init_git_commit(&dir.0, &[("a.txt", "head\n")]));
+        std::fs::write(dir.0.join("a.txt"), "index\n").unwrap();
+        git_checked(&dir.0, &["add", "a.txt"]).unwrap();
+        git_checked(&dir.0, &["update-index", "--skip-worktree", "a.txt"]).unwrap();
+        std::fs::write(dir.0.join("a.txt"), "local\n").unwrap();
+        let unstaged = git_file_diff_for(&dir.0, "a.txt", false).unwrap();
+        assert_eq!(unstaged.original, "index\n");
+        assert_eq!(unstaged.current, "local\n");
+        let staged = git_file_diff_for(&dir.0, "a.txt", true).unwrap();
+        assert_eq!(staged.original, "head\n");
+        assert_eq!(staged.current, "index\n");
+    }
+
+    #[test]
     fn attachment_bytes_round_trip_through_temp_dir() {
         let encoded =
             read_file_base64_sync(&write_attachment_sync("shot.png", "aGVsbG8=").unwrap()).unwrap();
@@ -7567,6 +5523,24 @@ mod tests {
         assert!(Path::new(&copied).join("a.rs").exists());
 
         let err = copy_path_sync(&src_s, &src_s).unwrap_err();
+        assert!(err.contains("itself"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_rejects_paste_into_self_through_a_symlink_alias() {
+        let dir = tmp("folder-alias");
+        let src = dir.0.join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.rs"), "fn a() {}\n").unwrap();
+        let alias = dir.0.join("alias");
+        std::os::unix::fs::symlink(&src, &alias).unwrap();
+        let src_s = src.to_string_lossy().into_owned();
+        let alias_s = alias.to_string_lossy().into_owned();
+
+        let err = copy_path_sync(&src_s, &alias_s).unwrap_err();
+        assert!(err.contains("itself"));
+        let err = move_path_sync(&src_s, &alias_s).unwrap_err();
         assert!(err.contains("itself"));
     }
 
@@ -7760,8 +5734,7 @@ mod tests {
             GitDiffStats {
                 files: 0,
                 additions: 0,
-                deletions: 0,
-                branch: None
+                deletions: 0
             }
         );
     }
@@ -7782,7 +5755,6 @@ mod tests {
         assert_eq!(stats.files, 3);
         assert_eq!(stats.additions, 4);
         assert_eq!(stats.deletions, 1);
-        assert_eq!(stats.branch.as_deref(), Some("main"));
     }
 
     #[test]
@@ -7796,31 +5768,9 @@ mod tests {
             GitDiffStats {
                 files: 0,
                 additions: 0,
-                deletions: 0,
-                branch: Some("main".to_string())
+                deletions: 0
             }
         );
-    }
-
-    #[test]
-    fn unicode_diff_rows_open_and_stage_the_original_file() {
-        let dir = tmp("unicode-diff");
-        let name = "hello ż.txt";
-        if !init_git_commit(&dir.0, &[(name, "before\n")]) {
-            return;
-        }
-        std::fs::write(dir.0.join(name), "after\n").unwrap();
-        let index = git_diff_index_for(&dir.0);
-        assert_eq!(index.files.len(), 1);
-        assert_eq!(index.files[0].relative, name);
-        assert_eq!(
-            git_file_diff_for(&dir.0, &index.files[0].relative, false)
-                .unwrap()
-                .current,
-            "after\n"
-        );
-        git_checked(&dir.0, &["add", "--", &index.files[0].relative]).unwrap();
-        assert!(git_diff_index_for(&dir.0).files[0].staged);
     }
 
     #[test]
@@ -8178,28 +6128,6 @@ mod tests {
     }
 
     #[test]
-    fn git_stage_contents_stages_partial_hunk() {
-        let dir = tmp("git-stage-contents");
-        if !init_git_commit(&dir.0, &[("a.txt", "alpha\nbeta\ngamma\ndelta\n")]) {
-            return;
-        }
-        std::fs::write(dir.0.join("a.txt"), "alpha\nBETA\ngamma\nDELTA\n").unwrap();
-        git_stage_contents_for(&dir.0, "a.txt", b"alpha\nBETA\ngamma\ndelta\n", None).unwrap();
-
-        let file = git_diff_index_for(&dir.0)
-            .files
-            .into_iter()
-            .find(|file| file.relative == "a.txt")
-            .unwrap();
-        assert!(file.staged);
-        assert!(file.unstaged);
-
-        let diff = git_file_diff_for(&dir.0, "a.txt", false).unwrap();
-        assert_eq!(diff.original, "alpha\nBETA\ngamma\ndelta\n");
-        assert_eq!(diff.current, "alpha\nBETA\ngamma\nDELTA\n");
-    }
-
-    #[test]
     fn git_stage_contents_rejects_a_stale_diff() {
         let dir = tmp("git-stage-stale");
         if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
@@ -8226,261 +6154,13 @@ mod tests {
     }
 
     #[test]
-    fn git_stage_contents_unstages_one_hunk_without_changing_the_worktree() {
-        let dir = tmp("git-unstage-hunk");
+    fn git_stage_contents_stages_partial_hunk() {
+        let dir = tmp("git-stage-contents");
         if !init_git_commit(&dir.0, &[("a.txt", "alpha\nbeta\ngamma\ndelta\n")]) {
             return;
         }
-        let working = "alpha\nBETA\ngamma\nDELTA\n";
-        std::fs::write(dir.0.join("a.txt"), working).unwrap();
-        git_stage_file_for(&dir.0, "a.txt").unwrap();
-        let inspected = git_file_diff_for(&dir.0, "a.txt", true).unwrap();
-        let guard = GitDiffGuard {
-            kind: "staged".into(),
-            status: inspected.status,
-            original: inspected.original,
-            current: inspected.current,
-        };
-
-        git_stage_contents_for(
-            &dir.0,
-            "a.txt",
-            b"alpha\nbeta\ngamma\nDELTA\n",
-            Some(&guard),
-        )
-        .unwrap();
-
-        let staged = git_file_diff_for(&dir.0, "a.txt", true).unwrap();
-        assert_eq!(staged.current, "alpha\nbeta\ngamma\nDELTA\n");
-        let unstaged = git_file_diff_for(&dir.0, "a.txt", false).unwrap();
-        assert_eq!(unstaged.original, "alpha\nbeta\ngamma\nDELTA\n");
-        assert_eq!(unstaged.current, working);
-        assert_eq!(
-            std::fs::read_to_string(dir.0.join("a.txt")).unwrap(),
-            working
-        );
-    }
-
-    #[test]
-    fn git_keep_local_hides_tracked_edits_and_blocks_staging() {
-        let dir = tmp("git-keep-tracked");
-        if !init_git_commit(&dir.0, &[("config.txt", "a\nb\n"), ("work.txt", "w\n")]) {
-            return;
-        }
-        std::fs::write(dir.0.join("config.txt"), "a\nlocal\n").unwrap();
-        assert!(git_diff_index_for(&dir.0)
-            .files
-            .iter()
-            .any(|file| file.relative == "config.txt"));
-
-        git_keep_local_for(&dir.0, "config.txt").unwrap();
-        let index = git_diff_index_for(&dir.0);
-        assert!(index.files.iter().all(|file| file.relative != "config.txt"));
-        assert_eq!(index.local_only.len(), 1);
-        assert_eq!(index.local_only[0].relative, "config.txt");
-        assert_eq!(index.local_only[0].status, "modified");
-
-        // The diff still shows the local edit against HEAD.
-        let diff = git_file_diff_for(&dir.0, "config.txt", false).unwrap();
-        assert_eq!(diff.original, "a\nb\n");
-        assert_eq!(diff.current, "a\nlocal\n");
-        assert_eq!(diff.status, "modified");
-
-        // Staging paths refuse kept files, and `add -A` skips them.
-        assert!(git_stage_file_for(&dir.0, "config.txt").is_err());
-        assert!(git_stage_contents_for(&dir.0, "config.txt", b"x\n", None).is_err());
-        git_checked(&dir.0, &["add", "-A", "--", "."]).unwrap();
-        assert!(git_diff_index_for(&dir.0).files.is_empty());
-        assert_eq!(
-            std::fs::read_to_string(dir.0.join("config.txt")).unwrap(),
-            "a\nlocal\n"
-        );
-
-        // A commit lands without the kept file, and unkeep restores it.
-        std::fs::write(dir.0.join("work.txt"), "w2\n").unwrap();
-        git_stage_file_for(&dir.0, "work.txt").unwrap();
-        git_commit_for(&dir.0, "work").unwrap();
-        let diff = git_file_diff_for(&dir.0, "config.txt", false).unwrap();
-        assert_eq!(diff.original, "a\nb\n");
-        git_unkeep_local_for(&dir.0, "config.txt").unwrap();
-        let index = git_diff_index_for(&dir.0);
-        assert!(index.local_only.is_empty());
-        let file = index
-            .files
-            .iter()
-            .find(|file| file.relative == "config.txt")
-            .unwrap();
-        assert!(file.unstaged);
-        assert!(!file.staged);
-    }
-
-    #[test]
-    fn git_keep_local_parks_untracked_files() {
-        let dir = tmp("git-keep-untracked");
-        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
-            return;
-        }
-        std::fs::write(dir.0.join("dev.local"), "secret=1\n").unwrap();
-        assert!(git_diff_index_for(&dir.0)
-            .files
-            .iter()
-            .any(|file| file.relative == "dev.local" && file.status == "untracked"));
-
-        git_keep_local_for(&dir.0, "dev.local").unwrap();
-        let index = git_diff_index_for(&dir.0);
-        assert!(index.files.is_empty());
-        assert_eq!(index.local_only.len(), 1);
-        assert_eq!(index.local_only[0].relative, "dev.local");
-        assert_eq!(index.local_only[0].status, "untracked");
-
-        // The parked file diffs as new content against nothing in HEAD.
-        let diff = git_file_diff_for(&dir.0, "dev.local", false).unwrap();
-        assert_eq!(diff.original, "");
-        assert_eq!(diff.current, "secret=1\n");
-        assert_eq!(diff.status, "untracked");
-
-        git_unkeep_local_for(&dir.0, "dev.local").unwrap();
-        let index = git_diff_index_for(&dir.0);
-        assert!(index.local_only.is_empty());
-        assert!(index
-            .files
-            .iter()
-            .any(|file| file.relative == "dev.local" && file.status == "untracked"));
-        assert!(git_unkeep_local_for(&dir.0, "dev.local").is_err());
-    }
-
-    #[test]
-    fn git_keep_local_unstages_a_staged_file_first() {
-        let dir = tmp("git-keep-staged");
-        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
-            return;
-        }
-        std::fs::write(dir.0.join("a.txt"), "beta\n").unwrap();
-        git_stage_file_for(&dir.0, "a.txt").unwrap();
-        assert!(git_diff_index_for(&dir.0).files[0].staged);
-
-        // Keeping a staged file must unstage it — the flag alone leaves it
-        // committable.
-        git_keep_local_for(&dir.0, "a.txt").unwrap();
-        let index = git_diff_index_for(&dir.0);
-        assert!(index.files.is_empty());
-        assert_eq!(index.local_only[0].relative, "a.txt");
-        git_commit_for(&dir.0, "must not contain a.txt").unwrap_err();
-    }
-
-    #[test]
-    fn git_commit_refuses_a_staged_keep_local_entry() {
-        let dir = tmp("git-keep-commit-guard");
-        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n"), ("b.txt", "beta\n")]) {
-            return;
-        }
-        std::fs::write(dir.0.join("a.txt"), "local\n").unwrap();
-        // Simulates flagging a file while it is staged from a plain shell —
-        // the entry stays committable until something unstages it.
-        assert!(git(&dir.0, &["add", "a.txt"]));
-        assert!(git(&dir.0, &["update-index", "--skip-worktree", "a.txt"]));
-
-        let error = git_commit_for(&dir.0, "work").unwrap_err();
-        assert!(error.contains("a.txt"), "{error}");
-        assert!(error.contains("kept-local") || error.contains("Kept-local"));
-    }
-
-    #[test]
-    fn git_keep_local_parked_file_never_lands_in_a_commit() {
-        let dir = tmp("git-keep-commit-clean");
-        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
-            return;
-        }
-        std::fs::write(dir.0.join("dev.local"), "secret=1\n").unwrap();
-        git_keep_local_for(&dir.0, "dev.local").unwrap();
-        std::fs::write(dir.0.join("a.txt"), "beta\n").unwrap();
-        git_stage_file_for(&dir.0, "a.txt").unwrap();
-
-        // The commit succeeds and HEAD gains only a.txt — the parked file
-        // stays out of the tree.
-        git_commit_for(&dir.0, "work").unwrap();
-        assert_eq!(git_head_entry(&dir.0, "dev.local"), None);
-        assert_eq!(git_head_entry(&dir.0, "a.txt").as_deref(), Some("blob"));
-        assert_eq!(git_diff_stats_for(&dir.0).files, 0);
-    }
-
-    #[test]
-    fn git_keep_local_refuses_conflicted_and_directory_paths() {
-        let dir = tmp("git-keep-conflict");
-        if !init_git_commit(&dir.0, &[("sub/f.txt", "f\n")]) {
-            return;
-        }
-        // A directory path must not unstage its subtree.
-        let error = git_keep_local_for(&dir.0, "sub").unwrap_err();
-        assert!(error.contains("directory"), "{error}");
-        assert_eq!(
-            git_diff_index_for(&dir.0).files.len(),
-            0,
-            "directory keep must not mutate the index"
-        );
-
-        // Diverge both sides of conf.txt and merge for a real conflict.
-        assert!(git(&dir.0, &["checkout", "-b", "side"]));
-        std::fs::write(dir.0.join("conf.txt"), "side\n").unwrap();
-        assert!(git(&dir.0, &["add", "conf.txt"]));
-        assert!(git(&dir.0, &["commit", "-m", "side"]));
-        assert!(git(&dir.0, &["checkout", "main"]));
-        std::fs::write(dir.0.join("conf.txt"), "main\n").unwrap();
-        assert!(git(&dir.0, &["add", "conf.txt"]));
-        assert!(git(&dir.0, &["commit", "-m", "main"]));
-        assert!(!git(&dir.0, &["merge", "side"]));
-
-        let error = git_keep_local_for(&dir.0, "conf.txt").unwrap_err();
-        assert!(error.contains("conflict"), "{error}");
-    }
-
-    #[test]
-    fn git_keep_local_reports_deleted_and_rekeep_unstages() {
-        let dir = tmp("git-keep-deleted");
-        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n"), ("b.txt", "beta\n")]) {
-            return;
-        }
-        git_keep_local_for(&dir.0, "a.txt").unwrap();
-        std::fs::remove_file(dir.0.join("a.txt")).unwrap();
-        let index = git_diff_index_for(&dir.0);
-        assert_eq!(index.local_only[0].relative, "a.txt");
-        assert_eq!(index.local_only[0].status, "deleted");
-
-        // A file flagged while staged (e.g. via bare update-index) stays
-        // committable — keeping it again must unstage it.
-        std::fs::write(dir.0.join("b.txt"), "local\n").unwrap();
-        assert!(git(&dir.0, &["add", "b.txt"]));
-        assert!(git(&dir.0, &["update-index", "--skip-worktree", "b.txt"]));
-        let index = git_diff_index_for(&dir.0);
-        let b = index
-            .files
-            .iter()
-            .find(|file| file.relative == "b.txt")
-            .unwrap();
-        assert!(b.staged);
-        git_keep_local_for(&dir.0, "b.txt").unwrap();
-        let index = git_diff_index_for(&dir.0);
-        assert!(index.files.iter().all(|file| file.relative != "b.txt"));
-        assert!(index.local_only.iter().any(|file| file.relative == "b.txt"));
-        git_commit_for(&dir.0, "nothing staged now").unwrap_err();
-    }
-
-    #[test]
-    fn git_stage_contents_stages_a_guarded_deletion() {
-        let dir = tmp("git-stage-deletion");
-        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
-            return;
-        }
-        std::fs::remove_file(dir.0.join("a.txt")).unwrap();
-        let inspected = git_file_diff_for(&dir.0, "a.txt", false).unwrap();
-        let guard = GitDiffGuard {
-            kind: "unstaged".into(),
-            status: inspected.status,
-            original: inspected.original,
-            current: inspected.current,
-        };
-
-        git_stage_contents_for(&dir.0, "a.txt", b"", Some(&guard)).unwrap();
+        std::fs::write(dir.0.join("a.txt"), "alpha\nBETA\ngamma\nDELTA\n").unwrap();
+        git_stage_contents_for(&dir.0, "a.txt", b"alpha\nBETA\ngamma\ndelta\n", None).unwrap();
 
         let file = git_diff_index_for(&dir.0)
             .files
@@ -8488,40 +6168,11 @@ mod tests {
             .find(|file| file.relative == "a.txt")
             .unwrap();
         assert!(file.staged);
-        assert!(!file.unstaged);
-        assert_eq!(file.status, "deleted");
-    }
-
-    #[test]
-    fn git_stage_contents_unstages_a_new_file_without_leaving_an_empty_entry() {
-        let dir = tmp("git-unstage-new-file");
-        if !init_git_commit(&dir.0, &[]) {
-            return;
-        }
-        std::fs::write(dir.0.join("a.txt"), "alpha\n").unwrap();
-        git_stage_file_for(&dir.0, "a.txt").unwrap();
-        let inspected = git_file_diff_for(&dir.0, "a.txt", true).unwrap();
-        let guard = GitDiffGuard {
-            kind: "staged".into(),
-            status: inspected.status,
-            original: inspected.original,
-            current: inspected.current,
-        };
-
-        git_stage_contents_for(&dir.0, "a.txt", b"", Some(&guard)).unwrap();
-
-        let file = git_diff_index_for(&dir.0)
-            .files
-            .into_iter()
-            .find(|file| file.relative == "a.txt")
-            .unwrap();
-        assert!(!file.staged);
         assert!(file.unstaged);
-        assert_eq!(file.status, "untracked");
-        assert_eq!(
-            std::fs::read_to_string(dir.0.join("a.txt")).unwrap(),
-            "alpha\n"
-        );
+
+        let diff = git_file_diff_for(&dir.0, "a.txt", false).unwrap();
+        assert_eq!(diff.original, "alpha\nBETA\ngamma\ndelta\n");
+        assert_eq!(diff.current, "alpha\nBETA\ngamma\nDELTA\n");
     }
 
     #[test]
@@ -8612,7 +6263,9 @@ mod tests {
         std::fs::write(dir.0.join("a.txt"), "beta\n").unwrap();
         git_stage_file_for(&dir.0, "a.txt").unwrap();
         git_commit_for(&dir.0, "update a").unwrap();
-        assert!(git_diff_index_for(&dir.0).files.is_empty());
+        let index = git_diff_index_for(&dir.0);
+        assert!(index.files.is_empty());
+        assert_eq!(index.head, git_stdout(&dir.0, &["rev-parse", "HEAD"]));
         assert_eq!(
             git_stdout(&dir.0, &["log", "-1", "--pretty=%s"]).as_deref(),
             Some("update a")
@@ -8623,6 +6276,71 @@ mod tests {
     fn git_commit_rejects_empty_message() {
         let dir = tmp("git-commit-empty");
         assert!(git_commit_for(&dir.0, "   ").is_err());
+    }
+
+    #[test]
+    fn git_commit_amend_rewrites_head_with_staged_changes() {
+        let dir = tmp("git-commit-amend");
+        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        std::fs::write(dir.0.join("a.txt"), "beta\n").unwrap();
+        git_stage_file_for(&dir.0, "a.txt").unwrap();
+        git_commit_amend_for(&dir.0, "amended").unwrap();
+        assert!(git_diff_index_for(&dir.0).files.is_empty());
+        assert_eq!(
+            git_stdout(&dir.0, &["rev-list", "--count", "HEAD"]).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            git_stdout(&dir.0, &["log", "-1", "--pretty=%s"]).as_deref(),
+            Some("amended")
+        );
+        assert_eq!(
+            git_stdout(&dir.0, &["show", "HEAD:a.txt"]).as_deref(),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn git_commit_amend_rewords_without_staged_changes() {
+        let dir = tmp("git-commit-reword");
+        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        git_commit_amend_for(&dir.0, "reworded").unwrap();
+        assert_eq!(
+            git_stdout(&dir.0, &["rev-list", "--count", "HEAD"]).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            git_stdout(&dir.0, &["log", "-1", "--pretty=%s"]).as_deref(),
+            Some("reworded")
+        );
+    }
+
+    #[test]
+    fn git_head_message_returns_subject_and_body() {
+        let dir = tmp("git-head-message");
+        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        std::fs::write(dir.0.join("a.txt"), "beta\n").unwrap();
+        git_stage_file_for(&dir.0, "a.txt").unwrap();
+        git_commit_for(&dir.0, "Subject line\n\nBody text").unwrap();
+        assert_eq!(
+            git_head_message_for(&dir.0).unwrap(),
+            "Subject line\n\nBody text"
+        );
+    }
+
+    #[test]
+    fn git_head_message_fails_without_commits() {
+        let dir = tmp("git-head-message-empty");
+        if !init_git(&dir.0, "main", None) {
+            return;
+        }
+        assert!(git_head_message_for(&dir.0).is_err());
     }
 
     #[test]
@@ -8715,10 +6433,45 @@ mod tests {
         assert_eq!(index.upstream, None);
         assert_eq!(index.ahead, 1);
         assert_eq!(index.ahead_of_default, 1);
-        let range = git_range_context_for(&repo.0, None).unwrap();
+        let range = git_range_context_for(&repo.0).unwrap();
         assert_eq!(range.base, "main");
         assert_eq!(range.head, "feature");
         assert!(range.commit_summary.contains("feature work"));
+    }
+
+    #[test]
+    fn git_sync_marks_head_pushed_without_upstream() {
+        let repo = tmp("git-pushed-repo");
+        let origin = tmp("git-pushed-origin");
+        if !init_git_commit(&repo.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        if Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&origin.0)
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let origin_url = origin.0.to_string_lossy().into_owned();
+        if !git(&repo.0, &["remote", "add", "origin", &origin_url])
+            || !git(&repo.0, &["push", "-u", "origin", "main"])
+            || !git(&repo.0, &["checkout", "-b", "feature"])
+        {
+            return;
+        }
+        std::fs::write(repo.0.join("a.txt"), "beta\n").unwrap();
+        git_stage_file_for(&repo.0, "a.txt").unwrap();
+        git_commit_for(&repo.0, "feature work").unwrap();
+        assert!(!git_diff_index_for(&repo.0).head_pushed);
+        if !git(&repo.0, &["push", "origin", "feature"]) {
+            return;
+        }
+        let index = git_diff_index_for(&repo.0);
+        assert_eq!(index.upstream, None);
+        assert!(index.head_pushed);
     }
 
     #[test]
@@ -8798,29 +6551,6 @@ mod tests {
             github_pr_head_filter("hardbeat920/monocode", "main").as_deref(),
             Some("hardbeat920:main")
         );
-    }
-
-    #[test]
-    fn parse_github_issue_relations_marks_foreign_repos() {
-        let json = r#"{"data":{"repository":{"issue":{
-            "parent":{"number":7,"title":"Epic","url":"https://github.com/acme/web/issues/7","state":"OPEN","updatedAt":"","repository":{"nameWithOwner":"acme/web"}},
-            "subIssues":{"totalCount":2,"pageInfo":{"hasNextPage":true},"nodes":[
-                {"number":9,"title":"Sub","url":"https://github.com/acme/web/issues/9","state":"CLOSED","updatedAt":"","repository":{"nameWithOwner":"acme/web"}},
-                {"number":4,"title":"Other repo","url":"https://github.com/acme/api/issues/4","state":"OPEN","updatedAt":"","repository":{"nameWithOwner":"acme/api"}},
-                null
-            ]}
-        }}}}"#;
-        let parsed = parse_github_issue_relations(json, "acme/web").unwrap();
-        assert_eq!(parsed["truncated"], true);
-        let edges = parsed["edges"].as_array().unwrap();
-        assert_eq!(edges.len(), 3);
-        assert_eq!(edges[0]["key"], "parent");
-        assert_eq!(edges[0]["item"]["number"], 7);
-        assert_eq!(edges[1]["key"], "children");
-        assert_eq!(edges[1]["item"]["state"], "closed");
-        assert_eq!(edges[2]["foreign"], true);
-        assert_eq!(edges[2]["item"]["repo"], "acme/api");
-        assert!(parse_github_issue_relations(r#"{"errors":[{"message":"boom"}]}"#, "a/b").is_err());
     }
 
     #[test]
@@ -9211,119 +6941,6 @@ mod tests {
     }
 
     #[test]
-    fn github_submit_review_validates_before_calling_gh() {
-        let root = Path::new("/nonexistent");
-        let comment = |path: &str, line: i64, side: &str, body: &str| GitHubReviewCommentInput {
-            path: path.into(),
-            line,
-            side: side.into(),
-            body: body.into(),
-        };
-        // Every rejection lands before `gh` runs — no checkout or auth needed.
-        assert!(
-            git_github_submit_review_for(root, "acme/app", 0, "abc123", "APPROVE", "", &[])
-                .is_err()
-        );
-        assert!(
-            git_github_submit_review_for(root, "acme/app", 1, "abc123", "LGTM", "", &[]).is_err()
-        );
-        assert!(
-            git_github_submit_review_for(root, "acme/app", 1, "not a sha", "APPROVE", "", &[])
-                .is_err()
-        );
-        assert!(git_github_submit_review_for(root, "acme/app", 1, "", "APPROVE", "", &[]).is_err());
-        assert!(
-            git_github_submit_review_for(root, "acme/app", 1, "abc123", "COMMENT", "", &[])
-                .is_err()
-        );
-        assert!(git_github_submit_review_for(
-            root,
-            "acme/app",
-            1,
-            "abc123",
-            "COMMENT",
-            "",
-            &[comment("", 1, "RIGHT", "hi"),]
-        )
-        .is_err());
-        assert!(git_github_submit_review_for(
-            root,
-            "acme/app",
-            1,
-            "abc123",
-            "COMMENT",
-            "",
-            &[comment("a.ts", 0, "RIGHT", "hi"),]
-        )
-        .is_err());
-        assert!(git_github_submit_review_for(
-            root,
-            "acme/app",
-            1,
-            "abc123",
-            "COMMENT",
-            "",
-            &[comment("a.ts", 1, "MIDDLE", "hi"),]
-        )
-        .is_err());
-        assert!(git_github_submit_review_for(
-            root,
-            "acme/app",
-            1,
-            "abc123",
-            "COMMENT",
-            "",
-            &[comment("a.ts", 1, "RIGHT", "  "),]
-        )
-        .is_err());
-        assert!(git_github_submit_review_for(
-            root,
-            "acme/app",
-            1,
-            "abc123",
-            "COMMENT",
-            "",
-            &[comment("/etc/passwd", 1, "RIGHT", "hi"),]
-        )
-        .is_err());
-        let many = vec![comment("a.ts", 1, "RIGHT", "hi"); 51];
-        assert!(
-            git_github_submit_review_for(root, "acme/app", 1, "abc123", "COMMENT", "", &many)
-                .is_err()
-        );
-        assert!(
-            git_github_submit_review_for(root, "bad repo", 1, "abc123", "APPROVE", "", &[])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn github_review_payload_allows_bare_approve_and_serializes() {
-        // An empty approve or request-changes is a valid review — only an
-        // empty COMMENT carries nothing and is rejected.
-        let payload: serde_json::Value =
-            serde_json::from_str(&github_review_payload("abc123", "APPROVE", "", &[]).unwrap())
-                .unwrap();
-        assert_eq!(payload["commit_id"], "abc123");
-        assert_eq!(payload["event"], "APPROVE");
-        assert_eq!(payload["body"], "");
-        assert_eq!(payload["comments"].as_array().unwrap().len(), 0);
-        assert!(github_review_payload("abc123", "REQUEST_CHANGES", "", &[]).is_ok());
-        assert!(github_review_payload("abc123", "COMMENT", "", &[]).is_err());
-    }
-
-    #[test]
-    fn parse_github_submit_review_url_reads_rest_response() {
-        let json = r#"{"id": 9, "html_url": "https://github.com/acme/app/pull/42#pullrequestreview-9", "state": "APPROVED"}"#;
-        assert_eq!(
-            parse_github_submit_review_url(json).unwrap(),
-            "https://github.com/acme/app/pull/42#pullrequestreview-9"
-        );
-        assert!(parse_github_submit_review_url(r#"{"message": "Validation Failed"}"#).is_err());
-        assert!(parse_github_submit_review_url(r#"{"id": 9}"#).is_err());
-    }
-
-    #[test]
     fn parse_github_work_item_thread_reads_graphql_errors() {
         let json = r#"{
             "data": {"repository": null},
@@ -9604,62 +7221,6 @@ mod tests {
     }
 
     #[test]
-    fn git_checkout_routes_a_branch_already_used_by_a_worktree() {
-        let dir = tmp("git-branch-worktree-route");
-        if !init_git_commit(&dir.0, &[("a.txt", "alpha\n")]) {
-            return;
-        }
-        assert!(!git_branches_for(&dir.0)
-            .branches
-            .iter()
-            .any(|branch| branch.name == "feature"));
-        // An external worktree can appear after the picker cached its branch list.
-        let sibling = dir.0.canonicalize().unwrap().join("sibling worktree ż");
-        let sibling_text = path_to_js(&sibling);
-        if !git(&dir.0, &["branch", "feature"])
-            || !git(&dir.0, &["worktree", "add", "--", &sibling_text, "feature"])
-        {
-            return;
-        }
-
-        let listed = git_branches_for(&dir.0);
-        let feature = listed
-            .branches
-            .iter()
-            .find(|branch| branch.name == "feature")
-            .unwrap();
-        assert_eq!(feature.worktree.as_deref(), Some(sibling_text.as_str()));
-
-        let target = git_checkout_target_for(&dir.0, "feature", None).unwrap();
-        assert_eq!(target.branch, "feature");
-        assert_eq!(target.worktree.as_deref(), Some(sibling_text.as_str()));
-        assert_eq!(git_head_branch(&dir.0).as_deref(), Some("main"));
-        std::fs::write(dir.0.join("a.txt"), "dirty main\n").unwrap();
-        assert!(git_checkout_target_for(&dir.0, "feature", None)
-            .unwrap()
-            .worktree
-            .is_some());
-        assert_eq!(
-            std::fs::read_to_string(dir.0.join("a.txt")).unwrap(),
-            "dirty main\n"
-        );
-        assert_eq!(
-            git_checkout_target_for(&sibling, "main", None)
-                .unwrap()
-                .worktree,
-            Some(path_to_js(&dir.0.canonicalize().unwrap()))
-        );
-        assert!(git_checkout_target_for(&sibling, "feature", None)
-            .unwrap()
-            .worktree
-            .is_none());
-        std::fs::rename(&sibling, dir.0.join("moved")).unwrap();
-        assert!(git_checkout_target_for(&dir.0, "feature", None)
-            .unwrap_err()
-            .contains("Worktree unavailable"));
-    }
-
-    #[test]
     fn git_stash_lets_checkout_proceed() {
         let dir = tmp("git-stash-checkout");
         if !init_git_commit(&dir.0, &[("a.txt", "main\n")]) {
@@ -9791,663 +7352,5 @@ mod tests {
             "feature"
         );
         assert_eq!(git_head_branch(&repo.0).as_deref(), Some("feature"));
-    }
-
-    fn init_bare(dir: &Path) -> bool {
-        Command::new("git")
-            .args(["init", "--bare"])
-            .current_dir(dir)
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-
-    #[test]
-    fn git_target_ref_resolves_remote_local_and_qualified_names() {
-        let repo = tmp("pr-target-repo");
-        let origin = tmp("pr-target-origin");
-        if !init_git_commit(&repo.0, &[("a.txt", "alpha\n")]) || !init_bare(&origin.0) {
-            return;
-        }
-        let origin_url = origin.0.to_string_lossy().into_owned();
-        if !git(&repo.0, &["remote", "add", "origin", &origin_url])
-            || !git(&repo.0, &["push", "origin", "main"])
-            || !git(&repo.0, &["push", "origin", "main:dev"])
-            || !git(&repo.0, &["branch", "local-only"])
-        {
-            return;
-        }
-        assert_eq!(
-            git_target_ref(&repo.0, "dev", Some("origin")).as_deref(),
-            Some("origin/dev")
-        );
-        assert_eq!(
-            git_target_ref(&repo.0, "refs/heads/dev", Some("origin")).as_deref(),
-            Some("origin/dev")
-        );
-        assert_eq!(
-            git_target_ref(&repo.0, "refs/remotes/origin/dev", Some("origin")).as_deref(),
-            Some("origin/dev")
-        );
-        assert_eq!(
-            git_target_ref(&repo.0, "local-only", Some("origin")).as_deref(),
-            Some("local-only")
-        );
-        assert_eq!(git_target_ref(&repo.0, "missing", Some("origin")), None);
-        for bad in ["", " ", "bad\nname"] {
-            assert_eq!(git_target_ref(&repo.0, bad, Some("origin")), None);
-        }
-        assert_eq!(
-            git_target_ref(&repo.0, &"x".repeat(201), Some("origin")),
-            None
-        );
-    }
-
-    #[test]
-    fn git_target_ref_rejects_ambiguous_remote_matches() {
-        let repo = tmp("pr-target-ambig-repo");
-        let one = tmp("pr-target-ambig-one");
-        let two = tmp("pr-target-ambig-two");
-        if !init_git_commit(&repo.0, &[("a.txt", "alpha\n")])
-            || !init_bare(&one.0)
-            || !init_bare(&two.0)
-        {
-            return;
-        }
-        for (name, dir) in [("one", &one), ("two", &two)] {
-            let url = dir.0.to_string_lossy().into_owned();
-            if !git(&repo.0, &["remote", "add", name, &url])
-                || !git(&repo.0, &["push", name, "main:shared"])
-            {
-                return;
-            }
-        }
-        // `one/shared` and `two/shared` both exist — no preferred remote means
-        // the base ref is ambiguous and must not be guessed.
-        assert_eq!(git_target_ref(&repo.0, "shared", None), None);
-        assert_eq!(
-            git_target_ref(&repo.0, "shared", Some("one")).as_deref(),
-            Some("one/shared")
-        );
-        // Branch names with slashes must match the full remote ref name.
-        if !git(&repo.0, &["push", "one", "main:feature/shared"]) {
-            return;
-        }
-        assert_eq!(
-            git_target_ref(&repo.0, "feature/shared", Some("one")).as_deref(),
-            Some("one/feature/shared")
-        );
-        // Unique across remotes — the sole `feature/shared` still resolves.
-        assert_eq!(
-            git_target_ref(&repo.0, "feature/shared", None).as_deref(),
-            Some("one/feature/shared")
-        );
-    }
-
-    #[test]
-    fn git_pr_check_reports_range_to_chosen_target() {
-        let repo = tmp("pr-check-repo");
-        let origin = tmp("pr-check-origin");
-        if !init_git_commit(&repo.0, &[("a.txt", "alpha\n")]) || !init_bare(&origin.0) {
-            return;
-        }
-        let origin_url = origin.0.to_string_lossy().into_owned();
-        if !git(&repo.0, &["remote", "add", "origin", &origin_url])
-            || !git(&repo.0, &["push", "-u", "origin", "main"])
-            || !git(&repo.0, &["push", "origin", "main:dev"])
-            || !git(&repo.0, &["checkout", "-b", "feature"])
-        {
-            return;
-        }
-        std::fs::write(repo.0.join("b.txt"), "beta\n").unwrap();
-        git_stage_file_for(&repo.0, "b.txt").unwrap();
-        git_commit_for(&repo.0, "feature work").unwrap();
-
-        let check = git_pr_check_for(&repo.0, "dev").unwrap();
-        assert_eq!(check.branch.as_deref(), Some("feature"));
-        assert_eq!(check.remote.as_deref(), Some("origin"));
-        assert_eq!(check.default_branch.as_deref(), Some("main"));
-        assert!(check.target_exists);
-        assert_eq!(check.ahead, 1);
-        assert_eq!(check.behind, 0);
-        assert_eq!(check.commits, vec!["feature work".to_string()]);
-        assert!(!check.published);
-        assert_eq!(check.dirty_files, 0);
-
-        std::fs::write(repo.0.join("dirty.txt"), "x\n").unwrap();
-        assert_eq!(git_pr_check_for(&repo.0, "dev").unwrap().dirty_files, 1);
-
-        let missing = git_pr_check_for(&repo.0, "nonexistent").unwrap();
-        assert!(!missing.target_exists);
-        assert_eq!(missing.ahead, 0);
-    }
-
-    #[test]
-    fn git_pr_check_reports_detached_head() {
-        let repo = tmp("pr-check-detached");
-        if !init_git_commit(&repo.0, &[("a.txt", "alpha\n")]) {
-            return;
-        }
-        let output = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&repo.0)
-            .output();
-        let Ok(output) = output else { return };
-        if !output.status.success() {
-            return;
-        }
-        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !git(&repo.0, &["checkout", &sha]) {
-            return;
-        }
-        let check = git_pr_check_for(&repo.0, "main").unwrap();
-        assert_eq!(check.branch, None);
-        assert!(!check.published);
-    }
-
-    #[test]
-    fn git_range_context_uses_requested_base() {
-        let repo = tmp("pr-range-base");
-        if !init_git_commit(&repo.0, &[("a.txt", "alpha\n")])
-            || !git(&repo.0, &["branch", "dev"])
-            || !git(&repo.0, &["checkout", "-b", "feature"])
-        {
-            return;
-        }
-        std::fs::write(repo.0.join("b.txt"), "beta\n").unwrap();
-        git_stage_file_for(&repo.0, "b.txt").unwrap();
-        git_commit_for(&repo.0, "feature work").unwrap();
-
-        let range = git_range_context_for(&repo.0, Some("dev")).unwrap();
-        assert_eq!(range.base, "dev");
-        assert_eq!(range.head, "feature");
-        assert!(range.commit_summary.contains("feature work"));
-        assert!(git_range_context_for(&repo.0, Some("missing")).is_err());
-    }
-
-    /// A `remote` repo used as `origin`'s filesystem URL, plus a `work`
-    /// checkout of it on `main`. Returns None when git is unavailable.
-    fn sync_pair(prefix: &str) -> Option<(Tmp, Tmp)> {
-        let remote = tmp(&format!("{prefix}-remote"));
-        if !init_git_commit(&remote.0, &[("f.txt", "a\nb\nc\n")]) {
-            return None;
-        }
-        let work = tmp(&format!("{prefix}-work"));
-        let url = remote.0.to_string_lossy().into_owned();
-        if !init_git(&work.0, "main", Some(&url))
-            || !git(&work.0, &["fetch", "origin", "main"])
-            || !git(&work.0, &["checkout", "-b", "main", "origin/main"])
-        {
-            return None;
-        }
-        Some((remote, work))
-    }
-
-    fn commit_file(dir: &Path, name: &str, contents: &str, message: &str) -> bool {
-        std::fs::write(dir.join(name), contents).is_ok()
-            && git(dir, &["add", name])
-            && git(dir, &["commit", "-m", message])
-    }
-
-    #[test]
-    fn git_merge_incoming_merges_remote_default_and_reports_commits() {
-        let Some((remote, work)) = sync_pair("sync-merged") else {
-            return;
-        };
-        if !git(&work.0, &["checkout", "-b", "feature"])
-            || !commit_file(&work.0, "feat.txt", "feat\n", "feature work")
-            || !commit_file(&remote.0, "remote.txt", "remote\n", "remote work")
-        {
-            return;
-        }
-
-        let outcome = git_merge_incoming(&work.0, "merge", None, None).unwrap();
-        assert_eq!(outcome.outcome, "merged");
-        assert_eq!(outcome.branch, "feature");
-        assert_eq!(outcome.synced_with, "origin/main");
-        assert_eq!(outcome.commits, vec!["remote work".to_string()]);
-        assert!(work.0.join("remote.txt").exists());
-        assert!(!git_op_in_progress(&work.0));
-
-        // A second run on the same working copy has nothing left to merge.
-        let again = git_merge_incoming(&work.0, "merge", None, None).unwrap();
-        assert_eq!(again.outcome, "up-to-date");
-    }
-
-    #[test]
-    fn git_merge_incoming_refuses_dirty_and_in_progress_states() {
-        let Some((remote, work)) = sync_pair("sync-refused") else {
-            return;
-        };
-        std::fs::write(work.0.join("dirty.txt"), "x\n").unwrap();
-        let outcome = git_merge_incoming(&work.0, "merge", None, None).unwrap();
-        assert_eq!(outcome.outcome, "refused");
-        assert!(outcome.reason.contains("uncommitted"));
-        // Nothing is stashed or cleaned implicitly.
-        assert!(work.0.join("dirty.txt").exists());
-        assert_eq!(
-            git_run(&work.0, &["status", "--porcelain"])
-                .unwrap_or_default()
-                .lines()
-                .count(),
-            1
-        );
-        // A second run reports the same refusal deterministically.
-        let again = git_merge_incoming(&work.0, "merge", None, None).unwrap();
-        assert_eq!(again.reason, outcome.reason);
-        std::fs::remove_file(work.0.join("dirty.txt")).unwrap();
-
-        // A merge already in progress is refused, not stacked.
-        if !git(&work.0, &["checkout", "-b", "feature"])
-            || !commit_file(&work.0, "f.txt", "a\nB-feat\nc\n", "feat change")
-            || !commit_file(&remote.0, "f.txt", "a\nB-main\nc\n", "main change")
-            || !git(&work.0, &["fetch", "origin", "main"])
-        {
-            return;
-        }
-        assert!(
-            !git(&work.0, &["merge", "--no-edit", "FETCH_HEAD"]),
-            "the fixture merge must conflict to leave an in-progress state"
-        );
-        assert!(git_op_in_progress(&work.0));
-        let blocked = git_merge_incoming(&work.0, "merge", None, None).unwrap();
-        assert_eq!(blocked.outcome, "refused");
-        assert!(blocked.reason.contains("in progress"));
-        git_abort_in_progress(&work.0).unwrap();
-    }
-
-    #[test]
-    fn git_merge_incoming_leaves_conflicts_and_merge_context_reports_them() {
-        let Some((remote, work)) = sync_pair("sync-conflict") else {
-            return;
-        };
-        if !git(&work.0, &["checkout", "-b", "feature"])
-            || !commit_file(&work.0, "f.txt", "a\nB-feat\nc\n", "feat change")
-            || !commit_file(&remote.0, "f.txt", "a\nB-main\nc\n", "main change")
-        {
-            return;
-        }
-
-        let outcome = git_merge_incoming(&work.0, "merge", None, None).unwrap();
-        assert_eq!(outcome.outcome, "conflicted");
-        assert_eq!(outcome.conflicts, vec!["f.txt".to_string()]);
-        assert_eq!(outcome.commits, vec!["main change".to_string()]);
-        // The real conflicted state stays in place for review or an agent.
-        assert!(git_op_in_progress(&work.0));
-
-        let index = git_diff_index_for(&work.0);
-        assert!(index.op_in_progress);
-        assert_eq!(index.conflicts, vec!["f.txt".to_string()]);
-        assert!(index.merge_head.is_some());
-
-        let context = git_merge_context_for(&work.0).unwrap();
-        assert!(context.merging);
-        assert_eq!(context.conflicts, vec!["f.txt".to_string()]);
-        assert!(context.merge_head.is_some());
-        assert!(context.diff.contains("<<<<<<<"));
-
-        git_abort_in_progress(&work.0).unwrap();
-        assert!(!git_op_in_progress(&work.0));
-        assert!(!git_diff_index_for(&work.0).op_in_progress);
-    }
-
-    #[test]
-    fn git_merge_incoming_refuses_a_concurrent_run_on_the_same_copy() {
-        let Some((_remote, work)) = sync_pair("sync-guard") else {
-            return;
-        };
-        let guard = MergeGuard::acquire(&work.0).expect("first acquire");
-        assert!(MergeGuard::acquire(&work.0).is_none());
-        // The refusal is data, not a thrown error — the UI surfaces it as
-        // an outcome, never queued.
-        let refused = git_merge_incoming(&work.0, "merge", None, None).unwrap();
-        assert_eq!(refused.outcome, "refused");
-        assert!(refused.reason.contains("already running"));
-        // A subdirectory of the same working copy is the same checkout —
-        // a differently-spelled path must not bypass the guard.
-        let sub = work.0.join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        let aliased = git_merge_incoming(&sub, "merge", None, None).unwrap();
-        assert_eq!(aliased.outcome, "refused");
-        assert!(aliased.reason.contains("already running"));
-        drop(guard);
-        let outcome = git_merge_incoming(&work.0, "merge", None, None).unwrap();
-        assert_eq!(outcome.outcome, "up-to-date");
-    }
-
-    #[test]
-    fn git_merge_abort_is_refused_while_a_sync_holds_the_guard() {
-        let Some((_remote, work)) = sync_pair("sync-abort-guard") else {
-            return;
-        };
-        let guard = MergeGuard::acquire(&work.0).expect("first acquire");
-        let error = git_merge_abort_for(&work.0).unwrap_err();
-        assert!(error.contains("sync is running"));
-        drop(guard);
-        // With the guard free there is simply nothing to abort.
-        assert!(git_merge_abort_for(&work.0).is_err());
-    }
-
-    #[test]
-    fn git_merge_incoming_refuses_a_branch_that_moved_since_confirm() {
-        let Some((remote, work)) = sync_pair("sync-drift") else {
-            return;
-        };
-        if !git(&work.0, &["checkout", "-b", "feature"])
-            || !commit_file(&remote.0, "remote.txt", "remote\n", "remote work")
-        {
-            return;
-        }
-        // The confirmation named `feature`; the checkout has since moved.
-        if !git(&work.0, &["checkout", "main"]) {
-            return;
-        }
-        let drifted = git_merge_incoming(&work.0, "merge", None, Some("feature")).unwrap();
-        assert_eq!(drifted.outcome, "refused");
-        assert!(drifted.reason.contains("moved from feature"));
-        // The confirmed branch still merges.
-        if !git(&work.0, &["checkout", "feature"]) {
-            return;
-        }
-        let outcome = git_merge_incoming(&work.0, "merge", None, Some("feature")).unwrap();
-        assert_eq!(outcome.outcome, "merged");
-    }
-
-    #[test]
-    fn git_merge_incoming_merges_into_an_unborn_branch() {
-        let Some((remote, _work)) = sync_pair("sync-unborn") else {
-            return;
-        };
-        if !commit_file(&remote.0, "remote.txt", "remote\n", "remote work") {
-            return;
-        }
-        // Fresh checkout whose HEAD points at a branch with no commits —
-        // `git init` + remote. The merge fast-forwards like `git pull`
-        // into an empty clone.
-        let empty = tmp("sync-unborn-empty");
-        if !git(&empty.0, &["init"])
-            || !git(
-                &empty.0,
-                &["remote", "add", "origin", remote.0.to_str().unwrap_or("")],
-            )
-            // The fetch creates refs/remotes/origin/* — the evidence the
-            // default-branch resolution needs.
-            || !git(&empty.0, &["fetch", "origin"])
-        {
-            return;
-        }
-        assert!(git_stdout(&empty.0, &["rev-parse", "-q", "--verify", "HEAD"]).is_none());
-        let outcome = git_merge_incoming(&empty.0, "merge", None, None).unwrap();
-        assert_eq!(outcome.outcome, "merged");
-        assert_eq!(outcome.synced_with, "origin/main");
-        assert!(outcome.commit_count > 0);
-        assert!(empty.0.join("remote.txt").exists());
-    }
-
-    #[test]
-    fn git_merge_incoming_rejects_a_base_that_is_not_a_branch_name() {
-        let Some((_remote, work)) = sync_pair("sync-bad-base") else {
-            return;
-        };
-        if !git(&work.0, &["checkout", "-b", "feature"]) {
-            return;
-        }
-        // Provider data is not argv: a ":" would be a refspec, a leading
-        // "-" a fetch flag, "+…" a forced update, and "@{…}" a local
-        // reflog expansion resolved against the wrong branch.
-        for bad in ["-x", "+main", "main:refs/heads/hacked", "..", "@{-1}"] {
-            let outcome = git_merge_incoming(&work.0, "merge", Some(bad), None).unwrap();
-            assert_eq!(outcome.outcome, "refused", "base {bad:?}");
-        }
-        // The refspec injection never ran: no local ref was written.
-        assert!(!git_ref_exists(&work.0, "refs/heads/hacked"));
-    }
-
-    #[test]
-    fn git_merge_context_reports_op_and_verified_incoming_ref() {
-        let Some((remote, work)) = sync_pair("sync-context") else {
-            return;
-        };
-        if !git(&work.0, &["checkout", "-b", "feature"])
-            || !commit_file(&work.0, "f.txt", "a\nB-feat\nc\n", "feat change")
-            || !commit_file(&remote.0, "f.txt", "a\nB-main\nc\n", "main change")
-        {
-            return;
-        }
-        let outcome = git_merge_incoming(&work.0, "merge", None, None).unwrap();
-        assert_eq!(outcome.outcome, "conflicted");
-
-        let context = git_merge_context_for(&work.0).unwrap();
-        assert_eq!(context.op, "merge");
-        // MERGE_HEAD is verified to be origin/main — not guessed.
-        assert_eq!(context.incoming_ref.as_deref(), Some("origin/main"));
-        assert!(context.merge_head.is_some());
-        assert!(context.diff.contains("<<<<<<<"));
-
-        // A merge context read from a subdirectory resolves the same
-        // root-relative conflicts — and still produces their diff.
-        let sub = work.0.join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        let from_sub = git_merge_context_for(&sub).unwrap();
-        assert_eq!(from_sub.conflicts, vec!["f.txt".to_string()]);
-        assert!(from_sub.diff.contains("<<<<<<<"));
-
-        git_abort_in_progress(&work.0).unwrap();
-    }
-
-    #[test]
-    fn git_own_op_in_progress_only_matches_the_merge_this_run_started() {
-        let Some((_remote, work)) = sync_pair("sync-foreign") else {
-            return;
-        };
-        // A commit on the checkout keeps HEAD distinct from origin/main.
-        if !commit_file(&work.0, "local.txt", "local\n", "local work") {
-            return;
-        }
-        let Some(head) = git_stdout(&work.0, &["rev-parse", "HEAD"]) else {
-            return;
-        };
-        let Some(other) = git_stdout(&work.0, &["rev-parse", "origin/main"]) else {
-            return;
-        };
-        assert_ne!(head, other);
-        let git_dir = work.0.join(".git");
-        // The marker must match the pinned fetched SHA and be no older
-        // than FETCH_HEAD itself — a marker written before this run's
-        // fetch is a same-commit op someone else started (foreign).
-        let older = SystemTime::now() - Duration::from_secs(60);
-        let set_older = |path: &Path| {
-            std::fs::File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_modified(older)
-                .unwrap();
-        };
-        // A foreign merge records a MERGE_HEAD that is not the commit this
-        // run fetched — it must never be aborted by us.
-        std::fs::write(git_dir.join("FETCH_HEAD"), format!("{other}\n")).unwrap();
-        std::fs::write(git_dir.join("MERGE_HEAD"), format!("{head}\n")).unwrap();
-        assert!(!git_own_op_in_progress(&work.0, "merge", &other));
-        // The merge this run started: MERGE_HEAD is the pinned SHA and was
-        // written after this run's FETCH_HEAD.
-        std::fs::write(git_dir.join("MERGE_HEAD"), format!("{other}\n")).unwrap();
-        assert!(git_own_op_in_progress(&work.0, "merge", &other));
-        // A same-commit marker older than FETCH_HEAD is foreign.
-        set_older(&git_dir.join("MERGE_HEAD"));
-        assert!(!git_own_op_in_progress(&work.0, "merge", &other));
-        // A foreign rebase (onto a different base) is never ours to abort —
-        // `git rebase <sha>` records the fetched commit as its onto.
-        std::fs::remove_file(git_dir.join("MERGE_HEAD")).unwrap();
-        assert!(!git_own_op_in_progress(&work.0, "merge", &other));
-        let rebase_merge = git_dir.join("rebase-merge");
-        std::fs::create_dir_all(&rebase_merge).unwrap();
-        std::fs::write(rebase_merge.join("onto"), format!("{head}\n")).unwrap();
-        assert!(!git_own_op_in_progress(&work.0, "rebase", &other));
-        std::fs::write(rebase_merge.join("onto"), format!("{other}\n")).unwrap();
-        assert!(git_own_op_in_progress(&work.0, "rebase", &other));
-        set_older(&rebase_merge.join("onto"));
-        assert!(!git_own_op_in_progress(&work.0, "rebase", &other));
-        let _ = git_abort_in_progress(&work.0);
-    }
-
-    #[test]
-    fn git_merge_incoming_rebase_conflicts_are_reported_as_rebase() {
-        let Some((remote, work)) = sync_pair("sync-rebase") else {
-            return;
-        };
-        if !git(&work.0, &["checkout", "-b", "feature"])
-            || !commit_file(&work.0, "f.txt", "a\nB-feat\nc\n", "feat change")
-            || !commit_file(&remote.0, "f.txt", "a\nB-main\nc\n", "main change")
-        {
-            return;
-        }
-        let outcome = git_merge_incoming(&work.0, "rebase", None, None).unwrap();
-        assert_eq!(outcome.outcome, "conflicted");
-        assert!(!outcome.conflicts.is_empty());
-        // The state is a rebase — detection, context and abort all agree.
-        let state = git_op_state_uncached(&work.0);
-        assert_eq!(state.op, "rebase");
-        let context = git_merge_context_for(&work.0).unwrap();
-        assert!(context.merging);
-        assert_eq!(context.op, "rebase");
-        git_abort_in_progress(&work.0).unwrap();
-        assert!(!git_op_state_uncached(&work.0).in_progress());
-    }
-
-    #[test]
-    fn git_op_state_and_abort_cover_cherry_pick_and_revert() {
-        let tmp = tmp("op-state-sequencer");
-        if !git(&tmp.0, &["init", "-b", "main"]) || !commit_file(&tmp.0, "a.txt", "base\n", "base")
-        {
-            return;
-        }
-        // Two commits to pick/revert that conflict with a local change.
-        if !commit_file(&tmp.0, "a.txt", "theirs\n", "theirs") {
-            return;
-        }
-        let Some(theirs) = git_stdout(&tmp.0, &["rev-parse", "HEAD"]) else {
-            return;
-        };
-        if !commit_file(&tmp.0, "a.txt", "more\n", "theirs 2") {
-            return;
-        }
-        let Some(theirs2) = git_stdout(&tmp.0, &["rev-parse", "HEAD"]) else {
-            return;
-        };
-        if !git(&tmp.0, &["reset", "--hard", "HEAD~2"])
-            || !commit_file(&tmp.0, "a.txt", "ours\n", "ours")
-        {
-            return;
-        }
-
-        // Cherry-pick conflict: detected, labeled, and abortable.
-        assert!(
-            !git(&tmp.0, &["cherry-pick", &theirs]),
-            "the pick must conflict — the fixture changes the same line"
-        );
-        let state = git_op_state_uncached(&tmp.0);
-        assert_eq!(state.op, "cherry-pick");
-        let expected = git_stdout(&tmp.0, &["rev-parse", "--short", &theirs]);
-        assert_eq!(
-            state.head, expected,
-            "cherry-pick must identify the picked commit",
-        );
-        git_abort_in_progress(&tmp.0).unwrap();
-        assert_eq!(git_op_state_uncached(&tmp.0).op, "");
-
-        // Revert conflict: same coverage.
-        assert!(
-            !git(&tmp.0, &["revert", "--no-edit", &theirs2]),
-            "the revert must conflict — the fixture changes the same line"
-        );
-        let state = git_op_state_uncached(&tmp.0);
-        assert_eq!(state.op, "revert");
-        let expected = git_stdout(&tmp.0, &["rev-parse", "--short", &theirs2]);
-        assert_eq!(state.head, expected);
-        git_abort_in_progress(&tmp.0).unwrap();
-        assert_eq!(git_op_state_uncached(&tmp.0).op, "");
-    }
-
-    #[test]
-    fn git_merge_incoming_honors_a_remote_prefix_in_base() {
-        // A second remote whose main carries a unique commit — base
-        // "upstream/main" must fetch upstream, never origin.
-        let Some((remote, work)) = sync_pair("sync-prefix") else {
-            return;
-        };
-        // A clone shares history so the merge can run; its extra commit is
-        // only reachable through upstream/main.
-        let other = tmp("sync-prefix-upstream");
-        if !git(
-            &tmp("sync-prefix-clone-src").0,
-            &[
-                "clone",
-                &remote.0.to_string_lossy(),
-                &other.0.to_string_lossy(),
-            ],
-        ) || !commit_file(&other.0, "upstream.txt", "up\n", "upstream work")
-            || !git(
-                &work.0,
-                &["remote", "add", "upstream", &other.0.to_string_lossy()],
-            )
-        {
-            return;
-        }
-        let outcome = git_merge_incoming(&work.0, "merge", Some("upstream/main"), None).unwrap();
-        assert_eq!(outcome.outcome, "merged");
-        assert_eq!(outcome.synced_with, "upstream/main");
-        assert!(work.0.join("upstream.txt").exists());
-    }
-
-    #[test]
-    fn git_rebase_dirs_detect_states_without_a_head_or_patch() {
-        // A rebase stopped at `break`/`exec` and a mid-run `git am` carry
-        // neither REBASE_HEAD nor a current patch — only the state dirs.
-        let Some((_remote, work)) = sync_pair("sync-state-dirs") else {
-            return;
-        };
-        let git_dir = work.0.join(".git");
-        assert!(!git_op_state_uncached(&work.0).in_progress());
-        std::fs::create_dir(git_dir.join("rebase-merge")).unwrap();
-        let state = git_op_state_uncached(&work.0);
-        assert_eq!(state.op, "rebase");
-        std::fs::remove_dir(git_dir.join("rebase-merge")).unwrap();
-        let apply = git_dir.join("rebase-apply");
-        std::fs::create_dir(&apply).unwrap();
-        assert_eq!(git_op_state_uncached(&work.0).op, "rebase");
-        std::fs::remove_dir(&apply).unwrap();
-        assert!(!git_op_state_uncached(&work.0).in_progress());
-    }
-
-    #[test]
-    fn git_am_state_is_detected_and_aborted_via_am() {
-        let Some((_remote, work)) = sync_pair("sync-am") else {
-            return;
-        };
-        // A patch whose context doesn't apply leaves rebase-apply state
-        // with the `applying` marker — `rebase --abort` refuses it; only
-        // `am --abort` unwinds it.
-        if !commit_file(&work.0, "f.txt", "base\n", "base")
-            || !commit_file(&work.0, "f.txt", "patched\n", "patched")
-            || !git(&work.0, &["format-patch", "-1", "HEAD", "-o", "."])
-            || !commit_file(&work.0, "f.txt", "other\n", "other")
-        {
-            return;
-        }
-        let patch = std::fs::read_dir(&work.0)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .find(|entry| entry.file_name().to_string_lossy().ends_with(".patch"))
-            .map(|entry| entry.file_name().to_string_lossy().into_owned());
-        let Some(patch) = patch else { return };
-        assert!(git_command_output(&work.0, &["am", &patch])
-            .map(|output| !output.status.success())
-            .unwrap_or(false));
-        let state = git_op_state_uncached(&work.0);
-        assert_eq!(state.op, "am", "am state must be labeled honestly");
-        git_abort_in_progress(&work.0).unwrap();
-        assert!(!git_op_state_uncached(&work.0).in_progress());
-        assert!(!work.0.join(".git").join("rebase-apply").exists());
     }
 }

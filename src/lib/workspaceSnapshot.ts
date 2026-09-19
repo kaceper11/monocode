@@ -1,3 +1,4 @@
+import { restoreBrowserTab } from "./browserWorkspace";
 import { markTurnInterrupted, type ResumedWorkspace } from "./inFlight";
 import {
   closeLeaf,
@@ -21,8 +22,6 @@ import {
 } from "./projectTerminal";
 import { normalizeProjectPath } from "./recents";
 import { pathKey } from "./paths";
-import { isHttpUrl } from "./browser";
-import { sanitizeSteps } from "./projects";
 import { reconcileProjectReturn, type ProjectReturnMemory } from "./projectReturn";
 import type { InboxAskContext } from "./inboxAsk";
 import {
@@ -47,6 +46,7 @@ export type WorkspaceSessionStub = {
   providerAccountId?: string;
   branch?: string;
   worktreeCwd?: string;
+  worktreeRemoved?: boolean;
 };
 
 export type WorkspaceSnapshot = {
@@ -320,6 +320,7 @@ function sessionStub(session: Session): WorkspaceSessionStub | null {
       : {}),
     ...(session.branch ? { branch: session.branch } : {}),
     ...(session.worktreeCwd ? { worktreeCwd: session.worktreeCwd } : {}),
+    ...(session.worktreeRemoved ? { worktreeRemoved: true } : {}),
   };
 }
 
@@ -344,6 +345,7 @@ function sessionFromStub(stub: WorkspaceSessionStub): Session {
       : {}),
     ...(stub.branch ? { branch: stub.branch } : {}),
     ...(stub.worktreeCwd ? { worktreeCwd: stub.worktreeCwd } : {}),
+    ...(stub.worktreeRemoved ? { worktreeRemoved: true } : {}),
   };
 }
 
@@ -367,14 +369,17 @@ function sanitizeStub(raw: unknown): WorkspaceSessionStub | null {
   return {
     id: value.id,
     cwd:
-      typeof value.cwd === "string" && value.cwd.trim() ? value.cwd.trim() : "~",
+      typeof value.cwd === "string" && value.cwd.trim()
+        ? value.cwd.trim()
+        : "~",
     harness,
     model: typeof value.model === "string" ? value.model : "",
     modelSettings,
     runtimeMode,
     title: typeof value.title === "string" ? value.title : "",
     ...(value.inboxAsk && typeof value.inboxAsk === "object"
-      ? { inboxAsk: value.inboxAsk as InboxAskContext } : {}),
+      ? { inboxAsk: value.inboxAsk as InboxAskContext }
+      : {}),
     ...(typeof value.providerSessionId === "string" && value.providerSessionId
       ? { providerSessionId: value.providerSessionId }
       : {}),
@@ -388,6 +393,7 @@ function sanitizeStub(raw: unknown): WorkspaceSessionStub | null {
     ...(typeof value.worktreeCwd === "string" && value.worktreeCwd.trim()
       ? { worktreeCwd: value.worktreeCwd.trim() }
       : {}),
+    ...(value.worktreeRemoved === true ? { worktreeRemoved: true } : {}),
   };
 }
 
@@ -411,7 +417,7 @@ function sanitizeTab(raw: unknown): WorkspaceTab | null {
       ? value.focusedId
       : leafIds(layout)[0];
   if (!focusedId) return null;
-  return {
+  let tab: WorkspaceTab | null = {
     kind: "session",
     id: value.id,
     layout,
@@ -424,6 +430,11 @@ function sanitizeTab(raw: unknown): WorkspaceTab | null {
       ? { groupId: value.groupId }
       : {}),
   };
+  // Retiring a fork-only delivery pane must not discard adjacent saved work.
+  for (const id of [...editorResult.retiredIds, ...terminalResult.retiredIds]) {
+    if (tab && leafIds(tab.layout).includes(id)) tab = closeLeaf(tab, id);
+  }
+  return tab;
 }
 
 function sanitizeLayout(raw: unknown): LayoutNode | null {
@@ -458,10 +469,12 @@ function sanitizeLayout(raw: unknown): LayoutNode | null {
 function sanitizePanes(raw: unknown): {
   panes: EditorPane[];
   invalidIds: string[];
+  retiredIds: string[];
 } {
-  if (!Array.isArray(raw)) return { panes: [], invalidIds: [] };
+  if (!Array.isArray(raw)) return { panes: [], invalidIds: [], retiredIds: [] };
   const panes: EditorPane[] = [];
   const invalidIds: string[] = [];
+  const retiredIds: string[] = [];
   for (const entry of raw) {
     const pane = sanitizePane(entry);
     if (pane) {
@@ -469,10 +482,31 @@ function sanitizePanes(raw: unknown): {
       continue;
     }
     if (!entry || typeof entry !== "object") continue;
-    const id = (entry as Record<string, unknown>).id;
-    if (typeof id === "string" && id) invalidIds.push(id);
+    const { id, files } = entry as Record<string, unknown>;
+    if (typeof id !== "string" || !id) continue;
+    const retired = Array.isArray(files) && files.length > 0 && files.every(isRetiredDeliveryFile);
+    (retired ? retiredIds : invalidIds).push(id);
   }
-  return { panes, invalidIds };
+  return { panes, invalidIds, retiredIds };
+}
+
+/** Recognize the archived delivery schema without accepting malformed panes. */
+function isRetiredDeliveryFile(raw: unknown): boolean {
+  if (!raw || typeof raw !== "object") return false;
+  const value = raw as Record<string, unknown>;
+  if (![value.id, value.path, value.cwd].every(field => typeof field === "string" && field)) return false;
+  if (!value.delivery || typeof value.delivery !== "object" || Array.isArray(value.delivery)) return false;
+  const delivery = value.delivery as Record<string, unknown>;
+  if ((delivery.kind !== "pr" && delivery.kind !== "ci") || typeof delivery.branch !== "string") return false;
+  if (delivery.sourceSessionId !== undefined && (typeof delivery.sourceSessionId !== "string" || !delivery.sourceSessionId)) return false;
+  if (delivery.provider !== undefined && !["azure", "github", "gitlab"].includes(delivery.provider as string)) return false;
+  if (delivery.repo !== undefined && typeof delivery.repo !== "string") return false;
+  const validNumber = typeof delivery.number === "number" && Number.isInteger(delivery.number) && delivery.number > 0;
+  if (delivery.number !== undefined && !validNumber) return false;
+  if ((delivery.provider === "github" || delivery.provider === "gitlab") &&
+      (typeof delivery.repo !== "string" || !delivery.repo.trim() || !validNumber)) return false;
+  return !["plan", "releaseNotes", "commit", "sessionChanges", "terminal", "review", "changes", "browser", "agent", "changeKind"]
+    .some(key => value[key] != null && value[key] !== false);
 }
 
 function sanitizePane(raw: unknown): EditorPane | null {
@@ -495,70 +529,11 @@ function sanitizePane(raw: unknown): EditorPane | null {
 function sanitizeFile(raw: unknown): FilePaneTab | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Record<string, unknown>;
+  if ("browser" in value) return restoreBrowserTab(value);
+  if ("delivery" in value) return null;
   if (typeof value.id !== "string" || !value.id) return null;
   if (typeof value.path !== "string" || !value.path) return null;
   if (typeof value.cwd !== "string" || !value.cwd) return null;
-  if ("delivery" in value) {
-    const source = value.delivery;
-    if (!source || typeof source !== "object") return null;
-    const delivery = source as Record<string, unknown>;
-    if (
-      (delivery.kind !== "pr" && delivery.kind !== "ci") ||
-      typeof delivery.branch !== "string" ||
-      (delivery.sourceSessionId !== undefined &&
-        (typeof delivery.sourceSessionId !== "string" ||
-          !delivery.sourceSessionId)) ||
-      (delivery.provider !== undefined &&
-        !["azure", "github", "gitlab"].includes(
-          delivery.provider as string,
-        )) ||
-      // A GitHub/GitLab review tab without repo+number identity cannot
-      // render its PR/MR.
-      ((delivery.provider === "gitlab" || delivery.provider === "github") &&
-        (typeof delivery.repo !== "string" ||
-          !delivery.repo.trim() ||
-          typeof delivery.number !== "number" ||
-          !Number.isInteger(delivery.number) ||
-          delivery.number <= 0)) ||
-      (delivery.repo !== undefined && typeof delivery.repo !== "string") ||
-      (delivery.number !== undefined &&
-        (typeof delivery.number !== "number" ||
-          !Number.isInteger(delivery.number) ||
-          delivery.number <= 0)) ||
-      [
-        "plan",
-        "releaseNotes",
-        "commit",
-        "sessionChanges",
-        "terminal",
-        "review",
-        "changes",
-        "browser",
-      ].some((key) => value[key] != null && value[key] !== false)
-    )
-      return null;
-    return {
-      id: value.id,
-      path: value.path,
-      cwd: value.cwd,
-      delivery: {
-        kind: delivery.kind,
-        branch: delivery.branch,
-        ...(typeof delivery.sourceSessionId === "string"
-          ? { sourceSessionId: delivery.sourceSessionId }
-          : {}),
-        ...(typeof delivery.provider === "string"
-          ? { provider: delivery.provider as "azure" | "github" | "gitlab" }
-          : {}),
-        ...(typeof delivery.repo === "string" && delivery.repo
-          ? { repo: delivery.repo }
-          : {}),
-        ...(typeof delivery.number === "number"
-          ? { number: delivery.number }
-          : {}),
-      },
-    };
-  }
   const plan = sanitizePlan(value.plan);
   const hasReleaseNotes = "releaseNotes" in value;
   const releaseNotes = sanitizeReleaseNotes(value.releaseNotes);
@@ -575,8 +550,7 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       releaseNotes != null ||
       commit != null ||
       value.changes === true ||
-      value.terminal === true ||
-      value.browser != null)
+      value.terminal === true)
   ) {
     return null;
   }
@@ -587,7 +561,6 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       value.changes === true ||
       sessionChanges != null ||
       value.terminal === true ||
-      value.browser != null ||
       commit != null)
   ) {
     return null;
@@ -598,51 +571,17 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       value.review === true ||
       value.changes === true ||
       sessionChanges != null ||
-      value.terminal === true ||
-      value.browser != null)
+      value.terminal === true)
   ) {
     return null;
   }
-  if ("browser" in value) {
-    const source = value.browser;
-    if (!source || typeof source !== "object") return null;
-    const browser = source as Record<string, unknown>;
-    if (
-      typeof browser.url !== "string" ||
-      !isHttpUrl(browser.url) ||
-      browser.url.length > 8192 ||
-      [
-        "plan",
-        "releaseNotes",
-        "commit",
-        "sessionChanges",
-        "terminal",
-        "review",
-        "changes",
-        "delivery",
-      ].some((key) => value[key] != null && value[key] !== false)
-    )
-      return null;
-    return {
-      id: value.id,
-      path: value.path,
-      cwd: value.cwd,
-      browser: {
-        url: browser.url,
-        ...(typeof browser.title === "string" && browser.title.trim()
-          ? { title: browser.title.trim().slice(0, 200) }
-          : {}),
-        ...(browser.expanded === true ? { expanded: true } : {}),
-        ...(browser.persist === false ? { persist: false } : {}),
-      },
-    };
-  }
-  const command =
-    value.terminal === true ? sanitizeTerminalCommand(value.command) : undefined;
   return {
     id: value.id,
     path: value.path,
     cwd: value.cwd,
+    ...(typeof value.projectCwd === "string" && value.projectCwd
+      ? { projectCwd: value.projectCwd }
+      : {}),
     ...(plan ? { plan } : {}),
     ...(releaseNotes ? { releaseNotes } : {}),
     ...(commit ? { commit } : {}),
@@ -653,63 +592,6 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       ? { changeKind: value.changeKind }
       : {}),
     ...(value.terminal === true ? { terminal: true } : {}),
-    ...(command ? { command } : {}),
-  };
-}
-
-function sanitizeTerminalCommand(
-  raw: unknown,
-): FilePaneTab["command"] | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const value = raw as Record<string, unknown>;
-  if (
-    typeof value.name !== "string" ||
-    !value.name.trim() ||
-    typeof value.text !== "string" ||
-    !value.text.trim() ||
-    typeof value.runId !== "number" ||
-    !Number.isInteger(value.runId) ||
-    value.runId < 1
-  )
-    return undefined;
-  const steps = sanitizeSteps(value.steps);
-  // Progress only means something for this run's step list — a `step` left
-  // over from an older runId, or with no steps at all, is dropped rather
-  // than restored as stale state.
-  const stepProgress =
-    steps?.length &&
-    value.step &&
-    typeof value.step === "object" &&
-    (value.step as Record<string, unknown>).runId === value.runId &&
-    Number.isInteger((value.step as Record<string, unknown>).done)
-      ? {
-          runId: value.runId,
-          // A done beyond the step list would silently skip the whole run.
-          done: Math.min(
-            steps.length,
-            Math.max(0, (value.step as { done: number }).done),
-          ),
-        }
-      : undefined;
-  return {
-    ...(typeof value.presetId === "string" && value.presetId
-      ? { presetId: value.presetId.slice(0, 128) }
-      : {}),
-    name: value.name.trim().slice(0, 200),
-    text: value.text.slice(0, 4_000),
-    ...(steps?.length ? { steps } : {}),
-    runId: value.runId,
-    ...(typeof value.launched === "number" &&
-    Number.isInteger(value.launched) &&
-    value.launched >= 0
-      ? { launched: value.launched }
-      : {}),
-    ...(typeof value.failed === "number" &&
-    Number.isInteger(value.failed) &&
-    value.failed >= 0
-      ? { failed: value.failed }
-      : {}),
-    ...(stepProgress ? { step: stepProgress } : {}),
   };
 }
 

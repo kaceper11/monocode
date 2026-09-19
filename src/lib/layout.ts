@@ -1,3 +1,4 @@
+import type { BrowserTabSource } from "./browserWorkspace";
 import type { ReleaseNotesTabSource } from "./releaseNotes";
 import type { GitFileDiffKind } from "./fs";
 import {
@@ -54,57 +55,14 @@ export type SessionChangesSource = {
   sessionId: string;
 };
 
-export type DeliveryTabSource = {
-  kind: "pr" | "ci";
-  branch: string;
-  sourceSessionId?: string;
-  /** PR/CI provider this tab is bound to; missing means Azure. */
-  provider?: "azure" | "github" | "gitlab";
-  /** Provider-scoped PR identity — owner/repo (GitHub) or project path (GitLab). */
-  repo?: string;
-  number?: number;
-};
-
-/** A saved project command bound to a terminal tab. `runId` bumps on each
- * launch; `launched` records the last run actually written to the PTY, so a
- * remount or app restart never re-runs it silently. A `steps` command runs
- * each step as its own process in order — `step.done` resumes an interrupted
- * run at the next step, and `failed` records a run that stopped on a failing
- * step so it is not retried silently. */
-export type TerminalCommand = {
-  /** Saved `ProjectCommand`/`ReusableCommand` id the launch came from. */
-  presetId?: string;
-  name: string;
-  text: string;
-  steps?: { command: string; host?: "native" }[];
-  runId: number;
-  launched?: number;
-  /** The runId whose step run stopped on a failing step. */
-  failed?: number;
-  /** Steps completed so far for the given runId. */
-  step?: { runId: number; done: number };
-};
-
-export type BrowserTabSource = {
-  /** Page currently shown; updated as the webview navigates. */
-  url: string;
-  /** Last document title reported by the page. */
-  title?: string;
-  /** Leaf expands to cover the whole pane area; other leaves stay mounted. */
-  expanded?: boolean;
-  /** Keep cookies/site data across restarts — the default. `false` marks a
-   * private tab on the throwaway data store. */
-  persist?: boolean;
-};
-
 export type FilePaneTab = {
   id: string;
   path: string;
   cwd: string;
+  /** Owning project when cwd points at one of its linked worktrees. */
+  projectCwd?: string;
   plan?: PlanTabSource;
   releaseNotes?: ReleaseNotesTabSource;
-  delivery?: DeliveryTabSource;
-  browser?: BrowserTabSource;
   review?: boolean;
   /** Single working-tree review of every changed file (unified diff). */
   changes?: boolean;
@@ -117,10 +75,9 @@ export type FilePaneTab = {
   /** Read-only transcript of an orchestration worker. Live only — not persisted. */
   agent?: AgentTabSource;
   terminal?: boolean;
+  browser?: BrowserTabSource;
   /** Foreground command when it isn't the shell. Live only — not persisted. */
   foreground?: string;
-  /** Saved command this terminal is bound to. */
-  command?: TerminalCommand;
 };
 
 export type EditorPane = {
@@ -182,11 +139,13 @@ export function newFileTab(
   cwd: string,
   review = false,
   changeKind?: GitFileDiffKind,
+  projectCwd?: string,
 ): FilePaneTab {
   return {
     id: crypto.randomUUID(),
     path,
     cwd,
+    ...(projectCwd && projectCwd !== cwd ? { projectCwd } : {}),
     ...(review ? { review: true } : {}),
     ...(changeKind ? { changeKind } : {}),
   };
@@ -196,11 +155,13 @@ export function newChangesTab(
   cwd: string,
   focusPath?: string,
   focusKind?: GitFileDiffKind,
+  projectCwd?: string,
 ): FilePaneTab {
   return {
     id: crypto.randomUUID(),
     path: focusPath || cwd,
     cwd,
+    ...(projectCwd && projectCwd !== cwd ? { projectCwd } : {}),
     review: true,
     changes: true,
     ...(focusKind ? { changeKind: focusKind } : {}),
@@ -211,11 +172,13 @@ export function newSessionChangesTab(
   cwd: string,
   sessionId: string,
   focusPath?: string,
+  projectCwd?: string,
 ): FilePaneTab {
   return {
     id: crypto.randomUUID(),
     path: focusPath || cwd,
     cwd,
+    ...(projectCwd && projectCwd !== cwd ? { projectCwd } : {}),
     review: true,
     sessionChanges: { sessionId },
   };
@@ -224,11 +187,13 @@ export function newSessionChangesTab(
 export function newCommitTab(
   cwd: string,
   commit: CommitTabSource,
+  projectCwd?: string,
 ): FilePaneTab {
   return {
     id: crypto.randomUUID(),
     path: `commit:${commit.sha}`,
     cwd,
+    ...(projectCwd && projectCwd !== cwd ? { projectCwd } : {}),
     commit,
   };
 }
@@ -276,73 +241,18 @@ export function newAgentTab(
   return { id: crypto.randomUUID(), path: title, cwd, agent };
 }
 
-export function newTerminalFile(cwd: string, title?: string): FilePaneTab {
+export function newTerminalFile(
+  cwd: string,
+  title?: string,
+  projectCwd?: string,
+): FilePaneTab {
   return {
     id: crypto.randomUUID(),
     path: title ?? defaultTerminalTitle(cwd),
     cwd,
+    ...(projectCwd && projectCwd !== cwd ? { projectCwd } : {}),
     terminal: true,
   };
-}
-
-export function newBrowserTab(
-  cwd: string,
-  url: string,
-  persist = true,
-): FilePaneTab {
-  return {
-    id: crypto.randomUUID(),
-    path: url,
-    cwd,
-    browser: { url, ...(persist ? {} : { persist: false }) },
-  };
-}
-
-export type BrowserMetaPatch = {
-  url?: string;
-  title?: string;
-  expanded?: boolean;
-  persist?: boolean;
-};
-
-/** Page-side state the webview reports back; keeps tab + snapshot current. */
-export function updateBrowserTab(
-  tab: WorkspaceTab,
-  fileId: string,
-  patch: BrowserMetaPatch,
-): WorkspaceTab {
-  let changed = false;
-  const editorPanes = tab.editorPanes.map((pane) => {
-    let paneChanged = false;
-    const files = pane.files.map((file) => {
-      if (!file.browser || file.id !== fileId) return file;
-      const url = patch.url?.trim();
-      const title =
-        patch.title !== undefined ? patch.title.trim() : file.browser.title;
-      const expanded = patch.expanded ?? file.browser.expanded;
-      const persist = patch.persist ?? file.browser.persist;
-      if (
-        (!url || url === file.browser.url) &&
-        title === file.browser.title &&
-        expanded === file.browser.expanded &&
-        persist === file.browser.persist
-      )
-        return file;
-      paneChanged = true;
-      const browser: BrowserTabSource = {
-        url: url || file.browser.url,
-        ...(title ? { title } : {}),
-        ...(expanded ? { expanded: true } : {}),
-        ...(persist === false ? { persist: false } : {}),
-      };
-      return { ...file, ...(url ? { path: url } : {}), browser };
-    });
-    if (!paneChanged) return pane;
-    changed = true;
-    return { ...pane, files };
-  });
-  if (!changed) return tab;
-  return { ...tab, editorPanes };
 }
 
 export function newTerminalWorkspaceTab(file: FilePaneTab): WorkspaceTab {
@@ -387,18 +297,13 @@ export function updateTerminalTab(
   const panes = tab.terminalPanes ?? [];
   let changed = false;
   const terminalPanes = panes.map((pane) => {
-    let paneChanged = false;
     const files = pane.files.map((file) => {
       if (!file.terminal || file.id !== fileId) return file;
       const next = applyTerminalMeta(file, patch);
-      if (next !== file) paneChanged = true;
+      if (next !== file) changed = true;
       return next;
     });
-    // `.map` always allocates — an untouched pane must keep its identity or
-    // downstream referential checks see churn on every patch.
-    if (!paneChanged) return pane;
-    changed = true;
-    return { ...pane, files };
+    return files === pane.files ? pane : { ...pane, files };
   });
   if (!changed) return tab;
   return withSurfacePanes(tab, "terminal", terminalPanes);
@@ -453,16 +358,16 @@ export function isTerminalTab(file: FilePaneTab): boolean {
   return !!file.terminal;
 }
 
-export function isBrowserTab(
-  file: FilePaneTab,
-): file is FilePaneTab & { browser: BrowserTabSource } {
-  return !!file.browser;
-}
-
 export function isAgentTab(
   file: FilePaneTab,
 ): file is FilePaneTab & { agent: AgentTabSource } {
   return !!file.agent;
+}
+
+export function isBrowserTab(
+  file: FilePaneTab,
+): file is FilePaneTab & { browser: BrowserTabSource } {
+  return !!file.browser;
 }
 
 export function isVirtualDocumentTab(file: FilePaneTab): boolean {
@@ -470,15 +375,16 @@ export function isVirtualDocumentTab(file: FilePaneTab): boolean {
     isPlanTab(file) ||
     isReleaseNotesTab(file) ||
     isCommitTab(file) ||
-    isBrowserTab(file) ||
-    !!file.delivery ||
-    isAgentTab(file)
+    isAgentTab(file) ||
+    isBrowserTab(file)
   );
 }
 
 export function isFilesystemTab(file: FilePaneTab): boolean {
   return (
-    !isTerminalTab(file) && !isVirtualDocumentTab(file) && !file.sessionChanges
+    !isTerminalTab(file) &&
+    !isVirtualDocumentTab(file) &&
+    !file.sessionChanges
   );
 }
 
@@ -549,10 +455,8 @@ export function isSessionChangesTab(
 }
 
 export function editorTabKey(file: FilePaneTab): string {
-  if (file.delivery)
-    return `delivery:${JSON.stringify([file.cwd, file.delivery.kind, file.delivery.branch, file.delivery.sourceSessionId, file.delivery.provider, file.delivery.repo, file.delivery.number])}`;
+  if (file.browser) return `browser:${file.cwd}:${file.browser.persist !== false}:${file.browser.url || file.id}`;
   if (file.terminal) return `terminal:${file.id}`;
-  if (file.browser) return `browser:${file.cwd}:${file.browser.url}`;
   if (file.agent) return `agent:${file.agent.sessionId}`;
   if (file.plan) return `plan:${file.plan.blockId}`;
   if (file.releaseNotes) return `release-notes:${file.releaseNotes.version}`;
@@ -574,8 +478,6 @@ export function newEditorPane(file: FilePaneTab): EditorPane {
 export type OpenEditorTabOptions = {
   /** Which side of the focused non-editor pane receives a new editor pane. */
   split?: "left" | "right";
-  /** Open in this pane rather than the focused one. */
-  targetPaneId?: string;
 };
 
 /** Focus an existing editor tab, or open it in the focused editor pane / a new split. */
@@ -607,9 +509,7 @@ export function openEditorTab(
     };
   }
 
-  const focusedPane = tab.editorPanes.find(
-    (pane) => pane.id === (options.targetPaneId ?? tab.focusedId),
-  );
+  const focusedPane = tab.editorPanes.find((pane) => pane.id === tab.focusedId);
   const targetPane = focusedPane ?? tab.editorPanes[0];
   if (targetPane) {
     return {
@@ -644,19 +544,21 @@ export function openEditorTab(
   };
 }
 
-/** Focus the single working-tree Changes tab, creating it if needed. */
+/** Focus this working copy's Changes tab, creating it if needed. */
 export function openChangesTab(
   tab: WorkspaceTab,
   cwd: string,
   focusPath?: string,
   focusKind?: GitFileDiffKind,
+  projectCwd?: string,
 ): WorkspaceTab {
   tab = isolateTerminalPanes(tab);
-  const next = newChangesTab(cwd, focusPath, focusKind);
+  const next = newChangesTab(cwd, focusPath, focusKind, projectCwd);
+  const matches = (file: FilePaneTab) => editorTabKey(file) === editorTabKey(next);
   const existingPane = tab.editorPanes.find((pane) =>
-    pane.files.some(isChangesTab),
+    pane.files.some(matches),
   );
-  const existingFile = existingPane?.files.find(isChangesTab);
+  const existingFile = existingPane?.files.find(matches);
 
   if (existingPane && existingFile) {
     const updated = focusPath
@@ -674,7 +576,7 @@ export function openChangesTab(
         pane.id === existingPane.id
           ? {
               ...pane,
-              files: dropPerFileReviewTabs(pane.files).map((file) =>
+              files: dropPerFileReviewTabs(pane.files, cwd).map((file) =>
                 file.id === updated.id ? updated : file,
               ),
               activeFileId: updated.id,
@@ -688,12 +590,12 @@ export function openChangesTab(
   return {
     ...opened,
     editorPanes: opened.editorPanes.map((pane) =>
-      pane.files.some(isChangesTab)
+      pane.files.some(matches)
         ? {
             ...pane,
-            files: dropPerFileReviewTabs(pane.files),
+            files: dropPerFileReviewTabs(pane.files, cwd),
             activeFileId:
-              pane.files.find(isChangesTab)?.id ?? pane.activeFileId,
+              pane.files.find(matches)?.id ?? pane.activeFileId,
           }
         : pane,
     ),
@@ -706,8 +608,9 @@ export function openSessionChangesTab(
   cwd: string,
   sessionId: string,
   focusPath?: string,
+  projectCwd?: string,
 ): WorkspaceTab {
-  const next = newSessionChangesTab(cwd, sessionId, focusPath);
+  const next = newSessionChangesTab(cwd, sessionId, focusPath, projectCwd);
   const key = editorTabKey(next);
   const existingPane = tab.editorPanes.find((pane) =>
     pane.files.some((file) => editorTabKey(file) === key),
@@ -717,9 +620,7 @@ export function openSessionChangesTab(
   );
   if (!existingPane || !existingFile) return openEditorTab(tab, next);
 
-  const updated = focusPath
-    ? { ...existingFile, path: focusPath }
-    : existingFile;
+  const updated = focusPath ? { ...existingFile, path: focusPath } : existingFile;
   return {
     ...tab,
     focusedId: existingPane.id,
@@ -743,13 +644,15 @@ export function openCommitTab(
   tab: WorkspaceTab,
   cwd: string,
   commit: CommitTabSource,
+  projectCwd?: string,
 ): WorkspaceTab {
-  return openEditorTab(tab, newCommitTab(cwd, commit));
+  return openEditorTab(tab, newCommitTab(cwd, commit, projectCwd));
 }
 
-function dropPerFileReviewTabs(files: FilePaneTab[]): FilePaneTab[] {
+function dropPerFileReviewTabs(files: FilePaneTab[], cwd: string): FilePaneTab[] {
   return files.filter(
     (file) =>
+      file.cwd !== cwd ||
       !isReviewTab(file) || isChangesTab(file) || isSessionChangesTab(file),
   );
 }

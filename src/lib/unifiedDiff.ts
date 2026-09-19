@@ -234,27 +234,3 @@ function visibleContext(
 function textFromString(value: string): Text {
   return Text.of(value.split("\n"));
 }
-
-/** Return only the displayed hunk containing the selected line. */
-export function selectedDiffHunk(blocks: readonly UnifiedBlock[], selected: UnifiedLine): UnifiedLine[] {
-  for (const block of blocks) {
-    if (block.kind !== "hunk") continue;
-    const index = block.lines.findIndex(line => line.kind === selected.kind && line.oldNumber === selected.oldNumber && line.newNumber === selected.newNumber && line.text === selected.text);
-    if (index < 0) continue;
-    let start = index;
-    while (start > 0 && block.lines[start].kind !== "hunk") start--;
-    let end = index + 1;
-    while (end < block.lines.length && block.lines[end].kind !== "hunk") end++;
-    return block.lines.slice(start, end);
-  }
-  return [];
-}
-
-/** Preserve line locations when a displayed hunk has no textual @@ header. */
-export function formatUnifiedHunk(lines: readonly UnifiedLine[]): string {
-  const patch = lines.map(line => `${line.kind === "add" ? "+" : line.kind === "del" ? "-" : line.kind === "context" ? " " : ""}${line.text}`).join("\n");
-  if (lines.some(line => line.kind === "hunk")) return patch;
-  const old = lines.filter(line => line.oldNumber != null);
-  const next = lines.filter(line => line.newNumber != null);
-  return `@@ -${old[0]?.oldNumber ?? 0},${old.length} +${next[0]?.newNumber ?? 0},${next.length} @@\n${patch}`;
-}

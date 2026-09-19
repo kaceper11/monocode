@@ -71,3 +71,34 @@ it("keeps native and distribution probes separate, coalesces requests and refres
   await probeHarnessAvailability({ cwd });
   expect(isHarnessAvailable("codex", cwd)).toBe(true);
 });
+
+
+it("retains upstream native installation hints when a resolver fails", async () => {
+  vi.resetModules();
+  invoke.mockReset().mockRejectedValue(new Error("resolver detail"));
+  const { registerBuiltinHarnesses } = await import("./register");
+  registerBuiltinHarnesses();
+  const { probeHarnessAvailability, harnessUnavailableHint } = await import("./availability");
+  await probeHarnessAvailability();
+  expect(harnessUnavailableHint("claude")).toBe("Claude Code CLI not found. Install it, or restart MonoCode if it is already installed.");
+  expect(harnessUnavailableHint("hermes")).toContain("Install from hermes-agent.nousresearch.com, then run hermes model");
+});
+
+it("does not let busy distribution probes prevent native discovery", async () => {
+  vi.resetModules();
+  const finish: Array<() => void> = [];
+  invoke.mockReset().mockImplementation((command) => command === "wsl_resolve_agents"
+    ? new Promise((resolve) => finish.push(() => resolve({})))
+    : Promise.resolve({ path: "C:/bin/agent.exe" }));
+  const { registerBuiltinHarnesses } = await import("./register");
+  registerBuiltinHarnesses();
+  const { probeHarnessAvailability, isHarnessAvailable } = await import("./availability");
+  const pending = Array.from({ length: 5 }, (_, i) => probeHarnessAvailability({ cwd: `//wsl.localhost/Busy${i}/repo` }));
+  try {
+    await probeHarnessAvailability();
+    expect(isHarnessAvailable("codex")).toBe(true);
+  } finally {
+    finish.forEach((resolve) => resolve());
+    await Promise.all(pending);
+  }
+});

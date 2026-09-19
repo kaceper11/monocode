@@ -1,4 +1,3 @@
-import { markTurn } from "../turnTiming";
 import { writeChild } from "./child";
 
 type Pending = {
@@ -93,13 +92,6 @@ export class JsonRpcClient {
     timeoutMs = 0,
   ): Promise<T> {
     if (this.closed) throw new Error("Harness process is not running");
-    if (
-      method === "turn/start" ||
-      method === "turn/steer" ||
-      method === "session/prompt"
-    ) {
-      markTurn(this.sessionId, `${method} write`);
-    }
     const id = this.nextId++;
     const key = String(id);
     const cancellation = new AbortController();

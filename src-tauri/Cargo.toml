@@ -7,7 +7,6 @@ authors = ["Nick"]
 repository = "https://github.com/hardbeat920/monocode"
 homepage = "https://usemono.dev"
 license.workspace = true
-default-run = "monocode"
 
 [lib]
 name = "monocode_lib"
@@ -17,7 +16,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset", "macos-private-api", "unstable", "devtools", "image-png"] }
+tauri = { version = "2", features = ["protocol-asset", "macos-private-api", "unstable", "image-png"] }
+# Browser uses Tauri's already-locked engine without its app command bridge.
+wry = { version = "0.55.1", default-features = false, features = ["os-webview", "devtools"] }
+tauri-plugin-clipboard-manager = "2"
 tauri-plugin-opener = "2"
 serde.workspace = true
 serde_json.workspace = true
@@ -29,44 +31,45 @@ tauri-plugin-dialog = "2"
 rusqlite = { version = "0.40.2", features = ["bundled"], default-features = false }
 ureq = { version = "2.12.1", default-features = false, features = ["tls", "gzip"] }
 # Already used by Tauri; cancellable streaming reads use the shared async runtime.
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "gzip"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider"] }
 url = "2.5"
 tauri-plugin-process = "2"
 cpal = "0.18.2"
-hound = "3.5.1"
 whisper-rs = "0.16"
-tauri-plugin-clipboard-manager = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
 portable-pty = { version = "0.9", path = "../vendor/portable-pty" }
-webview2-com = "0.38.2"
-# webview2-com's CapturePreview takes an IStream from its own windows 0.61
-# dependency, so the WebView2 interop below stays pinned to that crate version.
-windows61 = { package = "windows", version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_System_Power"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Power", "Win32_System_ProcessStatus"] }
 tauri-winrt-notification = "0.8"
+webview2-com = "0.38.2"
+# Match the locked WebView2 API's IStream type for native PNG capture.
+windows61 = { package = "windows", version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell"] }
 # WinRT toast settings (Windows.UI.Notifications) to read the per-app block.
 windows = { version = "0.62", features = ["UI_Notifications"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16", features = ["metal"] }
-mach2 = "0.6"
 block2 = "0.6.2"
+objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKSnapshotConfiguration"] }
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSBitmapImageRep", "NSButton", "NSColor", "NSControl", "NSDockTile", "NSGraphics", "NSImage", "NSLayoutAnchor", "NSLayoutConstraint", "NSMenu", "NSMenuItem", "NSResponder", "NSUserInterfaceItemIdentification", "NSView", "NSVisualEffectView", "NSWindow", "objc2-core-foundation"] }
-objc2-foundation = { version = "0.3", features = ["NSData", "NSDictionary", "NSGeometry", "NSError", "NSString"] }
-objc2-web-kit = { version = "0.3.2", features = ["WKSnapshotConfiguration", "WKWebView", "block2"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSBitmapImageRep", "NSButton", "NSColor", "NSControl", "NSDockTile", "NSGraphics", "NSImage", "NSLayoutAnchor", "NSLayoutConstraint", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSUserInterfaceItemIdentification", "NSView", "NSVisualEffectView", "NSWindow", "objc2-core-foundation"] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSError", "NSString"] }
 objc2-user-notifications = { version = "0.3.2", features = ["UNUserNotificationCenter", "UNNotification", "UNNotificationAction", "UNNotificationCategory", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSettings", "UNNotificationSound", "block2"] }
 raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 notify-rust = "4.18"
+gtk = "0.18"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-window-state = "2.4.1"
+
+[dev-dependencies]
+hound = "3.5.1"

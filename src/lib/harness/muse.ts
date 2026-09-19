@@ -15,7 +15,6 @@ import {
 import { JsonRpcClient, type JsonRpcId } from "./jsonRpc";
 import {
   asRecord,
-  isMuseSessionMissing,
   MUSE_AUTH_HELP,
   MUSE_AUTH_PATTERN,
   museAnswerParts,
@@ -55,7 +54,6 @@ import {
   type MuseSubagentMeta,
 } from "./museSubagents";
 import { acquireSharedStart } from "./liveStart";
-import { markTurn } from "../turnTiming";
 import type {
   ApprovalDecision,
   CompactContextInput,
@@ -141,14 +139,7 @@ type Live = {
   compactionWait: { resolve: () => void; reject: (e: Error) => void } | null;
   /** Throttles model/list re-warms triggered by route failures. */
   catalogRefreshedAt: number;
-  /** A non-bookkeeping item reached terminal — enables drain detection. */
-  hasCompletedReal: boolean;
-  /** A reminderChild event arrived while no real item was open. */
-  reminderIdleSeen: boolean;
-  /** A model retry is scheduled; its real item has not started yet. */
-  retryPending: boolean;
-  /** The turn whose bookkeeping status was already shown. */
-  drainReportedFor: string | null;
+
 };
 
 type Resume = {
@@ -236,13 +227,6 @@ export async function compactMuseContext(
   await work;
 }
 
-export function canSteerMuseSession(sessionId: string): boolean {
-  const live = liveByThread.get(sessionId);
-  // The host can acknowledge a steer after its final answer without making
-  // another model call. Queue at that boundary until the next foreground turn.
-  return !!live?.activeTurnId && !live.cancelled && !live.muteUpdates && openWorkCounts(live).real > 0;
-}
-
 export async function steerMuseTurn(input: SteerTurnInput): Promise<void> {
   const live = liveByThread.get(input.sessionId);
   if (!live) throw new Error("No active Muse session");
@@ -298,22 +282,11 @@ function applyApprovalMode(live: Live): Promise<void> {
     while (liveByThread.get(live.sessionId) === live && !live.cancelled) {
       const mode = museApprovalMode(live.runtimeMode, live.planning);
       if (mode === live.appliedMode) return;
-      let result: unknown;
-      try {
-        result = await live.rpc.request(
-          "session/setApprovalMode",
-          { commandId: newCommandId(), mode, sessionId: live.museSessionId },
-          CONTROL_TIMEOUT_MS,
-        );
-      } catch (error) {
-        // A host without this control keeps its session/start mode; mark the
-        // selection applied so the same doomed write is not retried per turn.
-        if (isMuseUnsupportedControl(error)) {
-          live.appliedMode = mode;
-          return;
-        }
-        throw error;
-      }
+      const result = await live.rpc.request(
+        "session/setApprovalMode",
+        { commandId: newCommandId(), mode, sessionId: live.museSessionId },
+        CONTROL_TIMEOUT_MS,
+      );
       const effective = stringField(asRecord(asRecord(result)?.effectiveMode), "mode");
       if (effective && effective !== mode) throw new Error(`Muse retained access mode ${effective}`);
       live.appliedMode = mode;
@@ -485,7 +458,6 @@ export async function cancelMuseTurn(sessionId: string): Promise<void> {
     return;
   }
   if (live.cancellation) return live.cancellation;
-  live.onEvent({ type: "session.activity" });
   live.cancelGeneration += 1;
   live.cancelled = true;
   live.muteUpdates = true;
@@ -657,11 +629,11 @@ async function startLive(
 
   const { path } = await resolveMuseBinary(input.cwd);
   assertStarting();
-  markTurn(input.sessionId, "muse binary resolved");
   const liveRef: { current: Live | null } = { current: null };
   // session/resume re-issues pending approvals/questions as server requests
   // before `live` is bound; hold them until the session object exists.
   const earlyRequests: { method: string; params: unknown }[] = [];
+  let earlyRequestChars = 0;
 
   const rpc = new JsonRpcClient(
     input.sessionId,
@@ -675,6 +647,12 @@ async function startLive(
         const live = liveRef.current;
         if (!live) {
           if (method === "approval/request" || method === "userInput/request") {
+            earlyRequestChars += JSON.stringify({ method, params }).length;
+            if (earlyRequests.length >= 256 || earlyRequestChars > 4 * 1024 * 1024) {
+              rpc.close(new Error("Muse exceeded the startup request limit"));
+              earlyRequests.length = 0;
+              return;
+            }
             earlyRequests.push({ method, params });
             void rpc.respond(id, {}).catch(() => undefined);
           } else {
@@ -738,7 +716,6 @@ async function startLive(
       input.cwd,
     );
     assertStarting();
-    markTurn(input.sessionId, "muse spawned");
 
     try {
       const result = await rpc.request(
@@ -755,7 +732,6 @@ async function startLive(
       throw museAuthError(error, "start");
     }
     void rpc.notify("initialized");
-    markTurn(input.sessionId, "muse initialized");
 
     // "muse:default" is the picker placeholder, not a servable model id.
     const wantedModel = museNativeModel(input.model, input.cwd);
@@ -779,11 +755,7 @@ async function startLive(
         // resume carries no mode/model; the stored session keeps its own.
         resumed = museSessionId != null;
       } catch (error) {
-        if (!isMuseSessionMissing(error)) {
-          // Keep the durable identity so Retry resumes the same conversation.
-          throw error;
-        }
-        museSessionId = undefined;
+        throw new Error(`Could not resume the saved Muse conversation; its binding was preserved. ${error instanceof Error ? error.message : String(error)}`);
       }
     }
 
@@ -808,7 +780,6 @@ async function startLive(
     if (!museSessionId) {
       throw new Error("Muse did not return a session id");
     }
-    markTurn(input.sessionId, resumed ? "muse resumed" : "muse session started");
 
     const live: Live = {
       rpc,
@@ -846,10 +817,6 @@ async function startLive(
       lastGoal: undefined,
       compactionWait: null,
       catalogRefreshedAt: 0,
-      hasCompletedReal: false,
-      reminderIdleSeen: false,
-      retryPending: false,
-      drainReportedFor: null,
     };
     assertStarting();
     liveRef.current = live;
@@ -928,19 +895,10 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
         .then(() => {
           live.appliedModelId = native;
         })
-        .catch((error: unknown) => {
-          // A host without this control keeps its session/start model; mark
-          // it applied so the doomed write is not retried every turn.
-          if (isMuseUnsupportedControl(error)) {
-            live.appliedModelId = native;
-            return;
-          }
-          throw error;
-        }),
+
     );
   }
   await Promise.all(controls);
-  markTurn(live.sessionId, "muse controls applied");
   // A live selection may have changed while the model control was pending.
   await applyApprovalMode(live);
   // The parallel controls widened the cancel window — check again before
@@ -975,7 +933,6 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
   }
   const rec = asRecord(ack);
   const turnId = stringField(rec, "turnId");
-  markTurn(live.sessionId, "muse turn/start ack");
   if (!turnId) {
     throw new Error("Muse turn/start returned no turn id");
   }
@@ -986,35 +943,14 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
   await waitTurn(live, turnId, disposition);
 }
 
-/**
- * A host may lack a session control entirely; only transport failures should
- * fail the turn. Unsupported methods are cached as "applied" so a doomed
- * write is not retried every turn.
- */
-function isMuseUnsupportedControl(error: unknown): boolean {
-  const kind = museErrorKind(error);
-  if (
-    kind === "methodNotFound" ||
-    kind === "unknownMethod" ||
-    kind === "unsupportedMethod"
-  ) {
-    return true;
-  }
-  if ((error as { code?: unknown } | null | undefined)?.code === -32601) {
-    return true;
-  }
-  const detail = error instanceof Error ? error.message : String(error);
-  return /unknown method|method not found|not implemented|unsupported/i.test(
-    detail,
-  );
-}
-
 async function runCompaction(live: Live): Promise<void> {
   // Register the settle hook before the request: a fast item/completed must
   // not beat it.
   const done = new Promise<void>((resolve, reject) => {
     live.compactionWait = { resolve, reject };
   });
+  // A terminal notification can reject before the admission reply arrives.
+  void done.catch(() => undefined);
   const timer = setTimeout(() => {
     const wait = live.compactionWait;
     live.compactionWait = null;
@@ -1096,26 +1032,6 @@ function waitTurn(
   return wait.promise;
 }
 
-/**
- * Resolve a turn's registered wait without clearing `activeTurnId` — the
- * turn still runs host-side (draining), so steer and interrupt must keep
- * their target until the real turn/completed lands.
- */
-function resolveTurnWait(live: Live, turnId: string, outcome: Error | undefined): void {
-  const wait = live.turnWaits.get(turnId);
-  if (wait) {
-    live.turnWaits.delete(turnId);
-    if (outcome) wait.reject(outcome);
-    else wait.resolve();
-    return;
-  }
-  if (live.finishedTurns.size >= MAX_FINISHED_TURNS) {
-    const oldest = live.finishedTurns.keys().next().value;
-    if (oldest !== undefined) live.finishedTurns.delete(oldest);
-  }
-  live.finishedTurns.set(turnId, outcome);
-}
-
 /** turn/completed and turn/unqueued settle the matching waiter. */
 function settleTurn(live: Live, turnId: string, outcome: Error | undefined): void {
   live.queuedTurnIds.delete(turnId);
@@ -1186,89 +1102,6 @@ function settleQuestion(live: Live, requestId: number, decision: "answered" | "s
 function emit(live: Live, events: HarnessEvent[]): void {
   if (live.muteUpdates) return;
   for (const event of events) live.onEvent(event);
-}
-
-/**
- * Open items by visibility class. `reminderChild` is memory bookkeeping;
- * the `userMessage` echo is not work either. Everything else — including
- * unknown kinds — counts as real work for drain detection.
- */
-function openWorkCounts(live: Live): { real: number; reminders: number } {
-  let real = 0;
-  let reminders = 0;
-  for (const state of live.items.values()) {
-    if (state.kind === "reminderChild") {
-      reminders += 1;
-    } else if (state.kind !== "userMessage") {
-      real += 1;
-    }
-  }
-  return { real, reminders };
-}
-
-/**
- * `turn/completed` trails the answer while Muse drains memory/reminder child
- * sessions (the eot gate — ~60s on real models), and the wire exposes no
- * "answer is done" signal. A drain is detected by shape instead: a real item
- * already completed, no non-bookkeeping item is still open, and reminder
- * children are running (or were observed while the real set was empty).
- * Turn-start recall cannot trip it — no real item has completed yet — and a
- * scheduled model retry holds it off until the retry's real item starts.
- * `turn/completed` stays the backstop for drains that emit no reminder items;
- * a late `terminal: "failed"` still surfaces through its own session.error.
- *
- * The UI turn settles at drain detection — the user is not made to wait out
- * the provider's bookkeeping. `activeTurnId` stays set until the real
- * turn/completed so steer/interrupt keep their host-side target, and a
- * follow-up sent at this boundary goes through `turn/start` with
- * `ifBusy: "queue"` (see `runTurn`): the host admits it now and runs it when
- * the bookkeeping finishes — no client-side wait is needed.
- */
-function reportDrain(live: Live): void {
-  const turnId = live.activeTurnId;
-  if (!turnId || live.retryPending || live.drainReportedFor === turnId) return;
-  const { real, reminders } = openWorkCounts(live);
-  if (
-    real > 0 ||
-    !live.hasCompletedReal ||
-    (reminders === 0 && !live.reminderIdleSeen)
-  ) {
-    return;
-  }
-  live.drainReportedFor = turnId;
-  if (!live.muteUpdates) {
-    live.onEvent({ type: "message.completed" });
-    live.onEvent({ type: "reasoning.completed" });
-    live.onEvent({
-      type: "session.activity",
-      text: "Muse is finishing up…",
-    });
-  }
-  resolveTurnWait(live, turnId, undefined);
-}
-
-/**
- * Record drain evidence from an item notification after `museItemEvent` has
- * applied it. A reminderChild event while no real item is open marks the
- * drain even when the child completes too fast to sit in `items`.
- */
-function noteDrainEvidence(
-  live: Live,
-  item: unknown,
-  phase: "started" | "updated" | "completed",
-): void {
-  const kind = stringField(asRecord(item), "kind") ?? "";
-  if (kind !== "reminderChild") {
-    if (kind !== "userMessage" && kind !== "") {
-      // A real item starting means a scheduled retry has produced work again.
-      if (phase === "started") live.retryPending = false;
-      if (phase === "completed") live.hasCompletedReal = true;
-    }
-    return;
-  }
-  if (live.hasCompletedReal && openWorkCounts(live).real === 0) {
-    live.reminderIdleSeen = true;
-  }
 }
 
 // ---- Subagent child-session trails ----
@@ -1485,15 +1318,11 @@ function handleNotification(live: Live, method: string, params: unknown): void {
   switch (method) {
     case "item/started":
       emit(live, museItemEvent(rec?.item, "started", live.items));
-      noteDrainEvidence(live, rec?.item, "started");
       noteSubagentItem(live, rec?.item, "started");
-      reportDrain(live);
       return;
     case "item/updated":
       emit(live, museItemEvent(rec?.item, "updated", live.items));
-      noteDrainEvidence(live, rec?.item, "updated");
       noteSubagentItem(live, rec?.item, "updated");
-      reportDrain(live);
       return;
     case "item/completed": {
       const item = asRecord(rec?.item);
@@ -1524,9 +1353,7 @@ function handleNotification(live: Live, method: string, params: unknown): void {
         live.compactionWait = null;
       }
       emit(live, events);
-      noteDrainEvidence(live, item, "completed");
       noteSubagentItem(live, item, "completed");
-      reportDrain(live);
       return;
     }
     case "item/delta":
@@ -1537,25 +1364,21 @@ function handleNotification(live: Live, method: string, params: unknown): void {
       if (turnId) {
         live.activeTurnId = turnId;
         live.queuedTurnIds.delete(turnId);
-        live.hasCompletedReal = false;
-        live.reminderIdleSeen = false;
-        live.retryPending = false;
-        live.drainReportedFor = null;
       }
       return;
     }
     case "turn/completed": {
       const turnId = stringField(rec, "turnId");
       if (!turnId) return;
-      const terminal = stringField(rec, "terminal") ?? "completed";
+      const terminal = stringField(rec, "terminal");
+      const error = terminal === "failed"
+        ? museTurnError(rec) ?? new Error("Muse turn failed")
+        : terminal === "completed" || terminal === "cancelled"
+          ? undefined
+          : new Error(`Muse reported an unrecognized terminal state: ${terminal ?? "missing"}`);
       // A delayed/duplicate terminal event must not close a newer response.
       if (turnId !== live.activeTurnId) {
-        const error =
-          terminal === "failed"
-            ? museTurnError(rec) ?? new Error("Muse turn failed")
-            : undefined;
-        // A turn whose UI wait already settled at drain detection can still
-        // fail late host-side — surface that instead of dropping it.
+        // Preserve failure information from out-of-order terminal events.
         if (error && !live.muteUpdates) {
           live.onEvent({ type: "session.error", message: error.message });
         }
@@ -1563,28 +1386,19 @@ function handleNotification(live: Live, method: string, params: unknown): void {
         return;
       }
       // Prompts the host forgot to settle must not outlive the turn.
-      emit(live, [{ type: "session.activity" }]);
       clearPending(live);
-      // The drain report already sealed this turn's streams; a real
-      // turn/completed must not re-emit the completions.
-      const drained = live.drainReportedFor === turnId;
-      if (terminal === "failed") {
-        const error = museTurnError(rec) ?? new Error("Muse turn failed");
+      if (error) {
         if (!live.muteUpdates) {
-          if (!drained) {
-            live.onEvent({ type: "message.completed" });
-            live.onEvent({ type: "reasoning.completed" });
-          }
+          live.onEvent({ type: "message.completed" });
+          live.onEvent({ type: "reasoning.completed" });
           live.onEvent({ type: "session.error", message: error.message });
         }
         settleTurn(live, turnId, error);
         return;
       }
       if (!live.muteUpdates) {
-        if (!drained) {
-          live.onEvent({ type: "message.completed" });
-          live.onEvent({ type: "reasoning.completed" });
-        }
+        live.onEvent({ type: "message.completed" });
+        live.onEvent({ type: "reasoning.completed" });
         if (terminal === "cancelled") {
           live.onEvent({
             type: "status",
@@ -1623,10 +1437,6 @@ function handleNotification(live: Live, method: string, params: unknown): void {
       return;
     }
     case "turn/retryScheduled": {
-      // A model retry is pending: all real items may be closed during the
-      // backoff without the turn being done — hold off drain settlement
-      // until the retry's real item starts.
-      live.retryPending = true;
       const attempt = rec?.attempt;
       const next = rec?.nextAttempt;
       const max = rec?.maxAttempts;
@@ -1657,8 +1467,12 @@ function handleNotification(live: Live, method: string, params: unknown): void {
       const uiId = live.approvalUiById.get(refresh.approvalId);
       const pending = uiId != null ? live.approvals.get(uiId) : undefined;
       if (pending) {
-        pending.requirementId = refresh.requirementId;
-        if (refresh.choices.length > 0) pending.choices = refresh.choices;
+        registerApproval(live, {
+          ...pending,
+          requirementId: refresh.requirementId,
+          choices: refresh.choices,
+          decidedLocally: undefined,
+        });
       }
       return;
     }
@@ -1811,28 +1625,26 @@ function handleApprovalRequested(live: Live, params: unknown): void {
     return;
   }
   if (live.cancelled || live.muteUpdates) return;
-  // A re-issued request for the same approval updates the pending entry;
-  // it must not stack a second row or orphan the first.
+  registerApproval(live, approval);
+}
+
+function registerApproval(live: Live, approval: PendingApproval): void {
+  if (live.cancelled || live.muteUpdates) return;
   const knownId = live.approvalUiById.get(approval.approvalId);
-  if (knownId != null) {
-    const known = live.approvals.get(knownId);
-    if (known) {
-      known.requirementId = approval.requirementId;
-      if (approval.choices.length > 0) known.choices = approval.choices;
-    }
-    return;
+  const known = knownId != null ? live.approvals.get(knownId) : undefined;
+  if (known && knownId != null) {
+    if (
+      known.requirementId.sourceIndex === approval.requirementId.sourceIndex &&
+      JSON.stringify({ ...known, decidedLocally: undefined }) ===
+        JSON.stringify({ ...approval, decidedLocally: undefined })
+    ) return;
+    // Retire the old revision before publishing the new one. Its in-flight
+    // decision may still settle, but cannot dismiss or decide this request.
+    live.approvals.delete(knownId);
+    live.onEvent({ type: "approval.resolved", requestId: knownId, decision: "cancelled" });
   }
   const uiId = live.nextUiId++;
-  const pending: PendingApproval = {
-    approvalId: approval.approvalId,
-    sessionId: approval.sessionId,
-    itemId: approval.itemId,
-    requirementId: approval.requirementId,
-    choices: approval.choices,
-    title: approval.title,
-    kind: approval.kind,
-    preview: approval.preview,
-  };
+  const pending = { ...approval, decidedLocally: undefined };
   live.approvals.set(uiId, pending);
   live.approvalUiById.set(approval.approvalId, uiId);
   // Refresh the gated tool row so the approval joins it by item id.

@@ -2,7 +2,6 @@ import {
   CheckCircle,
   ChevronLeft,
   ChevronRight,
-  Globe,
   Inbox,
   PanelLeft,
   Plus,
@@ -37,7 +36,7 @@ import { HarnessIcon } from "./HarnessIcon";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TerminalSpinner } from "./TerminalSpinner";
 import { WindowControls } from "./WindowControls";
-import { IS_MAC, IS_WIN, MOD, SHIFT } from "../lib/platform";
+import { IS_MAC, IS_WIN, MOD } from "../lib/platform";
 import type { RecentProject } from "../lib/recents";
 import { ExplorerMenu, type ExplorerMenuItem } from "./ExplorerMenu";
 import {
@@ -84,9 +83,6 @@ type Props = {
   onSelect: (id: string) => void;
   onNew: () => void;
   onNewTerminal?: () => void;
-  onOpenBrowser?: () => void;
-  /** A browser tab is open in the active workspace tab. */
-  browserActive?: boolean;
   onOpenSettings?: () => void;
   onOpenInbox?: () => void;
   onOpenNotes?: () => void;
@@ -579,8 +575,6 @@ function TitleBarComponent({
   onSelect,
   onNew,
   onNewTerminal,
-  onOpenBrowser,
-  browserActive = false,
   onOpenSettings,
   onOpenInbox,
   onOpenNotes,
@@ -799,19 +793,6 @@ function TitleBarComponent({
                 <Plus className="size-3.5" strokeWidth={1.75} />
               </IconButton>
             </>
-          ) : null}
-          {!projectless && onOpenBrowser ? (
-            <IconButton
-              label={
-                browserActive
-                  ? "Browser"
-                  : `Open URL in Browser (${MOD}${SHIFT}B)`
-              }
-              accent={browserActive}
-              onClick={onOpenBrowser}
-            >
-              <Globe className="size-3.5" strokeWidth={1.75} />
-            </IconButton>
           ) : null}
           {!projectRailOpen && !showCurrentProject && onOpenSettings ? (
             <IconButton label={`Settings (${MOD},)`} onClick={onOpenSettings}>

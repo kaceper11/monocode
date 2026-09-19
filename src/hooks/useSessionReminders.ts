@@ -1,14 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { message } from "../lib/dialogs";
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useReducer,
-  useRef,
-  useState,
-} from "react";
+import { message } from "@tauri-apps/plugin-dialog";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import {
   loadNotificationsEnabled,
   NOTIFICATIONS_CHANGE_EVENT,
@@ -39,10 +32,7 @@ export function useSessionReminders(
   const [reminders, setItems] = useState<SessionReminder[]>([]);
   const [now, setNow] = useState(Date.now);
   const [error, setError] = useState<string | null>(null);
-  const [policyRevision, refreshPolicy] = useReducer(
-    (revision: number) => revision + 1,
-    0,
-  );
+  const [, refreshPolicy] = useReducer((revision: number) => revision + 1, 0);
   const revision = useRef(0);
   const configurationRevision = useRef(0);
   const configurationQueue = useRef<Promise<void>>(Promise.resolve());
@@ -250,30 +240,19 @@ export function useSessionReminders(
     }
   }, []);
 
-  // Stable identities — consumers memo derived work on this object, so a
-  // fresh `.filter()`/object per render would defeat every memo downstream.
-  // `policyRevision` reruns the memo when project notification rules change.
-  const due = useMemo(
-    () =>
-      reminders.filter((reminder) => {
-        const project = knownNotificationProject(reminder.cwd);
-        if (!project || reminder.dueAt > now) return false;
-        const rule = getProjectNotificationRule(project.id, "reminders");
-        return rule.enabled && reminder.dueAt > rule.after;
-      }),
-    [reminders, now, policyRevision],
-  );
-  return useMemo(
-    () => ({
-      reminders,
-      due,
-      error,
-      refresh,
-      schedule,
-      cancel,
-      dismissDue,
-      open,
+  return {
+    reminders,
+    due: reminders.filter((reminder) => {
+      const project = knownNotificationProject(reminder.cwd);
+      if (!project || reminder.dueAt > now) return false;
+      const rule = getProjectNotificationRule(project.id, "reminders");
+      return rule.enabled && reminder.dueAt > rule.after;
     }),
-    [reminders, due, error, refresh, schedule, cancel, dismissDue, open],
-  );
+    error,
+    refresh,
+    schedule,
+    cancel,
+    dismissDue,
+    open,
+  };
 }

@@ -11,7 +11,6 @@ export type QuoteRequest = {
   id: number;
   text: string;
   mode?: AddToChatMode;
-  origin?: string;
 };
 
 export function requestAddToChat(text: string, mode: AddToChatMode = "quote") {
@@ -23,6 +22,16 @@ export function requestAddToChat(text: string, mode: AddToChatMode = "quote") {
       detail: { text: value, mode },
     }),
   );
+}
+
+/** Initial composer text for an add-to-chat request that opens a new session. */
+export function composerSeedForAddToChat(
+  text: string,
+  mode: AddToChatMode = "quote",
+): string {
+  return mode === "plain"
+    ? appendComposerInsert("", text)
+    : appendSelectionQuote("", text);
 }
 
 export type QuoteConsumption = {
@@ -40,29 +49,19 @@ export function isMarkdownBlockquotePosition(
   return /^ {0,3}>/.test(text.slice(lineStart, index));
 }
 
-export function appendSelectionQuote(draft: string, text: string, origin?: string): string {
-  const normalized = text.replace(/\r\n?/g, "\n").trim();
-  const selected =
-    normalized.slice(0, 32_000) +
-    (normalized.length > 32_000
-      ? "\n[Selected context truncated at 32,000 characters]"
-      : "");
+export function appendSelectionQuote(draft: string, text: string): string {
+  const selected = text.replace(/\r\n?/g, "\n").trim();
   if (!selected) return draft;
 
   const quote = selected
     .split("\n")
     .map((line) => (line ? `> ${line}` : ">"))
     .join("\n");
-  return joinComposerInsert(draft, origin ? `${quote}\n\nSource: ${origin.slice(0, 2000).replace(/[\r\n]+/g, " ")}` : quote);
+  return joinComposerInsert(draft, quote);
 }
 
 export function appendComposerInsert(draft: string, text: string): string {
-  const normalized = text.replace(/\r\n?/g, "\n").trim();
-  const selected =
-    normalized.slice(0, 32_000) +
-    (normalized.length > 32_000
-      ? "\n[Selected context truncated at 32,000 characters]"
-      : "");
+  const selected = text.replace(/\r\n?/g, "\n").trim();
   if (!selected) return draft;
   return joinComposerInsert(draft, selected);
 }
@@ -79,7 +78,7 @@ export function consumeQuoteRequest(
   const next =
     request.mode === "plain"
       ? appendComposerInsert(draft, request.text)
-      : appendSelectionQuote(draft, request.text, request.origin);
+      : appendSelectionQuote(draft, request.text);
   return {
     draft: next,
     consumedId: request.id,

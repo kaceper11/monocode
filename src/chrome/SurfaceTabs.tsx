@@ -1,13 +1,14 @@
+import { Globe } from "./icons";
+import { browserTabLabel } from "../lib/browser";
 import { openPath } from "@tauri-apps/plugin-opener";
-import { GitCompare, Globe, GripVertical, Terminal, X } from "./icons";
+import { GitCompare, GripVertical, Terminal, X } from "./icons";
 import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { useLayoutEffect, useRef, useState } from "react";
-import { browserTabLabel } from "../lib/browser";
 import { copyText } from "../lib/clipboard";
 import { basename, revealPath } from "../lib/fs";
 import {
-  isBrowserTab,
   isAgentTab,
+  isBrowserTab,
   isChangesTab,
   isCommitTab,
   isFilesystemTab,
@@ -100,10 +101,20 @@ export function surfaceTabMenuItems(
 export function surfaceTabPresentation(
   file: FilePaneTab,
 ): SurfaceTabPresentation {
-  if (file.delivery) {
-    const title = file.delivery.kind === "pr" ? "Pull requests" : "CI";
-    return { name: title, label: title, iconName: "CHANGES", tooltip: `${title} · ${file.delivery.branch || "detached"} · ${file.cwd}` };
+  if (isBrowserTab(file)) {
+    const name = file.browser.url
+      ? browserTabLabel(file.browser.url, file.browser.title)
+      : "Browser";
+    return {
+      name,
+      label: name,
+      iconName: "browser",
+      tooltip: file.browser.url
+        ? `${file.browser.url} — ${file.cwd}`
+        : `Browser — ${file.cwd}`,
+    };
   }
+
   if (isReleaseNotesTab(file)) {
     const title = releaseNotesTitle(file.releaseNotes.version);
     return {
@@ -129,20 +140,6 @@ export function surfaceTabPresentation(
       label: "Session Changes",
       iconName: "CHANGES",
       tooltip: "Changes captured for this session only",
-    };
-  }
-
-  if (isBrowserTab(file)) {
-    const name = file.browser.url
-      ? browserTabLabel(file.browser.url, file.browser.title)
-      : "Browser";
-    return {
-      name,
-      label: name,
-      iconName: "browser",
-      tooltip: file.browser.url
-        ? `${file.browser.url} — ${file.cwd}`
-        : `Browser — ${file.cwd}`,
     };
   }
 
@@ -211,7 +208,6 @@ export function SurfaceTabs({
   const [menu, setMenu] = useState<SurfaceTabMenu | null>(null);
   const fileIds = files.map((file) => file.id);
   const sortable = useAnimatedReorder(fileIds, onReorder);
-  const canDrag = files.length > 1;
   const menuFile = menu
     ? files.find((file) => file.id === menu.fileId)
     : undefined;
@@ -295,7 +291,6 @@ export function SurfaceTabs({
         const commit = isCommitTab(file);
         const review = isReviewTab(file) && !changes;
         const terminal = isTerminalTab(file);
-        const browser = isBrowserTab(file);
         const agent = isAgentTab(file) ? file.agent : null;
         const { label, iconName, tooltip } = surfaceTabPresentation(file);
         return (
@@ -305,9 +300,7 @@ export function SurfaceTabs({
               sortable.setItemRef(file.id, el);
               if (el && file.id === activeFileId) activeTabRef.current = el;
             }}
-            className={`reorder-item tab-motion group relative flex h-full w-56 min-w-28 shrink touch-none items-center ${
-              canDrag ? "cursor-grab active:cursor-grabbing" : ""
-            }`}
+            className="reorder-item tab-motion group relative flex h-full w-56 min-w-28 shrink touch-none items-center"
             onMouseDownCapture={(event) => {
               if (event.button === 1) event.preventDefault();
             }}
@@ -347,9 +340,7 @@ export function SurfaceTabs({
                 if (sortable.consumeClick()) return;
                 onSelectFile(file.id);
               }}
-              className={`relative flex h-7.5 min-w-0 flex-1 items-center gap-1.5 self-center rounded-md px-2 pr-7 text-left text-[13px] ${
-                canDrag ? "cursor-grab active:cursor-grabbing" : "cursor-default"
-              } ${
+              className={`relative flex h-7.5 min-w-0 flex-1 cursor-default items-center gap-1.5 self-center rounded-md px-2 pr-7 text-left text-[13px] ${
                 active
                   ? "bg-selection text-content"
                   : "text-content/50 hover:bg-content/5 hover:text-content"
@@ -357,14 +348,14 @@ export function SurfaceTabs({
             >
               {terminal ? (
                 <Terminal className="size-3.5 shrink-0" strokeWidth={1.75} />
-              ) : browser ? (
+              ) : isBrowserTab(file) ? (
                 <Globe className="size-3.5 shrink-0" strokeWidth={1.75} />
               ) : agent ? (
                 <HarnessIcon
                   harness={agent.harness}
                   className="size-3.5 shrink-0"
                 />
-              ) : changes || commit || file.delivery ? (
+              ) : changes || commit ? (
                 <GitCompare className="size-3.5 shrink-0" strokeWidth={1.75} />
               ) : (
                 <FileTypeIcon name={iconName} isDir={false} size={14} />

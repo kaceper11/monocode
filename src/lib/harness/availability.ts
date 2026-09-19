@@ -9,6 +9,7 @@ import {
   resolveDevinBinary,
   resolveFxBinary,
   resolveGrokBinary,
+  resolveHermesBinary,
   resolveMuseBinary,
   resolveOmpBinary,
   resolveOpenCodeBinary,
@@ -37,6 +38,11 @@ const CLI: Record<HarnessId, { name: string; install?: string }> = {
   pi: { name: "Pi CLI", install: "npm i -g @earendil-works/pi-coding-agent" },
   omp: { name: "omp CLI", install: "curl -fsSL https://omp.sh/install | sh" },
   fx: { name: "fx CLI", install: "curl -fsSL https://fx.sh/setup.sh | bash" },
+  hermes: {
+    name: "Hermes Agent CLI",
+    install:
+      "Install from hermes-agent.nousresearch.com, then run hermes model",
+  },
   devin: { name: "Devin CLI" },
   copilot: {
     name: "GitHub Copilot CLI",
@@ -54,6 +60,7 @@ const emptyAvailability: HarnessAvailability = {
   pi: false,
   omp: false,
   fx: false,
+  hermes: false,
   devin: false,
   copilot: false,
   muse: false,
@@ -161,7 +168,7 @@ export function probeHarnessAvailability(options?: {
   let probe = probes.get(key);
   if (!probe) {
     // One native host plus four WSL distributions; discard only cached probes.
-    if (probes.size >= 5) {
+    if (key !== "native" && probes.size - Number(probes.has("native")) >= 4) {
       const oldest = [...probes]
         .filter(([host, value]) => host !== "native" && !value.inflight)
         .sort((a, b) => a[1].probedAt - b[1].probedAt)[0];
@@ -231,6 +238,7 @@ export function probeHarnessAvailability(options?: {
     pi: resolvePiBinary,
     omp: resolveOmpBinary,
     fx: resolveFxBinary,
+    hermes: resolveHermesBinary,
     grok: resolveGrokBinary,
     devin: resolveDevinBinary,
     copilot: resolveCopilotBinary,
@@ -243,8 +251,7 @@ export function probeHarnessAvailability(options?: {
         if (options?.cwd) await resolvers[id](options.cwd);
         else await resolvers[id]();
         return [id, true] as const;
-      } catch (error) {
-        current.errors[id] = String(error);
+      } catch {
         return [id, false] as const;
       }
     }),

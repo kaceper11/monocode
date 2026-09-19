@@ -18,7 +18,7 @@ describe("distribution boundary", () => {
       `const DEV_BUNDLE_ID: &str = "${config.identifier}"`,
     );
     expect(macos).toContain(`<string>${config.identifier}</string>`);
-    expect(macos).toContain(`.join("${config.productName}.app")`);
+    expect(macos).toContain(`const DEV_BUNDLE_DEFAULT_NAME: &str = "${config.productName}"`);
     expect(macos).not.toContain("com.monocode.desktop");
   });
 

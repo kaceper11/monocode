@@ -1,10 +1,5 @@
-import { pathKey } from "../lib/paths";
 import { useCallback, useSyncExternalStore } from "react";
-import {
-  gitDiffStats,
-  subscribeGitChanged,
-  type GitDiffStats,
-} from "../lib/fs";
+import { gitDiffStats, subscribeGitChanged, type GitDiffStats } from "../lib/fs";
 
 type Entry = {
   cwd: string;
@@ -19,24 +14,8 @@ type Entry = {
 
 const entries = new Map<string, Entry>();
 
-/** Bumped on every publish so peek-based aggregates (task rail, chip dots)
- * can re-derive without subscribing to a stats entry per child. */
-let version = 0;
-const versionListeners = new Set<() => void>();
-
-export function subscribeDiffStatsVersion(listener: () => void) {
-  versionListeners.add(listener);
-  return () => {
-    versionListeners.delete(listener);
-  };
-}
-
-export function diffStatsVersion(): number {
-  return version;
-}
-
 function entryFor(cwd: string): Entry {
-  const existing = entries.get(pathKey(cwd));
+  const existing = entries.get(cwd);
   if (existing) return existing;
   const entry: Entry = {
     cwd,
@@ -48,7 +27,7 @@ function entryFor(cwd: string): Entry {
     unsubscribeGit: null,
     onResume: null,
   };
-  entries.set(pathKey(cwd), entry);
+  entries.set(cwd, entry);
   return entry;
 }
 
@@ -56,15 +35,12 @@ function publish(entry: Entry, stats: GitDiffStats | null) {
   if (
     entry.stats?.files === stats?.files &&
     entry.stats?.additions === stats?.additions &&
-    entry.stats?.deletions === stats?.deletions &&
-    entry.stats?.branch === stats?.branch
+    entry.stats?.deletions === stats?.deletions
   ) {
     return;
   }
   entry.stats = stats;
-  version += 1;
   for (const listener of entry.listeners) listener();
-  for (const listener of versionListeners) listener();
 }
 
 async function load(entry: Entry, force = false) {
@@ -82,7 +58,7 @@ async function load(entry: Entry, force = false) {
     if (epoch === entry.epoch) publish(entry, null);
   } finally {
     entry.inFlight = false;
-    if (entry.pending && entry.listeners.size) {
+    if (entry.pending) {
       entry.pending = false;
       void load(entry, true);
     }
@@ -97,13 +73,6 @@ export function applyProjectDiffStats(cwd: string, stats: GitDiffStats) {
   publish(entry, stats);
 }
 
-/** Last published stats without subscribing or fetching — for aggregates
- * (task rail rows) that must stay cheap and quiet. */
-export function peekProjectDiffStats(cwd: string): GitDiffStats | null {
-  if (!cwd || cwd === "~") return null;
-  return entries.get(pathKey(cwd))?.stats ?? null;
-}
-
 function start(entry: Entry) {
   if (entry.onResume) return;
   void load(entry, true);
@@ -112,7 +81,7 @@ function start(entry: Entry) {
   };
   window.addEventListener("focus", entry.onResume);
   document.addEventListener("visibilitychange", entry.onResume);
-  entry.unsubscribeGit = subscribeGitChanged(entry.onResume, entry.cwd);
+  entry.unsubscribeGit = subscribeGitChanged(entry.onResume);
 }
 
 function stop(entry: Entry) {
@@ -123,9 +92,6 @@ function stop(entry: Entry) {
   entry.unsubscribeGit?.();
   entry.onResume = null;
   entry.unsubscribeGit = null;
-  entry.pending = false;
-  entry.epoch += 1;
-  entries.delete(pathKey(entry.cwd));
 }
 
 export function useProjectDiffStats(

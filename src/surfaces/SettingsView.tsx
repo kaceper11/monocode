@@ -1,15 +1,21 @@
+import { KeepAwakeControl } from "../chrome/KeepAwakeControl";
 import { wslLocation } from "../lib/paths";
-import { Select } from "../chrome/Select";
-import { Toggle } from "../chrome/Toggle";
+import { JIRA_CHANGE_EVENT, jiraConnected, saveJiraConfig, type JiraStatus } from "../lib/jira";
+import { AZURE_CHANGE_EVENT, azureConnected, saveAzureConfig, type AzureStatus } from "../lib/azure";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { ask } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDownCircle,
   Check,
+  ChevronDown,
   ImagePlus,
   Loader,
+  Pencil,
+  Plus,
   RefreshCw,
   RotateCcw,
   Search,
+  Trash2,
   X,
 } from "../chrome/icons";
 import {
@@ -17,11 +23,12 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
-  useId,
   useSyncExternalStore,
+  type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
@@ -121,27 +128,22 @@ import {
 } from "../lib/uiScale";
 import {
   getHarnessAvailabilitySnapshot,
-  harnessAuthHint,
   harnessUnavailableHint,
   isHarnessAvailable,
   probeHarnessAvailability,
-  hasProbedHarnessAvailability,
   subscribeHarnessAvailability,
 } from "../lib/harness/availability";
 import { refreshHarnessCatalogs } from "../lib/harness/registry";
+import { loginHarness } from "../lib/harness/auth";
 import {
   defaultModelId,
   getModelSnapshot,
   isPickerProviderVisible,
   loadDefaultModels,
-  loadDefaultRuntimeMode,
   loadLastModelChoice,
   modelsFor,
-  modelCatalogStatus,
-  hasLiveCatalog,
   resolveModel,
   saveDefaultModel,
-  saveDefaultRuntimeMode,
   saveLastModelChoice,
   savePickerProviderVisible,
   subscribeModels,
@@ -158,12 +160,21 @@ import {
 import {
   HARNESSES,
   HARNESS_TITLE,
-  RUNTIME_MODE_LABEL,
-  RUNTIME_MODES,
   sessionDisplayTitle,
   type HarnessId,
-  type RuntimeMode,
 } from "../lib/session";
+import {
+  newProviderAccount,
+  providerAccounts,
+  PROVIDER_ACCOUNT_PROVIDERS,
+  removeProviderAccount,
+  renameProviderAccount,
+  saveProviderAccount,
+  subscribeProviderAccounts,
+  type ProviderAccount,
+  type ProviderAccountProvider,
+} from "../lib/providerAccounts";
+import { removeProviderAccountCredentials } from "../lib/providerAccountCredentials";
 import {
   loadSessionSidebarFilters,
   saveSessionSidebarFilters,
@@ -179,8 +190,6 @@ import {
   gitlabConnected,
   saveGitlabConfig,
 } from "../lib/gitlab";
-import { jiraConnected, saveJiraConfig, type JiraStatus } from "../lib/jira";
-import { azureConnected, saveAzureConfig, type AzureStatus } from "../lib/azure";
 import {
   disconnectLinear,
   LINEAR_CHANGE_EVENT,
@@ -193,43 +202,37 @@ import {
   type LinearTeam,
 } from "../lib/linear";
 import { loadTabGroupLabels, resolveTabGroupLabel } from "../lib/tabGroups";
-import type { OpenFileFn } from "../lib/search";
 import {
   filterKeybindings,
   KEYBINDINGS,
   loadClaudeHooks,
-  loadComposerEffortVisible,
+  loadCloseToTray,
   loadComposerRunner,
   loadDiffViewer,
   loadFollowUpBehavior,
   loadGridArcadeEnabled,
-  loadKeepAwakeEnabled,
   loadLiveAgentsEnabled,
+  loadModelControls,
   loadNotesEnabled,
   saveClaudeHooks,
-  saveComposerEffortVisible,
+  saveCloseToTray,
   saveComposerRunner,
   saveDiffViewer,
   saveFollowUpBehavior,
   saveGridArcadeEnabled,
-  saveKeepAwakeEnabled,
   saveLiveAgentsEnabled,
+  saveModelControls,
   saveNotesEnabled,
   searchSettings,
   settingsSectionDescription,
   settingsSectionLabel,
-  subscribeKeepAwakeEnabled,
   type DiffViewer,
   type FollowUpBehavior,
+  type ModelControls,
   type SettingsSearchResult,
   type SettingsSectionId,
 } from "../lib/settings";
-import {
-  getPowerStatus,
-  retryKeepAwake,
-  subscribePowerStatus,
-} from "../lib/keepAwake";
-import { loadSoundsEnabled, saveSoundsEnabled } from "../lib/sounds";
+import { loadSoundsEnabled, playCue, saveSoundsEnabled } from "../lib/sounds";
 import {
   cachedNotificationPermission,
   loadNotificationsEnabled,
@@ -246,9 +249,11 @@ import {
   type UpdaterSnapshot,
 } from "../lib/updater";
 
-import { ExtensionsPage } from "./ExtensionsPage";
-import { AutomationsPage } from "./AutomationsPage";
+import { SkillsPage } from "./SkillsPage";
 import { ProjectNotificationSettings } from "./ProjectNotificationSettings";
+import { WorktreesPage } from "./WorktreesPage";
+import { removeWorktree, type RemoveWorktree } from "../lib/worktrees";
+import type { Session } from "../lib/session";
 
 /**
  * The `data-setting-id` Settings should reveal when it opens: one of the ids in
@@ -272,6 +277,12 @@ type Props = {
   recents?: RecentProject[];
   cwd: string;
   sessions: SessionSummary[];
+  liveSessions?: Session[];
+  onRemoveWorktree?: RemoveWorktree;
+  onCheckWorktreeRemoval?: RemoveWorktree;
+  onDeleteWorktreeSessions?: (
+    sessionIds: readonly string[],
+  ) => Promise<boolean>;
   besideRail?: boolean;
   onClose: () => void;
   /** Lets search jump to a setting that lives on another page. */
@@ -282,8 +293,6 @@ type Props = {
   onRestoreProject?: (path: string) => void;
   onDeleteProject?: (path: string) => void;
   onOpenWhatsNew: (version: string) => void;
-  /** Opens instruction/config files in the editor when available. */
-  onOpenFile?: OpenFileFn;
 };
 
 export function SettingsView({
@@ -294,6 +303,10 @@ export function SettingsView({
   recents,
   cwd,
   sessions,
+  liveSessions,
+  onRemoveWorktree = removeWorktree,
+  onCheckWorktreeRemoval,
+  onDeleteWorktreeSessions,
   besideRail = false,
   onClose,
   onSelectSection,
@@ -303,7 +316,6 @@ export function SettingsView({
   onRestoreProject,
   onDeleteProject,
   onOpenWhatsNew,
-  onOpenFile,
 }: Props) {
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const [revealed, setRevealed] = useState<string | null>(anchor);
@@ -388,10 +400,9 @@ export function SettingsView({
       </div>
 
       {section === "skills" ? (
-        <ExtensionsPage
+        <SkillsPage
           key={cwd}
           cwd={cwd}
-          onOpenFile={onOpenFile}
           header={
             <PageHeader
               title={settingsSectionLabel(section)}
@@ -418,10 +429,17 @@ export function SettingsView({
               ) : null}
               {section === "chat" ? <ChatPage /> : null}
               {section === "keybindings" ? <KeybindingsPage /> : null}
-              {section === "providers" ? (
-                <ProvidersPage key={cwd} cwd={cwd} />
+              {section === "providers" ? <ProvidersPage cwd={cwd} /> : null}
+              {section === "worktrees" ? (
+                <WorktreesPage
+                  cwd={cwd}
+                  recents={recents}
+                  liveSessions={liveSessions}
+                  onRemove={onRemoveWorktree}
+                  onCheckRemove={onCheckWorktreeRemoval}
+                  onDeleteSessions={onDeleteWorktreeSessions}
+                />
               ) : null}
-              {section === "automations" ? <AutomationsPage /> : null}
               {section === "inbox" ? (
                 <InboxPage
                   cwd={cwd}
@@ -576,16 +594,6 @@ function GeneralPage({
 }: {
   onOpenWhatsNew: (version: string) => void;
 }) {
-  const keepAwakeEnabled = useSyncExternalStore(
-    subscribeKeepAwakeEnabled,
-    loadKeepAwakeEnabled,
-    () => false,
-  );
-  const powerStatus = useSyncExternalStore(
-    subscribePowerStatus,
-    getPowerStatus,
-    getPowerStatus,
-  );
   const [soundsEnabled, setSoundsEnabled] = useState(loadSoundsEnabled);
   const [notificationsEnabled, setNotificationsEnabled] = useState(
     loadNotificationsEnabled,
@@ -596,6 +604,7 @@ function GeneralPage({
   const [liveAgentsEnabled, setLiveAgentsEnabled] = useState(
     loadLiveAgentsEnabled,
   );
+  const [closeToTray, setCloseToTray] = useState(loadCloseToTray);
 
   // The user may flip the switch in System Settings and come back: re-read
   // the OS state whenever the window regains focus while the toggle is on.
@@ -631,8 +640,9 @@ function GeneralPage({
     setLiveAgentsEnabled(next);
   };
 
-  const onKeepAwakeEnabled = (next: boolean) => {
-    saveKeepAwakeEnabled(next);
+  const onCloseToTray = (next: boolean) => {
+    saveCloseToTray(next);
+    setCloseToTray(next);
   };
 
   return (
@@ -695,39 +705,23 @@ function GeneralPage({
             onChange={onLiveAgentsEnabled}
           />
         </Row>
-        <Row
-          id="keep-awake"
-          label="Keep computer awake while agents work"
-          description="Prevents idle sleep; may use more battery. Display and manual sleep are unaffected."
-        >
-          {keepAwakeEnabled && powerStatus.held ? (
-            <span className="text-[12px] text-content/45">
-              Active ·{" "}
-              {powerStatus.working === 1
-                ? "1 agent"
-                : `${powerStatus.working} agents`}{" "}
-              working
-            </span>
-          ) : null}
-          {keepAwakeEnabled && powerStatus.loaded && !powerStatus.supported ? (
-            <span className="text-[12px] text-content/45">
-              Not available on this platform
-            </span>
-          ) : null}
-          {keepAwakeEnabled && powerStatus.supported && powerStatus.error ? (
-            <span className="flex items-center gap-2 text-[12px] text-content/45">
-              {powerStatus.error}
-              <SecondaryButton onClick={() => void retryKeepAwake()}>
-                Retry
-              </SecondaryButton>
-            </span>
-          ) : null}
-          <Toggle
-            label="Keep computer awake while agents work"
-            on={keepAwakeEnabled}
-            onChange={onKeepAwakeEnabled}
-          />
+        <Row id="keep-awake" label="Keep computer awake while agents work"
+          description="Prevents idle sleep while agents execute; may use more battery. Waiting for input releases the hold. Display and manual sleep are unaffected.">
+          <KeepAwakeControl />
         </Row>
+        {IS_WIN && (
+          <Row
+            id="close-to-tray"
+            label="Close to tray"
+            description="Closing a window hides it to the system tray instead of quitting, so running agents keep going. Reopen from the tray icon, and quit for real from its menu. Turn this off to have close end the window."
+          >
+            <Toggle
+              label="Close to tray"
+              on={closeToTray}
+              onChange={onCloseToTray}
+            />
+          </Row>
+        )}
       </Group>
 
       <Group title="About">
@@ -744,16 +738,12 @@ function ChatPage() {
     useState(loadTranscriptAnchor);
   const [followUpBehavior, setFollowUpBehavior] =
     useState<FollowUpBehavior>(loadFollowUpBehavior);
-  const [composerEffortVisible, setComposerEffortVisible] = useState(
-    loadComposerEffortVisible,
-  );
+  const [modelControls, setModelControls] =
+    useState<ModelControls>(loadModelControls);
   const [diffViewer, setDiffViewer] = useState<DiffViewer>(loadDiffViewer);
   const [composerRunner, setComposerRunner] = useState(loadComposerRunner);
   const [gridArcadeEnabled, setGridArcadeEnabled] = useState(
     loadGridArcadeEnabled,
-  );
-  const [defaultRuntimeMode, setDefaultRuntimeMode] = useState<RuntimeMode>(
-    loadDefaultRuntimeMode,
   );
 
   useEffect(() => {
@@ -781,20 +771,14 @@ function ChatPage() {
     setFollowUpBehavior(next);
   };
 
-  const onComposerEffortVisible = (next: boolean) => {
-    saveComposerEffortVisible(next);
-    setComposerEffortVisible(next);
+  const onModelControls = (next: ModelControls) => {
+    saveModelControls(next);
+    setModelControls(next);
   };
 
   const onDiffViewer = (next: DiffViewer) => {
     saveDiffViewer(next);
     setDiffViewer(next);
-  };
-
-  const onDefaultRuntimeMode = (next: string) => {
-    const mode = next as RuntimeMode;
-    saveDefaultRuntimeMode(mode);
-    setDefaultRuntimeMode(mode);
   };
 
   const onComposerRunner = (next: boolean) => {
@@ -861,29 +845,18 @@ function ChatPage() {
           />
         </Row>
         <Row
-          id="new-conversation-access"
-          label="New conversation access"
-          description="The access mode every new conversation starts in. Change a running conversation from the access picker on its composer."
+          id="model-controls"
+          label="Model controls"
+          description="Show model options beside the picker instead of inside the model menu."
         >
-          <Select
-            label="New conversation access"
-            value={defaultRuntimeMode}
-            options={RUNTIME_MODES.map((mode) => ({
-              value: mode,
-              label: RUNTIME_MODE_LABEL[mode],
-            }))}
-            onChange={onDefaultRuntimeMode}
-          />
-        </Row>
-        <Row
-          id="effort-control"
-          label="Effort control"
-          description="Show the current effort as a separate control beside the model picker for quicker changes. When off, effort stays inside the model menu."
-        >
-          <Toggle
-            label="Show effort beside model picker"
-            on={composerEffortVisible}
-            onChange={onComposerEffortVisible}
+          <Segmented
+            label="Model controls"
+            value={modelControls}
+            options={[
+              { value: "menu", label: "Menu" },
+              { value: "beside", label: "Beside" },
+            ]}
+            onChange={onModelControls}
           />
         </Row>
       </Group>
@@ -948,19 +921,32 @@ function AzureSettings() {
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const operation = useRef(0);
   useEffect(() => {
-    let cancelled = false;
-    void azureConnected().then(next => {
-      if (!cancelled && next) { setStatus(next); setSite(next.site); setProject(next.project); }
-    }).catch(e => { if (!cancelled) setError(String(e)); });
-    return () => { cancelled = true; };
+    const refresh = (changed = false) => {
+      const current = ++operation.current;
+      if (changed) { setBusy(true); setStatus(previous => ({ ...previous, connected: false })); setToken(""); setEditing(false); }
+      void azureConnected().then(next => {
+        if (current === operation.current && next) { setStatus(next); setSite(next.site); setProject(next.project); setError(""); }
+      }).catch(e => { if (current === operation.current) setError(String(e)); })
+        .finally(() => { if (changed && current === operation.current) setBusy(false); });
+    };
+    const onChange = (event: Event) => { if (event instanceof CustomEvent && event.detail === "connection") refresh(true); };
+    window.addEventListener(AZURE_CHANGE_EVENT, onChange);
+    refresh();
+    return () => { operation.current++; window.removeEventListener(AZURE_CHANGE_EVENT, onChange); };
   }, []);
   const save = async (disconnect = false) => {
     if (busy) return;
+    const current = ++operation.current;
     setBusy(true); setError("");
-    try { setStatus(await saveAzureConfig(site, project, disconnect ? "" : token)); setToken(""); setEditing(false); clearInboxCache(); }
-    catch (e) { setError(String(e)); }
-    finally { setBusy(false); }
+    try {
+      const next = await saveAzureConfig(site, project, disconnect ? "" : token);
+      clearInboxCache();
+      if (current !== operation.current) return;
+      setStatus(next); setToken(""); setEditing(false);
+    } catch (e) { if (current === operation.current) setError(String(e)); }
+    finally { if (current === operation.current) setBusy(false); }
   };
   return <>
     <Row stacked={!status.connected || editing} label={<span className="flex items-center gap-2"><InboxProviderMark provider="azure" className="size-4 shrink-0" />{status.connected ? `Connected account · ${status.capabilities.join(", ") || "Read access"}` : "Connect your account"}</span>} description="One connection for Azure Boards, Repos and Pipelines. Credentials stay on this device; tickets, PRs, Git and CI remain independently selected.">
@@ -978,7 +964,7 @@ function AzureSettings() {
           <input type={f.type} value={f.value} onChange={e => f.change(e.target.value)} placeholder={f.placeholder} aria-label={f.label} autoComplete="off" spellCheck={false} disabled={busy} required className="h-8 w-full min-w-0 rounded-md border border-content/10 bg-transparent px-2.5 text-[12px] text-content outline-none placeholder:text-content/35 focus:border-content/30 disabled:opacity-50" />
         </label>)}
         <div className="flex items-start justify-between gap-4 sm:col-span-2">
-          <p className="max-w-sm text-[12px] leading-relaxed text-content/45">Use an organization-scoped PAT: Build (Read) for Pipelines; Code (Read) for PRs; Work Items (Read) and Project and Team (Read) for Boards. Grant only needed capabilities. Azure DevOps Services only.</p>
+          <p className="max-w-sm text-[12px] leading-relaxed text-content/45">Use an organization-scoped PAT: Build (Read) for Pipelines; Code (Read) to view PRs, or Read &amp; Write to create and review them; Work Items (Read) and Project and Team (Read) for Boards. Grant only needed capabilities. Azure DevOps Services only.</p>
           {editing ? <SecondaryButton disabled={busy} onClick={() => { setEditing(false); setToken(""); }}>Cancel</SecondaryButton> : null}
           <SecondaryButton type="submit" disabled={busy || !site.trim() || !project.trim() || !token.trim()}>{busy ? "Connecting…" : "Connect"}</SecondaryButton>
         </div>
@@ -993,6 +979,7 @@ function JiraSettings() {
     connected: false,
     site: "",
     account: "",
+    accountId: "",
     capabilities: [],
   });
   const [site, setSite] = useState("");
@@ -1000,34 +987,47 @@ function JiraSettings() {
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const operation = useRef(0);
   useEffect(() => {
-    let cancelled = false;
-    void jiraConnected()
-      .then((next) => {
-        if (!cancelled && next) {
-          setStatus(next);
-          setSite(next.site);
-        }
-      })
-      .catch((error) => {
-        if (!cancelled) setError(String(error));
-      });
+    const refresh = (changed = false) => {
+      const current = ++operation.current;
+      if (changed) { setBusy(true); setStatus(previous => ({ ...previous, connected: false })); setToken(""); }
+      void jiraConnected()
+        .then((next) => {
+          if (current === operation.current && next) {
+            setStatus(next);
+            setSite(next.site);
+            setError("");
+          }
+        })
+        .catch((error) => {
+          if (current === operation.current) setError(String(error));
+        })
+        .finally(() => { if (changed && current === operation.current) setBusy(false); });
+    };
+    const onChange = (event: Event) => { if (event instanceof CustomEvent && event.detail === "connection") refresh(true); };
+    window.addEventListener(JIRA_CHANGE_EVENT, onChange);
+    refresh();
     return () => {
-      cancelled = true;
+      operation.current++;
+      window.removeEventListener(JIRA_CHANGE_EVENT, onChange);
     };
   }, []);
   const save = async (disconnect = false) => {
     if (busy) return;
+    const current = ++operation.current;
     setBusy(true);
     setError("");
     try {
-      setStatus(await saveJiraConfig(site, email, disconnect ? "" : token));
-      setToken("");
+      const next = await saveJiraConfig(site, email, disconnect ? "" : token);
       clearInboxCache();
+      if (current !== operation.current) return;
+      setStatus(next);
+      setToken("");
     } catch (error) {
-      setError(String(error));
+      if (current === operation.current) setError(String(error));
     } finally {
-      setBusy(false);
+      if (current === operation.current) setBusy(false);
     }
   };
   return (
@@ -1218,30 +1218,8 @@ function InboxPage({
       >
         <LinearSettings />
       </Group>
-      <Group
-        id="jira"
-        title={
-          <span className="flex items-center gap-2">
-            <InboxProviderMark provider="jira" className="size-4 shrink-0" />
-            Atlassian Cloud
-          </span>
-        }
-        description="Jira issues from your Atlassian site."
-      >
-        <JiraSettings />
-      </Group>
-      <Group
-        id="azure"
-        title={
-          <span className="flex items-center gap-2">
-            <InboxProviderMark provider="azure" className="size-4 shrink-0" />
-            Azure DevOps
-          </span>
-        }
-        description="Azure Boards, Repos and Pipelines."
-      >
-        <AzureSettings />
-      </Group>
+      <Group id="jira" title="Atlassian Cloud" description="Jira issues and Confluence pages."><JiraSettings /></Group>
+      <Group id="azure" title="Azure DevOps" description="Azure Boards, Repos and Pipelines."><AzureSettings /></Group>
     </>
   );
 }
@@ -2234,26 +2212,35 @@ function KeybindingsPage() {
 }
 
 function ProvidersPage({ cwd }: { cwd: string }) {
-  const [location, setLocation] = useState(cwd);
-  return <><div className="mb-3 flex items-center justify-between gap-2"><span className="text-xs text-content/60">Execution location</span><Select label="Provider execution location" value={location} options={[{ value: "", label: "This computer" }, ...(wslLocation(cwd) ? [{ value: cwd, label: prettyCwd(cwd) }] : [{ value: cwd, label: "Current project" }])]} onChange={setLocation} /></div><ProvidersForLocation key={location} cwd={location || undefined} /></>;
+  const [selection, setSelection] = useState({ project: cwd, location: cwd });
+  const location = wslLocation(cwd)
+    ? selection.project === cwd ? selection.location : cwd
+    : "";
+  return <>
+    {wslLocation(cwd) ? <Select
+      label="Provider execution location"
+      value={location}
+      options={[{ value: "", label: "This computer" }, { value: cwd, label: prettyCwd(cwd) }]}
+      onChange={(location) => setSelection({ project: cwd, location })}
+    /> : null}
+    <ProvidersForLocation key={location} cwd={location || undefined} />
+  </>;
 }
 
 function ProvidersForLocation({ cwd }: { cwd?: string }) {
   useSyncExternalStore(subscribeModels, getModelSnapshot, getModelSnapshot);
-  const availabilityVersion = useSyncExternalStore(
+  useSyncExternalStore(
     subscribeHarnessAvailability,
     getHarnessAvailabilitySnapshot,
     getHarnessAvailabilitySnapshot,
   );
   const [choice, setChoice] = useState(() => loadLastModelChoice(cwd));
-  const [defaultModels, setDefaultModels] = useState(() =>
-    loadDefaultModels(cwd),
-  );
+  const [defaultModels, setDefaultModels] = useState(() => loadDefaultModels(cwd));
   const [claudeHooks, setClaudeHooks] = useState(loadClaudeHooks);
 
   useEffect(() => {
-    if (!hasProbedHarnessAvailability(cwd)) void probeHarnessAvailability({ cwd });
-  }, [cwd, availabilityVersion]);
+    void probeHarnessAvailability({ cwd });
+  }, []);
 
   const onClaudeHooks = (next: boolean) => {
     saveClaudeHooks(next);
@@ -2277,25 +2264,12 @@ function ProvidersForLocation({ cwd }: { cwd?: string }) {
 
   return (
     <>
+      {!wslLocation(cwd ?? "") && <ProviderAccountsSettings />}
+
       <Group
         title="Agent CLIs"
-        description="Installation and model defaults apply to the execution location above. A provider is installed once its CLI is found there. Uninstalled CLIs stay listed but are left out of the model picker, as are installed ones with Show in picker off. The model beside a provider is what its new conversations start with; Use by default picks the provider itself."
+        description="A provider is listed as installed once its CLI is found on your PATH. Uninstalled CLIs stay listed but are left out of the model picker, as are installed ones with Show in picker off. The model beside a provider is what its new conversations start with; Use by default picks the provider itself."
       >
-        <button
-          type="button"
-          className="mb-2 self-start rounded px-2 py-1 text-xs text-content/70 hover:bg-content/10"
-          onClick={() => {
-            void probeHarnessAvailability({ cwd, force: true }).then(() =>
-              refreshHarnessCatalogs(
-                HARNESSES.filter((id) => isHarnessAvailable(id, cwd)),
-                cwd,
-                true,
-              ),
-            );
-          }}
-        >
-          Refresh providers and models
-        </button>
         {HARNESSES.map((harness) => (
           <ProviderRow
             cwd={cwd}
@@ -2331,6 +2305,300 @@ function ProvidersForLocation({ cwd }: { cwd?: string }) {
   );
 }
 
+type AccountEditor = {
+  provider: ProviderAccountProvider;
+  accountId?: string;
+  label: string;
+};
+
+function ProviderAccountsSettings() {
+  const [, setVersion] = useState(0);
+  const [editor, setEditor] = useState<AccountEditor | null>(null);
+  const [working, setWorking] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(
+    () => subscribeProviderAccounts(() => setVersion((value) => value + 1)),
+    [],
+  );
+
+  const startAdd = (provider: ProviderAccountProvider) => {
+    setError(null);
+    setEditor({ provider, label: "" });
+  };
+
+  const startRename = (account: ProviderAccount) => {
+    setError(null);
+    setEditor({
+      provider: account.provider,
+      accountId: account.id,
+      label: account.label,
+    });
+  };
+
+  const submitEditor = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!editor || !editor.label.trim() || working) return;
+    const key = editor.accountId
+      ? `rename:${editor.provider}:${editor.accountId}`
+      : `add:${editor.provider}`;
+    setWorking(key);
+    setError(null);
+    try {
+      if (editor.accountId) {
+        renameProviderAccount(editor.provider, editor.accountId, editor.label);
+      } else {
+        const account = newProviderAccount(editor.provider, editor.label);
+        await loginHarness(editor.provider, account.id);
+        saveProviderAccount(account);
+      }
+      setEditor(null);
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : "Could not save this account",
+      );
+    } finally {
+      setWorking(null);
+    }
+  };
+
+  const removeAccount = async (account: ProviderAccount) => {
+    if (account.isDefault || working) return;
+    const confirmed = await ask(
+      `Remove “${account.label}”? Its stored credentials will be deleted and any running turns for this account will stop. Existing conversations stay in history, but cannot continue until you switch accounts.`,
+      {
+        title: `Remove ${HARNESS_TITLE[account.provider]} account`,
+        kind: "warning",
+        okLabel: "Remove account",
+        cancelLabel: "Cancel",
+      },
+    );
+    if (!confirmed) return;
+    const key = `remove:${account.provider}:${account.id}`;
+    setWorking(key);
+    setError(null);
+    try {
+      await removeProviderAccountCredentials(account.provider, account.id);
+      removeProviderAccount(account.provider, account.id);
+      if (
+        editor?.provider === account.provider &&
+        editor.accountId === account.id
+      ) {
+        setEditor(null);
+      }
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : "Could not remove this account",
+      );
+    } finally {
+      setWorking(null);
+    }
+  };
+
+  return (
+    <Group
+      id="provider-accounts"
+      title="Accounts"
+      description="Create isolated sign-ins for providers that support account profiles. Account switching stays available from the usage control in the footer."
+    >
+      {PROVIDER_ACCOUNT_PROVIDERS.map((provider) => {
+        const accounts = providerAccounts(provider);
+        const adding = editor?.provider === provider && !editor.accountId;
+        return (
+          <div
+            key={provider}
+            className="border-b border-content/5 last:border-b-0"
+          >
+            <div className="flex items-center gap-4 px-4 py-3.5">
+              <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-content/[0.05] ring-1 ring-inset ring-content/[0.06]">
+                  <HarnessIcon harness={provider} className="size-4" />
+                </span>
+                <div className="min-w-0">
+                  <div className="text-[13px] font-medium text-content">
+                    {HARNESS_TITLE[provider]}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-content/40">
+                    {accounts.length}{" "}
+                    {accounts.length === 1 ? "account" : "accounts"}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={Boolean(working)}
+                onClick={() => startAdd(provider)}
+                className="flex shrink-0 items-center gap-1.5 rounded-md border border-content/10 px-2.5 py-1 text-[12px] text-content/70 transition-transform duration-150 hover:bg-content/10 hover:text-content active:scale-[0.97] disabled:cursor-default disabled:opacity-40"
+              >
+                <Plus className="size-3.5" strokeWidth={1.75} aria-hidden />
+                Add account
+              </button>
+            </div>
+            <div className="border-t border-content/5 bg-content/[0.015] pl-10">
+              {accounts.map((account) => {
+                const editing =
+                  editor?.provider === provider &&
+                  editor.accountId === account.id;
+                const removing = working === `remove:${provider}:${account.id}`;
+                return editing ? (
+                  <ProviderAccountEditor
+                    key={account.id}
+                    editor={editor}
+                    working={Boolean(working)}
+                    onLabel={(label) =>
+                      setEditor((current) =>
+                        current ? { ...current, label } : current,
+                      )
+                    }
+                    onCancel={() => setEditor(null)}
+                    onSubmit={submitEditor}
+                  />
+                ) : (
+                  <div
+                    key={account.id}
+                    className="flex h-12 items-center gap-3 border-b border-content/5 px-4 py-2 last:border-b-0"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-[12px] text-content/85">
+                        {account.label}
+                      </div>
+                      <div className="mt-0.5 text-[10px] text-content/35">
+                        {account.isDefault
+                          ? "Provider CLI profile"
+                          : "Isolated profile"}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1">
+                      {account.isDefault ? (
+                        <span className="mr-1 text-[10px] font-medium uppercase tracking-wide text-content/30">
+                          Default
+                        </span>
+                      ) : null}
+                      <button
+                        type="button"
+                        disabled={Boolean(working)}
+                        aria-label={`Rename ${account.label}`}
+                        title="Rename account"
+                        onClick={() => startRename(account)}
+                        className="grid size-7 place-items-center rounded-md text-content/40 transition-transform duration-150 hover:bg-content/10 hover:text-content active:scale-[0.96] disabled:opacity-35"
+                      >
+                        <Pencil className="size-3.5" strokeWidth={1.75} />
+                      </button>
+                      {!account.isDefault ? (
+                        <button
+                          type="button"
+                          disabled={Boolean(working)}
+                          aria-label={`Remove ${account.label}`}
+                          title="Remove account"
+                          onClick={() => void removeAccount(account)}
+                          className="grid size-7 place-items-center rounded-md text-content/35 transition-transform duration-150 hover:bg-red-400/10 hover:text-red-400 active:scale-[0.96] disabled:opacity-35"
+                        >
+                          {removing ? (
+                            <Loader className="size-3.5 animate-spin" />
+                          ) : (
+                            <Trash2 className="size-3.5" strokeWidth={1.75} />
+                          )}
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              })}
+              {adding && editor ? (
+                <ProviderAccountEditor
+                  editor={editor}
+                  working={Boolean(working)}
+                  onLabel={(label) =>
+                    setEditor((current) =>
+                      current ? { ...current, label } : current,
+                    )
+                  }
+                  onCancel={() => setEditor(null)}
+                  onSubmit={submitEditor}
+                />
+              ) : null}
+            </div>
+          </div>
+        );
+      })}
+      {error ? (
+        <p
+          className="border-t border-content/5 px-4 py-2.5 text-[11px] leading-4 text-red-400"
+          role="alert"
+        >
+          {error}
+        </p>
+      ) : null}
+    </Group>
+  );
+}
+
+function ProviderAccountEditor({
+  editor,
+  working,
+  onLabel,
+  onCancel,
+  onSubmit,
+}: {
+  editor: AccountEditor;
+  working: boolean;
+  onLabel: (label: string) => void;
+  onCancel: () => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const adding = !editor.accountId;
+  return (
+    <form
+      className="flex h-12 items-center border-b border-content/5 px-4 py-2 last:border-b-0"
+      onSubmit={onSubmit}
+    >
+      <div
+        data-provider-account-editor-field
+        className="flex items-center pr-1 h-8 min-w-0 flex-1 overflow-hidden rounded-md border border-content/10 bg-content/[0.04] focus-within:border-accent/45"
+      >
+        <label className="h-full min-w-0 flex-1">
+          <span className="sr-only">Account name</span>
+          <input
+            autoFocus
+            type="text"
+            maxLength={48}
+            value={editor.label}
+            disabled={working}
+            placeholder="Work or Personal"
+            aria-label={`${adding ? "New" : "Rename"} ${HARNESS_TITLE[editor.provider]} account`}
+            onChange={(event) => onLabel(event.target.value)}
+            className="h-full w-full bg-transparent px-2.5 text-[12px] text-content outline-none placeholder:text-content/25 disabled:opacity-50"
+          />
+        </label>
+        <button
+          type="button"
+          disabled={working}
+          onClick={onCancel}
+          className="flex h-6 shrink-0 items-center rounded-[4.5px] bg-content/[0.05] px-2.5 text-[11px] text-content/45 transition-transform duration-150 hover:bg-content/10 hover:text-content active:scale-[0.97] disabled:opacity-40"
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          disabled={working || !editor.label.trim()}
+          className="ml-1 flex h-6 shrink-0 items-center gap-1.5 rounded-[4.5px] bg-content px-2.5 text-[11px] font-medium text-background-base transition-transform duration-150 hover:bg-content/85 active:scale-[0.97] disabled:cursor-default disabled:opacity-40"
+        >
+          {working ? <Loader className="size-3 animate-spin" /> : null}
+          {adding
+            ? working
+              ? "Waiting for browser…"
+              : "Sign in and add"
+            : "Save"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
 function ProviderRow({
   cwd,
   harness,
@@ -2355,9 +2623,9 @@ function ProviderRow({
   );
 
   useEffect(() => {
-    if (!available || hasLiveCatalog(harness, cwd)) return;
+    if (!available || models.length > 0) return;
     void refreshHarnessCatalogs([harness], cwd);
-  }, [available, harness, cwd]);
+  }, [available, harness, models.length, cwd]);
 
   const onPickerVisible = (visible: boolean) => {
     savePickerProviderVisible(harness, visible);
@@ -2369,7 +2637,7 @@ function ProviderRow({
       label={
         <span className="flex items-center gap-2">
           <HarnessIcon harness={harness} className="size-4 shrink-0" />
-          <span title={modelCatalogStatus(harness, cwd)}>{HARNESS_TITLE[harness]}</span>
+          {HARNESS_TITLE[harness]}
           {isDefault ? (
             <span className="rounded-full bg-content/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-content/60">
               Default
@@ -2379,7 +2647,7 @@ function ProviderRow({
       }
       description={
         available
-          ? `${models.length} ${models.length === 1 ? "model" : "models"} available.${harnessAuthHint(harness, cwd) ? ` ${harnessAuthHint(harness, cwd)}` : ""}`
+          ? `${models.length} ${models.length === 1 ? "model" : "models"} available.`
           : harnessUnavailableHint(harness, cwd)
       }
     >
@@ -2875,3 +3143,192 @@ function NotificationsBlocked() {
   );
 }
 
+function Toggle({
+  label,
+  on,
+  onChange,
+  disabled = false,
+}: {
+  label: string;
+  on: boolean;
+  onChange: (on: boolean) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-label={label}
+      aria-checked={on}
+      disabled={disabled}
+      onClick={() => {
+        onChange(!on);
+        playCue("switch");
+      }}
+      className={`relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+        on ? "bg-accent" : "bg-content/20"
+      }`}
+    >
+      <span
+        className={`absolute top-0.5 size-4 rounded-full bg-white transition-[left] ${
+          on ? "left-4.5" : "left-0.5"
+        }`}
+      />
+    </button>
+  );
+}
+
+/** Theme-aware dropdown for a Settings row: a trigger button opening a Popover listbox. Used instead of a native select, whose option popup is OS-rendered and unreadable in dark mode on Windows/Linux. */
+function Select({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: { value: string; label: string }[];
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(() =>
+    Math.max(
+      0,
+      options.findIndex((option) => option.value === value),
+    ),
+  );
+  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const activeOption = useRef<HTMLButtonElement>(null);
+  const listId = useId();
+  const selected = options.find((option) => option.value === value);
+  const activeId =
+    options[active] != null ? `${listId}-opt-${active}` : undefined;
+
+  useEffect(() => {
+    if (!open) return;
+    setActive(
+      Math.max(
+        0,
+        options.findIndex((option) => option.value === value),
+      ),
+    );
+  }, [open, value, options]);
+
+  useEffect(() => {
+    if (!open) return;
+    activeOption.current?.scrollIntoView({ block: "nearest" });
+  }, [active, open]);
+
+  const pick = (next: string) => {
+    onChange(next);
+    setOpen(false);
+    trigger.current?.focus();
+  };
+
+  const onMenuKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActive((i) => Math.min(options.length - 1, i + 1));
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActive((i) => Math.max(0, i - 1));
+      return;
+    }
+    if (e.key === "Home") {
+      e.preventDefault();
+      setActive(0);
+      return;
+    }
+    if (e.key === "End") {
+      e.preventDefault();
+      setActive(options.length - 1);
+      return;
+    }
+    if (e.key === "Tab") {
+      const option = options[active];
+      if (option && option.value !== value) onChange(option.value);
+      setOpen(false);
+      trigger.current?.focus();
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const option = options[active];
+      if (option) pick(option.value);
+    }
+  };
+
+  return (
+    <div ref={root} className="relative max-w-52">
+      <button
+        type="button"
+        ref={trigger}
+        aria-label={`${label}: ${selected?.label ?? value}`}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        onClick={() => setOpen((prev) => !prev)}
+        className="flex w-full items-center justify-between gap-2 rounded-md border border-content/10 bg-content/5 px-2 py-1 text-left text-[12px] text-content outline-none hover:border-content/20"
+      >
+        <span className="min-w-0 flex-1 truncate">
+          {selected ? selected.label : value}
+        </span>
+        <ChevronDown
+          className={`size-3.5 shrink-0 text-content/50 transition-transform ${open ? "rotate-180" : ""}`}
+          strokeWidth={1.75}
+        />
+      </button>
+      {open ? (
+        <Popover
+          anchor={root}
+          side="bottom"
+          align="end"
+          width={280}
+          maxHeight={320}
+          autoFocus
+          onDismiss={(reason) => {
+            setOpen(false);
+            if (reason === "escape") trigger.current?.focus();
+          }}
+          role="listbox"
+          aria-label={label}
+          aria-activedescendant={activeId}
+          tabIndex={-1}
+          onKeyDown={onMenuKey}
+          className="overflow-y-auto overscroll-contain p-1"
+        >
+          {options.map((option, index) => {
+            const isSelected = option.value === value;
+            const highlighted = index === active;
+            return (
+              <button
+                key={option.value}
+                ref={highlighted ? activeOption : undefined}
+                type="button"
+                id={`${listId}-opt-${index}`}
+                role="option"
+                tabIndex={-1}
+                aria-selected={isSelected}
+                onMouseDown={(e) => e.preventDefault()}
+                onMouseEnter={() => setActive(index)}
+                onClick={() => pick(option.value)}
+                className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] ${
+                  highlighted || isSelected
+                    ? "bg-selection text-content"
+                    : "text-content hover:bg-content/5"
+                }`}
+              >
+                <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                {isSelected ? (
+                  <Check className="size-3.5 shrink-0" strokeWidth={2.25} />
+                ) : null}
+              </button>
+            );
+          })}
+        </Popover>
+      ) : null}
+    </div>
+  );
+}

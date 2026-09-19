@@ -492,6 +492,12 @@ export function resolveFxBinary(cwd?: string): Promise<{ path: string }> {
     : invoke("harness_resolve_fx");
 }
 
+export function resolveHermesBinary(cwd?: string): Promise<{ path: string }> {
+  return cwd && wslLocation(cwd)
+    ? invoke("wsl_resolve_harness", { cwd, provider: "hermes" })
+    : invoke("harness_resolve_hermes");
+}
+
 export function resolveGrokBinary(cwd?: string): Promise<{ path: string }> {
   return cwd && wslLocation(cwd)
     ? invoke("wsl_resolve_harness", { cwd, provider: "grok" })

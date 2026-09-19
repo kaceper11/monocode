@@ -56,7 +56,7 @@ it("uses the themed listbox and returns keyboard focus without closing the dialo
     expect(document.activeElement).toBe(trigger);
     await act(async () => trigger.click());
     await act(async () =>
-      window.dispatchEvent(
+      document.activeElement!.dispatchEvent(
         new KeyboardEvent("keydown", {
           key: "Escape",
           bubbles: true,

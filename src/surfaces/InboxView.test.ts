@@ -1,8 +1,12 @@
+import { invoke } from "@tauri-apps/api/core";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
-import type { InboxItem } from "../lib/githubTasks";
-import type { InboxMyWork } from "../lib/inboxMyWork";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  clearInboxCache,
+  githubWorkItemDetails,
+  type InboxItem,
+} from "../lib/githubTasks";
 import type { LinkedWorkItem } from "../lib/session";
 import type { SessionSummary } from "../lib/sessionStore";
 import {
@@ -10,6 +14,8 @@ import {
   inboxShowsFullFileDiff,
   LinkedWorkItemPanel,
 } from "./InboxView";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 function item(overrides: Partial<InboxItem> = {}): InboxItem {
   return {
@@ -29,14 +35,19 @@ function item(overrides: Partial<InboxItem> = {}): InboxItem {
   };
 }
 
-function renderDetail(inboxItem: InboxItem, myWork?: InboxMyWork) {
+function renderDetail(
+  inboxItem: InboxItem,
+  relatedSessions: SessionSummary[] = [],
+) {
   return renderToStaticMarkup(
     createElement(InboxDetail, {
       item: inboxItem,
       cwd: "/tmp/web",
+      projects: [],
       revision: 0,
-      myWork,
+      relatedSessions,
       onDiscuss: () => {},
+      onStart: () => {},
     }),
   );
 }
@@ -233,9 +244,7 @@ describe("InboxDetail layout", () => {
     expect(inboxShowsFullFileDiff(item({ kind: "issue" }))).toBe(false);
   });
 
-  it("keeps a Linear ticket's send action clean of the project picker", () => {
-    // Project selection moved into the new-task sheet — the detail header
-    // stays free of a picker even for provider tickets without a local path.
+  it("keeps the Linear project picker beside the pinned send action", () => {
     const markup = renderDetail(
       item({
         provider: "linear",
@@ -250,11 +259,11 @@ describe("InboxDetail layout", () => {
     const header = markup.slice(headerIndex, scrollIndex);
 
     expect(header).toContain("Send to agent");
-    expect(header).not.toContain("Choose project");
+    expect(header).toContain("Choose project");
     expect(header).not.toContain("overflow-y-auto");
   });
 
-  it("shows why a remote GitLab item needs attention without a picker", () => {
+  it("shows why a remote GitLab item needs attention and asks for a workspace", () => {
     const markup = renderDetail(
       item({
         provider: "gitlab",
@@ -269,50 +278,62 @@ describe("InboxDetail layout", () => {
     const header = markup.slice(headerIndex, scrollIndex);
 
     expect(header).toContain("Mentioned you");
-    expect(header).toContain("Send to agent");
-    expect(header).not.toContain("Choose project");
+    expect(header).toContain("Choose project");
     expect(header).toContain("Open on GitLab");
   });
 
-  it("keeps attached tasks and conversations in the pinned header", () => {
-    const markup = renderDetail(item(), {
-      tasks: [
-        {
-          id: "task-1",
-          name: "Review work",
-          sessions: 1,
-          status: [],
-          delivery: {
-            prs: 0,
-            prNeedsAttention: false,
-            ci: 0,
-            ciRunning: false,
-            ciFailing: false,
-          },
-        },
-      ],
-      sessions: [
-        {
-          sessionId: "session-1",
-          cwd: "/tmp/web",
-          harness: "codex",
-          state: "idle",
-          title: "Review MonoCode Pull Request",
-        },
-      ],
-      prs: [],
-      ci: [],
-      attention: [],
-      hasWork: true,
-    });
+  it("keeps related threads in the pinned header", () => {
+    const markup = renderDetail(item(), [
+      {
+        id: "session-1",
+        cwd: "/tmp/web",
+        harness: "codex",
+        model: "gpt-5",
+        runtimeMode: "supervised",
+        title: "Review MonoCode Pull Request",
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ]);
     const headerIndex = markup.indexOf("data-inbox-detail-header");
     const scrollIndex = markup.indexOf("data-inbox-detail-scroll");
     const header = markup.slice(headerIndex, scrollIndex);
     const body = markup.slice(scrollIndex);
 
-    expect(header).toContain("Work on this item");
-    expect(header).toContain("Review work");
+    expect(header).toContain("Related thread");
     expect(header).toContain("Review MonoCode Pull Request");
     expect(body).not.toContain("Review MonoCode Pull Request");
+  });
+});
+
+describe("InboxDetail PR branch row", () => {
+  beforeEach(() => {
+    vi.mocked(invoke).mockReset();
+    clearInboxCache();
+  });
+
+  it("offers a copy action for the head branch name", async () => {
+    vi.mocked(invoke).mockResolvedValue({
+      body: "",
+      author: "octocat",
+      baseRefName: "main",
+      headRefName: "feature/inbox-branch-copy",
+    } as never);
+    await githubWorkItemDetails("/tmp/web", "acme/web", "pr", 157);
+
+    const markup = renderDetail(
+      item({ kind: "pr", repo: "acme/web", number: 157 }),
+    );
+
+    expect(markup).toContain("main ← feature/inbox-branch-copy");
+    expect(markup).toContain("Copy branch name");
+  });
+
+  it("has nothing to copy when the PR carries no branch info", () => {
+    const markup = renderDetail(
+      item({ kind: "pr", repo: "acme/web", number: 999 }),
+    );
+
+    expect(markup).not.toContain("Copy branch name");
   });
 });

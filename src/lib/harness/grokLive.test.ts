@@ -23,7 +23,6 @@ vi.mock("./child", () => ({
 }));
 
 const {
-  cancelGrokTurn,
   compactGrokContext,
   sendGrokTurn,
   respondGrokApproval,
@@ -134,10 +133,10 @@ describe("grok live turn sequence", () => {
     await stopGrokSession("t1");
   });
 
-  it("surfaces a supervised permission request instead of auto-approving", async () => {
+  it.each(["allow-once", "opaque-allow"])("surfaces a supervised permission request instead of auto-approving (%s)", async (allowId) => {
     const events: HarnessEvent[] = [];
     const turn = sendGrokTurn({
-      sessionId: "t2",
+      sessionId: `t2-${allowId}`,
       cwd: "/repo",
       model: "grok:grok-4.6",
       runtimeMode: "supervised",
@@ -165,7 +164,7 @@ describe("grok live turn sequence", () => {
             rawInput: { variant: "Bash", command: "git status" },
           },
           options: [
-            { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+            { optionId: allowId, name: "Allow once", kind: "allow_once" },
             { optionId: "reject-once", name: "Reject", kind: "reject_once" },
           ],
         },
@@ -175,171 +174,16 @@ describe("grok live turn sequence", () => {
       () => events.some((e) => e.type === "approval.requested"),
       "approval.requested",
     );
-    respondGrokApproval("t2", 1, "allow");
+    respondGrokApproval(`t2-${allowId}`, events.find((e) => e.type === "approval.requested")!.requestId, "allow");
     await waitFor(
       () => parse().some((m) => m.id === 1 && m.result),
       "permission response",
     );
     const response = parse().find((m) => m.id === 1 && m.result);
-    expect(response.result.outcome.optionId).toBe("allow-once");
+    expect(response.result.outcome.optionId).toBe(allowId);
     reply(promptId, { stopReason: "end_turn" });
     await turn;
-    await stopGrokSession("t2");
-  });
-
-  it("auto-answers MCP asks under full-access like the CLI's yolo mode", async () => {
-    const events: HarnessEvent[] = [];
-    const turn = sendGrokTurn({
-      sessionId: "tmcp",
-      cwd: "/repo",
-      model: "grok:grok-4.6",
-      runtimeMode: "full-access",
-      text: "use the github tool then run git",
-      attachments: [],
-      onEvent: (e) => events.push(e),
-    });
-    await handshake();
-    await waitFor(
-      () => parse().some((m) => m.method === "session/prompt"),
-      "prompt",
-    );
-    const promptId = parse().find((m) => m.method === "session/prompt")!.id;
-
-    onLine!(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: 41,
-        method: "session/request_permission",
-        params: {
-          sessionId: "S1",
-          toolCall: {
-            toolCallId: "call_mcp",
-            title: "mcp__github__create_issue",
-            kind: "other",
-          },
-          options: [
-            { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
-            { optionId: "reject-once", name: "Reject", kind: "reject_once" },
-          ],
-        },
-      }),
-    );
-    // yoloMode suppresses asks server-side; a straggler still auto-allows.
-    await waitFor(
-      () => parse().some((m) => m.id === 41 && m.result),
-      "MCP auto response",
-    );
-    expect(parse().find((m) => m.id === 41)?.result?.outcome?.optionId).toBe(
-      "allow-once",
-    );
-    expect(events.some((e) => e.type === "approval.requested")).toBe(false);
-
-    reply(promptId, { stopReason: "end_turn" });
-    await turn;
-    await stopGrokSession("tmcp");
-  });
-
-  it("answers a permission request that arrives after cancel", async () => {
-    const events: HarnessEvent[] = [];
-    const turn = sendGrokTurn({
-      sessionId: "tcancel",
-      cwd: "/repo",
-      model: "grok:grok-4.6",
-      runtimeMode: "full-access",
-      text: "use the github tool",
-      attachments: [],
-      onEvent: (e) => events.push(e),
-    });
-    await handshake();
-    await waitFor(
-      () => parse().some((m) => m.method === "session/prompt"),
-      "prompt",
-    );
-
-    await cancelGrokTurn("tcancel");
-    onLine!(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: 51,
-        method: "session/request_permission",
-        params: {
-          sessionId: "S1",
-          toolCall: {
-            toolCallId: "call_mcp",
-            title: "mcp__github__create_issue",
-            kind: "mcp",
-          },
-          options: [
-            { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
-          ],
-        },
-      }),
-    );
-    await waitFor(
-      () => parse().some((m) => m.id === 51 && m.result),
-      "post-cancel response",
-    );
-    const response = parse().find((m) => m.id === 51 && m.result)!;
-    expect(response.result.outcome.outcome).toBe("cancelled");
-    expect(events.some((e) => e.type === "approval.requested")).toBe(false);
-    await turn.catch(() => undefined);
-    await stopGrokSession("tcancel");
-  });
-
-  it("settles a parked MCP approval when the child exits", async () => {
-    const events: HarnessEvent[] = [];
-    const turn = sendGrokTurn({
-      sessionId: "texit",
-      cwd: "/repo",
-      model: "grok:grok-4.6",
-      runtimeMode: "supervised",
-      text: "use the github tool",
-      attachments: [],
-      onEvent: (e) => events.push(e),
-    });
-    await handshake();
-    await waitFor(
-      () => parse().some((m) => m.method === "session/prompt"),
-      "prompt",
-    );
-
-    onLine!(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: 61,
-        method: "session/request_permission",
-        params: {
-          sessionId: "S1",
-          toolCall: {
-            toolCallId: "call_mcp",
-            title: "mcp__github__create_issue",
-            kind: "mcp",
-          },
-          options: [
-            { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
-            { optionId: "reject-once", name: "Reject", kind: "reject_once" },
-          ],
-        },
-      }),
-    );
-    await waitFor(
-      () => events.some((e) => e.type === "approval.requested"),
-      "approval.requested",
-    );
-
-    // Attach the catch before the exit so the turn's rejection is handled.
-    const settled = turn.catch(() => undefined);
-    onExit!(1);
-    await waitFor(
-      () => events.some((e) => e.type === "approval.resolved"),
-      "approval.resolved",
-    );
-    const resolved = events.find((e) => e.type === "approval.resolved")!;
-    expect(resolved.decision).toBe("deny");
-    expect(events.some((e) => e.type === "session.ended")).toBe(true);
-    // The UI settles the ask; a closed transport must not write to a replacement child.
-    expect(parse().find((m) => m.id === 61 && m.result)).toBeUndefined();
-    await settled;
+    await stopGrokSession(`t2-${allowId}`);
   });
 
   it("routes a late exit to the current turn's listener", async () => {

@@ -1,6 +1,6 @@
+import { bindSavedCommandRun } from "../lib/savedCommandRun";
+import { registerBrowserTerminalLinks } from "../lib/browserTerminalLinks";
 import { Terminal } from "@xterm/xterm";
-import type { ILink } from "@xterm/xterm";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { useEffect, useRef } from "react";
 import {
   getPtyStatus,
@@ -17,8 +17,6 @@ import {
   type TerminalMetaPatch,
 } from "../lib/terminalTab";
 import { isLightScheme, SCHEME_CHANGE_EVENT } from "../lib/appearance";
-import { isLocalhostUrl, requestLinkChoice } from "../lib/browser";
-import { homeDir } from "../lib/fs";
 import {
   applyTerminalChrome,
   fitTerminal,
@@ -26,7 +24,6 @@ import {
   type TerminalFitMode,
 } from "../lib/terminalLayout";
 import { IS_MAC } from "../lib/platform";
-import type { TerminalCommand } from "../lib/layout";
 import "@xterm/xterm/css/xterm.css";
 
 type Props = {
@@ -34,9 +31,6 @@ type Props = {
   cwd: string;
   active: boolean;
   onMetaChange?: (patch: TerminalMetaPatch) => void;
-  /** Saved command bound to this terminal — written to the PTY once per
-   * `runId`; `launched` makes a remount or restart side-effect-free. */
-  command?: TerminalCommand;
 };
 
 function cssColor(expr: string, fallback: string): string {
@@ -47,11 +41,6 @@ function cssColor(expr: string, fallback: string): string {
   probe.remove();
   return color || fallback;
 }
-
-/** Printed URLs — brackets/quotes can't be part of a link, and trailing
- * punctuation is almost always prose, not the target. */
-const LINK_PATTERN = /https?:\/\/[^\s<>"'()[\]{}]+/g;
-const LINK_TRAILING = /[.,;:!?'")\]}>]+$/;
 
 function cssHexColor(expr: string, fallback: string): string {
   const color = cssColor(expr, fallback);
@@ -122,10 +111,6 @@ function terminalTheme(light: boolean) {
   };
 }
 
-/** The newest spawn owns the id: a StrictMode/remount ghost cleanup must not
- * kill the replacement PTY once its own spawn promise finally settles. */
-const latestSpawn = new Map<string, Promise<void>>();
-
 function monoFont(): string {
   const fromCss = getComputedStyle(document.documentElement)
     .getPropertyValue("--font-mono")
@@ -151,27 +136,16 @@ function oscColors() {
   };
 }
 
-export function TerminalView({ id, cwd, active, onMetaChange, command }: Props) {
+export function TerminalView({ id, cwd, active, onMetaChange }: Props) {
   const outerRef = useRef<HTMLDivElement>(null);
+  const browserCwdRef = useRef(cwd);
+  browserCwdRef.current = cwd;
   const hostRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const spawned = useRef(false);
-  const startingRef = useRef<Promise<void>>(Promise.resolve());
-  /** Spawn routine the mount effect installs; the step runner drives it. */
-  const startPtyRef = useRef<(exec: string | undefined, dir: string) => Promise<void>>(
-    () => Promise.reject(new Error("Terminal is not mounted")),
-  );
-  /** Resolved by the next PTY exit while a command step is in flight. */
-  const exitWaiterRef = useRef<((code: number | null) => void) | null>(null);
-  /** Whether a PTY is live or its spawn is in flight — set/cleared by the
-   * mount effect's spawn/exit handlers so the command effect can tell a dead
-   * terminal from one that is merely still starting. */
-  const ptyLiveRef = useRef(false);
   const applySizeRef = useRef<() => void>(() => {});
   const onMetaChangeRef = useRef(onMetaChange);
   onMetaChangeRef.current = onMetaChange;
-  const cwdRef = useRef(cwd);
-  cwdRef.current = cwd;
   const runningProcessRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -193,8 +167,10 @@ export function TerminalView({ id, cwd, active, onMetaChange, command }: Props) 
       macOptionIsMeta: IS_MAC,
     });
     term.open(host);
+    const browserLinks = registerBrowserTerminalLinks(term, () => browserCwdRef.current);
     termRef.current = term;
     let closed = false;
+    const savedRun = bindSavedCommandRun(id, text => term.writeln(`\r\n${text}`), () => ({ cols: term.cols, rows: term.rows }));
 
     const onCopy = (event: ClipboardEvent) => {
       const text = term.getSelection();
@@ -224,60 +200,14 @@ export function TerminalView({ id, cwd, active, onMetaChange, command }: Props) 
       return true;
     });
 
-    // Explicit click on a printed http(s) link: loopback targets ask where
-    // to open (preview vs system browser); anything else opens externally.
-    // Never automatic — activation is always a user gesture.
-    term.registerLinkProvider({
-      provideLinks(y, callback) {
-        const line = term.buffer.active.getLine(y - 1);
-        if (!line) {
-          callback(undefined);
-          return;
-        }
-        const text = line.translateToString(true);
-        const links: ILink[] = [];
-        for (const match of text.matchAll(LINK_PATTERN)) {
-          const url = match[0].replace(LINK_TRAILING, "");
-          if (!url) continue;
-          const startX = match.index + 1;
-          links.push({
-            range: {
-              start: { x: startX, y },
-              end: { x: startX + url.length - 1, y },
-            },
-            text: url,
-            activate(event, target) {
-              if (isLocalhostUrl(target)) {
-                requestLinkChoice({
-                  url: target,
-                  x: event.clientX,
-                  y: event.clientY,
-                  cwd: cwdRef.current,
-                });
-              } else {
-                void openUrl(target).catch(() => undefined);
-              }
-            },
-          });
-        }
-        callback(links.length ? links : undefined);
-      },
-    });
-
     let oscBuffer = "";
-    // Per-mount streaming decoder — shared state would leak partial codepoints
-    // between terminals, and a fresh decoder per chunk splits UTF-8.
-    const decoder = new TextDecoder();
-    // Bumped on every PTY exit so a spawn resolving after its process already
-    // died cannot flip `spawned` back on.
-    let exitStamp = 0;
 
     const unsubscribe = subscribePty(
       id,
       (data) => {
         const onMeta = onMetaChangeRef.current;
         if (onMeta) {
-          const text = decoder.decode(data, { stream: true });
+          const text = new TextDecoder().decode(data);
           const scanned = scanOscCwd(text, oscBuffer);
           oscBuffer = scanned.rest;
           if (scanned.cwd) {
@@ -292,63 +222,26 @@ export function TerminalView({ id, cwd, active, onMetaChange, command }: Props) 
       },
       (code) => {
         if (closed) return;
-        exitStamp++;
-        spawned.current = false;
-        ptyLiveRef.current = false;
-        runningProcessRef.current = null;
-        const waiter = exitWaiterRef.current;
-        exitWaiterRef.current = null;
-        if (!waiter) {
-          const status = code == null ? "" : ` (${code})`;
-          term.writeln(`\r\n[process exited${status}]`);
-        }
-        // The shell is gone — a dead terminal must not stay "running" or a
-        // bound command could never re-run.
-        onMetaChangeRef.current?.({
-          foreground: null,
-          title: defaultTerminalTitle(cwd),
-        });
-        waiter?.(code);
+        if (savedRun?.exited(code)) return;
+        const status = code == null ? "" : ` (${code})`;
+        term.writeln(`\r\n[process exited${status}]`);
       },
     );
 
-    // Every spawn this mount owns, so unmount kills whichever one is live
-    // while a newer mount's spawn stays untouched.
-    const myStarts = new Set<Promise<void>>();
-    const startPty = (exec: string | undefined, dir: string) => {
-      const stamp = exitStamp;
-      ptyLiveRef.current = true;
-      const starting = spawnPty(id, dir, term.cols, term.rows, exec)
-        .then(() => {
-          if (!closed && exitStamp === stamp) spawned.current = true;
-        })
-        .catch((error) => {
-          spawned.current = false;
-          ptyLiveRef.current = false;
-          if (!closed) {
-            const message =
-              error instanceof Error ? error.message : String(error);
-            term.writeln(`\x1b[31m${message}\x1b[0m`);
-          }
-          throw error;
-        });
-      myStarts.add(starting);
-      startingRef.current = starting;
-      latestSpawn.set(id, starting);
-      void starting.catch(() => undefined);
-      return starting;
-    };
-    startPtyRef.current = startPty;
-
-    // A steps run spawns each step itself — only open an interactive shell
-    // when nothing is pending.
-    const stepsPending =
-      !!command?.steps?.length &&
-      (command.launched ?? 0) < command.runId &&
-      command.failed !== command.runId;
-    const starting = stepsPending
-      ? Promise.resolve()
-      : startPty(undefined, cwd);
+    const starting = (savedRun ? savedRun.start(cwd) : spawnPty(id, cwd, term.cols, term.rows))
+      .then(() => {
+        if (!closed) spawned.current = true;
+      })
+      .catch((error) => {
+        spawned.current = false;
+        if (!closed) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          term.writeln(`\x1b[31m${message}\x1b[0m`);
+        }
+        throw error;
+      });
+    void starting.catch(() => undefined);
 
     const dataSub = term.onData((data) => {
       void starting
@@ -415,12 +308,8 @@ export function TerminalView({ id, cwd, active, onMetaChange, command }: Props) 
       void starting
         .then(() => (closed ? undefined : resizePty(id, cols, rows)))
         .catch(() => {
-          // A dead PTY rejects every resize — keep the attempted size so a
-          // blinking cursor doesn't re-issue a doomed invoke each frame.
-          if (spawned.current) {
-            lastCols = 0;
-            lastRows = 0;
-          }
+          lastCols = 0;
+          lastRows = 0;
         });
     };
 
@@ -459,24 +348,12 @@ export function TerminalView({ id, cwd, active, onMetaChange, command }: Props) 
       renderSub.dispose();
       bufferSub.dispose();
       unsubscribe();
-      // Spawns this mount started may still be in flight — wait for all of
-      // them before killing so `pty_kill` never races ahead of a host insert
-      // and an in-flight spawn can't land orphaned afterwards. A newer
-      // mount's spawn is not ours and must survive.
-      void Promise.allSettled([...myStarts])
-        .then(() => {
-          const live = latestSpawn.get(id);
-          if (!live || !myStarts.has(live)) return;
-          latestSpawn.delete(id);
-          void killPty(id);
-        });
-      // Wake a step runner blocked on a PTY exit so it can bail out.
-      exitWaiterRef.current?.(null);
-      exitWaiterRef.current = null;
+      if (savedRun) void savedRun.dispose();
+      else void starting.catch(() => undefined).then(() => killPty(id));
+      browserLinks.dispose();
       term.dispose();
       termRef.current = null;
       spawned.current = false;
-      ptyLiveRef.current = false;
     };
   }, [id]);
 
@@ -520,153 +397,6 @@ export function TerminalView({ id, cwd, active, onMetaChange, command }: Props) 
       document.removeEventListener("visibilitychange", refresh);
     };
   }, [id, cwd, wantsMeta]);
-
-  // A bound saved command is written to the PTY exactly once per runId.
-  // `launched` is persisted through the meta patch, so remounting the view or
-  // restarting the app re-shows the terminal without re-running the command.
-  // Deps are deliberately narrow — progress/launched meta patches rebuild the
-  // `command` object on every merge and must not retrigger a running sequence.
-  const commandRunId = command?.runId;
-  const commandText = command?.text;
-  const commandSteps = command?.steps;
-  useEffect(() => {
-    if (
-      !command ||
-      (command.launched ?? 0) >= command.runId ||
-      command.failed === command.runId
-    ) {
-      // Nothing is pending — a run finished elsewhere or the binding was
-      // cleared could leave this tab without any PTY. Make sure a shell
-      // exists, but don't fight a spawn that is already in flight.
-      if (!ptyLiveRef.current) {
-        void startPtyRef.current(undefined, cwd).catch(() => undefined);
-      }
-      return;
-    }
-    const pending = command;
-    let cancelled = false;
-    const steps = pending.steps;
-    if (steps?.length) {
-      const runId = pending.runId;
-      let done = pending.step?.runId === runId ? pending.step.done : 0;
-      let myWaiter: ((code: number | null) => void) | null = null;
-      // Only disarm the shared slot while it still holds this runner's
-      // resolver — a remount arms a new one we must not clear.
-      const clearWaiter = () => {
-        if (myWaiter && exitWaiterRef.current === myWaiter) {
-          exitWaiterRef.current = null;
-        }
-        myWaiter = null;
-      };
-      const note = (text: string, color: 2 | 31 = 2) =>
-        termRef.current?.writeln(`\r\n\x1b[${color}m${text}\x1b[0m`);
-      const respawnShell = () => {
-        void startPtyRef.current(undefined, cwd).catch(() => undefined);
-      };
-      const fail = (text: string) => {
-        note(text, 31);
-        // `launched` is set too: the run is over, so `runId > launched` must
-        // not pin the launch-pending guard forever.
-        onMetaChangeRef.current?.({
-          command: { failed: runId, launched: runId, step: { runId, done } },
-        });
-        respawnShell();
-      };
-      void (async () => {
-        // A mount-time interactive spawn can still be in flight — if it lands
-        // after a step PTY it would silently replace it, so serialize.
-        await startingRef.current.catch(() => undefined);
-        for (let i = done; i < steps.length; i++) {
-          if (cancelled || !termRef.current) return;
-          const step = steps[i];
-          let dir = cwd;
-          if (step.host === "native") {
-            // OS host home — where wsl.exe/diskpart actually belong when the
-            // resolved target lives inside WSL. A failed lookup must NOT fall
-            // back to `cwd`: that could land the step inside WSL, the host it
-            // explicitly means to avoid.
-            try {
-              dir = await homeDir();
-            } catch {
-              fail(`step ${i + 1} needs the OS host, but its directory is unavailable`);
-              return;
-            }
-          }
-          if (cancelled || !termRef.current) return;
-          note(
-            `── step ${i + 1}/${steps.length}${step.host === "native" ? " (OS host)" : ""}: ${step.command}`,
-          );
-          const exited = new Promise<number | null>((resolve) => {
-            myWaiter = resolve;
-            exitWaiterRef.current = resolve;
-          });
-          try {
-            await startPtyRef.current(step.command, dir);
-          } catch {
-            clearWaiter();
-            if (!cancelled && termRef.current) fail(`step ${i + 1} failed to start`);
-            return;
-          }
-          const code = await exited;
-          myWaiter = null;
-          if (cancelled || !termRef.current) return;
-          if (code !== 0) {
-            fail(
-              code == null
-                ? `step ${i + 1} was interrupted`
-                : `step ${i + 1} failed (${code})`,
-            );
-            return;
-          }
-          done = i + 1;
-          onMetaChangeRef.current?.({
-            command: { step: { runId, done } },
-          });
-        }
-        if (cancelled || !termRef.current) return;
-        onMetaChangeRef.current?.({ command: { launched: runId } });
-        note("── all steps finished");
-        // Hand an interactive shell back so the tab stays usable.
-        respawnShell();
-      })();
-      return () => {
-        cancelled = true;
-        // Wake the runner so its continuation can bail, and disarm the slot
-        // so a late step exit still prints its marker.
-        const waiter = myWaiter;
-        clearWaiter();
-        waiter?.(null);
-      };
-    }
-    void startingRef.current
-      .then(async () => {
-        const dead = () => {
-          // The run can never land — record it as failed so `runId >
-          // launched` doesn't pin the launch-pending guard forever, and so a
-          // remount doesn't silently retry a write of uncertain delivery.
-          if (!cancelled) {
-            onMetaChangeRef.current?.({
-              command: { failed: pending.runId, launched: pending.runId },
-            });
-          }
-        };
-        if (cancelled) return;
-        if (!spawned.current) return dead();
-        try {
-          await writePty(id, `${pending.text}\r`);
-          if (!cancelled) {
-            onMetaChangeRef.current?.({ command: { launched: pending.runId } });
-          }
-        } catch {
-          dead();
-        }
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, commandRunId, commandText, commandSteps]);
 
   useEffect(() => {
     if (!active) return;

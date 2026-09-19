@@ -1,5 +1,8 @@
+import type { JiraStatus } from "./jira";
 import { invoke } from "@tauri-apps/api/core";
 import { boundAgentContext, MAX_CONTEXT_TEXT, type AgentContext } from "./agentContext";
+
+type ConfluenceConnection = Pick<JiraStatus, "site" | "accountId">;
 
 export type ConfluenceSpace = { key: string; name: string };
 
@@ -25,20 +28,20 @@ export type ConfluenceSection = {
   text: string;
 };
 
-export function confluenceSpaces(site: string): Promise<ConfluenceSpace[]> {
+export function confluenceSpaces(connection: ConfluenceConnection): Promise<ConfluenceSpace[]> {
   return invoke<{ spaces?: ConfluenceSpace[] }>("confluence_spaces", {
-    site,
+    ...connection,
   }).then((result) => (result.spaces ?? []).slice(0, 100));
 }
 
 export function confluenceSearch(
-  site: string,
+  connection: ConfluenceConnection,
   query: { text: string; space: string; cursor?: string; cursorParam?: string },
 ): Promise<{ results: ConfluencePageSummary[]; next: string; nextParam: string }> {
   return invoke<{ results?: unknown[]; next?: string; nextParam?: string }>(
     "confluence_search",
     {
-      site,
+      ...connection,
       query: query.text,
       space: query.space,
       cursor: query.cursor ?? "",
@@ -48,7 +51,7 @@ export function confluenceSearch(
     results: (result.results ?? [])
       .slice(0, 25)
       .flatMap((row) => {
-        const page = pageSummary(site, row);
+        const page = pageSummary(connection.site, row);
         return page ? [page] : [];
       }),
     next: typeof result.next === "string" ? result.next : "",
@@ -56,10 +59,10 @@ export function confluenceSearch(
   }));
 }
 
-export function confluencePage(site: string, id: string): Promise<ConfluencePage | null> {
-  return invoke<unknown>("confluence_page", { site, id }).then((raw) => {
-    const page = pageSummary(site, raw);
-    if (!page) return null;
+export function confluencePage(connection: ConfluenceConnection, id: string): Promise<ConfluencePage | null> {
+  return invoke<unknown>("confluence_page", { ...connection, id }).then((raw) => {
+    const page = pageSummary(connection.site, raw);
+    if (!page || page.id !== id) return null;
     const storage =
       raw && typeof raw === "object"
         ? (raw as { body?: { storage?: { value?: unknown } } }).body?.storage
@@ -162,18 +165,6 @@ export function confluenceMarkdown(storage: string): { text: string; truncated: 
       return null;
     }
   };
-  // HTML parsing turns <![CDATA[…]]> into a bogus comment; recover its text.
-  const collectText = (node: Node): string => {
-    if (node.nodeType === 3 || node.nodeType === 4)
-      return stripMarkers(node.textContent ?? "");
-    if (node.nodeType === 8)
-      return stripMarkers(
-        (node.textContent ?? "")
-          .replace(/^\[CDATA\[/, "")
-          .replace(/\]\]$/, ""),
-      );
-    return Array.from(node.childNodes).map(collectText).join("");
-  };
   const render = (node: Node, depth: number): string => {
     if (++nodes > 10_000 || depth > 32) {
       truncated = true;
@@ -201,7 +192,9 @@ export function confluenceMarkdown(storage: string): { text: string; truncated: 
       const name = attr(node, "name") || attr(node, "macro-id");
       if (name === "code" || name === "noformat") {
         const plain = find(node, "ac:plain-text-body");
-        const code = (plain ? collectText(plain) : "").slice(0, 32_000);
+        const raw = stripMarkers(plain?.textContent ?? "");
+        truncated ||= raw.length > 32_000;
+        const code = raw.slice(0, 32_000);
         return `\`\`\`\n${code.replace(/```/g, "ˋˋˋ")}\n\`\`\`\n\n`;
       }
       if (name === "children" || name === "toc" || name === "pagetree")
@@ -294,8 +287,10 @@ export function confluenceMarkdown(storage: string): { text: string; truncated: 
     if (tag === "u" || tag === "span" || tag === "time") return body;
     if (tag === "pre" || tag === "code") {
       const text = stripMarkers(node.textContent ?? "");
-      if (tag === "pre")
+      if (tag === "pre") {
+        truncated ||= text.length > 32_000;
         return `\`\`\`\n${text.slice(0, 32_000).replace(/```/g, "ˋˋˋ")}\n\`\`\`\n\n`;
+      }
       return `\`${text.replace(/`/g, "ˋ")}\``;
     }
     if (/^h[1-6]$/.test(tag)) return `${"#".repeat(Number(tag[1]))} ${body.trim()}\n\n`;
@@ -334,7 +329,7 @@ export function confluenceSections(markdown: string): ConfluenceSection[] {
       id: `s${index++}`,
       title: current.title,
       level: current.level,
-      text: current.body.join("\n").trim().slice(0, 16_000),
+      text: current.body.join("\n").trim(),
     });
     current = null;
   };
@@ -378,16 +373,17 @@ function pageOrigin(site: string, page: ConfluencePageSummary): string {
 
 /** Build bounded agent-context entries for selected pages/sections. */
 export function confluencePageContext(
-  site: string,
+  connection: ConfluenceConnection,
   pages: readonly { page: ConfluencePage; sections: readonly string[] | null }[],
 ): AgentContext {
+  const { site, accountId } = connection;
   const entries = pages.flatMap(({ page, sections }) => {
     const { text, truncated } = confluenceMarkdown(page.storage);
-    const origin = pageOrigin(site, page);
+    const origin = `Account ${accountId} · ${pageOrigin(site, page)}`;
     if (!sections) {
       return [
         {
-          id: `confluence:${site}:${page.id}`,
+          id: `confluence:${site}:${accountId}:${page.id}`,
           title: page.spaceKey ? `${page.spaceKey}: ${page.title}` : page.title,
           origin,
           text,
@@ -398,12 +394,14 @@ export function confluencePageContext(
     const picked = confluenceSections(text).filter((section) =>
       sections.includes(section.id),
     );
+    if (picked.length !== new Set(sections).size)
+      throw new Error("Selected Confluence sections changed. Preview and select them again.");
     const body = picked
       .map((section) => `${"#".repeat(section.level)} ${section.title}\n\n${section.text}`)
       .join("\n\n");
     return [
       {
-        id: `confluence:${site}:${page.id}:sections`,
+        id: `confluence:${site}:${accountId}:${page.id}:sections`,
         title: page.spaceKey ? `${page.spaceKey}: ${page.title}` : page.title,
         origin: `${origin} · ${picked.length} ${picked.length === 1 ? "section" : "sections"}`,
         text: body.slice(0, MAX_CONTEXT_TEXT),

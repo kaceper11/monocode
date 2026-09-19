@@ -22,7 +22,7 @@ export type InboxReplyTarget = {
   threadId: string;
 };
 
-export type InboxComment = {
+type InboxComment = {
   id: string;
   kind: string;
   author: string;
@@ -38,7 +38,7 @@ export type InboxComment = {
   replies: InboxComment[];
 };
 
-export type InboxThread = {
+type InboxThread = {
   comments: InboxComment[];
   truncated: boolean;
 };
@@ -86,7 +86,9 @@ export function InboxComments({
         ? "GitLab"
         : provider === "azure"
           ? "Azure DevOps"
-          : "GitHub";
+          : provider === "jira"
+            ? "Jira"
+            : "GitHub";
 
   return (
     <section className="flex flex-col gap-3 border-t border-stroke pt-5">

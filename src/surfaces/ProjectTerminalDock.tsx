@@ -7,7 +7,6 @@ import {
   PanelLeft,
   PanelRight,
   PanelTop,
-  Play,
   Plus,
 } from "../chrome/icons";
 import {
@@ -44,8 +43,6 @@ type Props = {
   onCloseOtherTerminals: (fileId: string) => void;
   onReorderTerminals: (ids: string[]) => void;
   onTerminalMetaChange?: (fileId: string, patch: TerminalMetaPatch) => void;
-  /** Opens the saved-commands menu anchored at the trigger. */
-  onOpenCommands?: (anchor: DOMRect) => void;
 };
 
 const SIDE_ITEMS: { id: DockSide; label: string }[] = [
@@ -83,13 +80,11 @@ export function ProjectTerminalDock({
   onCloseOtherTerminals,
   onReorderTerminals,
   onTerminalMetaChange,
-  onOpenCommands,
 }: Props) {
   const vertical = isVerticalDock(dock.side);
   const [dragging, setDragging] = useState(false);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const sideButton = useRef<HTMLDivElement>(null);
-  const commandsButton = useRef<HTMLDivElement>(null);
   const drag = useRef<{ start: number; size: number } | null>(null);
   const sizeRef = useRef(dock.size);
   sizeRef.current = dock.size;
@@ -223,20 +218,6 @@ export function ProjectTerminalDock({
             >
               <Plus className="size-3.5" strokeWidth={1.75} />
             </IconButton>
-            {onOpenCommands ? (
-              <div ref={commandsButton} className="flex">
-                <IconButton
-                  label="Run saved command"
-                  onClick={() => {
-                    const rect =
-                      commandsButton.current?.getBoundingClientRect();
-                    if (rect) onOpenCommands(rect);
-                  }}
-                >
-                  <Play className="size-3.5" strokeWidth={1.75} />
-                </IconButton>
-              </div>
-            ) : null}
             <div ref={sideButton}>
             <IconButton
               label="Move Terminal"
@@ -274,7 +255,6 @@ export function ProjectTerminalDock({
               cwd={file.cwd}
               active={focused && file.id === dock.pane.activeFileId}
               onMetaChange={(patch) => onTerminalMetaChange?.(file.id, patch)}
-              command={file.command}
             />
           </div>
         ))}

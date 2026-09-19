@@ -8,7 +8,6 @@ export {
 } from "./auth";
 export {
   applyHarnessEvent,
-  applyHarnessEvents,
   appendUser,
   appendSteerUser,
   promoteLastAssistantToPlan,
@@ -18,7 +17,6 @@ export {
   sendCursorTurn,
   cancelCursorTurn,
   respondCursorApproval,
-  setCursorRuntimeMode,
   stopCursorSession,
   forgetCursorSession,
   bindCursorSession,
@@ -28,7 +26,6 @@ export {
   compactCodexContext,
   cancelCodexTurn,
   respondCodexApproval,
-  setCodexRuntimeMode,
   stopCodexSession,
   forgetCodexSession,
   bindCodexSession,
@@ -38,7 +35,6 @@ export {
   compactOpenCodeContext,
   cancelOpenCodeTurn,
   respondOpenCodeApproval,
-  setOpenCodeRuntimeMode,
   stopOpenCodeSession,
   forgetOpenCodeSession,
   bindOpenCodeSession,
@@ -48,7 +44,6 @@ export {
   compactClaudeContext,
   cancelClaudeTurn,
   respondClaudeApproval,
-  setClaudeRuntimeMode,
   stopClaudeSession,
   forgetClaudeSession,
   bindClaudeSession,
@@ -75,7 +70,6 @@ export {
   sendFxTurn,
   cancelFxTurn,
   respondFxApproval,
-  setFxRuntimeMode,
   stopFxSession,
   forgetFxSession,
   bindFxSession,
@@ -85,11 +79,18 @@ export {
   compactGrokContext,
   cancelGrokTurn,
   respondGrokApproval,
-  setGrokRuntimeMode,
   stopGrokSession,
   forgetGrokSession,
   bindGrokSession,
 } from "./grok";
+export {
+  sendHermesTurn,
+  cancelHermesTurn,
+  respondHermesApproval,
+  stopHermesSession,
+  forgetHermesSession,
+  bindHermesSession,
+} from "./hermes";
 export { generateCursorSessionTitle } from "./cursorTitle";
 export { generateCodexSessionTitle } from "./codexTitle";
 export { generateOpenCodeSessionTitle } from "./opencodeTitle";
@@ -129,12 +130,11 @@ export { refreshClaudeCatalog } from "./claudeCatalog";
 export { refreshPiCatalog, refreshOmpCatalog } from "./piCatalog";
 export { refreshFxCatalog } from "./fxCatalog";
 export { refreshGrokCatalog } from "./grokCatalog";
-export { refreshMuseCatalog } from "./museCatalog";
+export { refreshHermesCatalog } from "./hermesCatalog";
 export { registerBuiltinHarnesses } from "./register";
 export {
   getHarnessAvailabilitySnapshot,
   hasProbedHarnessAvailability,
-  harnessAuthHint,
   harnessUnavailableHint,
   isHarnessAvailable,
   probeHarnessAvailability,
@@ -145,7 +145,6 @@ export {
   requireHarness,
   isLiveHarness,
   sendHarnessTurn,
-  prewarmHarness,
   compactHarnessContext,
   canCompactHarnessContext,
   steerHarnessTurn,
@@ -153,7 +152,6 @@ export {
   cancelHarnessTurn,
   respondHarnessApproval,
   respondHarnessQuestion,
-  setHarnessRuntimeMode,
   keepHarnessQuestionOpen,
   stopHarnessSession,
   forgetHarnessSession,
@@ -162,6 +160,7 @@ export {
   generateHarnessTitle,
   generateHarnessCommitMessage,
   generateHarnessPrContent,
+  generateHarnessBranchName,
 } from "./registry";
 export type {
   ApprovalDecision,

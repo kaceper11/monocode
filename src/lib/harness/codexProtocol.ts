@@ -111,8 +111,8 @@ export function buildThreadStartParams(input: {
     sandboxPolicy: config.sandboxPolicy,
     approvalsReviewer: config.approvalsReviewer,
     ...(input.model ? { model: input.model } : {}),
-    ...(input.serviceTier
-      ? { serviceTier: input.serviceTier === "default" ? null : input.serviceTier }
+    ...(input.serviceTier && input.serviceTier !== "default"
+      ? { serviceTier: input.serviceTier }
       : {}),
   };
 }
@@ -173,8 +173,8 @@ export function buildTurnStartParams(input: {
     },
     ...(input.model ? { model: input.model } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
-    ...(input.serviceTier
-      ? { serviceTier: input.serviceTier === "default" ? null : input.serviceTier }
+    ...(input.serviceTier && input.serviceTier !== "default"
+      ? { serviceTier: input.serviceTier }
       : {}),
   };
 }
@@ -484,7 +484,7 @@ function mapTurnTerminal(
     stringField(turn, "status") ??
     (method === "turn/aborted" ? "interrupted" : "completed");
   const errorObj = asRecord(turn?.error);
-  const error = codexTurnErrorMessage(errorObj);
+  const error = stringField(errorObj, "message");
   const status =
     statusRaw === "failed"
       ? "failed"
@@ -507,22 +507,6 @@ function mapTurnTerminal(
     turnCompleted: { status, ...(error ? { error } : {}) },
     activeTurnId: null,
   };
-}
-
-/** The app-server can nest an upstream API error JSON inside error.message. */
-function codexTurnErrorMessage(
-  errorObj: Record<string, unknown> | null,
-): string | undefined {
-  const message = stringField(errorObj, "message");
-  if (!message) return undefined;
-  const trimmed = message.trim();
-  if (!trimmed.startsWith("{")) return message;
-  try {
-    const inner = asRecord(asRecord(JSON.parse(trimmed))?.error);
-    return stringField(inner, "message") ?? message;
-  } catch {
-    return message;
-  }
 }
 
 function mapItemLifecycle(
@@ -561,10 +545,12 @@ function mapItemLifecycle(
     if (completed) {
       const text = streamTextDelta(item.text);
       const events: HarnessEvent[] = [];
-      if (text) events.push({ type: "message.delta", text });
-      // Seal the streaming block even when the item carries no text —
-      // turn/completed may lag behind the last item.
-      events.push({ type: "message.completed" });
+      if (text) {
+        events.push(
+          { type: "message.delta", text },
+          { type: "message.completed" },
+        );
+      }
       return { events };
     }
     return { events: [] };

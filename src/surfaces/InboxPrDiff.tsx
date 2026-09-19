@@ -1,27 +1,24 @@
 import { useMemo } from "react";
-import type { GithubPrDiff } from "../lib/githubTasks";
+import type { InboxDiff } from "../lib/inboxProvider";
 import { mergePrDiff, parsePrPatch, type PrDiffFile } from "../lib/prDiff";
-import { blocksFromLines, type UnifiedLine } from "../lib/unifiedDiff";
-import {
-  UnifiedDiffView,
-  type LineCommentComposer,
-  type UnifiedDiffFileModel,
-} from "./UnifiedDiffView";
+import { buildUnifiedFile, blocksFromLines, type UnifiedLine } from "../lib/unifiedDiff";
+import { UnifiedDiffView, type UnifiedDiffFileModel } from "./UnifiedDiffView";
 
 type Props = {
-  diff: GithubPrDiff;
-  /** Remote review surfaces route line comments into their own review flow. */
-  lineCommentComposer?: LineCommentComposer;
+  diff: InboxDiff;
   /** When true, show the whole file (no fold rows). */
   fullFile?: boolean;
 };
 
-export function InboxPrDiff({
-  diff,
-  lineCommentComposer,
-  fullFile = false,
-}: Props) {
+export function InboxPrDiff({ diff, fullFile = false }: Props) {
   const files = useMemo(() => {
+    if ("items" in diff) return diff.items.map((item, index): UnifiedDiffFileModel => {
+      const built = item.error ? null : buildUnifiedFile(item.original ?? "", item.modified ?? "");
+      return { id: `${index}:${item.path}`, path: item.path,
+        label: item.originalPath ? `${item.originalPath} → ${item.path}` : item.path,
+        emptyMessage: item.error, additions: built?.additions ?? 0,
+        deletions: built?.deletions ?? 0, blocks: built?.blocks ?? [] };
+    });
     const parsed = mergePrDiff(diff.files, parsePrPatch(diff.patch));
     const context = fullFile ? Number.POSITIVE_INFINITY : undefined;
     return parsed.map((file) => toModel(file, diff.truncated, context));
@@ -31,11 +28,12 @@ export function InboxPrDiff({
     <UnifiedDiffView
       files={files}
       truncated={diff.truncated}
-      totals={{ additions: diff.additions, deletions: diff.deletions }}
+      totals={"items" in diff
+        ? { additions: files.reduce((sum, f) => sum + f.additions, 0), deletions: files.reduce((sum, f) => sum + f.deletions, 0) }
+        : { additions: diff.additions, deletions: diff.deletions }}
       fill={false}
       fileLayout="cards"
       initialExpansion="first"
-      lineCommentComposer={lineCommentComposer}
     />
   );
 }
@@ -62,9 +60,6 @@ function toModel(
         : undefined,
     additions: file.additions,
     deletions: file.deletions,
-    // Remote diff — chat-bound hunk/line actions lose the PR binding, so the
-    // owning review surface provides the comment flow instead.
-    contextActions: false,
     blocks: blocksFromLines(lines, context),
   };
 }

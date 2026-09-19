@@ -5,6 +5,7 @@ import { projectName } from "./paths";
 import { sameProjectPath } from "./recents";
 import {
   sessionDisplayTitle,
+  sessionDraftBlock,
   sessionNeedsInput,
   type Session,
 } from "./session";
@@ -106,16 +107,20 @@ export function summaryFromSession(
     id: session.id,
     orchestrationLeadId: session.orchestrationLeadId,
     cwd: session.cwd,
-    ...(session.worktreeCwd ? { worktreeCwd: session.worktreeCwd } : {}),
     harness: session.harness,
     model: session.model,
     runtimeMode: session.runtimeMode,
     title: session.title,
+    draft: !!sessionDraftBlock(session),
     providerSessionId: session.providerSessionId,
+    worktreeCwd: session.worktreeCwd,
+    worktreeRemoved: session.worktreeRemoved,
     ...(session.linkedWorkItem
       ? { linkedWorkItem: session.linkedWorkItem }
       : {}),
-    ...(git?.branch ? { branch: git.branch } : {}),
+    ...(!session.worktreeRemoved && (session.branch || git?.branch)
+      ? { branch: session.branch || git?.branch }
+      : {}),
     ...(git?.repo ? { repo: git.repo } : {}),
     createdAt: 0,
     updatedAt: Date.now(),
@@ -173,32 +178,21 @@ export function historyWithLiveSessions(
   for (const session of sessions) {
     if (session.inboxAsk || workerIds.has(session.id)) continue;
     if (!sameProjectPath(session.cwd, cwd)) continue;
+    const live = session.busy || sessionNeedsInput(session);
+    if (!shouldPersistSession(session) && !live) continue;
+    const storedIndex = rows.findIndex((row) => row.id === session.id);
+    if (storedIndex >= 0) {
+      const draft = !!sessionDraftBlock(session);
+      if (!!rows[storedIndex].draft !== draft) {
+        rows[storedIndex] = { ...rows[storedIndex], draft: draft || undefined };
+      }
+      continue;
+    }
     const sessionHint: SessionGitHint = {
       ...hint,
       ...(session.branch ? { branch: session.branch } : {}),
     };
-    const summary = summaryFromSession(session, sessionHint);
-    const existing = rows.findIndex((row) => row.id === session.id);
-    if (existing >= 0) {
-      // The live session wins over the last persisted write so agent/model/
-      // title changes show immediately instead of after the debounced save.
-      const row = rows[existing];
-      rows[existing] = {
-        ...row,
-        harness: summary.harness,
-        model: summary.model,
-        runtimeMode: summary.runtimeMode,
-        title: summary.title,
-        cwd: summary.cwd,
-        linkedWorkItem: summary.linkedWorkItem,
-        worktreeCwd: summary.worktreeCwd,
-        providerSessionId: summary.providerSessionId,
-      };
-      continue;
-    }
-    const live = session.busy || sessionNeedsInput(session);
-    if (!shouldPersistSession(session) && !live) continue;
-    rows = mergeHistorySummary(rows, summary);
+    rows = mergeHistorySummary(rows, summaryFromSession(session, sessionHint));
   }
   const byLead = new Map(runs.map((run) => [run.leadId, run]));
   return rows

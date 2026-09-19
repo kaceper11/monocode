@@ -220,44 +220,6 @@ function clip(text: string): string {
 }
 
 /**
- * OS banner for a failed/timed-out/broken check run. `sessionVisible` is
- * tied to focus on purpose: when the user is looking at the app the in-app
- * check toast is the cue, so a native banner would double up; unfocused
- * means the banner is the only signal. Clicking focuses the session.
- */
-export async function notifyCheckResult(
-  session: Session,
-  run: { status: "failed" | "timeout" | "error"; commandName: string },
-): Promise<boolean> {
-  if (session.inboxAsk) return false;
-  const decision = shouldNotify({
-    enabled: loadNotificationsEnabled(),
-    permission,
-    windowFocused,
-    sessionVisible: windowFocused,
-  });
-  if (!decision) return false;
-  const headline =
-    run.status === "timeout"
-      ? "Checks timed out"
-      : run.status === "error"
-        ? "Checks didn't run"
-        : "Checks failed";
-  try {
-    await invoke("show_notification", {
-      sessionId: session.id,
-      title: "MonoCode",
-      subtitle: sessionDisplayTitle(session.title, session.harness),
-      body: clip(`${headline} · ${run.commandName}`),
-      sound: loadSoundsEnabled(),
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Sends the banner when policy allows. Resolves true once the OS accepted it
  * so callers can skip the in-app cue: the OS sound stands in for it. A
  * rejected dispatch resolves false so the cue still plays.

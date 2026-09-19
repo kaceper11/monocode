@@ -29,8 +29,6 @@ AGENT_BINARIES = {}
 ATTACHMENTS = None
 ATTACHMENT_BYTES = 0
 ATTACHMENT_COUNT = 0
-# marker -> (sample time, {pid: jiffies}) for per-terminal CPU deltas.
-PROC_STATS = {}
 
 
 def absolute(value):
@@ -44,6 +42,18 @@ def portable(name):
     # that the host's JSON parser rejects — one bad name would void the whole
     # response, so such entries stay inside the guest.
     return all(not 0xD800 <= ord(char) <= 0xDFFF for char in name)
+
+
+def control_write_path(path):
+    missing = []
+    while not path.exists():
+        if path.is_symlink():
+            raise ValueError("Reported write path contains a dangling symlink")
+        if path == path.parent:
+            raise ValueError("Invalid write path")
+        missing.append(path.name)
+        path = path.parent
+    return path.resolve(strict=True).joinpath(*reversed(missing))
 
 
 def run(argv, cwd, input_bytes=None, timeout=25):
@@ -192,7 +202,7 @@ def bounded_tree(path):
                     pending.append(Path(entry.path))
 
 
-AGENT_PROVIDERS = ["claude", "codex", "cursor", "opencode", "pi", "omp", "fx", "grok", "devin", "copilot", "muse"]
+AGENT_PROVIDERS = ["claude", "codex", "cursor", "opencode", "pi", "omp", "fx", "grok", "hermes", "devin", "copilot", "muse"]
 AGENT_NAMES = {
     "claude": ["claude"],
     "codex": ["codex"],
@@ -201,6 +211,7 @@ AGENT_NAMES = {
     "pi": ["pi", "pi-coding-agent"],
     "omp": ["omp"],
     "fx": ["fx"],
+    "hermes": ["hermes"],
     "grok": ["grok"],
     "devin": ["devin"],
     "copilot": ["copilot"],
@@ -349,6 +360,8 @@ def find_agent(provider):
         if version:
             names = names + ["muse-bin-" + version]
     folders = [home / suffix for suffix in AGENT_FOLDERS]
+    if provider == "hermes":
+        folders += [home / ".hermes/hermes-agent/venv/bin", home / ".hermes/hermes-agent/.venv/bin"]
     folders = [Path(folder) for folder in os.environ.get("PATH", "").split(":") if folder.startswith("/") and not folder.startswith("/mnt/")] + folders
     folders += [Path(folder) for folder in AGENT_SYSTEM_FOLDERS]
     for name in names:
@@ -385,103 +398,25 @@ def agent_authenticated(provider):
     return False if checks.get("strict") else None
 
 
-def _proc_marker(pid_dir):
-    """MONOCODE_PTY value from one process's environment, or None. environ is
-    readable for same-user processes only; anything else is skipped."""
-    try:
-        with open(os.path.join(pid_dir, "environ"), "rb") as stream:
-            # 1 MiB — a small 64 KB cap could truncate the marker out of
-            # a large inherited environment.
-            data = stream.read(1024 * 1024)
-    except OSError:
-        return None
-    for field in data.split(b"\0"):
-        if field.startswith(b"MONOCODE_PTY="):
-            try:
-                marker = field[13:].decode("utf-8")
-            except UnicodeDecodeError:
-                return None
-            return marker if marker and len(marker) <= 128 else None
-    return None
-
-
-def _proc_stat(pid_dir):
-    """(comm, state, utime+stime jiffies, starttime) from
-    /proc/<pid>/stat. comm sits between the only parens, so splitting
-    after the last ')' is safe even when comm holds spaces or parens."""
-    try:
-        text = Path(pid_dir, "stat").read_text()
-    except OSError:
-        return None
-    end = text.rfind(")")
-    if end < 0:
-        return None
-    fields = text[end + 2 :].split()
-    if len(fields) < 20:
-        return None
-    try:
-        return (
-            text[text.find("(") + 1 : end],
-            fields[0],
-            int(fields[11]) + int(fields[12]),
-            int(fields[19]),
-        )
-    except ValueError:
-        return None
-
-
-def _scan_marked():
-    """Yields (pid, marker, parsed /proc stat) for marked processes."""
-    scanned = 0
-    try:
-        proc = os.scandir("/proc")
-    except OSError:
-        return
-    for entry in proc:
-        if scanned >= 8192 or not entry.name.isdigit():
-            continue
-        scanned += 1
-        marker = _proc_marker(entry.path)
-        if not marker:
-            continue
-        parsed = _proc_stat(entry.path)
-        if parsed:
-            yield int(entry.name), marker, parsed
-
-
-def _marked_pids(marker):
-    """{pid: starttime} of every process carrying MONOCODE_PTY=<marker>."""
-    return {
-        pid: parsed[3]
-        for pid, entry_marker, parsed in _scan_marked()
-        if entry_marker == marker
-    }
-
-
-def _alive(pid):
-    """Live and not a zombie — kill(pid, 0) alone reports zombies alive."""
-    parsed = _proc_stat(f"/proc/{pid}")
-    if parsed is not None:
-        return parsed[1] != "Z"
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _kill(pid, sig):
-    try:
-        os.kill(pid, sig)
-    except (ProcessLookupError, PermissionError):
-        pass
+def checkpoint_has_symlink(root, relative):
+    if not isinstance(relative, str) or not relative or relative.startswith("/") or any(part in ("", "..") for part in relative.split("/")):
+        raise ValueError("Invalid checkpoint path")
+    current = root
+    for part in relative.split("/"):
+        current = current / part
+        try:
+            if stat.S_ISLNK(current.lstat().st_mode):
+                return True
+        except FileNotFoundError:
+            return False
+    return False
 
 
 def handle(request):
     op = request["op"]
     path = absolute(request["path"])
+    if op in ("terminal_resources", "terminal_stop_workload"):
+        return terminal_resource_request(request)
     if op == "worktree_review":
         # The Rust owner verifies Git family/HEAD/index and all removal policy.
         # This OS boundary fingerprints Linux files without following symlinks.
@@ -545,90 +480,6 @@ def handle(request):
         if code and not out.strip():
             raise ValueError(err.decode("utf-8", errors="replace").strip())
         return out.decode("utf-8", errors="replace")
-    if op == "pty_stats":
-        # Every terminal spawned through wsl.exe carries MONOCODE_PTY=<id> in
-        # its environment — env is inherited, so the marker identifies the
-        # whole tree without a wsl.exe↔Linux pid map. One /proc pass serves
-        # all terminals in this distribution.
-        now = time.monotonic()
-        hz = os.sysconf("SC_CLK_TCK")
-        page = os.sysconf("SC_PAGE_SIZE")
-        trees = {}
-        for pid_key, marker, parsed in _scan_marked():
-            comm, _state, jiffies, start = parsed
-            try:
-                resident = int(Path("/proc", str(pid_key), "statm").read_text().split()[1]) * page
-            except (OSError, IndexError, ValueError):
-                resident = 0
-            slot = trees.setdefault(marker, {"pids": {}, "rss": 0})
-            slot["pids"][pid_key] = (jiffies, resident, comm, start)
-            slot["rss"] += resident
-        result = {}
-        for marker, slot in trees.items():
-            pids = slot["pids"]
-            prev = PROC_STATS.get(marker)
-            PROC_STATS[marker] = (now, {pid: p[0] for pid, p in pids.items()})
-            cpu = {}
-            if prev:
-                elapsed = now - prev[0]
-                # A stale baseline (panel closed for minutes) would dilute
-                # the reading to ~0 — treat it as a fresh sample.
-                if 0.05 < elapsed < 60:
-                    for pid, (jiffies, _, _, _) in pids.items():
-                        used = max(0, jiffies - prev[1].get(pid, 0))
-                        cpu[pid] = used / hz / elapsed * 100
-            # The shell spawned first, so the earliest-starttime marked
-            # process is the root — reparented orphans (daemonized dev
-            # servers, setsid children) stay workload members and remain
-            # killable instead of escaping as extra roots. Ties (same
-            # jiffy) break on the lower pid — the earlier fork.
-            root = min(pids, key=lambda pid: (pids[pid][3], pid))
-            members = [pid for pid in pids if pid != root]
-            top = None
-            if members:
-                best = max(members, key=lambda pid: (cpu.get(pid, 0), pids[pid][1]))
-                top = pids[best][2]
-            result[marker] = {
-                "cpu_pct": sum(cpu.values()),
-                "rss_bytes": slot["rss"],
-                "processes": len(pids),
-                "workload": bool(members),
-                "top": top,
-            }
-        for marker in list(PROC_STATS):
-            if marker not in trees:
-                del PROC_STATS[marker]
-        return result
-    if op == "signal":
-        marker = request.get("marker", "")
-        if (
-            not isinstance(marker, str)
-            or not marker
-            or len(marker) > 128
-            or any(not (c.isalnum() or c in "-_") for c in marker)
-        ):
-            raise ValueError("Invalid terminal marker")
-        if request.get("action") != "workload":
-            raise ValueError("Unknown signal action")
-        pids = _marked_pids(marker)
-        root = min(pids, key=lambda pid: (pids[pid], pid)) if pids else None
-        targets = [pid for pid in pids if pid != root]
-        signaled = len(targets)
-        for pid in targets:
-            _kill(pid, signal.SIGTERM)
-        # Same TERM→KILL escalation the host PTY kill uses, kept inside one
-        # bridge round trip so survivors cannot outlive the request.
-        deadline = time.monotonic() + 1.0
-        while targets and time.monotonic() < deadline:
-            targets = [pid for pid in targets if _alive(pid)]
-            if targets:
-                time.sleep(0.05)
-        # A target that died during the wait may have had its pid recycled
-        # by an unrelated process — re-verify the marker before KILLing.
-        for pid in targets:
-            if _proc_marker(f"/proc/{pid}") == marker:
-                _kill(pid, signal.SIGKILL)
-        return {"signaled": signaled}
     if op == "home":
         return str(Path.home())
     if op == "skill_entries":
@@ -706,6 +557,78 @@ def handle(request):
             ATTACHMENT_COUNT += 1
             ATTACHMENT_BYTES += len(data)
         return str(destination)
+    if op in ("worktree_seed", "worktree_seed_matches"):
+        target = absolute(request["target"])
+        paths = request["paths"]
+        if not isinstance(paths, list) or len(paths) > MAX_FILES:
+            raise ValueError("Worktree seed exceeds 20,000 files")
+        deadline = time.monotonic() + 25
+        def check_deadline():
+            if time.monotonic() > deadline:
+                raise ValueError("Worktree seed exceeded 25 seconds; the worktree was kept for review")
+        for relative in paths:
+            check_deadline()
+            if checkpoint_has_symlink(path, relative) or checkpoint_has_symlink(target, relative):
+                raise ValueError("Cannot seed a worktree through a symbolic link")
+            source_file, target_file = path / relative, target / relative
+            try:
+                source_meta = source_file.lstat()
+            except FileNotFoundError:
+                if op == "worktree_seed_matches":
+                    if target_file.exists():
+                        return False
+                elif target_file.is_file() or target_file.is_symlink():
+                    target_file.unlink()
+                elif target_file.exists():
+                    raise ValueError("Cannot replace a worktree directory")
+                continue
+            if not stat.S_ISREG(source_meta.st_mode):
+                raise ValueError("Cannot seed a non-regular worktree file")
+            if op == "worktree_seed_matches":
+                try:
+                    target_meta = target_file.lstat()
+                except FileNotFoundError:
+                    return False
+                if not stat.S_ISREG(target_meta.st_mode) or source_meta.st_size != target_meta.st_size or (source_meta.st_mode & 0o777) != (target_meta.st_mode & 0o777):
+                    return False
+                with source_file.open("rb") as left, target_file.open("rb") as right:
+                    while True:
+                        check_deadline()
+                        chunk = left.read(1024 * 1024)
+                        if chunk != right.read(1024 * 1024):
+                            return False
+                        if not chunk:
+                            break
+            else:
+                target_file.parent.mkdir(parents=True, exist_ok=True)
+                with source_file.open("rb") as source_stream, target_file.open("wb") as target_stream:
+                    while True:
+                        check_deadline()
+                        chunk = source_stream.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        target_stream.write(chunk)
+                    os.fchmod(target_stream.fileno(), stat.S_IMODE(source_meta.st_mode))
+        return True if op == "worktree_seed_matches" else None
+    if op == "checkpoint_symlink":
+        return checkpoint_has_symlink(path, request["relative"])
+    if op == "checkpoint_file":
+        try:
+            meta = path.lstat()
+        except FileNotFoundError:
+            return {"exists": False}
+        if not stat.S_ISREG(meta.st_mode) or meta.st_size > MAX_TEXT:
+            return {"exists": True, "isFile": False}
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as stream:
+            meta = os.fstat(stream.fileno())
+            if not stat.S_ISREG(meta.st_mode):
+                raise ValueError("Checkpoint path is not a regular file")
+            data = stream.read(MAX_TEXT + 1)
+            if len(data) > MAX_TEXT:
+                return {"exists": True, "isFile": True, "tooLarge": True}
+        return {"exists": True, "isFile": True, "mode": stat.S_IMODE(meta.st_mode) & 0o777,
+                "data": base64.b64encode(data).decode(), "tooLarge": False}
     if op == "diff_file":
         try:
             meta = path.stat()
@@ -790,10 +713,20 @@ def handle(request):
         content = request["content"].encode("utf-8") if op == "write_text" else base64.b64decode(request["data"], validate=True)
         if len(content) > MAX_TEXT:
             raise ValueError("File exceeds 8 MiB")
+        checkpoint_root = request.get("checkpointRoot") if op == "restore_bytes" else None
+        if checkpoint_root is not None:
+            root = absolute(checkpoint_root)
+            if checkpoint_has_symlink(root, str(path.relative_to(root))):
+                raise ValueError("Cannot write a checkpoint through a symbolic link")
+            requested_mode = request.get("mode")
+            if requested_mode is not None and (type(requested_mode) is not int or not 0 <= requested_mode <= 0o777):
+                raise ValueError("Invalid checkpoint file mode")
         if op == "restore_bytes":
             path.parent.mkdir(parents=True, exist_ok=True)
         destination = path.resolve(strict=path.exists())
         mode = stat.S_IMODE(destination.stat().st_mode) if destination.exists() else None
+        if checkpoint_root is not None and requested_mode is not None:
+            mode = requested_mode
         descriptor, temporary = tempfile.mkstemp(prefix=".monocode-", dir=destination.parent)
         try:
             with os.fdopen(descriptor, "wb") as stream:
@@ -824,6 +757,35 @@ def handle(request):
             raise ValueError("A directory replaced this file; inspect it before undoing")
         path.unlink(missing_ok=True)
         return None
+    if op == "worktree_path_info":
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return [False, False]
+        return [True, path.is_dir()]
+    if op == "control_cli":
+        if not Path("/proc/sys/fs/binfmt_misc/WSLInterop").read_text().startswith("enabled"):
+            raise ValueError("Enable Windows interoperability in this WSL distribution to use orchestration")
+        code, out, error = run(["/usr/bin/wslpath", "-u", request["executable"]], str(path))
+        if code:
+            raise ValueError(error.decode("utf-8", errors="replace") or "Cannot locate the MonoCode control CLI in WSL")
+        executable = absolute(out.decode("utf-8").strip())
+        if not executable.is_file():
+            raise ValueError("The MonoCode control CLI is not accessible inside this WSL distribution")
+        return str(executable)
+    if op == "worker_scratch":
+        return str(Path(tempfile.mkdtemp(prefix="monocode-worker-")).resolve(strict=True))
+    if op == "control_write_path":
+        return str(control_write_path(path))
+    if op == "control_scope":
+        scope = request["scope"]
+        if not isinstance(scope, str) or not scope or "\\" in scope or "\0" in scope or Path(scope).is_absolute() or ".." in Path(scope).parts:
+            raise ValueError("Write scopes must be project-relative paths without '..'")
+        root = path.resolve(strict=True)
+        result = control_write_path(root / scope)
+        if not result.is_relative_to(root):
+            raise ValueError("Write scope points outside the project")
+        return str(result)
     if op == "canonical_directory":
         result = path.resolve(strict=True)
         if not result.is_dir():

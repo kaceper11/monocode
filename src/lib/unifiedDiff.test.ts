@@ -1,7 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  selectedDiffHunk,
-  formatUnifiedHunk,
   blocksFromLines,
   buildUnifiedFile,
   expandFold,
@@ -164,15 +162,3 @@ function rangeContext(from: number, to: number): UnifiedLine[] {
   }
   return lines;
 }
-
-it("captures only the selected hunk, including removed lines and its context", () => {
-  const original = Array.from({length: 40}, (_, i) => `line ${i}`).join("\n");
-  const current = original.replace("line 2\n", "first change\n").replace("line 35\n", "second change\n");
-  const diff = buildUnifiedFile(original, current);
-  const selected = diff.lines.find(line => line.text === "second change")!;
-  const hunk = selectedDiffHunk(diff.blocks, selected);
-  expect(hunk.some(line => line.text === "line 35" && line.kind === "del")).toBe(true);
-  expect(hunk.some(line => line.text === "second change")).toBe(true);
-  expect(hunk.some(line => line.text === "first change")).toBe(false);
-  expect(formatUnifiedHunk(hunk)).toContain("@@ -33,7 +33,7 @@");
-});

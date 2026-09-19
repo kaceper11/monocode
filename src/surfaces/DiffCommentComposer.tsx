@@ -1,8 +1,8 @@
-import { contextFromText, requestAgentContext } from "../lib/agentContext";
 import { useState } from "react";
-import { Bot, MessageSquarePlus, X } from "../chrome/icons";
+import { MessageSquarePlus, X } from "../chrome/icons";
 import { Popover, type PopoverAnchor } from "../chrome/Popover";
 import { diffCommentLocation, formatDiffComment } from "../lib/diffComment";
+import { MOD } from "../lib/platform";
 import { requestAddToChat } from "../lib/quoteDraft";
 import type { UnifiedLine } from "../lib/unifiedDiff";
 
@@ -13,41 +13,21 @@ export type DiffCommentComposerTarget = {
 
 export function DiffCommentComposer({
   path,
-  sourcePath = path,
   target,
-  onBeforeSend,
   onDismiss,
 }: {
   path: string;
-  sourcePath?: string;
   target: DiffCommentComposerTarget;
-  onBeforeSend?: () => Promise<void>;
   onDismiss: () => void;
 }) {
   const [comment, setComment] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const location = diffCommentLocation({ path, line: target.line });
-  const send = async (deliver: (text: string) => void) => {
-    if (busy) return;
-    const text = formatDiffComment(
-      { path: sourcePath, line: target.line },
-      comment,
-    );
+  const addToChat = () => {
+    const text = formatDiffComment({ path, line: target.line }, comment);
     if (!text) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await onBeforeSend?.();
-      deliver(text);
-      onDismiss();
-    } catch (caught: unknown) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusy(false);
-    }
+    requestAddToChat(text, "plain");
+    onDismiss();
   };
-  const addToChat = () => send((text) => requestAddToChat(text, "plain"));
 
   return (
     <Popover
@@ -55,19 +35,19 @@ export function DiffCommentComposer({
       side="right"
       align="start"
       gap={6}
-      width={360}
+      width={320}
       onDismiss={onDismiss}
       role="dialog"
       aria-label={`Comment on ${location}`}
-      className="overflow-hidden"
+      className="p-2"
     >
       <form
         onSubmit={(event) => {
           event.preventDefault();
-          void addToChat();
+          addToChat();
         }}
       >
-        <div className="flex items-center gap-2 border-b border-content/10 px-3 py-2">
+        <div className="mb-1.5 flex items-center gap-2 px-0.5">
           <span
             className="min-w-0 flex-1 truncate font-mono text-[11px] text-content/55"
             title={location}
@@ -96,44 +76,18 @@ export function DiffCommentComposer({
               comment.trim()
             ) {
               event.preventDefault();
-              void addToChat();
+              addToChat();
             }
           }}
-          placeholder="Comment on this line…"
-          className="block max-h-40 min-h-20 w-full resize-y bg-transparent px-3 py-2 text-[13px] leading-5 text-content outline-none placeholder:text-content/35"
+          placeholder="Leave a comment…"
+          className="max-h-40 min-h-18 w-full resize-y rounded-lg border border-content/10 bg-background-base/70 px-2.5 py-2 text-[13px] leading-5 text-content outline-none placeholder:text-content/35 focus:border-content/20"
         />
-        {error ? (
-          <p
-            role="alert"
-            className="border-t border-content/10 px-3 py-1 text-[11px] text-red-400"
-          >
-            {error}
-          </p>
-        ) : null}
-        <div className="flex items-center justify-end gap-1 border-t border-content/10 p-1.5">
-          <button
-            type="button"
-            disabled={busy || !comment.trim()}
-            className="inline-flex h-7 items-center gap-1.5 rounded-lg px-2 text-[12px] text-content/65 hover:bg-content/5 disabled:opacity-40"
-            onClick={() =>
-              void send((text) =>
-                requestAgentContext({
-                  context: contextFromText(
-                    `Diff comment ${location}`,
-                    text,
-                    sourcePath,
-                  ),
-                }),
-              )
-            }
-          >
-            <Bot className="size-3.5" strokeWidth={1.75} />
-            Send to agent…
-          </button>
+        <div className="mt-2 flex items-center justify-between gap-3">
+          <span className="text-[10px] text-content/35">{MOD}↩ to add</span>
           <button
             type="submit"
-            disabled={busy || !comment.trim()}
-            className="inline-flex h-7 items-center gap-1.5 rounded-lg bg-content/10 px-2.5 text-[12px] font-medium text-content hover:bg-content/15 disabled:cursor-default disabled:opacity-40"
+            disabled={!comment.trim()}
+            className="inline-flex h-7 items-center gap-1.5 rounded-md bg-content px-2.5 text-[12px] font-medium text-background-base hover:opacity-80 disabled:cursor-default disabled:opacity-40"
           >
             <MessageSquarePlus className="size-3.5" strokeWidth={1.75} />
             Add to chat

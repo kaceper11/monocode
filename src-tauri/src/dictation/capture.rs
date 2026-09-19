@@ -114,8 +114,14 @@ pub fn start(sink: Arc<Mutex<AudioBuffer>>) -> Result<Capture, String> {
     let supported = device
         .default_input_config()
         .map_err(|error| format!("Cannot read microphone config on {device_name}: {error}"))?;
-    let channels = (supported.channels() as usize).max(1);
+    let channels = supported.channels() as usize;
+    if !(1..=32).contains(&channels) {
+        return Err("Unsupported microphone channel count".into());
+    }
     let input_rate = supported.sample_rate();
+    if !(4_000..=768_000).contains(&input_rate) {
+        return Err("Unsupported microphone sample rate".into());
+    }
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
 
@@ -163,7 +169,12 @@ where
                 for frame in data.chunks(channels) {
                     let mut sum = 0.0f32;
                     for sample in frame {
-                        sum += (*sample).to_sample::<f32>();
+                        let value = (*sample).to_sample::<f32>();
+                        sum += if value.is_finite() {
+                            value.clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        };
                     }
                     mono.push(sum / channels as f32);
                 }
@@ -278,7 +289,7 @@ mod macos {
                 requestAccessForMediaType: &*media,
                 completionHandler: &*handler];
         }
-        let _ = rx.recv();
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(60));
         authorization_status()
     }
 }

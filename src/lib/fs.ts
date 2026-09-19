@@ -44,6 +44,22 @@ export type FsEntry = {
   ignored: boolean;
 };
 
+export type ExternalEditor = {
+  id: string;
+  name: string;
+};
+
+export function listExternalEditors(): Promise<ExternalEditor[]> {
+  return invoke<ExternalEditor[]>("list_external_editors");
+}
+
+export function openInExternalEditor(
+  editorId: string,
+  cwd: string,
+): Promise<void> {
+  return invoke<void>("open_in_external_editor", { editorId, cwd });
+}
+
 export type ProjectFile = {
   name: string;
   path: string;
@@ -70,8 +86,10 @@ export type DiscoveredSkill = {
     | "omp"
     | "fx"
     | "grok"
+    | "hermes"
     | "devin"
     | "copilot"
+    | "muse"
     | "monocode";
 };
 
@@ -93,8 +111,6 @@ export type GitDiffStats = {
   files: number;
   additions: number;
   deletions: number;
-  /** Head branch (or short HEAD when detached) — same as GitDiffIndex.branch. */
-  branch: string | null;
 };
 
 export function gitDiffStats(cwd: string): Promise<GitDiffStats> {
@@ -112,10 +128,8 @@ export type GitChangedFile = {
 };
 
 export type GitDiffIndex = {
-  /** The cwd sits inside a Git work tree — a plain folder produces the same
-   * empty index as a clean repo without this flag. */
-  isRepo: boolean;
   branch: string | null;
+  head: string | null;
   files: GitChangedFile[];
   additions: number;
   deletions: number;
@@ -125,20 +139,7 @@ export type GitDiffIndex = {
   ahead: number;
   behind: number;
   aheadOfDefault: number;
-  /** A merge, rebase, patch apply (`git am`), cherry-pick or revert is in progress. */
-  opInProgress: boolean;
-  /** "merge" | "rebase" | "am" | "cherry-pick" | "revert" — "" when none. */
-  op: string;
-  /** Unmerged paths while an operation is in progress (bounded). */
-  conflicts: string[];
-  /** Short SHA of MERGE_HEAD (or the rebased head) when known. */
-  mergeHead: string | null;
-  /** HEAD is detached — `branch` then holds a short SHA, not a branch. */
-  detached: boolean;
-  /** "Keep local" files — skip-worktree entries git hides from status and
-   * refuses to stage or commit. Tracked entries are local edits; untracked
-   * ones are parked intent-to-add files. */
-  localOnly: GitChangedFile[];
+  headPushed: boolean;
 };
 
 export function gitDiffIndex(cwd: string): Promise<GitDiffIndex> {
@@ -161,13 +162,7 @@ export type GitFileDiff = {
 };
 
 export type GitFileDiffKind = "staged" | "unstaged";
-
-export type GitDiffGuard = {
-  kind: GitFileDiffKind;
-  status: string;
-  original: string;
-  current: string;
-};
+export type GitDiffGuard = { kind: GitFileDiffKind; status: string; original: string; current: string };
 
 export function gitFileDiff(
   cwd: string,
@@ -259,18 +254,16 @@ export function gitUnstageAll(cwd: string): Promise<void> {
   return invoke<void>("git_unstage_all", { cwd });
 }
 
-/** Hide a file's local state from staging and commits (skip-worktree). */
-export function gitKeepLocal(cwd: string, relative: string): Promise<void> {
-  return invoke<void>("git_keep_local", { cwd, relative });
+export function gitCommit(
+  cwd: string,
+  message: string,
+  amend = false,
+): Promise<void> {
+  return invoke<void>("git_commit", { cwd, message, amend });
 }
 
-/** Remove the keep-local flag so the file's real state shows again. */
-export function gitUnkeepLocal(cwd: string, relative: string): Promise<void> {
-  return invoke<void>("git_unkeep_local", { cwd, relative });
-}
-
-export function gitCommit(cwd: string, message: string): Promise<void> {
-  return invoke<void>("git_commit", { cwd, message });
+export function gitHeadMessage(cwd: string): Promise<string> {
+  return invoke<string>("git_head_message", { cwd });
 }
 
 export type GitStagedContext = {
@@ -295,88 +288,6 @@ export function gitSync(cwd: string): Promise<void> {
   return invoke<void>("git_sync", { cwd });
 }
 
-export type GitUpdateResult = {
-  /** "updated" | "up-to-date" | "conflicts" */
-  outcome: string;
-  branch: string;
-  updatedFrom: string;
-  conflicts: string[];
-};
-
-/**
- * Fetch `base` (the PR's target branch, or the remote default when absent)
- * and merge or rebase it into the checkout. Refuses a dirty tree; conflicts
- * stay in progress for explicit resolution.
- */
-export function gitUpdateFromDefault(
-  cwd: string,
-  mode: "merge" | "rebase",
-  base?: string,
-  expectedBranch?: string,
-): Promise<GitUpdateResult> {
-  return invoke<GitUpdateResult>("git_update_from_default", {
-    cwd,
-    mode,
-    base,
-    expectedBranch,
-  });
-}
-
-/** Abort an in-progress merge, rebase, `git am`, cherry-pick or revert, leaving the checkout clean. */
-export function gitMergeAbort(cwd: string): Promise<void> {
-  return invoke<void>("git_merge_abort", { cwd });
-}
-
-export type GitSyncResult = {
-  /** "merged" | "up-to-date" | "conflicted" | "refused" */
-  outcome: string;
-  branch: string;
-  /** The remote ref merged, e.g. "origin/main". */
-  syncedWith: string;
-  /** Subjects of the incoming commits the merge brought in (bounded). */
-  commits: string[];
-  /** Total incoming commits — `commits` may be truncated. */
-  commitCount: number;
-  /** Conflicted paths when the merge stopped; left in progress. */
-  conflicts: string[];
-  /** Why a refused sync did not run. */
-  reason: string;
-};
-
-/**
- * Fetch the remote default branch and merge `remote/<default>` into this
- * exact working copy on its own host. Merge only; never pushes. A dirty
- * tree, an operation already in progress, a branch that moved since
- * `expectedBranch` was confirmed, or a second concurrent sync is refused
- * as data — nothing is stashed or queued.
- */
-export function gitSyncBranch(
-  cwd: string,
-  expectedBranch?: string,
-): Promise<GitSyncResult> {
-  return invoke<GitSyncResult>("git_sync_branch", { cwd, expectedBranch });
-}
-
-export type GitMergeContext = {
-  /** A merge, rebase, patch apply (`git am`), cherry-pick or revert is in progress. */
-  merging: boolean;
-  /** "merge" | "rebase" | "am" | "cherry-pick" | "revert" — "" when none. */
-  op: string;
-  /** Unmerged paths (bounded). */
-  conflicts: string[];
-  /** Short SHA of the head being applied (MERGE_HEAD…) when known. */
-  mergeHead: string | null;
-  /** Remote-tracking ref verified to name MERGE_HEAD, e.g. "origin/main". */
-  incomingRef: string | null;
-  /** Bounded combined diff of the conflicted paths — both sides. */
-  diff: string;
-};
-
-/** Live merge state — honest after restart, unlike a remembered result. */
-export function gitMergeContext(cwd: string): Promise<GitMergeContext> {
-  return invoke<GitMergeContext>("git_merge_context", { cwd });
-}
-
 export type GitRangeContext = {
   base: string;
   head: string;
@@ -385,14 +296,8 @@ export type GitRangeContext = {
   diffPatch: string;
 };
 
-export function gitRangeContext(
-  cwd: string,
-  base?: string,
-): Promise<GitRangeContext> {
-  return invoke<GitRangeContext>("git_range_context", {
-    cwd,
-    base: base ?? null,
-  });
+export function gitRangeContext(cwd: string): Promise<GitRangeContext> {
+  return invoke<GitRangeContext>("git_range_context", { cwd });
 }
 
 export type GitPr = {
@@ -400,7 +305,6 @@ export type GitPr = {
   title: string;
   url: string;
   state: string;
-  base?: string;
 };
 
 export function gitPrStatus(cwd: string): Promise<GitPr | null> {
@@ -413,54 +317,14 @@ export function gitPrCreate(
   body: string,
   base: string,
   head: string,
-  draft = false,
 ): Promise<string> {
-  return invoke<string>("git_pr_create", {
-    cwd,
-    title,
-    body,
-    base,
-    head,
-    draft,
-  });
-}
-
-export function gitPrUpdate(
-  cwd: string,
-  url: string,
-  body: string,
-): Promise<void> {
-  return invoke<void>("git_pr_update", { cwd, url, body });
-}
-
-export function gitPrBody(cwd: string, url: string): Promise<string> {
-  return invoke<string>("git_pr_body", { cwd, url });
-}
-
-export type GitPrCheck = {
-  branch: string | null;
-  remote: string | null;
-  upstream: string | null;
-  defaultBranch: string | null;
-  dirtyFiles: number;
-  dirtyLimited: boolean;
-  published: boolean;
-  aheadOfRemote: number;
-  targetExists: boolean;
-  ahead: number;
-  behind: number;
-  commits: string[];
-};
-
-export function gitPrCheck(cwd: string, target: string): Promise<GitPrCheck> {
-  return invoke<GitPrCheck>("git_pr_check", { cwd, target });
+  return invoke<string>("git_pr_create", { cwd, title, body, base, head });
 }
 
 export type GitBranchInfo = {
   name: string;
   current: boolean;
   remote: string | null;
-  worktree: string | null;
 };
 
 export type GitBranches = {
@@ -477,8 +341,8 @@ export function gitCheckout(
   cwd: string,
   name: string,
   remote?: string | null,
-): Promise<{ branch: string; worktree: string | null }> {
-  return invoke("git_checkout", { cwd, name, remote: remote ?? null });
+): Promise<string> {
+  return invoke<string>("git_checkout", { cwd, name, remote: remote ?? null });
 }
 
 export function gitCreateBranch(cwd: string, name: string): Promise<string> {
@@ -499,42 +363,10 @@ export function isCheckoutBlockedByChanges(message: string): boolean {
   );
 }
 
-/** Preserve the exact checkout and provider session when restoring old records. */
-export function restoreSessionCheckout<
-  T extends {
-    cwd: string;
-    branch?: string;
-    worktreeCwd?: string;
-    providerSessionId?: string;
-  },
->(session: T): T {
-  return session;
-}
-
 const GIT_CHANGED = "monocode-git-changed";
-
-// Paths already notified this tick. Batch mutations (a task launch creates
-// several worktrees in one repository) re-notify the same anchor for every
-// child; the first dispatch already tells listeners to reload, so repeats
-// in the same tick only multiply downstream probes. Dispatch stays
-// synchronous — callers rely on listeners having run by the next line.
-const notifiedThisTick = new Set<string>();
-let notifiedResetQueued = false;
 
 /** Tell git UIs (diff pane, branch picker) to reload after a local git mutation. */
 export function notifyGitChanged(cwd?: string) {
-  if (cwd !== undefined) {
-    const key = pathKey(cwd);
-    if (notifiedThisTick.has(key)) return;
-    notifiedThisTick.add(key);
-    if (!notifiedResetQueued) {
-      notifiedResetQueued = true;
-      queueMicrotask(() => {
-        notifiedThisTick.clear();
-        notifiedResetQueued = false;
-      });
-    }
-  }
   window.dispatchEvent(new CustomEvent(GIT_CHANGED, { detail: cwd }));
 }
 
@@ -584,6 +416,18 @@ export function movePath(from: string, destParent: string): Promise<string> {
   return invoke<string>("move_path", { from, destParent }).then(slash);
 }
 
+/** macOS only. Other platforms return an empty list. */
+export function clipboardFilePaths(): Promise<string[]> {
+  return invoke<string[]>("clipboard_file_paths").then((paths) =>
+    paths.map(slash),
+  );
+}
+
+/** Put the original file on the macOS clipboard, preserving its name and type. */
+export function copyFileToClipboard(path: string): Promise<void> {
+  return invoke<void>("copy_file_to_clipboard", { path });
+}
+
 export function revealPath(path: string): Promise<void> {
   return invoke<void>("reveal_path", { path });
 }
@@ -607,28 +451,7 @@ export async function pickFolder(
   return typeof selected === "string" && selected ? slash(selected) : null;
 }
 
-/** Multi-select variant of pickFolder — every chosen folder comes back. */
-export async function pickFolders(
-  title = "Open project",
-  defaultPath?: string,
-): Promise<string[] | null> {
-  const selected = await open({
-    directory: true,
-    multiple: true,
-    title,
-    defaultPath,
-  });
-  const paths = (
-    Array.isArray(selected) ? selected : selected ? [selected] : []
-  )
-    .filter((path): path is string => Boolean(path))
-    .map(slash);
-  return paths.length ? paths : null;
-}
-
-export async function pickFiles(
-  title = "Attach files",
-): Promise<string[] | null> {
+export async function pickFiles(title = "Attach files"): Promise<string[] | null> {
   const selected = await open({
     multiple: true,
     directory: false,

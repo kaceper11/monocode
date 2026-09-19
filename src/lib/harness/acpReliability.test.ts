@@ -95,7 +95,7 @@ vi.mock("./cursorStore", () => ({
   readStoredCursorSubagentRuns: async () => [],
 }));
 const providers = [
-  {
+{
     id: "devin",
     model: "swe-2",
     ...(await import("./devin").then((m) => ({
@@ -106,7 +106,7 @@ const providers = [
       bind: m.bindDevinSession,
     }))),
   },
-  {
+{
     id: "copilot",
     model: "gpt-5.4",
     ...(await import("./copilot").then((m) => ({
@@ -116,40 +116,7 @@ const providers = [
       cancel: m.cancelCopilotTurn,
       bind: m.bindCopilotSession,
     }))),
-  },
-  {
-    id: "cursor",
-    model: "composer-2.5",
-    ...(await import("./cursor").then((m) => ({
-      send: m.sendCursorTurn,
-      stop: m.stopCursorSession,
-      forget: m.forgetCursorSession,
-      cancel: m.cancelCursorTurn,
-      bind: m.bindCursorSession,
-    }))),
-  },
-  {
-    id: "grok",
-    model: "grok-4.6",
-    ...(await import("./grok").then((m) => ({
-      send: m.sendGrokTurn,
-      stop: m.stopGrokSession,
-      forget: m.forgetGrokSession,
-      cancel: m.cancelGrokTurn,
-      bind: m.bindGrokSession,
-    }))),
-  },
-  {
-    id: "fx",
-    model: "zai/glm-5.2",
-    ...(await import("./fx").then((m) => ({
-      send: m.sendFxTurn,
-      stop: m.stopFxSession,
-      forget: m.forgetFxSession,
-      cancel: m.cancelFxTurn,
-      bind: m.bindFxSession,
-    }))),
-  },
+  }
 ];
 function setup(thread: string) {
   const provider = providers.find((p) => thread.startsWith(p.id))!;
@@ -304,29 +271,8 @@ describe.each(
   });
 });
 
-it("bounds Cursor's otherwise silent initialize request", async () => {
-  vi.useFakeTimers();
-  wire.holdInitialize = true;
-  const provider = providers.find((p) => p.id === "cursor")!;
-  const turn = input(provider);
-  const rejected = expect(provider.send(turn)).rejects.toThrow(
-    /initialize timed out/,
-  );
-  await until(() => methods(turn.sessionId).includes("initialize"));
-  await vi.advanceTimersByTimeAsync(15_001);
-  await rejected;
-  expect(methods(turn.sessionId)).not.toContain("session/prompt");
-});
-
-import {
-  acpAutoOption,
-  acpElicitation,
-  acpElicitationResult,
-  acpPermissionOptionId,
-  acpPermissionRequest,
-} from "./acp";
+import { acpUnsupportedControl, acpAutoOption, acpElicitation, acpElicitationResult, acpPermissionOptionId, acpPermissionRequest } from "./acpProtocol";
 import { AcpSubagents } from "./acpSubagents";
-import { respondCursorQuestion } from "./cursor";
 
 it("uses opaque permission ids according to their advertised kind", () => {
   const request = acpPermissionRequest({
@@ -421,55 +367,6 @@ it("bounds completed child routing state while preserving a recent child's steps
   );
 });
 
-it("does not silently acknowledge a typed Cursor answer it cannot transmit", async () => {
-  const provider = providers.find((p) => p.id === "cursor")!;
-  const events: HarnessEvent[] = [];
-  const turn = input(provider, events);
-  await provider.send(turn);
-  wire.listeners.get(turn.sessionId)!(
-    JSON.stringify({
-      jsonrpc: "2.0",
-      id: 777,
-      method: "cursor/ask_question",
-      params: {
-        questions: [
-          {
-            id: "q",
-            prompt: "Which option?",
-            allowCustom: true,
-            options: [
-              { id: "a", label: "A" },
-              { id: "other", label: "Other" },
-            ],
-          },
-        ],
-      },
-    }),
-  );
-  await until(() => events.some((event) => event.type === "question.asked"));
-  respondCursorQuestion(turn.sessionId, 777, {
-    kind: "answered",
-    answers: { q: ["__custom__"] },
-    custom: { q: "typed answer" },
-  });
-  await until(() => events.some((event) => event.type === "question.error"));
-  expect(wire.sent.some((message) => message.id === 777)).toBe(false);
-  expect(events.some((event) => event.type === "question.resolved")).toBe(
-    false,
-  );
-  respondCursorQuestion(turn.sessionId, 777, {
-    kind: "answered",
-    answers: { q: ["a"] },
-  });
-  await until(() => wire.sent.some((message) => message.id === 777));
-  expect(wire.sent.find((message) => message.id === 777)?.result).toEqual({
-    outcome: {
-      outcome: "answered",
-      answers: [{ questionId: "q", selectedOptionIds: ["a"] }],
-    },
-  });
-});
-
 import { respondDevinQuestion } from "./devin";
 import { respondCopilotQuestion } from "./copilot";
 
@@ -506,7 +403,7 @@ it.each(["devin", "copilot"])(
       const priorErrors = events.filter(
         (event) => event.type === "question.error",
       ).length;
-      respond(turn.sessionId, 778, {
+      respond(turn.sessionId, events.find((event) => event.type === "question.asked")!.requestId, {
         kind: "answered",
         answers: {},
         custom: { count },
@@ -521,7 +418,7 @@ it.each(["devin", "copilot"])(
       );
       expect(wire.sent.some((message) => message.id === 778)).toBe(false);
     }
-    respond(turn.sessionId, 778, {
+    respond(turn.sessionId, events.find((event) => event.type === "question.asked")!.requestId, {
       kind: "answered",
       answers: {},
       custom: { count: "4" },
@@ -564,17 +461,13 @@ it.each(providers)(
     ).toHaveLength(2);
   },
 );
-
-import { respondGrokQuestion } from "./grok";
 import { applyHarnessEvent } from "./apply";
 import { newSession } from "../session";
 import { buildQuestionReply } from "../userQuestion";
 
 const questionProviders = [
-  { id: "devin", method: "elicitation/create", respond: respondDevinQuestion },
-  { id: "copilot", method: "elicitation/create", respond: respondCopilotQuestion },
-  { id: "cursor", method: "cursor/ask_question", respond: respondCursorQuestion },
-  { id: "grok", method: "_x.ai/ask_user_question", respond: respondGrokQuestion },
+{ id: "devin", method: "elicitation/create", respond: respondDevinQuestion },
+{ id: "copilot", method: "elicitation/create", respond: respondCopilotQuestion }
 ];
 function ask(thread: string, id: number, method: string) {
   const params = method === "elicitation/create"
@@ -593,13 +486,16 @@ describe.each(questionProviders)("$id overlapping questions", ({ id, method, res
     ask(turn.sessionId, 802, method);
     await until(() => events.some((event) => event.type === "question.asked"));
     let session = events.reduce(applyHarnessEvent, newSession(provider.id, turn.cwd));
-    expect(session.pendingQuestion?.requestId).toBe(801);
+    const first = events.find((event) => event.type === "question.asked")!;
+    expect(session.pendingQuestion?.requestId).toBe(first.requestId);
     expect(events.filter((event) => event.type === "question.asked")).toHaveLength(1);
-    respond(turn.sessionId, 801, { kind: "answered", answers: { q: ["yes"] } });
+    respond(turn.sessionId, first.requestId, { kind: "answered", answers: { q: ["yes"] } });
     await until(() => events.filter((event) => event.type === "question.asked").length === 2);
     session = events.reduce(applyHarnessEvent, newSession(provider.id, turn.cwd));
-    expect(session.pendingQuestion?.requestId).toBe(802);
-    respond(turn.sessionId, 802, { kind: "answered", answers: { q: ["no"] } });
+    const second = events.filter((event) => event.type === "question.asked")[1];
+    expect(second.requestId).not.toBe(first.requestId);
+    expect(session.pendingQuestion?.requestId).toBe(second.requestId);
+    respond(turn.sessionId, second.requestId, { kind: "answered", answers: { q: ["no"] } });
     await until(() => wire.sent.some((message) => message.id === 802));
     session = events.reduce(applyHarnessEvent, newSession(provider.id, turn.cwd));
     expect(session.pendingQuestion).toBeUndefined();
@@ -631,35 +527,6 @@ describe.each(questionProviders)("$id overlapping questions", ({ id, method, res
   });
 });
 
-it.each([false, true])("Cursor never approves a plan automatically (cancelled=%s)", async (cancelled) => {
-  const provider = providers.find((p) => p.id === "cursor")!;
-  const events: HarnessEvent[] = [];
-  const turn = { ...input(provider, events), intent: "plan" as const };
-  wire.holdPrompt = true;
-  const running = provider.send(turn);
-  await until(() => methods(turn.sessionId).includes("session/prompt"));
-  if (cancelled) {
-    await provider.cancel(turn.sessionId);
-    await running;
-  }
-  wire.listeners.get(turn.sessionId)!(JSON.stringify({
-    jsonrpc: "2.0", id: 805, method: "cursor/create_plan",
-    params: { toolCallId: "plan-tool", plan: "Change implementation" },
-  }));
-  await until(() => wire.sent.some((message) => message.id === 805));
-  expect(wire.sent.find((message) => message.id === 805)?.result).toEqual({
-    outcome: cancelled ? { outcome: "cancelled" } : {
-      outcome: "rejected",
-      reason: "Review the plan in MonoCode and start a Build turn to approve implementation.",
-    },
-  });
-  expect(events.some((event) => event.type === "plan")).toBe(!cancelled);
-  if (!cancelled) {
-    await provider.cancel(turn.sessionId);
-    await running;
-  }
-});
-
 it.each(["devin", "copilot"])("%s keeps a form open when a required field is skipped", async (id) => {
   const provider = providers.find((p) => p.id === id)!;
   const respond = id === "devin" ? respondDevinQuestion : respondCopilotQuestion;
@@ -676,11 +543,11 @@ it.each(["devin", "copilot"])("%s keeps a form open when a required field is ski
   await until(() => events.some((event) => event.type === "question.asked"));
   const asked = events.find((event) => event.type === "question.asked")!;
   // QuestionForm's per-field Skip submits the earlier answers through this builder.
-  respond(turn.sessionId, 806, buildQuestionReply(asked.questions, {}, { host: "example.com" }));
+  respond(turn.sessionId, asked.requestId, buildQuestionReply(asked.questions, {}, { host: "example.com" }));
   await until(() => events.some((event) => event.type === "question.error"));
   expect(events.some((event) => event.type === "question.resolved")).toBe(false);
   expect(wire.sent.some((message) => message.id === 806)).toBe(false);
-  respond(turn.sessionId, 806, buildQuestionReply(asked.questions, {}, { host: "example.com", port: "443" }));
+  respond(turn.sessionId, asked.requestId, buildQuestionReply(asked.questions, {}, { host: "example.com", port: "443" }));
   await until(() => wire.sent.some((message) => message.id === 806));
   expect(wire.sent.find((message) => message.id === 806)?.result).toEqual({
     action: "accept", content: { host: "example.com", port: 443 },
@@ -816,25 +683,42 @@ describe.each(modeProviders)("$id latest runtime mode", ({ id, auto, setMode }) 
   });
 });
 
-it.each([false, true])("Grok preserves the Build boundary and suppresses cancelled plan output (cancelled=%s)", async (cancelled) => {
-  const provider = providers.find((p) => p.id === "grok")!;
-  const events: HarnessEvent[] = [];
-  const turn = { ...input(provider, events), intent: "plan" as const };
-  wire.holdPrompt = true;
+
+it("round-trips prototype-named elicitation fields and choices as data", () => {
+  const parsed = acpElicitation(JSON.parse(`{
+    "requestedSchema": {"properties": {
+      "__proto__": {"type": "string", "enum": ["__proto__"]},
+      "choice": {"type": "string", "enum": ["safe"]}
+    }}
+  }`))!;
+  const reply = { kind: "answered" as const, answers: JSON.parse('{"__proto__": ["__proto__"], "choice": ["constructor"]}') };
+  const result = acpElicitationResult(reply, parsed.questions, parsed.fields);
+  expect(JSON.stringify(result)).toBe('{"action":"accept","content":{"__proto__":"__proto__"}}');
+});
+
+
+it("does not reinterpret a coded policy failure as an unsupported control", () => {
+  expect(acpUnsupportedControl(Object.assign(new Error("Method not found"), { code: -32601 }))).toBe(true);
+  expect(acpUnsupportedControl(new Error("Method not found"))).toBe(true);
+  expect(acpUnsupportedControl(Object.assign(new Error("Policy not implemented for this account"), { code: -32000 }))).toBe(false);
+});
+
+
+it.each(providers)("$id rejects excessive startup notifications without sending a prompt", async (provider) => {
+  wire.holdInitialize = true;
+  const turn = input(provider);
   const running = provider.send(turn);
-  await until(() => methods(turn.sessionId).includes("session/prompt"));
-  if (cancelled) {
-    await provider.cancel(turn.sessionId);
-    await running;
+  void running.catch(() => undefined);
+  await until(() => methods(turn.sessionId).includes("initialize"));
+  const line = wire.listeners.get(turn.sessionId)!;
+  for (let index = 0; index < 257; index++) {
+    line(JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: {
+      update: { sessionUpdate: "available_commands_update", availableCommands: [] },
+    } }));
   }
-  wire.listeners.get(turn.sessionId)!(JSON.stringify({ jsonrpc: "2.0", id: 909,
-    method: "_x.ai/exit_plan_mode", params: { plan: "Proposed changes" },
-  }));
-  await until(() => wire.sent.some((message) => message.id === 909));
-  expect(wire.sent.find((message) => message.id === 909)?.result).toEqual({ outcome: "abandoned" });
-  expect(events.some((event) => event.type === "plan")).toBe(!cancelled);
-  if (!cancelled) {
-    await provider.cancel(turn.sessionId);
-    await running;
-  }
+  let settled = false;
+  void running.catch(() => { settled = true; });
+  await until(() => settled);
+  await expect(running).rejects.toThrow(/startup notification limit/);
+  expect(methods(turn.sessionId)).not.toContain("session/prompt");
 });
