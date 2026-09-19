@@ -27,7 +27,6 @@ import {
   LoaderCircle,
   MessageMultiple,
   PanelLeft,
-  Plus,
   RefreshCw,
   Search,
   type IconComponent,
@@ -44,7 +43,6 @@ import {
   InboxFiltersMenu,
   INBOX_FILTER_MENU_WIDTH,
 } from "../chrome/InboxFiltersMenu";
-import { InboxConnectMenu } from "../chrome/InboxConnectMenu";
 import { InboxProviderMark } from "../chrome/InboxProviderMark";
 import { ProjectLogoIcon } from "../chrome/ProjectLogoIcon";
 import { ProjectMascot } from "../chrome/ProjectMascot";
@@ -374,8 +372,6 @@ export function InboxView({
   const [source, setSource] = useState(() =>
     resolveInboxSource(loadInboxSource(), connections),
   );
-  const [connectMenuOpen, setConnectMenuOpen] = useState(false);
-  const connectButtonRef = useRef<HTMLButtonElement | null>(null);
   const [filterMenu, setFilterMenu] = useState<{ x: number; y: number } | null>(
     null,
   );
@@ -457,15 +453,11 @@ export function InboxView({
         setFilterMenu(null);
         return;
       }
-      if (connectMenuOpen) {
-        setConnectMenuOpen(false);
-        return;
-      }
       onCloseRef.current?.();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [connectMenuOpen, filterMenu]);
+  }, [filterMenu]);
 
   useEffect(() => {
     const onChange = () => {
@@ -873,8 +865,8 @@ export function InboxView({
       ref={resize.setPaneRef}
       className="relative flex h-full min-h-0 shrink-0 flex-col border-r border-stroke"
     >
-      <div className="flex h-9 shrink-0 items-center gap-px border-b border-stroke px-2">
-        {visibleSources.length > 0 ? (
+      {visibleSources.length > 0 ? (
+        <div className="flex h-9 shrink-0 items-center gap-px border-b border-stroke px-2">
           <div
             role="tablist"
             aria-label="Inbox source"
@@ -890,27 +882,8 @@ export function InboxView({
               />
             ))}
           </div>
-        ) : null}
-        {connectableSources.length > 0 ? (
-          <button
-            ref={connectButtonRef}
-            type="button"
-            aria-label="Connect an inbox source"
-            aria-haspopup="menu"
-            aria-expanded={connectMenuOpen}
-            title="Connect an inbox source"
-            onClick={() => setConnectMenuOpen((open) => !open)}
-            className={`flex h-6 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-[12px] leading-none ${
-              connectMenuOpen
-                ? "bg-selection text-content"
-                : "text-content/40 hover:bg-content/5 hover:text-content"
-            }`}
-          >
-            <Plus className="size-3.5 shrink-0" strokeWidth={1.75} />
-            <span className="min-w-0 truncate">Add connection</span>
-          </button>
-        ) : null}
-      </div>
+        </div>
+      ) : null}
       {noSourcesConnected ? null : (
         <div className="flex h-9 shrink-0 items-center gap-1 border-b border-stroke px-2">
           <div className="relative flex h-7 min-w-0 flex-1 items-center">
@@ -980,7 +953,16 @@ export function InboxView({
       >
         {noSourcesConnected ? (
           <p className="px-3 py-3 text-[12px] text-content/50">
-            Add a connection to start using the Inbox.
+            <button
+              type="button"
+              className="underline"
+              onClick={() =>
+                onOpenIntegrations(connectableSources[0] ?? "github")
+              }
+            >
+              Add a connection
+            </button>{" "}
+            to start using the Inbox.
           </p>
         ) : sourceError && visibleItems.length === 0 ? (
           <p className="px-3 py-2 text-[12px] text-content/50">{sourceError}</p>
@@ -1092,16 +1074,6 @@ export function InboxView({
     />
   ) : null;
 
-  const connectPortal =
-    connectMenuOpen && connectableSources.length > 0 ? (
-      <InboxConnectMenu
-        anchor={connectButtonRef}
-        sources={connectableSources}
-        onConnect={onOpenIntegrations}
-        onClose={() => setConnectMenuOpen(false)}
-      />
-    ) : null;
-
   return (
     <div
       role="region"
@@ -1158,7 +1130,6 @@ export function InboxView({
         </div>
       </div>
       {filtersPortal}
-      {connectPortal}
     </div>
   );
 }
