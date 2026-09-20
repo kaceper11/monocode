@@ -25,6 +25,8 @@ export function SearchableSelect({
   emptyLabel = "No matching options",
   disabled = false,
   layer,
+  compact = false,
+  minMenuWidth,
 }: {
   label: string;
   value: string;
@@ -35,6 +37,11 @@ export function SearchableSelect({
   emptyLabel?: string;
   disabled?: boolean;
   layer?: number;
+  /** h-8/text-[12px] trigger for dense rows. */
+  compact?: boolean;
+  /** Floor for the dropdown width — long option labels stay readable even
+   * when the trigger itself is narrow. */
+  minMenuWidth?: number;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -158,7 +165,7 @@ export function SearchableSelect({
           event.preventDefault();
           openMenu();
         }}
-        className="flex h-9 w-full items-center justify-between gap-2 rounded-md border border-content/10 bg-background-base px-2.5 text-left text-[13px] outline-none hover:border-content/20 focus:border-content/25 disabled:opacity-50 active:scale-[0.99]"
+        className={`flex ${compact ? "h-8 text-[12px]" : "h-9 text-[13px]"} w-full items-center justify-between gap-2 rounded-md border border-content/10 bg-background-base px-2.5 text-left outline-none hover:border-content/20 focus:border-content/25 disabled:opacity-50 active:scale-[0.99]`}
       >
         <span
           className={`min-w-0 flex-1 truncate ${selected ? "text-content" : "text-content/40"}`}
@@ -176,7 +183,9 @@ export function SearchableSelect({
           side="bottom"
           align="start"
           gap={4}
-          width={menuWidth}
+          width={
+            minMenuWidth ? Math.max(menuWidth ?? 0, minMenuWidth) : menuWidth
+          }
           maxHeight={300}
           layer={layer}
           role="dialog"

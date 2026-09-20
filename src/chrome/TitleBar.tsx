@@ -1,4 +1,5 @@
 import {
+  ChartBreakoutSquare,
   CheckCircle,
   ChevronLeft,
   ChevronRight,
@@ -85,6 +86,7 @@ type Props = {
   onNewTerminal?: () => void;
   onOpenSettings?: () => void;
   onOpenInbox?: () => void;
+  onOpenBoard?: () => void;
   onOpenNotes?: () => void;
   onClose: (id: string) => void;
   onCloseMany: (ids: string[], fallbackId: string) => void;
@@ -577,6 +579,7 @@ function TitleBarComponent({
   onNewTerminal,
   onOpenSettings,
   onOpenInbox,
+  onOpenBoard,
   onOpenNotes,
   onClose,
   onCloseMany,
@@ -768,7 +771,7 @@ function TitleBarComponent({
   const showTrailingActions =
     (projectless &&
       railClosed &&
-      Boolean(onOpenInbox || onOpenNotes || onOpenSettings)) ||
+      Boolean(onOpenInbox || onOpenBoard || onOpenNotes || onOpenSettings)) ||
     (railClosed && !projectless);
   const trailingControls = showTrailingActions || !IS_MAC ? (
     <div className="flex h-full shrink-0 items-stretch">
@@ -777,6 +780,11 @@ function TitleBarComponent({
           {projectless && railClosed && onOpenInbox ? (
             <IconButton label="Inbox" onClick={onOpenInbox}>
               <Inbox className="size-3.5" strokeWidth={1.75} />
+            </IconButton>
+          ) : null}
+          {projectless && railClosed && onOpenBoard ? (
+            <IconButton label="Board" onClick={onOpenBoard}>
+              <ChartBreakoutSquare className="size-3.5" strokeWidth={1.75} />
             </IconButton>
           ) : null}
           {projectless && railClosed && onOpenNotes ? (

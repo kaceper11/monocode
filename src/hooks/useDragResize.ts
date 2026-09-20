@@ -68,6 +68,9 @@ export function useDragResize({
 
   const onPointerDown = (event: ReactPointerEvent<HTMLElement>) => {
     if (event.button !== 0) return;
+    // A second pointerdown while a drag is live would orphan the first
+    // gesture's listeners.
+    if (stopDrag.current) return;
     event.preventDefault();
     event.stopPropagation();
     const handle = event.currentTarget;
@@ -118,6 +121,15 @@ export function useDragResize({
   };
 
   useEffect(() => () => stopDrag.current?.(), []);
+
+  // A saved width can exceed a shrunken window — re-clamp on resize so the
+  // pane never pins itself wider than the viewport allows.
+  useEffect(() => {
+    const onResize = () => commit(widthRef.current);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- commit reads refs only
+  }, []);
 
   const onDoubleClick = () => {
     commit(defaultRef.current);

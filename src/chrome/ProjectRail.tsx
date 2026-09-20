@@ -3,6 +3,7 @@ import {
   AppWindow,
   Archive,
   BellOff,
+  ChartBreakoutSquare,
   ChevronDown,
   ChevronRight,
   FolderOpen,
@@ -224,6 +225,8 @@ type Props = {
   searchActive?: boolean;
   onOpenInbox?: () => void;
   inboxActive?: boolean;
+  onOpenBoard?: () => void;
+  boardActive?: boolean;
   notesEnabled?: boolean;
   onOpenNotes?: () => void;
   notesActive?: boolean;
@@ -258,6 +261,8 @@ export function ProjectRail({
   searchActive = false,
   onOpenInbox,
   inboxActive = false,
+  onOpenBoard,
+  boardActive = false,
   notesEnabled = true,
   onOpenNotes,
   notesActive = false,
@@ -701,6 +706,15 @@ export function ProjectRail({
               dot={inboxUnseen}
               ariaLabel={inboxUnseen ? "Inbox, new items" : "Inbox"}
             />
+            {onOpenBoard ? (
+              <RailAction
+                label="Board"
+                icon={ChartBreakoutSquare}
+                onClick={onOpenBoard}
+                active={boardActive}
+                ariaLabel="Board"
+              />
+            ) : null}
             {notesEnabled ? (
               <RailAction
                 label="Notes"

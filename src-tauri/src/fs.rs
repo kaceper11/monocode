@@ -866,6 +866,109 @@ pub async fn git_pr_create(
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct GitPrCheck {
+    pub name: String,
+    pub state: String,
+    /// pass | fail | pending | skipping | cancel — gh's rollup bucket.
+    pub bucket: String,
+    pub url: String,
+}
+
+/// Check runs on the current branch's pull request via `gh pr checks`.
+#[tauri::command]
+pub async fn git_pr_checks(cwd: String) -> Result<Vec<GitPrCheck>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        let out = gh_checked(&root, &["pr", "checks", "--json", "name,state,link,bucket"])?;
+        #[derive(Deserialize)]
+        struct Row {
+            name: String,
+            state: String,
+            #[serde(default)]
+            link: String,
+            #[serde(default)]
+            bucket: String,
+        }
+        let rows: Vec<Row> = serde_json::from_str(&out).map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| GitPrCheck {
+                name: row.name,
+                state: row.state,
+                bucket: row.bucket,
+                url: row.link,
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Merge (or fast-forward) a base ref into the checked-out branch after
+/// fetching it — used to update task workstreams from main/master.
+#[tauri::command]
+pub async fn git_merge_from(cwd: String, git_ref: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        let git_ref = git_ref.trim().to_string();
+        if git_ref.is_empty() || git_ref == "HEAD" {
+            return Err("Pick a base branch to merge from".into());
+        }
+        // Only treat `name/branch` as remote-qualified when `name` is a real
+        // remote — a local base like `release/1.2` must not be split.
+        let remote_qualified = git_ref.split_once('/').and_then(|(remote, branch)| {
+            let qualified = !remote.is_empty()
+                && !branch.is_empty()
+                && git_remote_names(&root)
+                    .iter()
+                    .any(|name| name.as_str() == remote);
+            qualified.then(|| (remote.to_string(), branch.to_string()))
+        });
+        if let Some((remote, branch)) = remote_qualified {
+            git_checked(&root, &["fetch", &remote, &branch])?;
+            git_checked(&root, &["merge", "--no-edit", "FETCH_HEAD"])
+        } else if let Some(remote) = git_remote_name(&root) {
+            git_checked(&root, &["fetch", &remote, &git_ref])?;
+            git_checked(&root, &["merge", "--no-edit", "FETCH_HEAD"])
+        } else {
+            git_checked(&root, &["merge", "--no-edit", &git_ref])
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Replace a GitHub pull request body — used to link sibling PRs after a
+/// task creates them, since the URLs only exist once creation returns.
+#[tauri::command]
+pub async fn git_pr_update(cwd: String, url: String, body: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let body_path = std::env::temp_dir().join(format!("monocode-pr-edit-{stamp}.md"));
+        std::fs::write(&body_path, body.trim()).map_err(|e| e.to_string())?;
+        let result = gh_checked(
+            &root,
+            &[
+                "pr",
+                "edit",
+                url.trim(),
+                "--body-file",
+                &body_path.to_string_lossy(),
+            ],
+        );
+        let _ = std::fs::remove_file(&body_path);
+        result.map(|_| ())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct GitHubLabel {
     pub name: String,
     pub color: String,

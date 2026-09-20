@@ -3,6 +3,7 @@ import { OrchestrationSidebarAgents } from "./OrchestrationSidebarAgents";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Archive,
+  ChartBreakoutSquare,
   Check,
   ChevronDown,
   ChevronRight,
@@ -240,10 +241,12 @@ type Props = {
   onSearch?: () => void;
   onOpenInbox?: () => void;
   onOpenInboxItem?: (item: LinkedWorkItem, sessionId: string) => void;
+  onOpenBoard?: () => void;
   onOpenNotes?: () => void;
   onGoToFile?: () => void;
   searchActive?: boolean;
   inboxActive?: boolean;
+  boardActive?: boolean;
   notesActive?: boolean;
   notesEnabled?: boolean;
   onToggleProjectRail?: () => void;
@@ -322,10 +325,12 @@ function SidebarComponent({
   onSearch,
   onOpenInbox,
   onOpenInboxItem,
+  onOpenBoard,
   onOpenNotes,
   onGoToFile,
   searchActive = false,
   inboxActive = false,
+  boardActive = false,
   notesActive = false,
   notesEnabled = true,
   onToggleProjectRail,
@@ -551,6 +556,7 @@ function SidebarComponent({
     open &&
     !searchActive &&
     !inboxActive &&
+    !boardActive &&
     !notesActive &&
     !settingsOpen &&
     inProject;
@@ -1227,10 +1233,12 @@ function SidebarComponent({
               onNew={onNew}
               onSearch={onSearch}
               onOpenInbox={onOpenInbox}
+              onOpenBoard={onOpenBoard}
               onOpenNotificationSettings={onOpenNotificationSettings}
               onOpenNotes={notesEnabled ? onOpenNotes : undefined}
               searchActive={searchActive}
               inboxActive={inboxActive}
+              boardActive={boardActive}
               notesActive={notesActive}
               inboxUnseen={inboxUnseen}
             />
@@ -1706,6 +1714,8 @@ function SidebarComponent({
           searchActive={searchActive}
           onOpenInbox={onOpenInbox}
           inboxActive={inboxActive}
+          onOpenBoard={onOpenBoard}
+          boardActive={boardActive}
           notesEnabled={notesEnabled}
           onOpenNotes={onOpenNotes}
           notesActive={notesActive}
@@ -1740,10 +1750,12 @@ function SidebarProjectPicker({
   onNew,
   onSearch,
   onOpenInbox,
+  onOpenBoard,
   onOpenNotificationSettings,
   onOpenNotes,
   searchActive = false,
   inboxActive = false,
+  boardActive = false,
   notesActive = false,
   inboxUnseen = false,
 }: {
@@ -1755,10 +1767,12 @@ function SidebarProjectPicker({
   onNew?: () => void;
   onSearch?: () => void;
   onOpenInbox?: () => void;
+  onOpenBoard?: () => void;
   onOpenNotificationSettings?: () => void;
   onOpenNotes?: () => void;
   searchActive?: boolean;
   inboxActive?: boolean;
+  boardActive?: boolean;
   notesActive?: boolean;
   inboxUnseen?: boolean;
 }) {
@@ -1816,6 +1830,11 @@ function SidebarProjectPicker({
                 />
               ) : null}
             </span>
+          </IconButton>
+        ) : null}
+        {onOpenBoard ? (
+          <IconButton label="Board" active={boardActive} onClick={onOpenBoard}>
+            <ChartBreakoutSquare className="size-3.5" strokeWidth={1.75} />
           </IconButton>
         ) : null}
         {onOpenNotes ? (

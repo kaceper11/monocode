@@ -435,6 +435,14 @@ import { SearchView } from "./surfaces/SearchView";
 import { SettingsView, type SettingsAnchor } from "./surfaces/SettingsView";
 import type { ConnectableInboxSource } from "./lib/inboxFilters";
 import { InboxView, LinkedWorkItemPanel } from "./surfaces/InboxView";
+import { BoardView } from "./board/BoardView";
+import type { TaskWorkstreamSpec } from "./board/NewTaskDialog";
+import {
+  boardSnapshot,
+  loadBoard,
+  subscribeBoard,
+} from "./board/boardStore";
+import { linkBundleFromLinks } from "./board/boardData";
 import type { InboxSessionPortal } from "./surfaces/InboxDiscussionPanel";
 import { inboxProvider } from "./lib/inboxProvider";
 import { inboxAskKey, inboxAskPrompt } from "./lib/inboxAsk";
@@ -775,6 +783,7 @@ export default function App({
   const [searchViewOpen, setSearchViewOpen] = useState(false);
   const [searchViewFocusToken, setSearchViewFocusToken] = useState(0);
   const [inboxViewOpen, setInboxViewOpen] = useState(false);
+  const [boardViewOpen, setBoardViewOpen] = useState(false);
   const [linkedWorkItemPanels, setLinkedWorkItemPanels] = useState<
     ReadonlyMap<string, LinkedWorkItemPanelState>
   >(() => new Map());
@@ -811,6 +820,9 @@ export default function App({
     loadNotesEnabled,
     () => true,
   );
+  // Board-store writes (task/session binds, placements) invalidate
+  // inboxRelatedSessions — it reads task workstream bindings via loadBoard.
+  const boardVersion = useSyncExternalStore(subscribeBoard, boardSnapshot);
   const liveAgentsEnabled = useSyncExternalStore(
     subscribeLiveAgentsEnabled,
     loadLiveAgentsEnabled,
@@ -906,6 +918,11 @@ export default function App({
   searchViewOpenRef.current = searchViewOpen;
   const inboxViewOpenRef = useRef(inboxViewOpen);
   inboxViewOpenRef.current = inboxViewOpen;
+  const boardViewOpenRef = useRef(boardViewOpen);
+  boardViewOpenRef.current = boardViewOpen;
+  /** Set when a session was opened from the board — the next visit-back
+   * returns there instead of popping tab history. Consumed once. */
+  const boardReturnRef = useRef(false);
   const notesViewOpenRef = useRef(notesViewOpen);
   notesViewOpenRef.current = notesViewOpen;
   const settingsOpenRef = useRef(settingsOpen);
@@ -1465,6 +1482,7 @@ export default function App({
             !projectTerminalFocusedRef.current &&
             !searchViewOpenRef.current &&
             !inboxViewOpenRef.current &&
+            !boardViewOpenRef.current &&
             !notesViewOpenRef.current &&
             !settingsOpenRef.current
           ) {
@@ -1568,7 +1586,7 @@ export default function App({
   }, [sidebarCwd, refreshHistory]);
 
   useEffect(() => {
-    if (!inboxViewOpen) return;
+    if (!inboxViewOpen && !boardViewOpen) return;
     let cancelled = false;
     void listLinkedSessions()
       .then((rows) => {
@@ -1580,7 +1598,7 @@ export default function App({
     return () => {
       cancelled = true;
     };
-  }, [inboxViewOpen]);
+  }, [inboxViewOpen, boardViewOpen]);
 
   useEffect(() => {
     prefetchProjectFiles(gitCwd);
@@ -1965,6 +1983,7 @@ export default function App({
     async (item: InboxItem, body?: string) => {
       const start = (description?: string) => {
         setInboxViewOpen(false);
+        setBoardViewOpen(false);
         setNotesViewOpen(false);
         setSidebarTab("sessions");
         const cwd =
@@ -2024,6 +2043,7 @@ export default function App({
       if (!card.id) return;
       setSearchViewOpen(false);
       setInboxViewOpen(false);
+      setBoardViewOpen(false);
       setNotesViewOpen(false);
       setSidebarTab("sessions");
       const cwd =
@@ -3095,6 +3115,18 @@ export default function App({
   }, [activateTab, activeTabId, deckProjectTabs]);
 
   const onVisitBack = useCallback(() => {
+    if (boardReturnRef.current) {
+      boardReturnRef.current = false;
+      // Same exclusivity as onOpenBoard — a sibling surface left open would
+      // paint over the board we're returning to.
+      setFilePickerOpen(false);
+      setSettingsOpen(false);
+      setSearchViewOpen(false);
+      setNotesViewOpen(false);
+      setInboxViewOpen(false);
+      setBoardViewOpen(true);
+      return;
+    }
     const openIds = new Set(tabsRef.current.map((tab) => tab.id));
     const pruned = pruneTabVisitHistory(
       tabVisitRef.current,
@@ -3708,6 +3740,7 @@ export default function App({
         throw new Error("This conversation is no longer available.");
       setSearchViewOpen(false);
       setInboxViewOpen(false);
+      setBoardViewOpen(false);
       setNotesViewOpen(false);
       setSettingsOpen(false);
       setFilePickerOpen(false);
@@ -4334,6 +4367,7 @@ export default function App({
           surfaceOpen: Boolean(
             searchViewOpenRef.current ||
             inboxViewOpenRef.current ||
+            boardViewOpenRef.current ||
             notesViewOpenRef.current ||
             settingsOpenRef.current ||
             filePickerOpenRef.current ||
@@ -7357,13 +7391,26 @@ export default function App({
   } = useInboxActivity(recents, sidebarCwd, sidebarHistory);
   linkedSessionUpdatesRef.current = linkedSessionUpdates;
   const inboxRelatedSessions = useMemo(() => {
+    void boardVersion; // board writes (task binds) change the derived set
     const byId = new Map<string, SessionSummary>();
     for (const session of storedLinkedSessions) byId.set(session.id, session);
+    // Sessions bound to board-task workstreams stay resolvable even for
+    // ticketless tasks, which have no linkedWorkItem to carry them.
+    const taskBound = new Set(
+      loadBoard().tasks.flatMap((task) =>
+        task.workstreams.flatMap((ws) => ws.sessionIds ?? []),
+      ),
+    );
     for (const session of history) {
-      if (session.linkedWorkItem) byId.set(session.id, session);
+      if (session.linkedWorkItem || taskBound.has(session.id))
+        byId.set(session.id, session);
     }
     for (const session of sessions) {
-      if (session.inboxAsk || !session.linkedWorkItem) continue;
+      if (
+        session.inboxAsk ||
+        (!session.linkedWorkItem && !taskBound.has(session.id))
+      )
+        continue;
       const current = byId.get(session.id);
       const summary = summaryFromSession(session);
       byId.set(
@@ -7384,7 +7431,7 @@ export default function App({
     return [...byId.values()].sort(
       (a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id),
     );
-  }, [history, sessions, storedLinkedSessions]);
+  }, [history, sessions, storedLinkedSessions, boardVersion]);
   const openProjectSessions = useMemo(
     () =>
       sessions
@@ -7426,6 +7473,7 @@ export default function App({
   const onGoToFile = useCallback(() => {
     setSearchViewOpen(false);
     setInboxViewOpen(false);
+    setBoardViewOpen(false);
     setNotesViewOpen(false);
     setFilePickerInitialQuery("");
     setFilePickerResetToken((token) => token + 1);
@@ -7434,6 +7482,7 @@ export default function App({
   const onOpenCommandPalette = useCallback(() => {
     setSearchViewOpen(false);
     setInboxViewOpen(false);
+    setBoardViewOpen(false);
     setNotesViewOpen(false);
     setFilePickerInitialQuery(">");
     setFilePickerResetToken((token) => token + 1);
@@ -7449,6 +7498,7 @@ export default function App({
   const onFindInProject = useCallback(() => {
     setSearchViewOpen(false);
     setInboxViewOpen(false);
+    setBoardViewOpen(false);
     setNotesViewOpen(false);
     setSidebarTab("files");
     setFilesSearchOpen(true);
@@ -7459,6 +7509,7 @@ export default function App({
     setFilePickerOpen(false);
     setSettingsOpen(false);
     setInboxViewOpen(false);
+    setBoardViewOpen(false);
     setNotesViewOpen(false);
     setSearchViewOpen(true);
     setSearchViewFocusToken((token) => token + 1);
@@ -7473,8 +7524,151 @@ export default function App({
     setSettingsOpen(false);
     setSearchViewOpen(false);
     setNotesViewOpen(false);
+    setBoardViewOpen(false);
     setInboxViewOpen(true);
   }, []);
+
+  const onOpenBoard = useCallback(() => {
+    setFilePickerOpen(false);
+    setSettingsOpen(false);
+    setSearchViewOpen(false);
+    setNotesViewOpen(false);
+    setInboxViewOpen(false);
+    boardReturnRef.current = false;
+    setBoardViewOpen(true);
+  }, []);
+
+  const onLeaveBoard = useCallback(() => {
+    boardReturnRef.current = false;
+    setBoardViewOpen(false);
+  }, []);
+
+  const onOpenBoardSession = useCallback(
+    (sessionId: string) => {
+      // Remember the board was the origin — one visit-back returns to it.
+      boardReturnRef.current = true;
+      setBoardViewOpen(false);
+      setSidebarTab("sessions");
+      void onSelectHistorySession(sessionId);
+    },
+    [onSelectHistorySession],
+  );
+
+  const onBoardSendToSession = useCallback(
+    (sessionId: string, text: string) => {
+      boardReturnRef.current = true;
+      setBoardViewOpen(false);
+      setSidebarTab("sessions");
+      // ensureOpenSession mutates sessionsRef synchronously, so the dispatch
+      // below lands even for sessions that were only stored summaries.
+      void onSelectHistorySession(sessionId).then(() => {
+        onSubmit(sessionId, text, []);
+      });
+    },
+    [onSelectHistorySession, onSubmit],
+  );
+
+  // Board task workstreams are eager: the worktree exists (or is created now)
+  // and the session starts bound to it — unlike the composer's lazy worktrees.
+  const onBoardSpawnSession = useCallback(
+    async (
+      spec: TaskWorkstreamSpec & {
+        title: string;
+        links: LinkedWorkItem[];
+      },
+    ) => {
+      let worktreePath = spec.worktreePath;
+      if (!worktreePath) {
+        // A partial earlier attempt can leave the branch behind — adopt it
+        // rather than failing the lane.
+        const created = await createWorktree(
+          spec.projectPath,
+          spec.branch,
+          spec.base,
+          false,
+        ).catch((error) =>
+          /already exists/i.test(String(error))
+            ? createWorktree(spec.projectPath, spec.branch, spec.base, true)
+            : Promise.reject(error),
+        );
+        worktreePath = created.path;
+      } else {
+        // The stored path may have been deleted externally — refuse to bind
+        // a session to a directory that isn't a live worktree anymore. A
+        // failed listing is fatal too: skipping the guard would bind to a
+        // path we couldn't verify.
+        const live = await listWorktrees(spec.projectPath);
+        if (
+          !live.worktrees.some(
+            (entry) => entry.path === spec.worktreePath,
+          )
+        ) {
+          throw new Error(
+            "Worktree is gone — remove the lane and add it again",
+          );
+        }
+      }
+      const linkedWorkItem = linkBundleFromLinks(spec.links) ?? undefined;
+      const session = {
+        ...newDefaultSession(spec.projectPath, sessionDefaults?.runtimeMode),
+        title: spec.title,
+        worktreeCwd: worktreePath,
+        branch: spec.branch,
+        ...(linkedWorkItem ? { linkedWorkItem } : {}),
+      };
+      const tab = newTab(session.id);
+      setSessions((prev) => [...prev, session]);
+      appendTab(tab, spec.projectPath);
+      persistSession(session);
+      return { sessionId: session.id, worktreePath };
+    },
+    [appendTab, sessionDefaults?.runtimeMode],
+  );
+
+  const onBoardBindSession = useCallback(
+    (sessionId: string, linked: LinkedWorkItem | null) => {
+      const current = sessionsRef.current.find(
+        (session) => session.id === sessionId,
+      );
+      if (current) {
+        const updated = {
+          ...current,
+          ...(linked ? { linkedWorkItem: linked } : {}),
+        };
+        if (!linked) delete updated.linkedWorkItem;
+        const next = sessionsRef.current.map((session) =>
+          session.id === sessionId ? updated : session,
+        );
+        sessionsRef.current = next;
+        setSessions(next);
+        persistSession(updated);
+        return;
+      }
+      // Dormant session — the workstream may list a stored summary. Patch
+      // the record too, or a cleared link silently rejoins it to the task
+      // card via the link join on the next board build.
+      void getSession(sessionId)
+        .then((stored) => {
+          if (!stored) return null;
+          if (linked) stored.linkedWorkItem = linked;
+          else delete stored.linkedWorkItem;
+          return upsertSession(stored);
+        })
+        .then((summary) => {
+          if (!summary) return;
+          setHistory((current) =>
+            mergeProjectHistorySummary(current, summary),
+          );
+          setStoredLinkedSessions((current) =>
+            summary.linkedWorkItem
+              ? mergeProjectHistorySummary(current, summary)
+              : current.filter((entry) => entry.id !== summary.id),
+          );
+        })
+        .catch(() => undefined);
+    },
+    [persistSession],
+  );
 
   const onOpenLinkedWorkItem = useCallback(
     (item: LinkedWorkItem, sessionId: string) => {
@@ -7485,6 +7679,7 @@ export default function App({
       setSearchViewOpen(false);
       setNotesViewOpen(false);
       setInboxViewOpen(false);
+      setBoardViewOpen(false);
       const cwd =
         sessionsRef.current.find((session) => session.id === sessionId)?.cwd ??
         history.find((session) => session.id === sessionId)?.cwd ??
@@ -7526,6 +7721,7 @@ export default function App({
     setSettingsOpen(false);
     setSearchViewOpen(false);
     setInboxViewOpen(false);
+    setBoardViewOpen(false);
     setNotesViewOpen(true);
   }, []);
 
@@ -7538,6 +7734,7 @@ export default function App({
       setFilePickerOpen(false);
       setSearchViewOpen(false);
       setInboxViewOpen(false);
+      setBoardViewOpen(false);
       setNotesViewOpen(false);
       if (section) {
         setSettingsSection(section);
@@ -7596,17 +7793,22 @@ export default function App({
       setInboxViewOpen(false);
       return;
     }
+    if (boardViewOpen) {
+      setBoardViewOpen(false);
+      return;
+    }
     if (notesViewOpen) {
       setNotesViewOpen(false);
       return;
     }
     onVisitBack();
-  }, [onVisitBack, searchViewOpen, settingsOpen, inboxViewOpen, notesViewOpen]);
+  }, [onVisitBack, searchViewOpen, settingsOpen, inboxViewOpen, boardViewOpen, notesViewOpen]);
 
   const onRailForward = useCallback(() => {
     setSearchViewOpen(false);
     setSettingsOpen(false);
     setInboxViewOpen(false);
+    setBoardViewOpen(false);
     setNotesViewOpen(false);
     onVisitForward();
   }, [onVisitForward]);
@@ -7743,7 +7945,7 @@ export default function App({
   };
 
   const focusedBrowserLabel = () => {
-    if (settingsOpenRef.current || inboxViewOpenRef.current || searchViewOpenRef.current || notesViewOpenRef.current || filePickerOpenRef.current) return null;
+    if (settingsOpenRef.current || inboxViewOpenRef.current || boardViewOpenRef.current || searchViewOpenRef.current || notesViewOpenRef.current || filePickerOpenRef.current) return null;
     const tab = tabsRef.current.find(entry => entry.id === activeTabIdRef.current);
     if (!tab || tab.diffFocused) return null;
     const file = focusedFileTab(tab);
@@ -7805,6 +8007,7 @@ export default function App({
           const surfaceOpen =
             searchViewOpenRef.current ||
             inboxViewOpenRef.current ||
+            boardViewOpenRef.current ||
             notesViewOpenRef.current ||
             settingsOpenRef.current ||
             filePickerOpenRef.current ||
@@ -7880,6 +8083,7 @@ export default function App({
       if (
         !searchViewOpenRef.current &&
         !inboxViewOpenRef.current &&
+        !boardViewOpenRef.current &&
         !notesViewOpenRef.current &&
         handleEditorFindKey(e)
       ) {
@@ -8183,6 +8387,7 @@ export default function App({
               searchViewOpen ||
               settingsOpen ||
               inboxViewOpen ||
+              boardViewOpen ||
               notesViewOpen
             }
             canGoForward={tabVisitNav.canForward}
@@ -8216,11 +8421,13 @@ export default function App({
             onNewTerminal={onNewTerminal}
             onSearch={onOpenSearch}
             onOpenInbox={onOpenInbox}
+            onOpenBoard={onOpenBoard}
             onOpenInboxItem={onOpenLinkedWorkItem}
             onOpenNotes={notesEnabled ? onOpenNotes : undefined}
             onGoToFile={onGoToFile}
             searchActive={searchViewOpen}
             inboxActive={inboxViewOpen}
+            boardActive={boardViewOpen}
             notesActive={notesViewOpen}
             notesEnabled={notesEnabled}
             projectRailOpen={projectRailOpen}
@@ -8244,17 +8451,26 @@ export default function App({
             {wslOpening && <WslConnectionStatus opening={wslOpening} onRetry={() => onSelectProject(wslOpening.path)} onDismiss={dismissOpening} />}
             <div
               className={
-                searchViewOpen || settingsOpen || inboxViewOpen || notesViewOpen
+                searchViewOpen ||
+                settingsOpen ||
+                inboxViewOpen ||
+                boardViewOpen ||
+                notesViewOpen
                   ? "hidden"
                   : "flex min-h-0 min-w-0 flex-1 flex-col"
               }
               aria-hidden={
-                searchViewOpen || settingsOpen || inboxViewOpen || notesViewOpen
+                searchViewOpen ||
+                settingsOpen ||
+                inboxViewOpen ||
+                boardViewOpen ||
+                notesViewOpen
               }
               inert={
                 searchViewOpen ||
                 settingsOpen ||
                 inboxViewOpen ||
+                boardViewOpen ||
                 notesViewOpen ||
                 undefined
               }
@@ -8278,6 +8494,7 @@ export default function App({
                   onFindInProject={onFindInProject}
                   onSearch={onOpenSearch}
                   onOpenInbox={onOpenInbox}
+                  onOpenBoard={onOpenBoard}
                   onOpenNotes={notesEnabled ? onOpenNotes : undefined}
                   onZoomIn={() => {
                     const next = saveUiScale(zoomInUiScale(loadUiScale()));
@@ -8304,6 +8521,7 @@ export default function App({
                 onNewTerminal={onNewTerminal}
                 onOpenSettings={onOpenSettings}
                 onOpenInbox={onOpenInbox}
+                onOpenBoard={onOpenBoard}
                 onOpenNotes={notesEnabled ? onOpenNotes : undefined}
                 onClose={onCloseTitleTab}
                 onCloseMany={onCloseTabs}
@@ -8505,6 +8723,22 @@ export default function App({
                 onOpenIntegrations={onOpenInboxIntegrations}
               />
             ) : null}
+            {boardViewOpen ? (
+              <BoardView
+                cwd={sidebarCwd}
+                recents={recents}
+                besideRail={projectRailOpen}
+                sessions={sessions}
+                linkedSessions={inboxRelatedSessions}
+                onClose={onLeaveBoard}
+                onToggleSidebar={onToggleSidebar}
+                onOpenSession={onOpenBoardSession}
+                onStartItem={onStartInboxItem}
+                onSendToSession={onBoardSendToSession}
+                onSpawnSession={onBoardSpawnSession}
+                onBindSession={onBoardBindSession}
+              />
+            ) : null}
             {notesViewOpen ? (
               <NotesView
                 besideRail={projectRailOpen}
@@ -8542,6 +8776,7 @@ export default function App({
             ) : null}
             {searchViewOpen ||
             inboxViewOpen ||
+            boardViewOpen ||
             notesViewOpen ||
             settingsOpen ? null : (
               <UsageFooter

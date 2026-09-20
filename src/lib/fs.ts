@@ -321,6 +321,34 @@ export function gitPrCreate(
   return invoke<string>("git_pr_create", { cwd, title, body, base, head });
 }
 
+export type GitPrCheck = {
+  name: string;
+  state: string;
+  /** pass | fail | pending | skipping | cancel — gh's rollup bucket. */
+  bucket: string;
+  url: string;
+};
+
+/** Check runs on the current branch's GitHub pull request. */
+export function gitPrChecks(cwd: string): Promise<GitPrCheck[]> {
+  return invoke<GitPrCheck[]>("git_pr_checks", { cwd });
+}
+
+/** Replace a GitHub pull request body. */
+export function gitPrUpdate(
+  cwd: string,
+  url: string,
+  body: string,
+): Promise<void> {
+  return invoke<void>("git_pr_update", { cwd, url, body });
+}
+
+/** Fetch and merge a base ref (e.g. `main`, `origin/main`) into the
+ * checked-out branch of `cwd`. */
+export function gitMergeFrom(cwd: string, ref: string): Promise<void> {
+  return invoke<void>("git_merge_from", { cwd, gitRef: ref });
+}
+
 export type GitBranchInfo = {
   name: string;
   current: boolean;
