@@ -223,7 +223,7 @@ export type WorkItemIndex<T> = Map<string, Map<string, Set<T>>>;
  * Entities indexed by their linked-work-item identities — one pass for a
  * whole caller's lookups. Account-scoped exactly like
  * {@link inboxItemMatchesLinkedWorkItem}: upstream unscoped links join every
- * account; legacy Jira/Azure links require an explicit account first.
+ * account; legacy Jira links require an explicit account first.
  */
 export function indexByWorkItem<T>(
   entities: readonly T[],
