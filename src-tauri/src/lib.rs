@@ -7,10 +7,8 @@ mod saved_commands;
 mod wsl;
 use tauri::Manager;
 
-mod azure;
-mod azure_inbox;
-mod azure_pipelines;
-mod azure_repos;
+mod automations;
+mod azure_devops;
 mod chat_background;
 mod checkpoint;
 mod confluence;
@@ -315,6 +313,15 @@ pub fn run() {
             reminders::reminder_take_open,
             reminders::reminder_register_window,
             reminders::reminder_open,
+            automations::automations_list,
+            automations::automations_upsert,
+            automations::automations_delete,
+            automations::automation_runs_list,
+            automations::automation_runs_recover,
+            automations::automation_run_now,
+            automations::automations_claim_due,
+            automations::automations_claim_event,
+            automations::automation_run_update,
             external_editor::list_external_editors,
             external_editor::open_in_external_editor,
             fs::list_dir,
@@ -367,6 +374,15 @@ pub fn run() {
             gitlab::gitlab_work_item_thread,
             gitlab::gitlab_work_item_comment,
             gitlab::gitlab_mr_diff,
+            azure_devops::azure_devops_status,
+            azure_devops::azure_devops_set_config,
+            azure_devops::azure_devops_repo,
+            azure_devops::azure_devops_list_work_items,
+            azure_devops::azure_devops_list_todos,
+            azure_devops::azure_devops_work_item_details,
+            azure_devops::azure_devops_work_item_thread,
+            azure_devops::azure_devops_work_item_comment,
+            azure_devops::azure_devops_mr_diff,
             linear::linear_status,
             jira::jira_status,
             jira::jira_set_config,
@@ -378,22 +394,6 @@ pub fn run() {
             confluence::confluence_spaces,
             confluence::confluence_search,
             confluence::confluence_page,
-            azure::azure_status,
-            azure_inbox::azure_delivery_inbox,
-            azure_inbox::azure_ci_inbox_summary,
-            azure::azure_set_config,
-            azure::azure_list_items,
-            azure::azure_options,
-            azure::azure_item_content,
-            azure::azure_image,
-            azure_pipelines::azure_ci_context,
-            azure_pipelines::azure_ci_lookup,
-            azure_pipelines::azure_ci_read,
-            azure_repos::azure_pr_list,
-            azure_repos::azure_pr_create,
-            azure_repos::azure_pr_read,
-            azure_repos::azure_pr_thread_comment,
-            azure_repos::azure_pr_submit_review,
             linear::linear_set_token,
             linear::linear_list_teams,
             linear::linear_list_issues,
@@ -448,6 +448,7 @@ pub fn run() {
             harness::harness_resolve_devin,
             harness::harness_resolve_copilot,
             harness::harness_resolve_muse,
+            harness::harness_resolve_antigravity,
             harness::harness_free_port,
             harness::harness_spawn,
             harness::harness_write,

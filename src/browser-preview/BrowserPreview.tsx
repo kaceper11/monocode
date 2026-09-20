@@ -6,7 +6,7 @@ import {
   ChevronRight,
   ExternalLink,
   RefreshCw,
-} from "../chrome/icons";
+} from "../shared/ui/icons";
 import "./preview.css";
 
 type Notice = { url: string | null; message: string };
