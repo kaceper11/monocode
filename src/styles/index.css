@@ -995,6 +995,12 @@ header[data-tauri-drag-region] button {
   margin-top: 1rem;
 }
 
+/* Nested blocks do not get Streamdown's root spacing. Keep blank-line
+   paragraphs inside a quote distinct without adding space above the first. */
+.agent-markdown [data-streamdown="blockquote"] > p:not(:first-child) {
+  margin-top: 1rem;
+}
+
 .agent-markdown > div:not(:empty) ~ div > [data-streamdown="unordered-list"],
 .agent-markdown > div:not(:empty) ~ div > [data-streamdown="ordered-list"] {
   margin-top: 0.5rem;

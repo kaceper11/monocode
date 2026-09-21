@@ -197,6 +197,53 @@ it("selects a draft workspace without opening the creation dialog", async () => 
   expect(document.querySelector('[aria-label="Workspace"]')).toBeNull();
 });
 
+it("selects an existing worktree from the draft workspace menu", async () => {
+  const onModeChange = vi.fn();
+  const onSelectWorktree = vi.fn(async () => {});
+  await act(async () =>
+    root.render(
+      createElement(WorkspacePicker, {
+        cwd: "/existing-worktree-picker",
+        mode: "current",
+        onModeChange,
+        onBaseChange: vi.fn(),
+        onSelectWorktree,
+      }),
+    ),
+  );
+
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>(
+        '[aria-label="Workspace Current checkout"]',
+      )!
+      .click(),
+  );
+  const existingWorktree = button("Existing worktree…");
+  expect(existingWorktree).not.toBeNull();
+  await act(async () =>
+    existingWorktree.dispatchEvent(
+      new MouseEvent("mouseover", { bubbles: true }),
+    ),
+  );
+
+  expect(
+    document.querySelector('[aria-label="Existing worktrees"]'),
+  ).not.toBeNull();
+  expect(existingWorktree.getAttribute("aria-expanded")).toBe("true");
+  expect(listWorktrees).toHaveBeenCalledWith("/existing-worktree-picker");
+  const option = document.querySelector<HTMLButtonElement>(
+    `[role="menuitem"][title="${tree.path}"]`,
+  )!;
+  expect(option.textContent).toContain("feature");
+  expect(option.textContent).toContain(tree.path);
+  await act(async () => option.click());
+
+  expect(onSelectWorktree).toHaveBeenCalledWith(tree);
+  expect(onModeChange).not.toHaveBeenCalled();
+  expect(gitCheckout).not.toHaveBeenCalled();
+});
+
 it("renders a started session's workspace as a non-interactive identity", () => {
   const markup = renderToStaticMarkup(
     createElement(WorkspaceIdentity, { worktree: true }),

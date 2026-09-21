@@ -93,6 +93,9 @@ import {
   saveTranscriptLayout,
   saveTranscriptAnchor,
   TRANSCRIPT_ANCHOR_CHANGE_EVENT,
+  loadShowExcludedFiles,
+  saveShowExcludedFiles,
+  SHOW_EXCLUDED_FILES_DEFAULT,
   SIDEBAR_BLUR_DEFAULT,
   SIDEBAR_BLUR_MAX,
   SIDEBAR_BLUR_MIN,
@@ -1815,6 +1818,9 @@ function useAppearanceSettings(
     loadThemeDarkLightness,
   );
   const [bodyGlass, setBodyGlass] = useState(loadBodyGlass);
+  const [showExcludedFiles, setShowExcludedFiles] = useState(
+    loadShowExcludedFiles,
+  );
   const [chatBackgroundPath, setChatBackgroundPath] = useState(
     loadChatBackgroundPath,
   );
@@ -1879,6 +1885,11 @@ function useAppearanceSettings(
     applyBodyGlass(next);
     saveBodyGlass(next);
     setBodyGlass(next);
+  }, []);
+
+  const onShowExcludedFiles = useCallback((next: boolean) => {
+    saveShowExcludedFiles(next);
+    setShowExcludedFiles(next);
   }, []);
 
   const onChooseChatBackground = useCallback(async () => {
@@ -1957,6 +1968,7 @@ function useAppearanceSettings(
     onTint(THEME_HUE_DEFAULT, THEME_SATURATION_DEFAULT);
     onDarkLightness(THEME_DARK_LIGHTNESS_DEFAULT);
     onBodyGlass(BODY_GLASS_DEFAULT);
+    onShowExcludedFiles(SHOW_EXCLUDED_FILES_DEFAULT);
     onChatBackgroundEmptyOpacity(
       Math.round(CHAT_BACKGROUND_EMPTY_OPACITY_DEFAULT * 100),
     );
@@ -1976,6 +1988,7 @@ function useAppearanceSettings(
     onChatBackgroundScope,
     onClearChatBackground,
     onAccentColor,
+    onShowExcludedFiles,
     onThemePreference,
     onOpacity,
     onTint,
@@ -1993,6 +2006,7 @@ function useAppearanceSettings(
     themeSaturation,
     themeDarkLightness,
     bodyGlass,
+    showExcludedFiles,
     chatBackgroundPath,
     chatBackgroundEmptyOpacity,
     chatBackgroundSessionOpacity,
@@ -2008,6 +2022,7 @@ function useAppearanceSettings(
     onTint,
     onDarkLightness,
     onBodyGlass,
+    onShowExcludedFiles,
     onChooseChatBackground,
     onClearChatBackground,
     onChatBackgroundEmptyOpacity,
@@ -2195,6 +2210,17 @@ function AppearancePage({ appearance }: { appearance: AppearanceSettings }) {
             max={Math.round(UI_SCALE_MAX * 100)}
             step={10}
             onChange={appearance.onUiScale}
+          />
+        </Row>
+        <Row
+          id="show-excluded-files"
+          label="Show excluded files"
+          description="Show files and folders Git excludes, such as build output and dependencies, in the explorer."
+        >
+          <Toggle
+            label="Show excluded files"
+            on={appearance.showExcludedFiles}
+            onChange={appearance.onShowExcludedFiles}
           />
         </Row>
       </Group>

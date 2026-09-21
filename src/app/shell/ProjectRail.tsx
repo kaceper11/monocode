@@ -52,6 +52,7 @@ import {
   sameProjectPath,
   savePinnedProjects,
   saveProjectRailOrder,
+  subscribeProjectPathsChanged,
   syncProjectRailOrder,
   type RecentProject,
 } from "../../features/projects/model/recents";
@@ -307,6 +308,19 @@ export function ProjectRail({
   const [projectGroups, setProjectGroups] = useState(loadProjectGroups);
   const [projectGroupAssignments, setProjectGroupAssignments] = useState(
     loadProjectGroupAssignments,
+  );
+  useEffect(
+    () =>
+      subscribeProjectPathsChanged(() => {
+        setRailOrder(loadProjectRailOrder());
+        setPinnedPaths(loadPinnedProjects());
+        setGroupLabels(loadTabGroupLabels());
+        setGroupColors(loadTabGroupColors());
+        setGroupMascots(loadTabGroupMascots());
+        setGroupCustomColors(loadTabGroupCustomColors());
+        setProjectGroupAssignments(loadProjectGroupAssignments());
+      }),
+    [],
   );
   const [externalEditors, setExternalEditors] = useState<
     ExternalEditor[] | null

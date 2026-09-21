@@ -288,7 +288,15 @@ import {
   rebasePath,
   resolveWorkspacePath,
 } from "../shared/lib/paths";
-import { removeProjectData } from "../features/projects/model/projectData";
+import {
+  rebaseProjectData,
+  removeProjectData,
+} from "../features/projects/model/projectData";
+import {
+  forgetProjectLocation,
+  rememberProjectLocation,
+  synchronizeProjectLocation,
+} from "../features/projects/model/projectLocation";
 import {
   archiveProject,
   forgetProject,
@@ -298,6 +306,7 @@ import {
   normalizeProjectPath,
   projectRailItems,
   rememberProject,
+  replaceProjectPath,
   sameProjectPath,
 } from "../features/projects/model/recents";
 import {
@@ -306,14 +315,13 @@ import {
   applyPlaceSessionOnPane,
   filterTabsForProject,
   findOpenSessionTab,
-  openAddToChatSessionPane,
   planWorkspaceTabClose,
   workspaceTabCwd,
   focusedWorkspaceTabCwd,
 } from "../features/workspace/model/workspaceTabGroups";
+import { applyAddToChatRequest } from "../features/sessions/model/addChatToWorkspace";
 import {
   ADD_TO_CHAT_EVENT,
-  composerSeedForAddToChat,
   type AddToChatRequest,
 } from "../features/sessions/model/quoteDraft";
 import { createSessionRemover } from "../features/sessions/model/sessionRemoval";
@@ -364,6 +372,7 @@ import {
   listLinkedSessions,
   listSessionsByProject,
   persistFingerprint,
+  rebaseProjectSessions,
   replaceInFlightSessions,
   saveWorkspaceSnapshot,
   setSessionArchived,
@@ -544,6 +553,30 @@ type LinkedWorkItemPanelState = {
   sessionId: string;
   cwd: string;
 };
+
+type SubmitOptions = {
+  secondOpinion?: SecondOpinionMeta;
+  followUpBehavior?: FollowUpBehavior;
+  noteCard?: NoteComposerCard;
+  handoffCard?: HandoffComposerCard;
+  queuedMessageId?: string;
+  intent?: TurnIntent;
+  planBlockId?: string;
+  buildTarget?: PlanBuildTarget;
+  managed?: boolean;
+  orchestrationRetry?: OrchestrationProposal;
+  draftBlockId?: string;
+  onSettled?: (outcome: ControlOutcome) => void;
+  /** Internal guard for the retry after resolving a renamed project. */
+  projectLocationReady?: boolean;
+};
+
+type Submit = (
+  sessionId: string,
+  text: string,
+  attachments?: Attachment[],
+  options?: SubmitOptions,
+) => boolean;
 
 function withPlanStatus(
   session: Session,
@@ -1000,6 +1033,16 @@ export default function App({
   const harnessFlush = useRef<ScheduledFlush | null>(null);
   const skipForgetSessionIds = useRef(new Set<string>());
   const importedSessionsApplied = useRef(false);
+  const projectLocationSyncs = useRef(
+    new Map<string, ReturnType<typeof synchronizeProjectLocation>>(),
+  );
+  const submitAfterProjectSyncRef = useRef<Submit>(() => false);
+
+  useEffect(() => {
+    for (const project of recents) {
+      void rememberProjectLocation(project.path).catch(() => undefined);
+    }
+  }, [recents]);
 
   useEffect(() => {
     if (importedSessionsApplied.current) return;
@@ -1227,47 +1270,23 @@ export default function App({
       const detail = (event as CustomEvent<AddToChatRequest>).detail;
       if (!detail?.text) return;
 
-      const currentTabs = tabsRef.current;
-      const currentSessions = sessionsRef.current;
-      const tab =
-        currentTabs.find((entry) => entry.id === activeTabIdRef.current) ??
-        currentTabs[0];
-      if (!tab) return;
-      const mountedSessionIds = new Set(
-        currentSessions.map((session) => session.id),
-      );
-      if (leafIds(tab.layout).some((id) => mountedSessionIds.has(id))) return;
-
-      const cwd =
-        focusedWorkspaceTabCwd(tab, currentSessions) ??
-        sessionDefaults?.cwd ??
-        projectCwdRef.current;
-      const composerSeed = composerSeedForAddToChat(detail.text, detail.mode);
-      if (!composerSeed) return;
-
-      const file = focusedFileTab(tab);
-      const session = {
-        ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
-        ...(file?.projectCwd ? { worktreeCwd: file.cwd } : {}),
-        composerSeed,
-      };
-      const openedTab = openAddToChatSessionPane({
-        tab,
-        sessions: currentSessions,
-        sessionId: session.id,
+      const result = applyAddToChatRequest({
+        sessions: sessionsRef.current,
+        tabs: tabsRef.current,
+        activeTabId: activeTabIdRef.current,
+        projectCwd: projectCwdRef.current,
+        fallbackCwd: sessionDefaults?.cwd,
+        defaultRuntimeMode: sessionDefaults?.runtimeMode,
+        text: detail.text,
+        mode: detail.mode,
       });
-      // A mounted session pane owns the normal add-to-chat path.
-      if (!openedTab) return;
+      if (!result) return;
 
-      const nextSessions = [...currentSessions, session];
-      const nextTabs = currentTabs.map((entry) =>
-        entry.id === tab.id ? openedTab : entry,
-      );
-      sessionsRef.current = nextSessions;
-      tabsRef.current = nextTabs;
-      setSessions(nextSessions);
-      setTabs(nextTabs);
-      setActiveTabId(tab.id);
+      sessionsRef.current = result.sessions;
+      tabsRef.current = result.tabs;
+      setSessions(result.sessions);
+      setTabs(result.tabs);
+      setActiveTabId(result.activeTabId);
       setProjectTerminalFocused(false);
       setComposerFocused(true);
     };
@@ -4824,6 +4843,7 @@ export default function App({
       const remaining = options.purgeData
         ? forgetProject(normalized)
         : archiveProject(normalized);
+      if (options.purgeData) forgetProjectLocation(normalized);
       setRecents(remaining);
 
       const tabs = tabsRef.current;
@@ -4958,6 +4978,65 @@ export default function App({
       }),
     );
   }, []);
+
+  const applyProjectLocationChange = useCallback(
+    async (from: string, to: string) => {
+      await rebaseProjectSessions(from, to);
+
+      const nextSessions = sessionsRef.current.map((session) =>
+        sameProjectPath(session.cwd, from) ? { ...session, cwd: to } : session,
+      );
+      sessionsRef.current = nextSessions;
+      setSessions(nextSessions);
+      for (const [id, session] of loadedSessionCache.current) {
+        if (sameProjectPath(session.cwd, from)) {
+          loadedSessionCache.current.set(id, { ...session, cwd: to });
+        }
+      }
+      for (const [id, session] of pendingPersist.current) {
+        if (sameProjectPath(session.cwd, from)) {
+          pendingPersist.current.set(id, { ...session, cwd: to });
+        }
+      }
+      setHistory((current) =>
+        current.map((session) =>
+          sameProjectPath(session.cwd, from)
+            ? { ...session, cwd: to }
+            : session,
+        ),
+      );
+      setStoredLinkedSessions((current) =>
+        current.map((session) =>
+          sameProjectPath(session.cwd, from)
+            ? { ...session, cwd: to }
+            : session,
+        ),
+      );
+      setLoadedProjects((current) => {
+        const next = new Set(current);
+        next.delete(normalizeProjectPath(from));
+        next.add(normalizeProjectPath(to));
+        return next;
+      });
+
+      if (sameProjectPath(projectCwdRef.current, from)) {
+        projectCwdRef.current = to;
+        setProjectCwd(to);
+      }
+      const nextDocks = projectTerminalsRef.current.map((dock) =>
+        sameProjectPath(dock.projectPath, from)
+          ? { ...dock, projectPath: to }
+          : dock,
+      );
+      projectTerminalsRef.current = nextDocks;
+      setProjectTerminals(nextDocks);
+      rebaseProjectData(from, to);
+      setRecents(replaceProjectPath(from, to));
+      onFileMoved(from, to);
+      notifyDirsChanged();
+    },
+    [onFileMoved],
+  );
 
   const onFileDeleted = useCallback((path: string) => {
     invalidateProjectFiles();
@@ -5336,20 +5415,7 @@ export default function App({
       sessionId: string,
       text: string,
       attachments: Attachment[] = [],
-      options?: {
-        secondOpinion?: SecondOpinionMeta;
-        followUpBehavior?: FollowUpBehavior;
-        noteCard?: NoteComposerCard;
-        handoffCard?: HandoffComposerCard;
-        queuedMessageId?: string;
-        intent?: TurnIntent;
-        planBlockId?: string;
-        buildTarget?: PlanBuildTarget;
-        managed?: boolean;
-        orchestrationRetry?: OrchestrationProposal;
-        draftBlockId?: string;
-        onSettled?: (outcome: ControlOutcome) => void;
-      },
+      options?: SubmitOptions,
     ) => {
       const controlError = orchestrator.submissionError(
         sessionId,
@@ -5591,6 +5657,55 @@ export default function App({
             flushHarnessEvents();
           }
         })();
+        return true;
+      }
+
+      if (
+        !options?.projectLocationReady &&
+        looksLikeProject(current.cwd) &&
+        !current.worktreeCwd
+      ) {
+        const key = pathKey(current.cwd);
+        let sync = projectLocationSyncs.current.get(key);
+        if (!sync) {
+          sync = synchronizeProjectLocation(current.cwd);
+          projectLocationSyncs.current.set(key, sync);
+          void sync.then(
+            () => projectLocationSyncs.current.delete(key),
+            () => projectLocationSyncs.current.delete(key),
+          );
+        }
+        void sync
+          .then(async (location) => {
+            if (!location) {
+              throw new Error(
+                `Project folder not found: ${displayPath(current.cwd)}. Reopen the folder to reconnect it.`,
+              );
+            }
+            if (location.moved) {
+              await applyProjectLocationChange(current.cwd, location.path);
+            }
+            submitAfterProjectSyncRef.current(sessionId, text, attachments, {
+              ...options,
+              projectLocationReady: true,
+            });
+          })
+          .catch((error: unknown) => {
+            const message =
+              error instanceof Error
+                ? error.message
+                : "The project folder could not be opened.";
+            enqueueHarnessEvent(sessionId, {
+              type: "session.error",
+              message,
+            });
+            flushHarnessEvents();
+            options?.onSettled?.({
+              status: "failed",
+              text: "",
+              error: message,
+            });
+          });
         return true;
       }
 
@@ -6220,11 +6335,13 @@ export default function App({
       return true;
     },
     [
+      applyProjectLocationChange,
       dismissNoticesForContinuedSession,
       enqueueHarnessEvent,
       flushHarnessEvents,
     ],
   );
+  submitAfterProjectSyncRef.current = onSubmit;
 
   const automationSessionReservations = useRef(new Set<string>());
   const automationRecoveryRef = useRef<Promise<void> | null>(null);

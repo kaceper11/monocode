@@ -467,6 +467,7 @@ describe("Composer question focus", () => {
       onFocus: vi.fn(),
       onCwdChange: vi.fn(),
       onBranchChange: vi.fn(async () => {}),
+      onWorktreeChange: vi.fn(async () => {}),
       onWorkspaceModeChange,
       onWorktreeBaseChange,
       onModelChange: vi.fn(),
@@ -479,6 +480,18 @@ describe("Composer question focus", () => {
       ),
     );
     const textarea = container.querySelector("textarea")!;
+    const workspace = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Workspace Current checkout"]',
+    )!;
+    expect(
+      container.querySelector('[aria-label="Branch main"]'),
+    ).not.toBeNull();
+    await act(async () => workspace.click());
+    expect(document.body.textContent).toContain("Existing worktree…");
+    expect(
+      container.querySelector('[aria-label="Branch main"]'),
+    ).not.toBeNull();
+    await act(async () => workspace.click());
 
     await act(async () =>
       textarea.dispatchEvent(
