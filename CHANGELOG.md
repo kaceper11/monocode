@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Hermes turns stay busy while detached subagents are running and resume automatically with their completed transcripts instead of requiring a manual Continue. Hermes ACP usage updates also populate the context meter. In #335.
 
+## [0.3.2] - 2026-09-21
+
+### Changed
+
+- Align the core application with upstream MonoCode through 04711a1 (v0.1.53), including shared markdown document preview with frontmatter, the explorer's **Show excluded files** setting, existing-worktree selection in the workspace picker, Enter-to-select in the branch picker, and project-state preservation when project folders are renamed.
+- Retain WSL, Azure Boards/Repos/Pipelines, Jira, Confluence and Devin/Muse/Copilot integrations, the browser side panel, Keep Awake, saved project commands, Actions prompts, terminal resources, dictation, and the Board surface.
+
 ## [0.1.53] - 2026-09-21
 
 ### Added
