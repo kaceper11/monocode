@@ -55,7 +55,8 @@
     },
     "macOS": {
       "entitlements": "Entitlements.plist",
-      "signingIdentity": "-"
+      "signingIdentity": "-",
+      "minimumSystemVersion": "10.15"
     }
   },
   "plugins": {

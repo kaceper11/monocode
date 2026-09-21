@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Align the core application with upstream MonoCode through 04711a1 (v0.1.53), including shared markdown document preview with frontmatter, the explorer's **Show excluded files** setting, existing-worktree selection in the workspace picker, Enter-to-select in the branch picker, and project-state preservation when project folders are renamed.
 - Retain WSL, Azure Boards/Repos/Pipelines, Jira, Confluence and Devin/Muse/Copilot integrations, the browser side panel, Keep Awake, saved project commands, Actions prompts, terminal resources, dictation, and the Board surface.
 
+### Fixed
+
+- Restore the macOS 10.15 minimum system version dropped by the upstream merge so release builds compile the bundled Whisper engine's `std::filesystem` usage.
+
 ## [0.1.53] - 2026-09-21
 
 ### Added
