@@ -25,7 +25,19 @@ import type {
   BoardLocalCard,
   BoardPlacement,
   BoardTask,
+  Snooze,
 } from "./boardStore";
+
+/** Column header dot — literal classes so Tailwind keeps them. Custom
+ * columns fall back to a neutral dot. */
+const COLUMN_DOTS: Record<string, string> = {
+  todo: "bg-content/40",
+  progress: "bg-emerald-400",
+  review: "bg-amber-400",
+  done: "bg-accent",
+};
+export const columnDot = (id: string) =>
+  COLUMN_DOTS[id] ?? "bg-content/30";
 
 /** Group chip palette — literal classes so Tailwind keeps them. `color` on a
  * `BoardGroup` indexes this list; the store cycles indices on creation.
@@ -123,8 +135,8 @@ type BoardTicketChip = {
   kind?: "issue" | "pr";
 };
 
-/** A PR item discovered for a card — matched by ticket key or workstream
- * branch, or probed on a workstream's checkout. */
+/** A PR item discovered for a card — matched by ticket key or a direct
+ * ticket link. */
 type BoardLinkedPr = {
   id: string;
   provider?: InboxProvider;
@@ -133,8 +145,7 @@ type BoardLinkedPr = {
   url?: string;
   state?: string;
   draft?: boolean;
-  /** Which signal attached it. */
-  via: "link" | "branch" | "key" | "workstream";
+  updatedAt?: string;
 };
 
 /** One repo lane of a task card: branch/worktree + bound sessions + PR/CI. */
@@ -150,10 +161,29 @@ export type BoardWorkstreamRow = {
   sessions: BoardCardSession[];
   /** Primary display ref — first live session, else first bound. */
   session?: BoardCardSession;
-  pr?: { number: number; title: string; url: string; state: string };
+  pr?: {
+    number: number;
+    title: string;
+    url: string;
+    state: string;
+    /** `APPROVED` | `CHANGES_REQUESTED` | `REVIEW_REQUIRED`. */
+    reviewDecision?: string;
+    /** Review threads still unresolved. */
+    unresolvedThreads?: number;
+    draft?: boolean;
+    /** Provider-side update time (ISO) — recency signal for merges. */
+    updatedAt?: string;
+    /** Provider mergeability — `clean` | `behind` | `blocked` |
+     * `conflicts` | `unstable`. */
+    mergeState?: string;
+  };
+  /** Commits the lane's base has that the branch lacks — "behind main". */
+  behind?: number;
   ciTotal: number;
   ciFailing: number;
   ciRunning: number;
+  /** Mid-merge (`MERGE_HEAD` present) — surfaces the conflict resolver. */
+  merging?: boolean;
   /** Probe failure — deleted worktree, missing `gh`, auth. */
   probeError?: string;
 };
@@ -161,6 +191,9 @@ export type BoardWorkstreamRow = {
 export type WorkstreamStatus = {
   pr: GitPr | null;
   checks: GitPrCheck[];
+  merging?: boolean;
+  /** Commits the resolved base is ahead — local refs only, no fetch. */
+  behind?: number;
   error?: string;
 };
 
@@ -220,6 +253,9 @@ type BoardInput = {
   cardGroups?: Readonly<Record<string, readonly string[]>>;
   /** workstreamId → probed PR + checks for its worktree. */
   workstreamStatus?: ReadonlyMap<string, WorkstreamStatus>;
+  /** cardId → pipeline checks for standalone Azure PR cards — probed by
+   * `azureDevOpsBranchChecks` since they have no worktree to probe. */
+  cardChecks?: ReadonlyMap<string, GitPrCheck[]>;
 };
 
 const DONE_STATES = new Set([
@@ -235,7 +271,7 @@ const DONE_STATES = new Set([
 ]);
 const DONE_STATE_TYPES = new Set(["completed", "canceled"]);
 
-function itemCardKey(item: InboxItem): string {
+export function itemCardKey(item: InboxItem): string {
   const linked = linkedWorkItemFromInboxItem(item);
   if (linked) return `item:${linkedWorkItemInboxKey(linked)}`;
   return `item:${item.provider}:${item.url}`;
@@ -259,7 +295,7 @@ function cardIdentifier(item: InboxItem): string | undefined {
  * Boards state. Returns null when the provider hasn't moved it out of the
  * backlog — the board then falls back to session signals.
  */
-function providerStage(item: {
+export function providerStage(item: {
   state?: string;
   stateType?: string;
 }): "done" | "progress" | "review" | null {
@@ -293,7 +329,12 @@ export function deriveColumn(
   if (card.kind === "local") return "todo";
   if (card.kind === "task") {
     const tickets = card.tickets ?? [];
-    const openPrs = (card.prs ?? []).filter((pr) => prIsOpen(pr.state));
+    // A PR linked as a ticket chip is still a PR — it belongs in Review
+    // and blocks Done like any discovered/lane PR.
+    const linkedPrs = tickets.filter((ticket) => ticket.kind === "pr");
+    const openPrs = [...(card.prs ?? []), ...linkedPrs].filter((pr) =>
+      prIsOpen(pr.state),
+    );
     // Only probed PRs count — an unprobed row has no PR, not an unknown one.
     const workstreamPrs = (card.workstreams ?? []).filter(
       (ws) => ws.pr && prIsOpen(ws.pr.state),
@@ -315,6 +356,7 @@ export function deriveColumn(
       : !tickets.length && trackedPrs > 0;
     const prsDone =
       (card.prs ?? []).every((pr) => !prIsOpen(pr.state)) &&
+      linkedPrs.every((pr) => !prIsOpen(pr.state)) &&
       (card.workstreams ?? []).every((ws) => !ws.pr || !prIsOpen(ws.pr.state));
     if (ticketsDone && prsDone) return "done";
     if (openPrs.length || workstreamPrs.length) return "review";
@@ -335,12 +377,42 @@ export function deriveColumn(
   return "todo";
 }
 
-const prIsOpen = (state?: string) => {
+/** Open-ish PR states — unknown counts as open so badges stay honest.
+ * Denylist (not allowlist): an unrecognized provider state still gets
+ * review/CI attention rather than silently treated as done. */
+export const prIsOpen = (state?: string) => {
   const value = (state ?? "").trim().toLowerCase();
-  // Unknown — assume open so the PR stays visible.
   if (!value) return true;
   return !DONE_STATES.has(value);
 };
+
+/** Provider mergeability signal for one lane's open PR. `ready` requires a
+ * clean merge state plus nothing else outstanding — GitHub's `clean`
+ * already encodes branch protection (reviews, checks, up-to-date), but
+ * Azure's `succeeded` only covers conflicts, so votes/threads/checks are
+ * verified explicitly for both. `REVIEW_REQUIRED` isn't ready: Azure
+ * synthesizes it for assigned-but-unvoted reviewers, which a
+ * conflicts-only `mergeStatus` can't rule out. Threads must be a known
+ * zero — a failed count probe isn't "no threads". Drafts never signal. */
+export function lanePrSignal(
+  row: Pick<BoardWorkstreamRow, "pr" | "ciFailing" | "ciRunning">,
+): "ready" | "conflicts" | "blocked" | "behind" | null {
+  const pr = row.pr;
+  if (!pr || !prIsOpen(pr.state) || pr.draft) return null;
+  if (pr.mergeState === "conflicts") return "conflicts";
+  if (pr.mergeState === "blocked") return "blocked";
+  if (pr.mergeState === "behind") return "behind";
+  if (
+    pr.mergeState === "clean" &&
+    !row.ciFailing &&
+    !row.ciRunning &&
+    pr.reviewDecision !== "CHANGES_REQUESTED" &&
+    pr.reviewDecision !== "REVIEW_REQUIRED" &&
+    pr.unresolvedThreads === 0
+  )
+    return "ready";
+  return null;
+}
 
 /** Where a card actually sits — manual placement beats derivation. Local
  * cards store their column on the record, surfaced as `derived`. */
@@ -353,8 +425,13 @@ export function cardColumn(
     : (placements[card.id]?.column ?? card.derived);
 }
 
-/** One-line attention phrases for a card, most actionable first. */
-export function cardAttentionLines(card: BoardCard): string[] {
+/** One-line attention phrases for a card, most actionable first. `column`
+ * is the card's effective column — the ticket-closed nudge only makes sense
+ * outside Done (defaults to the derived column when omitted). */
+export function cardAttentionLines(
+  card: BoardCard,
+  column?: BoardColumnId,
+): string[] {
   const lines: string[] = [];
   const needsInput = card.sessions.filter((session) => session.needsInput);
   if (needsInput.length)
@@ -365,6 +442,50 @@ export function cardAttentionLines(card: BoardCard): string[] {
     );
   if (card.ciFailing)
     lines.push(card.ciFailing === 1 ? "CI failing" : `CI failing ×${card.ciFailing}`);
+  // Lane PRs carrying a review verdict or unresolved threads.
+  const changesRequested = (card.workstreams ?? []).filter(
+    (row) => row.pr && prIsOpen(row.pr.state) && row.pr.reviewDecision === "CHANGES_REQUESTED",
+  ).length;
+  if (changesRequested)
+    lines.push(
+      changesRequested === 1 ? "Changes requested" : `Changes requested ×${changesRequested}`,
+    );
+  const unresolved = (card.workstreams ?? []).reduce(
+    (sum, row) => sum + (row.pr && prIsOpen(row.pr.state) ? (row.pr.unresolvedThreads ?? 0) : 0),
+    0,
+  );
+  if (unresolved)
+    lines.push(unresolved === 1 ? "1 open thread" : `${unresolved} open threads`);
+  // Provider-side mergeability — conflicts/blocks are problems, "ready" is
+  // the positive counterpart answering "what can I land right now".
+  const signals = (card.workstreams ?? []).map(lanePrSignal);
+  const conflicts = signals.filter((signal) => signal === "conflicts").length;
+  const blocked = signals.filter((signal) => signal === "blocked").length;
+  if (conflicts)
+    lines.push(conflicts === 1 ? "Merge conflicts" : `Merge conflicts ×${conflicts}`);
+  if (blocked)
+    lines.push(blocked === 1 ? "Merge blocked" : `Merge blocked ×${blocked}`);
+  // Provider-side staleness — the lane's own `behind` count covers
+  // worktree lanes; this reaches cleaned ones too.
+  const behind = signals.filter((signal) => signal === "behind").length;
+  if (behind)
+    lines.push(behind === 1 ? "Behind base" : `Behind base ×${behind}`);
+  const ready = signals.filter((signal) => signal === "ready").length;
+  if (ready)
+    lines.push(ready === 1 ? "Ready to merge" : `Ready to merge ×${ready}`);
+  // Tickets closed but the card isn't done — the leftover PR/lane still
+  // needs a decision. Only tickets carrying a provider state count — an
+  // unfetched ticket can't claim "closed".
+  const knownTickets = (card.tickets ?? []).filter(
+    (ticket) => ticket.state || ticket.stateType,
+  );
+  if (
+    card.kind === "task" &&
+    (column ?? card.derived) !== "done" &&
+    knownTickets.length &&
+    knownTickets.every((ticket) => providerStage(ticket) === "done")
+  )
+    lines.push("Ticket closed");
   if (card.hasUpdate) lines.push("New activity");
   if (card.attentionReason) lines.push(card.attentionReason);
   const working = card.sessions.filter((session) => session.busy).length;
@@ -373,6 +494,87 @@ export function cardAttentionLines(card: BoardCard): string[] {
   if (card.ciRunning && !working)
     lines.push(card.ciRunning === 1 ? "CI running" : `CI running ×${card.ciRunning}`);
   return lines;
+}
+
+/** How urgently a card needs eyes — drives the attention-first sort.
+ * Pinned still wins; this only reorders inside each pinned/placed bucket. */
+export function attentionScore(card: BoardCard): number {
+  let score = 0;
+  if (card.sessions.some((session) => session.needsInput)) score += 8;
+  if (card.ciFailing) score += 6;
+  if (
+    (card.workstreams ?? []).some(
+      (row) => row.pr && prIsOpen(row.pr.state) && row.pr.reviewDecision === "CHANGES_REQUESTED",
+    )
+  )
+    score += 5;
+  if (
+    (card.workstreams ?? []).some(
+      (row) => row.pr && prIsOpen(row.pr.state) && (row.pr.unresolvedThreads ?? 0) > 0,
+    )
+  )
+    score += 4;
+  if ((card.workstreams ?? []).some((row) => row.merging)) score += 4;
+  if (
+    (card.workstreams ?? []).some((row) => {
+      const signal = lanePrSignal(row);
+      return signal === "conflicts" || signal === "blocked";
+    })
+  )
+    score += 5;
+  if ((card.workstreams ?? []).some((row) => lanePrSignal(row) === "behind"))
+    score += 3;
+  // A mergeable PR still needs someone to land it — actionable, but below
+  // the real problems.
+  if ((card.workstreams ?? []).some((row) => lanePrSignal(row) === "ready"))
+    score += 2;
+  if (card.hasUpdate) score += 2;
+  if (card.ciRunning) score += 1;
+  return score;
+}
+
+/** Fingerprint of a card's actionable state — stored on snooze; any change
+ * (CI flip, review verdict, session needing input, provider update) wakes
+ * the card early. */
+export function snoozeWakeKey(card: BoardCard): string {
+  return [
+    card.item?.updatedAt ?? "",
+    card.state ?? "",
+    // Ticket close/reopen flips — a linked ticket going done is exactly
+    // the activity a snoozed card should wake for.
+    (card.tickets ?? [])
+      .map((ticket) => ticket.state ?? ticket.stateType ?? "")
+      .join(","),
+    (card.workstreams ?? [])
+      .map(
+        (row) =>
+          `${row.pr?.state ?? ""}:${row.pr?.reviewDecision ?? ""}:${row.pr?.unresolvedThreads ?? ""}:${row.pr?.mergeState ?? ""}:${row.ciFailing}:${row.merging ? 1 : 0}`,
+      )
+      .join(","),
+    // Discovered PRs — state flips (merged/closed), not just the count.
+    (card.prs ?? []).map((pr) => pr.state ?? "").join(","),
+    card.sessions
+      .map((session) => `${session.busy ? 1 : 0}${session.needsInput ? 1 : 0}`)
+      .join(","),
+    String(card.ciFailing),
+    String(card.hasUpdate),
+    String(card.prs?.length ?? 0),
+  ].join("|");
+}
+
+/** Is the card still asleep? A snooze hides while BOTH clocks hold: the
+ * `until` time hasn't passed AND the `wake` fingerprint is unchanged.
+ * Either lapse wakes the card (expired entries get swept on next write). */
+export function isCardSnoozed(
+  card: BoardCard,
+  snooze: Snooze | undefined,
+  now = Date.now(),
+): boolean {
+  if (!snooze) return false;
+  if (snooze.until !== undefined && now >= snooze.until) return false;
+  if (snooze.wake !== undefined && snooze.wake !== snoozeWakeKey(card))
+    return false;
+  return true;
 }
 
 type MutableCard = BoardCard & {
@@ -415,17 +617,20 @@ export function ticketKeys(link: LinkedWorkItem): string[] {
 const escapeRegExp = (text: string) =>
   text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+/** Boundary pattern for a ticket key — matches `PROJ-123` but not
+ * `PROJ-1234` or `APROJ-123`. The join loop precompiles one per key per
+ * refresh (`taskPatterns`); `itemMatchesTicketKey` compiles per call —
+ * fine for its test/diagnostic callers, wrong for a hot path. */
+const ticketKeyPattern = (key: string) =>
+  new RegExp(`(^|[^A-Za-z0-9])${escapeRegExp(key)}(?![0-9])`, "i");
+
 /** Whether an inbox item references a ticket key — in its identifier, title,
- * or URL. Matched on non-alphanumeric boundaries so `PROJ-123` doesn't join
- * `PROJ-1234` or `APROJ-123`. */
+ * or URL. */
 export function itemMatchesTicketKey(item: InboxItem, key: string): boolean {
   const haystack = [item.identifier, item.title, item.url]
     .filter(Boolean)
     .join("\n");
-  return new RegExp(
-    `(^|[^A-Za-z0-9])${escapeRegExp(key)}(?![0-9])`,
-    "i",
-  ).test(haystack);
+  return ticketKeyPattern(key).test(haystack);
 }
 
 /**
@@ -513,7 +718,7 @@ function ticketChipFromLink(link: LinkedWorkItem): BoardTicketChip {
   };
 }
 
-function linkedPrFromItem(item: InboxItem, via: BoardLinkedPr["via"]): BoardLinkedPr {
+function linkedPrFromItem(item: InboxItem): BoardLinkedPr {
   const linked = linkedWorkItemFromInboxItem(item);
   return {
     id: linked ? `item:${linkedWorkItemInboxKey(linked)}` : `item:${item.url}`,
@@ -523,7 +728,7 @@ function linkedPrFromItem(item: InboxItem, via: BoardLinkedPr["via"]): BoardLink
     ...(item.url ? { url: item.url } : {}),
     ...(item.state ? { state: item.state } : {}),
     ...(item.draft ? { draft: true } : {}),
-    via,
+    ...(item.updatedAt ? { updatedAt: item.updatedAt } : {}),
   };
 }
 
@@ -641,7 +846,15 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
   // --- task cards + lookup indexes -------------------------------------
   const taskByLink = new Map<string, MutableCard>();
   const taskBySession = new Map<string, { card: MutableCard; workstreamId?: string }>();
-  const taskKeys = new Map<MutableCard, string[]>();
+  /** Lowercase workstream branch → candidate lanes — Azure PRs join by
+   * `sourceRefName`. Several lanes can share a branch name across repos, so
+   * the item's repo name breaks the tie before a lane is trusted. */
+  const taskByBranch = new Map<
+    string,
+    { card: MutableCard; workstreamId: string; repo: string }[]
+  >();
+  // Compiled once per key — the PR join tests every pattern per item.
+  const taskPatterns = new Map<MutableCard, RegExp[]>();
   const groupById = new Map(
     (input.groups ?? []).map((group) => [group.id, group] as const),
   );
@@ -650,7 +863,10 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     if (task.archived) continue;
     const card = newTaskCard(task, groupById);
     cards.set(card.id, card);
-    taskKeys.set(card, task.links.flatMap(ticketKeys));
+    taskPatterns.set(
+      card,
+      task.links.flatMap(ticketKeys).map(ticketKeyPattern),
+    );
     for (const link of task.links) {
       taskByLink.set(linkedWorkItemInboxKey(link), card);
       if (link.url) taskByLink.set(link.url, card);
@@ -670,12 +886,23 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
       };
       const status = input.workstreamStatus?.get(ws.id);
       if (status?.error) row.probeError = status.error;
+      if (status?.merging) row.merging = true;
+      if (status?.behind) row.behind = status.behind;
       if (status?.pr) {
         row.pr = {
           number: status.pr.number,
           title: status.pr.title,
           url: status.pr.url,
           state: status.pr.state,
+          ...(status.pr.reviewDecision
+            ? { reviewDecision: status.pr.reviewDecision }
+            : {}),
+          ...(status.pr.unresolvedThreads !== undefined
+            ? { unresolvedThreads: status.pr.unresolvedThreads }
+            : {}),
+          ...(status.pr.draft ? { draft: true } : {}),
+          ...(status.pr.updatedAt ? { updatedAt: status.pr.updatedAt } : {}),
+          ...(status.pr.mergeState ? { mergeState: status.pr.mergeState } : {}),
         };
       }
       for (const check of status?.checks ?? []) {
@@ -685,17 +912,34 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
         else if (state === "running") row.ciRunning += 1;
       }
       card.workstreamRows.set(ws.id, row);
+      const laneBranch = ws.branch.replace(/^refs\/heads\//, "").toLowerCase();
+      if (laneBranch) {
+        const lanes = taskByBranch.get(laneBranch) ?? [];
+        lanes.push({
+          card,
+          workstreamId: ws.id,
+          repo:
+            ws.projectPath
+              .split(/[\\/]/)
+              .filter(Boolean)
+              .pop()
+              ?.toLowerCase() ?? "",
+        });
+        taskByBranch.set(laneBranch, lanes);
+      }
       for (const sessionId of ws.sessionIds ?? [])
         taskBySession.set(sessionId, { card, workstreamId: ws.id });
     }
   }
 
-  /** Fold a fetched item into its task card — refresh the ticket chip or
-   * add the PR to the discovered list. `via` says which join matched. */
+  /** Fold a fetched item into its task card — refresh the ticket chip, put
+   * a branch-matched PR on its lane, or add the PR to the discovered list.
+   * `via` says which join matched. */
   const absorbItem = (
     card: MutableCard,
     item: InboxItem,
     via: "link" | "branch" | "key",
+    workstreamId?: string,
   ): boolean => {
     const key = inboxItemKey(item);
     const index = (card.tickets ?? []).findIndex((t) => t.key === key);
@@ -704,7 +948,26 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
       return true;
     }
     if (item.kind === "pr") {
-      const pr = linkedPrFromItem(item, via);
+      // A branch-matched PR is the lane's own — show it on the row (a probe
+      // result wins; it's fresher) rather than as a discovered chip.
+      if (via === "branch" && workstreamId) {
+        const row = card.workstreamRows.get(workstreamId);
+        if (row && !row.pr) {
+          row.pr = {
+            number: item.number,
+            title: item.title,
+            url: item.url ?? "",
+            state: item.state ?? "",
+            ...(item.draft ? { draft: true } : {}),
+            ...(item.updatedAt ? { updatedAt: item.updatedAt } : {}),
+          };
+          return true;
+        }
+        // Same PR already on the row — dedupe; a *different* one falls
+        // through to the discovered list rather than vanishing.
+        if (row?.pr?.number === item.number) return true;
+      }
+      const pr = linkedPrFromItem(item);
       if (!card.prs!.some((entry) => entry.id === pr.id)) card.prs!.push(pr);
       return true;
     }
@@ -713,7 +976,9 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
 
   const taskForItem = (
     item: InboxItem,
-  ): { card: MutableCard; via: "link" | "branch" | "key" } | undefined => {
+  ):
+    | { card: MutableCard; via: "link" | "branch" | "key"; workstreamId?: string }
+    | undefined => {
     // Links were built through `boardLinkFromInboxItem`, whose key is the
     // item's own identity — this catches every provider, not just the
     // three `linkedWorkItemFromInboxItem` covers.
@@ -722,9 +987,36 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
       (item.url ? taskByLink.get(item.url) : undefined);
     if (direct) return { card: direct, via: "link" };
     if (item.kind !== "pr") return undefined;
+    // Azure/GitLab PRs carry `sourceRefName` — a match on a workstream's
+    // branch is the lane's own pull request, more precise than a guess.
+    const source = item.sourceRefName
+      ?.replace(/^refs\/heads\//, "")
+      .toLowerCase();
+    if (source) {
+      const lanes = taskByBranch.get(source) ?? [];
+      // The item's `owner/repo`/`project/repo` basename vs the lane's
+      // project dir disambiguates shared branch names — and when known it
+      // must match even a lone candidate: a same-named branch in another
+      // repo is a different change entirely.
+      const repo = item.repo?.split("/").pop()?.toLowerCase() ?? "";
+      const candidates = repo
+        ? lanes.filter((entry) => entry.repo === repo)
+        : lanes;
+      const lane = candidates.length === 1 ? candidates[0] : undefined;
+      if (lane)
+        return {
+          card: lane.card,
+          via: "branch",
+          workstreamId: lane.workstreamId,
+        };
+    }
     // A PR joins a task when it carries one of the task's ticket keys.
-    for (const [card, keys] of taskKeys) {
-      if (keys.some((key) => itemMatchesTicketKey(item, key)))
+    // Patterns compile once per card — not once per (item × key).
+    const haystack = [item.identifier, item.title, item.url]
+      .filter(Boolean)
+      .join("\n");
+    for (const [card, patterns] of taskPatterns) {
+      if (patterns.some((pattern) => pattern.test(haystack)))
         return { card, via: "key" };
     }
     return undefined;
@@ -732,8 +1024,17 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
 
   for (const item of input.items) {
     const task = taskForItem(item);
-    if (task && absorbItem(task.card, item, task.via)) continue;
+    if (task && absorbItem(task.card, item, task.via, task.workstreamId))
+      continue;
     const card = newItemCard(item);
+    // Standalone Azure PR cards get their branch pipeline badges from the
+    // board's `azureDevOpsBranchChecks` probe.
+    for (const check of input.cardChecks?.get(card.id) ?? []) {
+      card.ciTotal += 1;
+      const state = checkCiState(check);
+      if (state === "failing") card.ciFailing += 1;
+      else if (state === "running") card.ciRunning += 1;
+    }
     if (!cards.has(card.id)) cards.set(card.id, card);
   }
 
@@ -895,8 +1196,9 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
   });
 }
 
-/** Column contents: placed cards keep their order, derived cards fall to
- * the bottom sorted by recency. */
+/** Column contents: pinned cards first (their placement order decides among
+ * them — pinning writes a topmost order), then placed cards keep their
+ * order, derived cards fall to the bottom sorted by recency. */
 export function columnCards(
   cards: readonly BoardCard[],
   column: BoardColumnId,
@@ -904,9 +1206,16 @@ export function columnCards(
   locals: readonly BoardLocalCard[],
 ): BoardCard[] {
   const localOrder = new Map(locals.map((card) => [card.id, card]));
+  const pinned = (card: BoardCard) =>
+    card.kind === "local"
+      ? localOrder.get(card.id)?.pinned === true
+      : placements[card.id]?.pinned === true;
   return cards
     .filter((card) => cardColumn(card, placements) === column)
     .sort((a, b) => {
+      const aPin = pinned(a);
+      const bPin = pinned(b);
+      if (aPin !== bPin) return aPin ? -1 : 1;
       const aPlaced = placements[a.id] ?? localOrder.get(a.id);
       const bPlaced = placements[b.id] ?? localOrder.get(b.id);
       if (aPlaced && bPlaced) return aPlaced.order - bPlaced.order;
@@ -951,4 +1260,26 @@ export function columnUnits(cards: readonly BoardCard[]): ColumnUnit[] {
     }
   }
   return units;
+}
+
+/** Splice `cardId` into the column's `ordered` ids at `index`. Pinned cards
+ * hold the column's top regardless of order — a drop marker above them
+ * can't be honored, so an unpinned card's index clamps below the pinned
+ * prefix (marker and commit then agree). `pinned` is the effective set —
+ * a pinned card being repositioned is unpinned by the caller first. */
+export function dropOrder(
+  ordered: readonly string[],
+  pinned: ReadonlySet<string>,
+  cardId: string,
+  index: number,
+): string[] {
+  const rest = ordered.filter((id) => id !== cardId);
+  const firstFree = rest.findIndex((id) => !pinned.has(id));
+  const bound = firstFree < 0 ? rest.length : firstFree;
+  const at = pinned.has(cardId)
+    ? Math.min(index, rest.length)
+    : Math.max(Math.min(index, rest.length), bound);
+  const ids = [...rest];
+  ids.splice(at, 0, cardId);
+  return ids;
 }

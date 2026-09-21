@@ -15,7 +15,9 @@ import {
   ChartBreakoutSquare,
   Check,
   ChevronDown,
+  Clock,
   Folder,
+  ListBullet,
   ListFilter,
   LoaderCircle,
   Pencil,
@@ -23,7 +25,9 @@ import {
   RefreshCw,
   Search,
   Tag,
+  Trash2,
   X,
+  Zap,
 } from "../../shared/ui/icons";
 import { Popover } from "../../shared/ui/Popover";
 import { ProjectLogoIcon } from "../projects/ui/ProjectLogoIcon";
@@ -59,15 +63,26 @@ import {
   linkedWorkItemUpdateKey,
 } from "../inbox/model/linkedSessionUpdates";
 import { linkedSessionSeenAt } from "../inbox/model/linkedSessionSeen";
-import { linkedWorkItemFromInboxItem } from "../sessions/model/sessionWorkItem";
-import { setGrabbing, suppressTextSelection } from "../../shared/lib/drag";
 import {
+  inboxItemMatchesLinkedWorkItem,
+  linkedWorkItemFromInboxItem,
+} from "../sessions/model/sessionWorkItem";
+import { setGrabbing, suppressTextSelection } from "../../shared/lib/drag";
+import { azureDevOpsBranchChecks } from "../inbox/model/azureDevOps";
+import type { GitPrCheck } from "../../platform/tauri/fs";
+import {
+  attentionScore,
   buildBoardCards,
   cardColumn,
   columnCards,
+  columnDot,
   columnUnits,
+  dropOrder,
   groupSwatch,
+  isCardSnoozed,
+  lanePrSignal,
   sessionDotClass,
+  snoozeWakeKey,
   type BoardCard,
   type WorkstreamStatus,
 } from "./boardData";
@@ -85,38 +100,44 @@ import {
   updateWorkstreamFromBase,
   type WorkstreamResult,
 } from "./taskOps";
+import { standupSections } from "./standup";
+import { StandupDialog } from "./StandupDialog";
+import { ReviewLocallyDialog } from "./ReviewLocallyDialog";
+import type { PrSubmit } from "./CreatePrsDialog";
 import {
+  addColumn,
   addLocalCard,
   addTask,
   archiveTasks,
-  BOARD_COLUMNS,
   boardFromSnapshot,
   boardSnapshot,
   createGroup,
+  DEFAULT_COLUMN_IDS,
   deleteGroup,
   hideCards,
   loadBoard,
+  MAX_TASK_GROUPS,
+  MAX_TASKS,
   newEntityId,
+  pinCard,
   placeColumnOrder,
   removeCardFromGroup,
+  removeColumn,
   removeLocalCard,
+  renameColumn,
   renameGroup,
   setCardGroups,
+  snoozeCard,
   subscribeBoard,
   unarchiveAll,
   unplaceCard,
+  unsnoozeCard,
   updateTask,
+  type BoardColumn,
   type BoardColumnId,
   type BoardGroup,
   type TaskWorkstream,
 } from "./boardStore";
-
-const COLUMN_DOT: Record<BoardColumnId, string> = {
-  todo: "bg-content/40",
-  progress: "bg-emerald-400",
-  review: "bg-amber-400",
-  done: "bg-accent",
-};
 
 const DRAG_THRESHOLD = 5;
 const BOARD_QUERY = {
@@ -129,9 +150,6 @@ const UNGROUPED = "__ungrouped__";
 
 type DragState = {
   cardId: string;
-  pointerId: number;
-  startX: number;
-  startY: number;
   /** Pointer position and grab offset — the overlay follows the cursor at the
    * point the card was picked up, not glued to its corner. */
   x: number;
@@ -140,6 +158,9 @@ type DragState = {
   offY: number;
   w: number;
   active: boolean;
+  /** Escape set this mid-drag — pointerup still eats its release click but
+   * commits nothing. */
+  cancelled: boolean;
   overColumn: BoardColumnId | null;
   overIndex: number;
   /** Group wrapper under the pointer — dropping a task on it joins the
@@ -160,6 +181,7 @@ export function BoardView({
   onSendToSession,
   onSpawnSession,
   onBindSession,
+  onRemoveWorktree,
 }: {
   besideRail?: boolean;
   recents: RecentProject[];
@@ -182,6 +204,14 @@ export function BoardView({
   ) => Promise<{ sessionId: string; worktreePath: string }>;
   /** Attach a work-item link to an existing live session. */
   onBindSession: (sessionId: string, linked: LinkedWorkItem | null) => void;
+  /** App-level worktree removal — session detach, persist guards, and
+   * open-file checks live there; the model helper alone bypasses them. */
+  onRemoveWorktree: (
+    cwd: string,
+    path: string,
+    force: boolean,
+    keepSessions?: boolean,
+  ) => Promise<unknown>;
 }) {
   const boardRaw = useSyncExternalStore(subscribeBoard, boardSnapshot);
   const board = useMemo(() => boardFromSnapshot(boardRaw), [boardRaw]);
@@ -259,12 +289,16 @@ export function BoardView({
   const probeStreams = useMemo(
     () =>
       board.tasks.flatMap((task) =>
-        task.archived ? [] : task.workstreams.filter((ws) => ws.worktreePath),
+        task.archived
+          ? []
+          : // A cleaned-up lane keeps probing its pinned PR from the
+            // project root — the merged record shouldn't vanish.
+            task.workstreams.filter((ws) => ws.worktreePath || ws.prUrl),
       ),
     [board.tasks],
   );
   const probeKey = probeStreams
-    .map((ws) => `${ws.id}:${ws.worktreePath}:${ws.branch}`)
+    .map((ws) => `${ws.id}:${ws.worktreePath}:${ws.branch}:${ws.prUrl ?? ""}`)
     .join("\n");
   const probeRef = useRef(probeStreams);
   useEffect(() => {
@@ -286,18 +320,37 @@ export function BoardView({
       ),
     ).then((results) => {
       if (cancelled) return;
-      const next = new Map<string, WorkstreamStatus>();
-      for (const result of results) {
-        if (result.status === "fulfilled" && result.value[1]) {
-          next.set(result.value[0], result.value[1]);
+      setWsStatus((prev) => {
+        const next = new Map<string, WorkstreamStatus>();
+        for (const result of results) {
+          if (result.status !== "fulfilled" || !result.value[1]) continue;
+          const status = result.value[1];
+          const prior = prev.get(result.value[0]);
+          // A failed probe (offline, deleted worktree, gh hiccup) must not
+          // erase known PR/CI state — carry it forward so cards don't lose
+          // badges or jump columns on a transient error.
+          next.set(
+            result.value[0],
+            status.error && prior
+              ? {
+                  ...status,
+                  pr: status.pr ?? prior.pr ?? null,
+                  checks: status.checks.length ? status.checks : prior.checks,
+                }
+              : status,
+          );
         }
-      }
-      setWsStatus(next);
+        return next;
+      });
     });
     return () => {
       cancelled = true;
     };
   }, [probeKey, refresh]);
+
+  const [cardChecks, setCardChecks] = useState<
+    ReadonlyMap<string, GitPrCheck[]>
+  >(new Map());
 
   const cards = useMemo(
     () =>
@@ -311,6 +364,7 @@ export function BoardView({
         groups: board.groups,
         cardGroups: board.cardGroups,
         workstreamStatus: wsStatus,
+        cardChecks,
       }),
     [
       items,
@@ -320,9 +374,69 @@ export function BoardView({
       board.locals,
       board.tasks,
       board.groups,
+      board.cardGroups,
       wsStatus,
+      cardChecks,
     ],
   );
+
+  // Standalone Azure PR cards have no worktree — probe their branch's
+  // pipeline builds by repo + sourceRefName + PR number. Targets are item
+  // cards, so anything a task absorbed is skipped for free. The effect keys
+  // on a serialization so unrelated board-store writes don't refire.
+  const azureCheckTargets = useMemo(
+    () =>
+      cards.filter(
+        (card) =>
+          card.kind === "item" &&
+          card.provider === "azuredevops" &&
+          card.itemKind === "pr" &&
+          card.item?.repo &&
+          card.item.sourceRefName,
+      ),
+    [cards],
+  );
+  const azureCheckKey = azureCheckTargets
+    .map(
+      (card) =>
+        `${card.id}:${card.item!.repo}:${card.item!.sourceRefName}:${card.item!.number}`,
+    )
+    .join("\n");
+  const azureCheckRef = useRef(azureCheckTargets);
+  useEffect(() => {
+    azureCheckRef.current = azureCheckTargets;
+  });
+  useEffect(() => {
+    let cancelled = false;
+    const targets = azureCheckRef.current;
+    if (!targets.length) {
+      setCardChecks(new Map());
+      return;
+    }
+    void Promise.allSettled(
+      targets.map(
+        async (card) =>
+          [
+            card.id,
+            await azureDevOpsBranchChecks(
+              card.item!.repo!,
+              card.item!.sourceRefName!,
+              card.item!.number,
+            ),
+          ] as const,
+      ),
+    ).then((results) => {
+      if (cancelled) return;
+      const next = new Map<string, GitPrCheck[]>();
+      for (const result of results)
+        if (result.status === "fulfilled")
+          next.set(result.value[0], result.value[1]);
+      setCardChecks(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [azureCheckKey, refresh]);
 
   // --- filters -----------------------------------------------------------
   const [search, setSearch] = useState("");
@@ -337,6 +451,12 @@ export function BoardView({
     useState<HTMLElement | null>(null);
   const [groupPickerAnchor, setGroupPickerAnchor] =
     useState<HTMLElement | null>(null);
+  // Column editor popover — rename/delete the target column, or flip to
+  // add mode for a new one.
+  const [columnEdit, setColumnEdit] = useState<{
+    anchor: HTMLElement;
+    column: BoardColumn;
+  } | null>(null);
   const [projectSearch, setProjectSearch] = useState("");
 
   const visibleSources = useMemo(
@@ -361,6 +481,8 @@ export function BoardView({
     const hiddenCards = new Set(board.hidden);
     return cards.filter((card) => {
       if (hiddenCards.has(card.id)) return false;
+      // Snoozed — until the time passes or the wake fingerprint changes.
+      if (isCardSnoozed(card, board.snoozed[card.id])) return false;
       if (card.provider && hidden.has(card.provider)) return false;
       // Cards without a project (locals, linked-only items) pass any filter.
       // Tasks match when any workstream lives in the filtered project.
@@ -369,7 +491,10 @@ export function BoardView({
           [card.projectPath, ...(card.workstreams ?? []).map((w) => w.projectPath)]
             .filter((p): p is string => Boolean(p)),
         );
-        if (projectsOf.size && ![...projectsOf].some((p) => p === projectFilter))
+        if (
+          projectsOf.size &&
+          ![...projectsOf].some((p) => sameProjectPath(p, projectFilter))
+        )
           return false;
       }
       if (groupFilter.size) {
@@ -384,7 +509,12 @@ export function BoardView({
         !card.hasUpdate &&
         !card.ciFailing &&
         !card.attentionReason &&
-        !card.sessions.some((session) => session.needsInput)
+        !card.sessions.some((session) => session.needsInput) &&
+        // Lane merge signals ("Ready", "Conflicts") and probe failures are
+        // actionable too — the filter must see what the card can show.
+        !(card.workstreams ?? []).some(
+          (row) => lanePrSignal(row) || row.probeError,
+        )
       )
         return false;
       if (!tokens.length) return true;
@@ -415,7 +545,17 @@ export function BoardView({
     groupFilter,
     actionOnly,
     board.hidden,
+    board.snoozed,
   ]);
+
+  // Still-asleep snoozed cards — surfaced as a quiet restore affordance.
+  const snoozedIds = useMemo(
+    () =>
+      cards
+        .filter((card) => isCardSnoozed(card, board.snoozed[card.id]))
+        .map((card) => card.id),
+    [cards, board.snoozed],
+  );
 
   // Deleted groups shouldn't linger in the filter — they'd match nothing
   // but still count in the button badge.
@@ -445,16 +585,74 @@ export function BoardView({
     () => filtered.filter((card) => card.kind !== "session"),
     [filtered],
   );
+  const pinnedIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const card of board.locals) if (card.pinned) ids.add(card.id);
+    for (const [id, placement] of Object.entries(board.placements))
+      if (placement.pinned) ids.add(id);
+    return ids;
+  }, [board.locals, board.placements]);
+  const [attentionFirst, setAttentionFirst] = useState(false);
   const cardsByColumn = useMemo(() => {
     const map = new Map<BoardColumnId, BoardCard[]>();
-    for (const column of BOARD_COLUMNS) {
-      map.set(
+    for (const column of board.columns) {
+      let list = columnCards(
+        columnSource,
         column.id,
-        columnCards(columnSource, column.id, board.placements, board.locals),
+        board.placements,
+        board.locals,
       );
+      if (attentionFirst) {
+        // Pinned keep their hand-set order; everything else ranks by
+        // attention score (stable — equal scores keep board order).
+        const pinned = list.filter((card) => pinnedIds.has(card.id));
+        const rest = list
+          .filter((card) => !pinnedIds.has(card.id))
+          .map((card, index) => ({ card, index, score: attentionScore(card) }))
+          .sort((a, b) => b.score - a.score || a.index - b.index)
+          .map((entry) => entry.card);
+        list = [...pinned, ...rest];
+      }
+      map.set(column.id, list);
     }
     return map;
-  }, [columnSource, board.placements, board.locals]);
+  }, [
+    columnSource,
+    board.columns,
+    board.placements,
+    board.locals,
+    pinnedIds,
+    attentionFirst,
+  ]);
+  /** cardId → when it entered its column — feeds the card age chip. */
+  const placedAts = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const card of board.locals)
+      if (card.placedAt) map.set(card.id, card.placedAt);
+    for (const [id, placement] of Object.entries(board.placements))
+      if (placement.placedAt) map.set(id, placement.placedAt);
+    return map;
+  }, [board.locals, board.placements]);
+
+  // Canonical card list for report/placement consumers — unfiltered and in
+  // board order. `columnSource` is presentation: writing its filtered or
+  // attention-sorted order back would freeze a transient view as truth.
+  const canonicalByColumn = useMemo(() => {
+    const hidden = new Set(board.hidden);
+    const pool = cards.filter(
+      (card) =>
+        card.kind !== "session" &&
+        !hidden.has(card.id) &&
+        !isCardSnoozed(card, board.snoozed[card.id]),
+    );
+    const map = new Map<BoardColumnId, BoardCard[]>();
+    for (const column of board.columns)
+      map.set(
+        column.id,
+        columnCards(pool, column.id, board.placements, board.locals),
+      );
+    return map;
+  }, [cards, board.hidden, board.snoozed, board.columns, board.placements, board.locals]);
 
   // Archived = dismissed derived cards + archived tasks — restored together.
   const archivedCount =
@@ -469,13 +667,28 @@ export function BoardView({
       const ordered = columnUnits(cardsByColumn.get(column) ?? []).flatMap(
         (unit) => (unit.type === "group" ? unit.cards : [unit.card]),
       );
-      const without = ordered
-        .map((card) => card.id)
-        .filter((id) => id !== cardId);
-      without.splice(Math.min(index, without.length), 0, cardId);
-      placeColumnOrder(column, without);
+      const pinned = new Set(pinnedIds);
+      // A pinned card dragged inside its own column is an explicit
+      // reposition — drop the pin rather than snapping back to the top.
+      // (Dragged to ANOTHER column it lands pinned at that column's top.)
+      const from = [...cardsByColumn.entries()].find(([, list]) =>
+        list.some((card) => card.id === cardId),
+      )?.[0];
+      if (pinned.has(cardId) && from === column) {
+        pinCard(cardId, column, false);
+        pinned.delete(cardId);
+      }
+      placeColumnOrder(
+        column,
+        dropOrder(
+          ordered.map((card) => card.id),
+          pinned,
+          cardId,
+          index,
+        ),
+      );
     },
-    [cardsByColumn],
+    [cardsByColumn, pinnedIds],
   );
   // The drag's window listeners outlive renders — a poll refresh mid-drag
   // would leave the captured dropCard computing against stale columns.
@@ -502,20 +715,34 @@ export function BoardView({
       ).getBoundingClientRect();
       const state: DragState = {
         cardId: card.id,
-        pointerId: event.pointerId,
-        startX,
-        startY,
         x: startX,
         y: startY,
         offX: startX - rect.left,
         offY: startY - rect.top,
         w: rect.width,
         active: false,
+        cancelled: false,
         overColumn: null,
         overIndex: -1,
         overGroup: null,
       };
       let releaseSuppress: (() => void) | null = null;
+
+      // A drag-release still fires click on the pressed element — eat it so
+      // dropping (or releasing after Escape) doesn't also open the card or
+      // hit a chip. The listener expires next tick: if that click never
+      // comes (released off-window) it must not eat the next real click.
+      const eatReleaseClick = () => {
+        const eat = (click: MouseEvent) => {
+          click.preventDefault();
+          click.stopPropagation();
+        };
+        window.addEventListener("click", eat, { capture: true });
+        setTimeout(
+          () => window.removeEventListener("click", eat, { capture: true }),
+          0,
+        );
+      };
 
       const locate = (clientX: number, clientY: number) => {
         const root = boardRef.current;
@@ -568,46 +795,48 @@ export function BoardView({
       const onUp = (up: globalThis.PointerEvent) => {
         if (up.pointerId !== event.pointerId) return;
         cleanup();
-        if (state.active && state.overColumn && state.overIndex >= 0) {
+        if (
+          state.active &&
+          !state.cancelled &&
+          state.overColumn &&
+          state.overIndex >= 0
+        ) {
           dropCardRef.current(card.id, state.overColumn, state.overIndex);
-          // Groups are positional: a drop ON a wrapper moves the card into
-          // that group, a drop OUTSIDE every wrapper removes it from the
-          // group it was in. Dropping back on its own wrapper just reorders —
-          // secondary memberships survive that.
-          if (card.kind === "task" && card.task) {
-            const current = card.task.groupIds ?? [];
-            if (state.overGroup && state.overGroup !== current[0]) {
-              updateTask(card.task.id, { groupIds: [state.overGroup] });
-            } else if (!state.overGroup && current.length) {
-              updateTask(card.task.id, { groupIds: [] });
-            }
-          } else if (card.kind === "item" || card.kind === "local") {
-            const current = loadBoard().cardGroups[card.id] ?? [];
-            if (state.overGroup && state.overGroup !== current[0]) {
-              setCardGroups(card.id, [state.overGroup]);
-            } else if (!state.overGroup && current.length) {
-              setCardGroups(card.id, []);
+          // Groups are memberships, not containers: a drop ON a wrapper
+          // promotes that group to primary (the wrapper the card renders
+          // under) while keeping every other membership. A drop OUTSIDE
+          // every wrapper removes only the primary — secondary groups keep
+          // the card grouped. Dropping back on its own wrapper reorders.
+          const over = state.overGroup;
+          const current =
+            card.kind === "task" && card.task
+              ? (card.task.groupIds ?? [])
+              : card.kind === "item" || card.kind === "local"
+                ? (loadBoard().cardGroups[card.id] ?? [])
+                : null;
+          if (current) {
+            const next = over
+              ? over === current[0]
+                ? current
+                : [over, ...current.filter((id) => id !== over)].slice(
+                    0,
+                    MAX_TASK_GROUPS,
+                  )
+              : current.slice(1);
+            const changed =
+              next.length !== current.length ||
+              next.some((id, index) => id !== current[index]);
+            if (changed) {
+              if (card.kind === "task" && card.task)
+                updateTask(card.task.id, { groupIds: next });
+              else setCardGroups(card.id, next);
             }
           }
         }
-        if (state.active) {
-          // A drag-release still fires click on the pressed element — eat it
-          // so dropping a card doesn't also open it or hit a chip. The
-          // listener expires next tick: if that click never comes (released
-          // off-window) it must not eat the user's next real click.
-          const eat = (click: MouseEvent) => {
-            click.preventDefault();
-            click.stopPropagation();
-          };
-          window.addEventListener("click", eat, { capture: true });
-          setTimeout(
-            () => window.removeEventListener("click", eat, { capture: true }),
-            0,
-          );
-        }
+        if (state.active) eatReleaseClick();
       };
       // pointercancel = the browser/OS took the gesture (touch scroll,
-      // interruption) — abort without committing a drop.
+      // interruption) — abort without committing a drop. No click follows.
       const onCancel = (cancel: globalThis.PointerEvent) => {
         if (cancel.pointerId !== event.pointerId) return;
         cleanup();
@@ -615,7 +844,21 @@ export function BoardView({
       const onKey = (key: KeyboardEvent) => {
         if (key.key !== "Escape") return;
         key.preventDefault();
-        cleanup();
+        if (!state.active) {
+          cleanup();
+          return;
+        }
+        // Cancel the drag but keep pointerup/pointercancel armed — the
+        // release still fires a click on the card, which onUp eats.
+        state.cancelled = true;
+        state.overColumn = null;
+        state.overGroup = null;
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("keydown", onKey, true);
+        setGrabbing(false);
+        releaseSuppress?.();
+        releaseSuppress = null;
+        setDrag(null);
       };
       const cleanup = () => {
         window.removeEventListener("pointermove", onMove);
@@ -624,6 +867,7 @@ export function BoardView({
         window.removeEventListener("keydown", onKey, true);
         setGrabbing(false);
         releaseSuppress?.();
+        releaseSuppress = null;
         setDrag(null);
       };
       window.addEventListener("pointermove", onMove);
@@ -647,6 +891,9 @@ export function BoardView({
   };
 
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+  /** PR inbox item being checked out into a review lane. */
+  const [reviewItem, setReviewItem] = useState<InboxItem | null>(null);
+  const [standupOpen, setStandupOpen] = useState(false);
   const selectedCard = useMemo(
     () =>
       selectedCardId
@@ -672,6 +919,39 @@ export function BoardView({
           return;
         case "open-url":
           if (card.url) void openUrl(card.url);
+          return;
+        case "open-prs": {
+          const urls = new Set<string>();
+          for (const pr of card.prs ?? []) if (pr.url) urls.add(pr.url);
+          for (const row of card.workstreams ?? [])
+            if (row.pr?.url) urls.add(row.pr.url);
+          for (const url of urls) void openUrl(url);
+          return;
+        }
+        case "review-locally": {
+          if (!card.item) return;
+          // A task already tracking this PR gets surfaced instead of
+          // spawning a duplicate review lane. Links can nest via
+          // `additionalItems` — flatten before matching. Archived tasks are
+          // invisible — they must not win the dedupe.
+          const existing = loadBoard().tasks.find(
+            (task) =>
+              !task.archived &&
+              task.links
+                .flatMap((link) => [link, ...(link.additionalItems ?? [])])
+                .some((link) =>
+                  inboxItemMatchesLinkedWorkItem(card.item!, link),
+                ),
+          );
+          if (existing) setSelectedCardId(existing.id);
+          else setReviewItem(card.item);
+          return;
+        }
+        case "snooze":
+          snoozeCard(card.id, {
+            until: action.until,
+            wake: action.wakeOnChange ? snoozeWakeKey(card) : undefined,
+          });
           return;
         case "fix-ci": {
           const ref = card.identifier ?? card.title;
@@ -706,6 +986,13 @@ export function BoardView({
         case "reset":
           unplaceCard(card.id);
           return;
+        case "pin":
+          pinCard(
+            card.id,
+            cardColumn(card, board.placements),
+            !pinnedIds.has(card.id),
+          );
+          return;
         case "archive":
           if (card.kind === "task" && card.task) {
             archiveTasks([card.task.id]);
@@ -730,7 +1017,13 @@ export function BoardView({
           return;
       }
     },
-    [board.placements, onOpenSession, onSendToSession, onStartItem],
+    [
+      board.placements,
+      pinnedIds,
+      onOpenSession,
+      onSendToSession,
+      onStartItem,
+    ],
   );
 
   // --- task creation + details ---------------------------------------------
@@ -750,6 +1043,13 @@ export function BoardView({
 
   const onCreateTask = useCallback(
     async (spec: NewTaskSpec) => {
+      // A full board must fail before any spawn — `addTask` returning null
+      // after spawning would orphan fresh worktrees/sessions.
+      // Archived tasks don't render — they shouldn't count toward the cap.
+      if (loadBoard().tasks.filter((task) => !task.archived).length >= MAX_TASKS) {
+        setTaskError("Board is full — archive some tasks first.");
+        return;
+      }
       setTaskBusy(true);
       setTaskError("");
       const workstreams: TaskWorkstream[] = [];
@@ -796,7 +1096,12 @@ export function BoardView({
       }
       // Failed lanes stay on the task as rows without a worktree — the
       // details panel's "Create worktree" retries them.
-      const id = addTask({ title: spec.title, links: spec.links, workstreams });
+      const id = addTask({
+        title: spec.title,
+        links: spec.links,
+        workstreams,
+        groupIds: spec.groupIds,
+      });
       if (!id) {
         // The board is full — don't orphan the worktrees we just created.
         setTaskError("Board is full — remove a task first");
@@ -875,24 +1180,56 @@ export function BoardView({
     return {
       onClose: () => setSelectedCardId(null),
       onOpenSession,
+      onSendToSession,
       onSpawnSession: async (spec: TaskWorkstreamSpec) =>
         onSpawnSession({ ...spec, title: task.title, links: task.links }),
       onBindSession,
-      onCreatePrs: () => runTaskOp("prs", () => createTaskPrs(task, wsStatus)),
+      onSubmitPrs: (only: ReadonlySet<string>, opts: PrSubmit) =>
+        runTaskOp("prs", async () => {
+          // A chosen target is the lane's base going forward — persist it so
+          // "Update branches" merges from the same branch the PR targets.
+          updateTask(task.id, (current) => ({
+            workstreams: current.workstreams.map((ws) =>
+              opts.bases.has(ws.id)
+                ? { ...ws, base: opts.bases.get(ws.id)! }
+                : ws,
+            ),
+          }));
+          // Full task context — `only` restricts creation, so bodies still
+          // list sibling branches and existing sibling PRs.
+          return createTaskPrs(task, wsStatus, only, {
+            title: opts.title,
+            body: opts.body,
+            bases: opts.bases,
+          });
+        }),
       onUpdateBranches: () =>
         run("merge", task.workstreams, (ws) =>
           updateWorkstreamFromBase(ws),
-        ),
-      onCreateWorkstreamPr: (wsId: string) =>
-        runTaskOp(`pr:${wsId}`, async () =>
-          // Full task context — `only` restricts creation, so the body still
-          // lists sibling branches and existing sibling PRs.
-          createTaskPrs(task, wsStatus, new Set([wsId])),
         ),
       onUpdateWorkstream: (wsId: string) =>
         run(`merge:${wsId}`, task.workstreams.filter((ws) => ws.id === wsId), (ws) =>
           updateWorkstreamFromBase(ws),
         ),
+      onCleanupWorkstream: (wsId: string) =>
+        runTaskOp(`cleanup:${wsId}`, async () => {
+          const ws = task.workstreams.find((entry) => entry.id === wsId);
+          if (!ws?.worktreePath) return [];
+          // keepSessions — bound sessions are stale but their records
+          // aren't the lane's to delete.
+          await onRemoveWorktree(ws.projectPath, ws.worktreePath, false, true);
+          // Pin the PR so the lane keeps probing it via the project
+          // root — clearing the worktree must not erase the record.
+          const prUrl = ws.prUrl ?? (wsStatus.get(wsId)?.pr?.url || undefined);
+          updateTask(task.id, (current) => ({
+            workstreams: current.workstreams.map((entry) =>
+              entry.id === wsId
+                ? { ...entry, worktreePath: undefined, prUrl }
+                : entry,
+            ),
+          }));
+          return [];
+        }),
     };
   }, [
     selectedCard,
@@ -901,6 +1238,8 @@ export function BoardView({
     onSpawnSession,
     onBindSession,
     onOpenSession,
+    onSendToSession,
+    onRemoveWorktree,
   ]);
 
   const [newCardTitle, setNewCardTitle] = useState("");
@@ -1035,19 +1374,6 @@ export function BoardView({
           </button>
           <button
             type="button"
-            title="New task"
-            className="flex h-7 items-center gap-1 rounded-md bg-accent/12 px-1.5 text-[11px] font-medium text-accent hover:bg-accent/20"
-            onClick={() => {
-              setTaskError("");
-              setPromoteFrom(null);
-              setTaskDialogOpen(true);
-            }}
-          >
-            <Plus className="size-3.5" strokeWidth={2} />
-            Task
-          </button>
-          <button
-            type="button"
             aria-pressed={actionOnly}
             title="Only cards that need action"
             className={`flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium ${
@@ -1060,6 +1386,39 @@ export function BoardView({
             <ListFilter className="size-3.5" strokeWidth={1.75} />
             Action
           </button>
+          <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 bg-content/10" />
+          <button
+            type="button"
+            aria-pressed={attentionFirst}
+            title="Sort each column by what needs action first (pins still win)"
+            className={`flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium ${
+              attentionFirst
+                ? "bg-accent/15 text-accent"
+                : "text-content/50 hover:bg-content/8 hover:text-content"
+            }`}
+            onClick={() => setAttentionFirst((value) => !value)}
+          >
+            <Zap className="size-3.5" strokeWidth={1.75} />
+            Attention
+          </button>
+          {snoozedIds.length ? (
+            <button
+              type="button"
+              title={`${snoozedIds.length} snoozed — click to wake them all`}
+              className="flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium text-content/50 hover:bg-content/8 hover:text-content"
+              onClick={() => snoozedIds.forEach(unsnoozeCard)}
+            >
+              <Clock className="size-3.5" strokeWidth={1.75} />
+              {snoozedIds.length}
+            </button>
+          ) : null}
+          <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 bg-content/10" />
+          <IconButton
+            label="Standup report"
+            onClick={() => setStandupOpen(true)}
+          >
+            <ListBullet className="size-3.5" strokeWidth={1.75} />
+          </IconButton>
           <IconButton
             label="Refresh"
             onClick={refreshNow}
@@ -1070,6 +1429,19 @@ export function BoardView({
               <RefreshCw className="size-3.5" strokeWidth={1.75} />
             )}
           </IconButton>
+          <button
+            type="button"
+            title="New task"
+            className="flex h-7 items-center gap-1 rounded-md bg-accent/12 px-1.5 text-[11px] font-medium text-accent hover:bg-accent/20"
+            onClick={() => {
+              setTaskError("");
+              setPromoteFrom(null);
+              setTaskDialogOpen(true);
+            }}
+          >
+            <Plus className="size-3.5" strokeWidth={2} />
+            Task
+          </button>
         </div>
         {IS_MAC ? null : <WindowControls />}
       </div>
@@ -1077,9 +1449,9 @@ export function BoardView({
       <div className="flex min-h-0 min-w-0 flex-1">
         <div
           ref={boardRef}
-          className="grid min-h-0 min-w-0 flex-1 grid-cols-1 gap-3 overflow-y-auto p-3 sm:grid-cols-2 xl:grid-cols-4"
+          className="flex min-h-0 min-w-0 flex-1 items-stretch gap-3 overflow-auto p-3"
         >
-        {BOARD_COLUMNS.map((column) => {
+        {board.columns.map((column) => {
           const columnList = cardsByColumn.get(column.id) ?? [];
           const units = columnUnits(columnList);
           // `drag.overIndex` counts rows with the dragged card removed, in
@@ -1094,21 +1466,25 @@ export function BoardView({
           const visibleIndex = new Map(
             visibleIds.map((card, index) => [card.id, index] as const),
           );
-          const renderCard = (card: BoardCard, grouped = false) => (
+          const renderCard = (card: BoardCard, inGroup?: string) => (
             <BoardCardView
               key={card.id}
               card={card}
+              column={column.id}
+              columns={board.columns}
               manual={
                 card.kind !== "local" &&
                 board.placements[card.id] !== undefined
               }
+              pinned={pinnedIds.has(card.id)}
+              placedAt={placedAts.get(card.id)}
               dragging={drag?.active === true && drag.cardId === card.id}
               dropTarget={
                 drag?.active === true &&
                 drag.overColumn === column.id &&
                 drag.overIndex === visibleIndex.get(card.id)
               }
-              grouped={grouped}
+              inGroup={inGroup}
               onAction={onCardAction}
               onDragStart={onDragStart}
             />
@@ -1118,7 +1494,7 @@ export function BoardView({
               key={column.id}
               data-board-column={column.id}
               aria-label={column.label}
-              className={`group/col flex min-h-24 min-w-0 flex-col rounded-xl border border-content/8 bg-content/[0.02] ${
+              className={`group/col flex min-h-24 min-w-64 flex-1 flex-col rounded-xl border border-content/8 bg-content/[0.02] ${
                 drag?.active && drag.overColumn === column.id
                   ? "ring-1 ring-accent/40"
                   : ""
@@ -1127,20 +1503,21 @@ export function BoardView({
               <header className="flex h-8 shrink-0 items-center gap-1.5 px-2.5">
                 <span
                   aria-hidden
-                  className={`size-1.5 rounded-full ${COLUMN_DOT[column.id]}`}
+                  className={`size-1.5 rounded-full ${columnDot(column.id)}`}
                 />
-                <h2 className="text-[12px] font-medium text-content/80">
+                <h2 className="min-w-0 truncate text-[12px] font-medium text-content/80">
                   {column.label}
                 </h2>
                 <span className="text-[11px] text-content/40">
                   {columnList.length}
                 </span>
+                <span className="ml-auto flex items-center gap-0.5">
                 {column.id === "done" && columnList.length ? (
                   <button
                     type="button"
                     title="Archive the cards shown in Done"
                     aria-label="Archive the cards shown in Done"
-                    className="ml-auto grid size-5 place-items-center rounded text-content/35 hover:bg-content/10 hover:text-content"
+                    className="grid size-5 place-items-center rounded text-content/35 hover:bg-content/10 hover:text-content"
                     onClick={() => {
                       const taskIds: string[] = [];
                       const hideIds: string[] = [];
@@ -1158,6 +1535,21 @@ export function BoardView({
                     <Archive className="size-3" strokeWidth={1.75} />
                   </button>
                 ) : null}
+                <button
+                  type="button"
+                  title={`Edit column ${column.label}`}
+                  aria-label={`Edit column ${column.label}`}
+                  className="grid size-5 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover/col:opacity-100 focus-visible:opacity-100"
+                  onClick={(event) =>
+                    setColumnEdit({
+                      anchor: event.currentTarget,
+                      column,
+                    })
+                  }
+                >
+                  <Pencil className="size-3" strokeWidth={1.75} />
+                </button>
+                </span>
               </header>
               <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
                 {units.map((unit) =>
@@ -1191,7 +1583,9 @@ export function BoardView({
                         </span>
                       </p>
                       <div className="flex flex-col gap-1.5">
-                        {unit.cards.map((card) => renderCard(card, true))}
+                        {unit.cards.map((card) =>
+                          renderCard(card, unit.group.id),
+                        )}
                       </div>
                     </div>
                   ) : (
@@ -1258,12 +1652,14 @@ export function BoardView({
             results={actionResults}
             onClose={taskOpsHandlers.onClose}
             onOpenSession={taskOpsHandlers.onOpenSession}
+            onSendToSession={taskOpsHandlers.onSendToSession}
             onSpawnSession={taskOpsHandlers.onSpawnSession}
             onBindSession={taskOpsHandlers.onBindSession}
-            onCreatePrs={taskOpsHandlers.onCreatePrs}
+            wsStatus={wsStatus}
             onUpdateBranches={taskOpsHandlers.onUpdateBranches}
-            onCreateWorkstreamPr={taskOpsHandlers.onCreateWorkstreamPr}
             onUpdateWorkstream={taskOpsHandlers.onUpdateWorkstream}
+            onSubmitPrs={taskOpsHandlers.onSubmitPrs}
+            onCleanupWorkstream={taskOpsHandlers.onCleanupWorkstream}
           />
           ) : (
             <CardDetailsPanel
@@ -1311,7 +1707,10 @@ export function BoardView({
         >
           <BoardCardView
             card={dragCard}
+            column={drag.overColumn ?? "todo"}
+            columns={board.columns}
             manual={false}
+            pinned={false}
             dragging={false}
             dropTarget={false}
             onAction={() => {}}
@@ -1423,6 +1822,22 @@ export function BoardView({
           onClose={() => setGroupPickerAnchor(null)}
         />
       ) : null}
+      {columnEdit ? (
+        <ColumnPopover
+          anchor={columnEdit.anchor}
+          column={columnEdit.column}
+          cardCount={
+            // Unfiltered — a delete moves every card in the column, not
+            // just the ones passing the current filter.
+            cards.filter(
+              (card) =>
+                cardColumn(card, board.placements) === columnEdit.column.id,
+            ).length
+          }
+          columns={board.columns}
+          onClose={() => setColumnEdit(null)}
+        />
+      ) : null}
       {taskDialogOpen ? (
         <NewTaskDialog
           items={items}
@@ -1435,6 +1850,32 @@ export function BoardView({
             setTaskDialogOpen(false);
             setPromoteFrom(null);
           }}
+        />
+      ) : null}
+      {reviewItem ? (
+        <ReviewLocallyDialog
+          item={reviewItem}
+          recents={recents}
+          reviewColumnIds={(canonicalByColumn.get("review") ?? []).map(
+            (card) => card.id,
+          )}
+          onSpawnSession={onSpawnSession}
+          onSendToSession={onSendToSession}
+          onCreated={setSelectedCardId}
+          onClose={() => setReviewItem(null)}
+        />
+      ) : null}
+      {standupOpen ? (
+        <StandupDialog
+          sections={standupSections({
+            // The report covers the whole board (filters are view-only),
+            // in canonical column order — pinned and manual order carry.
+            cards: [...canonicalByColumn.values()].flat(),
+            placements: board.placements,
+            locals: board.locals,
+          })}
+          openUrl={(url) => void openUrl(url)}
+          onClose={() => setStandupOpen(false)}
         />
       ) : null}
       {visibleErrorEntries.length ? (
@@ -1627,6 +2068,135 @@ function GroupFilterPopover({
           />
         </label>
       </div>
+    </Popover>
+  );
+}
+
+/** Column editor — name field for add/rename; custom columns also get a
+ * delete row. Defaults can't be removed (derivation + archive key on them)
+ * but can be renamed. */
+function ColumnPopover({
+  anchor,
+  column,
+  cardCount,
+  columns,
+  onClose,
+}: {
+  anchor: HTMLElement;
+  column: BoardColumn;
+  /** Cards currently sitting in `column` — shown when deleting it. */
+  cardCount: number;
+  /** All columns, to offer move destinations on delete. */
+  columns: readonly BoardColumn[];
+  onClose: () => void;
+}) {
+  const [name, setName] = useState(column.label);
+  // Edit mode starts on the existing column; "New column" flips it to add.
+  const [adding, setAdding] = useState(false);
+  // "" → cards return to their status columns; anything else is a column id.
+  const [target, setTarget] = useState("");
+  const deletable = !adding && !DEFAULT_COLUMN_IDS.has(column.id);
+  const submit = () => {
+    if (!name.trim()) return;
+    if (!adding) renameColumn(column.id, name);
+    else addColumn(name);
+    onClose();
+  };
+  return (
+    <Popover
+      anchor={anchor}
+      align="start"
+      width={208}
+      onDismiss={onClose}
+      aria-label={!adding ? `Edit column ${column.label}` : "Add column"}
+      className="p-1.5"
+    >
+      <input
+        autoFocus
+        value={name}
+        aria-label="Column name"
+        placeholder={adding ? "New column name" : "Column name"}
+        onChange={(event) => setName(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") submit();
+          else if (event.key === "Escape") onClose();
+        }}
+        className="h-7 w-full rounded bg-content/8 px-2 text-[12px] text-content outline-none focus:ring-1 focus:ring-accent/50"
+      />
+      <div className="mt-1.5 flex items-center gap-1.5">
+        <button
+          type="button"
+          disabled={!name.trim()}
+          className="h-7 flex-1 rounded-md bg-accent/15 text-[12px] font-medium text-accent hover:bg-accent/25 disabled:opacity-40"
+          onClick={submit}
+        >
+          {adding ? "Add column" : "Rename"}
+        </button>
+        {deletable ? (
+          <button
+            type="button"
+            aria-label={`Delete column ${column.label}`}
+            className="grid h-7 w-9 place-items-center rounded-md text-red-300/80 hover:bg-red-400/10 hover:text-red-300"
+            onClick={() => {
+              removeColumn(column.id, target || undefined);
+              onClose();
+            }}
+          >
+            <Trash2 className="size-3.5" strokeWidth={1.75} />
+          </button>
+        ) : null}
+      </div>
+      {deletable && cardCount > 0 ? (
+        <div className="mt-1.5 border-t border-content/8 pt-1.5">
+          <p className="px-0.5 pb-1 text-[10px] text-content/45">
+            Move {cardCount} {cardCount === 1 ? "card" : "cards"} to
+          </p>
+          <div role="radiogroup" aria-label="Move cards to" className="max-h-36 overflow-y-auto">
+            {[
+              { id: "", label: "Their status columns" },
+              ...columns.filter((entry) => entry.id !== column.id),
+            ].map((entry) => (
+              <button
+                key={entry.id || "auto"}
+                type="button"
+                role="radio"
+                aria-checked={target === entry.id}
+                className={`flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] ${
+                  target === entry.id
+                    ? "bg-accent/12 text-content"
+                    : "text-content/70 hover:bg-content/6 hover:text-content"
+                }`}
+                onClick={() => setTarget(entry.id)}
+              >
+                <span
+                  className={`size-1.5 shrink-0 rounded-full ${
+                    entry.id ? columnDot(entry.id) : "border border-content/40"
+                  }`}
+                />
+                <span className="min-w-0 flex-1 truncate">{entry.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      {!adding ? (
+        <button
+          type="button"
+          className="mt-1 flex h-7 w-full items-center gap-1.5 rounded-md px-2 text-[12px] text-content/50 hover:bg-content/8 hover:text-content"
+          onClick={() => {
+            setAdding(true);
+            setName("");
+          }}
+        >
+          <Plus className="size-3.5 shrink-0" strokeWidth={1.75} />
+          New column
+        </button>
+      ) : null}
+      {!adding && !deletable ? (
+        <p className="mt-1.5 px-0.5 text-[10px] text-content/35">
+          Built-in columns can't be removed.
+        </p>
+      ) : null}
     </Popover>
   );
 }

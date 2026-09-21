@@ -306,10 +306,24 @@ export type GitPr = {
   title: string;
   url: string;
   state: string;
+  /** `APPROVED` | `CHANGES_REQUESTED` | `REVIEW_REQUIRED` — GitHub
+   * reviewDecision or Azure reviewer-vote rollup. */
+  reviewDecision?: string;
+  /** Review threads still unresolved — undefined when unprobed. */
+  unresolvedThreads?: number;
+  draft?: boolean;
+  /** Provider-side update time (ISO) — orders "recently merged". */
+  updatedAt?: string;
+  /** Provider mergeability — `clean` | `behind` | `blocked` | `conflicts` |
+   * `unstable` (GitHub mergeStateStatus, Azure mergeStatus). */
+  mergeState?: string;
 };
 
-export function gitPrStatus(cwd: string): Promise<GitPr | null> {
-  return invoke<GitPr | null>("git_pr_status", { cwd });
+export function gitPrStatus(
+  cwd: string,
+  prUrl?: string,
+): Promise<GitPr | null> {
+  return invoke<GitPr | null>("git_pr_status", { cwd, prUrl });
 }
 
 export function gitPrCreate(
@@ -330,9 +344,13 @@ export type GitPrCheck = {
   url: string;
 };
 
-/** Check runs on the current branch's GitHub pull request. */
-export function gitPrChecks(cwd: string): Promise<GitPrCheck[]> {
-  return invoke<GitPrCheck[]>("git_pr_checks", { cwd });
+/** Check runs on the current branch's GitHub pull request — or the exact
+ * `prUrl` when a lane pins one (review lanes check out `pr/<N>`). */
+export function gitPrChecks(
+  cwd: string,
+  prUrl?: string,
+): Promise<GitPrCheck[]> {
+  return invoke<GitPrCheck[]>("git_pr_checks", { cwd, prUrl });
 }
 
 /** Replace a GitHub pull request body. */
@@ -348,6 +366,58 @@ export function gitPrUpdate(
  * checked-out branch of `cwd`. */
 export function gitMergeFrom(cwd: string, ref: string): Promise<void> {
   return invoke<void>("git_merge_from", { cwd, gitRef: ref });
+}
+
+/** Whether `cwd` has an unfinished merge (`MERGE_HEAD` present) — the board
+ * offers conflict resolution on those workstreams. */
+export function gitMergeInProgress(cwd: string): Promise<boolean> {
+  return invoke<boolean>("git_merge_in_progress", { cwd });
+}
+
+export type GitPrPreflight = {
+  /** Checked-out branch — null on a detached HEAD. */
+  head: string | null;
+  /** Ref used for the ahead count — remote-tracking preferred. */
+  baseRef: string | null;
+  /** The branch name the PR targets (remote prefix stripped). */
+  baseBranch: string;
+  /** Base exists remote-tracked — required for a server-side PR. */
+  baseOnRemote: boolean;
+  /** Commits on HEAD not reachable from the base. */
+  ahead: number;
+  /** HEAD is contained in a remote-tracking ref — already pushed. */
+  headPushed: boolean;
+  hasRemote: boolean;
+};
+
+/** Pre-submit check for the PR composer — validates base, ahead count, and
+ * checked-out branch so provider rejections surface before submit. */
+export function gitPrPreflight(cwd: string, base: string): Promise<GitPrPreflight> {
+  return invoke<GitPrPreflight>("git_pr_preflight", { cwd, base });
+}
+
+/** Configured remote names — authoritative, unlike inferring them from
+ * fetched tracking refs (a never-fetched remote has none). */
+export function gitRemotes(cwd: string): Promise<string[]> {
+  return invoke<string[]>("git_remotes", { cwd });
+}
+
+/** Commits the resolved base has that `cwd`'s HEAD lacks — the "behind
+ * main" count on a lane badge. Pure local refs, no fetch. */
+export function gitBehindBase(cwd: string, base: string): Promise<number> {
+  return invoke<number>("git_behind_base", { cwd, base });
+}
+
+/** Fetch a provider-side ref into a local branch without checking it out
+ * (`git fetch <remote> <remoteRef>:refs/heads/<branch>`) — how "review
+ * locally" turns an inbox PR into a worktree-able branch. */
+export function gitFetchBranch(
+  cwd: string,
+  remote: string,
+  remoteRef: string,
+  branch: string,
+): Promise<void> {
+  return invoke<void>("git_fetch_branch", { cwd, remote, remoteRef, branch });
 }
 
 export type GitBranchInfo = {

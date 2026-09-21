@@ -88,6 +88,10 @@ export type InboxItem = Omit<GithubWorkItem, "kind"> & {
   site?: string;
   /** GitLab To-Do action that caused this item to need attention. */
   attentionReason?: string;
+  /** `refs/heads/…` source/target refs — set on Azure DevOps PRs so the
+   * board can join a PR to the workstream branch it was opened from. */
+  sourceRefName?: string;
+  targetRefName?: string;
 };
 
 export type GithubWorkItemDetails = {

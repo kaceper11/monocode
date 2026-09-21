@@ -1,33 +1,96 @@
 import {
+  gitBehindBase,
   gitBranches,
   gitMergeFrom,
+  gitMergeInProgress,
   gitPrChecks,
   gitPrCreate,
   gitPrStatus,
   gitPrUpdate,
-  gitSync,
+  gitPush,
+  gitRemotes,
 } from "../../platform/tauri/fs";
+import {
+  azureDevOpsPrCreate,
+  azureDevOpsPrProbe,
+  azureDevOpsPrUpdateBody,
+  azureDevOpsRepoMatch,
+} from "../inbox/model/azureDevOps";
 import type { LinkedWorkItem } from "../sessions/model/session";
 import type { BoardTask, TaskWorkstream } from "./boardStore";
-import type { WorkstreamStatus } from "./boardData";
+import { prIsOpen, type WorkstreamStatus } from "./boardData";
+
+export { prIsOpen };
 
 /**
  * Task-level IO — workstream PR/CI probes and the bulk git operations the
  * details panel exposes. Everything else on the board stays a pure join.
- * PR/CI probing is upstream's `gh`-backed surface — GitHub remotes only;
- * Azure Repos workstreams surface their PRs as inbox cards instead.
+ * PR/CI calls route per worktree: Azure DevOps remotes go through the
+ * `azure_devops_*` commands, everything else through upstream's `gh`-backed
+ * `git_pr_*` surface.
  */
 
-/** Probe one workstream's PR + checks on the checked-out branch. */
+/** The PR-create surface for one worktree — Azure when its remote resolves
+ * to the configured org, GitHub/`gh` otherwise. An Azure-shaped remote that
+ * isn't configured throws a readable error rather than falling to `gh`. */
+async function prOps(cwd: string) {
+  const azure = await azureDevOpsRepoMatch(cwd);
+  return azure
+    ? {
+        // The probe surface is the one that honours a pinned `prUrl`.
+        status: (path: string, prUrl?: string, branch?: string) =>
+          azureDevOpsPrProbe(path, prUrl, branch).then((probe) => probe.pr),
+        create: azureDevOpsPrCreate,
+        // Azure PRs carry their id in the web url (`…/pullrequest/42`) —
+        // patch that exact PR, not whatever is newest on the branch now.
+        updateBody: (path: string, url: string, body: string) =>
+          azureDevOpsPrUpdateBody(
+            path,
+            body,
+            Number(/pullrequest\/(\d+)/.exec(url)?.[1]) || undefined,
+          ),
+      }
+    : {
+        status: gitPrStatus,
+        create: gitPrCreate,
+        updateBody: gitPrUpdate,
+      };
+}
+
+/** Probe one workstream's PR + checks on the checked-out branch. A lane
+ * whose worktree was cleaned up after merge keeps probing via the project
+ * root — a pinned `prUrl` resolves against the repo, not the worktree. */
 export async function probeWorkstream(
   workstream: TaskWorkstream,
 ): Promise<WorkstreamStatus | null> {
-  const cwd = workstream.worktreePath;
+  // Review lanes pin their PR — the local `pr/<N>` branch never matches
+  // the PR's real head name for a branch-based probe to find it.
+  const prUrl = workstream.prUrl?.trim() || undefined;
+  const worktree = workstream.worktreePath?.trim() || undefined;
+  const cwd = worktree ?? (prUrl ? workstream.projectPath : undefined);
   if (!cwd) return null;
   try {
-    const pr = await gitPrStatus(cwd);
-    const checks = pr ? await gitPrChecks(cwd).catch(() => []) : [];
-    return { pr, checks };
+    // Local-worktree signals are meaningless against the project fallback.
+    const merging = worktree
+      ? gitMergeInProgress(cwd).catch(() => false)
+      : Promise.resolve(false);
+    // Behind-base is local refs only — it must never fetch per lane.
+    const behind = worktree
+      ? gitBehindBase(cwd, workstream.base).catch(() => 0)
+      : Promise.resolve(0);
+    if (await azureDevOpsRepoMatch(cwd)) {
+      // PR + pipelines in one round trip; Azure branch builds exist pre-PR.
+      // Pass the lane's branch — the cwd may be the project root after a
+      // post-merge cleanup, whose checkout isn't this lane's branch.
+      return {
+        ...(await azureDevOpsPrProbe(cwd, prUrl, workstream.branch)),
+        merging: await merging,
+        behind: await behind,
+      };
+    }
+    const pr = await gitPrStatus(cwd, prUrl);
+    const checks = pr ? await gitPrChecks(cwd, prUrl).catch(() => []) : [];
+    return { pr, checks, merging: await merging, behind: await behind };
   } catch (error) {
     // Keep a visible failure — a deleted worktree or missing `gh` must not
     // silently erase the row's PR/CI state.
@@ -39,10 +102,32 @@ export async function probeWorkstream(
   }
 }
 
+/** Provider-side ref that holds a PR's head — `git fetch <remote>
+ * <ref>:refs/heads/pr/<N>` turns an inbox PR into a local branch for the
+ * "review locally" lane. GitHub exposes `refs/pull/<N>/head` on the base
+ * repo (fork PRs included); GitLab uses `refs/merge-requests/<N>/head`.
+ * Azure advertises no head ref — the author's source branch is the real
+ * head; `refs/pull/<N>/merge` is the fallback (absent under conflicts). */
+export function prHeadRemoteRef(
+  provider: "github" | "gitlab" | "azuredevops",
+  number: number,
+  sourceRefName?: string,
+): string {
+  if (provider === "gitlab") return `refs/merge-requests/${number}/head`;
+  if (provider === "azuredevops") {
+    // An empty sourceRefName isn't a ref — fall back to the merge ref.
+    const source = sourceRefName?.trim();
+    return source || `refs/pull/${number}/merge`;
+  }
+  return `refs/pull/${number}/head`;
+}
+
 export type WorkstreamResult = {
   workstreamId: string;
   ok: boolean;
   message: string;
+  /** The update left the worktree mid-merge — offer agent resolution. */
+  conflict?: boolean;
 };
 
 const shortError = (error: unknown) =>
@@ -51,15 +136,14 @@ const shortError = (error: unknown) =>
 const branchMismatch = (workstream: TaskWorkstream, actual: string) =>
   `Worktree is on ${actual || "another branch"}, expected ${workstream.branch}`;
 
-/** Current branch + remote names in one call. */
+/** Current branch + configured remote names. `git remote` is authoritative —
+ * a configured-but-never-fetched remote has no tracking refs to infer from. */
 async function gitContext(cwd: string) {
-  const branches = await gitBranches(cwd);
-  const remotes = new Set(
-    branches.branches
-      .map((branch) => branch.remote)
-      .filter((remote): remote is string => Boolean(remote)),
-  );
-  return { branch: branches.current ?? "", remotes };
+  const [branches, remotes] = await Promise.all([
+    gitBranches(cwd),
+    gitRemotes(cwd),
+  ]);
+  return { branch: branches.current ?? "", remotes: new Set(remotes) };
 }
 
 /** Fetch + merge the workstream's base ref into its branch. Runs in the
@@ -93,14 +177,69 @@ export async function updateWorkstreamFromBase(
     };
   } catch (error) {
     const message = shortError(error);
+    // MERGE_HEAD is the authoritative conflict signal — error text alone
+    // can't distinguish a real conflict from "uncommitted changes block
+    // merge" or a fetch failure.
+    const conflict = await gitMergeInProgress(cwd).catch(() => false);
     return {
       workstreamId: workstream.id,
       ok: false,
-      message: /conflict|merge|diverg/i.test(message)
+      conflict,
+      message: conflict
         ? `Conflict merging ${workstream.base} — resolve in the worktree`
         : message,
     };
   }
+}
+
+/** Prompt sent to a lane's session to resolve an in-progress merge. Instructs
+ * a real merge of both sides — not "ours" or "theirs" — so incoming base
+ * changes and the branch's work both survive. */
+export function resolveConflictPrompt(row: {
+  branch: string;
+  base: string;
+}): string {
+  return [
+    `Merging \`${row.base}\` into \`${row.branch}\` left conflicts in this worktree.`,
+    `Resolve each conflicted file by combining both sides — keep the current branch's changes and integrate the incoming \`${row.base}\` changes; don't just pick one side.`,
+    "Then commit the merge with the default message and run the project's checks if they're quick. Report what you resolved and any judgment calls.",
+  ].join(" ");
+}
+
+/** Pre-submit PR validation — turns the provider's create-time rejections
+ * ("head sha can't be blank", "no commits between") into lane messages before
+ * the user submits. Returns the problem text, or null when the lane can
+ * produce a PR. */
+export function laneProblem(
+  row: { branch: string; worktreePath?: string },
+  base: string,
+  preflight: {
+    head: string | null;
+    baseRef: string | null;
+    baseBranch: string;
+    baseOnRemote: boolean;
+    ahead: number;
+    hasRemote: boolean;
+  },
+): string | null {
+  if (!row.worktreePath) return "No worktree — spawn a session first";
+  if (preflight.head !== row.branch)
+    return `Worktree is on ${preflight.head || "a detached HEAD"}, expected ${row.branch}`;
+  if (!preflight.hasRemote) return "No git remote — nowhere to create a PR";
+  // `baseBranch` is the resolved name — a `HEAD` base becomes the remote's
+  // default branch, so messages name the real target.
+  const name = preflight.baseBranch || base;
+  if (!preflight.baseRef)
+    return preflight.baseBranch
+      ? `Base branch ${preflight.baseBranch} doesn't exist`
+      : "Couldn't resolve a base branch — pick one";
+  if (!preflight.baseOnRemote)
+    return `Base branch ${name} isn't on the remote — push it first`;
+  // A remote-qualified pick of the lane's own branch resolves to itself.
+  if (preflight.baseBranch === row.branch)
+    return "Target is the same branch as the source";
+  if (preflight.ahead === 0) return `No commits ahead of ${name}`;
+  return null;
 }
 
 function ticketLine(link: LinkedWorkItem): string {
@@ -112,43 +251,74 @@ function ticketLine(link: LinkedWorkItem): string {
   return `- ${ref}${link.title ? ` — ${link.title}` : ""}${link.url ? ` (${link.url})` : ""}`;
 }
 
-function prBody(
+/**
+ * PR body template — `{task}` `{branch}` `{base}` substitute per lane;
+ * `{tickets}` `{prs}` `{branches}` expand to headed bullet sections that drop
+ * out entirely when empty. The default reproduces the generated body.
+ */
+export const DEFAULT_PR_TEMPLATE =
+  "Part of task: **{task}**\n\n{tickets}\n\n{prs}\n\n{branches}";
+
+export function renderPrBody(
   task: BoardTask,
   workstream: TaskWorkstream,
   siblings: readonly string[],
+  base: string,
+  template: string = DEFAULT_PR_TEMPLATE,
 ): string {
-  const parts = [`Part of task: **${task.title}**`];
-  if (task.links.length) {
-    parts.push("", "Tickets:", ...task.links.map(ticketLine));
-  }
-  if (siblings.length) {
-    parts.push("", "Related pull requests:", ...siblings.map((s) => `- ${s}`));
-  }
+  const section = (heading: string, lines: string[]) =>
+    lines.length ? `${heading}:\n${lines.join("\n")}` : "";
   const others = task.workstreams.filter((ws) => ws.id !== workstream.id);
-  if (others.length) {
-    parts.push(
-      "",
-      "Related branches:",
-      ...others.map((ws) => `- \`${ws.branch}\``),
-    );
-  }
-  return parts.join("\n");
+  const values: Record<string, string> = {
+    task: task.title,
+    branch: workstream.branch,
+    base,
+    tickets: section(
+      "Tickets",
+      task.links.map(ticketLine),
+    ),
+    prs: section(
+      "Related pull requests",
+      siblings.map((s) => `- ${s}`),
+    ),
+    branches: section(
+      "Related branches",
+      others.map((ws) => `- \`${ws.branch}\``),
+    ),
+  };
+  return template
+    .replace(/\{(\w+)\}/g, (token, name: string) => values[name] ?? token)
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 /**
  * Create a PR per workstream that doesn't have one, then patch bodies with
  * the sibling URLs (they only exist once creation returns). `only` restricts
  * creation to specific workstreams while keeping the full task context —
- * sibling branches and existing PR URLs — in the body. GitHub remotes only:
- * upstream's `git_pr_*` commands route through `gh`.
+ * sibling branches and existing PR URLs — in the body. Each workstream
+ * routes to its own provider (Azure DevOps or GitHub via `gh`).
  */
+export type PrCreateOptions = {
+  /** Override the task title used as every PR title. */
+  title?: string;
+  /** `renderPrBody` template — the dialog's editable body. */
+  body?: string;
+  /** Per-lane target branch overrides, keyed by workstream id. */
+  bases?: ReadonlyMap<string, string>;
+};
+
 export async function createTaskPrs(
   task: BoardTask,
   status: ReadonlyMap<string, WorkstreamStatus>,
   only?: ReadonlySet<string>,
+  opts?: PrCreateOptions,
 ): Promise<WorkstreamResult[]> {
   const results: WorkstreamResult[] = [];
-  const created: { ws: TaskWorkstream; url: string }[] = [];
+  const created: { ws: TaskWorkstream; url: string; base: string }[] = [];
+  // URLs found at submit time (a PR created outside since the last probe) —
+  // they join the sibling links so bodies cross-link them too.
+  const discovered = new Map<string, string>();
   // Every known sibling URL — probed PRs plus ones created earlier in this
   // run — so bodies cross-link even for a single-lane creation.
   const knownUrls = () => {
@@ -158,6 +328,7 @@ export async function createTaskPrs(
       if (existing) urls.set(ws.id, existing);
     }
     for (const entry of created) urls.set(entry.ws.id, entry.url);
+    for (const [id, url] of discovered) urls.set(id, url);
     return urls;
   };
   for (const ws of task.workstreams) {
@@ -171,19 +342,26 @@ export async function createTaskPrs(
       });
       continue;
     }
-    if (status.get(ws.id)?.pr) {
+    const probed = status.get(ws.id)?.pr;
+    if (probed && prIsOpen(probed.state)) {
       results.push({ workstreamId: ws.id, ok: true, message: "PR exists" });
       continue;
     }
     try {
-      // The worktree must still be on the task's branch — `gitSync` pushes
+      // The worktree must still be on the task's branch — the push sends
       // whatever is checked out, so verify before pushing anything.
       const context = await gitContext(cwd);
       if (context.branch !== ws.branch)
         throw new Error(branchMismatch(ws, context.branch));
       if (!context.remotes.size) throw new Error("No git remote");
-      await gitSync(cwd);
-      if (await gitPrStatus(cwd)) {
+      const ops = await prOps(cwd);
+      // Push-only: a pull mid-submit could leave merge commits (or a
+      // conflicted MERGE_HEAD) nobody asked for. A rejected non-ff push
+      // tells the user to Update the lane first.
+      await gitPush(cwd);
+      const found = await ops.status(cwd, ws.prUrl);
+      if (found && prIsOpen(found.state)) {
+        discovered.set(ws.id, found.url);
         results.push({
           workstreamId: ws.id,
           ok: true,
@@ -191,27 +369,28 @@ export async function createTaskPrs(
         });
         continue;
       }
-      // ws.base may be remote-qualified ("origin/main") or a plain branch —
-      // including branches with slashes ("release/1.2"). Strip only a real
-      // remote prefix, never the first path segment of a branch name.
+      // The chosen target may be remote-qualified ("origin/main") or a
+      // plain branch — including branches with slashes ("release/1.2").
+      // Strip only a real remote prefix, never the first path segment.
+      const chosenBase = opts?.bases?.get(ws.id) ?? ws.base;
       const base = [...context.remotes].some((remote) =>
-        ws.base.startsWith(`${remote}/`),
+        chosenBase.startsWith(`${remote}/`),
       )
-        ? ws.base.slice(ws.base.indexOf("/") + 1)
-        : ws.base;
+        ? chosenBase.slice(chosenBase.indexOf("/") + 1)
+        : chosenBase;
       if (!base || base === "HEAD")
         throw new Error("Pick a base branch for the pull request");
       const siblings = [...knownUrls().entries()]
         .filter(([id]) => id !== ws.id)
         .map(([, url]) => url);
-      const url = await gitPrCreate(
+      const url = await ops.create(
         cwd,
-        task.title,
-        prBody(task, ws, siblings),
+        opts?.title?.trim() || task.title,
+        renderPrBody(task, ws, siblings, base, opts?.body),
         base,
         ws.branch,
       );
-      created.push({ ws, url });
+      created.push({ ws, url, base });
       results.push({ workstreamId: ws.id, ok: true, message: "PR created" });
     } catch (error) {
       results.push({ workstreamId: ws.id, ok: false, message: shortError(error) });
@@ -224,11 +403,15 @@ export async function createTaskPrs(
       const siblings = [...urls.entries()]
         .filter(([id]) => id !== entry.ws.id)
         .map(([, url]) => url);
-      await gitPrUpdate(
-        entry.ws.worktreePath!,
-        entry.url,
-        prBody(task, entry.ws, siblings),
-      ).catch(() => undefined);
+      const cwd = entry.ws.worktreePath!;
+      const ops = await prOps(cwd).catch(() => null);
+      await ops
+        ?.updateBody(
+          cwd,
+          entry.url,
+          renderPrBody(task, entry.ws, siblings, entry.base, opts?.body),
+        )
+        .catch(() => undefined);
     }
   }
   return results;

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { InboxProviderMark } from "../inbox/ui/InboxProviderMark";
 import { Popover } from "../../shared/ui/Popover";
@@ -7,14 +7,20 @@ import {
   ArrowUp,
   Check,
   ChevronLeft,
+  ArrowDownCircle,
+  CheckCircle,
   ChevronRight,
   ExternalLink,
+  Folder,
+  GitBranch,
   GitMerge,
   GitPullRequest,
   LoaderCircle,
   Play,
   Plus,
   Search,
+  Trash2,
+  WandSparkles,
   X,
 } from "../../shared/ui/icons";
 import { useDragResize } from "../../shared/hooks/useDragResize";
@@ -26,19 +32,30 @@ import {
 import { projectName } from "../../shared/lib/paths";
 import { sameProjectPath, type RecentProject } from "../projects/model/recents";
 import type { LinkedWorkItem, Session } from "../sessions/model/session";
-import { linkedWorkItemInboxKey } from "../sessions/model/sessionWorkItem";
+import {
+  linkedWorkItemInboxKey,
+  sessionWorkItems,
+} from "../sessions/model/sessionWorkItem";
 import {
   boardTicketOptions,
   cardAttentionLines,
   groupSwatch,
+  lanePrSignal,
   linkBundleFromLinks,
+  providerStage,
   sessionDotClass,
 } from "./boardData";
-import { namedWorktreeBranch } from "../source-control/model/worktrees";
-import type { BoardCard, BoardWorkstreamRow } from "./boardData";
+import type {
+  BoardCard,
+  BoardWorkstreamRow,
+  WorkstreamStatus,
+} from "./boardData";
+import { CreatePrsDialog, type PrSubmit } from "./CreatePrsDialog";
 import {
   createGroup,
   loadBoard,
+  MAX_TASK_GROUPS,
+  MAX_WORKSTREAMS,
   newEntityId,
   removeTask,
   renameLocalCard,
@@ -46,12 +63,18 @@ import {
   type BoardGroup,
 } from "./boardStore";
 import {
+  resolveLaneBranch,
   suggestedBranch,
   WorkstreamFields,
   workstreamProjectOptions,
   type NewTaskSpec,
 } from "./NewTaskDialog";
-import type { WorkstreamResult } from "./taskOps";
+import {
+  prIsOpen,
+  resolveConflictPrompt,
+  type WorkstreamResult,
+} from "./taskOps";
+
 
 const ACTION =
   "flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium text-content/55 hover:bg-content/8 hover:text-content disabled:opacity-40";
@@ -150,6 +173,7 @@ function SessionPicker({
   sessions,
   projectPath,
   bound,
+  linkKeys,
   onPick,
   onClose,
 }: {
@@ -159,16 +183,27 @@ function SessionPicker({
   /** Session ids already bound to a workstream — excluded so a pick
    * can't silently steal one from another lane. */
   bound: ReadonlySet<string>;
+  /** Inbox keys of this task's tickets — a session linked to work outside
+   * this set would lose its link bundle if bound here. */
+  linkKeys: ReadonlySet<string>;
   onPick: (sessionId: string) => void;
   onClose: () => void;
 }) {
-  const options = sessions.filter(
-    (session) =>
-      !session.inboxAsk &&
-      !session.orchestrationLeadId &&
-      !bound.has(session.id) &&
-      sameProjectPath(session.cwd, projectPath),
-  );
+  const options = sessions.filter((session) => {
+    if (
+      session.inboxAsk ||
+      session.orchestrationLeadId ||
+      bound.has(session.id) ||
+      !sameProjectPath(session.cwd, projectPath)
+    )
+      return false;
+    // Binding overwrites the session's link bundle — a session carrying
+    // items this task doesn't have would silently lose that association.
+    const linked = sessionWorkItems(session);
+    return linked.every((item) =>
+      linkKeys.has(linkedWorkItemInboxKey(item)),
+    );
+  });
   return (
     <Popover
       anchor={anchor}
@@ -437,32 +472,43 @@ export function TaskDetailsPanel({
   results,
   onClose,
   onOpenSession,
+  onSendToSession,
   onSpawnSession,
   onBindSession,
-  onCreatePrs,
+  wsStatus,
   onUpdateBranches,
   onUpdateWorkstream,
-  onCreateWorkstreamPr,
+  onSubmitPrs,
+  onCleanupWorkstream,
 }: {
   card: BoardCard;
   items: InboxItem[];
   recents: RecentProject[];
   sessions: Session[];
+  /** Lane probe results — feeds the dialog's related-PR list. */
+  wsStatus: ReadonlyMap<string, WorkstreamStatus>;
   /** Action currently running, e.g. "prs" | "merge" — disables buttons. */
   busyAction: string;
   /** Latest bulk-action results, keyed by workstream id. */
   results: ReadonlyMap<string, WorkstreamResult>;
   onClose: () => void;
   onOpenSession: (sessionId: string) => void;
+  /** Open `sessionId` and submit `text` — used to hand a conflicted lane a
+   * resolve prompt in a freshly spawned worktree session. */
+  onSendToSession: (sessionId: string, text: string) => void;
   onSpawnSession: (spec: NewTaskSpec["workstreams"][number]) => Promise<{
     sessionId: string;
     worktreePath: string;
   }>;
   onBindSession: (sessionId: string, linked: LinkedWorkItem | null) => void;
-  onCreatePrs: () => void;
   onUpdateBranches: () => void;
   onUpdateWorkstream: (workstreamId: string) => void;
-  onCreateWorkstreamPr: (workstreamId: string) => void;
+  /** Create-PR dialog submitted — `only` scopes the run to those lanes.
+   * Resolves when the run finishes so the dialog can stay open on busy. */
+  onSubmitPrs: (only: ReadonlySet<string>, opts: PrSubmit) => Promise<void>;
+  /** Remove a merged lane's worktree via the App-level removal path and pin
+   * its PR so the lane keeps probing it. Only called when offered. */
+  onCleanupWorkstream: (workstreamId: string) => Promise<unknown>;
 }) {
   const task = card.task!;
   const [addTicketAt, setAddTicketAt] = useState<HTMLElement | null>(null);
@@ -474,14 +520,17 @@ export function TaskDetailsPanel({
   const [showAddStream, setShowAddStream] = useState(false);
   const [addingStream, setAddingStream] = useState(false);
   const [streamError, setStreamError] = useState("");
+  /** Lanes the create-PR dialog is composing for — null when closed. */
+  const [prDialog, setPrDialog] = useState<ReadonlySet<string> | null>(null);
 
   const linkKeys = useMemo(
     () => new Set(task.links.map((link) => linkedWorkItemInboxKey(link))),
     [task.links],
   );
-  // Fresh read — `task` gets a new identity on every store write, so this
-  // tracks renames/deletes from this panel and any other surface.
-  const allGroups = useMemo(() => loadBoard().groups, [task]);
+  // Fresh read — `task` gets a new identity on every store write, and
+  // `groupMenuAt` re-reads on each picker open, so renames/deletes from the
+  // board header can't leave this stale.
+  const allGroups = useMemo(() => loadBoard().groups, [task, groupMenuAt]);
   // Session ids already owned by any task workstream — read fresh when the
   // picker opens so a pick can't steal a binding from another task.
   const boundSessionIds = useMemo(() => {
@@ -512,7 +561,7 @@ export function TaskDetailsPanel({
     updateTask(task.id, (current) => ({
       groupIds: current.groupIds?.includes(groupId)
         ? current.groupIds.filter((id) => id !== groupId)
-        : [...(current.groupIds ?? []), groupId],
+        : [...(current.groupIds ?? []), groupId].slice(0, MAX_TASK_GROUPS),
     }));
 
   const addWorkstream = async (
@@ -523,8 +572,12 @@ export function TaskDetailsPanel({
     setAddingStream(true);
     setStreamError("");
     try {
+      // Cap check before spawn — `updateTask` failing after the worktree +
+      // session exist would orphan both.
+      if (task.workstreams.length >= MAX_WORKSTREAMS)
+        throw new Error(`A task can hold at most ${MAX_WORKSTREAMS} lanes.`);
       const resolved =
-        namedWorktreeBranch(branch.trim()) ||
+        resolveLaneBranch(projectPath, branch) ||
         suggestedBranch(task.title, task.links);
       const spawned = await onSpawnSession({
         projectPath,
@@ -592,7 +645,7 @@ export function TaskDetailsPanel({
               {ticket.state ? (
                 <span
                   className={`max-w-20 shrink-0 truncate text-[10px] ${
-                    /done|closed|merged|resolved|completed/i.test(ticket.state)
+                    providerStage(ticket) === "done"
                       ? "text-content/35"
                       : "text-emerald-300/80"
                   }`}
@@ -669,53 +722,75 @@ export function TaskDetailsPanel({
           </button>
         </div>
 
-        {/* Pull requests -------------------------------------------- */}
-        {card.prs?.length ? (
-          <>
-            <div className="mb-1.5 mt-5">
-              <SectionLabel>Pull requests</SectionLabel>
-            </div>
-            <div className="flex flex-col">
-              {card.prs.map((pr) => (
-                <div
-                  key={pr.id}
-                  className="flex items-center gap-2 rounded-md px-1.5 py-1.5 hover:bg-content/4"
-                >
-                  {pr.provider ? (
-                    <InboxProviderMark
-                      provider={pr.provider}
-                      className="size-3.5 shrink-0 text-content/60"
-                    />
-                  ) : (
+        {/* Pull requests — lane PRs plus discovered items, one list so a
+         * multi-repo task shows its whole PR surface. */}
+        {(() => {
+          const multiLane = (card.workstreams?.length ?? 0) > 1;
+          const lanePrs = (card.workstreams ?? [])
+            .filter((row) => row.pr)
+            .map((row) => ({
+              id: `ws:${row.id}`,
+              title: row.pr!.title,
+              url: row.pr!.url,
+              state: row.pr!.state,
+              lane: multiLane
+                ? projectName(row.projectPath) || row.projectPath
+                : "",
+            }));
+          const seen = new Set(lanePrs.map((pr) => pr.url));
+          const allPrs = [
+            ...lanePrs,
+            ...(card.prs ?? [])
+              .filter((pr) => !pr.url || !seen.has(pr.url))
+              .map((pr) => ({
+                id: pr.id,
+                title: pr.identifier ? `${pr.identifier} ${pr.title}` : pr.title,
+                url: pr.url,
+                state: pr.state,
+                lane: "",
+              })),
+          ];
+          if (!allPrs.length) return null;
+          return (
+            <>
+              <div className="mb-1.5 mt-5">
+                <SectionLabel>Pull requests</SectionLabel>
+              </div>
+              <div className="flex flex-col">
+                {allPrs.map((pr) => (
+                  <div
+                    key={pr.id}
+                    className="flex items-center gap-2 rounded-md px-1.5 py-1.5 hover:bg-content/4"
+                  >
                     <GitPullRequest
                       className="size-3.5 shrink-0 text-content/50"
                       strokeWidth={1.75}
                     />
-                  )}
-                  <span className="min-w-0 flex-1 truncate text-[12px] text-content/85">
-                    {pr.identifier ? `${pr.identifier} ` : ""}
-                    {pr.title}
-                  </span>
-                  {pr.state ? (
-                    <span className="max-w-20 shrink-0 truncate text-[10px] capitalize text-content/40">
-                      {pr.state.toLowerCase()}
+                    <span className="min-w-0 flex-1 truncate text-[12px] text-content/85">
+                      {pr.lane ? `${pr.lane} — ` : ""}
+                      {pr.title}
                     </span>
-                  ) : null}
-                  {pr.url ? (
-                    <button
-                      type="button"
-                      aria-label={`Open pull request ${pr.title}`}
-                      className="grid size-5 shrink-0 place-items-center rounded text-content/35 hover:bg-content/10 hover:text-content"
-                      onClick={() => void openUrl(pr.url!)}
-                    >
-                      <ExternalLink className="size-3" strokeWidth={1.75} />
-                    </button>
-                  ) : null}
-                </div>
-              ))}
-            </div>
-          </>
-        ) : null}
+                    {pr.state ? (
+                      <span className="max-w-20 shrink-0 truncate text-[10px] capitalize text-content/40">
+                        {pr.state.toLowerCase()}
+                      </span>
+                    ) : null}
+                    {pr.url ? (
+                      <button
+                        type="button"
+                        aria-label={`Open pull request ${pr.title}`}
+                        className="grid size-5 shrink-0 place-items-center rounded text-content/35 hover:bg-content/10 hover:text-content"
+                        onClick={() => void openUrl(pr.url!)}
+                      >
+                        <ExternalLink className="size-3" strokeWidth={1.75} />
+                      </button>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </>
+          );
+        })()}
 
         {/* Workstreams ---------------------------------------------- */}
         <div className="mb-1.5 mt-5 flex items-center justify-between">
@@ -741,16 +816,20 @@ export function TaskDetailsPanel({
             {streamError}
           </p>
         ) : null}
-        <div className="mt-1 flex flex-col divide-y divide-content/6">
+        <div className="mt-1 flex flex-col gap-1.5">
           {(card.workstreams ?? []).map((row) => (
             <WorkstreamCard
               key={row.id}
               row={row}
               result={results.get(row.id)}
-              busy={busyAction}
+              busy={
+                busyAction === "merge" ||
+                busyAction === "prs" ||
+                busyAction === `merge:${row.id}`
+              }
               onOpenSession={onOpenSession}
               onUpdate={() => onUpdateWorkstream(row.id)}
-              onCreatePr={() => onCreateWorkstreamPr(row.id)}
+              onCreatePr={() => setPrDialog(new Set([row.id]))}
               onSpawnSession={async () => {
                 const spawned = await onSpawnSession({
                   projectPath: row.projectPath,
@@ -776,6 +855,21 @@ export function TaskDetailsPanel({
                 }));
                 // Spawning is an intent to chat — take the user to it.
                 onOpenSession(spawned.sessionId);
+              }}
+              onResolve={async () => {
+                // A fresh session bound to the conflicted worktree — bound
+                // sessions may run in the project root, but the merge state
+                // lives in the worktree, so the fix needs that cwd.
+                const spawned = await onSpawnSession({
+                  projectPath: row.projectPath,
+                  branch: row.branch,
+                  base: row.base,
+                  ...(row.worktreePath
+                    ? { worktreePath: row.worktreePath }
+                    : {}),
+                });
+                appendSession(row.id, spawned.sessionId);
+                onSendToSession(spawned.sessionId, resolveConflictPrompt(row));
               }}
               onBind={(anchor) =>
                 setBindAt({ anchor, workstreamId: row.id })
@@ -811,6 +905,9 @@ export function TaskDetailsPanel({
                   ),
                 }));
               }}
+              onCleanup={async () => {
+                await onCleanupWorkstream(row.id);
+              }}
             />
           ))}
           {!card.workstreams?.length ? (
@@ -827,8 +924,23 @@ export function TaskDetailsPanel({
       <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-t border-stroke px-3 py-2">
         <button
           type="button"
-          disabled={!!busyAction || !card.workstreams?.length}
-          onClick={onCreatePrs}
+          disabled={
+            !!busyAction ||
+            !(card.workstreams ?? []).some(
+              // A closed/merged PR doesn't block a replacement — only an
+              // open one does.
+              (row) => !row.pr || !prIsOpen(row.pr.state),
+            )
+          }
+          onClick={() =>
+            setPrDialog(
+              new Set(
+                (card.workstreams ?? [])
+                  .filter((row) => !row.pr || !prIsOpen(row.pr.state))
+                  .map((row) => row.id),
+              ),
+            )
+          }
           className="flex h-7 items-center gap-1.5 rounded-md bg-accent/15 px-2 text-[11px] font-medium text-accent hover:bg-accent/25 disabled:opacity-40"
         >
           {busyAction === "prs" ? (
@@ -877,6 +989,21 @@ export function TaskDetailsPanel({
           onClose={() => setAddTicketAt(null)}
         />
       ) : null}
+      {prDialog ? (
+        <CreatePrsDialog
+          task={task}
+          rows={(card.workstreams ?? []).filter((row) => prDialog.has(row.id))}
+          status={wsStatus}
+          busy={busyAction === "prs"}
+          onSubmit={async (only, opts) => {
+            // Stay open through the run — the busy state reports progress
+            // and a failure's results are visible right after close.
+            await onSubmitPrs(only, opts);
+            setPrDialog(null);
+          }}
+          onCancel={() => setPrDialog(null)}
+        />
+      ) : null}
       {groupMenuAt ? (
         <GroupAssign
           anchor={groupMenuAt}
@@ -891,6 +1018,7 @@ export function TaskDetailsPanel({
           anchor={bindAt.anchor}
           sessions={sessions}
           bound={boundSessionIds}
+          linkKeys={linkKeys}
           projectPath={
             card.workstreams?.find((ws) => ws.id === bindAt.workstreamId)
               ?.projectPath ?? ""
@@ -1084,47 +1212,91 @@ function WorkstreamCard({
   onUpdate,
   onCreatePr,
   onSpawnSession,
+  onResolve,
   onBind,
   onUnbind,
   onRemove,
+  onCleanup,
 }: {
   row: BoardWorkstreamRow;
   result?: WorkstreamResult;
-  busy: string;
+  /** True while this lane's update or a task-wide op runs — sibling lanes
+   * keep their own controls live. */
+  busy: boolean;
   onOpenSession: (sessionId: string) => void;
   onUpdate: () => void;
   onCreatePr: () => void;
   onSpawnSession: () => Promise<void>;
+  onResolve: () => Promise<void>;
   onBind: (anchor: HTMLElement) => void;
   onUnbind: (sessionId: string) => void;
   onRemove: () => void;
+  /** Remove the merged lane's worktree — only rendered when applicable. */
+  onCleanup?: () => Promise<void>;
 }) {
   const unresolved = row.sessionIds.filter(
     (id) => !row.sessions.some((ref) => ref.id === id),
   );
-  const [spawning, setSpawning] = useState(false);
-  const [spawnError, setSpawnError] = useState("");
-  const spawn = async () => {
-    setSpawning(true);
-    setSpawnError("");
+  const [pending, setPending] = useState<
+    "spawn" | "resolve" | "cleanup" | null
+  >(null);
+  const [armed, setArmed] = useState(false);
+  const [actionError, setActionError] = useState("");
+  const runAction = async (
+    which: "spawn" | "resolve" | "cleanup",
+    fn: () => Promise<void>,
+  ) => {
+    setPending(which);
+    setActionError("");
     try {
-      await onSpawnSession();
+      await fn();
     } catch (error) {
-      setSpawnError(
+      setActionError(
         String(error).replace(/^Error:\s*/, "").split("\n")[0].slice(0, 160),
       );
     } finally {
-      setSpawning(false);
+      setPending(null);
+      setArmed(false);
     }
   };
+  // MERGE_HEAD is the durable signal — probes refire right after an update
+  // op and keep polling, so the banner clears once the merge concludes and
+  // also covers conflicts created outside this flow.
+  const conflicted = Boolean(row.merging);
+  const mergeSignal = lanePrSignal(row);
+  // A merged/closed lane keeps its worktree until cleaned up — offer it.
+  const cleanupOffered =
+    Boolean(row.worktreePath) && row.pr != null && !prIsOpen(row.pr.state);
+  // Task-level ops (`busy`) and lane ops (`pending`) share the worktree —
+  // neither may run while the other is in flight.
+  const laneBusy = busy || pending !== null;
+  // The banner hiding (PR reopened, worktree gone) must disarm the two-click
+  // confirm — a stale "armed" state would turn the next render's first click
+  // into an immediate delete.
+  useEffect(() => {
+    if (!cleanupOffered) setArmed(false);
+  }, [cleanupOffered]);
   return (
-    <div className="py-2.5">
+    <div className="rounded-lg border border-content/8 bg-content/[0.015] px-2 py-1.5">
+      {/* Lane header — repo · branch → base · remove */}
       <div className="flex items-center gap-1.5">
-        <span className="min-w-0 max-w-[45%] truncate text-[12px] font-medium text-content/85">
+        <Folder className="size-3.5 shrink-0 text-content/40" strokeWidth={1.75} />
+        <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-content/85">
           {projectName(row.projectPath) || row.projectPath}
         </span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-content/40">
-          {row.branch}
+        <span
+          className="flex min-w-0 shrink items-center gap-1 rounded bg-content/8 px-1.5 py-0.5"
+          title={`${row.branch} → ${row.base}`}
+        >
+          <GitBranch className="size-2.5 shrink-0 text-content/45" strokeWidth={1.75} />
+          <span className="min-w-0 truncate font-mono text-[10px] text-content/60">
+            {row.branch}
+          </span>
+          {row.base ? (
+            <span className="shrink-0 font-mono text-[10px] text-content/30">
+              → {row.base}
+            </span>
+          ) : null}
         </span>
         <button
           type="button"
@@ -1135,112 +1307,264 @@ function WorkstreamCard({
           <X className="size-3" strokeWidth={1.75} />
         </button>
       </div>
+      {/* Status chips — the lane's PR + pipeline state at a glance. */}
+      {row.pr || row.ciTotal || row.behind ? (
+        <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5">
+          {row.pr ? (
+            <button
+              type="button"
+              className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                prIsOpen(row.pr.state)
+                  ? "bg-amber-400/10 text-amber-300"
+                  : "bg-content/8 text-content/50"
+              } hover:bg-content/10`}
+              title={`${row.pr.title} — ${row.pr.state}`}
+              onClick={() => void openUrl(row.pr!.url)}
+            >
+              <GitPullRequest className="size-3" strokeWidth={1.75} />
+              PR #{row.pr.number}
+              {row.pr.draft ? " · draft" : ""}
+            </button>
+          ) : null}
+          {row.pr && prIsOpen(row.pr.state) && row.pr.reviewDecision ? (
+            <span
+              className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                row.pr.reviewDecision === "CHANGES_REQUESTED"
+                  ? "bg-red-400/15 text-red-300"
+                  : row.pr.reviewDecision === "APPROVED"
+                    ? "bg-emerald-400/10 text-emerald-300/90"
+                    : "bg-content/8 text-content/50"
+              }`}
+            >
+              {row.pr.reviewDecision === "CHANGES_REQUESTED"
+                ? "Changes requested"
+                : row.pr.reviewDecision === "APPROVED"
+                  ? "Approved"
+                  : "Awaiting review"}
+            </span>
+          ) : null}
+          {row.pr && prIsOpen(row.pr.state) && row.pr.unresolvedThreads ? (
+            <span
+              className="rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-300/90"
+              title="Unresolved review threads"
+            >
+              {row.pr.unresolvedThreads} thread
+              {row.pr.unresolvedThreads === 1 ? "" : "s"}
+            </span>
+          ) : null}
+          {mergeSignal === "ready" ? (
+            <span
+              className="flex items-center gap-1 rounded bg-emerald-400/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300"
+              title="Approved, checks green, mergeable — land it on the provider"
+            >
+              <CheckCircle className="size-3" strokeWidth={1.75} />
+              Ready
+            </span>
+          ) : mergeSignal === "conflicts" ? (
+            <span
+              className="rounded bg-red-400/15 px-1.5 py-0.5 text-[10px] font-medium text-red-300"
+              title="The provider reports merge conflicts"
+            >
+              Conflicts
+            </span>
+          ) : mergeSignal === "blocked" ? (
+            <span
+              className="rounded bg-red-400/15 px-1.5 py-0.5 text-[10px] font-medium text-red-300"
+              title="Merge blocked by branch policy/protection"
+            >
+              Blocked
+            </span>
+          ) : null}
+          {mergeSignal === "behind" && !row.behind ? (
+            <span
+              className="rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-300/90"
+              title="The provider reports the PR is behind its base branch"
+            >
+              Behind base
+            </span>
+          ) : null}
+          {row.behind ? (
+            <button
+              type="button"
+              disabled={laneBusy}
+              title={`${row.branch} is ${row.behind} commit${row.behind === 1 ? "" : "s"} behind ${row.base} (last fetch) — click to merge`}
+              className="flex items-center gap-0.5 rounded bg-content/8 px-1.5 py-0.5 text-[10px] font-medium text-content/55 hover:bg-content/12 hover:text-content disabled:opacity-40"
+              onClick={onUpdate}
+            >
+              <ArrowDownCircle className="size-3" strokeWidth={1.75} />
+              {row.behind}
+            </button>
+          ) : null}
+          {row.ciFailing ? (
+            <span className="rounded bg-red-400/15 px-1.5 py-0.5 text-[10px] font-medium text-red-300">
+              CI ×{row.ciFailing}
+            </span>
+          ) : row.ciRunning ? (
+            <span className="rounded bg-emerald-400/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300/90">
+              CI ●{row.ciRunning}
+            </span>
+          ) : row.ciTotal ? (
+            <span className="rounded bg-content/8 px-1.5 py-0.5 text-[10px] font-medium text-content/45">
+              CI ✓
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+      {/* Merge conflict — durable while MERGE_HEAD exists. Spawns a session
+       * in this worktree with the resolve prompt. */}
+      {conflicted ? (
+        <div className="mt-1.5 flex items-center gap-1.5 rounded-md bg-red-400/10 py-1 pl-1.5 pr-1 ring-1 ring-red-400/20">
+          <GitMerge className="size-3 shrink-0 text-red-300" strokeWidth={1.75} />
+          <span className="min-w-0 flex-1 truncate text-[10.5px] font-medium text-red-300">
+            Merge conflict{row.base ? ` — ${row.base}` : ""}
+          </span>
+          <button
+            type="button"
+            disabled={laneBusy || !row.worktreePath}
+            title={`Resolve the ${row.base} merge with an agent in this worktree`}
+            className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-accent hover:bg-accent/10 disabled:opacity-40"
+            onClick={() => void runAction("resolve", onResolve)}
+          >
+            {pending === "resolve" ? (
+              <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
+            ) : (
+              <WandSparkles className="size-3" strokeWidth={1.75} />
+            )}
+            Resolve
+          </button>
+        </div>
+      ) : null}
+      {/* Merged/closed PR — the worktree is litter. Two-click arm, then
+       * `git worktree remove` (dirty worktrees still refuse). */}
+      {cleanupOffered && onCleanup ? (
+        <div className="mt-1.5 flex items-center gap-1.5 rounded-md bg-content/[0.04] py-1 pl-1.5 pr-1 ring-1 ring-content/10">
+          <CheckCircle
+            className="size-3 shrink-0 text-content/50"
+            strokeWidth={1.75}
+          />
+          <span className="min-w-0 flex-1 truncate text-[10.5px] font-medium text-content/60">
+            PR {row.pr!.state} — worktree no longer needed
+          </span>
+          <button
+            type="button"
+            disabled={laneBusy}
+            aria-pressed={armed}
+            title={
+              armed
+                ? "Confirm — removes the worktree directory"
+                : "Remove this lane's worktree"
+            }
+            className={`flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium disabled:opacity-40 ${
+              armed
+                ? "bg-red-400/15 text-red-300 hover:bg-red-400/25"
+                : "text-content/55 hover:bg-content/10 hover:text-content"
+            }`}
+            onClick={() =>
+              armed
+                ? void runAction("cleanup", onCleanup)
+                : setArmed(true)
+            }
+          >
+            {pending === "cleanup" ? (
+              <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
+            ) : (
+              <Trash2 className="size-3" strokeWidth={1.75} />
+            )}
+            {armed ? "Remove?" : "Clean up"}
+          </button>
+        </div>
+      ) : null}
       {/* Conversations — a lane can hold several sessions. */}
-      <div className="mt-0.5 flex flex-col">
-        {row.sessions.map((session) => (
-          <div key={session.id} className="group flex items-center">
-            <button
-              type="button"
-              className="flex min-w-0 flex-1 items-center gap-1.5 rounded py-0.5 text-left text-[11px] text-content/65 hover:text-content"
-              title={
-                session.live ? session.title : `${session.title} — click to resume`
-              }
-              onClick={() => onOpenSession(session.id)}
+      {row.sessions.length || unresolved.length ? (
+        <div className="mt-1 flex flex-col">
+          {row.sessions.map((session) => (
+            <div
+              key={session.id}
+              className="group -mx-1 flex items-center rounded-md px-1 hover:bg-content/4"
             >
-              <span
-                aria-hidden
-                className={`size-1.5 shrink-0 rounded-full ${
-                  session.needsInput
-                    ? "bg-amber-400"
-                    : session.busy
-                      ? "bg-emerald-400"
-                      : session.live
-                        ? "bg-content/25"
-                        : "bg-transparent ring-1 ring-content/25"
-                }`}
-              />
-              <span
-                className={`truncate ${session.live ? "" : "text-content/45"}`}
+              <button
+                type="button"
+                className="flex min-w-0 flex-1 items-center gap-1.5 py-1 text-left text-[11.5px] text-content/70 hover:text-content"
+                title={
+                  session.live
+                    ? session.title
+                    : `${session.title} — click to resume`
+                }
+                onClick={() => onOpenSession(session.id)}
               >
-                {session.title}
-              </span>
-            </button>
-            <button
-              type="button"
-              aria-label={`Unbind ${session.title}`}
-              className="grid size-4 shrink-0 place-items-center rounded text-content/30 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
-              onClick={() => onUnbind(session.id)}
+                <span
+                  aria-hidden
+                  className={`size-1.5 shrink-0 rounded-full ${
+                    session.live
+                      ? sessionDotClass(session)
+                      : "bg-transparent ring-1 ring-content/25"
+                  }`}
+                />
+                <span
+                  className={`min-w-0 flex-1 truncate ${session.live ? "" : "text-content/45"}`}
+                >
+                  {session.title}
+                </span>
+                <span
+                  className={`shrink-0 text-[10px] ${
+                    session.needsInput
+                      ? "text-amber-300/80"
+                      : session.busy
+                        ? "text-emerald-300/80"
+                        : "text-content/30"
+                  }`}
+                >
+                  {session.needsInput
+                    ? "needs input"
+                    : session.busy
+                      ? "running"
+                      : session.live
+                        ? "idle"
+                        : "stored"}
+                </span>
+              </button>
+              <button
+                type="button"
+                aria-label={`Unbind ${session.title}`}
+                className="grid size-4 shrink-0 place-items-center rounded text-content/30 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
+                onClick={() => onUnbind(session.id)}
+              >
+                <X className="size-2.5" strokeWidth={2} />
+              </button>
+            </div>
+          ))}
+          {unresolved.map((id) => (
+            // Bound but unresolved — resume rehydrates the stored session.
+            <div
+              key={id}
+              className="group -mx-1 flex items-center rounded-md px-1 hover:bg-content/4"
             >
-              <X className="size-2.5" strokeWidth={2} />
-            </button>
-          </div>
-        ))}
-        {unresolved.map((id) => (
-          // Bound but unresolved — resume rehydrates the stored session.
-          <div key={id} className="group flex items-center">
-            <button
-              type="button"
-              className="flex flex-1 items-center gap-1 rounded py-0.5 text-[11px] text-accent hover:underline"
-              onClick={() => onOpenSession(id)}
-            >
-              <Play className="size-2.5" strokeWidth={2} />
-              Resume session
-            </button>
-            <button
-              type="button"
-              aria-label="Unbind session"
-              className="grid size-4 shrink-0 place-items-center rounded text-content/30 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
-              onClick={() => onUnbind(id)}
-            >
-              <X className="size-2.5" strokeWidth={2} />
-            </button>
-          </div>
-        ))}
-      </div>
-      {/* Lane status + actions on one line — chips read, links act. */}
-      <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-        {row.pr ? (
-          <button
-            type="button"
-            className={`flex items-center gap-1 rounded px-1 text-[11px] ${
-              /open|active/i.test(row.pr.state)
-                ? "bg-amber-400/10 text-amber-300"
-                : "bg-content/8 text-content/50"
-            } hover:bg-content/10`}
-            title={`${row.pr.title} — ${row.pr.state}`}
-            onClick={() => void openUrl(row.pr!.url)}
-          >
-            <GitPullRequest className="size-3" strokeWidth={1.75} />
-            PR #{row.pr.number}
-          </button>
-        ) : row.worktreePath ? (
-          <button
-            type="button"
-            disabled={!!busy}
-            className="flex items-center gap-1 rounded px-1 text-[11px] text-content/50 hover:bg-content/8 hover:text-content disabled:opacity-40"
-            onClick={onCreatePr}
-          >
-            <GitPullRequest className="size-3" strokeWidth={1.75} />
-            Create PR
-          </button>
-        ) : null}
-        {row.ciFailing ? (
-          <span className="rounded bg-red-400/15 px-1 text-[10px] font-medium text-red-300">
-            CI ×{row.ciFailing}
-          </span>
-        ) : row.ciRunning ? (
-          <span className="rounded bg-emerald-400/10 px-1 text-[10px] font-medium text-emerald-300/90">
-            CI ●{row.ciRunning}
-          </span>
-        ) : row.ciTotal ? (
-          <span className="rounded bg-content/8 px-1 text-[10px] text-content/45">
-            CI ✓
-          </span>
-        ) : null}
+              <button
+                type="button"
+                className="flex min-w-0 flex-1 items-center gap-1.5 py-1 text-left text-[11.5px] text-accent hover:underline"
+                onClick={() => onOpenSession(id)}
+              >
+                <Play className="size-2.5 shrink-0" strokeWidth={2} />
+                Resume session
+              </button>
+              <button
+                type="button"
+                aria-label="Unbind session"
+                className="grid size-4 shrink-0 place-items-center rounded text-content/30 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
+                onClick={() => onUnbind(id)}
+              >
+                <X className="size-2.5" strokeWidth={2} />
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {/* Lane actions — separated from status by a hairline. */}
+      <div className="mt-1.5 flex min-w-0 items-center gap-1 border-t border-content/6 pt-1.5">
         <button
           type="button"
-          disabled={!!busy}
-          className="flex items-center gap-1 rounded px-1 text-[11px] text-content/45 hover:bg-content/8 hover:text-content disabled:opacity-40"
+          disabled={laneBusy}
+          className="flex items-center gap-1 rounded px-1 py-0.5 text-[11px] text-content/45 hover:bg-content/8 hover:text-content disabled:opacity-40"
           title={`Merge ${row.base} into ${row.branch}`}
           onClick={onUpdate}
         >
@@ -1249,11 +1573,11 @@ function WorkstreamCard({
         </button>
         <button
           type="button"
-          disabled={spawning}
-          className="flex items-center gap-1 rounded px-1 text-[11px] text-content/50 hover:bg-content/8 hover:text-content disabled:opacity-40"
-          onClick={() => void spawn()}
+          disabled={laneBusy}
+          className="flex items-center gap-1 rounded px-1 py-0.5 text-[11px] text-content/50 hover:bg-content/8 hover:text-content disabled:opacity-40"
+          onClick={() => void runAction("spawn", onSpawnSession)}
         >
-          {spawning ? (
+          {pending === "spawn" ? (
             <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
           ) : (
             <Plus className="size-3" strokeWidth={2} />
@@ -1266,11 +1590,23 @@ function WorkstreamCard({
         </button>
         <button
           type="button"
-          className="rounded px-1 text-[11px] text-content/45 hover:bg-content/8 hover:text-content"
+          disabled={laneBusy}
+          className="rounded px-1 py-0.5 text-[11px] text-content/45 hover:bg-content/8 hover:text-content disabled:opacity-40"
           onClick={(event) => onBind(event.currentTarget as HTMLElement)}
         >
           Bind
         </button>
+        {(!row.pr || !prIsOpen(row.pr.state)) && row.worktreePath ? (
+          <button
+            type="button"
+            disabled={laneBusy}
+            className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-accent hover:bg-accent/10 disabled:opacity-40"
+            onClick={onCreatePr}
+          >
+            <GitPullRequest className="size-3" strokeWidth={1.75} />
+            Create PR
+          </button>
+        ) : null}
       </div>
       {row.probeError ? (
         <p
@@ -1280,9 +1616,9 @@ function WorkstreamCard({
           {row.probeError}
         </p>
       ) : null}
-      {spawnError ? (
+      {actionError ? (
         <p role="alert" className="mt-1 break-words text-[10px] text-red-300">
-          {spawnError}
+          {actionError}
         </p>
       ) : null}
       {result ? (

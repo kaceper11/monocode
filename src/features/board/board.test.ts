@@ -1,20 +1,35 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  laneProblem,
+  prHeadRemoteRef,
+  prIsOpen,
+  renderPrBody,
+  resolveConflictPrompt,
+} from "./taskOps";
 import type { InboxItem } from "../inbox/model/githubTasks";
 import type { LinkedWorkItem, Session } from "../sessions/model/session";
 import type { SessionSummary } from "../sessions/data/sessionStore";
 import {
+  attentionScore,
   buildBoardCards,
   cardAttentionLines,
   cardColumn,
   columnCards,
   columnUnits,
   deriveColumn,
+  dropOrder,
+  isCardSnoozed,
+  itemCardKey,
   itemMatchesTicketKey,
+  lanePrSignal,
+  snoozeWakeKey,
   ticketKeys,
   type ColumnUnit,
 } from "./boardData";
+import { buildStandup } from "./standup";
+import { defaultReviewProject } from "./ReviewLocallyDialog";
 import {
-  addCardToGroup,
+  addColumn,
   addLocalCard,
   addTask,
   archiveTasks,
@@ -22,14 +37,20 @@ import {
   deleteGroup,
   hideCards,
   loadBoard,
+  pinCard,
   placeColumnOrder,
   removeCardFromGroup,
+  removeColumn,
   removeLocalCard,
   removeTask,
+  renameColumn,
   renameGroup,
   renameLocalCard,
+  setCardGroups,
+  snoozeCard,
   unarchiveAll,
   unplaceCard,
+  unsnoozeCard,
   updateTask,
   type BoardTask,
 } from "./boardStore";
@@ -282,9 +303,51 @@ describe("buildBoardCards", () => {
     const card = cards[0]!;
     expect(card.prs).toHaveLength(1);
     expect(card.prs![0]!.title).toBe("PROJ-123 auth fix");
-    expect(card.prs![0]!.via).toBe("key");
     // An open discovered PR pushes the task into review.
     expect(card.derived).toBe("review");
+  });
+
+  it("renders the default PR template with tickets, siblings and branches", () => {
+    const t = task({
+      title: "Auth rework",
+      links: [linked({ identifier: "ENG-9", title: "Auth bug" })],
+      workstreams: [
+        { id: "w1", projectPath: "/a", branch: "mc/auth-a", base: "main" },
+        { id: "w2", projectPath: "/b", branch: "mc/auth-b", base: "main" },
+      ],
+    });
+    const body = renderPrBody(t, t.workstreams[0]!, ["https://x/pr/2"], "main");
+    expect(body).toBe(
+      [
+        "Part of task: **Auth rework**",
+        "",
+        "Tickets:",
+        "- ENG-9 — Auth bug (https://github.com/acme/app/issues/42)",
+        "",
+        "Related pull requests:",
+        "- https://x/pr/2",
+        "",
+        "Related branches:",
+        "- `mc/auth-b`",
+      ].join("\n"),
+    );
+  });
+
+  it("drops empty template sections and substitutes lane tokens", () => {
+    const t = task({
+      title: "Solo",
+      workstreams: [
+        { id: "w1", projectPath: "/a", branch: "mc/x", base: "main" },
+      ],
+    });
+    // No links, no siblings, one lane — only the task line survives.
+    expect(renderPrBody(t, t.workstreams[0]!, [], "main")).toBe(
+      "Part of task: **Solo**",
+    );
+    // Custom template — unknown tokens pass through untouched.
+    expect(
+      renderPrBody(t, t.workstreams[0]!, [], "release/1.2", "{branch} → {base} {nope}"),
+    ).toBe("mc/x → release/1.2 {nope}");
   });
 
   it("projects probed PR + checks onto workstream rows", () => {
@@ -318,6 +381,321 @@ describe("buildBoardCards", () => {
     expect(row.ciFailing).toBe(1);
     expect(row.ciRunning).toBe(1);
     expect(cards[0]!.derived).toBe("review");
+  });
+
+  it("joins an Azure PR to its workstream lane by sourceRefName", () => {
+    const cards = buildBoardCards({
+      items: [
+        item({
+          provider: "azuredevops",
+          kind: "pr",
+          number: 77,
+          title: "Azure PR",
+          url: "https://dev.azure.com/acme/p/_git/r/pullrequest/77",
+          repo: "acme/repo",
+          sourceRefName: "refs/heads/mc/x",
+          targetRefName: "refs/heads/main",
+        }),
+      ],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({
+          workstreams: [
+            { id: "w1", projectPath: "/repo", branch: "mc/x", base: "main" },
+          ],
+        }),
+      ],
+    });
+    // Absorbed — no standalone item card.
+    expect(cards).toHaveLength(1);
+    const row = cards[0]!.workstreams![0]!;
+    expect(row.pr).toEqual({
+      number: 77,
+      title: "Azure PR",
+      url: "https://dev.azure.com/acme/p/_git/r/pullrequest/77",
+      state: "open",
+      updatedAt: "2025-01-01T00:00:00Z",
+    });
+    // And not duplicated into the discovered-PR chips.
+    expect(cards[0]!.prs).toEqual([]);
+  });
+
+  it("keeps the probed PR when an Azure item also matches the lane", () => {
+    const cards = buildBoardCards({
+      items: [
+        item({
+          provider: "azuredevops",
+          kind: "pr",
+          number: 77,
+          title: "Stale title",
+          url: "https://dev.azure.com/acme/p/_git/r/pullrequest/77",
+          repo: "acme/repo",
+          sourceRefName: "refs/heads/mc/x",
+        }),
+      ],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({
+          workstreams: [
+            { id: "w1", projectPath: "/repo", branch: "mc/x", base: "main" },
+          ],
+        }),
+      ],
+      workstreamStatus: new Map([
+        [
+          "w1",
+          {
+            pr: { number: 77, title: "Fresh", url: "https://x", state: "open" },
+            checks: [],
+          },
+        ],
+      ]),
+    });
+    // Still absorbed — and the fresher probe row is not overwritten.
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.workstreams![0]!.pr?.title).toBe("Fresh");
+  });
+
+  it("breaks a shared branch-name tie by repo when joining a PR", () => {
+    const cards = buildBoardCards({
+      items: [
+        item({
+          provider: "azuredevops",
+          kind: "pr",
+          number: 77,
+          title: "Azure PR",
+          url: "https://dev.azure.com/acme/p/_git/app/pullrequest/77",
+          repo: "acme/app",
+          sourceRefName: "refs/heads/mc/x",
+        }),
+      ],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({
+          id: "t1",
+          title: "App lane",
+          workstreams: [
+            { id: "w1", projectPath: "/code/app", branch: "mc/x", base: "main" },
+          ],
+        }),
+        task({
+          id: "t2",
+          title: "Other lane",
+          workstreams: [
+            {
+              id: "w2",
+              projectPath: "/code/other",
+              branch: "mc/x",
+              base: "main",
+            },
+          ],
+        }),
+      ],
+    });
+    const app = cards.find((entry) => entry.task?.id === "t1")!;
+    const other = cards.find((entry) => entry.task?.id === "t2")!;
+    expect(app.workstreams![0]!.pr?.number).toBe(77);
+    expect(other.workstreams![0]!.pr).toBeUndefined();
+  });
+
+  it("leaves a shared-branch PR standalone when no lane's repo matches", () => {
+    const cards = buildBoardCards({
+      items: [
+        item({
+          provider: "azuredevops",
+          kind: "pr",
+          number: 77,
+          repo: "acme/third",
+          sourceRefName: "refs/heads/mc/x",
+        }),
+      ],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({
+          id: "t1",
+          workstreams: [
+            { id: "w1", projectPath: "/code/app", branch: "mc/x", base: "main" },
+          ],
+        }),
+        task({
+          id: "t2",
+          workstreams: [
+            {
+              id: "w2",
+              projectPath: "/code/other",
+              branch: "mc/x",
+              base: "main",
+            },
+          ],
+        }),
+      ],
+    });
+    // Ambiguous — no lane claims it, so it stands alone rather than
+    // poisoning the wrong lane.
+    expect(cards.filter((entry) => entry.kind === "task")).toHaveLength(2);
+    const itemCard = cards.find((entry) => entry.kind === "item")!;
+    expect(itemCard.item?.number).toBe(77);
+    for (const entry of cards)
+      for (const row of entry.workstreams ?? [])
+        expect(row.pr).toBeUndefined();
+  });
+
+  it("does not join an Azure PR on a different branch", () => {
+    const cards = buildBoardCards({
+      items: [
+        item({
+          provider: "azuredevops",
+          kind: "pr",
+          number: 77,
+          sourceRefName: "refs/heads/other",
+        }),
+      ],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({
+          workstreams: [
+            { id: "w1", projectPath: "/repo", branch: "mc/x", base: "main" },
+          ],
+        }),
+      ],
+    });
+    expect(cards).toHaveLength(2);
+    expect(cards[0]!.workstreams![0]!.pr).toBeUndefined();
+  });
+
+  it("does not branch-join an Azure PR when two lanes claim the branch", () => {
+    const cards = buildBoardCards({
+      items: [
+        item({
+          provider: "azuredevops",
+          kind: "pr",
+          number: 77,
+          url: "https://dev.azure.com/acme/p/_git/r/pullrequest/77",
+          sourceRefName: "refs/heads/mc/x",
+        }),
+      ],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({
+          id: "ta",
+          title: "A",
+          workstreams: [
+            { id: "w1", projectPath: "/a", branch: "mc/x", base: "main" },
+          ],
+        }),
+        task({
+          id: "tb",
+          title: "B",
+          workstreams: [
+            { id: "w2", projectPath: "/b", branch: "mc/x", base: "main" },
+          ],
+        }),
+      ],
+    });
+    // The join can't tell which repo's PR this is — better standalone than wrong.
+    expect(cards).toHaveLength(3);
+    expect(cards[0]!.workstreams![0]!.pr).toBeUndefined();
+    expect(cards[1]!.workstreams![0]!.pr).toBeUndefined();
+  });
+
+  it("does not branch-join a lone lane when the PR's repo differs", () => {
+    // One candidate lane is not enough — a same-named branch in another
+    // repo is a different change; the PR stays a standalone card.
+    const cards = buildBoardCards({
+      items: [
+        item({
+          provider: "azuredevops",
+          kind: "pr",
+          number: 77,
+          repo: "p/other-repo",
+          url: "https://dev.azure.com/acme/p/_git/other-repo/pullrequest/77",
+          sourceRefName: "refs/heads/mc/x",
+        }),
+      ],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({
+          id: "ta",
+          title: "A",
+          workstreams: [
+            { id: "w1", projectPath: "/code/app", branch: "mc/x", base: "main" },
+          ],
+        }),
+      ],
+    });
+    expect(cards).toHaveLength(2);
+    expect(cards[0]!.workstreams![0]!.pr).toBeUndefined();
+  });
+
+  it("keeps a second same-branch Azure PR as a discovered chip", () => {
+    const cards = buildBoardCards({
+      items: [
+        item({
+          provider: "azuredevops",
+          kind: "pr",
+          number: 77,
+          title: "First",
+          url: "https://dev.azure.com/acme/p/_git/repo/pullrequest/77",
+          repo: "acme/repo",
+          sourceRefName: "refs/heads/mc/x",
+        }),
+        item({
+          provider: "azuredevops",
+          kind: "pr",
+          number: 88,
+          title: "Second",
+          url: "https://dev.azure.com/acme/p/_git/repo/pullrequest/88",
+          repo: "acme/repo",
+          sourceRefName: "refs/heads/mc/x",
+        }),
+      ],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({
+          workstreams: [
+            { id: "w1", projectPath: "/repo", branch: "mc/x", base: "main" },
+          ],
+        }),
+      ],
+    });
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.workstreams![0]!.pr?.number).toBe(77);
+    expect(cards[0]!.prs!.map((pr) => pr.title)).toEqual(["Second"]);
+  });
+
+  it("projects branch pipeline checks onto standalone Azure PR cards", () => {
+    const prItem = item({
+      provider: "azuredevops",
+      kind: "pr",
+      number: 9,
+      repo: "p/r",
+      sourceRefName: "refs/heads/feature",
+    });
+    const cards = buildBoardCards({
+      items: [prItem],
+      sessions: [],
+      summaries: [],
+      cardChecks: new Map([
+        [
+          itemCardKey(prItem),
+          [
+            { name: "build", state: "succeeded", bucket: "pass", url: "" },
+            { name: "tests", state: "failed", bucket: "fail", url: "" },
+          ],
+        ],
+      ]),
+    });
+    expect(cards[0]!.ciTotal).toBe(2);
+    expect(cards[0]!.ciFailing).toBe(1);
+    expect(cards[0]!.ciRunning).toBe(0);
   });
 
   it("keeps a linked ticket off the board twice when its item is missing", () => {
@@ -452,6 +830,87 @@ describe("buildBoardCards", () => {
     });
     expect(cards[0]!.workstreams![0]!.probeError).toBe("not a git repository");
   });
+
+  it("marks a mid-merge workstream row for conflict resolution", () => {
+    const cards = buildBoardCards({
+      items: [],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({
+          workstreams: [
+            { id: "w1", projectPath: "/repo", branch: "mc/x", base: "main" },
+          ],
+        }),
+      ],
+      workstreamStatus: new Map([
+        ["w1", { pr: null, checks: [], merging: true }],
+      ]),
+    });
+    expect(cards[0]!.workstreams![0]!.merging).toBe(true);
+  });
+
+  it("conflict prompt keeps both sides and commits the merge", () => {
+    const prompt = resolveConflictPrompt({ branch: "mc/x", base: "main" });
+    expect(prompt).toContain("`main`");
+    expect(prompt).toContain("`mc/x`");
+    expect(prompt).toMatch(/combining both sides/);
+    expect(prompt).toMatch(/commit the merge/);
+  });
+
+  it("laneProblem flags each pre-submit failure mode", () => {
+    const row = { branch: "mc/x", worktreePath: "/repo/.wt/mc-x" };
+    const pf = {
+      head: "mc/x",
+      baseRef: "origin/main",
+      baseBranch: "main",
+      baseOnRemote: true,
+      ahead: 3,
+      headPushed: true,
+      hasRemote: true,
+    };
+    expect(laneProblem(row, "main", pf)).toBeNull();
+    expect(laneProblem({ branch: "mc/x" }, "main", pf)).toMatch(/No worktree/);
+    expect(laneProblem(row, "main", { ...pf, head: "other" })).toMatch(
+      /Worktree is on other/,
+    );
+    expect(laneProblem(row, "main", { ...pf, head: null })).toMatch(
+      /detached HEAD/,
+    );
+    expect(laneProblem(row, "main", { ...pf, hasRemote: false })).toMatch(
+      /No git remote/,
+    );
+    expect(laneProblem(row, "gone", { ...pf, baseRef: null })).toMatch(
+      /doesn't exist/,
+    );
+    expect(
+      laneProblem(row, "main", { ...pf, baseRef: "main", baseOnRemote: false }),
+    ).toMatch(/isn't on the remote/);
+    // Remote-qualified pick of the lane's own branch.
+    expect(
+      laneProblem(row, "origin/mc/x", {
+        ...pf,
+        baseRef: "origin/mc/x",
+        baseBranch: "mc/x",
+      }),
+    ).toMatch(/same branch/);
+    expect(laneProblem(row, "main", { ...pf, ahead: 0 })).toMatch(
+      /No commits ahead/,
+    );
+    // A "HEAD" base resolved by preflight — messages name the real target.
+    expect(laneProblem(row, "HEAD", { ...pf, ahead: 0 })).toMatch(
+      /ahead of main/,
+    );
+    expect(
+      laneProblem(row, "HEAD", { ...pf, baseRef: null, baseBranch: "" }),
+    ).toMatch(/resolve a base/i);
+    // Closed/merged PRs don't block creation; unknown state stays safe.
+    expect(prIsOpen("open")).toBe(true);
+    expect(prIsOpen("active")).toBe(true);
+    expect(prIsOpen("CLOSED")).toBe(false);
+    expect(prIsOpen("merged")).toBe(false);
+    expect(prIsOpen("")).toBe(true);
+  });
 });
 
 describe("ticketKeys + itemMatchesTicketKey", () => {
@@ -540,7 +999,6 @@ describe("deriveColumn", () => {
             id: "p",
             title: "pr",
             state: "merged",
-            via: "link" as const,
           },
         ],
         workstreams: [],
@@ -601,6 +1059,109 @@ describe("cardColumn + columnCards", () => {
     const [one, two, three] = cards;
     const ordered = columnCards(cards, "todo", { [one!.id]: { column: "todo", order: 0 } }, []);
     expect(ordered.map((card) => card.id)).toEqual([one!.id, three!.id, two!.id]);
+  });
+
+  it("pinned cards sort first, ahead of placed and unplaced cards", () => {
+    const cards = buildBoardCards({
+      items: [
+        item({ provider: "github", number: 1, updatedAt: "2025-03-01T00:00:00Z" }),
+        item({ provider: "github", number: 2, updatedAt: "2025-02-01T00:00:00Z" }),
+        item({ provider: "github", number: 3, updatedAt: "2025-01-01T00:00:00Z" }),
+      ],
+      sessions: [],
+      summaries: [],
+    });
+    const [one, two, three] = cards;
+    // Three is pinned, one placed — pin wins even over explicit placement.
+    const ordered = columnCards(
+      cards,
+      "todo",
+      {
+        [one!.id]: { column: "todo", order: 0 },
+        [three!.id]: { column: "todo", order: 5, pinned: true },
+      },
+      [],
+    );
+    expect(ordered.map((card) => card.id)).toEqual([
+      three!.id,
+      one!.id,
+      two!.id,
+    ]);
+  });
+});
+
+describe("pinning", () => {
+  it("pins an unplaced card to the column top and back", () => {
+    pinCard("item:x", "todo", true);
+    let store = loadBoard();
+    expect(store.placements["item:x"]).toEqual({
+      column: "todo",
+      order: -1024,
+      pinned: true,
+      placedAt: expect.any(Number),
+    });
+    pinCard("item:x", "todo", false);
+    store = loadBoard();
+    // Unpin keeps the position — Reset removes the placement entirely.
+    expect(store.placements["item:x"]).toEqual({
+      column: "todo",
+      order: -1024,
+      placedAt: expect.any(Number),
+    });
+  });
+
+  it("pins a local card and lands it above everything in the column", () => {
+    const id = addLocalCard("note")!;
+    placeColumnOrder("todo", ["item:a", "item:b"]);
+    pinCard(id, "todo", true);
+    const store = loadBoard();
+    const local = store.locals.find((card) => card.id === id)!;
+    expect(local.pinned).toBe(true);
+    expect(local.order).toBeLessThan(0);
+    pinCard(id, "todo", false);
+    expect(loadBoard().locals.find((card) => card.id === id)!.pinned).toBe(
+      undefined,
+    );
+  });
+
+  it("keeps the pinned flag through a column drop", () => {
+    pinCard("item:x", "todo", true);
+    placeColumnOrder("todo", ["item:a", "item:x", "item:b"]);
+    expect(loadBoard().placements["item:x"]!.pinned).toBe(true);
+  });
+
+  it("surfaces a pinned member at the top of its group wrapper", () => {
+    const groupId = createGroup("work")!;
+    const cards = buildBoardCards({
+      items: [
+        item({ provider: "github", number: 1 }),
+        item({ provider: "github", number: 2 }),
+      ],
+      sessions: [],
+      summaries: [],
+    });
+    const [first, second] = cards;
+    const withGroups = cards.map((card) => ({
+      ...card,
+      groups:
+        card.id === first!.id || card.id === second!.id
+          ? [{ id: groupId, name: "work", color: 0 }]
+          : [],
+    }));
+    const ordered = columnCards(
+      withGroups,
+      "todo",
+      {
+        [first!.id]: { column: "todo", order: 0 },
+        [second!.id]: { column: "todo", order: 1, pinned: true },
+      },
+      [],
+    );
+    const units = columnUnits(ordered);
+    expect(units[0]!.type).toBe("group");
+    if (units[0]!.type === "group") {
+      expect(units[0]!.cards[0]!.id).toBe(second!.id);
+    }
   });
 });
 
@@ -721,6 +1282,171 @@ describe("boardStore", () => {
     expect(store.placements.b!.column).toBe("done");
     expect(store.locals).toHaveLength(1);
   });
+
+  it("adds, renames, and removes custom columns", () => {
+    const id = addColumn("QA")!;
+    expect(id).toMatch(/^col:/);
+    // Customs slot between review and done.
+    expect(loadBoard().columns.map((c) => c.id)).toEqual([
+      "todo",
+      "progress",
+      "review",
+      id,
+      "done",
+    ]);
+
+    renameColumn(id, "QA review");
+    expect(loadBoard().columns.find((c) => c.id === id)!.label).toBe(
+      "QA review",
+    );
+
+    // Cards placed in the column survive as placements.
+    placeColumnOrder(id, ["item:x"]);
+    expect(loadBoard().placements["item:x"]!.column).toBe(id);
+    const localId = addLocalCard("note")!;
+    placeColumnOrder(id, [localId]);
+
+    removeColumn(id);
+    const store = loadBoard();
+    expect(store.columns.some((c) => c.id === id)).toBe(false);
+    // Placement pruned; the orphaned local lands back in todo.
+    expect(store.placements["item:x"]).toBeUndefined();
+    expect(store.locals.find((c) => c.id === localId)!.column).toBe("todo");
+  });
+
+  it("moves a deleted column's cards to a chosen column", () => {
+    const id = addColumn("QA")!;
+    placeColumnOrder(id, ["item:x", "item:y"]);
+    const localId = addLocalCard("note")!;
+    placeColumnOrder(id, [localId]);
+    // Existing content in the destination keeps its spot; moved cards append.
+    placeColumnOrder("review", ["item:there"]);
+
+    removeColumn(id, "review");
+    const store = loadBoard();
+    expect(store.columns.some((c) => c.id === id)).toBe(false);
+    const orders = [
+      store.placements["item:x"]!.order,
+      store.placements["item:y"]!.order,
+      store.locals.find((c) => c.id === localId)!.order,
+    ];
+    expect(store.placements["item:x"]!.column).toBe("review");
+    expect(store.placements["item:y"]!.column).toBe("review");
+    expect(store.locals.find((c) => c.id === localId)!.column).toBe("review");
+    // Appended after the destination's existing card, in move order.
+    expect(Math.min(...orders)).toBeGreaterThan(
+      store.placements["item:there"]!.order,
+    );
+    expect(orders).toEqual([...orders].sort((a, b) => a - b));
+  });
+
+  it("keeps pins when a deleted column's cards move", () => {
+    const id = addColumn("QA")!;
+    pinCard("item:x", id, true);
+    const localId = addLocalCard("note")!;
+    pinCard(localId, id, true);
+
+    removeColumn(id, "review");
+    const store = loadBoard();
+    expect(store.placements["item:x"]).toMatchObject({
+      column: "review",
+      pinned: true,
+    });
+    expect(store.locals.find((c) => c.id === localId)).toMatchObject({
+      column: "review",
+      pinned: true,
+    });
+  });
+
+  it("appends locals moved by column delete instead of keeping stale order", () => {
+    const id = addColumn("QA")!;
+    const localId = addLocalCard("note")!;
+    placeColumnOrder(id, [localId]);
+    const anchor = addLocalCard("anchor")!; // sits in todo
+
+    removeColumn(id); // no target → todo
+    const moved = loadBoard().locals.find((c) => c.id === localId)!;
+    const existing = loadBoard().locals.find((c) => c.id === anchor)!;
+    expect(moved.column).toBe("todo");
+    expect(moved.order).toBeGreaterThan(existing.order);
+  });
+
+  it("clamps unpinned drops below the pinned prefix", () => {
+    const pinned = new Set(["a", "b"]);
+    // Dropping above the pinned block lands right below it.
+    expect(dropOrder(["a", "b", "c"], pinned, "x", 0)).toEqual([
+      "a",
+      "b",
+      "x",
+      "c",
+    ]);
+    // Inside the free region the index is honored.
+    expect(dropOrder(["a", "b", "c"], pinned, "x", 3)).toEqual([
+      "a",
+      "b",
+      "c",
+      "x",
+    ]);
+    // A still-pinned dragged card (cross-column drop) keeps its index —
+    // the sort renders it at the top anyway.
+    expect(dropOrder(["a", "b"], new Set(["x"]), "x", 2)).toEqual([
+      "a",
+      "b",
+      "x",
+    ]);
+  });
+
+  it("falls back to derived columns for a bogus delete target", () => {
+    const id = addColumn("QA")!;
+    placeColumnOrder(id, ["item:x"]);
+    removeColumn(id, "col:gone");
+    expect(loadBoard().placements["item:x"]).toBeUndefined();
+  });
+
+  it("refuses to remove built-in columns", () => {
+    removeColumn("done");
+    expect(loadBoard().columns.map((c) => c.id)).toEqual([
+      "todo",
+      "progress",
+      "review",
+      "done",
+    ]);
+  });
+
+  it("keeps stored custom columns and placements across loads", () => {
+    storage.set(
+      "monocode.board.v1",
+      JSON.stringify({
+        columns: [
+          { id: "col:a", label: "Blocked" },
+          { id: "done", label: "Shipped" }, // renamed default survives
+          { id: "col:a", label: "dupe" }, // dupes drop
+          { id: "", label: "no id" },
+        ],
+        placements: {
+          x: { column: "col:a", order: 0 },
+          y: { column: "gone", order: 0 },
+        },
+      }),
+    );
+    const store = loadBoard();
+    expect(store.columns.map((c) => c.id)).toEqual([
+      "todo",
+      "progress",
+      "review",
+      "col:a",
+      "done",
+    ]);
+    expect(store.columns.find((c) => c.id === "done")!.label).toBe("Shipped");
+    expect(store.placements.x!.column).toBe("col:a");
+    // Placement into a deleted column is pruned.
+    expect(store.placements.y).toBeUndefined();
+  });
+
+  it("ignores drops into unknown columns", () => {
+    placeColumnOrder("col:nope", ["item:x"]);
+    expect(loadBoard().placements["item:x"]).toBeUndefined();
+  });
 });
 
 describe("groups", () => {
@@ -766,6 +1492,17 @@ describe("groups", () => {
     expect(store.tasks[0]!.groupIds).toEqual(["g1"]);
   });
 
+  it("addTask keeps only group ids that exist", () => {
+    const a = createGroup("Backend")!;
+    const id = addTask({
+      title: "T",
+      links: [],
+      workstreams: [],
+      groupIds: [a, "gone"],
+    });
+    expect(loadBoard().tasks.find((t) => t.id === id)!.groupIds).toEqual([a]);
+  });
+
   it("resolves card.groups from task groupIds", () => {
     const cards = buildBoardCards({
       items: [],
@@ -778,12 +1515,12 @@ describe("groups", () => {
     expect(card.groups).toEqual([{ id: "g1", name: "Backend", color: 0 }]);
   });
 
-  it("adds/removes non-task cards via cardGroups, deduped and prepended", () => {
+  it("sets/removes non-task card groups via cardGroups, deduped", () => {
     const a = createGroup("Backend")!;
     const b = createGroup("Ops")!;
-    addCardToGroup("item:x", a);
-    addCardToGroup("item:x", a); // no dup
-    addCardToGroup("item:x", b); // prepend — newest is primary
+    setCardGroups("item:x", [a, a]); // no dup
+    expect(loadBoard().cardGroups["item:x"]).toEqual([a]);
+    setCardGroups("item:x", [b, a]); // first id is primary
     expect(loadBoard().cardGroups["item:x"]).toEqual([b, a]);
     removeCardFromGroup("item:x", b);
     removeCardFromGroup("item:x", a);
@@ -811,13 +1548,13 @@ describe("groups", () => {
   it("deleteGroup strips cardGroups refs; removeLocalCard prunes its entry", () => {
     const localId = addLocalCard("note")!;
     const g = createGroup("Ops")!;
-    addCardToGroup(localId, g);
-    addCardToGroup("item:x", g);
+    setCardGroups(localId, [g]);
+    setCardGroups("item:x", [g]);
     deleteGroup(g);
     expect(loadBoard().cardGroups).toEqual({});
 
     const g2 = createGroup("Ops2")!;
-    addCardToGroup(localId, g2);
+    setCardGroups(localId, [g2]);
     removeLocalCard(localId);
     expect(loadBoard().cardGroups[localId]).toBeUndefined();
   });
@@ -968,4 +1705,480 @@ describe("session link join", () => {
     expect(cards[0]!.sessions.map((s) => s.id)).toEqual(["s1"]);
   });
 
+});
+
+describe("column age (placedAt)", () => {
+  it("sets on entry, survives same-column reorders and pins, resets on moves", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1000);
+      const id = addTask({ title: "A", links: [], workstreams: [] })!;
+      const other = addTask({ title: "B", links: [], workstreams: [] })!;
+      placeColumnOrder("todo", [id, other]);
+      expect(loadBoard().placements[id]!.placedAt).toBe(1000);
+
+      // Reorder inside the column — entry time is preserved.
+      vi.setSystemTime(2000);
+      placeColumnOrder("todo", [other, id]);
+      expect(loadBoard().placements[id]!.placedAt).toBe(1000);
+
+      // Pinning inside the column keeps the age too.
+      vi.setSystemTime(3000);
+      pinCard(id, "todo", true);
+      expect(loadBoard().placements[id]!.placedAt).toBe(1000);
+      expect(loadBoard().placements[id]!.pinned).toBe(true);
+
+      // A real move restarts the clock.
+      vi.setSystemTime(4000);
+      placeColumnOrder("progress", [id]);
+      expect(loadBoard().placements[id]!.placedAt).toBe(4000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stamps local cards on creation and on column moves", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(5000);
+      const id = addLocalCard("note")!;
+      expect(loadBoard().locals[0]!.placedAt).toBe(5000);
+      vi.setSystemTime(9000);
+      placeColumnOrder("done", [id]);
+      expect(loadBoard().locals[0]!.placedAt).toBe(9000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("snooze", () => {
+  const cardAt = (partial: Parameters<typeof buildBoardCards>[0]) =>
+    buildBoardCards(partial)[0]!;
+
+  it("hides until the deadline, then lets the card back", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10_000);
+      const card = cardAt({ items: [item({ provider: "github", number: 1 })], sessions: [], summaries: [] });
+      snoozeCard(card.id, { until: 20_000 });
+      expect(loadBoard().snoozed[card.id]).toEqual({ until: 20_000 });
+      expect(isCardSnoozed(card, loadBoard().snoozed[card.id], 15_000)).toBe(true);
+      expect(isCardSnoozed(card, loadBoard().snoozed[card.id], 20_000)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("wakes early when the card's actionable fingerprint changes", () => {
+    const before = cardAt({ items: [item({ provider: "github", number: 1 })], sessions: [], summaries: [] });
+    const wake = snoozeWakeKey(before);
+    snoozeCard(before.id, { wake });
+    expect(isCardSnoozed(before, { wake })).toBe(true);
+    // CI failure flips the fingerprint — the card resurfaces.
+    const failing = { ...before, ciFailing: 1 };
+    expect(isCardSnoozed(failing, { wake })).toBe(false);
+  });
+
+  it("rejects a condition-less snooze and unsnooze restores", () => {
+    const card = cardAt({ items: [item({ provider: "github", number: 1 })], sessions: [], summaries: [] });
+    // {} has no wake condition — permanent dismissal is hideCards' job.
+    snoozeCard(card.id, {});
+    expect(loadBoard().snoozed[card.id]).toBeUndefined();
+    snoozeCard(card.id, { until: Date.now() + 60_000 });
+    expect(loadBoard().snoozed[card.id]).toBeDefined();
+    unsnoozeCard(card.id);
+    expect(loadBoard().snoozed[card.id]).toBeUndefined();
+  });
+});
+
+describe("attention signals", () => {
+  it("ranks needs-input over failing CI over a quiet card", () => {
+    const [inputCard] = buildBoardCards({
+      items: [item({ provider: "github", number: 1 })],
+      sessions: [
+        liveSession({
+          id: "s1",
+          linkedWorkItem: linked({ number: 1, url: "https://example.test/1" }),
+        }),
+      ],
+      summaries: [],
+    });
+    // needsInput lives on the session join — fake it via the card shape.
+    const needy = {
+      ...inputCard!,
+      sessions: [{ ...inputCard!.sessions[0]!, needsInput: true, live: true }],
+    };
+    const quiet = buildBoardCards({
+      items: [item({ provider: "github", number: 2 })],
+      sessions: [],
+      summaries: [],
+    })[0]!;
+    const ci = { ...quiet, ciFailing: 2 };
+    expect(attentionScore(needy)).toBeGreaterThan(attentionScore(ci));
+    expect(attentionScore(ci)).toBeGreaterThan(attentionScore(quiet));
+    expect(attentionScore(quiet)).toBe(0);
+  });
+
+  it("flags changes-requested review decisions and open threads", () => {
+    const cards = buildBoardCards({
+      items: [],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({
+          id: "t1",
+          workstreams: [
+            {
+              id: "w1",
+              projectPath: "/repo",
+              branch: "feat",
+              base: "main",
+              worktreePath: "/repo/.wt/feat",
+              sessionIds: [],
+            },
+          ],
+        }),
+      ],
+      workstreamStatus: new Map([
+        [
+          "w1",
+          {
+            pr: {
+              number: 9,
+              title: "PR",
+              url: "https://example.test/pr/9",
+              state: "open",
+              reviewDecision: "CHANGES_REQUESTED",
+              unresolvedThreads: 3,
+            },
+            checks: [],
+          },
+        ],
+      ]),
+    });
+    const lines = cardAttentionLines(cards[0]!);
+    expect(lines).toContain("Changes requested");
+    expect(lines).toContain("3 open threads");
+    expect(attentionScore(cards[0]!)).toBeGreaterThanOrEqual(9);
+  });
+
+  const laneCard = (
+    pr: Partial<NonNullable<BoardCard["workstreams"]>[number]["pr"]>,
+    checks: { bucket: string; name?: string; state?: string }[] = [],
+  ) =>
+    buildBoardCards({
+      items: [],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({
+          id: "t1",
+          workstreams: [
+            {
+              id: "w1",
+              projectPath: "/repo",
+              branch: "feat",
+              base: "main",
+              worktreePath: "/repo/.wt/feat",
+              sessionIds: [],
+            },
+          ],
+        }),
+      ],
+      workstreamStatus: new Map([
+        [
+          "w1",
+          {
+            pr: {
+              number: 9,
+              title: "PR",
+              url: "https://example.test/pr/9",
+              state: "open",
+              ...pr,
+            },
+            checks: checks.map((check, index) => ({
+              name: check.name ?? `ci/${index}`,
+              state: check.state ?? check.bucket,
+              bucket: check.bucket,
+              url: "",
+            })),
+          },
+        ],
+      ]),
+    })[0]!;
+
+  it("reports ready only when clean and nothing outstanding", () => {
+    // clean merge state alone isn't enough — checks/votes/threads gate it.
+    // Threads must be a probed zero: an unknown count isn't "no threads".
+    const clean = { mergeState: "clean", unresolvedThreads: 0 };
+    expect(lanePrSignal(laneCard(clean).workstreams![0]!)).toBe("ready");
+    expect(
+      lanePrSignal(laneCard({ mergeState: "clean" }).workstreams![0]!),
+    ).toBeNull();
+    expect(
+      lanePrSignal(
+        laneCard(clean, [{ bucket: "fail" }]).workstreams![0]!,
+      ),
+    ).toBeNull();
+    expect(
+      lanePrSignal(
+        laneCard(clean, [{ bucket: "pending" }]).workstreams![0]!,
+      ),
+    ).toBeNull();
+    expect(
+      lanePrSignal(
+        laneCard({ ...clean, reviewDecision: "CHANGES_REQUESTED" })
+          .workstreams![0]!,
+      ),
+    ).toBeNull();
+    expect(
+      lanePrSignal(
+        laneCard({ ...clean, unresolvedThreads: 2 }).workstreams![0]!,
+      ),
+    ).toBeNull();
+    // Drafts and closed PRs never report a signal.
+    expect(
+      lanePrSignal(laneCard({ ...clean, draft: true }).workstreams![0]!),
+    ).toBeNull();
+    expect(
+      lanePrSignal(
+        laneCard({ ...clean, state: "merged" }).workstreams![0]!,
+      ),
+    ).toBeNull();
+    // Awaiting review isn't ready — Azure can't distinguish optional from
+    // required reviewers, and GitHub's `clean` wouldn't co-occur anyway.
+    expect(
+      lanePrSignal(
+        laneCard({ ...clean, reviewDecision: "REVIEW_REQUIRED" })
+          .workstreams![0]!,
+      ),
+    ).toBeNull();
+  });
+
+  it("surfaces provider merge conflicts and blocks", () => {
+    expect(
+      lanePrSignal(laneCard({ mergeState: "conflicts" }).workstreams![0]!),
+    ).toBe("conflicts");
+    expect(
+      lanePrSignal(laneCard({ mergeState: "blocked" }).workstreams![0]!),
+    ).toBe("blocked");
+    // `unstable` (checks failing) is already covered by the CI signal.
+    expect(
+      lanePrSignal(laneCard({ mergeState: "unstable" }).workstreams![0]!),
+    ).toBeNull();
+    // Provider-side staleness has its own signal (local `behind` can't
+    // reach lanes without a worktree).
+    expect(
+      lanePrSignal(laneCard({ mergeState: "behind" }).workstreams![0]!),
+    ).toBe("behind");
+    expect(
+      cardAttentionLines(laneCard({ mergeState: "behind" })),
+    ).toContain("Behind base");
+    const card = laneCard({ mergeState: "conflicts" });
+    expect(cardAttentionLines(card)).toContain("Merge conflicts");
+    expect(
+      cardAttentionLines(laneCard({ mergeState: "blocked" })),
+    ).toContain("Merge blocked");
+    expect(
+      cardAttentionLines(
+        laneCard({ mergeState: "clean", unresolvedThreads: 0 }),
+      ),
+    ).toContain("Ready to merge");
+    expect(attentionScore(laneCard({ mergeState: "conflicts" }))).toBeGreaterThan(
+      attentionScore(
+        laneCard({ mergeState: "clean", unresolvedThreads: 0 }),
+      ),
+    );
+    expect(
+      attentionScore(
+        laneCard({ mergeState: "clean", unresolvedThreads: 0 }),
+      ),
+    ).toBeGreaterThan(attentionScore(laneCard({})));
+  });
+
+  it("wakes a snoozed card when the merge state flips", () => {
+    const before = laneCard({ mergeState: "blocked" });
+    const wake = snoozeWakeKey(before);
+    expect(
+      isCardSnoozed(laneCard({ mergeState: "clean" }), { wake }),
+    ).toBe(false);
+  });
+
+  it("says 'Ticket closed' when every linked ticket is done", () => {
+    const cards = buildBoardCards({
+      items: [item({ provider: "github", number: 42, kind: "issue", state: "closed" })],
+      sessions: [],
+      summaries: [],
+      tasks: [task({ id: "t1", links: [linked({ number: 42 })] })],
+    });
+    const card = cards.find((entry) => entry.kind === "task")!;
+    // All-closed tickets derive to Done — the nudge fires only when the
+    // card's EFFECTIVE column is elsewhere (e.g. manually held in flight).
+    expect(card.derived).toBe("done");
+    expect(cardAttentionLines(card)).not.toContain("Ticket closed");
+    expect(cardAttentionLines(card, "progress")).toContain("Ticket closed");
+    // A ticket with no provider state can't claim "closed" either.
+    const unknown = buildBoardCards({
+      items: [],
+      sessions: [],
+      summaries: [],
+      tasks: [task({ id: "t2", links: [linked({ number: 77 })] })],
+    }).find((entry) => entry.kind === "task")!;
+    expect(cardAttentionLines(unknown, "progress")).not.toContain(
+      "Ticket closed",
+    );
+  });
+});
+
+describe("review locally", () => {
+  it("maps providers to their PR head refs", () => {
+    expect(prHeadRemoteRef("github", 7)).toBe("refs/pull/7/head");
+    expect(prHeadRemoteRef("gitlab", 7)).toBe("refs/merge-requests/7/head");
+    // Azure exposes no PR head ref — the author's source branch is the
+    // real head; the merge ref is the only fallback.
+    expect(
+      prHeadRemoteRef("azuredevops", 7, "refs/heads/feature-x"),
+    ).toBe("refs/heads/feature-x");
+    expect(prHeadRemoteRef("azuredevops", 7)).toBe("refs/pull/7/merge");
+  });
+
+  it("prefers the item's own project, then a unique repo-name match", () => {
+    const recents = [
+      { path: "/code/app", name: "app" },
+      { path: "/code/other", name: "other" },
+    ] as never[];
+    const pr = item({ provider: "github", number: 3, kind: "pr", projectPath: "/code/app" });
+    expect(defaultReviewProject(pr, recents)).toBe("/code/app");
+    // projectPath missing → unique basename match wins.
+    const orphan = item({ provider: "github", number: 3, kind: "pr", projectPath: "", repo: "acme/other" });
+    expect(defaultReviewProject(orphan, recents)).toBe("/code/other");
+    // Ambiguous basename → no silent pick.
+    const ambiguous = item({ provider: "github", number: 3, kind: "pr", projectPath: "", repo: "acme/app" });
+    expect(
+      defaultReviewProject(ambiguous, [
+        { path: "/a/app", name: "app" },
+        { path: "/b/app", name: "app" },
+      ] as never[]),
+    ).toBe("");
+  });
+});
+
+describe("buildStandup", () => {
+  it("reports done, in-flight, and planned work", () => {
+    const now = Date.now();
+    const todoItem = item({ provider: "github", number: 1, title: "Todo thing" });
+    const flightItem = item({ provider: "github", number: 2, title: "Flight thing" });
+    const cards = buildBoardCards({
+      items: [todoItem, flightItem],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({ id: "done1", title: "Shipped fix" }),
+        task({
+          id: "merged1",
+          title: "Merged work",
+          workstreams: [
+            {
+              id: "w1",
+              projectPath: "/repo",
+              branch: "feat",
+              base: "main",
+              worktreePath: "/repo/.wt",
+              sessionIds: [],
+            },
+          ],
+        }),
+      ],
+      workstreamStatus: new Map([
+        [
+          "w1",
+          {
+            pr: {
+              number: 5,
+              title: "PR five",
+              url: "https://example.test/pr/5",
+              state: "merged",
+              updatedAt: new Date(now - 3600_000).toISOString(),
+            },
+            checks: [],
+          },
+        ],
+      ]),
+    });
+    const placements = {
+      done1: { column: "done", order: 0, placedAt: now - 3600_000 },
+      // The lane's PR merged but the task is still in flight elsewhere —
+      // the merge is its own reportable line.
+      merged1: { column: "progress", order: 0, placedAt: now - 7200_000 },
+      [itemCardKey(todoItem)]: { column: "todo", order: 0, placedAt: now },
+      [itemCardKey(flightItem)]: {
+        column: "progress",
+        order: 0,
+        placedAt: now,
+      },
+    } as never;
+    const report = buildStandup({ cards, placements, locals: [], now });
+    expect(report).toContain("### Done / merged");
+    expect(report).toContain("Shipped fix");
+    expect(report).toContain("PR #5 merged");
+    expect(report).toContain("### In flight");
+    expect(report).toContain("Flight thing");
+    expect(report).toContain("Merged work");
+    expect(report).toContain("### Plan");
+    expect(report).toContain("Todo thing");
+  });
+
+  it("omits empty sections and stale merges", () => {
+    const now = Date.now();
+    const cards = buildBoardCards({
+      items: [],
+      sessions: [],
+      summaries: [],
+      tasks: [
+        task({
+          id: "old1",
+          title: "Old merge",
+          workstreams: [
+            {
+              id: "w1",
+              projectPath: "/repo",
+              branch: "feat",
+              base: "main",
+              worktreePath: "/repo/.wt",
+              sessionIds: [],
+            },
+          ],
+        }),
+      ],
+      workstreamStatus: new Map([
+        [
+          "w1",
+          {
+            pr: {
+              number: 5,
+              title: "PR",
+              url: "https://example.test/pr/5",
+              state: "merged",
+              // Merged a week ago — outside the standup window.
+              updatedAt: new Date(now - 7 * 24 * 3600_000).toISOString(),
+            },
+            checks: [],
+          },
+        ],
+      ]),
+    });
+    // Task parked in flight — the week-old merge doesn't qualify.
+    const report = buildStandup({
+      cards,
+      placements: {
+        old1: { column: "progress", order: 0, placedAt: now },
+      } as never,
+      locals: [],
+      now,
+    });
+    expect(report).not.toContain("Done / merged");
+    expect(report).not.toContain("PR #5");
+    expect(report).toContain("Old merge");
+  });
 });

@@ -8,6 +8,7 @@ import {
   ArrowUp,
   Bot,
   CircleDot,
+  Clock,
   ExternalLink,
   FolderTree,
   GitPullRequest,
@@ -15,6 +16,7 @@ import {
   MoreHorizontal,
   PanelRight,
   Pin,
+  PinOff,
   Play,
   RefreshCw,
   RotateCcw,
@@ -24,10 +26,13 @@ import {
 } from "../../shared/ui/icons";
 import type { BoardCard } from "./boardData";
 import {
+  attentionScore,
   cardAttentionLines,
   groupSwatch,
   sessionDotClass,
 } from "./boardData";
+import { prIsOpen } from "./taskOps";
+import type { BoardColumn, BoardColumnId } from "./boardStore";
 
 export type BoardCardAction =
   | { kind: "open-session"; sessionId: string }
@@ -35,11 +40,15 @@ export type BoardCardAction =
   | { kind: "fix-ci" }
   | { kind: "comments" }
   | { kind: "open-url" }
+  | { kind: "open-prs" }
+  | { kind: "review-locally" }
   | { kind: "open-task" }
   | { kind: "reset" }
+  | { kind: "pin" }
   | { kind: "promote" }
   | { kind: "archive" }
   | { kind: "remove" }
+  | { kind: "snooze"; until?: number; wakeOnChange?: boolean }
   | { kind: "ungroup"; groupId: string };
 
 const KIND_FALLBACK_ICON = {
@@ -48,6 +57,17 @@ const KIND_FALLBACK_ICON = {
   local: CircleDot,
   task: FolderTree,
 } as const;
+
+/** "Until tomorrow" = next morning — snoozing at 23:40 shouldn't buy
+ * twenty minutes. */
+const DAY_MS = 24 * 3600_000;
+const tomorrow = () => {
+  const date = new Date(Date.now() + DAY_MS);
+  date.setHours(9, 0, 0, 0);
+  return date.getTime();
+};
+/** A card sits dimmed once it's idled this long with nothing actionable. */
+const STALE_MS = 5 * DAY_MS;
 
 function MenuRow({
   icon: Icon,
@@ -80,23 +100,37 @@ function MenuRow({
   );
 }
 
-/** Card ⋯ menu — quick actions for the card's kind. Column moves are done
- * by dragging; this menu acts on the card itself. */
+/** Card ⋯ menu — quick actions. Column changes are drag-only. */
 function CardMenu({
   card,
   manual,
+  pinned,
   anchor,
   onAction,
   onClose,
 }: {
   card: BoardCard;
   manual: boolean;
+  pinned: boolean;
   anchor: HTMLElement;
   onAction: (card: BoardCard, action: BoardCardAction) => void;
   onClose: () => void;
 }) {
   const liveSession = card.sessions.find((session) => session.live);
   const anySession = liveSession ?? card.sessions[0];
+  // Deduped PR urls across lanes + discovered chips — "open all" only
+  // earns a row when there's more than one (a single PR opens from its chip).
+  const prUrlCount = new Set(
+    [
+      ...(card.prs ?? []).map((pr) => pr.url),
+      ...(card.workstreams ?? []).map((row) => row.pr?.url),
+    ].filter((url): url is string => Boolean(url)),
+  ).size;
+  const reviewablePr =
+    card.kind === "item" &&
+    card.itemKind === "pr" &&
+    card.item &&
+    prIsOpen(card.state ?? "");
   const run = (action: BoardCardAction) => () => {
     onAction(card, action);
     onClose();
@@ -121,6 +155,20 @@ function CardMenu({
           icon={ExternalLink}
           label="Open in provider"
           onClick={run({ kind: "open-url" })}
+        />
+      ) : null}
+      {prUrlCount > 1 ? (
+        <MenuRow
+          icon={GitPullRequest}
+          label={`Open ${prUrlCount} PRs`}
+          onClick={run({ kind: "open-prs" })}
+        />
+      ) : null}
+      {reviewablePr ? (
+        <MenuRow
+          icon={FolderTree}
+          label="Review locally"
+          onClick={run({ kind: "review-locally" })}
         />
       ) : null}
       {card.kind === "item" && !anySession ? (
@@ -151,6 +199,11 @@ function CardMenu({
           onClick={run({ kind: "promote" })}
         />
       ) : null}
+      <MenuRow
+        icon={pinned ? PinOff : Pin}
+        label={pinned ? "Unpin" : "Pin to top"}
+        onClick={run({ kind: "pin" })}
+      />
       {manual ? (
         <MenuRow
           icon={RotateCcw}
@@ -158,7 +211,25 @@ function CardMenu({
           onClick={run({ kind: "reset" })}
         />
       ) : null}
-      <div className="mx-1 my-1 h-px bg-content/10" />
+      <div className="mx-1 my-1 h-px bg-content/10" role="separator" />
+      {card.kind !== "local" ? (
+        // Locals carry no provider/session signal — a wake fingerprint
+        // could never change, so the snooze would be permanent.
+        <MenuRow
+          icon={Zap}
+          label="Snooze until activity"
+          onClick={run({ kind: "snooze", wakeOnChange: true })}
+        />
+      ) : null}
+      <MenuRow
+        icon={Clock}
+        label="Snooze until tomorrow"
+        onClick={run({
+          kind: "snooze",
+          until: tomorrow(),
+        })}
+      />
+      <div className="mx-1 my-1 h-px bg-content/10" role="separator" />
       {card.kind === "local" ? (
         <MenuRow
           icon={Trash2}
@@ -179,27 +250,39 @@ function CardMenu({
 
 export function BoardCardView({
   card,
+  column,
+  columns,
   manual,
+  pinned,
+  placedAt,
   dragging,
   dropTarget,
-  grouped,
+  inGroup,
   onAction,
   onDragStart,
 }: {
   card: BoardCard;
+  /** Column the card renders in — scopes the attention lines. */
+  column: BoardColumnId;
+  /** All board columns — resolves this column's label. */
+  columns: readonly BoardColumn[];
   /** True when the user placed this card by hand — enables "Reset to auto". */
   manual: boolean;
+  /** Pinned to the top of the column / its group wrapper. */
+  pinned: boolean;
+  /** When the card entered this column — drives the age chip/stale dim. */
+  placedAt?: number;
   dragging: boolean;
   /** Insertion marker should render above this card. */
   dropTarget: boolean;
-  /** Inside a group wrapper — the wrapper carries the colour, so the card
-   * itself goes neutral. */
-  grouped?: boolean;
+  /** Inside a group wrapper — the wrapper carries the colour and labels the
+   * group, so the card goes neutral and skips that group's chip. */
+  inGroup?: string;
   onAction: (card: BoardCard, action: BoardCardAction) => void;
   onDragStart: (card: BoardCard, event: React.PointerEvent) => void;
 }) {
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
-  const lines = cardAttentionLines(card);
+  const lines = cardAttentionLines(card, column);
   const liveSession = card.sessions.find((session) => session.live);
   const anySession = liveSession ?? card.sessions[0];
   const FallbackIcon =
@@ -208,18 +291,36 @@ export function BoardCardView({
       : KIND_FALLBACK_ICON[card.kind];
   // First group's colour washes the card — a whole group reads as one hue.
   const groupWash =
-    !grouped && card.groups?.length
+    !inGroup && card.groups?.length
       ? groupSwatch(card.groups[0].color).card
       : "border-content/10 bg-content/[0.06]";
+  // Inside a group wrapper the wrapper already names that group — only
+  // memberships beyond it still earn a chip.
+  const chipGroups = (card.groups ?? []).filter(
+    (group) => group.id !== inGroup,
+  );
   const showStart = card.kind === "item" && !anySession;
   const showFixCi = card.ciFailing > 0 && !!liveSession;
   const showUpdates = card.hasUpdate && !!liveSession;
   const hasActions =
     showStart || showFixCi || showUpdates || card.kind === "local";
+  // Column age — surfaced at a glance; the card dims once it's idled past
+  // the stale threshold with nothing actionable left.
+  const ageDays = placedAt
+    ? Math.floor((Date.now() - placedAt) / DAY_MS)
+    : 0;
+  const stale =
+    ageDays * DAY_MS >= STALE_MS &&
+    attentionScore(card) === 0 &&
+    card.sessions.every((session) => !session.busy);
+  const columnLabel = columns.find((entry) => entry.id === column)?.label;
 
   return (
     <div
       data-board-card={card.id}
+      role="button"
+      tabIndex={0}
+      aria-label={`Open ${card.title}`}
       onPointerDown={(event) => {
         // Whole card is the drag surface — except its interactive elements.
         if (
@@ -230,8 +331,29 @@ export function BoardCardView({
           return;
         onDragStart(card, event);
       }}
-      className={`group relative cursor-grab rounded-xl border px-2.5 py-2 transition-opacity ${groupWash} ${
-        dragging ? "opacity-40" : ""
+      onClick={(event) => {
+        // Whole card opens details — the same interactive-element guard as
+        // the drag surface keeps buttons/chips/links on their own actions.
+        // A completed drag eats this click in the capture phase upstream.
+        if (
+          (event.target as HTMLElement).closest(
+            "button, a, input, textarea, select, [role='checkbox']",
+          )
+        )
+          return;
+        onAction(card, { kind: "open-task" });
+      }}
+      onKeyDown={(event) => {
+        if (
+          (event.key === "Enter" || event.key === " ") &&
+          event.target === event.currentTarget
+        ) {
+          event.preventDefault();
+          onAction(card, { kind: "open-task" });
+        }
+      }}
+      className={`group relative cursor-grab rounded-xl border px-2.5 py-2 outline-none transition-opacity focus-visible:ring-1 focus-visible:ring-accent/60 ${groupWash} ${
+        dragging ? "opacity-40" : stale ? "opacity-60" : ""
       }`}
     >
       {dropTarget ? (
@@ -263,7 +385,21 @@ export function BoardCardView({
             Draft
           </span>
         ) : null}
-        {manual ? (
+        {ageDays >= 1 ? (
+          <span
+            className="shrink-0 text-[9px] text-content/35"
+            title={`In ${columnLabel ?? column} for ${ageDays} day${ageDays === 1 ? "" : "s"}`}
+          >
+            {ageDays}d
+          </span>
+        ) : null}
+        {pinned ? (
+          <Pin
+            className="size-2.5 shrink-0 text-accent"
+            strokeWidth={2}
+            aria-label="Pinned"
+          />
+        ) : manual ? (
           <Pin
             className="size-2.5 shrink-0 text-content/30"
             strokeWidth={2}
@@ -302,6 +438,7 @@ export function BoardCardView({
               <CardMenu
                 card={card}
                 manual={manual}
+                pinned={pinned}
                 anchor={menuAnchor}
                 onAction={onAction}
                 onClose={() => setMenuAnchor(null)}
@@ -311,10 +448,7 @@ export function BoardCardView({
         </span>
       </div>
 
-      <p
-        className="mt-1 line-clamp-2 cursor-pointer break-words text-[12px] leading-snug text-content/90 hover:text-content"
-        onClick={() => onAction(card, { kind: "open-task" })}
-      >
+      <p className="mt-1 line-clamp-2 break-words text-[12px] leading-snug text-content/90">
         {card.title}
       </p>
       {(card.repo || card.projectPath) && card.kind !== "task" ? (
@@ -322,9 +456,9 @@ export function BoardCardView({
           {card.repo ?? card.projectPath}
         </p>
       ) : null}
-      {card.groups?.length ? (
+      {chipGroups.length ? (
         <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
-          <GroupChips card={card} onAction={onAction} />
+          <GroupChips card={card} groups={chipGroups} onAction={onAction} />
         </div>
       ) : null}
       {card.kind === "task" ? (
@@ -453,14 +587,17 @@ export function BoardCardView({
  * an × that removes just that membership (the "ungroup" action). */
 function GroupChips({
   card,
+  groups,
   onAction,
 }: {
   card: BoardCard;
+  /** Groups to render — the caller filters out the enclosing wrapper's. */
+  groups: readonly { id: string; name: string; color: number }[];
   onAction: (card: BoardCard, action: BoardCardAction) => void;
 }) {
   return (
     <>
-      {(card.groups ?? []).map((group) => {
+      {groups.map((group) => {
         const swatch = groupSwatch(group.color);
         return (
           <span

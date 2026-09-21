@@ -9,6 +9,7 @@ use tauri::Manager;
 
 mod automations;
 mod azure_devops;
+mod azure_devops_board;
 mod chat_background;
 mod checkpoint;
 mod confluence;
@@ -352,6 +353,11 @@ pub fn run() {
             fs::git_pr_checks,
             fs::git_pr_update,
             fs::git_merge_from,
+            fs::git_merge_in_progress,
+            fs::git_pr_preflight,
+            fs::git_remotes,
+            fs::git_behind_base,
+            fs::git_fetch_branch,
             fs::git_github_status,
             fs::github_monocode_star_status,
             fs::github_star_monocode,
@@ -383,6 +389,11 @@ pub fn run() {
             azure_devops::azure_devops_work_item_thread,
             azure_devops::azure_devops_work_item_comment,
             azure_devops::azure_devops_mr_diff,
+            azure_devops_board::azure_devops_pr_probe,
+            azure_devops_board::azure_devops_pr_create,
+            azure_devops_board::azure_devops_pr_update_body,
+            azure_devops_board::azure_devops_branch_checks,
+            azure_devops_board::azure_devops_repo_match,
             linear::linear_status,
             jira::jira_status,
             jira::jira_set_config,

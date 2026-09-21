@@ -90,3 +90,65 @@ it("does not scroll the page when a compact menu opens", async () => {
   const option = document.body.querySelector('[role="option"]');
   expect(option?.className).toContain("h-7");
 });
+
+const typeSearch = async (text: string) => {
+  const search = document.body.querySelector<HTMLInputElement>(
+    '[role="combobox"]',
+  )!;
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLInputElement.prototype,
+    "value",
+  )!.set!;
+  await act(async () => {
+    setter.call(search, text);
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+};
+
+const optionTexts = () =>
+  [...document.body.querySelectorAll('[role="option"]')].map(
+    (element) => element.textContent,
+  );
+
+it("creatable: typed text becomes a pickable option and verbatim value", async () => {
+  const onChange = vi.fn();
+  await act(async () => {
+    root.render(
+      createElement(SearchableSelect, {
+        label: "Branch",
+        value: "",
+        creatable: "New branch",
+        options: [{ value: "main", label: "main" }],
+        onChange,
+      }),
+    );
+  });
+  const trigger = container.querySelector<HTMLButtonElement>("button")!;
+  await act(async () => trigger.click());
+  await typeSearch("mc/new-thing");
+
+  expect(optionTexts()).toEqual(['New branch "mc/new-thing"']);
+  const option = document.body.querySelector<HTMLElement>('[role="option"]')!;
+  await act(async () => option.click());
+  expect(onChange).toHaveBeenCalledWith("mc/new-thing");
+});
+
+it("creatable: no create row on exact match; trigger shows a raw value", async () => {
+  await act(async () => {
+    root.render(
+      createElement(SearchableSelect, {
+        label: "Branch",
+        value: "typed-name",
+        creatable: "New branch",
+        options: [{ value: "main", label: "main" }],
+        onChange: vi.fn(),
+      }),
+    );
+  });
+  const trigger = container.querySelector<HTMLButtonElement>("button")!;
+  expect(trigger.textContent).toContain("typed-name");
+
+  await act(async () => trigger.click());
+  await typeSearch("main");
+  expect(optionTexts()).toEqual(["main"]);
+});

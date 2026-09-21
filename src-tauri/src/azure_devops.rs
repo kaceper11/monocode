@@ -16,8 +16,8 @@ const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DIFF_FILE_BYTES: usize = 512 * 1024;
 /// Hunks render for the first N files; the rest stay listed without hunks.
 const MAX_DIFF_HUNK_FILES: usize = 40;
-const USER_AGENT: &str = "MonoCode";
-const API_VERSION: &str = "7.1";
+pub(crate) const USER_AGENT: &str = "MonoCode";
+pub(crate) const API_VERSION: &str = "7.1";
 const CONNECTION_DATA_API_VERSION: &str = "7.1-preview.1";
 const WIT_COMMENTS_API_VERSION: &str = "7.1-preview.4";
 
@@ -30,9 +30,9 @@ pub struct AzureDevOpsStatus {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct AzureDevOpsConfig {
-    url: String,
-    token: String,
+pub(crate) struct AzureDevOpsConfig {
+    pub url: String,
+    pub token: String,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -63,6 +63,10 @@ pub struct AzureDevOpsWorkItem {
     pub draft: bool,
     pub repo: String,
     pub attention_reason: String,
+    /// Pull request source/target branches (`refs/heads/...`); empty for
+    /// Boards work items.
+    pub source_ref_name: String,
+    pub target_ref_name: String,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -177,7 +181,7 @@ pub async fn azure_devops_set_config(
 pub async fn azure_devops_repo(app: AppHandle, cwd: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app)?;
-        azure_devops_repo_for(&expand_home(&cwd), &config.url)
+        azure_devops_repo_for(&crate::fs::expand_home(&cwd), &config.url)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -194,7 +198,7 @@ pub async fn azure_devops_list_work_items(
 ) -> Result<Vec<AzureDevOpsWorkItem>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app)?;
-        let repo = azure_devops_repo_for(&expand_home(&cwd), &config.url)?;
+        let repo = azure_devops_repo_for(&crate::fs::expand_home(&cwd), &config.url)?;
         azure_devops_list_work_items_for(
             &config,
             &repo,
@@ -739,7 +743,7 @@ fn parse_pr_list(
         .collect())
 }
 
-fn parse_pr(row: &Value, repo: &str, base_url: &str) -> Option<AzureDevOpsWorkItem> {
+pub(crate) fn parse_pr(row: &Value, repo: &str, base_url: &str) -> Option<AzureDevOpsWorkItem> {
     let number = row.get("pullRequestId").and_then(Value::as_i64)?;
     if number <= 0 {
         return None;
@@ -764,6 +768,8 @@ fn parse_pr(row: &Value, repo: &str, base_url: &str) -> Option<AzureDevOpsWorkIt
         draft: row.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
         repo: repo.into(),
         attention_reason: String::new(),
+        source_ref_name: string_field(row, "sourceRefName").unwrap_or_default(),
+        target_ref_name: string_field(row, "targetRefName").unwrap_or_default(),
     })
 }
 
@@ -897,6 +903,8 @@ fn parse_wit(row: &Value) -> Option<AzureDevOpsWorkItem> {
         draft: false,
         repo: project,
         attention_reason: String::new(),
+        source_ref_name: String::new(),
+        target_ref_name: String::new(),
     })
 }
 
@@ -1406,7 +1414,7 @@ fn parse_wit_assignees(fields: &Value) -> Vec<AzureDevOpsAssignee> {
         .unwrap_or_default()
 }
 
-fn normalize_pr_state(state: &str) -> String {
+pub(crate) fn normalize_pr_state(state: &str) -> String {
     match state.trim().to_ascii_lowercase().as_str() {
         "active" => "open".into(),
         "completed" => "merged".into(),
@@ -1464,7 +1472,12 @@ fn pr_repo_parts(row: &Value) -> (Option<String>, Option<String>) {
     (project, repo_name)
 }
 
-fn pr_web_url(config: &AzureDevOpsConfig, project: &str, repo: &str, number: i64) -> String {
+pub(crate) fn pr_web_url(
+    config: &AzureDevOpsConfig,
+    project: &str,
+    repo: &str,
+    number: i64,
+) -> String {
     format!(
         "{}/{}/_git/{}/pullrequest/{}",
         config.url.trim_end_matches('/'),
@@ -1474,7 +1487,7 @@ fn pr_web_url(config: &AzureDevOpsConfig, project: &str, repo: &str, number: i64
     )
 }
 
-fn short_ref(value: &str) -> String {
+pub(crate) fn short_ref(value: &str) -> String {
     value
         .trim()
         .strip_prefix("refs/heads/")
@@ -1538,7 +1551,7 @@ fn wit_project(repo: &str) -> Result<String, String> {
     Ok(project)
 }
 
-fn split_repo(repo: &str) -> Result<(String, String), String> {
+pub(crate) fn split_repo(repo: &str) -> Result<(String, String), String> {
     let repo = validate_repo(repo)?;
     let (project, name) = repo
         .split_once('/')
@@ -1565,17 +1578,17 @@ fn validate_repo(repo: &str) -> Result<String, String> {
 
 // ---- HTTP ----
 
-struct AzureResponse {
-    value: Value,
-    truncated: bool,
+pub(crate) struct AzureResponse {
+    pub value: Value,
+    pub truncated: bool,
 }
 
-fn basic_auth(token: &str) -> String {
+pub(crate) fn basic_auth(token: &str) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(format!(":{token}"));
     format!("Basic {encoded}")
 }
 
-fn azure_get(config: &AzureDevOpsConfig, path: &str) -> Result<AzureResponse, String> {
+pub(crate) fn azure_get(config: &AzureDevOpsConfig, path: &str) -> Result<AzureResponse, String> {
     let url = format!("{}{}", config.url.trim_end_matches('/'), path);
     let agent = azure_agent();
     read_azure_response(
@@ -1588,8 +1601,10 @@ fn azure_get(config: &AzureDevOpsConfig, path: &str) -> Result<AzureResponse, St
     )
 }
 
-fn azure_post_json(
+/// JSON request body over an arbitrary method — POST and PATCH share this.
+pub(crate) fn azure_request_json(
     config: &AzureDevOpsConfig,
+    method: &str,
     path: &str,
     body: Value,
 ) -> Result<AzureResponse, String> {
@@ -1598,13 +1613,21 @@ fn azure_post_json(
     let agent = azure_agent();
     read_azure_response(
         agent
-            .post(&url)
+            .request(method, &url)
             .set("Authorization", &basic_auth(&config.token))
             .set("Accept", "application/json")
             .set("Content-Type", "application/json")
             .set("User-Agent", USER_AGENT)
             .send_string(&payload),
     )
+}
+
+pub(crate) fn azure_post_json(
+    config: &AzureDevOpsConfig,
+    path: &str,
+    body: Value,
+) -> Result<AzureResponse, String> {
+    azure_request_json(config, "POST", path, body)
 }
 
 fn azure_current_user_id(config: &AzureDevOpsConfig) -> Result<String, String> {
@@ -1630,14 +1653,14 @@ fn azure_current_user_id(config: &AzureDevOpsConfig) -> Result<String, String> {
     Ok(id)
 }
 
-fn azure_agent() -> ureq::Agent {
+pub(crate) fn azure_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(HTTP_TIMEOUT)
         .redirects(0)
         .build()
 }
 
-fn read_azure_response(
+pub(crate) fn read_azure_response(
     result: Result<ureq::Response, ureq::Error>,
 ) -> Result<AzureResponse, String> {
     let (bytes, status, truncated) = read_azure_bytes(result, None)?;
@@ -1721,7 +1744,7 @@ fn azure_http_error(status: u16, body: &str) -> String {
     message.unwrap_or_else(|| format!("Azure DevOps request failed ({status})"))
 }
 
-fn string_field(value: &Value, key: &str) -> Option<String> {
+pub(crate) fn string_field(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
         .and_then(Value::as_str)
@@ -1815,7 +1838,7 @@ fn canonical_org_key(url: &str) -> Option<String> {
     Some(normalized.to_ascii_lowercase())
 }
 
-fn encode_segment(value: &str) -> String {
+pub(crate) fn encode_segment(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.as_bytes() {
         if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~') {
@@ -1827,24 +1850,34 @@ fn encode_segment(value: &str) -> String {
     encoded
 }
 
-fn azure_devops_repo_for(root: &Path, organization_url: &str) -> Result<String, String> {
-    let mut cmd = Command::new("git");
-    crate::hide_window_console(&mut cmd);
-    let output = cmd
-        .args(["config", "--get-regexp", r"^remote\..*\.url$"])
-        .current_dir(root)
-        .output()
-        .map_err(|_| "Could not run git".to_string())?;
+/// The worktree's configured remotes as `(remote.<name>.url, url)` pairs.
+/// `--local` keeps global gitconfig remotes out of non-repo directories, and
+/// `git_command_output` routes through WSL when the worktree lives there.
+pub(crate) fn remote_urls(root: &Path) -> Result<Vec<(String, String)>, String> {
+    let output = crate::fs::git_command_output(
+        root,
+        &["config", "--local", "--get-regexp", r"^remote\..*\.url$"],
+    )
+    .map_err(|_| "Could not run git".to_string())?;
     if !output.status.success() && output.status.code() != Some(1) {
         return Err("Could not read git remotes".into());
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .filter_map(|line| {
+            line.split_once(char::is_whitespace)
+                .map(|(name, url)| (name.to_string(), url.trim().to_string()))
+        })
+        .collect())
+}
+
+/// The `project/repo` among `remotes` that belongs to `organization_url`,
+/// preferring `origin`.
+pub(crate) fn match_remote(remotes: &[(String, String)], organization_url: &str) -> Option<String> {
     let mut matches = Vec::new();
-    for line in stdout.lines() {
-        let Some((name, remote)) = line.split_once(char::is_whitespace) else {
-            continue;
-        };
-        if let Some(repo) = project_repo_from_remote(remote.trim(), organization_url) {
+    for (name, remote) in remotes {
+        if let Some(repo) = project_repo_from_remote(remote, organization_url) {
             matches.push((name == "remote.origin.url", repo));
         }
     }
@@ -1853,6 +1886,10 @@ fn azure_devops_repo_for(root: &Path, organization_url: &str) -> Result<String, 
         .find(|(origin, _)| *origin)
         .or_else(|| matches.first())
         .map(|(_, repo)| repo.clone())
+}
+
+pub(crate) fn azure_devops_repo_for(root: &Path, organization_url: &str) -> Result<String, String> {
+    match_remote(&remote_urls(root)?, organization_url)
         .ok_or_else(|| "No Azure DevOps remote matches the configured organization".to_string())
 }
 
@@ -1868,7 +1905,7 @@ fn project_repo_from_remote(remote: &str, organization_url: &str) -> Option<Stri
     Some(format!("{project}/{repo}"))
 }
 
-fn parse_azure_remote(remote: &str) -> Option<(String, String, String)> {
+pub(crate) fn parse_azure_remote(remote: &str) -> Option<(String, String, String)> {
     let remote = remote.trim();
     if remote.is_empty() {
         return None;
@@ -1950,7 +1987,7 @@ fn parse_azure_remote(remote: &str) -> Option<(String, String, String)> {
     ))
 }
 
-fn percent_decode(value: &str) -> String {
+pub(crate) fn percent_decode(value: &str) -> String {
     let mut out: Vec<u8> = Vec::new();
     let bytes = value.as_bytes();
     let mut index = 0;
@@ -2006,7 +2043,7 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
         .join("azure-devops-config.json"))
 }
 
-fn read_config(app: &AppHandle) -> Result<Option<AzureDevOpsConfig>, String> {
+pub(crate) fn read_config(app: &AppHandle) -> Result<Option<AzureDevOpsConfig>, String> {
     let path = config_path(app)?;
     match fs::read_to_string(path) {
         Ok(raw) => {
@@ -2025,7 +2062,7 @@ fn read_config(app: &AppHandle) -> Result<Option<AzureDevOpsConfig>, String> {
     }
 }
 
-fn require_config(app: &AppHandle) -> Result<AzureDevOpsConfig, String> {
+pub(crate) fn require_config(app: &AppHandle) -> Result<AzureDevOpsConfig, String> {
     read_config(app)?.ok_or_else(|| "Connect Azure DevOps in Settings".to_string())
 }
 
@@ -2067,21 +2104,6 @@ fn write_secret_file(path: &Path, value: &str) -> Result<(), String> {
     {
         fs::write(path, value).map_err(|error| error.to_string())
     }
-}
-
-fn expand_home(input: &str) -> PathBuf {
-    if input == "~" {
-        return crate::dirs_home()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(input));
-    }
-    if let Some(rest) = input.strip_prefix("~/") {
-        return crate::dirs_home()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("~"))
-            .join(rest);
-    }
-    PathBuf::from(input)
 }
 
 #[cfg(test)]

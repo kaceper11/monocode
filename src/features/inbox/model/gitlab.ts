@@ -21,6 +21,8 @@ export type GitlabWorkItem = {
   draft: boolean;
   repo: string;
   attentionReason: string;
+  /** `refs/heads/<source_branch>` on MRs — feeds the board's lane join. */
+  sourceRefName?: string;
 };
 
 export type GitlabWorkItemDetails = {

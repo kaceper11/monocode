@@ -132,3 +132,9 @@ export function useProjectBranches(
 ): GitBranches | null {
   return useProjectBranchesState(cwd, enabled).branches;
 }
+
+/** Cached branch list without subscribing — for submit-time checks inside
+ * event handlers (e.g. "is this typed name an existing local branch?"). */
+export function peekProjectBranches(cwd: string): GitBranches | null {
+  return entries.get(cwd)?.state.branches ?? null;
+}

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dirs_home;
 use crate::wsl;
-use serde_json::json;
+use serde_json::{json, Value};
 
 pub(crate) const MAX_TEXT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_ATTACHMENT_EMBED_BYTES: u64 = 20 * 1024 * 1024;
@@ -822,14 +822,37 @@ pub struct GitPr {
     pub title: String,
     pub url: String,
     pub state: String,
+    /// GitHub `reviewDecision` / Azure reviewer-vote rollup —
+    /// `APPROVED` | `CHANGES_REQUESTED` | `REVIEW_REQUIRED`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_decision: Option<String>,
+    /// Review threads still unresolved — GitHub `reviewThreads`,
+    /// Azure active threads. None when the provider didn't supply one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_threads: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<bool>,
+    /// Provider-side update time (ISO) — orders "recently merged" in the
+    /// standup report; a PR row alone has no merge timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// Normalized provider mergeability — `clean` | `behind` | `blocked` |
+    /// `conflicts` | `unstable` (GitHub `mergeStateStatus`, Azure
+    /// `mergeStatus`). None when the provider reports nothing conclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_state: Option<String>,
 }
 
 /// Latest pull request for the current branch, if `gh` can see one.
+/// `pr_url` pins the lookup to that exact PR — review lanes check out a
+/// `pr/<N>` branch that never matches the PR's real head name.
 #[tauri::command]
-pub async fn git_pr_status(cwd: String) -> Result<Option<GitPr>, String> {
-    tauri::async_runtime::spawn_blocking(move || Ok(git_pr_status_for(&expand_home(&cwd))))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn git_pr_status(cwd: String, pr_url: Option<String>) -> Result<Option<GitPr>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_pr_status_for(&expand_home(&cwd), pr_url.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[derive(Deserialize)]
@@ -874,34 +897,165 @@ pub struct GitPrCheck {
     pub url: String,
 }
 
-/// Check runs on the current branch's pull request via `gh pr checks`.
+/// Check runs on a pull request — `gh pr view --json statusCheckRollup`,
+/// not `gh pr checks`: that command exits non-zero (8 pending, 1 failing)
+/// while still printing results, which reads as "no checks" and loses
+/// stdout entirely through the WSL bridge. `pr_url` targets an exact PR —
+/// the same pin `git_pr_status` takes.
 #[tauri::command]
-pub async fn git_pr_checks(cwd: String) -> Result<Vec<GitPrCheck>, String> {
+pub async fn git_pr_checks(cwd: String, pr_url: Option<String>) -> Result<Vec<GitPrCheck>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = expand_home(&cwd);
-        let out = gh_checked(&root, &["pr", "checks", "--json", "name,state,link,bucket"])?;
-        #[derive(Deserialize)]
-        struct Row {
-            name: String,
-            state: String,
-            #[serde(default)]
-            link: String,
-            #[serde(default)]
-            bucket: String,
+        let url = pr_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty() && !u.starts_with('-'));
+        let mut args = vec!["pr", "view"];
+        if let Some(url) = url {
+            args.push(url);
         }
-        let rows: Vec<Row> = serde_json::from_str(&out).map_err(|e| e.to_string())?;
-        Ok(rows
-            .into_iter()
-            .map(|row| GitPrCheck {
-                name: row.name,
-                state: row.state,
-                bucket: row.bucket,
-                url: row.link,
-            })
-            .collect())
+        args.extend(["--json", "statusCheckRollup"]);
+        let out = gh_checked(&root, &args)?;
+        Ok(parse_status_rollup(&out))
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// `statusCheckRollup` is a union: CheckRun nodes carry
+/// status+conclusion+detailsUrl, StatusContext nodes carry
+/// state+targetUrl+context. Both fold into gh's pass/fail/pending/skipping
+/// buckets so `checkCiState` sees one vocabulary across providers.
+fn parse_status_rollup(json: &str) -> Vec<GitPrCheck> {
+    #[derive(Deserialize)]
+    struct View {
+        #[serde(default, rename = "statusCheckRollup")]
+        status_check_rollup: Vec<Value>,
+    }
+    let rollup = serde_json::from_str::<View>(json)
+        .map(|view| view.status_check_rollup)
+        .unwrap_or_default();
+    let field = |node: &Value, key: &str| {
+        node.get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default()
+    };
+    rollup
+        .iter()
+        .filter_map(|node| {
+            let name = {
+                let value = field(node, "name");
+                if value.is_empty() {
+                    field(node, "context")
+                } else {
+                    value
+                }
+            };
+            if name.is_empty() {
+                return None;
+            }
+            let (state, bucket) = if field(node, "__typename") == "StatusContext" {
+                let state = field(node, "state");
+                (state.clone(), status_context_bucket(&state))
+            } else {
+                // CheckRun: QUEUED/IN_PROGRESS/… while running, conclusion
+                // once COMPLETED.
+                let status = field(node, "status");
+                let conclusion = field(node, "conclusion");
+                let state = if status == "COMPLETED" && !conclusion.is_empty() {
+                    conclusion
+                } else {
+                    status.clone()
+                };
+                (state.clone(), check_run_bucket(&status, &state))
+            };
+            Some(GitPrCheck {
+                name,
+                state,
+                bucket: bucket.to_string(),
+                url: {
+                    let url = field(node, "detailsUrl");
+                    if url.is_empty() {
+                        field(node, "targetUrl")
+                    } else {
+                        url
+                    }
+                },
+            })
+        })
+        .collect()
+}
+
+fn check_run_bucket(status: &str, state: &str) -> &'static str {
+    if status != "COMPLETED" {
+        return "pending";
+    }
+    match state {
+        "SUCCESS" => "pass",
+        "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" | "STALE" => "fail",
+        "CANCELLED" => "cancel",
+        // SKIPPED/NEUTRAL — GitHub treats both as non-blocking.
+        _ => "skipping",
+    }
+}
+
+fn status_context_bucket(state: &str) -> &'static str {
+    match state {
+        "SUCCESS" => "pass",
+        "FAILURE" | "ERROR" => "fail",
+        _ => "pending",
+    }
+}
+
+/// `name/branch` splits as `<remote>/<branch>` only when `name` is a real
+/// remote — a local base like `release/1.2` must not be split.
+fn remote_qualified_ref(root: &Path, git_ref: &str) -> Option<(String, String)> {
+    let (remote, branch) = git_ref.split_once('/')?;
+    (!remote.is_empty()
+        && !branch.is_empty()
+        && git_remote_names(root)
+            .iter()
+            .any(|name| name.as_str() == remote))
+    .then(|| (remote.to_string(), branch.to_string()))
+}
+
+/// `HEAD`/empty means "the default branch" — resolve it to a real branch
+/// name; providers reject symbolic names and `git merge HEAD` is a no-op.
+fn resolve_base_branch(root: &Path, git_ref: &str) -> Option<String> {
+    let trimmed = git_ref.trim();
+    if trimmed.is_empty() || trimmed == "HEAD" {
+        git_default_branch(root, git_remote_name(root).as_deref())
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Branch names that would read as flags or refspecs to `git fetch`.
+fn safe_fetch_name(name: &str) -> bool {
+    !name.starts_with('-') && !name.contains(':')
+}
+
+/// Fetch `branch` from `remote`, then merge what it updated. The merge
+/// target is the remote-tracking ref, not FETCH_HEAD — that scratch file is
+/// shared, and a concurrent fetch (git sync, another lane's update) could
+/// rewrite it between the two commands.
+fn fetch_and_merge(root: &Path, remote: &str, branch: &str) -> Result<(), String> {
+    // Bail on unsafe input — skipping the fetch would fall through to a
+    // merge of a stale FETCH_HEAD from some earlier, unrelated fetch.
+    if !safe_fetch_name(branch) {
+        return Err(format!("Invalid base branch `{branch}`"));
+    }
+    git_checked(root, &["fetch", remote, branch])?;
+    let tracked = format!("refs/remotes/{remote}/{branch}");
+    let target = if git_ref_exists(root, &tracked) {
+        tracked
+    } else {
+        // A nonstandard fetch refspec leaves no tracking ref — FETCH_HEAD
+        // is the best available record of what was just fetched.
+        "FETCH_HEAD".to_string()
+    };
+    git_checked(root, &["merge", "--no-edit", &target])
 }
 
 /// Merge (or fast-forward) a base ref into the checked-out branch after
@@ -910,29 +1064,217 @@ pub async fn git_pr_checks(cwd: String) -> Result<Vec<GitPrCheck>, String> {
 pub async fn git_merge_from(cwd: String, git_ref: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = expand_home(&cwd);
-        let git_ref = git_ref.trim().to_string();
-        if git_ref.is_empty() || git_ref == "HEAD" {
-            return Err("Pick a base branch to merge from".into());
+        let git_ref = resolve_base_branch(&root, &git_ref)
+            .ok_or_else(|| "Pick a base branch to merge from".to_string())?;
+        // The resolved name lands as a bare `git merge` argument when no
+        // remote exists — a flag-like value (`--abort`) would be read as
+        // an option instead of a ref.
+        if !safe_fetch_name(&git_ref) {
+            return Err(format!("Invalid base branch `{git_ref}`"));
         }
-        // Only treat `name/branch` as remote-qualified when `name` is a real
-        // remote — a local base like `release/1.2` must not be split.
-        let remote_qualified = git_ref.split_once('/').and_then(|(remote, branch)| {
-            let qualified = !remote.is_empty()
-                && !branch.is_empty()
-                && git_remote_names(&root)
-                    .iter()
-                    .any(|name| name.as_str() == remote);
-            qualified.then(|| (remote.to_string(), branch.to_string()))
-        });
-        if let Some((remote, branch)) = remote_qualified {
-            git_checked(&root, &["fetch", &remote, &branch])?;
-            git_checked(&root, &["merge", "--no-edit", "FETCH_HEAD"])
+        if let Some((remote, branch)) = remote_qualified_ref(&root, &git_ref) {
+            fetch_and_merge(&root, &remote, &branch)
         } else if let Some(remote) = git_remote_name(&root) {
-            git_checked(&root, &["fetch", &remote, &git_ref])?;
-            git_checked(&root, &["merge", "--no-edit", "FETCH_HEAD"])
+            fetch_and_merge(&root, &remote, &git_ref)
         } else {
             git_checked(&root, &["merge", "--no-edit", &git_ref])
         }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Whether the worktree is mid-merge (`MERGE_HEAD` present) — the board
+/// shows a conflict-resolver affordance on lanes in that state.
+#[tauri::command]
+pub async fn git_merge_in_progress(cwd: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        Ok(git_stdout(&root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_some())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPrPreflight {
+    /// Checked-out branch — its short sha when HEAD is detached.
+    pub head: Option<String>,
+    /// Ref used for the ahead count — remote-tracking preferred, local
+    /// fallback. None when the base doesn't exist at all.
+    pub base_ref: Option<String>,
+    /// The branch name the PR would target (remote prefix stripped) — what
+    /// `createTaskPrs` passes to the provider.
+    pub base_branch: String,
+    /// Base exists remote-tracked — a PR targets a server-side ref, so a
+    /// local-only base would fail the create call.
+    pub base_on_remote: bool,
+    /// Commits on HEAD not reachable from the base — the PR's payload.
+    pub ahead: i64,
+    /// HEAD is contained in some remote-tracking ref — already pushed.
+    pub head_pushed: bool,
+    pub has_remote: bool,
+}
+
+fn git_pr_preflight_for(root: &Path, base: &str) -> GitPrPreflight {
+    let remotes = git_remote_names(root);
+    let head = git_branch(root);
+    // `HEAD`/empty means the repo's default branch — resolve it so the
+    // composer shows and submits a real branch name.
+    let base = resolve_base_branch(root, base).unwrap_or_default();
+    let qualified = remote_qualified_ref(root, &base);
+    // Fetch proves the remote ref exists and freshens the ahead count —
+    // best-effort, failures fall through to local checks. Try the
+    // origin-preferred remote first.
+    let fetchable = safe_fetch_name(&base);
+    let remote_base = if let Some((remote, branch)) = &qualified {
+        if fetchable && safe_fetch_name(branch) {
+            let _ = git_checked(root, &["fetch", remote, branch]);
+        }
+        git_ref_exists(root, &format!("refs/remotes/{remote}/{branch}"))
+            .then(|| format!("{remote}/{branch}"))
+    } else {
+        ordered_remote_names(root).iter().find_map(|remote| {
+            if fetchable {
+                let _ = git_checked(root, &["fetch", remote, &base]);
+            }
+            git_ref_exists(root, &format!("refs/remotes/{remote}/{base}"))
+                .then(|| format!("{remote}/{base}"))
+        })
+    };
+    let base_ref = remote_base
+        .clone()
+        .or_else(|| git_ref_exists(root, &format!("refs/heads/{base}")).then(|| base.clone()));
+    let ahead = base_ref
+        .as_deref()
+        .map(|base_ref| git_ahead_behind(root, base_ref).0)
+        .unwrap_or(0);
+    GitPrPreflight {
+        head,
+        base_ref,
+        base_branch: qualified
+            .map(|(_, branch)| branch)
+            .unwrap_or_else(|| base.clone()),
+        base_on_remote: remote_base.is_some(),
+        ahead,
+        head_pushed: git_head_pushed(root),
+        has_remote: !remotes.is_empty(),
+    }
+}
+
+/// Pre-submit check for the board's PR composer. Resolves the base ref
+/// (fetching remotes first, so a moved or remote-only base validates against
+/// the server), counts the commits it would carry, and reports the
+/// checked-out branch — surfacing "no commits" / "base not on remote" /
+/// "wrong branch" before the provider rejects the create call.
+#[tauri::command]
+pub async fn git_pr_preflight(cwd: String, base: String) -> Result<GitPrPreflight, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(git_pr_preflight_for(&expand_home(&cwd), &base))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Remote names for a repo — authoritative: a configured remote with no
+/// fetched tracking refs still counts (tracking-ref inference misses it).
+#[tauri::command]
+pub async fn git_remotes(cwd: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || Ok(git_remote_names(&expand_home(&cwd))))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Remote names with the repo's preferred remote (`origin`, else the only
+/// remote) first — multi-remote repos resolve against the same remote the
+/// fetch/PR paths use rather than an arbitrary alphabetical one.
+fn ordered_remote_names(root: &Path) -> Vec<String> {
+    let remotes = git_remote_names(root);
+    let preferred = git_remote_name(root);
+    remotes
+        .iter()
+        .filter(|name| preferred.as_ref() == Some(*name))
+        .chain(
+            remotes
+                .iter()
+                .filter(|name| preferred.as_ref() != Some(*name)),
+        )
+        .cloned()
+        .collect()
+}
+
+/// The ref a base branch resolves to for local comparisons — the
+/// remote-tracking ref when one exists (fresher than the local branch),
+/// the local branch otherwise. Handles `origin/x` picks and `HEAD`/`""`.
+fn resolve_tracking_ref(root: &Path, base: &str) -> Option<String> {
+    let base = resolve_base_branch(root, base)?;
+    if let Some((remote, branch)) = remote_qualified_ref(root, &base) {
+        let tracked = format!("refs/remotes/{remote}/{branch}");
+        if git_ref_exists(root, &tracked) {
+            return Some(tracked);
+        }
+    }
+    for remote in ordered_remote_names(root) {
+        let tracked = format!("refs/remotes/{remote}/{base}");
+        if git_ref_exists(root, &tracked) {
+            return Some(tracked);
+        }
+    }
+    git_ref_exists(root, &format!("refs/heads/{base}")).then_some(base)
+}
+
+fn git_behind_base_for(root: &Path, base: &str) -> i64 {
+    let Some(target) = resolve_tracking_ref(root, base) else {
+        return 0;
+    };
+    git_stdout(root, &["rev-list", "--count", &format!("HEAD..{target}")])
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Commits the resolved base has that HEAD lacks — the "behind main" count
+/// on a lane badge. Local refs only: polling N lanes must not fetch each.
+#[tauri::command]
+pub async fn git_behind_base(cwd: String, base: String) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || Ok(git_behind_base_for(&expand_home(&cwd), &base)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Fetch a provider-side ref into a local branch without checking it out —
+/// `git fetch <remote> <remote_ref>:refs/heads/<branch>`. The board's
+/// "review locally" flow turns an inbox PR into a lane this way; the
+/// worktree add then reuses the existing `git_worktree_create(existing)`.
+#[tauri::command]
+pub async fn git_fetch_branch(
+    cwd: String,
+    remote: String,
+    remote_ref: String,
+    branch: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        // Both sides land verbatim in a refspec — reject flag-like and
+        // extra-colon input before it reaches git.
+        for part in [&remote, &remote_ref, &branch] {
+            if !safe_fetch_name(part) || part.is_empty() {
+                return Err(format!("Invalid ref `{part}`"));
+            }
+        }
+        if git_branch(&root).as_deref() == Some(branch.as_str()) {
+            return Err(format!(
+                "`{branch}` is checked out here — pick another name or worktree"
+            ));
+        }
+        git_checked(
+            &root,
+            &[
+                "fetch",
+                &remote,
+                &format!("{remote_ref}:refs/heads/{branch}"),
+            ],
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -950,12 +1292,17 @@ pub async fn git_pr_update(cwd: String, url: String, body: String) -> Result<(),
             .unwrap_or(0);
         let body_path = std::env::temp_dir().join(format!("monocode-pr-edit-{stamp}.md"));
         std::fs::write(&body_path, body.trim()).map_err(|e| e.to_string())?;
+        let url = url.trim();
+        if url.is_empty() || url.starts_with('-') {
+            let _ = std::fs::remove_file(&body_path);
+            return Err("Invalid pull request URL".into());
+        }
         let result = gh_checked(
             &root,
             &[
                 "pr",
                 "edit",
-                url.trim(),
+                url,
                 "--body-file",
                 &body_path.to_string_lossy(),
             ],
@@ -2289,31 +2636,156 @@ fn git_range_context_for(root: &Path) -> Result<GitRangeContext, String> {
     })
 }
 
-fn git_pr_status_for(root: &Path) -> Option<GitPr> {
-    let branch = git_branch(root)?;
-    let repo = git_github_repo_for(root).ok()?;
-    let head = github_pr_head_filter(&repo, &branch)?;
+fn git_pr_status_for(root: &Path, url: Option<&str>) -> Result<Option<GitPr>, String> {
+    let url = url
+        .map(str::trim)
+        .filter(|u| !u.is_empty() && !u.starts_with('-'));
+    // The threads follow-up needs the PR's own owner/repo — a pinned url
+    // may point at a different repository than the local checkout.
+    let (pr, threads_key) = if let Some(url) = url {
+        // A pinned PR (review lane) resolves by url — the local `pr/<N>`
+        // branch never equals the PR's real head name. Errors propagate:
+        // a bad pin or auth failure must surface, not read as "no PR".
+        let json = gh_checked(
+            root,
+            &[
+                "pr",
+                "view",
+                url,
+                "--json",
+                "number,title,url,state,reviewDecision,isDraft,updatedAt,mergeStateStatus",
+            ],
+        )?;
+        // gh succeeded but returned a shape we can't read — surface it
+        // rather than reporting "no PR" on a pinned lane.
+        let pr = parse_gh_pr_row(&json)
+            .ok_or_else(|| "gh returned a pull request that couldn't be parsed".to_string())?;
+        (Some(pr), gh_pr_url_parts(url))
+    } else {
+        let Some(branch) = git_branch(root) else {
+            return Ok(None);
+        };
+        // Not a GitHub remote (Azure/GitLab lane) — quiet None, the board
+        // routes those providers elsewhere. Errors past this point are
+        // real: the list call runs only once gh+repo resolved.
+        let Some(repo) = git_github_repo_for(root).ok() else {
+            return Ok(None);
+        };
+        let json = gh_checked(
+            root,
+            &[
+                "pr",
+                "list",
+                // `--head` takes the BARE branch — gh doesn't support the
+                // `owner:branch` syntax (it goes verbatim into headRefName
+                // and matches nothing). `headRepositoryOwner` is fetched
+                // so a fork's same-named branch can't hijack the match.
+                "--head",
+                &branch,
+                "--json",
+                "number,title,url,state,reviewDecision,isDraft,updatedAt,mergeStateStatus,headRepositoryOwner",
+                "--limit",
+                "20",
+                "--state",
+                "all",
+            ],
+        )?;
+        let pr = parse_gh_pr_list(&json, &repo);
+        let threads_key = pr.as_ref().map(|p| (repo.clone(), p.number));
+        (pr, threads_key)
+    };
+    let Some(mut pr) = pr else {
+        return Ok(None);
+    };
+    // `pr view --json` has no reviewThreads field — unresolved threads
+    // come from GraphQL, scoped to the PR's own repository.
+    if pr.state == "open" {
+        if let Some((repo, number)) = threads_key {
+            pr.unresolved_threads = gh_pr_unresolved_threads(root, &repo, number);
+        }
+    }
+    Ok(Some(pr))
+}
+
+/// `…/<owner>/<repo>/pull/<n>` → (`owner/repo`, n). Host-agnostic — GHES
+/// urls share the path shape.
+fn gh_pr_url_parts(url: &str) -> Option<(String, i64)> {
+    let path = url.split_once("://")?.1.split_once('/')?.1;
+    let (repo_path, tail) = path.rsplit_once("/pull/")?;
+    let number: i64 = tail
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    let mut segments: Vec<&str> = repo_path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() < 2 || number <= 0 {
+        return None;
+    }
+    let repo = segments.pop()?;
+    let owner = segments.pop()?;
+    Some((format!("{owner}/{repo}"), number))
+}
+
+const GITHUB_PR_THREADS_COUNT_QUERY: &str = r#"
+query BoardPrThreads($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes { isResolved }
+      }
+    }
+  }
+}
+"#;
+
+/// Unresolved review-thread count via `gh api graphql` — `pr view --json`
+/// has no reviewThreads field. Best-effort: failures leave the badge unset.
+fn gh_pr_unresolved_threads(root: &Path, repo: &str, number: i64) -> Option<i64> {
+    let (owner, name) = split_github_repo(repo).ok()?;
     let json = gh_stdout(
         root,
         &[
-            "pr",
-            "list",
-            "--head",
-            &head,
-            "--json",
-            "number,title,url,state",
-            "--limit",
-            "20",
-            "--state",
-            "all",
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={GITHUB_PR_THREADS_COUNT_QUERY}"),
+            // `-f` not `-F` for the strings — typed field coercion would
+            // turn a repo named "2024" or "true" into a non-string and the
+            // query would fail silently.
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={number}"),
         ],
     )?;
-    parse_gh_pr_list(&json)
+    parse_unresolved_threads(&json)
 }
 
-fn github_pr_head_filter(repo: &str, branch: &str) -> Option<String> {
-    let (owner, _) = split_github_repo(repo).ok()?;
-    Some(format!("{owner}:{branch}"))
+/// Count unresolved `reviewThreads` nodes in the GraphQL response —
+/// `data.repository.pullRequest.reviewThreads.nodes`.
+fn parse_unresolved_threads(json: &str) -> Option<i64> {
+    let value: Value = serde_json::from_str(json).ok()?;
+    let nodes = value
+        .get("data")?
+        .get("repository")?
+        .get("pullRequest")?
+        .get("reviewThreads")?
+        .get("nodes")?
+        .as_array()?;
+    Some(
+        nodes
+            .iter()
+            .filter(|node| {
+                !node
+                    .get("isResolved")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .count() as i64,
+    )
 }
 
 fn git_github_repo_for(root: &Path) -> Result<String, String> {
@@ -2674,9 +3146,11 @@ fn git_github_work_item_thread_for(
             "graphql",
             "-f",
             &format!("query={query}"),
-            "-F",
+            // `-f` keeps owner/name strings literal — `-F` coerces
+            // numeric/boolean-looking values into non-strings.
+            "-f",
             &owner_field,
-            "-F",
+            "-f",
             &name_field,
             "-F",
             &number_field,
@@ -3526,23 +4000,80 @@ fn parse_github_work_item(json: &str, kind: &str, repo: &str) -> Result<GitHubWo
         .ok_or_else(|| "GitHub did not return a work item".into())
 }
 
-fn parse_gh_pr_list(json: &str) -> Option<GitPr> {
-    #[derive(Deserialize)]
-    struct Row {
-        number: i64,
-        title: String,
-        url: String,
-        state: String,
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPrRow {
+    number: i64,
+    title: String,
+    url: String,
+    state: String,
+    review_decision: Option<String>,
+    is_draft: Option<bool>,
+    updated_at: Option<String>,
+    merge_state_status: Option<String>,
+    head_repository_owner: Option<GhOwner>,
+}
+
+#[derive(Deserialize)]
+struct GhOwner {
+    login: String,
+}
+
+/// GitHub `mergeStateStatus` → shared buckets. `CLEAN` already satisfies
+/// branch protection (reviews + checks + up-to-date); `UNSTABLE` means
+/// checks failing, `BLOCKED` a protection/policy block. `DRAFT`,
+/// `HAS_HOOKS`, `UNKNOWN` say nothing the board doesn't already show.
+fn normalize_gh_merge_state(status: Option<String>) -> Option<String> {
+    Some(
+        match status.as_deref()? {
+            "CLEAN" => "clean",
+            "BEHIND" => "behind",
+            "BLOCKED" => "blocked",
+            "DIRTY" => "conflicts",
+            "UNSTABLE" => "unstable",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+fn gh_pr_row_to_pr(row: GhPrRow) -> GitPr {
+    GitPr {
+        number: row.number,
+        title: row.title,
+        url: row.url,
+        state: row.state.to_lowercase(),
+        review_decision: row.review_decision.filter(|s| !s.is_empty()),
+        unresolved_threads: None,
+        draft: row.is_draft,
+        updated_at: row.updated_at.filter(|s| !s.is_empty()),
+        merge_state: normalize_gh_merge_state(row.merge_state_status),
     }
-    let rows: Vec<Row> = serde_json::from_str(json).ok()?;
+}
+
+/// `gh pr view --json …` — a single object, not the list array.
+fn parse_gh_pr_row(json: &str) -> Option<GitPr> {
+    let row: GhPrRow = serde_json::from_str(json).ok()?;
+    Some(gh_pr_row_to_pr(row))
+}
+
+/// Pick the best PR for a branch list query. `--head` filters on
+/// `headRefName` only — a fork's same-named branch also matches, so rows
+/// carry `headRepositoryOwner` and get filtered to the repo's own owner.
+fn parse_gh_pr_list(json: &str, repo: &str) -> Option<GitPr> {
+    let owner = split_github_repo(repo).ok()?.0;
+    let rows: Vec<GhPrRow> = serde_json::from_str(json).ok()?;
     let mut best: Option<GitPr> = None;
     for row in rows {
-        let pr = GitPr {
-            number: row.number,
-            title: row.title,
-            url: row.url,
-            state: row.state.to_lowercase(),
-        };
+        // Rows without owner data (`pr view` doesn't go through here, but a
+        // hand-shaped payload could omit it) are kept — absence isn't proof
+        // of a fork.
+        if let Some(head_owner) = &row.head_repository_owner {
+            if !head_owner.login.eq_ignore_ascii_case(&owner) {
+                continue;
+            }
+        }
+        let pr = gh_pr_row_to_pr(row);
         if pr.state == "open" {
             return Some(pr);
         }
@@ -3782,7 +4313,7 @@ fn git_status_ok(status: &std::process::ExitStatus, args: &[&str]) -> bool {
     status.success() || (status.code() == Some(1) && args.first().copied() == Some("diff"))
 }
 
-fn git_branch(root: &Path) -> Option<String> {
+pub(crate) fn git_branch(root: &Path) -> Option<String> {
     git_head_branch(root).or_else(|| git_stdout(root, &["rev-parse", "--short", "HEAD"]))
 }
 
@@ -4014,17 +4545,7 @@ fn git_sync_for(root: &Path) -> GitSync {
     } else {
         ahead
     };
-    let head_pushed = git_stdout(
-        root,
-        &[
-            "for-each-ref",
-            "--count=1",
-            "--contains",
-            "HEAD",
-            "refs/remotes",
-        ],
-    )
-    .is_some();
+    let head_pushed = git_head_pushed(root);
     GitSync {
         remote,
         upstream,
@@ -4034,6 +4555,20 @@ fn git_sync_for(root: &Path) -> GitSync {
         ahead_of_default,
         head_pushed,
     }
+}
+
+fn git_head_pushed(root: &Path) -> bool {
+    git_stdout(
+        root,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--contains",
+            "HEAD",
+            "refs/remotes",
+        ],
+    )
+    .is_some()
 }
 
 fn git_remote_name(root: &Path) -> Option<String> {
@@ -6578,6 +7113,190 @@ mod tests {
     }
 
     #[test]
+    fn safe_fetch_name_rejects_flag_like_and_refspec_args() {
+        assert!(safe_fetch_name("main"));
+        assert!(safe_fetch_name("release/1.2"));
+        assert!(!safe_fetch_name("--upload-pack=evil"));
+        assert!(!safe_fetch_name("-oflag"));
+        assert!(!safe_fetch_name("src:dst"));
+    }
+
+    #[test]
+    fn git_pr_preflight_resolves_head_and_remote_qualified_bases() {
+        let repo = tmp("git-preflight-repo");
+        let origin = tmp("git-preflight-origin");
+        if !init_git_commit(&repo.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        if Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&origin.0)
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let origin_url = origin.0.to_string_lossy().into_owned();
+        if !git(&repo.0, &["remote", "add", "origin", &origin_url])
+            || !git(&repo.0, &["push", "-u", "origin", "main"])
+            || !git(&repo.0, &["checkout", "-b", "mc/x"])
+        {
+            return;
+        }
+        std::fs::write(repo.0.join("a.txt"), "beta\n").unwrap();
+        git_stage_file_for(&repo.0, "a.txt").unwrap();
+        git_commit_for(&repo.0, "work").unwrap();
+
+        // "HEAD" resolves to the default branch; remote-tracking wins.
+        let preflight = git_pr_preflight_for(&repo.0, "HEAD");
+        assert_eq!(preflight.head.as_deref(), Some("mc/x"));
+        assert_eq!(preflight.base_branch, "main");
+        assert_eq!(preflight.base_ref.as_deref(), Some("origin/main"));
+        assert!(preflight.base_on_remote);
+        assert_eq!(preflight.ahead, 1);
+        assert!(!preflight.head_pushed);
+        assert!(preflight.has_remote);
+
+        // A remote-qualified pick reports the plain branch name.
+        let preflight = git_pr_preflight_for(&repo.0, "origin/main");
+        assert_eq!(preflight.base_branch, "main");
+        assert!(preflight.base_on_remote);
+
+        // Unknown base — nothing resolved, nothing counted.
+        let preflight = git_pr_preflight_for(&repo.0, "gone");
+        assert_eq!(preflight.base_ref, None);
+        assert!(!preflight.base_on_remote);
+        assert_eq!(preflight.ahead, 0);
+    }
+
+    #[test]
+    fn git_behind_base_counts_remote_commits_without_fetching() {
+        let repo = tmp("git-behind-repo");
+        let origin = tmp("git-behind-origin");
+        let other = tmp("git-behind-other");
+        if !init_git_commit(&repo.0, &[("a.txt", "alpha\n")]) {
+            return;
+        }
+        if Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&origin.0)
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let origin_url = origin.0.to_string_lossy().into_owned();
+        if !git(&repo.0, &["remote", "add", "origin", &origin_url])
+            || !git(&repo.0, &["push", "-u", "origin", "main"])
+            || !git(&repo.0, &["checkout", "-b", "mc/x"])
+        {
+            return;
+        }
+        // A second clone pushes two commits to main — the feature branch
+        // is behind by 2 once this repo's tracking ref knows about them.
+        if !git(&other.0, &["clone", &origin_url, "."]) {
+            return;
+        }
+        for (name, message) in [("b.txt", "two"), ("c.txt", "three")] {
+            std::fs::write(other.0.join(name), "x\n").unwrap();
+            if !git(&other.0, &["add", name])
+                || !git(&other.0, &["commit", "-m", message])
+                || !git(&other.0, &["push", "origin", "HEAD:main"])
+            {
+                return;
+            }
+        }
+        // Stale tracking ref — behind stays 0 until a fetch refreshes it.
+        assert_eq!(git_behind_base_for(&repo.0, "main"), 0);
+        // After fetch the remote-tracking ref reports the true count.
+        if !git(&repo.0, &["fetch", "origin"]) {
+            return;
+        }
+        assert_eq!(git_behind_base_for(&repo.0, "main"), 2);
+        // `origin/main` picks resolve identically; HEAD resolves to main.
+        assert_eq!(git_behind_base_for(&repo.0, "origin/main"), 2);
+        assert_eq!(git_behind_base_for(&repo.0, "HEAD"), 2);
+        // Unknown base — nothing resolved, zero rather than an error.
+        assert_eq!(git_behind_base_for(&repo.0, "gone"), 0);
+    }
+
+    #[test]
+    fn parse_unresolved_threads_counts_only_open_nodes() {
+        let json = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+            {"isResolved":false},
+            {"isResolved":true},
+            {"isResolved":false},
+            {}
+        ]}}}}}"#;
+        assert_eq!(parse_unresolved_threads(json), Some(3));
+        assert_eq!(parse_unresolved_threads("{}"), None);
+        assert_eq!(
+            parse_unresolved_threads(
+                r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}"#
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn gh_pr_url_parts_reads_owner_repo_number() {
+        assert_eq!(
+            gh_pr_url_parts("https://github.com/acme/app/pull/42"),
+            Some(("acme/app".to_string(), 42))
+        );
+        assert_eq!(
+            gh_pr_url_parts("https://ghe.corp.net/acme/app/pull/7?diff=split"),
+            Some(("acme/app".to_string(), 7))
+        );
+        assert_eq!(gh_pr_url_parts("https://github.com/acme/app"), None);
+        assert_eq!(gh_pr_url_parts("not a url"), None);
+        assert_eq!(
+            gh_pr_url_parts("https://dev.azure.com/o/p/_git/r/pullrequest/9"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_status_rollup_folds_check_runs_and_contexts() {
+        let json = r#"{"statusCheckRollup":[
+            {"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://ci/1"},
+            {"__typename":"CheckRun","name":"test","status":"IN_PROGRESS","conclusion":""},
+            {"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":"https://ci/2"},
+            {"__typename":"CheckRun","name":"audit","status":"COMPLETED","conclusion":"SKIPPED"},
+            {"__typename":"StatusContext","context":"ci/travis","state":"PENDING","targetUrl":"https://ci/3"},
+            {"__typename":"StatusContext","context":"ci/dco","state":"ERROR","targetUrl":"https://ci/4"},
+            {"__typename":"StatusContext","state":"SUCCESS"}
+        ]}"#;
+        let checks = parse_status_rollup(json);
+        let get = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(checks.len(), 6);
+        assert_eq!(
+            (get("build").bucket.as_str(), get("build").url.as_str()),
+            ("pass", "https://ci/1")
+        );
+        assert_eq!(get("test").bucket, "pending");
+        assert_eq!(
+            (get("lint").bucket.as_str(), get("lint").state.as_str()),
+            ("fail", "FAILURE")
+        );
+        assert_eq!(get("audit").bucket, "skipping");
+        assert_eq!(
+            (
+                get("ci/travis").bucket.as_str(),
+                get("ci/travis").url.as_str()
+            ),
+            ("pending", "https://ci/3")
+        );
+        assert_eq!(get("ci/dco").bucket, "fail");
+        // A context with no name/context is dropped rather than "".
+        assert!(checks.iter().all(|c| !c.name.is_empty()));
+        assert!(parse_status_rollup("{}").is_empty());
+        assert!(parse_status_rollup("not json").is_empty());
+    }
+
+    #[test]
     fn git_sync_pulls_then_pushes() {
         let origin = tmp("git-sync-origin");
         let a = tmp("git-sync-a");
@@ -6642,18 +7361,63 @@ mod tests {
     #[test]
     fn parse_gh_pr_list_prefers_open() {
         let json = r#"[{"number":2,"title":"Old","url":"https://example.com/2","state":"MERGED"},{"number":3,"title":"Now","url":"https://example.com/3","state":"OPEN"}]"#;
-        let pr = parse_gh_pr_list(json).unwrap();
+        let pr = parse_gh_pr_list(json, "acme/app").unwrap();
         assert_eq!(pr.number, 3);
         assert_eq!(pr.state, "open");
         assert_eq!(pr.title, "Now");
     }
 
     #[test]
-    fn pr_head_filter_qualifies_branch_with_repo_owner() {
-        assert_eq!(
-            github_pr_head_filter("hardbeat920/monocode", "main").as_deref(),
-            Some("hardbeat920:main")
-        );
+    fn parse_gh_pr_row_reads_view_shape() {
+        // `gh pr view --json …` returns one object — the pinned-PR path a
+        // review lane uses instead of the branch list query.
+        let json = r#"{"number":7,"title":"Fix","url":"https://example.com/7","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","isDraft":true,"updatedAt":"2026-01-02T00:00:00Z","mergeStateStatus":"BLOCKED"}"#;
+        let pr = parse_gh_pr_row(json).unwrap();
+        assert_eq!(pr.number, 7);
+        assert_eq!(pr.state, "open");
+        assert_eq!(pr.review_decision.as_deref(), Some("CHANGES_REQUESTED"));
+        assert_eq!(pr.draft, Some(true));
+        assert_eq!(pr.updated_at.as_deref(), Some("2026-01-02T00:00:00Z"));
+        assert_eq!(pr.merge_state.as_deref(), Some("blocked"));
+        assert!(parse_gh_pr_row("{}").is_none());
+    }
+
+    #[test]
+    fn gh_merge_state_normalizes_to_shared_buckets() {
+        let cases = [
+            ("CLEAN", Some("clean")),
+            ("BEHIND", Some("behind")),
+            ("BLOCKED", Some("blocked")),
+            ("DIRTY", Some("conflicts")),
+            ("UNSTABLE", Some("unstable")),
+            // These say nothing the board doesn't already surface.
+            ("DRAFT", None),
+            ("HAS_HOOKS", None),
+            ("UNKNOWN", None),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                normalize_gh_merge_state(Some(raw.to_string())).as_deref(),
+                expected,
+                "{raw}"
+            );
+        }
+        assert_eq!(normalize_gh_merge_state(None), None);
+    }
+
+    #[test]
+    fn gh_pr_list_filters_fork_heads_to_the_repo_owner() {
+        // `--head` matches headRefName across forks — a fork's same-named
+        // branch must not hijack the repo's own PR row.
+        let json = r#"[
+            {"number":1,"title":"Fork PR","url":"https://example.com/1","state":"OPEN","headRepositoryOwner":{"login":"someone-else"}},
+            {"number":2,"title":"Ours","url":"https://example.com/2","state":"OPEN","headRepositoryOwner":{"login":"Acme"}}
+        ]"#;
+        let pr = parse_gh_pr_list(json, "acme/app").unwrap();
+        assert_eq!(pr.number, 2);
+        // Rows without owner data are still candidates.
+        let bare = r#"[{"number":3,"title":"x","url":"u","state":"OPEN"}]"#;
+        assert_eq!(parse_gh_pr_list(bare, "acme/app").unwrap().number, 3);
     }
 
     #[test]

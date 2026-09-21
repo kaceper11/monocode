@@ -9125,6 +9125,7 @@ export default function App({
                   onSendToSession={onBoardSendToSession}
                   onSpawnSession={onBoardSpawnSession}
                   onBindSession={onBoardBindSession}
+                  onRemoveWorktree={onRemoveWorktree}
                 />
               ) : null}
               {notesViewOpen ? (

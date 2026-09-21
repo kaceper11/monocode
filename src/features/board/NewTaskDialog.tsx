@@ -17,8 +17,12 @@ import type { RecentProject } from "../projects/model/recents";
 import type { LinkedWorkItem } from "../sessions/model/session";
 import { linkedWorkItemInboxKey } from "../sessions/model/sessionWorkItem";
 import { namedWorktreeBranch } from "../source-control/model/worktrees";
-import { useProjectBranchesState } from "../source-control/hooks/useProjectBranches";
-import { boardTicketOptions } from "./boardData";
+import {
+  peekProjectBranches,
+  useProjectBranchesState,
+} from "../source-control/hooks/useProjectBranches";
+import { boardTicketOptions, groupSwatch } from "./boardData";
+import { createGroup, loadBoard } from "./boardStore";
 
 export type TaskWorkstreamSpec = {
   projectPath: string;
@@ -32,6 +36,8 @@ export type NewTaskSpec = {
   title: string;
   links: LinkedWorkItem[];
   workstreams: TaskWorkstreamSpec[];
+  /** Board groups the task starts in. */
+  groupIds?: string[];
 };
 
 /** kebab-case fragment for `mc/<fragment>` branch names. */
@@ -53,9 +59,30 @@ export function suggestedBranch(title: string, links: LinkedWorkItem[]): string 
   return namedWorktreeBranch(fragment) ?? "mc/task";
 }
 
+/** Resolve a typed/picked lane branch. A name matching an existing LOCAL
+ * branch stays verbatim — spawn adopts it via the `existing: true` retry
+ * (`mc/` wrapping would create a different branch instead). Anything else
+ * is a new branch and gets the `mc/` convention. */
+export function resolveLaneBranch(
+  projectPath: string,
+  typed: string,
+): string | null {
+  const clean = typed.trim();
+  if (!clean) return null;
+  const known = peekProjectBranches(projectPath);
+  // Cache still loading — pass the name through verbatim. The spawn path
+  // adopts an existing branch or creates it under the user's literal name;
+  // wrapping in `mc/` here could fork an existing branch into `mc/<name>`.
+  if (!known) return clean;
+  const isLocal = known.branches.some(
+    (branch) => !branch.remote && branch.name === clean,
+  );
+  return isLocal ? clean : namedWorktreeBranch(clean);
+}
+
 /** Repo select options from recents — shared by this dialog and the
  * details panel's add-lane row. */
-export function workstreamProjectOptions(recents: RecentProject[]) {
+export function workstreamProjectOptions(recents: readonly RecentProject[]) {
   return recents.map((project) => ({
     value: project.path,
     label: projectName(project.path) || project.path,
@@ -104,6 +131,18 @@ export function WorkstreamFields({
       ? [{ value: current, label: current }, ...list]
       : list;
   }, [branches]);
+  // Adoptable branches are local-only, matching CreateWorktreeDialog — the
+  // spawn path creates a new branch from base for anything else it can't
+  // adopt. "" keeps the auto-generated name.
+  const branchOptions = useMemo(
+    () => [
+      { value: "", label: "Auto from task" },
+      ...(branches?.branches ?? [])
+        .filter((branch) => !branch.remote)
+        .map((branch) => ({ value: branch.name, label: branch.name })),
+    ],
+    [branches],
+  );
   const repoSelect = (
     <SearchableSelect
       label="Repository"
@@ -128,13 +167,18 @@ export function WorkstreamFields({
       minMenuWidth={260}
     />
   );
-  const branchInput = (
-    <input
+  const branchSelect = (
+    <SearchableSelect
+      label="Branch"
       value={draft.branch}
-      onChange={(event) => onChange({ branch: event.target.value })}
-      placeholder={compact ? "mc/branch" : "mc/branch-name"}
-      aria-label="Branch name"
-      className={`${compact ? "h-8 min-w-0 flex-1" : "h-9 w-36 shrink-0"} rounded-md border border-content/10 bg-background-base px-2 font-mono text-[12px] text-content outline-none placeholder:text-content/35 focus:border-content/25`}
+      options={branchOptions}
+      onChange={(branch) => onChange({ branch })}
+      placeholder={branches ? "mc/branch…" : "…"}
+      searchPlaceholder="Pick or type a branch…"
+      creatable="New branch"
+      disabled={!draft.projectPath}
+      layer={layer}
+      minMenuWidth={240}
     />
   );
   // Compact rows live in the narrow details panel — stack the repo over
@@ -143,7 +187,7 @@ export function WorkstreamFields({
     <div className="flex flex-col gap-1.5">
       {repoSelect}
       <div className="flex items-center gap-1.5">
-        {branchInput}
+        <div className="min-w-0 flex-1">{branchSelect}</div>
         <div className="w-28 shrink-0">{baseSelect}</div>
         {tail}
       </div>
@@ -151,7 +195,7 @@ export function WorkstreamFields({
   ) : (
     <div className="flex items-center gap-1.5">
       <div className="min-w-0 flex-1">{repoSelect}</div>
-      {branchInput}
+      <div className="w-44 shrink-0">{branchSelect}</div>
       <div className="w-40 shrink-0">{baseSelect}</div>
       {tail}
     </div>
@@ -185,6 +229,11 @@ export function NewTaskDialog({
   const [streams, setStreams] = useState<DraftWorkstream[]>([
     { key: 0, projectPath: "", branch: "", base: "" },
   ]);
+  // Group ids the task starts in; the list is read fresh on open and grows
+  // when a new group is created inline.
+  const [groups, setGroups] = useState(() => loadBoard().groups);
+  const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
+  const [newGroupName, setNewGroupName] = useState("");
   const nextKey = useRef(1);
   const titleRef = useRef<HTMLInputElement>(null);
   // The modal focuses its close button on mount — land title focus a frame
@@ -225,9 +274,10 @@ export function NewTaskDialog({
         .filter((stream) => stream.projectPath)
         .map((stream) => ({
           projectPath: stream.projectPath,
-          branch: namedWorktreeBranch(stream.branch) || fallback,
+          branch: resolveLaneBranch(stream.projectPath, stream.branch) || fallback,
           base: stream.base.trim() || "HEAD",
         })),
+      groupIds: [...selectedGroups],
     });
   };
 
@@ -294,6 +344,11 @@ export function NewTaskDialog({
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                // Inside the form an unguarded Enter submits the whole
+                // task — searching must never create worktrees/sessions.
+                if (event.key === "Enter") event.preventDefault();
+              }}
               placeholder="Search inbox items…"
               aria-label="Search tickets"
               className="h-7 w-full rounded-md bg-content/6 pl-7 pr-2 text-[12px] text-content outline-none placeholder:text-content/40 focus:ring-1 focus:ring-accent/40"
@@ -341,6 +396,67 @@ export function NewTaskDialog({
                 tickets later.
               </p>
             ) : null}
+          </div>
+        </section>
+
+        <section>
+          <h3 className="mb-1.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-content/40">
+            Groups
+          </h3>
+          <div className="flex flex-wrap items-center gap-1">
+            {groups.map((group) => {
+              const swatch = groupSwatch(group.color);
+              const on = selectedGroups.has(group.id);
+              return (
+                <button
+                  key={group.id}
+                  type="button"
+                  aria-pressed={on}
+                  onClick={() =>
+                    setSelectedGroups((current) => {
+                      const next = new Set(current);
+                      if (next.has(group.id)) next.delete(group.id);
+                      else next.add(group.id);
+                      return next;
+                    })
+                  }
+                  className={`inline-flex h-5 items-center gap-1 rounded px-1.5 text-[11px] font-medium outline-none focus-visible:ring-1 focus-visible:ring-accent/60 ${
+                    on
+                      ? `${swatch.chip} ring-1 ring-current/30`
+                      : "bg-content/6 text-content/50 hover:bg-content/10 hover:text-content"
+                  }`}
+                >
+                  <span
+                    aria-hidden
+                    className={`size-1.5 rounded-full ${swatch.dot}`}
+                  />
+                  <span className="min-w-0 truncate">{group.name}</span>
+                  {on ? (
+                    <Check className="size-2.5 shrink-0" strokeWidth={2.5} />
+                  ) : null}
+                </button>
+              );
+            })}
+            <label className="inline-flex h-5 items-center gap-1 rounded border border-dashed border-content/20 px-1.5 text-content/40 focus-within:border-content/40 focus-within:text-content/60">
+              <Plus className="size-2.5 shrink-0" strokeWidth={2.5} />
+              <input
+                value={newGroupName}
+                onChange={(event) => setNewGroupName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter") return;
+                  event.preventDefault();
+                  const id = createGroup(newGroupName);
+                  if (id) {
+                    setGroups(loadBoard().groups);
+                    setSelectedGroups((current) => new Set(current).add(id));
+                    setNewGroupName("");
+                  }
+                }}
+                placeholder="New group…"
+                aria-label="New group name"
+                className="w-20 bg-transparent text-[11px] outline-none placeholder:text-content/40"
+              />
+            </label>
           </div>
         </section>
 

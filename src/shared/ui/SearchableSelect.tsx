@@ -32,6 +32,7 @@ export function SearchableSelect({
   searchable = true,
   align = "start",
   minMenuWidth,
+  creatable,
 }: {
   label: string;
   value: string;
@@ -48,6 +49,12 @@ export function SearchableSelect({
   /** Floor for the dropdown width — long option labels stay readable even
    * when the trigger itself is narrow. */
   minMenuWidth?: number;
+  /** Label prefix for a "create" row — when set, search text that matches no
+   * option becomes a pickable entry carrying the raw text (e.g. a new
+   * branch name). The trigger then displays arbitrary values verbatim.
+   * Requires the default `searchable` — with it off there is no query to
+   * create from. */
+  creatable?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -60,18 +67,21 @@ export function SearchableSelect({
   const activeOption = useRef<HTMLButtonElement>(null);
   const listId = useId();
   const selected = options.find((option) => option.value === value);
+  const shown = selected?.label ?? (creatable && value ? value : placeholder);
   const normalizedQuery = query.trim().toLocaleLowerCase();
-  const filtered = useMemo(
-    () =>
-      normalizedQuery
-        ? options.filter((option) =>
-            `${option.label}\n${option.keywords ?? ""}`
-              .toLocaleLowerCase()
-              .includes(normalizedQuery),
-          )
-        : [...options],
-    [normalizedQuery, options],
-  );
+  const filtered = useMemo(() => {
+    const list = normalizedQuery
+      ? options.filter((option) =>
+          `${option.value}\n${option.label}\n${option.keywords ?? ""}`
+            .toLocaleLowerCase()
+            .includes(normalizedQuery),
+        )
+      : [...options];
+    const draft = query.trim();
+    if (creatable && draft && !options.some((option) => option.value === draft))
+      list.push({ value: draft, label: `${creatable} "${draft}"` });
+    return list;
+  }, [normalizedQuery, options, creatable, query]);
   const activeId =
     filtered[active] != null ? `${listId}-option-${active}` : undefined;
   const popoverLayer =
@@ -192,7 +202,7 @@ export function SearchableSelect({
         ref={trigger}
         type="button"
         disabled={disabled}
-        aria-label={`${label}: ${selected?.label ?? placeholder}`}
+        aria-label={`${label}: ${shown}`}
         aria-expanded={open}
         aria-haspopup="dialog"
         onClick={() => (open ? close() : openMenu())}
@@ -213,9 +223,9 @@ export function SearchableSelect({
         }
       >
         <span
-          className={`min-w-0 truncate ${variant === "panel" ? "flex-1 text-right" : variant === "pill" || variant === "row" ? "" : "flex-1"} ${selected ? "text-content" : "text-content/40"}`}
+          className={`min-w-0 truncate ${variant === "panel" ? "flex-1 text-right" : variant === "pill" || variant === "row" ? "" : "flex-1"} ${selected || (creatable && value) ? "text-content" : "text-content/40"}`}
         >
-          {selected?.label ?? placeholder}
+          {shown}
         </span>
         <ChevronDown
           className={`shrink-0 text-content/45 transition-transform duration-150 ease-out ${variant === "pill" || variant === "row" ? "size-3" : "size-3.5"} ${open ? "rotate-180" : ""}`}

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { GitPr, GitPrCheck } from "../../../platform/tauri/fs";
 import { recordInboxSelfActivity } from "./inboxSelfActivity";
 import { normalizeProjectPath } from "../../projects/model/recents";
 
@@ -22,6 +23,9 @@ export type AzureDevOpsWorkItem = {
   draft: boolean;
   repo: string;
   attentionReason: string;
+  /** `refs/heads/…` source/target refs — populated on pull requests. */
+  sourceRefName?: string;
+  targetRefName?: string;
 };
 
 export type AzureDevOpsWorkItemDetails = {
@@ -81,6 +85,7 @@ function itemKey(repo: string, kind: AzureDevOpsKind, number: number): string {
 
 export function clearAzureDevOpsCache() {
   repoByPath.clear();
+  matchByPath.clear();
   detailsByKey.clear();
   detailsInflight.clear();
   threadByKey.clear();
@@ -282,4 +287,90 @@ export async function azureDevOpsMrDiff(
 export function notifyAzureDevOpsChange() {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new Event(AZUREDEVOPS_CHANGE_EVENT));
+}
+
+// ---- Board workstream surface --------------------------------------------
+// Per-branch PR status/create and pipeline builds — the Azure counterpart of
+// `gitPrStatus`/`gitPrChecks`/`gitPrCreate`/`gitPrUpdate` in
+// `platform/tauri/fs`, which route through `gh` and only cover GitHub.
+
+export type AzureDevOpsPrProbe = {
+  pr: GitPr | null;
+  checks: GitPrCheck[];
+};
+
+/** PR + latest pipeline build per definition on the branch and its PR's
+ * validation runs — one round trip per lane probe. Check buckets match
+ * `GitPrCheck` (pass/fail/pending/…). `branch` overrides the checkout's
+ * branch — pass the lane's when `cwd` isn't its own worktree. */
+export function azureDevOpsPrProbe(
+  cwd: string,
+  prUrl?: string,
+  branch?: string,
+): Promise<AzureDevOpsPrProbe> {
+  return invoke<AzureDevOpsPrProbe>("azure_devops_pr_probe", {
+    cwd,
+    prUrl,
+    branch,
+  });
+}
+
+export function azureDevOpsPrCreate(
+  cwd: string,
+  title: string,
+  body: string,
+  base: string,
+  head: string,
+): Promise<string> {
+  return invoke<string>("azure_devops_pr_create", { cwd, title, body, base, head });
+}
+
+/** Replace a pull request's description — `prId` targets the exact PR the
+ * caller created; without it the branch's newest active PR is patched. */
+export function azureDevOpsPrUpdateBody(
+  cwd: string,
+  body: string,
+  prId?: number,
+): Promise<void> {
+  return invoke<void>("azure_devops_pr_update_body", {
+    cwd,
+    body,
+    prId: prId ?? null,
+  });
+}
+
+const matchByPath = new Map<string, { at: number; match: Promise<boolean> }>();
+/** Remotes can change under a live session (repointed origin, added
+ * upstream) — a forever-cache would route PR calls to the wrong provider
+ * until restart. 60s bounds the staleness while absorbing probe churn. */
+const MATCH_TTL_MS = 60_000;
+
+/** Whether the worktree's remote resolves to the configured Azure org — the
+ * board routes PR/CI calls through this surface instead of `gh` when true.
+ * Cached per path: every lane probe and create asks, and each call is a git
+ * subprocess. */
+export function azureDevOpsRepoMatch(cwd: string): Promise<boolean> {
+  const key = normalizeProjectPath(cwd);
+  const entry = matchByPath.get(key);
+  if (entry && Date.now() - entry.at < MATCH_TTL_MS) return entry.match;
+  const match = invoke<boolean>("azure_devops_repo_match", { cwd });
+  // A transient failure (git subprocess, auth) must not poison the cache —
+  // evict rejections so the next probe retries.
+  match.catch(() => matchByPath.delete(key));
+  matchByPath.set(key, { at: Date.now(), match });
+  return match;
+}
+
+/** Pipeline builds for an inbox PR's `repo` (`project/name`) + source ref +
+ * number — CI badges for Azure PR cards that have no local workstream. */
+export function azureDevOpsBranchChecks(
+  repo: string,
+  sourceRefName: string,
+  pr: number,
+): Promise<GitPrCheck[]> {
+  return invoke<GitPrCheck[]>("azure_devops_branch_checks", {
+    repo,
+    branch: sourceRefName,
+    pr,
+  });
 }

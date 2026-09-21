@@ -6,17 +6,29 @@ import type { LinkedWorkItem } from "../sessions/model/session";
  * store only holds what the user changed by hand, so provider/task state
  * never forks.
  */
-export type BoardColumnId = "todo" | "progress" | "review" | "done";
+/** Column ids are plain strings — the four defaults are fixed, custom
+ * columns get `col:…` ids from `newEntityId`. */
+export type BoardColumnId = string;
 
-export const BOARD_COLUMNS: readonly {
+export type BoardColumn = {
   id: BoardColumnId;
   label: string;
-}[] = [
+};
+
+/** The built-in statuses — always present, always in this order around the
+ * custom columns (todo → progress → review → customs → done). Only custom
+ * columns can be deleted. */
+export const BOARD_COLUMNS: readonly BoardColumn[] = [
   { id: "todo", label: "Todo" },
   { id: "progress", label: "In Progress" },
   { id: "review", label: "Review" },
   { id: "done", label: "Done" },
 ];
+
+/** Ids that can't be deleted — derivation/archive logic keys on them. */
+export const DEFAULT_COLUMN_IDS = new Set<string>(
+  BOARD_COLUMNS.map((column) => column.id),
+);
 
 /** A card that lives only on the board — no provider item, no session. */
 export type BoardLocalCard = {
@@ -25,6 +37,10 @@ export type BoardLocalCard = {
   column: BoardColumnId;
   order: number;
   createdAt: number;
+  /** Pinned cards sort to the top of their column (and group wrapper). */
+  pinned?: boolean;
+  /** When the card entered its column — powers the "in progress 6d" age. */
+  placedAt?: number;
 };
 
 /** User-dragged position for a derived card. `order` sorts within a column —
@@ -32,6 +48,21 @@ export type BoardLocalCard = {
 export type BoardPlacement = {
   column: BoardColumnId;
   order: number;
+  pinned?: boolean;
+  /** When the card entered its column — reordering within a column
+   * preserves it, a cross-column move resets it. */
+  placedAt?: number;
+};
+
+/** A snoozed card returns when `until` passes or its wake fingerprint
+ * changes — whichever comes first. A snooze must name at least one wake
+ * condition; a condition-less "hide forever" is what `hidden` is for. */
+export type Snooze = {
+  /** Epoch ms — card reappears after this. */
+  until?: number;
+  /** `snoozeWakeKey(card)` at snooze time — a provider/CI/session change
+   * wakes the card early. */
+  wake?: string;
 };
 
 /** One repo lane of a task: a branch on a worktree (or the main checkout)
@@ -42,6 +73,9 @@ export type TaskWorkstream = {
   branch: string;
   base: string;
   worktreePath?: string;
+  /** Pinned provider PR — review lanes fetch `pr/<N>` branches that never
+   * match the PR's real head name, so probes target this url directly. */
+  prUrl?: string;
   /** Bound sessions — a lane can hold multiple conversations. First is
    * treated as primary on the board card. */
   sessionIds?: string[];
@@ -75,9 +109,13 @@ type Store = {
   locals: BoardLocalCard[];
   tasks: BoardTask[];
   groups: BoardGroup[];
+  /** Ordered columns — defaults plus user-added statuses. */
+  columns: readonly BoardColumn[];
   /** Dismissed derived-card ids (items/archived rows) — hidden until
    * restored via `unarchiveAll`. */
   hidden: string[];
+  /** Temporarily hidden cards — return on `until` or a wake-key change. */
+  snoozed: Record<string, Snooze>;
   /** Non-task card id → group ids. Tasks carry `groupIds` on their record;
    * derived cards (items/locals) keep membership here keyed by card id. */
   cardGroups: Record<string, string[]>;
@@ -87,17 +125,17 @@ const KEY = "monocode.board.v1";
 const EVENT = "monocode:board-changed";
 const MAX_PLACEMENTS = 500;
 const MAX_LOCALS = 100;
-const MAX_TASKS = 100;
+export const MAX_TASKS = 100;
 const MAX_LINKS = 20;
-const MAX_WORKSTREAMS = 12;
+export const MAX_WORKSTREAMS = 12;
 const MAX_GROUPS = 24;
-const MAX_TASK_GROUPS = 8;
+export const MAX_TASK_GROUPS = 8;
 const MAX_HIDDEN = 500;
 const MAX_CARD_GROUPS = 200;
 const MAX_TEXT = 300;
 const MAX_GROUP_NAME = 48;
-
-const COLUMN_IDS = new Set<string>(BOARD_COLUMNS.map((column) => column.id));
+const MAX_COLUMNS = 12;
+const MAX_COLUMN_LABEL = 24;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
@@ -111,10 +149,11 @@ const cleanString = (value: unknown, max = MAX_TEXT): string | undefined => {
 const cleanOrder = (value: unknown): number =>
   typeof value === "number" && Number.isFinite(value) ? value : 0;
 
-const cleanColumn = (value: unknown): BoardColumnId | null =>
-  typeof value === "string" && COLUMN_IDS.has(value)
-    ? (value as BoardColumnId)
-    : null;
+const cleanColumn = (
+  value: unknown,
+  ids: ReadonlySet<string>,
+): BoardColumnId | null =>
+  typeof value === "string" && ids.has(value) ? value : null;
 
 const cleanNumber = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) ? value : undefined;
@@ -211,6 +250,9 @@ function sanitizeTasks(value: unknown): BoardTask[] {
           ...(cleanString(ws.worktreePath, 600)
             ? { worktreePath: cleanString(ws.worktreePath, 600) }
             : {}),
+          ...(cleanString(ws.prUrl, 600)
+            ? { prUrl: cleanString(ws.prUrl, 600) }
+            : {}),
           ...(sessionIds.length ? { sessionIds } : {}),
         });
       }
@@ -253,21 +295,59 @@ function sanitizeGroups(value: unknown): BoardGroup[] {
   return groups;
 }
 
+/** Stored column list normalized to `todo → progress → review → customs →
+ * done`. Missing defaults are injected; customs keep their stored order and
+ * can only live between review and done. */
+function sanitizeColumns(value: unknown): BoardColumn[] {
+  const stored = new Map<string, BoardColumn>();
+  const customs: BoardColumn[] = [];
+  if (Array.isArray(value)) {
+    for (const raw of value) {
+      if (!isRecord(raw)) continue;
+      const id = cleanString(raw.id, 60);
+      const label = cleanString(raw.label, MAX_COLUMN_LABEL);
+      if (!id || !label || stored.has(id)) continue;
+      const column = { id, label };
+      stored.set(id, column);
+      if (
+        !DEFAULT_COLUMN_IDS.has(id) &&
+        customs.length < MAX_COLUMNS - BOARD_COLUMNS.length
+      )
+        customs.push(column);
+    }
+  }
+  // Defaults hold their canonical slots; customs live between review and
+  // done — the same slot `addColumn` writes.
+  const get = (id: BoardColumnId) =>
+    stored.get(id) ?? BOARD_COLUMNS.find((column) => column.id === id)!;
+  return [get("todo"), get("progress"), get("review"), ...customs, get("done")];
+}
+
 function sanitizeStore(value: unknown): Store {
   const placements: Record<string, BoardPlacement> = {};
   const locals: BoardLocalCard[] = [];
   let tasks: BoardTask[] = [];
   let groups: BoardGroup[] = [];
   const hidden: string[] = [];
+  const snoozed: Record<string, Snooze> = {};
   const cardGroups: Record<string, string[]> = {};
+  const columns = isRecord(value) ? sanitizeColumns(value.columns) : null;
+  const columnIds = new Set((columns ?? BOARD_COLUMNS).map((c) => c.id));
   if (isRecord(value)) {
     if (isRecord(value.placements)) {
       for (const [key, raw] of Object.entries(value.placements)) {
         if (Object.keys(placements).length >= MAX_PLACEMENTS) break;
         if (!key || key.length > 300 || !isRecord(raw)) continue;
-        const column = cleanColumn(raw.column);
+        const column = cleanColumn(raw.column, columnIds);
         if (!column) continue;
-        placements[key] = { column, order: cleanOrder(raw.order) };
+        placements[key] = {
+          column,
+          order: cleanOrder(raw.order),
+          ...(raw.pinned === true ? { pinned: true } : {}),
+          ...(cleanNumber(raw.placedAt) !== undefined
+            ? { placedAt: cleanNumber(raw.placedAt) }
+            : {}),
+        };
       }
     }
     if (Array.isArray(value.locals)) {
@@ -276,7 +356,7 @@ function sanitizeStore(value: unknown): Store {
         if (!isRecord(raw)) continue;
         const id = cleanString(raw.id, 120);
         const title = cleanString(raw.title);
-        const column = cleanColumn(raw.column) ?? "todo";
+        const column = cleanColumn(raw.column, columnIds) ?? "todo";
         if (!id || !title) continue;
         locals.push({
           id,
@@ -287,6 +367,10 @@ function sanitizeStore(value: unknown): Store {
             typeof raw.createdAt === "number" && Number.isFinite(raw.createdAt)
               ? raw.createdAt
               : Date.now(),
+          ...(raw.pinned === true ? { pinned: true } : {}),
+          ...(cleanNumber(raw.placedAt) !== undefined
+            ? { placedAt: cleanNumber(raw.placedAt) }
+            : {}),
         });
       }
     }
@@ -297,6 +381,21 @@ function sanitizeStore(value: unknown): Store {
         if (hidden.length >= MAX_HIDDEN) break;
         const id = cleanString(entry, 300);
         if (id && !hidden.includes(id)) hidden.push(id);
+      }
+    }
+    if (isRecord(value.snoozed)) {
+      for (const [key, raw] of Object.entries(value.snoozed)) {
+        if (Object.keys(snoozed).length >= MAX_HIDDEN) break;
+        if (!key || key.length > 300 || !isRecord(raw)) continue;
+        const until = cleanNumber(raw.until);
+        const wake = cleanString(raw.wake, 600);
+        if (until === undefined && !wake) continue;
+        // Already-expired snoozes are done sleeping.
+        if (until !== undefined && until <= Date.now()) continue;
+        snoozed[key] = {
+          ...(until !== undefined ? { until } : {}),
+          ...(wake ? { wake } : {}),
+        };
       }
     }
     if (isRecord(value.cardGroups)) {
@@ -326,7 +425,16 @@ function sanitizeStore(value: unknown): Store {
     cardGroups[cardId] = cardGroups[cardId].filter((id) => valid.has(id));
     if (!cardGroups[cardId].length) delete cardGroups[cardId];
   }
-  return { placements, locals, tasks, groups, hidden, cardGroups };
+  return {
+    placements,
+    locals,
+    tasks,
+    groups,
+    columns: columns ?? [...BOARD_COLUMNS],
+    hidden,
+    snoozed,
+    cardGroups,
+  };
 }
 
 let memoryRaw: string | null = null;
@@ -345,7 +453,9 @@ const EMPTY_STORE: Store = {
   locals: [],
   tasks: [],
   groups: [],
+  columns: BOARD_COLUMNS,
   hidden: [],
+  snoozed: {},
   cardGroups: {},
 };
 
@@ -409,24 +519,112 @@ export function placeColumnOrder(
   orderedIds: readonly string[],
 ) {
   const store = loadBoard();
+  if (!store.columns.some((entry) => entry.id === column)) return;
+  const now = Date.now();
   const placements = { ...store.placements };
   const localIds = new Set(store.locals.map((card) => card.id));
   let index = 0;
   const locals = store.locals.map((card) => {
     const position = orderedIds.indexOf(card.id);
-    return position >= 0
-      ? { ...card, column, order: position * 1024 }
-      : card;
+    if (position < 0) return card;
+    // A reorder inside the column keeps its entry time — only a real
+    // move restarts the age clock.
+    return {
+      ...card,
+      column,
+      order: position * 1024,
+      placedAt: card.column === column ? (card.placedAt ?? now) : now,
+    };
   });
   for (const id of orderedIds) {
     if (localIds.has(id)) {
       index += 1;
       continue;
     }
-    placements[id] = { column, order: index * 1024 };
+    const prior = placements[id];
+    placements[id] = {
+      column,
+      order: index * 1024,
+      ...(prior?.pinned ? { pinned: true } : {}),
+      placedAt: prior?.column === column ? (prior.placedAt ?? now) : now,
+    };
     index += 1;
   }
   writeStore({ ...store, placements, locals });
+}
+
+/** Pin a card to the top of a column — and to the top of its group wrapper,
+ * since pinned members sort first. Pinning an unplaced card writes a
+ * placement at the column's top; unpinning clears the flag but keeps the
+ * position (Reset removes the placement entirely). */
+export function pinCard(
+  cardId: string,
+  column: BoardColumnId,
+  pinned: boolean,
+) {
+  const store = loadBoard();
+  if (!store.columns.some((entry) => entry.id === column)) return;
+  const topOrder = pinned
+    ? Math.min(
+        0,
+        ...Object.values(store.placements)
+          .filter((p) => p.column === column)
+          .map((p) => p.order),
+        ...store.locals
+          .filter((c) => c.column === column)
+          .map((c) => c.order),
+      ) - 1024
+    : 0;
+  if (store.locals.some((card) => card.id === cardId)) {
+    writeStore({
+      ...store,
+      locals: store.locals.map((card) =>
+        card.id === cardId
+          ? {
+              ...card,
+              pinned: pinned || undefined,
+              ...(pinned
+                ? {
+                    column,
+                    order: topOrder,
+                    placedAt:
+                      card.column === column
+                        ? (card.placedAt ?? Date.now())
+                        : Date.now(),
+                  }
+                : {}),
+            }
+          : card,
+      ),
+    });
+    return;
+  }
+  const placements = { ...store.placements };
+  const existing = placements[cardId];
+  if (pinned) {
+    placements[cardId] = {
+      column,
+      order: topOrder,
+      pinned: true,
+      // Pinning isn't a move — keep the column-entry time unless the
+      // pin also carried the card across columns.
+      placedAt:
+        existing?.column === column
+          ? (existing.placedAt ?? Date.now())
+          : Date.now(),
+    };
+  } else if (existing?.pinned) {
+    placements[cardId] = {
+      column: existing.column,
+      order: existing.order,
+      ...(existing.placedAt !== undefined
+        ? { placedAt: existing.placedAt }
+        : {}),
+    };
+  } else {
+    return;
+  }
+  writeStore({ ...store, placements });
 }
 
 /** Back to the derived column — clears both placement and ordering. */
@@ -456,6 +654,7 @@ export function addLocalCard(title: string): string | null {
         column: "todo",
         order: topOrder - 1024,
         createdAt: Date.now(),
+        placedAt: Date.now(),
       },
     ],
   });
@@ -466,12 +665,15 @@ export function removeLocalCard(id: string) {
   const store = loadBoard();
   const cardGroups = { ...store.cardGroups };
   delete cardGroups[id];
+  const snoozed = { ...store.snoozed };
+  delete snoozed[id];
   writeStore({
     ...store,
     locals: store.locals.filter((card) => card.id !== id),
-    // A locally-archived card leaves a `hidden` entry — prune it.
+    // A locally-archived card leaves `hidden`/`snoozed` entries — prune.
     hidden: store.hidden.filter((entry) => entry !== id),
     cardGroups,
+    snoozed,
   });
 }
 
@@ -501,12 +703,39 @@ export function hideCards(ids: readonly string[]) {
   writeStore({ ...store, hidden: merged });
 }
 
+/** Snooze a card — it disappears until `snooze.until` passes or its wake
+ * fingerprint (`snoozeWakeKey` at snooze time) changes, e.g. a CI flip or
+ * a new review. An empty snooze has no wake condition — permanent
+ * dismissal is `hideCards`. */
+export function snoozeCard(cardId: string, snooze: Snooze) {
+  if (snooze.until === undefined && !snooze.wake) return;
+  const store = loadBoard();
+  if (
+    !(cardId in store.snoozed) &&
+    Object.keys(store.snoozed).length >= MAX_HIDDEN
+  )
+    return;
+  writeStore({
+    ...store,
+    snoozed: { ...store.snoozed, [cardId]: snooze },
+  });
+}
+
+export function unsnoozeCard(cardId: string) {
+  const store = loadBoard();
+  if (!(cardId in store.snoozed)) return;
+  const snoozed = { ...store.snoozed };
+  delete snoozed[cardId];
+  writeStore({ ...store, snoozed });
+}
+
 /** Restore everything archived: hidden derived cards + archived tasks. */
 export function unarchiveAll() {
   const store = loadBoard();
   writeStore({
     ...store,
     hidden: [],
+    snoozed: {},
     tasks: store.tasks.map((task) =>
       task.archived ? { ...task, archived: false } : task,
     ),
@@ -532,12 +761,16 @@ export function addTask(input: {
   title: string;
   links: LinkedWorkItem[];
   workstreams: TaskWorkstream[];
+  groupIds?: string[];
 }): string | null {
   const title = input.title.trim().slice(0, MAX_TEXT);
   if (!title) return null;
   const store = loadBoard();
   if (store.tasks.length >= MAX_TASKS) return null;
   const id = newEntityId("task");
+  const groupIds = (input.groupIds ?? [])
+    .filter((groupId) => store.groups.some((group) => group.id === groupId))
+    .slice(0, MAX_TASK_GROUPS);
   writeStore({
     ...store,
     tasks: [
@@ -547,6 +780,7 @@ export function addTask(input: {
         title,
         links: input.links.slice(0, MAX_LINKS),
         workstreams: input.workstreams.slice(0, MAX_WORKSTREAMS),
+        ...(groupIds.length ? { groupIds } : {}),
         createdAt: Date.now(),
       },
     ],
@@ -580,10 +814,13 @@ export function removeTask(id: string) {
   if (!store.tasks.some((task) => task.id === id)) return;
   const placements = { ...store.placements };
   delete placements[id];
+  const snoozed = { ...store.snoozed };
+  delete snoozed[id];
   writeStore({
     ...store,
     tasks: store.tasks.filter((task) => task.id !== id),
     placements,
+    snoozed,
   });
 }
 
@@ -648,22 +885,6 @@ export function deleteGroup(id: string) {
   });
 }
 
-/** Group a non-task card (item/local). Prepends so the group becomes
- * primary — a drop onto a wrapper lands the card inside it. */
-export function addCardToGroup(cardId: string, groupId: string) {
-  const store = loadBoard();
-  if (!store.groups.some((group) => group.id === groupId)) return;
-  const current = store.cardGroups[cardId] ?? [];
-  if (current.includes(groupId)) return;
-  writeStore({
-    ...store,
-    cardGroups: {
-      ...store.cardGroups,
-      [cardId]: [groupId, ...current].slice(0, MAX_TASK_GROUPS),
-    },
-  });
-}
-
 export function removeCardFromGroup(cardId: string, groupId: string) {
   const store = loadBoard();
   const current = store.cardGroups[cardId];
@@ -675,8 +896,8 @@ export function removeCardFromGroup(cardId: string, groupId: string) {
   writeStore({ ...store, cardGroups });
 }
 
-/** Replace a non-task card's group membership wholesale — drag drops treat
- * the wrapper as the card's single home. */
+/** Replace a non-task card's group membership wholesale — callers compute
+ * the merged list (first id is primary: the wrapper the card renders in). */
 export function setCardGroups(cardId: string, ids: readonly string[]) {
   const store = loadBoard();
   const valid = new Set(store.groups.map((group) => group.id));
@@ -687,4 +908,80 @@ export function setCardGroups(cardId: string, ids: readonly string[]) {
   if (next.length) cardGroups[cardId] = next;
   else delete cardGroups[cardId];
   writeStore({ ...store, cardGroups });
+}
+
+// --- columns -------------------------------------------------------------
+
+/** Add a custom status column, inserted before Done. Returns its id. */
+export function addColumn(label: string): string | null {
+  const cleaned = label.trim().slice(0, MAX_COLUMN_LABEL);
+  if (!cleaned) return null;
+  const store = loadBoard();
+  if (store.columns.length >= MAX_COLUMNS) return null;
+  const column = { id: newEntityId("col"), label: cleaned };
+  const columns = [...store.columns];
+  const doneIndex = columns.findIndex((entry) => entry.id === "done");
+  columns.splice(doneIndex < 0 ? columns.length : doneIndex, 0, column);
+  writeStore({ ...store, columns });
+  return column.id;
+}
+
+export function renameColumn(id: string, label: string) {
+  const cleaned = label.trim().slice(0, MAX_COLUMN_LABEL);
+  if (!cleaned) return;
+  const store = loadBoard();
+  if (!store.columns.some((column) => column.id === id)) return;
+  writeStore({
+    ...store,
+    columns: store.columns.map((column) =>
+      column.id === id ? { ...column, label: cleaned } : column,
+    ),
+  });
+}
+
+/** Deletes a custom column — defaults refuse. With `target`, its cards move
+ * to that column appended at the end; otherwise placements drop (cards fall
+ * back to their derived column) and local cards move to Todo. */
+export function removeColumn(id: string, target?: string) {
+  if (DEFAULT_COLUMN_IDS.has(id)) return;
+  const store = loadBoard();
+  if (!store.columns.some((column) => column.id === id)) return;
+  const destination =
+    target && target !== id && store.columns.some((c) => c.id === target)
+      ? target
+      : undefined;
+  // Moved cards append after the destination's content — the fallback for
+  // local cards is Todo, so that's the baseline when no target was picked.
+  const appendTo = destination ?? "todo";
+  let order = Math.max(
+    0,
+    ...Object.values(store.placements)
+      .filter((p) => p.column === appendTo)
+      .map((p) => p.order),
+    ...store.locals
+      .filter((c) => c.column === appendTo)
+      .map((c) => c.order),
+  );
+  const placements: Record<string, BoardPlacement> = {};
+  const now = Date.now();
+  for (const [cardId, placement] of Object.entries(store.placements)) {
+    if (placement.column !== id) placements[cardId] = placement;
+    else if (destination)
+      placements[cardId] = {
+        column: destination,
+        order: (order += 1024),
+        ...(placement.pinned ? { pinned: true } : {}),
+        placedAt: now,
+      };
+  }
+  writeStore({
+    ...store,
+    columns: store.columns.filter((column) => column.id !== id),
+    placements,
+    locals: store.locals.map((card) =>
+      card.column === id
+        ? { ...card, column: appendTo, order: (order += 1024), placedAt: now }
+        : card,
+    ),
+  });
 }

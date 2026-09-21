@@ -54,6 +54,11 @@ pub struct GitlabWorkItem {
     pub draft: bool,
     pub repo: String,
     pub attention_reason: String,
+    /// `refs/heads/<source_branch>` on MRs — lets the board join a merge
+    /// request to the workstream lane building that branch (same shape
+    /// Azure's `sourceRefName` carries).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_ref_name: String,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -480,6 +485,13 @@ fn parse_work_item(row: &Value, kind: &str, repo: &str) -> Option<GitlabWorkItem
         draft,
         repo: repo.into(),
         attention_reason: String::new(),
+        source_ref_name: if kind == "pr" {
+            string_field(row, "source_branch")
+                .map(|branch| format!("refs/heads/{branch}"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
     })
 }
 
