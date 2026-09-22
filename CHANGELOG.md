@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Hermes turns stay busy while detached subagents are running and resume automatically with their completed transcripts instead of requiring a manual Continue. Hermes ACP usage updates also populate the context meter. In #335.
 
+## [0.3.6] - 2026-09-22
+
+### Fixed
+
+- Automatically connect the saved WSL distribution when opening or restoring a project or creating an agent session. Failed connections keep the session and draft available for manual retry.
+- Refresh model discovery after WSL connects, keep the compact model picker on the selected WSL host, and discover provider models even when bundled defaults already exist.
+- Show model discovery errors and Retry controls in the composer and provider settings instead of reporting the bundled Default entry as a discovered catalog.
+- Preserve refreshed catalogs when stale WSL disconnect events arrive and keep abandoned connection requests from affecting another session.
+- Fix Windows CI lint failures in test-only worktree helpers and process-statistics test layout.
+
 ## [0.3.5] - 2026-09-22
 
 ### Added
