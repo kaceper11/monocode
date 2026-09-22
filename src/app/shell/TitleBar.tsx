@@ -3,6 +3,7 @@ import {
   CheckCircle,
   ChevronLeft,
   ChevronRight,
+  Globe,
   Inbox,
   PanelLeft,
   Plus,
@@ -75,6 +76,8 @@ export type Tab = {
   groupId?: string;
   dirty?: boolean;
   terminal?: boolean;
+  /** The representative file is a browser tab — show the globe. */
+  browser?: boolean;
 };
 
 type Props = {
@@ -336,6 +339,13 @@ function TitleTabItem({
           />
         ) : tab.terminal || !fileIcon ? (
           <Terminal
+            className={`size-3.5 shrink-0 ${
+              active ? "text-content" : "text-content/55"
+            }`}
+            strokeWidth={1.75}
+          />
+        ) : tab.browser ? (
+          <Globe
             className={`size-3.5 shrink-0 ${
               active ? "text-content" : "text-content/55"
             }`}

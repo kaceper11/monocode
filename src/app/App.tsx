@@ -4,7 +4,7 @@ import { pruneQueuedSavedCommands } from "../features/sessions/model/savedComman
 import { useKeepAwake } from "../features/sessions/model/keepAwake";
 import { LinkChoiceMenu } from "../features/sessions/ui/LinkChoiceMenu";
 import { newBrowserTab, openBrowserTab, closeBrowserTabs, updateBrowserTab, type BrowserMetaPatch } from "../features/sessions/model/browserWorkspace";
-import { OPEN_BROWSER_EVENT, requestBrowserCommand, isBrowserOpenRequest, normalizeBrowserUrl, rememberedBrowserUrl } from "../features/sessions/model/browser";
+import { OPEN_BROWSER_EVENT, requestBrowserCommand, isBrowserOpenRequest, normalizeBrowserUrl, rememberedBrowserUrl, browserTabLabel } from "../features/sessions/model/browser";
 import { BROWSER_CONTEXT_ADDED } from "../features/sessions/model/browserContext";
 import { inboxProvider, inboxSessionDescription } from "../features/sessions/model/inboxProvider";
 import { useWslProjects } from "../shared/hooks/useWslProjects";
@@ -742,6 +742,7 @@ function titleTabsEqual(a: TitleTab[], b: TitleTab[]): boolean {
       tab.fileFocused === other.fileFocused &&
       tab.blank === other.blank &&
       tab.terminal === other.terminal &&
+      tab.browser === other.browser &&
       tab.groupId === other.groupId
     );
   });
@@ -9516,6 +9517,7 @@ function toTitleTab(
 
   const files: string[] = [];
   const seenKeys = new Set<string>();
+  let firstIsBrowser = false;
   const pushFile = (file: FilePaneTab) => {
     const key = file.terminal
       ? `terminal:${file.id}`
@@ -9526,13 +9528,16 @@ function toTitleTab(
           : file.path;
     if (seenKeys.has(key)) return;
     seenKeys.add(key);
+    if (files.length === 0) firstIsBrowser = !!file.browser;
     files.push(
       file.plan?.title?.trim() ||
         (file.releaseNotes
           ? releaseNotesTitle(file.releaseNotes.version)
-          : file.terminal
-            ? terminalTabLabel(file)
-            : basename(file.path)),
+          : file.browser
+            ? browserTabLabel(file.browser.url || file.path, file.browser.title)
+            : file.terminal
+              ? terminalTabLabel(file)
+              : basename(file.path)),
     );
   };
   const focusedPane =
@@ -9584,6 +9589,7 @@ function toTitleTab(
       ),
     ),
     terminal: hasTerminal && harnesses.length === 0,
+    browser: firstIsBrowser,
     groupId: tab.groupId,
   };
 }

@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The board's assigned-only listing now reaches Jira — a saved Jira filter or an unchecked inbox toggle no longer leaks unassigned tickets onto the board.
+- Workspace tabs containing a browser pane now show the page title or host with the globe icon instead of a raw URL segment.
 
 ## [0.3.3] - 2026-09-22
 
