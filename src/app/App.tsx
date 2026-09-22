@@ -207,8 +207,10 @@ import {
   bindHarnessSession,
   cancelHarnessTurn,
   canCompactHarnessContext,
+  canRewindHarnessLastTurn,
   canSteerHarness,
   compactHarnessContext,
+  rewindHarnessLastTurn,
   forgetHarnessSession,
   generateHarnessTitle,
   generateHarnessBranchName,
@@ -253,6 +255,10 @@ import {
 } from "../features/sessions/model/handoff";
 import { requestOutgoingHandoff } from "../features/sessions/model/handoffTurn";
 import { isEditTool } from "../integrations/harness/core/preview";
+import {
+  createEditedResendAttempt,
+  createEditedResendCoordinator,
+} from "../features/sessions/model/editLastTurn";
 import {
   beginSessionTurn,
   applySessionCheckpoint,
@@ -325,6 +331,7 @@ import {
   type AddToChatRequest,
 } from "../features/sessions/model/quoteDraft";
 import { createSessionRemover } from "../features/sessions/model/sessionRemoval";
+import { shouldGenerateSessionTitle } from "../features/sessions/model/sessionTitle";
 import {
   DEFAULT_PROVIDER_ACCOUNT_ID,
   providerAccountExists,
@@ -348,6 +355,7 @@ import {
   titleFromPrompt,
   type Attachment,
   type Block,
+  type ComposerTurnOptions,
   type HarnessId,
   type LinkedWorkItem,
   type ModelTarget,
@@ -356,7 +364,6 @@ import {
   type PlanStatus,
   type SecondOpinionMeta,
   type Session,
-  type TurnIntent,
   type WorkspaceMode,
 } from "../features/sessions/model/session";
 
@@ -376,6 +383,7 @@ import {
   replaceInFlightSessions,
   saveWorkspaceSnapshot,
   setSessionArchived,
+  setSessionLinkedWorkItem,
   setSessionPinned,
   shouldPersistSession,
   upsertSession,
@@ -474,6 +482,7 @@ import {
 } from "../features/inbox/model/githubTasks";
 import {
   bindLinkedWorkItemAccount,
+  linkedWorkItemFromAutomationEvent,
   linkedWorkItemFromInboxItem,
   resolveLinkedWorkItem,
 } from "../features/sessions/model/sessionWorkItem";
@@ -554,19 +563,19 @@ type LinkedWorkItemPanelState = {
   cwd: string;
 };
 
-type SubmitOptions = {
+type SubmitOptions = ComposerTurnOptions & {
   secondOpinion?: SecondOpinionMeta;
   followUpBehavior?: FollowUpBehavior;
   noteCard?: NoteComposerCard;
   handoffCard?: HandoffComposerCard;
   queuedMessageId?: string;
-  intent?: TurnIntent;
   planBlockId?: string;
   buildTarget?: PlanBuildTarget;
   managed?: boolean;
   orchestrationRetry?: OrchestrationProposal;
-  draftBlockId?: string;
   onSettled?: (outcome: ControlOutcome) => void;
+  /** Generate a fresh title even when this is not the session's first turn. */
+  refreshTitle?: boolean;
   /** Internal guard for the retry after resolving a renamed project. */
   projectLocationReady?: boolean;
 };
@@ -1014,6 +1023,7 @@ export default function App({
     canForward: false,
   });
   const turnGen = useRef(new Map<string, number>());
+  const editedResends = useRef(createEditedResendCoordinator()).current;
   const lastPersisted = useRef(new Map<string, string>());
   const lastBoundProvider = useRef(new Map<string, string>());
   const lastPersistedUserBlock = useRef(new Map<string, string>());
@@ -4421,6 +4431,82 @@ export default function App({
     [],
   );
 
+  const onSetHistorySessionLinkedWorkItem = useCallback(
+    (sessionId: string, linkedWorkItem: LinkedWorkItem | undefined) => {
+      const previousLinkedWorkItem =
+        sessionsRef.current.find((session) => session.id === sessionId)
+          ?.linkedWorkItem ??
+        history.find((session) => session.id === sessionId)?.linkedWorkItem;
+      invalidateLoadedSession(sessionId);
+      loadedSessionCache.current.delete(sessionId);
+
+      const nextSessions = sessionsRef.current.map((session) =>
+        session.id === sessionId ? { ...session, linkedWorkItem } : session,
+      );
+      sessionsRef.current = nextSessions;
+      setSessions(nextSessions);
+      setHistory((current) =>
+        current.map((session) =>
+          session.id === sessionId ? { ...session, linkedWorkItem } : session,
+        ),
+      );
+      setStoredLinkedSessions((current) =>
+        linkedWorkItem
+          ? current.map((session) =>
+              session.id === sessionId
+                ? { ...session, linkedWorkItem }
+                : session,
+            )
+          : current.filter((session) => session.id !== sessionId),
+      );
+      setLinkedWorkItemPanels((current) => {
+        if (!current.has(sessionId)) return current;
+        const next = new Map(current);
+        next.delete(sessionId);
+        return next;
+      });
+
+      void setSessionLinkedWorkItem(sessionId, linkedWorkItem).catch(
+        (error) => {
+          const rolledBackSessions = sessionsRef.current.map((session) =>
+            session.id === sessionId &&
+            session.linkedWorkItem === linkedWorkItem
+              ? { ...session, linkedWorkItem: previousLinkedWorkItem }
+              : session,
+          );
+          sessionsRef.current = rolledBackSessions;
+          setSessions(rolledBackSessions);
+          setHistory((current) =>
+            current.map((session) =>
+              session.id === sessionId &&
+              session.linkedWorkItem === linkedWorkItem
+                ? { ...session, linkedWorkItem: previousLinkedWorkItem }
+                : session,
+            ),
+          );
+          setStoredLinkedSessions((current) =>
+            previousLinkedWorkItem
+              ? current.map((session) =>
+                  session.id === sessionId
+                    ? {
+                        ...session,
+                        linkedWorkItem: previousLinkedWorkItem,
+                      }
+                    : session,
+                )
+              : current.filter((session) => session.id !== sessionId),
+          );
+          void refreshHistory(sidebarCwd);
+          void message(
+            `Could not update this conversation's GitHub link.\n\n${String(error)}`,
+            { title: "MonoCode", kind: "error" },
+          );
+        },
+      );
+    },
+    [history, invalidateLoadedSession, refreshHistory, sidebarCwd],
+  );
+
   const onArchiveHistorySessions = useCallback(
     async (sessionIds: readonly string[], archived: boolean) => {
       for (const sessionId of sessionIds) {
@@ -5440,6 +5526,7 @@ export default function App({
       attachments: Attachment[] = [],
       options?: SubmitOptions,
     ) => {
+      if (editedResends.isActive(sessionId)) return false;
       const controlError = orchestrator.submissionError(
         sessionId,
         options?.managed,
@@ -5497,9 +5584,17 @@ export default function App({
             ),
           }
         : storedCurrent;
-      const current = options?.buildTarget
+      let current = options?.buildTarget
         ? withPlanBuildTarget(draftCleared, options.buildTarget)
         : draftCleared;
+      const editedResend = options?.resendEdited
+        ? createEditedResendAttempt(current, options.onResendRejected)
+        : undefined;
+      if (options?.resendEdited && !editedResend) return false;
+      const editedProviderTurnId = editedResend?.providerTurnId;
+      if (editedResend) {
+        current = { ...current, blocks: editedResend.blocks };
+      }
       const intent = options?.intent ?? "default";
       if (intent === "orchestrate") {
         try {
@@ -5633,21 +5728,21 @@ export default function App({
         dismissNoticesForContinuedSession(sessionId);
         const visible = displayAttachments(attachments);
         const cards = userTurnCards(noteCard);
-        setSessions((prev) =>
-          prev.map((s) => {
-            if (s.id !== sessionId) return s;
-            let next: Session = {
-              ...s,
-              inboxCard: rawCommand ? s.inboxCard : undefined,
-              noteCard: rawCommand ? s.noteCard : undefined,
-              handoffCard: rawCommand ? s.handoffCard : undefined,
-            };
-            if (options?.queuedMessageId) {
-              next = dequeueQueuedMessage(next, options.queuedMessageId);
-            }
-            return appendSteerUser(next, submittedText, visible, cards);
-          }),
-        );
+        const nextSessions = sessionsRef.current.map((s) => {
+          if (s.id !== sessionId) return s;
+          let next: Session = {
+            ...s,
+            inboxCard: rawCommand ? s.inboxCard : undefined,
+            noteCard: rawCommand ? s.noteCard : undefined,
+            handoffCard: rawCommand ? s.handoffCard : undefined,
+          };
+          if (options?.queuedMessageId) {
+            next = dequeueQueuedMessage(next, options.queuedMessageId);
+          }
+          return appendSteerUser(next, submittedText, visible, cards);
+        });
+        sessionsRef.current = nextSessions;
+        setSessions(nextSessions);
         void (async () => {
           try {
             const prepared = await prepareAttachments(attachments, initialWorkCwd);
@@ -5723,6 +5818,7 @@ export default function App({
               message,
             });
             flushHarnessEvents();
+            editedResend?.reject();
             options?.onSettled?.({
               status: "failed",
               text: "",
@@ -5793,97 +5889,116 @@ export default function App({
       }
 
       dismissNoticesForContinuedSession(sessionId);
-      setSessions((prev) =>
-        prev.map((s) => {
-          if (s.id !== sessionId) return s;
-          const draftRemoved = draftBlock
-            ? {
-                ...s,
-                blocks: s.blocks.filter((block) => block.id !== draftBlock.id),
-              }
-            : s;
-          const selected = options?.buildTarget
-            ? withPlanBuildTarget(draftRemoved, options.buildTarget)
-            : draftRemoved;
-          const titled = isFirstTurn ? titleSeed : selected.title;
-          let next: Session = {
-            ...selected,
-            providerAccountId,
-            worktreePreparing: createDraftWorktree
-              ? true
-              : selected.worktreePreparing,
-            inboxCard: rawCommand ? s.inboxCard : undefined,
-            noteCard: rawCommand ? s.noteCard : undefined,
-            handoffCard: rawCommand ? s.handoffCard : undefined,
-          };
-          if (approvedPlan && intent === "build") {
-            next = {
-              ...next,
-              blocks: next.blocks.map((block) =>
-                block.id === approvedPlan.id
-                  ? {
-                      ...block,
-                      plan: {
-                        ...(block.plan ?? { status: "ready" as const }),
-                        status: "building" as const,
-                        approvedText: block.text,
-                      },
-                    }
-                  : block,
-              ),
+      const commitSubmittedTurn = () => {
+        setSessions((prev) =>
+          prev.map((s) => {
+            if (s.id !== sessionId) return s;
+            const draftRemoved = draftBlock
+              ? {
+                  ...s,
+                  blocks: s.blocks.filter((block) => block.id !== draftBlock.id),
+                }
+              : s;
+            const selected = options?.buildTarget
+              ? withPlanBuildTarget(draftRemoved, options.buildTarget)
+              : draftRemoved;
+            const titled = isFirstTurn ? titleSeed : selected.title;
+            let next: Session = {
+              ...selected,
+              providerAccountId,
+              worktreePreparing: createDraftWorktree
+                ? true
+                : selected.worktreePreparing,
+              inboxCard: rawCommand ? s.inboxCard : undefined,
+              noteCard: rawCommand ? s.noteCard : undefined,
+              handoffCard: rawCommand ? s.handoffCard : undefined,
             };
-          }
-          if (options?.queuedMessageId) {
-            next = dequeueQueuedMessage(next, options.queuedMessageId);
-          }
-          if (!live) {
-            return {
-              ...next,
-              title: titled,
-              pendingSwitch: undefined,
-              busy: false,
-              blocks: [
-                ...next.blocks,
-                {
-                  id: crypto.randomUUID(),
-                  role: "user",
-                  text: visibleText,
-                  ...(visible.length > 0 ? { attachments: visible } : {}),
-                  ...cards,
-                },
-                {
-                  id: crypto.randomUUID(),
-                  role: "system",
-                  text: `${next.harness} is not connected yet — install and sign in to that provider, then retry.`,
-                  notice: "error",
-                },
-              ],
-            };
-          }
-          if (pendingSwitch) {
-            const sealed = stopStreaming({
-              ...next,
-              title: titled,
-              pendingSwitch: undefined,
-            });
+            if (editedResend) {
+              next = editedResend.replace(next);
+            }
+            if (approvedPlan && intent === "build") {
+              next = {
+                ...next,
+                blocks: next.blocks.map((block) =>
+                  block.id === approvedPlan.id && block.role === "plan"
+                    ? {
+                        ...block,
+                        plan: {
+                          ...(block.plan ?? { status: "ready" as const }),
+                          status: "building" as const,
+                          approvedText: block.text,
+                        },
+                      }
+                    : block,
+                ),
+              };
+            }
+            if (options?.queuedMessageId) {
+              next = dequeueQueuedMessage(next, options.queuedMessageId);
+            }
+            if (!live) {
+              return {
+                ...next,
+                title: titled,
+                pendingSwitch: undefined,
+                busy: false,
+                blocks: [
+                  ...next.blocks,
+                  {
+                    id: crypto.randomUUID(),
+                    role: "user",
+                    text: visibleText,
+                    ...(visible.length > 0 ? { attachments: visible } : {}),
+                    ...cards,
+                  },
+                  {
+                    id: crypto.randomUUID(),
+                    role: "system",
+                    text: `${next.harness} is not connected yet — install and sign in to that provider, then retry.`,
+                    notice: "error",
+                  },
+                ],
+              };
+            }
+            if (pendingSwitch) {
+              const sealed = stopStreaming({
+                ...next,
+                title: titled,
+                pendingSwitch: undefined,
+              });
+              return appendUser(
+                appendPreparingHandoff(
+                  sealed,
+                  pendingSwitch.from,
+                  next.harness,
+                ),
+                visibleText,
+                visible,
+                cards,
+              );
+            }
             return appendUser(
-              appendPreparingHandoff(sealed, pendingSwitch.from, next.harness),
+              { ...next, title: titled },
               visibleText,
               visible,
               cards,
             );
-          }
-          return appendUser(
-            { ...next, title: titled },
-            visibleText,
-            visible,
-            cards,
-          );
-        }),
-      );
+          }),
+        );
+      };
+      if (!options?.resendEdited) flushSync(commitSubmittedTurn);
 
       const launchTitleGeneration = (workCwd: string) => {
-        if (!isFirstTurn || !live || !placeholderTitle) return;
+        if (
+          !live ||
+          !shouldGenerateSessionTitle(
+            isFirstTurn,
+            placeholderTitle,
+            options?.refreshTitle,
+          )
+        ) {
+          return;
+        }
         const titleMessage =
           harnessText || attachments.map((file) => file.name).join(", ");
         void generateHarnessTitle(current.harness, {
@@ -5893,6 +6008,13 @@ export default function App({
           providerAccountId,
         })
           .then(async (generated) => {
+            if (
+              options?.refreshTitle &&
+              !isFirstTurn &&
+              turnGen.current.get(sessionId) !== gen
+            ) {
+              return;
+            }
             const linkedWorkItem = await resolveLinkedWorkItem(
               titleMessage,
               workCwd,
@@ -5905,7 +6027,8 @@ export default function App({
                 let next = s;
                 if (
                   generated &&
-                  canReplaceSessionTitle(s.title, s.harness, titleSeed)
+                  (options?.refreshTitle ||
+                    canReplaceSessionTitle(s.title, s.harness, titleSeed))
                 ) {
                   next = {
                     ...next,
@@ -5926,12 +6049,22 @@ export default function App({
         if (pendingSwitch) {
           void forgetHarnessSession(pendingSwitch.from, sessionId);
         }
+        editedResend?.reject();
         options?.onSettled?.({
           status: "failed",
           text: "",
           error: "Harness is not connected",
         });
         return true;
+      }
+      if (editedResend && canRewindHarnessLastTurn(current.harness)) {
+        editedResends.start(sessionId);
+        const locked = sessionsRef.current.map((session) =>
+          session.id === sessionId ? { ...session, busy: true } : session,
+        );
+        sessionsRef.current = locked;
+        syncDockBadge(locked);
+        setSessions(locked);
       }
 
       if (proposalId && proposalDraft) {
@@ -6105,6 +6238,57 @@ export default function App({
           return event;
         };
 
+        const pendingEditedEvents: HarnessEvent[] = [];
+        const applyTurnEvent = (event: HarnessEvent) => {
+          orchestrator.observe(sessionId, event);
+          if (options?.onSettled && event.type === "message.delta")
+            controlText = (controlText + event.text).slice(-20_000);
+          if (options?.onSettled && event.type === "message.completed")
+            controlText += "\n";
+          if (event.type === "session.error")
+            controlOutcome.error = event.message;
+          if (
+            wrap &&
+            (event.type === "session.started" ||
+              event.type === "session.providerBound")
+          ) {
+            revealHandoff(wrap.text);
+          }
+          nudgeOpenEditors(event, workCwd);
+          if (!orchestrator.forSession(sessionId))
+            trackSessionEdits(sessionId, workCwd, event);
+          const routed = routePlanEvent(event);
+          if (routed) enqueueHarnessEvent(sessionId, routed);
+        };
+        const routeTurnEvent = (event: HarnessEvent) => {
+          if (turnGen.current.get(sessionId) !== gen) return;
+          if (editedResend && !editedResend.isAccepted()) {
+            pendingEditedEvents.push(event);
+            return;
+          }
+          applyTurnEvent(event);
+        };
+        const acceptEditedResend = () => {
+          if (!editedResend || editedResend.isAccepted()) return;
+          flushSync(commitSubmittedTurn);
+          editedResend.markAccepted();
+          for (const event of pendingEditedEvents) applyTurnEvent(event);
+          pendingEditedEvents.length = 0;
+        };
+        const recoverEditedResend = () => {
+          if (!editedResend || editedResend.isAccepted()) return;
+          pendingEditedEvents.length = 0;
+          flushSync(() => {
+            setSessions((prev) =>
+              prev.map((session) =>
+                session.id === sessionId
+                  ? editedResend.recoverAfterFailure(session)
+                  : session,
+              ),
+            );
+          });
+        };
+
         if (!current.inboxAsk && !orchestrator.forSession(sessionId)) {
           await beginSessionTurn(sessionId, workCwd).catch(() => undefined);
         }
@@ -6138,6 +6322,58 @@ export default function App({
           const earlier = queuedHandoff
             ? userMessagesAfterHandoff(current)
             : [];
+          if (
+            editedResend &&
+            canRewindHarnessLastTurn(current.harness)
+          ) {
+            try {
+              await rewindHarnessLastTurn({
+                harness: current.harness,
+                sessionId,
+                cwd: workCwd,
+                model: current.model,
+                modelSettings: current.modelSettings,
+                runtimeMode: current.runtimeMode,
+                ...(editedProviderTurnId
+                  ? { providerTurnId: editedProviderTurnId }
+                  : {}),
+                onEvent: (event) => {
+                  if (turnGen.current.get(sessionId) !== gen) return;
+                  enqueueHarnessEvent(sessionId, event);
+                },
+              });
+            } catch (error) {
+              flushHarnessEvents();
+              editedResend.reject();
+              throw error;
+            }
+            editedResend.markProviderRewound();
+            flushHarnessEvents();
+            if (turnGen.current.get(sessionId) !== gen) {
+              const latest = sessionsRef.current.find(
+                (session) => session.id === sessionId,
+              );
+              if (
+                !latest ||
+                (!latest.busy &&
+                  latest.providerSessionId === current.providerSessionId)
+              ) {
+                await forgetHarnessSession(current.harness, sessionId);
+                if (latest) {
+                  setSessions((prev) =>
+                    prev.map((session) =>
+                      session.id === sessionId &&
+                      session.providerSessionId === current.providerSessionId
+                        ? { ...session, providerSessionId: undefined }
+                        : session,
+                    ),
+                  );
+                }
+              }
+              recoverEditedResend();
+              return;
+            }
+          }
           const sendTurn = (text: string, turnAttachments = prepared) =>
             sendHarnessTurn({
               harness: current.harness,
@@ -6153,28 +6389,8 @@ export default function App({
               controlsAgents: orchestrator.run(sessionId)?.status === "active",
               text,
               attachments: turnAttachments,
-              onEvent: (event) => {
-                if (turnGen.current.get(sessionId) !== gen) return;
-                orchestrator.observe(sessionId, event);
-                if (options?.onSettled && event.type === "message.delta")
-                  controlText = (controlText + event.text).slice(-20_000);
-                if (options?.onSettled && event.type === "message.completed")
-                  controlText += "\n";
-                if (event.type === "session.error")
-                  controlOutcome.error = event.message;
-                if (
-                  wrap &&
-                  (event.type === "session.started" ||
-                    event.type === "session.providerBound")
-                ) {
-                  revealHandoff(wrap.text);
-                }
-                nudgeOpenEditors(event, workCwd);
-                if (!orchestrator.forSession(sessionId))
-                  trackSessionEdits(sessionId, workCwd, event);
-                const routed = routePlanEvent(event);
-                if (routed) enqueueHarnessEvent(sessionId, routed);
-              },
+              ...(editedResend ? { onAccepted: acceptEditedResend } : {}),
+              onEvent: routeTurnEvent,
             });
           await sendTurn(
             orchestrator.prompt(
@@ -6192,6 +6408,7 @@ export default function App({
               ),
             ),
           );
+          acceptEditedResend();
           if (proposalDraft && !providerFailureSeen) {
             completedProposal = await completeOrRepairOrchestrationProposal(
               proposalDraft,
@@ -6227,12 +6444,13 @@ export default function App({
           }
           buildSucceeded = true;
         } catch (error: unknown) {
+          recoverEditedResend();
           if (turnGen.current.get(sessionId) !== gen) return;
           if (wrap) revealHandoff(wrap.text);
           const message =
             error instanceof Error
               ? error.message
-              : `${current.harness} adapter failed`;
+              : String(error) || `${current.harness} adapter failed`;
           controlOutcome.error = message;
           if (!providerFailureSeen) {
             enqueueHarnessEvent(sessionId, {
@@ -6349,6 +6567,8 @@ export default function App({
           }
         })
         .finally(() => {
+          editedResend?.reject();
+          if (editedResend) editedResends.finish(sessionId);
           options?.onSettled?.(
             turnGen.current.get(sessionId) !== gen
               ? { status: "cancelled", text: controlText }
@@ -6376,6 +6596,7 @@ export default function App({
       run: AutomationRun,
       reveal = false,
       prompt = run.prompt ?? automation.prompt,
+      sourceWorkItem?: LinkedWorkItem,
     ) => {
       let reservationId: string | undefined;
       let releaseAfterSettle = false;
@@ -6384,6 +6605,9 @@ export default function App({
         automationSessionReservations.current.delete(reservationId);
       };
       try {
+        const eventRun = run.trigger === "event";
+        const linkedWorkItem =
+          sourceWorkItem ?? linkedWorkItemFromAutomationEvent(run);
         let session =
           automation.reuseSession && automation.lastSessionId
             ? sessionsRef.current.find(
@@ -6413,8 +6637,11 @@ export default function App({
               automation.runtimeMode,
               automation.modelSettings,
             ),
-            title: formatSessionTitle(automation.harness, automation.name),
+            title: eventRun
+              ? HARNESS_LABEL[automation.harness]
+              : formatSessionTitle(automation.harness, automation.name),
             automationId: automation.id,
+            ...(linkedWorkItem ? { linkedWorkItem } : {}),
             ...(automation.workspaceMode === "worktree"
               ? { workspaceMode: "worktree" as const, worktreeBase: "HEAD" }
               : automation.workspaceMode === "existing" &&
@@ -6438,6 +6665,7 @@ export default function App({
             model: automation.model,
             modelSettings: automation.modelSettings ?? {},
             runtimeMode: automation.runtimeMode,
+            ...(linkedWorkItem ? { linkedWorkItem } : {}),
           };
           session = stamped;
           const nextSessions = sessionsRef.current.map((entry) =>
@@ -6476,6 +6704,7 @@ export default function App({
           sessionId: session.id,
         });
         const accepted = onSubmit(session.id, prompt, [], {
+          refreshTitle: eventRun,
           onSettled: (outcome) => {
             const status =
               outcome.status === "completed"
@@ -6580,6 +6809,7 @@ export default function App({
               item.run,
               false,
               item.prompt,
+              item.linkedWorkItem,
             ).catch(() => undefined);
           }
         })
@@ -8906,6 +9136,7 @@ export default function App({
               onArchiveSessions={onArchiveHistorySessions}
               onPinSession={onPinHistorySession}
               onPinSessions={onPinHistorySessions}
+              onSetSessionLinkedWorkItem={onSetHistorySessionLinkedWorkItem}
               reminders={sessionReminders.reminders}
               onSetReminders={sessionReminders.schedule}
               onCancelReminders={sessionReminders.cancel}

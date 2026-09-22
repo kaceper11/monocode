@@ -6,9 +6,10 @@ import {
   Copy,
   FilePlusCorner,
   Minus,
+  Pencil,
+  PenLine,
   Bot,
   ChartBreakoutSquare,
-  PenLine,
   Search,
   Terminal,
   Trash2,
@@ -117,6 +118,7 @@ import {
   type ToolCallState,
   type TurnItem,
 } from "../model/transcriptActivity";
+import { lastUserTurnBlock } from "../model/editLastTurn";
 
 const NEAR_BOTTOM_PX = 16;
 const INITIAL_TURNS = 20;
@@ -142,6 +144,8 @@ type Props = {
   onBuildPlan?: (blockId: string, target?: PlanBuildTarget) => void;
   onSecondOpinion?: (target: ModelTarget, turn: Block[]) => void;
   onHandoff?: (target: ModelTarget, turn: Block[]) => void;
+  onEditLastTurn?: () => void;
+  editingLastTurn?: boolean;
   onJumpToBottomChange?: (show: boolean) => void;
   onJumpToBottomReady?: (jump: () => void) => void;
   /** Passes a function that renders the turn that holds a block. The render completes before the function returns. */
@@ -174,6 +178,8 @@ function AgentTranscriptComponent({
   onBuildPlan,
   onSecondOpinion,
   onHandoff,
+  onEditLastTurn,
+  editingLastTurn = false,
   onJumpToBottomChange,
   onJumpToBottomReady,
   onRevealReady,
@@ -195,6 +201,10 @@ function AgentTranscriptComponent({
       ? sourceBlocks
       : visibleBlocks;
   }, [harness, sourceBlocks]);
+  const editableUserBlockId = useMemo(
+    () => lastUserTurnBlock(blocks)?.id,
+    [blocks],
+  );
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const scroller = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
@@ -553,6 +563,20 @@ function AgentTranscriptComponent({
                 planModel={model}
                 planModelSettings={modelSettings}
                 cwd={cwd}
+                onEditLastTurn={
+                  onEditLastTurn &&
+                  settled &&
+                  item.block.role === "user" &&
+                  item.block.id === editableUserBlockId &&
+                  !item.block.draft
+                    ? onEditLastTurn
+                    : undefined
+                }
+                editing={
+                  editingLastTurn &&
+                  item.block.role === "user" &&
+                  item.block.id === editableUserBlockId
+                }
               />
             );
           // The fold reaches across a stack of delegated runs, but those rows
@@ -1060,6 +1084,35 @@ function SaveNoteButton({
   );
 }
 
+function EditLastTurnButton({
+  onEdit,
+  editing = false,
+}: {
+  onEdit: () => void;
+  editing?: boolean;
+}) {
+  const label = editing ? "Cancel edit" : "Edit and resend";
+  return (
+    <button
+      type="button"
+      title={label}
+      aria-label={label}
+      aria-pressed={editing}
+      onClick={(event) => {
+        event.stopPropagation();
+        onEdit();
+      }}
+      className={`rounded-md p-1 transition-[background-color,color] duration-150 focus-visible:ring-1 focus-visible:ring-accent ${
+        editing
+          ? "edit-last-turn-button"
+          : "text-content/40 hover:bg-content/8 hover:text-content/70"
+      }`}
+    >
+      <Pencil className="size-3.5" strokeWidth={1.75} />
+    </button>
+  );
+}
+
 const TranscriptBlock = memo(function TranscriptBlock({
   block,
   layout,
@@ -1078,6 +1131,8 @@ const TranscriptBlock = memo(function TranscriptBlock({
   planHarness,
   planModel,
   planModelSettings,
+  onEditLastTurn,
+  editing = false,
 }: {
   block: Block;
   layout: TranscriptLayout;
@@ -1097,6 +1152,8 @@ const TranscriptBlock = memo(function TranscriptBlock({
   planHarness?: HarnessId;
   planModel?: string;
   planModelSettings?: Record<string, string>;
+  onEditLastTurn?: () => void;
+  editing?: boolean;
 }) {
   if (block.role === "user") {
     return (
@@ -1105,6 +1162,8 @@ const TranscriptBlock = memo(function TranscriptBlock({
         layout={layout}
         stickyIndex={stickyIndex}
         cwd={cwd}
+        onEdit={onEditLastTurn}
+        editing={editing}
         onSaveNote={onSaveNote}
         onSendDraft={onSendDraft}
         onRemoveDraft={onRemoveDraft}
@@ -1220,6 +1279,8 @@ function UserMessageBlock({
   block,
   layout,
   stickyIndex,
+  onEdit,
+  editing = false,
   cwd,
   onSaveNote,
   onSendDraft,
@@ -1228,6 +1289,8 @@ function UserMessageBlock({
   block: Block;
   layout: TranscriptLayout;
   stickyIndex: number;
+  onEdit?: () => void;
+  editing?: boolean;
   cwd?: string;
   onSaveNote?: (text: string) => void | Promise<void>;
   onSendDraft?: (block: Block) => boolean | void;
@@ -1300,19 +1363,22 @@ function UserMessageBlock({
   return (
     <div
       data-prompt-anchor={block.id}
-      className={`user-message-row ${
+      data-editing-last-turn={editing ? "true" : undefined}
+      className={`user-message-row group/usermsg overflow-visible ${
         chat ? "flex flex-col items-end pt-1.5 pr-4 pb-5 pl-14" : "p-1.5 pb-4"
       }`}
     >
       <div
-        className={`user-message-hover-zone min-w-0 ${chat ? "flex w-fit max-w-full flex-col items-end" : "w-full"}`}
+        className={`user-message-hover-zone min-w-0 overflow-visible ${chat ? "flex w-fit max-w-full flex-col items-end" : "w-full"}`}
       >
         <div
           data-draft={block.draft ? "true" : undefined}
-          className={`user-message-bubble min-w-0 px-3 py-2 font-sans text-content ${
+          className={`user-message-bubble relative min-w-0 px-3 py-2 font-sans text-content transition-[background-color] duration-200 ${
             block.draft
               ? "border border-dashed border-content/30 bg-content/4"
               : "bg-content/10"
+          } ${
+            editing ? "edit-last-turn-bubble" : ""
           } ${
             chat
               ? `w-fit max-w-xl ${singleLine ? "rounded-full" : "rounded-xl"}`
@@ -1403,7 +1469,10 @@ function UserMessageBlock({
             </div>
           ) : null}
         </div>
-        {text || block.attachments?.length || block.startedAt != null ? (
+        {text ||
+        block.attachments?.length ||
+        block.startedAt != null ||
+        onEdit ? (
           <div className="user-message-actions flex items-center gap-1 px-3 pt-1">
             {text || block.attachments?.length ? (
               <CopyTurnButton
@@ -1411,6 +1480,9 @@ function UserMessageBlock({
                 attachments={block.attachments}
                 label="Copy message"
               />
+            ) : null}
+            {onEdit ? (
+              <EditLastTurnButton onEdit={onEdit} editing={editing} />
             ) : null}
             {text && onSaveNote ? (
               <SaveNoteButton text={text} onSave={onSaveNote} />

@@ -43,6 +43,7 @@ import {
   type GitDiffStats,
 } from "../../platform/tauri/fs";
 import { IS_MAC, IS_WIN, MOD } from "../../platform/tauri/platform";
+import { formatInteger } from "../../shared/lib/numbers";
 import { pathKey, projectKey, projectName } from "../../shared/lib/paths";
 import {
   collectRailProjects,
@@ -1610,8 +1611,8 @@ function ProjectDiffStat({
   if (additions <= 0 && deletions <= 0) return null;
 
   const label = [
-    additions > 0 ? `+${additions}` : "",
-    deletions > 0 ? `-${deletions}` : "",
+    additions > 0 ? `+${formatInteger(additions)}` : "",
+    deletions > 0 ? `-${formatInteger(deletions)}` : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -1619,13 +1620,13 @@ function ProjectDiffStat({
   return (
     <span
       title={`${label} uncommitted`}
-      className="flex shrink-0 items-center gap-1 font-mono text-[11px] font-semibold tabular-nums"
+      className="flex shrink-0 items-center gap-1 font-sans text-[11px] font-semibold tabular-nums"
     >
       {additions > 0 ? (
-        <span className="text-emerald-400">+{additions}</span>
+        <span className="text-emerald-400">+{formatInteger(additions)}</span>
       ) : null}
       {deletions > 0 ? (
-        <span className="text-red-400">-{deletions}</span>
+        <span className="text-red-400">-{formatInteger(deletions)}</span>
       ) : null}
     </span>
   );
@@ -1646,8 +1647,8 @@ function projectCardTitle(
     parts.push(
       [
         files > 0 ? `${files} ${files === 1 ? "file" : "files"} changed` : "",
-        additions > 0 ? `+${additions}` : "",
-        deletions > 0 ? `-${deletions}` : "",
+        additions > 0 ? `+${formatInteger(additions)}` : "",
+        deletions > 0 ? `-${formatInteger(deletions)}` : "",
       ]
         .filter(Boolean)
         .join(" "),
@@ -1669,7 +1670,7 @@ function projectCardAriaLabel(
   if (files > 0) {
     parts.push(`${files} ${files === 1 ? "file" : "files"} changed`);
   }
-  if (additions > 0) parts.push(`+${additions}`);
-  if (deletions > 0) parts.push(`-${deletions}`);
+  if (additions > 0) parts.push(`+${formatInteger(additions)}`);
+  if (deletions > 0) parts.push(`-${formatInteger(deletions)}`);
   return parts.join(", ");
 }

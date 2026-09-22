@@ -415,6 +415,19 @@ export async function setSessionPinned(
   await invoke<void>("session_set_pinned", { sessionId, pinned });
 }
 
+export async function setSessionLinkedWorkItem(
+  sessionId: string,
+  value: LinkedWorkItem | undefined,
+): Promise<void> {
+  const linkedWorkItem = sanitizeLinkedWorkItem(value);
+  await enqueueSessionWrite(sessionId, () =>
+    invoke<void>("session_set_linked_work_item", {
+      sessionId,
+      linkedWorkItem: linkedWorkItem ?? null,
+    }),
+  );
+}
+
 /** Drain pending saves before a worktree removal changes stored session context. */
 export async function flushSessionWrites(): Promise<void> {
   await Promise.all([...sessionWriteQueues.values()]);
@@ -496,6 +509,12 @@ function sanitizeBlock(block: Block): Block | null {
   const turnModel = sanitizeTurnModel(block.turnModel);
   if (block.role === "user" && turnModel) next.turnModel = turnModel;
   if (block.role === "user" && block.draft) next.draft = true;
+  if (
+    block.role === "user" &&
+    typeof block.providerTurnId === "string" &&
+    isPersistableId(block.providerTurnId)
+  )
+    next.providerTurnId = block.providerTurnId;
   if (
     block.role === "user" &&
     typeof block.orchestrationLeadId === "string" &&

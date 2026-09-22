@@ -4,6 +4,7 @@ import type { HarnessId } from "../../../features/sessions/model/session";
 import {
   HARNESS_IDLE_PARK_MS,
   canCompactHarnessContext,
+  canRewindHarnessLastTurn,
   compactHarnessContext,
   isLiveHarness,
   listHarnesses,
@@ -117,6 +118,33 @@ describe("harness registry", () => {
     });
   });
 
+  it("exposes the edit-last-turn support matrix", () => {
+    registerBuiltinHarnesses();
+    const ids: HarnessId[] = [
+      "claude",
+      "codex",
+      "cursor",
+      "grok",
+      "opencode",
+      "pi",
+      "omp",
+      "fx",
+    ];
+
+    expect(
+      Object.fromEntries(ids.map((id) => [id, canRewindHarnessLastTurn(id)])),
+    ).toEqual({
+      claude: false,
+      codex: true,
+      cursor: false,
+      grok: false,
+      opencode: true,
+      pi: true,
+      omp: true,
+      fx: false,
+    });
+  });
+
   it("registers Antigravity as a live fx-tier harness", () => {
     registerBuiltinHarnesses();
     expect(isLiveHarness("antigravity")).toBe(true);
@@ -187,9 +215,6 @@ describe("harness registry", () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(stopSession).toHaveBeenCalledWith("s1");
   });
-
-
-
   it("a park timer armed mid-turn cannot kill the running session", async () => {
     vi.useFakeTimers();
     const stopSession = vi.fn(async () => undefined);
@@ -249,11 +274,11 @@ describe("harness registry", () => {
         text: "follow up",
         onEvent: () => undefined,
       };
+      // A finished send arms the idle timer; the operation outlives it.
+      await sendHarnessTurn(input);
       const active = operation === "compact"
         ? compactHarnessContext(input)
         : steerHarnessTurn(input);
-      // A concurrent send can finish and arm the idle timer first.
-      await sendHarnessTurn(input);
       await vi.advanceTimersByTimeAsync(HARNESS_IDLE_PARK_MS * 2);
       expect(stopSession).not.toHaveBeenCalled();
       finish();
@@ -293,5 +318,65 @@ describe("harness registry", () => {
 
     await vi.advanceTimersByTimeAsync(HARNESS_IDLE_PARK_MS);
     expect(stopSession).toHaveBeenCalledWith("s5");
+  });
+
+  it("serializes provider-state operations per session", async () => {
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const compactContext = vi.fn(async (input: { sessionId: string }) => {
+      order.push(`start:${input.sessionId}`);
+      if (input.sessionId === "s1") {
+        markFirstStarted();
+        await firstGate;
+      }
+      order.push(`end:${input.sessionId}`);
+    });
+    registerHarness(stub("codex", { compactContext }));
+
+    const compact1 = compactHarnessContext({
+      harness: "codex",
+      sessionId: "s1",
+      cwd: "/tmp",
+      model: "codex:gpt-5.4",
+      runtimeMode: "supervised",
+      onEvent: () => undefined,
+    });
+    await firstStarted;
+    const compact2 = compactHarnessContext({
+      harness: "codex",
+      sessionId: "s1",
+      cwd: "/tmp",
+      model: "codex:gpt-5.4",
+      runtimeMode: "supervised",
+      onEvent: () => undefined,
+    });
+    const independent = compactHarnessContext({
+      harness: "codex",
+      sessionId: "s2",
+      cwd: "/tmp",
+      model: "codex:gpt-5.4",
+      runtimeMode: "supervised",
+      onEvent: () => undefined,
+    });
+
+    await independent;
+    expect(order).toEqual(["start:s1", "start:s2", "end:s2"]);
+    releaseFirst();
+    await Promise.all([compact1, compact2]);
+    expect(order).toEqual([
+      "start:s1",
+      "start:s2",
+      "end:s2",
+      "end:s1",
+      "start:s1",
+      "end:s1",
+    ]);
   });
 });

@@ -32,6 +32,7 @@ import {
   ChevronUp,
   RotateCcw,
 } from "../../../shared/ui/icons";
+import { formatInteger } from "../../../shared/lib/numbers";
 import { minimalSetup } from "codemirror";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -1027,12 +1028,12 @@ function DiffChunkStat({
     return <span className="min-w-0 flex-1" />;
   }
   return (
-    <span className="flex min-w-0 shrink-0 items-center gap-1.5 font-mono text-[11px] font-semibold tabular-nums">
+    <span className="flex min-w-0 shrink-0 items-center gap-1.5 font-sans text-[11px] font-semibold tabular-nums">
       {additions > 0 ? (
-        <span className="text-emerald-400">+{additions}</span>
+        <span className="text-emerald-400">+{formatInteger(additions)}</span>
       ) : null}
       {deletions > 0 ? (
-        <span className="text-red-400">-{deletions}</span>
+        <span className="text-red-400">-{formatInteger(deletions)}</span>
       ) : null}
     </span>
   );
