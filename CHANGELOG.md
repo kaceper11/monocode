@@ -11,6 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Hermes turns stay busy while detached subagents are running and resume automatically with their completed transcripts instead of requiring a manual Continue. Hermes ACP usage updates also populate the context meter. In #335.
 
+## [0.3.7] - 2026-09-22
+
+### Added
+
+- Workstream lanes are editable in task details: retarget a lane's branch or base, bind an existing worktree (including the project checkout), or adopt an existing local branch. When a new worktree would collide with a copy already on the branch, the board offers to bind it instead of failing.
+- Create draft pull requests from the board and give each lane its own description ahead of the generated PR body; sibling pull request links always survive in the body.
+- Dialogs stay within the viewport and keep their actions in a pinned footer.
+
+### Fixed
+
+- Lanes claim branches and worktrees board-wide — re-checked at write time — so two lanes can no longer share a branch or working copy, including lanes on archived tasks.
+- Sessions no longer bind to vanished worktrees or checkouts that drifted onto another branch; lane probes report the drift instead of the wrong PR and merge state.
+- Removing a worktree whose directory is already gone prunes the stale registration instead of failing its dirty check.
+- Failed task creation cleans up only the worktrees it spawned, never a pre-existing copy the user bound, and review-local tasks check the same claims before fetching.
+- The new-task dialog caps workstream rows before spawning and blocks duplicate submits and cancels while it refreshes branches.
+- Board capacity counts only live tasks, and archiving or restoring at the cap no longer drops stored tasks on the next load.
+
 ## [0.3.6] - 2026-09-22
 
 ### Fixed
