@@ -359,118 +359,6 @@ fn snapshot() -> Result<Vec<ProcRow>, String> {
 #[cfg(not(any(unix, windows)))]
 fn measure(_rows: &mut [ProcRow], _wanted: &HashSet<u32>) {}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn row(pid: u32, ppid: u32, cpu: f32, rss: u64, name: &str) -> ProcRow {
-        ProcRow {
-            pid,
-            ppid,
-            cpu_secs: 0.0,
-            cpu: Some(cpu),
-            rss_bytes: Some(rss),
-            started: "test-start".into(),
-            name: name.into(),
-        }
-    }
-
-    #[test]
-    fn subtree_collects_descendants_without_looping() {
-        let rows = vec![
-            row(1, 0, 0.0, 0, "init"),
-            row(10, 1, 0.0, 0, "zsh"),
-            row(11, 10, 0.0, 0, "node"),
-            row(12, 11, 0.0, 0, "esbuild"),
-            row(13, 13, 0.0, 0, "cycle"),
-        ];
-        let (index_of, children) = build_children(&rows);
-        let members = subtree(&rows, &index_of, &children, 10);
-        let pids: Vec<u32> = members.iter().map(|&i| rows[i].pid).collect();
-        assert_eq!(pids, [10, 11, 12]);
-        // A self-parented row terminates instead of looping.
-        assert_eq!(subtree(&rows, &index_of, &children, 13).len(), 1);
-    }
-
-    #[test]
-    fn aggregate_sums_the_tree_and_names_the_top_consumer() {
-        let rows = vec![
-            row(10, 1, 0.4, 20_000, "zsh"),
-            row(11, 10, 12.0, 300_000, "node"),
-            row(12, 11, 50.0, 80_000, "esbuild"),
-        ];
-        let stat = aggregate(&rows, vec![0, 1, 2], 10);
-        assert_eq!(stat.processes, 3);
-        assert!(stat.workload);
-        assert!((stat.cpu_pct.unwrap() - 62.4).abs() < 0.001);
-        assert_eq!(stat.rss_bytes, Some(400_000));
-        assert_eq!(stat.top.as_deref(), Some("esbuild"));
-    }
-
-    #[test]
-    fn aggregate_shell_only_tree_has_no_workload() {
-        let rows = vec![row(10, 1, 0.1, 10_000, "zsh")];
-        let stat = aggregate(&rows, vec![0], 10);
-        assert!(!stat.workload);
-        assert_eq!(stat.top, None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn parse_ps_reads_fixed_columns() {
-        let text =
-            "  417   415  0:03.20  84512 Sat Sep 19 12:00:00 2026 /usr/bin/vim\n    9     1  0:00.00   1204 Sat Sep 19 12:00:00 2026 zsh\nbad line\n";
-        let rows = parse_ps(text);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].pid, 417);
-        assert_eq!(rows[0].ppid, 415);
-        assert!((rows[0].cpu_secs - 3.2).abs() < 0.001);
-        assert_eq!(rows[0].rss_bytes, Some(84512 * 1024));
-        assert_eq!(rows[0].name, "vim");
-        // Paths with spaces are the last column — the basename survives.
-        let spaced =
-            parse_ps("  5     1  0:00.00  1024 Sat Sep 19 12:00:00 2026 /Applications/My App/app");
-        assert_eq!(spaced[0].name, "app");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn parse_cputime_handles_minutes_hours_and_days() {
-        assert_eq!(parse_cputime("0:03.20"), Some(3.2));
-        assert_eq!(parse_cputime("732:42.44"), Some(732.0 * 60.0 + 42.44));
-        assert_eq!(parse_cputime("1:02:03.00"), Some(3723.0));
-        assert_eq!(
-            parse_cputime("2-03:04:05.50"),
-            Some(2.0 * 86400.0 + 3.0 * 3600.0 + 245.5)
-        );
-        assert_eq!(parse_cputime("junk"), None);
-        for bad in ["nan", "-1", "1:bad:20", "1:2:3:4", "inf"] {
-            assert_eq!(parse_cputime(bad), None);
-        }
-    }
-
-    #[test]
-    fn cpu_delta_is_percent_of_one_core_over_the_interval() {
-        // 1.5 cpu-secs over 1.5 wall secs → one full core.
-        assert_eq!(cpu_delta_pct(10.0, 11.5, 1.5), 100.0);
-        // 3 cpu-secs over 1.5 wall secs → two cores busy → >100%.
-        assert_eq!(cpu_delta_pct(10.0, 13.0, 1.5), 200.0);
-        // 0.75 cpu-secs over 1.5 wall secs → half a core.
-        assert_eq!(cpu_delta_pct(0.0, 0.75, 1.5), 50.0);
-    }
-
-    #[test]
-    fn cpu_delta_clamps_bad_intervals_and_pid_reuse() {
-        // A pid recycled between samples reports a negative delta → 0.
-        assert_eq!(cpu_delta_pct(500.0, 0.4, 1.5), 0.0);
-        // A baseline older than the panel's lifetime dilutes to ~0 —
-        // refresh instead of reporting a diluted reading.
-        assert_eq!(cpu_delta_pct(10.0, 700.0, 600.0), 0.0);
-        // Sub-millisecond intervals amplify scheduling jitter.
-        assert_eq!(cpu_delta_pct(10.0, 10.1, 0.0005), 0.0);
-    }
-}
-
 /// Stop only the descendants captured by this request. The root shell remains
 /// alive. Revalidate both the mounted PTY and process birth before every signal.
 /// Unlike ordinary terminal close, this feature never schedules detached kills.
@@ -789,5 +677,117 @@ mod live_tests {
         std::thread::sleep(Duration::from_millis(2));
         apply_cpu_deltas(&mut rows, &wanted);
         assert_eq!(rows[0].cpu, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(pid: u32, ppid: u32, cpu: f32, rss: u64, name: &str) -> ProcRow {
+        ProcRow {
+            pid,
+            ppid,
+            cpu_secs: 0.0,
+            cpu: Some(cpu),
+            rss_bytes: Some(rss),
+            started: "test-start".into(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn subtree_collects_descendants_without_looping() {
+        let rows = vec![
+            row(1, 0, 0.0, 0, "init"),
+            row(10, 1, 0.0, 0, "zsh"),
+            row(11, 10, 0.0, 0, "node"),
+            row(12, 11, 0.0, 0, "esbuild"),
+            row(13, 13, 0.0, 0, "cycle"),
+        ];
+        let (index_of, children) = build_children(&rows);
+        let members = subtree(&rows, &index_of, &children, 10);
+        let pids: Vec<u32> = members.iter().map(|&i| rows[i].pid).collect();
+        assert_eq!(pids, [10, 11, 12]);
+        // A self-parented row terminates instead of looping.
+        assert_eq!(subtree(&rows, &index_of, &children, 13).len(), 1);
+    }
+
+    #[test]
+    fn aggregate_sums_the_tree_and_names_the_top_consumer() {
+        let rows = vec![
+            row(10, 1, 0.4, 20_000, "zsh"),
+            row(11, 10, 12.0, 300_000, "node"),
+            row(12, 11, 50.0, 80_000, "esbuild"),
+        ];
+        let stat = aggregate(&rows, vec![0, 1, 2], 10);
+        assert_eq!(stat.processes, 3);
+        assert!(stat.workload);
+        assert!((stat.cpu_pct.unwrap() - 62.4).abs() < 0.001);
+        assert_eq!(stat.rss_bytes, Some(400_000));
+        assert_eq!(stat.top.as_deref(), Some("esbuild"));
+    }
+
+    #[test]
+    fn aggregate_shell_only_tree_has_no_workload() {
+        let rows = vec![row(10, 1, 0.1, 10_000, "zsh")];
+        let stat = aggregate(&rows, vec![0], 10);
+        assert!(!stat.workload);
+        assert_eq!(stat.top, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_ps_reads_fixed_columns() {
+        let text =
+            "  417   415  0:03.20  84512 Sat Sep 19 12:00:00 2026 /usr/bin/vim\n    9     1  0:00.00   1204 Sat Sep 19 12:00:00 2026 zsh\nbad line\n";
+        let rows = parse_ps(text);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].pid, 417);
+        assert_eq!(rows[0].ppid, 415);
+        assert!((rows[0].cpu_secs - 3.2).abs() < 0.001);
+        assert_eq!(rows[0].rss_bytes, Some(84512 * 1024));
+        assert_eq!(rows[0].name, "vim");
+        // Paths with spaces are the last column — the basename survives.
+        let spaced =
+            parse_ps("  5     1  0:00.00  1024 Sat Sep 19 12:00:00 2026 /Applications/My App/app");
+        assert_eq!(spaced[0].name, "app");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_cputime_handles_minutes_hours_and_days() {
+        assert_eq!(parse_cputime("0:03.20"), Some(3.2));
+        assert_eq!(parse_cputime("732:42.44"), Some(732.0 * 60.0 + 42.44));
+        assert_eq!(parse_cputime("1:02:03.00"), Some(3723.0));
+        assert_eq!(
+            parse_cputime("2-03:04:05.50"),
+            Some(2.0 * 86400.0 + 3.0 * 3600.0 + 245.5)
+        );
+        assert_eq!(parse_cputime("junk"), None);
+        for bad in ["nan", "-1", "1:bad:20", "1:2:3:4", "inf"] {
+            assert_eq!(parse_cputime(bad), None);
+        }
+    }
+
+    #[test]
+    fn cpu_delta_is_percent_of_one_core_over_the_interval() {
+        // 1.5 cpu-secs over 1.5 wall secs → one full core.
+        assert_eq!(cpu_delta_pct(10.0, 11.5, 1.5), 100.0);
+        // 3 cpu-secs over 1.5 wall secs → two cores busy → >100%.
+        assert_eq!(cpu_delta_pct(10.0, 13.0, 1.5), 200.0);
+        // 0.75 cpu-secs over 1.5 wall secs → half a core.
+        assert_eq!(cpu_delta_pct(0.0, 0.75, 1.5), 50.0);
+    }
+
+    #[test]
+    fn cpu_delta_clamps_bad_intervals_and_pid_reuse() {
+        // A pid recycled between samples reports a negative delta → 0.
+        assert_eq!(cpu_delta_pct(500.0, 0.4, 1.5), 0.0);
+        // A baseline older than the panel's lifetime dilutes to ~0 —
+        // refresh instead of reporting a diluted reading.
+        assert_eq!(cpu_delta_pct(10.0, 700.0, 600.0), 0.0);
+        // Sub-millisecond intervals amplify scheduling jitter.
+        assert_eq!(cpu_delta_pct(10.0, 10.1, 0.0005), 0.0);
     }
 }

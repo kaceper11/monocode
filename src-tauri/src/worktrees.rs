@@ -881,6 +881,7 @@ pub async fn git_orchestration_branch_remove(cwd: String, branch: String) -> Res
 pub(crate) mod tests {
     use super::*;
 
+    #[cfg(unix)]
     pub(crate) fn verify_wsl_removal(root: &str, child: &str) {
         let root = Path::new(root);
         let child = Path::new(child);
