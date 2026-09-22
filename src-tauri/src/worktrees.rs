@@ -89,7 +89,7 @@ pub(crate) fn canonical(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-fn path_info(path: &Path) -> Result<(bool, bool), String> {
+pub(crate) fn path_info(path: &Path) -> Result<(bool, bool), String> {
     if let Some(location) = crate::wsl::path_location(path)? {
         return crate::wsl::request(&location, "worktree_path_info", serde_json::json!({}));
     }
@@ -539,18 +539,22 @@ pub async fn git_worktree_rename_branch(
 }
 
 fn removal_target(root: &Path, path: &Path) -> Result<Worktree, String> {
-    let tree = list(root)?
+    let mut tree = list(root)?
         .into_iter()
         .find(|tree| same_path(Path::new(&tree.path), path))
         .ok_or("This path is not a registered worktree of this repository")?;
+    // `missing` is only filled by the git_worktrees command wrapper — the
+    // removal path needs it to tell "vanished dir" from "dirty checkout".
+    tree.missing = !path_info(Path::new(&tree.path))?.1;
     if tree.is_main {
         return Err("The main working copy cannot be deleted".into());
     }
     if tree.locked {
         return Err("This worktree is locked. Unlock it in Git before deleting it.".into());
     }
-    if tree.branch.is_none() {
-        // There is no branch retaining detached commits after removal.
+    if !tree.missing && tree.branch.is_none() {
+        // There is no branch retaining detached commits after removal. A
+        // vanished dir has nothing left to retain — prune still applies.
         return Err("Create a branch for this detached worktree before deleting it.".into());
     }
     Ok(tree)
@@ -579,7 +583,10 @@ fn check_removal(root: &Path, path: &Path, force: bool, has_terminals: bool) -> 
     }
     // Sessions and their agents still exist during preflight. The actual
     // removal below checks them again after the session deletion lifecycle.
-    if !force
+    // A vanished directory can't hold uncommitted work — `git status` in it
+    // would only fail, and removal prunes the stale registration.
+    if !tree.missing
+        && !force
         && !git(
             Path::new(&tree.path),
             &["status", "--porcelain", "--untracked-files=normal"],
@@ -593,6 +600,12 @@ fn check_removal(root: &Path, path: &Path, force: bool, has_terminals: bool) -> 
 
 fn remove(root: &Path, path: &Path, force: bool) -> Result<(), String> {
     let tree = removal_target(root, path)?;
+    if tree.missing {
+        // Only the stale registration remains — `worktree remove` rejects
+        // missing dirs on older gits; prune is the documented tool. It also
+        // clears any other stale registrations — they're equally dead.
+        return git_checked(root, &["worktree", "prune", "--expire", "now"]);
+    }
     let mut args = vec!["worktree", "remove"];
     if force {
         args.push("--force");
@@ -1010,6 +1023,23 @@ pub(crate) mod tests {
             git(&root, &["rev-parse", "--verify", "refs/heads/feature/test"]).unwrap(),
             commit
         );
+    }
+
+    #[test]
+    fn removes_a_vanished_worktree_registration() {
+        let repo = repo();
+        let root = repo.0.join("repo");
+        let tree = create(&root, "feature/gone", "main", false).unwrap();
+        let path = Path::new(&tree.path);
+        std::fs::remove_dir_all(path).unwrap();
+        // The dir is gone but git still lists the registration — preflight
+        // must not run `git status` in it, and removal must prune the entry.
+        check_removal(&root, path, false, false).unwrap();
+        remove(&root, path, false).unwrap();
+        assert!(list(&root)
+            .unwrap()
+            .iter()
+            .all(|entry| entry.path != tree.path));
     }
 
     #[cfg(unix)]

@@ -68,12 +68,12 @@ function outboundRequest(method: string) {
   return parse().find((message) => message.method === method);
 }
 
-async function startTurn(sessionId: string) {
+async function startTurn(sessionId: string, model = "cursor:composer-2.5") {
   const events: HarnessEvent[] = [];
   const turn = sendCursorTurn({
     sessionId,
     cwd: "/repo",
-    model: "cursor:composer-2.5",
+    model,
     modelSettings: {},
     runtimeMode: "supervised",
     text: "explore the codebase",
@@ -142,6 +142,14 @@ afterEach(async () => {
 });
 
 describe("cursor background subagents", () => {
+  it("keeps the provider model when the selection is empty", async () => {
+    const { promptId, turn } = await startTurn("cursor-live", "");
+    expect(outboundRequest("session/set_config_option")).toBeUndefined();
+    expect(outboundRequest("session/set_model")).toBeUndefined();
+    reply(promptId, { stopReason: "end_turn" });
+    await turn;
+  });
+
   it("recovers native child steps without parent-attributed ACP events and enriches foreground names", async () => {
     const run = {
       agentId: "child_1",

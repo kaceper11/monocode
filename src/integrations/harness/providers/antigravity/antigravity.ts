@@ -602,12 +602,12 @@ async function applyModelSelection(
   live: Live,
   input: SendTurnInput,
 ): Promise<void> {
-  const base = nativeModelId(input.model);
+  const base = nativeModelId(input.model, input.cwd).trim();
   const settings = input.modelSettings ?? {};
   const modelConfigId =
     live.modelConfigId === "provider" ? "model" : live.modelConfigId;
 
-  await setConfigOption(live, modelConfigId, base);
+  if (base) await setConfigOption(live, modelConfigId, base);
 
   for (const [settingId, value] of Object.entries(settings)) {
     const configId = resolveSettingConfigId(live.configOptions, settingId);

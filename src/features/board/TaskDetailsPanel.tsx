@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { InboxProviderMark } from "../inbox/ui/InboxProviderMark";
 import { Popover } from "../../shared/ui/Popover";
+import { SearchableSelect } from "../../shared/ui/SearchableSelect";
 import {
   Archive,
   ArrowUp,
@@ -12,10 +13,12 @@ import {
   ChevronRight,
   ExternalLink,
   Folder,
+  FolderTree,
   GitBranch,
   GitMerge,
   GitPullRequest,
   LoaderCircle,
+  Pencil,
   Play,
   Plus,
   Search,
@@ -24,12 +27,20 @@ import {
   X,
 } from "../../shared/ui/icons";
 import { useDragResize } from "../../shared/hooks/useDragResize";
+import { LAYER } from "../../shared/lib/layers";
 import {
   formatRelativeTime,
   inboxItemRef,
   type InboxItem,
 } from "../inbox/model/githubTasks";
-import { projectName } from "../../shared/lib/paths";
+import { pathKey, prettyCwd, projectName } from "../../shared/lib/paths";
+import { gitBranches } from "../../platform/tauri/fs";
+import {
+  localBranchOptions,
+  useProjectBranchesState,
+} from "../source-control/hooks/useProjectBranches";
+import { useProjectWorktrees } from "../source-control/hooks/useProjectWorktrees";
+import { bindableWorktrees } from "../source-control/model/worktrees";
 import { sameProjectPath, type RecentProject } from "../projects/model/recents";
 import type { LinkedWorkItem, Session } from "../sessions/model/session";
 import {
@@ -61,17 +72,22 @@ import {
   renameLocalCard,
   updateTask,
   type BoardGroup,
+  type TaskWorkstream,
 } from "./boardStore";
 import {
+  baseBranchOptions,
   resolveLaneBranch,
   suggestedBranch,
   WorkstreamFields,
+  worktreeLaneOptions,
   workstreamProjectOptions,
   type NewTaskSpec,
 } from "./NewTaskDialog";
 import {
   prIsOpen,
   resolveConflictPrompt,
+  shortError,
+  worktreeOnBranch,
   type WorkstreamResult,
 } from "./taskOps";
 
@@ -330,33 +346,65 @@ function GroupAssign({
 /** Add-workstream row — the dialog's fields with a compact submit tail. */
 function AddWorkstreamRow({
   recents,
+  lanes,
   busy,
   onAdd,
 }: {
   recents: RecentProject[];
+  /** All board lanes — claimed worktree paths are hidden from the picker
+   * (a pick that can only fail at submit is worse than no option). */
+  lanes: TaskWorkstream[];
   busy: boolean;
-  onAdd: (projectPath: string, branch: string, base: string) => void;
+  onAdd: (spec: {
+    projectPath: string;
+    branch: string;
+    base: string;
+    worktreePath?: string;
+  }) => void;
 }) {
-  const [draft, setDraft] = useState({
+  const [draft, setDraft] = useState<{
+    projectPath: string;
+    branch: string;
+    base: string;
+    worktreePath?: string;
+  }>({
     projectPath: "",
     branch: "",
     base: "",
   });
   const projects = useMemo(() => workstreamProjectOptions(recents), [recents]);
+  const claimedPaths = useMemo(
+    () =>
+      new Set(
+        lanes
+          .filter(
+            (ws) =>
+              !!ws.worktreePath &&
+              sameProjectPath(ws.projectPath, draft.projectPath),
+          )
+          .map((ws) => pathKey(ws.worktreePath!)),
+      ),
+    [lanes, draft.projectPath],
+  );
   return (
     <div className="mt-1.5">
       <WorkstreamFields
         draft={draft}
         projects={projects}
         compact
+        excludeWorktreePaths={claimedPaths}
         onChange={(patch) => setDraft((current) => ({ ...current, ...patch }))}
         tail={
           <button
             type="button"
             disabled={busy || !draft.projectPath}
             onClick={() => {
-              onAdd(draft.projectPath, draft.branch, draft.base || "HEAD");
-              setDraft((current) => ({ ...current, branch: "" }));
+              onAdd({ ...draft, base: draft.base || "HEAD" });
+              setDraft((current) => ({
+                ...current,
+                branch: "",
+                worktreePath: undefined,
+              }));
             }}
             className="grid size-7 shrink-0 place-items-center rounded-md bg-accent/15 text-accent hover:bg-accent/25 disabled:opacity-40"
             aria-label="Add workstream"
@@ -369,14 +417,64 @@ function AddWorkstreamRow({
   );
 }
 
+/** A worktree for the lane's branch already exists — confirm before binding
+ * it (the create would fail in git anyway). */
+function BindOfferBar({
+  path,
+  busy,
+  onAccept,
+  onDismiss,
+}: {
+  path: string;
+  busy: boolean;
+  onAccept: () => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="mt-1.5 flex items-center gap-1.5 rounded-md bg-accent/10 py-1 pl-1.5 pr-1 ring-1 ring-accent/20">
+      <FolderTree
+        className="size-3 shrink-0 text-accent"
+        strokeWidth={1.75}
+      />
+      <span
+        className="min-w-0 flex-1 truncate text-[10.5px] font-medium text-content/70"
+        title={path}
+      >
+        Worktree exists — {prettyCwd(path)}
+      </span>
+      <button
+        type="button"
+        disabled={busy}
+        title="Bind the lane to this worktree instead of creating a new one"
+        className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-accent hover:bg-accent/10 disabled:opacity-40"
+        onClick={onAccept}
+      >
+        Use it
+      </button>
+      <button
+        type="button"
+        aria-label="Dismiss"
+        disabled={busy}
+        className="grid size-5 shrink-0 place-items-center rounded text-content/40 hover:bg-content/10 hover:text-content disabled:opacity-40"
+        onClick={onDismiss}
+      >
+        <X className="size-3" strokeWidth={1.75} />
+      </button>
+    </div>
+  );
+}
+
 /** Shared details-pane chrome: left-edge resize sash, collapse-to-strip,
  * header with title + collapse + close. Body/footer come from the caller. */
 function PanelShell({
   title,
+  onRenameTitle,
   onClose,
   children,
 }: {
   title: string;
+  /** Commit a renamed title — the header becomes an editable input. */
+  onRenameTitle?: (title: string) => void;
   onClose: () => void;
   children: React.ReactNode;
 }) {
@@ -438,9 +536,32 @@ function PanelShell({
         onDoubleClick={resize.onDoubleClick}
       />
       <header className="flex h-10 shrink-0 items-center gap-2 border-b border-stroke px-3">
-        <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-content">
-          {title}
-        </span>
+        {onRenameTitle ? (
+          <input
+            key={title}
+            defaultValue={title}
+            aria-label="Task title"
+            onBlur={(event) => {
+              const next = event.target.value.trim();
+              if (next && next !== title) onRenameTitle(next);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+              if (event.key === "Escape") {
+                // Revert-and-blur is this keypress's whole job — don't let
+                // the board-level handler read it as "close the board".
+                event.preventDefault();
+                event.currentTarget.value = title;
+                event.currentTarget.blur();
+              }
+            }}
+            className="-mx-1 min-w-0 flex-1 truncate rounded bg-transparent px-1 text-[13px] font-medium text-content outline-none focus:bg-content/6"
+          />
+        ) : (
+          <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-content">
+            {title}
+          </span>
+        )}
         <button
           type="button"
           aria-label="Collapse details"
@@ -465,6 +586,7 @@ function PanelShell({
 
 export function TaskDetailsPanel({
   card,
+  lanes,
   items,
   recents,
   sessions,
@@ -482,6 +604,9 @@ export function TaskDetailsPanel({
   onCleanupWorkstream,
 }: {
   card: BoardCard;
+  /** Every lane on the board, all tasks — ownership checks are board-wide:
+   * a worktree or branch serves one lane, not one lane per task. */
+  lanes: TaskWorkstream[];
   items: InboxItem[];
   recents: RecentProject[];
   sessions: Session[];
@@ -517,9 +642,21 @@ export function TaskDetailsPanel({
     anchor: HTMLElement;
     workstreamId: string;
   } | null>(null);
+  const [editAt, setEditAt] = useState<{
+    anchor: HTMLElement;
+    workstreamId: string;
+  } | null>(null);
   const [showAddStream, setShowAddStream] = useState(false);
   const [addingStream, setAddingStream] = useState(false);
   const [streamError, setStreamError] = useState("");
+  /** A create that found a worktree already on the branch — confirm binds
+   * that copy instead of failing. Lane-scoped when `workstreamId` is set. */
+  const [bindOffer, setBindOffer] = useState<{
+    workstreamId?: string;
+    path: string;
+    /** Add-row offers re-run the full spec on accept. */
+    spec?: { projectPath: string; branch: string; base: string };
+  } | null>(null);
   /** Lanes the create-PR dialog is composing for — null when closed. */
   const [prDialog, setPrDialog] = useState<ReadonlySet<string> | null>(null);
 
@@ -564,51 +701,171 @@ export function TaskDetailsPanel({
         : [...(current.groupIds ?? []), groupId].slice(0, MAX_TASK_GROUPS),
     }));
 
-  const addWorkstream = async (
-    projectPath: string,
-    branch: string,
-    base: string,
-  ) => {
+  /** A lane — on ANY task — already bound to this worktree path. Two lanes
+   * on one worktree share sessions' cwd and race every probe. Reads the
+   * store fresh so a path claimed since render can't slip through. */
+  const laneOwnsPath = (path: string, exceptId?: string) =>
+    loadBoard().tasks.some((entry) =>
+      entry.workstreams.some(
+        (ws) =>
+          ws.id !== exceptId &&
+          !!ws.worktreePath &&
+          pathKey(ws.worktreePath) === pathKey(path),
+      ),
+    );
+
+  const addWorkstream = async (spec: {
+    projectPath: string;
+    branch: string;
+    base: string;
+    worktreePath?: string;
+  }) => {
     setAddingStream(true);
     setStreamError("");
+    const resolved = spec.worktreePath
+      ? spec.branch
+      : resolveLaneBranch(
+          spec.projectPath,
+          spec.branch,
+          // Fresh list — the cache can lag a branch created outside the
+          // app; wrapping a real branch in `mc/` would silently fork it.
+          await gitBranches(spec.projectPath).catch(() => null),
+        ) || suggestedBranch(task.title, task.links);
     try {
       // Cap check before spawn — `updateTask` failing after the worktree +
       // session exist would orphan both.
       if (task.workstreams.length >= MAX_WORKSTREAMS)
         throw new Error(`A task can hold at most ${MAX_WORKSTREAMS} lanes.`);
-      const resolved =
-        resolveLaneBranch(projectPath, branch) ||
-        suggestedBranch(task.title, task.links);
+      // A branch lives in at most one worktree — two lanes on it would
+      // race every spawn and probe, same bound worktree the same story.
+      // Claims are board-wide: another task's lane owns it just as much.
+      if (
+        loadBoard().tasks.some((entry) =>
+          entry.workstreams.some(
+            (ws) =>
+              sameProjectPath(ws.projectPath, spec.projectPath) &&
+              (ws.branch === resolved ||
+                (!!spec.worktreePath &&
+                  !!ws.worktreePath &&
+                  pathKey(ws.worktreePath) === pathKey(spec.worktreePath))),
+          ),
+        )
+      ) {
+        throw new Error(`A lane already tracks ${resolved}`);
+      }
+      if (!spec.worktreePath) {
+        // "New" can collide with a worktree already on this branch — offer
+        // to bind that copy instead of erroring out. Unless another lane
+        // already owns it — then there's nothing to offer.
+        const clash = await worktreeOnBranch(spec.projectPath, resolved);
+        if (clash) {
+          if (laneOwnsPath(clash.path))
+            throw new Error(`A lane already tracks ${resolved}`);
+          setBindOffer({
+            path: clash.path,
+            spec: { ...spec, branch: resolved },
+          });
+          return;
+        }
+      }
       const spawned = await onSpawnSession({
-        projectPath,
+        projectPath: spec.projectPath,
         branch: resolved,
-        base,
+        base: spec.base,
+        ...(spec.worktreePath ? { worktreePath: spec.worktreePath } : {}),
       });
       updateTask(task.id, (current) => ({
         workstreams: [
           ...current.workstreams,
           {
             id: newEntityId("ws"),
-            projectPath,
+            projectPath: spec.projectPath,
             branch: resolved,
-            base,
+            base: spec.base,
             worktreePath: spawned.worktreePath,
             sessionIds: [spawned.sessionId],
           },
         ],
       }));
+      setBindOffer(null);
       setShowAddStream(false);
     } catch (error) {
-      setStreamError(
-        String(error).replace(/^Error:\s*/, "").split("\n")[0].slice(0, 160),
-      );
+      // The probe→create race can still collide — turn the backend's
+      // collision error into the bind offer rather than a dead end.
+      if (
+        await offerOnCollision(error, spec.projectPath, resolved, {
+          spec: { ...spec, branch: resolved },
+        })
+      )
+        return;
+      setStreamError(shortError(error));
     } finally {
       setAddingStream(false);
     }
   };
 
+  /** A create that still hit "already has a working copy" — the probe raced
+   * a worktree that appeared in between. Re-probe and offer the bind. */
+  const offerOnCollision = async (
+    error: unknown,
+    projectPath: string,
+    branch: string,
+    offer: {
+      workstreamId?: string;
+      spec?: { projectPath: string; branch: string; base: string };
+    },
+  ): Promise<boolean> => {
+    if (!/already has a working copy/i.test(String(error))) return false;
+    const tree = await worktreeOnBranch(projectPath, branch).catch(
+      () => null,
+    );
+    // Another lane already bound that worktree — a real error, not an offer.
+    if (!tree || laneOwnsPath(tree.path, offer.workstreamId)) return false;
+    setBindOffer({ path: tree.path, ...offer });
+    return true;
+  };
+
+  /** Spawn a session for a lane — bound to `worktreePath` when given (the
+   * bind-offer accept), else the lane's own worktree/create flow. */
+  const spawnForRow = async (
+    row: BoardWorkstreamRow,
+    worktreePath?: string,
+  ) => {
+    const bound = worktreePath ?? row.worktreePath;
+    const spawned = await onSpawnSession({
+      projectPath: row.projectPath,
+      branch: row.branch,
+      base: row.base,
+      ...(bound ? { worktreePath: bound } : {}),
+    });
+    updateTask(task.id, (current) => ({
+      workstreams: current.workstreams.map((ws) =>
+        ws.id === row.id
+          ? {
+              ...ws,
+              // A rebind landed mid-spawn wins — writing the spawn's own
+              // path would clobber the user's pick.
+              worktreePath:
+                ws.worktreePath === row.worktreePath
+                  ? spawned.worktreePath
+                  : ws.worktreePath,
+              sessionIds: [...(ws.sessionIds ?? []), spawned.sessionId],
+            }
+          : ws,
+      ),
+    }));
+    // Spawning is an intent to chat — take the user to it.
+    onOpenSession(spawned.sessionId);
+  };
+
   return (
-    <PanelShell title={task.title} onClose={onClose}>
+    <PanelShell
+      title={task.title}
+      onRenameTitle={(title) =>
+        updateTask(task.id, { title: title.slice(0, 300) })
+      }
+      onClose={onClose}
+    >
       <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-none px-3 py-3">
         {/* Tickets -------------------------------------------------- */}
         <div className="mb-1.5 flex items-center justify-between">
@@ -798,7 +1055,13 @@ export function TaskDetailsPanel({
           <button
             type="button"
             className={ACTION}
-            onClick={() => setShowAddStream((open) => !open)}
+            onClick={() => {
+              // Closing the row abandons its pending bind offer.
+              setBindOffer((current) =>
+                current && !current.workstreamId ? null : current,
+              );
+              setShowAddStream((open) => !open);
+            }}
           >
             <Plus className="size-3" strokeWidth={2} />
             Add repo
@@ -807,8 +1070,21 @@ export function TaskDetailsPanel({
         {showAddStream ? (
           <AddWorkstreamRow
             recents={recents}
+            lanes={lanes}
             busy={addingStream}
             onAdd={addWorkstream}
+          />
+        ) : null}
+        {bindOffer && !bindOffer.workstreamId ? (
+          <BindOfferBar
+            path={bindOffer.path}
+            busy={addingStream}
+            onAccept={() => {
+              const spec = bindOffer.spec;
+              if (!spec) return;
+              void addWorkstream({ ...spec, worktreePath: bindOffer.path });
+            }}
+            onDismiss={() => setBindOffer(null)}
           />
         ) : null}
         {streamError ? (
@@ -825,36 +1101,66 @@ export function TaskDetailsPanel({
               busy={
                 busyAction === "merge" ||
                 busyAction === "prs" ||
-                busyAction === `merge:${row.id}`
+                busyAction === `merge:${row.id}` ||
+                busyAction === `cleanup:${row.id}`
               }
               onOpenSession={onOpenSession}
               onUpdate={() => onUpdateWorkstream(row.id)}
               onCreatePr={() => setPrDialog(new Set([row.id]))}
+              onEdit={(anchor) =>
+                setEditAt({ anchor, workstreamId: row.id })
+              }
+              offer={
+                bindOffer?.workstreamId === row.id ? bindOffer : undefined
+              }
+              onOfferAccept={async () => {
+                const offer = bindOffer;
+                if (!offer) return;
+                // A sibling lane may have claimed this path since the
+                // offer rendered — binding it now would join two lanes
+                // on one worktree.
+                if (laneOwnsPath(offer.path, row.id))
+                  throw new Error(
+                    `That worktree already has a lane on this task`,
+                  );
+                await spawnForRow(row, offer.path);
+                setBindOffer(null);
+              }}
+              onOfferDismiss={() => setBindOffer(null)}
               onSpawnSession={async () => {
-                const spawned = await onSpawnSession({
-                  projectPath: row.projectPath,
-                  branch: row.branch,
-                  base: row.base,
-                  ...(row.worktreePath
-                    ? { worktreePath: row.worktreePath }
-                    : {}),
-                });
-                updateTask(task.id, (current) => ({
-                  workstreams: current.workstreams.map((ws) =>
-                    ws.id === row.id
-                      ? {
-                          ...ws,
-                          worktreePath: spawned.worktreePath,
-                          sessionIds: [
-                            ...(ws.sessionIds ?? []),
-                            spawned.sessionId,
-                          ],
-                        }
-                      : ws,
-                  ),
-                }));
-                // Spawning is an intent to chat — take the user to it.
-                onOpenSession(spawned.sessionId);
+                if (!row.worktreePath) {
+                  // A fresh worktree would collide with the branch's
+                  // existing copy — offer to bind it instead of failing.
+                  // A copy another lane already owns is a real error.
+                  const clash = await worktreeOnBranch(
+                    row.projectPath,
+                    row.branch,
+                  );
+                  if (clash) {
+                    if (laneOwnsPath(clash.path, row.id))
+                      throw new Error(
+                        `That worktree already has a lane on this task`,
+                      );
+                    setBindOffer({ workstreamId: row.id, path: clash.path });
+                    return;
+                  }
+                }
+                try {
+                  await spawnForRow(row);
+                } catch (error) {
+                  // The probe→create race can still collide — same offer,
+                  // second chance instead of a dead-end error.
+                  if (
+                    await offerOnCollision(
+                      error,
+                      row.projectPath,
+                      row.branch,
+                      { workstreamId: row.id },
+                    )
+                  )
+                    return;
+                  throw error;
+                }
               }}
               onResolve={async () => {
                 // A fresh session bound to the conflicted worktree — bound
@@ -890,9 +1196,15 @@ export function TaskDetailsPanel({
                 }));
               }}
               onRemove={() => {
-                // An open Bind popover anchored on this lane would dangle —
-                // its anchor element is about to unmount.
+                // Open popovers anchored on this lane would dangle — their
+                // anchor element is about to unmount.
                 setBindAt((current) =>
+                  current?.workstreamId === row.id ? null : current,
+                );
+                setEditAt((current) =>
+                  current?.workstreamId === row.id ? null : current,
+                );
+                setBindOffer((current) =>
                   current?.workstreamId === row.id ? null : current,
                 );
                 // Detach bound sessions' ticket links so they don't
@@ -1030,6 +1342,35 @@ export function TaskDetailsPanel({
           onClose={() => setBindAt(null)}
         />
       ) : null}
+      {editAt
+        ? (() => {
+            const editRow = card.workstreams?.find(
+              (ws) => ws.id === editAt.workstreamId,
+            );
+            if (!editRow) return null;
+            return (
+              <WorkstreamEditor
+                anchor={editAt.anchor}
+                row={editRow}
+                siblings={lanes.filter(
+                  (ws) =>
+                    ws.id !== editRow.id &&
+                    pathKey(ws.projectPath) === pathKey(editRow.projectPath),
+                )}
+                busy={busyAction === `cleanup:${editRow.id}`}
+                onPatch={(patch) =>
+                  updateTask(task.id, (current) => ({
+                    workstreams: current.workstreams.map((ws) =>
+                      ws.id === editRow.id ? { ...ws, ...patch } : ws,
+                    ),
+                  }))
+                }
+                onRemoveWorktree={() => onCleanupWorkstream(editRow.id)}
+                onClose={() => setEditAt(null)}
+              />
+            );
+          })()
+        : null}
     </PanelShell>
   );
 }
@@ -1211,6 +1552,10 @@ function WorkstreamCard({
   onOpenSession,
   onUpdate,
   onCreatePr,
+  onEdit,
+  offer,
+  onOfferAccept,
+  onOfferDismiss,
   onSpawnSession,
   onResolve,
   onBind,
@@ -1226,6 +1571,11 @@ function WorkstreamCard({
   onOpenSession: (sessionId: string) => void;
   onUpdate: () => void;
   onCreatePr: () => void;
+  onEdit: (anchor: HTMLElement) => void;
+  /** A create found this branch's existing worktree — offer binds it. */
+  offer?: { path: string };
+  onOfferAccept: () => Promise<void>;
+  onOfferDismiss: () => void;
   onSpawnSession: () => Promise<void>;
   onResolve: () => Promise<void>;
   onBind: (anchor: HTMLElement) => void;
@@ -1251,9 +1601,7 @@ function WorkstreamCard({
     try {
       await fn();
     } catch (error) {
-      setActionError(
-        String(error).replace(/^Error:\s*/, "").split("\n")[0].slice(0, 160),
-      );
+      setActionError(shortError(error));
     } finally {
       setPending(null);
       setArmed(false);
@@ -1300,9 +1648,24 @@ function WorkstreamCard({
         </span>
         <button
           type="button"
+          aria-label="Edit workstream"
+          title={
+            row.worktreePath
+              ? `Edit lane — bound to ${row.worktreePath}`
+              : "Edit lane"
+          }
+          disabled={laneBusy}
+          onClick={(event) => onEdit(event.currentTarget as HTMLElement)}
+          className="grid size-5 shrink-0 place-items-center rounded text-content/30 hover:bg-content/10 hover:text-content disabled:opacity-40"
+        >
+          <Pencil className="size-3" strokeWidth={1.75} />
+        </button>
+        <button
+          type="button"
           aria-label="Remove workstream"
+          disabled={laneBusy}
           onClick={onRemove}
-          className="grid size-5 shrink-0 place-items-center rounded text-content/30 hover:bg-content/10 hover:text-content"
+          className="grid size-5 shrink-0 place-items-center rounded text-content/30 hover:bg-content/10 hover:text-content disabled:opacity-40"
         >
           <X className="size-3" strokeWidth={1.75} />
         </button>
@@ -1409,6 +1772,15 @@ function WorkstreamCard({
             </span>
           ) : null}
         </div>
+      ) : null}
+      {/* Bind offer — "create" found the branch's existing worktree. */}
+      {offer ? (
+        <BindOfferBar
+          path={offer.path}
+          busy={laneBusy}
+          onAccept={() => void runAction("spawn", onOfferAccept)}
+          onDismiss={onOfferDismiss}
+        />
       ) : null}
       {/* Merge conflict — durable while MERGE_HEAD exists. Spawns a session
        * in this worktree with the resolve prompt. */}
@@ -1631,5 +2003,212 @@ function WorkstreamCard({
         </p>
       ) : null}
     </div>
+  );
+}
+
+/** Lane editor — rebind an existing worktree, retarget branch/base, or drop
+ * the lane's worktree. Picks apply immediately; no save step. */
+function WorkstreamEditor({
+  anchor,
+  row,
+  siblings,
+  busy,
+  onPatch,
+  onRemoveWorktree,
+  onClose,
+}: {
+  anchor: HTMLElement;
+  row: BoardWorkstreamRow;
+  /** Other lanes on the same repo — their branches and bound worktrees are
+   * claimed; a branch lives in one worktree and a worktree serves one lane. */
+  siblings: TaskWorkstream[];
+  /** Lane-level cleanup in flight — the remove button waits on it. */
+  busy: boolean;
+  onPatch: (
+    patch: Partial<
+      Pick<TaskWorkstream, "branch" | "base" | "worktreePath" | "prUrl">
+    >,
+  ) => void;
+  onRemoveWorktree: () => Promise<unknown>;
+  onClose: () => void;
+}) {
+  const { branches } = useProjectBranchesState(row.projectPath, true);
+  const { data: worktrees, refresh } = useProjectWorktrees(
+    row.projectPath,
+    true,
+  );
+  const [armed, setArmed] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const [error, setError] = useState("");
+  // The shared cache can lag a worktree created/removed elsewhere — the
+  // editor's whole job is correctness, so ask git again on open.
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+  // An armed confirm must not survive a rebind — it would remove the new
+  // pick's worktree instead of the one the user armed against.
+  useEffect(() => setArmed(false), [row.worktreePath]);
+  const claimedPaths = useMemo(
+    () =>
+      new Set(
+        siblings
+          .map((ws) => ws.worktreePath)
+          .filter((path): path is string => !!path)
+          .map(pathKey),
+      ),
+    [siblings],
+  );
+  const claimedBranches = useMemo(
+    () => new Set(siblings.map((ws) => ws.branch)),
+    [siblings],
+  );
+  const worktreeOptions = useMemo(
+    () =>
+      worktreeLaneOptions(
+        (worktrees?.worktrees ?? []).filter(
+          // A bound pick syncs the lane's branch to the tree's — a tree on a
+          // sibling-claimed branch would claim that branch too, so both
+          // claims must exclude it here, not just its path.
+          (tree) =>
+            !claimedPaths.has(pathKey(tree.path)) &&
+            !(tree.branch && claimedBranches.has(tree.branch)),
+        ),
+        row.worktreePath,
+      ),
+    [worktrees, row.worktreePath, claimedPaths, claimedBranches],
+  );
+  const baseOptions = useMemo(() => baseBranchOptions(branches), [branches]);
+  const branchOptions = useMemo(
+    () =>
+      localBranchOptions(branches).filter(
+        (option) => !claimedBranches.has(option.value),
+      ),
+    [branches, claimedBranches],
+  );
+  return (
+    <Popover
+      anchor={anchor}
+      width={280}
+      onDismiss={onClose}
+      // SearchableSelect menus portal out of this popover — they aren't
+      // "outside" clicks.
+      ignore="[data-dialog-popover]"
+      className="flex flex-col gap-2 p-2"
+      aria-label="Edit workstream"
+    >
+      <div className="flex flex-col gap-1 text-[11px] font-medium text-content/45">
+        <span>Worktree</span>
+        <SearchableSelect
+          label="Worktree"
+          value={row.worktreePath ?? ""}
+          options={[
+            { value: "", label: "Create on spawn" },
+            ...worktreeOptions,
+          ]}
+          onChange={(path) => {
+            const tree = bindableWorktrees(worktrees?.worktrees ?? []).find(
+              (entry) => entry.path === path,
+            );
+            onPatch({
+              worktreePath: path || undefined,
+              ...(tree?.branch ? { branch: tree.branch } : {}),
+              // Unbinding keeps the lane's probed PR alive — a lane without
+              // a worktree only tracks a PR when one's pinned.
+              ...(!path && row.pr?.url ? { prUrl: row.pr.url } : {}),
+            });
+          }}
+          placeholder="Create on spawn"
+          searchPlaceholder="Search worktrees…"
+          emptyLabel="No working copies"
+          layer={LAYER.submenu}
+          minMenuWidth={280}
+        />
+      </div>
+      <div className="flex items-start gap-1.5">
+        <div className="flex min-w-0 flex-1 flex-col gap-1 text-[11px] font-medium text-content/45">
+          <span>Branch</span>
+          <SearchableSelect
+            label="Branch"
+            value={row.branch}
+            options={branchOptions}
+            onChange={(branch) => {
+              const next =
+                resolveLaneBranch(row.projectPath, branch) ?? row.branch;
+              // A typed name can still resolve onto a sibling lane's branch.
+              if (claimedBranches.has(next)) {
+                setError(`A lane already tracks ${next}`);
+                return;
+              }
+              setError("");
+              onPatch({ branch: next });
+            }}
+            searchPlaceholder="Pick or type a branch…"
+            creatable="New branch"
+            disabled={!!row.worktreePath}
+            layer={LAYER.submenu}
+            minMenuWidth={220}
+          />
+        </div>
+        <div className="flex w-28 shrink-0 flex-col gap-1 text-[11px] font-medium text-content/45">
+          <span>Base</span>
+          <SearchableSelect
+            label="Base branch"
+            value={row.base}
+            options={baseOptions}
+            onChange={(base) => onPatch({ base })}
+            searchPlaceholder="Branches…"
+            layer={LAYER.submenu}
+            minMenuWidth={220}
+          />
+        </div>
+      </div>
+      {row.worktreePath ? (
+        <button
+          type="button"
+          disabled={busy || removing}
+          aria-pressed={armed}
+          title={
+            armed
+              ? "Confirm — removes the worktree directory; live sessions bound to it are detached"
+              : "Remove this lane's worktree"
+          }
+          onClick={() => {
+            if (!armed) {
+              setArmed(true);
+              return;
+            }
+            setRemoving(true);
+            setError("");
+            void onRemoveWorktree()
+              .catch((cause) => setError(shortError(cause, 120)))
+              .finally(() => {
+                setRemoving(false);
+                setArmed(false);
+              });
+          }}
+          className={`flex h-7 items-center justify-center gap-1.5 rounded-md text-[11px] font-medium disabled:opacity-40 ${
+            armed
+              ? "bg-red-400/15 text-red-300 hover:bg-red-400/25"
+              : "text-content/55 hover:bg-content/8 hover:text-content"
+          }`}
+        >
+          {removing ? (
+            <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
+          ) : (
+            <Trash2 className="size-3" strokeWidth={1.75} />
+          )}
+          {armed
+            ? row.sessions.length
+              ? `Detach ${row.sessions.length} & remove`
+              : "Confirm removal"
+            : "Remove worktree"}
+        </button>
+      ) : null}
+      {error ? (
+        <p role="alert" className="break-words text-[10px] text-red-300">
+          {error}
+        </p>
+      ) : null}
+    </Popover>
   );
 }

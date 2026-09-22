@@ -294,7 +294,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     input.sessionId,
     path,
     grokSpawnArgs({
-      model: input.model,
+      model: nativeModelId(input.model, input.cwd),
       effort: grokEffort(input.modelSettings),
       fullAccess: wantFullAccess,
       plan: wantPlanning,

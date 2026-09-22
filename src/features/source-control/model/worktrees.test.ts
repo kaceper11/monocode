@@ -5,6 +5,7 @@ import {
   sessionInWorktree,
   detachSessionWorktree,
   assertWorktreeFilesClosed,
+  bindableWorktrees,
   worktreeSessionIds,
   type Worktree,
 } from "./worktrees";
@@ -21,6 +22,18 @@ const tree: Worktree = {
   unpushed: 0,
   sessionIds: [],
 };
+
+describe("bindableWorktrees", () => {
+  it("keeps live on-branch copies, drops missing and detached ones", () => {
+    const trees = bindableWorktrees([
+      tree,
+      { ...tree, path: "/repo", branch: "main", isMain: true },
+      { ...tree, path: "/repo-wt/det", branch: null },
+      { ...tree, path: "/repo-wt/gone", missing: true },
+    ]);
+    expect(trees.map((entry) => entry.path)).toEqual([tree.path, "/repo"]);
+  });
+});
 
 describe("worktree deletion preflight", () => {
   it("blocks open files and terminals, including nested working folders", () => {

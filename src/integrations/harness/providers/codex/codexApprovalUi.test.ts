@@ -114,7 +114,7 @@ describe("Codex requests reach the chat and notifications", () => {
       });
       for (const [method, result] of [
         ["initialize", {}],
-        ["thread/start", { thread: { id: "thr_ui" } }],
+        ["thread/start", { thread: { id: "thr_ui" }, model: "gpt-5.4" }],
         ["turn/start", { turn: { id: "turn_ui" } }],
       ] as const) {
         await vi.waitFor(() =>

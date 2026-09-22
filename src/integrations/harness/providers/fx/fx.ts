@@ -261,7 +261,12 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     },
   );
 
-  await spawnChild(input.sessionId, path, fxSpawnArgs(input.model), input.cwd);
+  await spawnChild(
+    input.sessionId,
+    path,
+    fxSpawnArgs(input.model, input.cwd),
+    input.cwd,
+  );
 
   try {
     try {
@@ -363,18 +368,20 @@ async function applyModelSelection(
   live: Live,
   input: SendTurnInput,
 ): Promise<void> {
-  const base = nativeModelId(input.model, input.cwd);
+  const base = nativeModelId(input.model, input.cwd).trim();
   const settings = input.modelSettings ?? {};
   const modelConfigId =
     live.modelConfigId === "provider" ? "model" : live.modelConfigId;
 
-  await setConfigOption(live, modelConfigId, base).catch((error: unknown) => {
-    ignoreUnsupportedControl("set_config_option", error);
-  });
-  if (modelConfigId !== "model") {
-    await setConfigOption(live, "model", base).catch((error: unknown) => {
+  if (base) {
+    await setConfigOption(live, modelConfigId, base).catch((error: unknown) => {
       ignoreUnsupportedControl("set_config_option", error);
     });
+    if (modelConfigId !== "model") {
+      await setConfigOption(live, "model", base).catch((error: unknown) => {
+        ignoreUnsupportedControl("set_config_option", error);
+      });
+    }
   }
 
   for (const [settingId, value] of Object.entries(settings)) {
@@ -432,8 +439,8 @@ async function setConfigOption(
   }
 }
 
-function fxSpawnArgs(model: string): string[] {
-  const native = nativeModelId(model).trim();
+function fxSpawnArgs(model: string, cwd: string): string[] {
+  const native = nativeModelId(model, cwd).trim();
   return native ? ["acp", "--model", native] : ["acp"];
 }
 

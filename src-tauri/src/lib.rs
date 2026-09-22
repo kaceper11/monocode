@@ -415,6 +415,7 @@ pub fn run() {
             linear::linear_issue_comment,
             link_preview::fetch_link_preview,
             fs::git_branches,
+            fs::git_current_branch,
             fs::git_checkout,
             fs::git_create_branch,
             fs::git_stash,

@@ -8271,13 +8271,21 @@ export default function App({
         // failed listing is fatal too: skipping the guard would bind to a
         // path we couldn't verify.
         const live = await listWorktrees(spec.projectPath);
-        if (
-          !live.worktrees.some(
-            (entry) => entry.path === spec.worktreePath,
-          )
-        ) {
+        const bound = live.worktrees.find(
+          (entry) => pathKey(entry.path) === pathKey(spec.worktreePath!),
+        );
+        // A deleted dir stays registered until git prunes it — `missing`
+        // marks it, so path-presence alone isn't proof the copy is usable.
+        if (!bound || bound.missing) {
           throw new Error(
-            "Worktree is gone — remove the lane and add it again",
+            "Worktree is gone — repoint it in the lane's editor or remove the lane",
+          );
+        }
+        // Someone checked out another branch in this worktree — the session
+        // would silently work the wrong branch.
+        if (bound.branch !== spec.branch) {
+          throw new Error(
+            `Worktree is on ${bound.branch ?? "a detached HEAD"}, expected ${spec.branch} — repoint it in the lane's editor`,
           );
         }
       }

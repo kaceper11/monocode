@@ -112,7 +112,7 @@ async function promptOnLive(input: {
         threadId: session.threadId,
         runtimeMode: TEXT_RUNTIME_MODE,
         prompt: input.prompt,
-        model: session.model || undefined,
+        model: session.model,
         effort: session.effort,
       }),
       timeoutMs,

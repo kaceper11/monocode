@@ -52,7 +52,7 @@ import {
 } from "../inbox/model/inboxFilters";
 import { timeFilterStart } from "../sessions/model/sessionFilters";
 import { IS_MAC } from "../../platform/tauri/platform";
-import { projectKey, projectName } from "../../shared/lib/paths";
+import { pathKey, projectKey, projectName } from "../../shared/lib/paths";
 import { sameProjectPath, type RecentProject } from "../projects/model/recents";
 import type { LinkedWorkItem, Session } from "../sessions/model/session";
 import {
@@ -311,8 +311,17 @@ export function BoardView({
       ),
     [board.tasks],
   );
+  // Every lane on the board, archived included — a worktree or branch serves
+  // one lane board-wide; claims must see other tasks' lanes too.
+  const boardLanes = useMemo(
+    () => board.tasks.flatMap((task) => task.workstreams),
+    [board.tasks],
+  );
   const probeKey = probeStreams
-    .map((ws) => `${ws.id}:${ws.worktreePath}:${ws.branch}:${ws.prUrl ?? ""}`)
+    .map(
+      (ws) =>
+        `${ws.id}:${ws.worktreePath}:${ws.branch}:${ws.base}:${ws.prUrl ?? ""}`,
+    )
     .join("\n");
   const probeRef = useRef(probeStreams);
   useEffect(() => {
@@ -1090,7 +1099,43 @@ export function BoardView({
       const workstreams: TaskWorkstream[] = [];
       const errors: string[] = [];
       const failed = new Map<string, WorkstreamResult>();
+      // A failed lane stays on the task as a row without a worktree — the
+      // details panel's "Create worktree" retries it.
+      const failLane = (ws: TaskWorkstreamSpec, reason: string) => {
+        const message = `${projectName(ws.projectPath)}: ${reason}`;
+        errors.push(message);
+        const stubId = newEntityId("ws");
+        failed.set(stubId, { workstreamId: stubId, ok: false, message });
+        workstreams.push({
+          id: stubId,
+          projectPath: ws.projectPath,
+          branch: ws.branch,
+          base: ws.base,
+        });
+      };
+      // A branch lives in one worktree and a worktree serves one lane —
+      // sibling rows and other tasks' lanes both count as claims.
+      const claimed = (ws: TaskWorkstreamSpec) => {
+        const takes = (lane: {
+          projectPath: string;
+          branch: string;
+          worktreePath?: string;
+        }) =>
+          sameProjectPath(lane.projectPath, ws.projectPath) &&
+          (lane.branch === ws.branch ||
+            (!!ws.worktreePath &&
+              !!lane.worktreePath &&
+              pathKey(lane.worktreePath) === pathKey(ws.worktreePath)));
+        return (
+          workstreams.some(takes) ||
+          loadBoard().tasks.some((task) => task.workstreams.some(takes))
+        );
+      };
       for (const ws of spec.workstreams) {
+        if (claimed(ws)) {
+          failLane(ws, `a lane already tracks ${ws.branch}`);
+          continue;
+        }
         try {
           const spawned = await onSpawnSession({
             ...ws,
@@ -1106,21 +1151,7 @@ export function BoardView({
             sessionIds: [spawned.sessionId],
           });
         } catch (error) {
-          const message = `${projectName(ws.projectPath)}: ${String(error)}`;
-          errors.push(message);
-          // Keep a row so the failed lane is visible and retryable from details.
-          const stubId = newEntityId("ws");
-          failed.set(stubId, {
-            workstreamId: stubId,
-            ok: false,
-            message,
-          });
-          workstreams.push({
-            id: stubId,
-            projectPath: ws.projectPath,
-            branch: ws.branch,
-            base: ws.base,
-          });
+          failLane(ws, String(error));
         }
       }
       setTaskBusy(false);
@@ -1138,7 +1169,19 @@ export function BoardView({
         groupIds: spec.groupIds,
       });
       if (!id) {
-        // The board is full — don't orphan the worktrees we just created.
+        // The board filled since the pre-check — don't leave the worktrees
+        // just created behind. Sessions stay reachable in the sessions
+        // view; deleting them isn't BoardView's call.
+        for (const ws of workstreams) {
+          if (ws.worktreePath) {
+            void onRemoveWorktree(
+              ws.projectPath,
+              ws.worktreePath,
+              false,
+              true,
+            ).catch(() => {});
+          }
+        }
         setTaskError("Board is full — remove a task first");
         return;
       }
@@ -1696,7 +1739,9 @@ export function BoardView({
         {selectedCard ? (
           selectedCard.kind === "task" && taskOpsHandlers ? (
             <TaskDetailsPanel
+            key={selectedCard.id}
             card={selectedCard}
+            lanes={boardLanes}
             items={items}
             recents={recents}
             sessions={sessions}

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { HarnessEvent, SendTurnInput } from "../../core/types";
-import { modelsFor, resetHarnessModelOverlays } from "../../../../features/sessions/model/models";
+import { modelsFor, resetHarnessModelOverlays, setHarnessModels } from "../../../../features/sessions/model/models";
 
 const mock = vi.hoisted(() => {
   const listeners = new Map<string, (line: string) => void>();
@@ -144,6 +144,26 @@ describe.each(providers)("$id offline ACP transport", (provider) => {
   afterEach(async () => {
     await provider.forget("thread");
     resetHarnessModelOverlays();
+  });
+
+  it("keeps the provider model for an empty selection while applying effort", async () => {
+    mock.autoPrompt = true;
+    await provider.send({ ...input, model: "", modelSettings: { effort: "high" } });
+    const writes = mock.sent.filter((m) => m.method === "session/set_config_option");
+    expect(writes.map((m) => m.params)).toEqual([
+      expect.objectContaining({ configId: "thinking", value: "high" }),
+    ]);
+  });
+
+  it("resolves the model from the session catalog", async () => {
+    mock.autoPrompt = true;
+    const cwd = "//wsl.localhost/Ubuntu/home/me/project";
+    const model = { id: "antigravity:shared", harness: provider.id, name: "Shared" };
+    setHarnessModels(provider.id, [{ ...model, nativeId: "host-model" }]);
+    setHarnessModels(provider.id, [{ ...model, nativeId: "m2" }], cwd);
+    await provider.send({ ...input, cwd, model: model.id });
+    expect(mock.sent.find((m) => m.method === "session/set_config_option")?.params)
+      .toMatchObject({ configId: "model", value: "m2" });
   });
 
   it("spawns the exact endpoint, sends settings/images and routes real approvals", async () => {

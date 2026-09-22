@@ -136,11 +136,14 @@ export function buildTurnStartParams(input: {
   controlsAgents?: boolean;
   prompt?: string;
   attachments?: Attachment[];
-  model?: string;
+  model: string;
   effort?: string;
   serviceTier?: string;
   intent?: TurnIntent;
 }): Record<string, unknown> {
+  if (!input.model.trim()) {
+    throw new Error("Codex did not return a model. Select a model and retry.");
+  }
   const runtimeConfig = runtimeModeToCodexConfig(
     input.runtimeMode,
     input.controlsAgents,
@@ -166,12 +169,12 @@ export function buildTurnStartParams(input: {
     collaborationMode: {
       mode: input.intent === "plan" ? "plan" : "default",
       settings: {
-        model: input.model ?? null,
+        model: input.model,
         reasoning_effort: input.effort ?? null,
         developer_instructions: null,
       },
     },
-    ...(input.model ? { model: input.model } : {}),
+    model: input.model,
     ...(input.effort ? { effort: input.effort } : {}),
     ...(input.serviceTier && input.serviceTier !== "default"
       ? { serviceTier: input.serviceTier }

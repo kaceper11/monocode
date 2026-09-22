@@ -10,7 +10,8 @@ vi.mock("../model/worktrees", async (original) => ({
   createWorktree: vi.fn(),
   checkWorktreeRemoval: vi.fn(),
 }));
-vi.mock("../hooks/useProjectBranches", () => ({
+vi.mock("../hooks/useProjectBranches", async (original) => ({
+  ...(await original<typeof import("../hooks/useProjectBranches")>()),
   useProjectBranchesState: vi.fn(() => ({
     branches: {
       current: "main",

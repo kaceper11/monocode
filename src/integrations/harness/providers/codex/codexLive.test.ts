@@ -63,6 +63,9 @@ async function startTurn(
   options: {
     runtimeMode?: RuntimeMode;
     intent?: TurnIntent;
+    model?: string;
+    cwd?: string;
+    threadModel?: string;
     resume?: boolean;
     providerAccountId?: string;
     resumeProviderAccountId?: string;
@@ -76,14 +79,14 @@ async function startTurn(
     bindCodexSession(
       sessionId,
       "thr_1",
-      "/repo",
+      options.cwd ?? "/repo",
       options.resumeProviderAccountId,
     );
   }
   const turn = sendCodexTurn({
     sessionId,
-    cwd: "/repo",
-    model: "codex:gpt-5.4",
+    cwd: options.cwd ?? "/repo",
+    model: options.model ?? "codex:gpt-5.4",
     modelSettings: {},
     providerAccountId: options.providerAccountId,
     runtimeMode: options.runtimeMode ?? "supervised",
@@ -108,6 +111,7 @@ async function startTurn(
   await options.beforeThreadReply?.();
   reply(parse().find((m) => m.method === threadMethod)!.id as number, {
     thread: { id: "thr_1" },
+    model: options.threadModel ?? "gpt-5.4",
   });
 
   await waitFor(
@@ -133,6 +137,75 @@ describe("codex live turn sequence", () => {
     vi.restoreAllMocks();
     await stopCodexSession("codex-live");
     __codexTestReset();
+  });
+
+  it.each([
+    { resume: false, intent: "default" as const },
+    { resume: true, intent: "default" as const },
+    { resume: false, intent: "plan" as const },
+    { resume: true, intent: "plan" as const },
+  ])(
+    "uses the WSL thread's model for a saved Default selection ($resume, $intent)",
+    async ({ resume, intent }) => {
+      const { turn } = await startTurn("codex-live", {
+        cwd: "//wsl.localhost/Ubuntu/home/dev/repo",
+        model: "codex:default",
+        threadModel: "linux-account-model",
+        resume,
+        intent,
+      });
+      const thread = parse().find(
+        (m) => m.method === (resume ? "thread/resume" : "thread/start"),
+      )!;
+      expect(thread.params).not.toHaveProperty("model");
+      expect(
+        parse().find((m) => m.method === "turn/start")!.params,
+      ).toMatchObject({
+        model: "linux-account-model",
+        collaborationMode: {
+          mode: intent === "plan" ? "plan" : "default",
+          settings: { model: "linux-account-model" },
+        },
+      });
+      notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+      await turn;
+    },
+  );
+
+  it("preserves an explicit model and inherits it on a later Default turn", async () => {
+    const { turn } = await startTurn("codex-live", {
+      model: "codex:chosen-model",
+      threadModel: "server-default-model",
+    });
+    expect(
+      parse().find((m) => m.method === "turn/start")!.params,
+    ).toMatchObject({
+      model: "chosen-model",
+      collaborationMode: { settings: { model: "chosen-model" } },
+    });
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
+
+    const nextTurn = sendCodexTurn({
+      sessionId: "codex-live",
+      cwd: "/repo",
+      model: "codex:default",
+      runtimeMode: "supervised",
+      text: "Continue",
+      onEvent: () => undefined,
+    });
+    await waitFor(
+      () => parse().filter((m) => m.method === "turn/start").length === 2,
+      "next turn",
+    );
+    const next = parse().filter((m) => m.method === "turn/start")[1];
+    expect(next.params).toMatchObject({
+      model: "chosen-model",
+      collaborationMode: { settings: { model: "chosen-model" } },
+    });
+    reply(next.id as number, { turn: { id: "turn_2" } });
+    notify("turn/completed", { turn: { id: "turn_2", status: "completed" } });
+    await nextTurn;
   });
 
   it("reports when the provider accepts a turn", async () => {

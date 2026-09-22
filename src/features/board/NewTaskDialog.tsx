@@ -8,19 +8,29 @@ import {
 } from "react";
 import { InboxProviderMark } from "../inbox/ui/InboxProviderMark";
 import { Modal } from "../../shared/ui/Modal";
-import { SearchableSelect } from "../../shared/ui/SearchableSelect";
+import {
+  SearchableSelect,
+  type SearchableSelectOption,
+} from "../../shared/ui/SearchableSelect";
 import { Check, GitBranch, LoaderCircle, Plus, Search, X } from "../../shared/ui/icons";
 import { inboxItemRef, type InboxItem } from "../inbox/model/githubTasks";
 import { LAYER } from "../../shared/lib/layers";
-import { projectName } from "../../shared/lib/paths";
+import { pathKey, prettyCwd, projectName } from "../../shared/lib/paths";
 import type { RecentProject } from "../projects/model/recents";
 import type { LinkedWorkItem } from "../sessions/model/session";
 import { linkedWorkItemInboxKey } from "../sessions/model/sessionWorkItem";
-import { namedWorktreeBranch } from "../source-control/model/worktrees";
 import {
+  bindableWorktrees,
+  namedWorktreeBranch,
+  type Worktree,
+} from "../source-control/model/worktrees";
+import {
+  localBranchOptions,
   peekProjectBranches,
   useProjectBranchesState,
 } from "../source-control/hooks/useProjectBranches";
+import { useProjectWorktrees } from "../source-control/hooks/useProjectWorktrees";
+import { gitBranches, type GitBranches } from "../../platform/tauri/fs";
 import { boardTicketOptions, groupSwatch } from "./boardData";
 import { createGroup, loadBoard } from "./boardStore";
 
@@ -62,14 +72,18 @@ export function suggestedBranch(title: string, links: LinkedWorkItem[]): string 
 /** Resolve a typed/picked lane branch. A name matching an existing LOCAL
  * branch stays verbatim — spawn adopts it via the `existing: true` retry
  * (`mc/` wrapping would create a different branch instead). Anything else
- * is a new branch and gets the `mc/` convention. */
+ * is a new branch and gets the `mc/` convention. Callers on a submit path
+ * should pass a fresh `branches` — the cache can lag branches created
+ * outside the app, and wrapping a real branch in `mc/` silently forks it. */
 export function resolveLaneBranch(
   projectPath: string,
   typed: string,
+  branches?: GitBranches | null,
 ): string | null {
   const clean = typed.trim();
   if (!clean) return null;
-  const known = peekProjectBranches(projectPath);
+  const known =
+    branches !== undefined ? branches : peekProjectBranches(projectPath);
   // Cache still loading — pass the name through verbatim. The spawn path
   // adopts an existing branch or creates it under the user's literal name;
   // wrapping in `mc/` here could fork an existing branch into `mc/<name>`.
@@ -89,12 +103,57 @@ export function workstreamProjectOptions(recents: readonly RecentProject[]) {
   }));
 }
 
+/** Base-branch select options: every known ref, current checkout first when
+ * it isn't listed. Shared by WorkstreamFields and the lane editor. */
+export function baseBranchOptions(
+  branches: GitBranches | null,
+): SearchableSelectOption[] {
+  const list = (branches?.branches ?? []).map((branch) => ({
+    value: branch.remote ? `${branch.remote}/${branch.name}` : branch.name,
+    label: branch.remote ? `${branch.remote}/${branch.name}` : branch.name,
+  }));
+  const current = branches?.current;
+  return current && !list.some((option) => option.value === current)
+    ? [{ value: current, label: current }, ...list]
+    : list;
+}
+
+/** Existing-worktree select options — the main checkout is a valid bind
+ * target too (lanes work on its checked-out branch). A stale bound path
+ * stays listed so the pick can be corrected instead of rendering blank. */
+export function worktreeLaneOptions(
+  trees: readonly Worktree[],
+  boundPath?: string,
+): SearchableSelectOption[] {
+  const options = bindableWorktrees(trees).map((tree) => ({
+    value: tree.path,
+    label: tree.isMain
+      ? `Project checkout — ${tree.branch}`
+      : `${tree.branch} — ${prettyCwd(tree.path)}`,
+  }));
+  if (
+    boundPath &&
+    !options.some((option) => pathKey(option.value) === pathKey(boundPath))
+  ) {
+    // The bound path isn't bindable — name the actual state so the user
+    // knows whether to repoint (gone) or re-branch it (detached).
+    const stale = trees.find((tree) => pathKey(tree.path) === pathKey(boundPath));
+    options.push({
+      value: boundPath,
+      label: `${prettyCwd(boundPath)} — ${stale && !stale.missing ? "detached" : "missing"}`,
+    });
+  }
+  return options;
+}
+
 type DraftWorkstream = {
   key: number;
   projectPath: string;
   /** "" → auto from title/tickets on submit. */
   branch: string;
   base: string;
+  /** Bind this existing worktree instead of creating a new one. */
+  worktreePath?: string;
 };
 
 /** Repo + branch + base inputs — shared by this dialog and the details
@@ -106,54 +165,100 @@ export function WorkstreamFields({
   tail,
   compact,
   layer,
+  excludeWorktreePaths,
 }: {
-  draft: { projectPath: string; branch: string; base: string };
+  draft: {
+    projectPath: string;
+    branch: string;
+    base: string;
+    worktreePath?: string;
+  };
   projects: { value: string; label: string }[];
   onChange: (
-    patch: Partial<{ projectPath: string; branch: string; base: string }>,
+    patch: Partial<{
+      projectPath: string;
+      branch: string;
+      base: string;
+      worktreePath?: string;
+    }>,
   ) => void;
   tail: ReactNode;
   compact?: boolean;
   /** Popover layer — pass `LAYER.dialogPopover` when inside a modal. */
   layer?: number;
+  /** pathKey'd worktree paths another lane already claims — offering one
+   * would only fail at submit, so keep it out of the picker. */
+  excludeWorktreePaths?: ReadonlySet<string>;
 }) {
   const { branches } = useProjectBranchesState(
     draft.projectPath,
     !!draft.projectPath,
   );
-  const baseOptions = useMemo(() => {
-    const list = (branches?.branches ?? []).map((branch) => ({
-      value: branch.remote ? `${branch.remote}/${branch.name}` : branch.name,
-      label: branch.remote ? `${branch.remote}/${branch.name}` : branch.name,
-    }));
-    const current = branches?.current;
-    return current && !list.some((option) => option.value === current)
-      ? [{ value: current, label: current }, ...list]
-      : list;
-  }, [branches]);
+  const { data: worktrees } = useProjectWorktrees(
+    draft.projectPath,
+    !!draft.projectPath,
+  );
+  const baseOptions = useMemo(() => baseBranchOptions(branches), [branches]);
   // Adoptable branches are local-only, matching CreateWorktreeDialog — the
   // spawn path creates a new branch from base for anything else it can't
   // adopt. "" keeps the auto-generated name.
   const branchOptions = useMemo(
-    () => [
-      { value: "", label: "Auto from task" },
-      ...(branches?.branches ?? [])
-        .filter((branch) => !branch.remote)
-        .map((branch) => ({ value: branch.name, label: branch.name })),
-    ],
+    () => [{ value: "", label: "Auto from task" }, ...localBranchOptions(branches)],
     [branches],
+  );
+  // Existing worktrees of the chosen repo — a lane can bind one instead of
+  // creating a fresh copy. Branch follows the pick (a bound lane's branch
+  // is whatever the worktree has checked out).
+  const worktreeOptions = useMemo(
+    () =>
+      worktreeLaneOptions(
+        (worktrees?.worktrees ?? []).filter(
+          (tree) => !excludeWorktreePaths?.has(pathKey(tree.path)),
+        ),
+        draft.worktreePath,
+      ),
+    [worktrees, draft.worktreePath, excludeWorktreePaths],
   );
   const repoSelect = (
     <SearchableSelect
       label="Repository"
       value={draft.projectPath}
       options={projects}
-      onChange={(projectPath) => onChange({ projectPath })}
+      onChange={(projectPath) =>
+        onChange({ projectPath, worktreePath: undefined })
+      }
       placeholder={compact ? "Repo…" : "Choose repo…"}
       searchPlaceholder="Search projects…"
       layer={layer}
     />
   );
+  const worktreeSelect = worktreeOptions.length ? (
+    <SearchableSelect
+      label="Worktree"
+      value={draft.worktreePath ?? ""}
+      options={[{ value: "", label: "New worktree" }, ...worktreeOptions]}
+      onChange={(path) => {
+        const tree = worktrees?.worktrees.find(
+          (entry) => entry.path === path,
+        );
+        onChange({
+          // `path` may be the stale-bound synthetic option — keep it so the
+          // pick stays visible instead of silently unbinding. Reverting to
+          // "New worktree" drops the copied branch too — leaving it would
+          // collide with the worktree it came from. A stale pick has no
+          // live tree to read from — keep the branch it synced.
+          worktreePath: path || undefined,
+          branch: path ? (tree?.branch ?? draft.branch) : "",
+        });
+      }}
+      placeholder="New worktree"
+      searchPlaceholder="Search worktrees…"
+      emptyLabel="No working copies"
+      disabled={!draft.projectPath}
+      layer={layer}
+      minMenuWidth={280}
+    />
+  ) : null;
   const baseSelect = (
     <SearchableSelect
       label="Base branch"
@@ -176,20 +281,38 @@ export function WorkstreamFields({
       placeholder={branches ? "mc/branch…" : "…"}
       searchPlaceholder="Pick or type a branch…"
       creatable="New branch"
-      disabled={!draft.projectPath}
+      disabled={!draft.projectPath || !!draft.worktreePath}
       layer={layer}
       minMenuWidth={240}
     />
   );
   // Compact rows live in the narrow details panel — stack the repo over
   // branch+base so every field stays readable.
-  return compact ? (
+  if (compact) {
+    return (
+      <div className="flex flex-col gap-1.5">
+        {repoSelect}
+        {worktreeSelect}
+        <div className="flex items-center gap-1.5">
+          <div className="min-w-0 flex-1">{branchSelect}</div>
+          <div className="w-28 shrink-0">{baseSelect}</div>
+          {tail}
+        </div>
+      </div>
+    );
+  }
+  // With a worktree pick the row wraps: repo+worktree on top, branch+base
+  // underneath — four selects can't share one readable line.
+  return worktreeSelect ? (
     <div className="flex flex-col gap-1.5">
-      {repoSelect}
+      <div className="flex items-center gap-1.5">
+        <div className="min-w-0 flex-1">{repoSelect}</div>
+        <div className="w-56 shrink-0">{worktreeSelect}</div>
+        {tail}
+      </div>
       <div className="flex items-center gap-1.5">
         <div className="min-w-0 flex-1">{branchSelect}</div>
-        <div className="w-28 shrink-0">{baseSelect}</div>
-        {tail}
+        <div className="w-40 shrink-0">{baseSelect}</div>
       </div>
     </div>
   ) : (
@@ -262,11 +385,22 @@ export function NewTaskDialog({
     });
   };
 
-  const submit = (event: FormEvent) => {
+  const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (busy) return;
     const links = [...selected.values()];
     const fallback = suggestedBranch(title, links);
+    // Fresh branch lists — a stale cache would wrap a branch created
+    // outside the app in `mc/` instead of adopting it.
+    const fresh = new Map<string, GitBranches | null>();
+    for (const stream of streams) {
+      if (stream.projectPath && !fresh.has(stream.projectPath)) {
+        fresh.set(
+          stream.projectPath,
+          await gitBranches(stream.projectPath).catch(() => null),
+        );
+      }
+    }
     onSubmit({
       title: title.trim(),
       links,
@@ -274,8 +408,19 @@ export function NewTaskDialog({
         .filter((stream) => stream.projectPath)
         .map((stream) => ({
           projectPath: stream.projectPath,
-          branch: resolveLaneBranch(stream.projectPath, stream.branch) || fallback,
+          // A bound worktree carries its own branch — resolveLaneBranch
+          // would only be needed for fresh creations.
+          branch: stream.worktreePath
+            ? stream.branch
+            : resolveLaneBranch(
+                stream.projectPath,
+                stream.branch,
+                fresh.get(stream.projectPath),
+              ) || fallback,
           base: stream.base.trim() || "HEAD",
+          ...(stream.worktreePath
+            ? { worktreePath: stream.worktreePath }
+            : {}),
         })),
       groupIds: [...selectedGroups],
     });

@@ -1,4 +1,7 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { resetHarnessModelOverlays, setHarnessModels } from "../../../../features/sessions/model/models";
+
+const spawn = vi.hoisted(() => vi.fn(async () => undefined));
 
 const sent: string[] = [];
 let onLine: ((line: string) => void) | undefined;
@@ -6,7 +9,7 @@ let onExit: ((code: number | null) => void) | undefined;
 
 vi.mock("../../core/child", () => ({
   resolveFxBinary: async () => ({ path: "/fake/fx" }),
-  spawnChild: async () => undefined,
+  spawnChild: spawn,
   killChild: async () => undefined,
   unwatchChild: () => undefined,
   watchChild: (
@@ -22,7 +25,7 @@ vi.mock("../../core/child", () => ({
   },
 }));
 
-const { sendFxTurn, stopFxSession } = await import("./fx");
+const { sendFxTurn, stopFxSession, forgetFxSession } = await import("./fx");
 import type { HarnessEvent } from "../../core/types";
 
 function reply(id: number, result: unknown) {
@@ -51,14 +54,24 @@ const waitFor = async (pred: () => boolean, label: string) => {
 describe("fx live turn sequence", () => {
   beforeEach(() => {
     sent.length = 0;
+    spawn.mockClear();
   });
 
-  it("auto-approves a permission request instead of blocking the turn", async () => {
+  afterEach(async () => {
+    await forgetFxSession("t1");
+    resetHarnessModelOverlays();
+  });
+
+  it.each(["fx:zai/glm-5.2", "", "fx:shared"])("preserves model selection and approvals (%j)", async (model) => {
     const events: HarnessEvent[] = [];
+    const cwd = "//wsl.localhost/Ubuntu/home/me/project";
+    const shared = { id: "fx:shared", harness: "fx" as const, name: "Shared" };
+    setHarnessModels("fx", [{ ...shared, nativeId: "host-model" }]);
+    setHarnessModels("fx", [{ ...shared, nativeId: "zai/glm-5.2" }], cwd);
     const input = {
       sessionId: "t1",
-      cwd: "/repo",
-      model: "fx:zai/glm-5.2",
+      cwd,
+      model,
       modelSettings: {},
       runtimeMode: "supervised" as const,
       text: "hey",
@@ -100,6 +113,8 @@ describe("fx live turn sequence", () => {
       stopReason: "end_turn",
     });
     await turn1;
+    expect(spawn).toHaveBeenCalledWith("t1", "/fake/fx",
+      model ? ["acp", "--model", "zai/glm-5.2"] : ["acp"], cwd);
     console.log(
       "TURN 1 OK, messages:",
       parse().map((m) => m.method ?? `reply:${m.id}`),

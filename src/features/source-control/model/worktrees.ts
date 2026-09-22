@@ -165,6 +165,12 @@ export function worktreeSessionIds(
 
 export const NO_BRANCH_LABEL = "No branch selected";
 
+/** Working copies a lane/session can bind to: live and on a branch — a
+ * lane's branch drives probes and updates, so detached copies don't fit. */
+export function bindableWorktrees(trees: readonly Worktree[]): Worktree[] {
+  return trees.filter((tree) => !tree.missing && tree.branch != null);
+}
+
 /** Keep the transcript and project identity while requiring a new working copy. */
 export function detachSessionWorktree<T extends { cwd: string; worktreeCwd?: string }>(
   session: T,

@@ -452,6 +452,13 @@ export function gitBranches(cwd: string): Promise<GitBranches> {
   return invoke<GitBranches>("git_branches", { cwd });
 }
 
+/** The checked-out branch only — one `symbolic-ref` subprocess; null on a
+ * detached HEAD or a path that isn't a work tree. Cheaper than
+ * `gitBranches` for per-lane probe cycles. */
+export function gitCurrentBranch(cwd: string): Promise<string | null> {
+  return invoke<string | null>("git_current_branch", { cwd });
+}
+
 export function gitCheckout(
   cwd: string,
   name: string,

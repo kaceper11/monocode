@@ -4,8 +4,10 @@ import {
   laneProblem,
   prHeadRemoteRef,
   prIsOpen,
+  probeWorkstream,
   renderPrBody,
   resolveConflictPrompt,
+  worktreeOnBranch,
 } from "./taskOps";
 import type { InboxItem } from "../inbox/model/githubTasks";
 import type { LinkedWorkItem, Session } from "../sessions/model/session";
@@ -29,6 +31,20 @@ import {
 } from "./boardData";
 import { buildStandup } from "./standup";
 import { defaultReviewProject } from "./ReviewLocallyDialog";
+import { worktreeLaneOptions } from "./NewTaskDialog";
+import {
+  listWorktrees,
+  type Worktree,
+} from "../source-control/model/worktrees";
+import {
+  gitBehindBase,
+  gitCurrentBranch,
+  gitMergeInProgress,
+  gitPrChecks,
+  gitPrStatus,
+  type GitPr,
+} from "../../platform/tauri/fs";
+import { azureDevOpsRepoMatch } from "../inbox/model/azureDevOps";
 import {
   addColumn,
   addLocalCard,
@@ -54,7 +70,28 @@ import {
   unsnoozeCard,
   updateTask,
   type BoardTask,
+  type TaskWorkstream,
 } from "./boardStore";
+
+// IO boundaries mocked module-wide — everything tested here stays pure.
+vi.mock("../../platform/tauri/fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../platform/tauri/fs")>()),
+  gitBehindBase: vi.fn(),
+  gitCurrentBranch: vi.fn(),
+  gitMergeInProgress: vi.fn(),
+  gitPrChecks: vi.fn(),
+  gitPrStatus: vi.fn(),
+}));
+vi.mock("../inbox/model/azureDevOps", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../inbox/model/azureDevOps")>()),
+  azureDevOpsRepoMatch: vi.fn(),
+}));
+vi.mock("../source-control/model/worktrees", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("../source-control/model/worktrees")
+  >()),
+  listWorktrees: vi.fn(),
+}));
 
 // boardStore persists to localStorage + notifies on window — node has neither.
 const storage = new Map<string, string>();
@@ -2227,5 +2264,127 @@ describe("buildStandup", () => {
     expect(report).not.toContain("Done / merged");
     expect(report).not.toContain("PR #5");
     expect(report).toContain("Old merge");
+  });
+});
+
+const wt = (partial: Partial<Worktree>): Worktree => ({
+  path: "/repo-wt/x",
+  branch: "feat",
+  head: "abc",
+  isMain: false,
+  locked: false,
+  prunable: false,
+  missing: false,
+  dirty: false,
+  unpushed: 0,
+  sessionIds: [],
+  ...partial,
+});
+
+describe("worktreeLaneOptions", () => {
+  it("lists bindable worktrees and keeps a stale bound path visible", () => {
+    const options = worktreeLaneOptions(
+      [
+        wt({ path: "/repo", branch: "main", isMain: true }),
+        wt({ path: "/repo-wt/feat", branch: "feat" }),
+        wt({ path: "/repo-wt/det", branch: null }),
+        wt({ path: "/repo-wt/gone", branch: "gone", missing: true }),
+      ],
+      "/repo-wt/stale",
+    );
+    // Detached and missing copies can't be lanes; the bound-but-gone path
+    // stays listed so the pick doesn't render blank.
+    expect(options.map((option) => option.value)).toEqual([
+      "/repo",
+      "/repo-wt/feat",
+      "/repo-wt/stale",
+    ]);
+    expect(options[0]!.label).toContain("Project checkout");
+    expect(options[2]!.label).toContain("missing");
+  });
+});
+
+describe("worktreeOnBranch", () => {
+  beforeEach(() => vi.mocked(listWorktrees).mockReset());
+
+  it("finds the live worktree on a branch and ignores missing ones", async () => {
+    vi.mocked(listWorktrees).mockResolvedValue({
+      worktrees: [
+        wt({ path: "/repo-wt/gone", missing: true }),
+        wt({ path: "/repo-wt/live" }),
+      ],
+      defaultRoot: "/repo-worktrees",
+    });
+    await expect(worktreeOnBranch("/repo", "feat")).resolves.toMatchObject({
+      path: "/repo-wt/live",
+    });
+    await expect(worktreeOnBranch("/repo", "other")).resolves.toBeNull();
+  });
+});
+
+describe("probeWorkstream", () => {
+  const lane: TaskWorkstream = {
+    id: "w1",
+    projectPath: "/repo",
+    branch: "feat",
+    base: "main",
+    worktreePath: "/repo-wt/feat",
+    sessionIds: [],
+  };
+  const pr: GitPr = {
+    number: 5,
+    title: "PR",
+    url: "https://example.test/pr/5",
+    state: "open",
+  };
+
+  beforeEach(() => {
+    vi.mocked(gitCurrentBranch).mockReset().mockResolvedValue("feat");
+    vi.mocked(azureDevOpsRepoMatch).mockReset().mockResolvedValue(false);
+    vi.mocked(gitMergeInProgress).mockReset().mockResolvedValue(false);
+    vi.mocked(gitBehindBase).mockReset().mockResolvedValue(0);
+    vi.mocked(gitPrStatus).mockReset().mockResolvedValue(null);
+    vi.mocked(gitPrChecks).mockReset().mockResolvedValue([]);
+  });
+
+  it("flags a drifted checkout instead of misreporting the lane", async () => {
+    vi.mocked(gitCurrentBranch).mockResolvedValue("other");
+    // `gh` would return `other`'s PR — drift must skip the inference.
+    vi.mocked(gitPrStatus).mockResolvedValue(pr);
+    const status = await probeWorkstream(lane);
+    expect(status?.pr).toBeNull();
+    expect(status?.error).toContain("other");
+    expect(status?.error).toContain("feat");
+    expect(vi.mocked(gitPrStatus)).not.toHaveBeenCalled();
+    expect(vi.mocked(gitBehindBase)).not.toHaveBeenCalled();
+  });
+
+  it("keeps a pinned PR visible under drift", async () => {
+    vi.mocked(gitCurrentBranch).mockResolvedValue("other");
+    vi.mocked(gitPrStatus).mockResolvedValue(pr);
+    const status = await probeWorkstream({
+      ...lane,
+      prUrl: "https://example.test/pr/5",
+    });
+    expect(status?.pr).toEqual(pr);
+    expect(status?.error).toContain("other");
+  });
+
+  it("probes normally when the worktree is on the lane's branch", async () => {
+    vi.mocked(gitPrStatus).mockResolvedValue(pr);
+    vi.mocked(gitBehindBase).mockResolvedValue(3);
+    const status = await probeWorkstream(lane);
+    expect(status).toMatchObject({ pr, behind: 3 });
+    expect(status?.error).toBeUndefined();
+  });
+
+  it("surfaces a gone worktree dir as a probe error, not a silent lane", async () => {
+    vi.mocked(gitCurrentBranch).mockRejectedValue(
+      new Error("Worktree directory is gone"),
+    );
+    const status = await probeWorkstream(lane);
+    expect(status?.pr).toBeNull();
+    expect(status?.checks).toEqual([]);
+    expect(status?.error).toContain("gone");
   });
 });

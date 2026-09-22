@@ -396,18 +396,20 @@ async function applyModelSelection(
   live: Live,
   input: SendTurnInput,
 ): Promise<void> {
-  const base = nativeModelId(input.model, input.cwd);
+  const base = nativeModelId(input.model, input.cwd).trim();
   const settings = input.modelSettings ?? {};
 
-  try {
-    await setConfigOption(live, live.modelConfigId, base);
-  } catch {
-    await live.acp
-      .request("session/set_model", {
-        sessionId: live.acpSessionId,
-        modelId: base,
-      })
-      .catch(() => undefined);
+  if (base) {
+    try {
+      await setConfigOption(live, live.modelConfigId, base);
+    } catch {
+      await live.acp
+        .request("session/set_model", {
+          sessionId: live.acpSessionId,
+          modelId: base,
+        })
+        .catch(() => undefined);
+    }
   }
 
   for (const [settingId, value] of Object.entries(settings)) {

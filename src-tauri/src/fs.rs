@@ -1847,6 +1847,26 @@ pub async fn git_branches(cwd: String) -> Result<GitBranches, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// The checked-out branch only — one `symbolic-ref` subprocess where the
+/// full `git_branches` listing would be waste (per-lane probe cycles).
+/// None on a detached HEAD or a path that isn't a work tree; Err when the
+/// directory itself is gone — a lane probing a vanished worktree needs a
+/// readable error, not a wrong "detached HEAD" drift report.
+#[tauri::command]
+pub async fn git_current_branch(cwd: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || current_branch_for(&expand_home(&cwd)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn current_branch_for(root: &Path) -> Result<Option<String>, String> {
+    let (exists, is_dir) = crate::worktrees::path_info(root)?;
+    if !(exists && is_dir) {
+        return Err("Worktree directory is gone".into());
+    }
+    Ok(git_head_branch(root))
+}
+
 /// Switch to an existing local branch, or create a local tracking branch from a remote.
 #[tauri::command]
 pub async fn git_checkout(
@@ -6623,6 +6643,26 @@ mod tests {
             }
         }
         git(dir, &["add", "."]) && git(dir, &["commit", "-m", "init"])
+    }
+
+    #[test]
+    fn current_branch_distinguishes_gone_detached_and_checked_out() {
+        let dir = tmp("current-branch");
+        // A vanished worktree dir must fail loudly — the lane probe turns
+        // it into a readable error, not a wrong-branch drift report.
+        assert!(current_branch_for(&dir.0.join("gone")).is_err());
+        // A plain directory isn't a work tree — None like detached, not gone.
+        let plain = dir.0.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert_eq!(current_branch_for(&plain).unwrap(), None);
+        if !init_git_commit(&dir.0, &[("f.txt", "x")]) {
+            return;
+        }
+        assert_eq!(current_branch_for(&dir.0).unwrap().as_deref(), Some("main"));
+        if !git(&dir.0, &["checkout", "--detach", "HEAD"]) {
+            return;
+        }
+        assert_eq!(current_branch_for(&dir.0).unwrap(), None);
     }
 
     #[test]

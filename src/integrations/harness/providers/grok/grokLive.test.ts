@@ -1,4 +1,7 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { resetHarnessModelOverlays, setHarnessModels } from "../../../../features/sessions/model/models";
+
+const spawn = vi.hoisted(() => vi.fn(async () => undefined));
 
 const sent: string[] = [];
 let onLine: ((line: string) => void) | undefined;
@@ -6,7 +9,7 @@ let onExit: ((code: number | null) => void) | undefined;
 
 vi.mock("../../core/child", () => ({
   resolveGrokBinary: async () => ({ path: "/fake/grok" }),
-  spawnChild: async () => undefined,
+  spawnChild: spawn,
   killChild: async () => undefined,
   unwatchChild: () => undefined,
   watchChild: (
@@ -27,6 +30,7 @@ const {
   sendGrokTurn,
   respondGrokApproval,
   stopGrokSession,
+  forgetGrokSession,
 } = await import("./grok");
 import type { HarnessEvent } from "../../core/types";
 
@@ -86,14 +90,24 @@ async function handshake() {
 describe("grok live turn sequence", () => {
   beforeEach(() => {
     sent.length = 0;
+    spawn.mockClear();
   });
 
-  it("authenticates, selects the model, and prompts", async () => {
+  afterEach(async () => {
+    await forgetGrokSession("t1");
+    resetHarnessModelOverlays();
+  });
+
+  it.each(["grok:grok-4.6", "grok:shared"])("authenticates, selects the model, and prompts (%s)", async (model) => {
     const events: HarnessEvent[] = [];
+    const cwd = "//wsl.localhost/Ubuntu/home/me/project";
+    const shared = { id: "grok:shared", harness: "grok" as const, name: "Shared" };
+    setHarnessModels("grok", [{ ...shared, nativeId: "host-model" }]);
+    setHarnessModels("grok", [{ ...shared, nativeId: "grok-4.6" }], cwd);
     const turn = sendGrokTurn({
       sessionId: "t1",
-      cwd: "/repo",
-      model: "grok:grok-4.6",
+      cwd,
+      model,
       modelSettings: { effort: "high" },
       runtimeMode: "supervised",
       text: "hey",
@@ -131,6 +145,8 @@ describe("grok live turn sequence", () => {
     expect(events.some((e) => e.type === "session.providerBound")).toBe(true);
     expect(parse().some((m) => m.method === "authenticate")).toBe(true);
     await stopGrokSession("t1");
+    expect(spawn).toHaveBeenCalledWith("t1", "/fake/grok",
+      expect.arrayContaining(["--model", "grok-4.6"]), cwd);
   });
 
   it.each(["allow-once", "opaque-allow"])("surfaces a supervised permission request instead of auto-approving (%s)", async (allowId) => {

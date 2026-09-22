@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { useProjectBranchesState } from "../hooks/useProjectBranches";
+import {
+  localBranchOptions,
+  useProjectBranchesState,
+} from "../hooks/useProjectBranches";
 import { LAYER } from "../../../shared/lib/layers";
 import { createWorktree, type Worktree } from "../model/worktrees";
 import { prettyCwd } from "../../../shared/lib/paths";
@@ -33,10 +36,7 @@ export function CreateWorktreeDialog({
     return () => cancelAnimationFrame(frame);
   }, [existing]);
   const localBranches = useMemo(
-    () =>
-      (branches?.branches ?? [])
-        .filter((branch) => !branch.remote)
-        .map((branch) => ({ value: branch.name, label: branch.name })),
+    () => localBranchOptions(branches),
     [branches],
   );
   const baseOptions = useMemo(

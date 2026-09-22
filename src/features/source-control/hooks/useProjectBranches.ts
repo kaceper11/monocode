@@ -138,3 +138,13 @@ export function useProjectBranches(
 export function peekProjectBranches(cwd: string): GitBranches | null {
   return entries.get(cwd)?.state.branches ?? null;
 }
+
+/** Select options for the repo's LOCAL branches only — adoptable targets.
+ * Remote-qualified names would create a new local branch instead. */
+export function localBranchOptions(
+  branches: GitBranches | null,
+): { value: string; label: string }[] {
+  return (branches?.branches ?? [])
+    .filter((branch) => !branch.remote)
+    .map((branch) => ({ value: branch.name, label: branch.name }));
+}

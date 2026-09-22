@@ -1,6 +1,7 @@
 import {
   gitBehindBase,
   gitBranches,
+  gitCurrentBranch,
   gitMergeFrom,
   gitMergeInProgress,
   gitPrChecks,
@@ -17,6 +18,10 @@ import {
   azureDevOpsRepoMatch,
 } from "../inbox/model/azureDevOps";
 import type { LinkedWorkItem } from "../sessions/model/session";
+import {
+  listWorktrees,
+  type Worktree,
+} from "../source-control/model/worktrees";
 import type { BoardTask, TaskWorkstream } from "./boardStore";
 import { prIsOpen, type WorkstreamStatus } from "./boardData";
 
@@ -70,34 +75,58 @@ export async function probeWorkstream(
   const cwd = worktree ?? (prUrl ? workstream.projectPath : undefined);
   if (!cwd) return null;
   try {
-    // Local-worktree signals are meaningless against the project fallback.
-    const merging = worktree
-      ? gitMergeInProgress(cwd).catch(() => false)
-      : Promise.resolve(false);
+    // A worktree someone checked out onto another branch feeds every
+    // checkout-based signal — detect drift before it misreports.
+    const [actual, azure] = await Promise.all([
+      worktree
+        ? gitCurrentBranch(cwd).then((branch) => branch ?? "")
+        : Promise.resolve(workstream.branch),
+      azureDevOpsRepoMatch(cwd),
+    ]);
+    const drifted = actual !== workstream.branch;
+    const drift = drifted
+      ? `Worktree is on ${actual || "a detached HEAD"}, expected ${workstream.branch}`
+      : undefined;
+    // Local-worktree signals are meaningless against the project fallback —
+    // and describe the wrong HEAD on a drifted checkout.
+    const merging =
+      worktree && !drifted
+        ? gitMergeInProgress(cwd).catch(() => false)
+        : Promise.resolve(false);
     // Behind-base is local refs only — it must never fetch per lane.
-    const behind = worktree
-      ? gitBehindBase(cwd, workstream.base).catch(() => 0)
-      : Promise.resolve(0);
-    if (await azureDevOpsRepoMatch(cwd)) {
+    const behind =
+      worktree && !drifted
+        ? gitBehindBase(cwd, workstream.base).catch(() => 0)
+        : Promise.resolve(0);
+    if (azure) {
       // PR + pipelines in one round trip; Azure branch builds exist pre-PR.
-      // Pass the lane's branch — the cwd may be the project root after a
-      // post-merge cleanup, whose checkout isn't this lane's branch.
+      // The branch-anchored probe stays correct under drift — pass the
+      // lane's branch, not whatever is checked out.
       return {
         ...(await azureDevOpsPrProbe(cwd, prUrl, workstream.branch)),
         merging: await merging,
         behind: await behind,
+        ...(drift ? { error: drift } : {}),
       };
     }
-    const pr = await gitPrStatus(cwd, prUrl);
+    // `gh` infers the PR from the checked-out branch — under drift only a
+    // pinned URL still resolves the lane's PR.
+    const pr = drifted && !prUrl ? null : await gitPrStatus(cwd, prUrl);
     const checks = pr ? await gitPrChecks(cwd, prUrl).catch(() => []) : [];
-    return { pr, checks, merging: await merging, behind: await behind };
+    return {
+      pr,
+      checks,
+      merging: await merging,
+      behind: await behind,
+      ...(drift ? { error: drift } : {}),
+    };
   } catch (error) {
     // Keep a visible failure — a deleted worktree or missing `gh` must not
     // silently erase the row's PR/CI state.
     return {
       pr: null,
       checks: [],
-      error: String(error).replace(/^Error:\s*/, "").split("\n")[0].slice(0, 120),
+      error: shortError(error, 120),
     };
   }
 }
@@ -122,6 +151,20 @@ export function prHeadRemoteRef(
   return `refs/pull/${number}/head`;
 }
 
+/** The worktree currently holding `branch`, if any — a create would collide
+ * with it, so callers can offer to bind that copy instead of failing. */
+export async function worktreeOnBranch(
+  projectPath: string,
+  branch: string,
+): Promise<Worktree | null> {
+  const live = await listWorktrees(projectPath);
+  return (
+    live.worktrees.find(
+      (tree) => tree.branch === branch && !tree.missing,
+    ) ?? null
+  );
+}
+
 export type WorkstreamResult = {
   workstreamId: string;
   ok: boolean;
@@ -130,8 +173,10 @@ export type WorkstreamResult = {
   conflict?: boolean;
 };
 
-const shortError = (error: unknown) =>
-  String(error).replace(/^Error:\s*/, "").split("\n")[0].slice(0, 160);
+/** First line of an error's message, stripped of the `Error:` prefix —
+ * the shared shape every lane/panel error surface renders. */
+export const shortError = (error: unknown, max = 160) =>
+  String(error).replace(/^Error:\s*/, "").split("\n")[0].slice(0, max);
 
 const branchMismatch = (workstream: TaskWorkstream, actual: string) =>
   `Worktree is on ${actual || "another branch"}, expected ${workstream.branch}`;

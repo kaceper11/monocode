@@ -74,6 +74,7 @@ describe("runtimeModeToCodexConfig", () => {
     expect(
       buildTurnStartParams({
         threadId: "t",
+        model: "gpt-5.4",
         runtimeMode: "auto",
         controlsAgents: true,
       }).sandboxPolicy,
@@ -81,14 +82,18 @@ describe("runtimeModeToCodexConfig", () => {
     expect(
       buildTurnStartParams({
         threadId: "t",
+        model: "gpt-5.4",
         runtimeMode: "auto",
         controlsAgents: true,
         intent: "plan",
       }).sandboxPolicy,
     ).toMatchObject({ type: "readOnly", networkAccess: true });
     expect(
-      buildTurnStartParams({ threadId: "t", runtimeMode: "auto" })
-        .sandboxPolicy,
+      buildTurnStartParams({
+        threadId: "t",
+        model: "gpt-5.4",
+        runtimeMode: "auto",
+      }).sandboxPolicy,
     ).not.toHaveProperty("networkAccess");
   });
 
@@ -103,6 +108,16 @@ describe("runtimeModeToCodexConfig", () => {
 });
 
 describe("buildThreadStartParams / buildTurnStartParams", () => {
+  it.each(["", "   "])("rejects a blank turn model (%j)", (model) => {
+    expect(() =>
+      buildTurnStartParams({
+        threadId: "t",
+        runtimeMode: "supervised",
+        model,
+      }),
+    ).toThrow("Select a model and retry");
+  });
+
   it("includes model and omits default service tier", () => {
     const thread = buildThreadStartParams({
       cwd: "/tmp/proj",
@@ -180,6 +195,7 @@ describe("buildThreadStartParams / buildTurnStartParams", () => {
       expect(
         buildTurnStartParams({
           threadId: "thr_1",
+          model: "gpt-5.4",
           runtimeMode,
           intent: "plan",
           prompt: "inspect",

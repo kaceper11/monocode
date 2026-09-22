@@ -67,6 +67,7 @@ const QUESTION_AUTO_RESOLVE_MS = 120_000;
 type Live = {
   rpc: JsonRpcClient;
   threadId: string;
+  model: string;
   cwd: string;
   providerAccountId?: string;
   runtimeMode: RuntimeMode;
@@ -482,7 +483,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     });
     await rpc.notify("initialized", undefined);
 
-    const model = nativeModelId(input.model, input.cwd);
+    let model = nativeModelId(input.model, input.cwd);
     const serviceTier = input.modelSettings?.serviceTier;
     const effort = input.modelSettings?.reasoningEffort;
 
@@ -491,20 +492,21 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
 
     if (canResume && resume) {
       try {
-        const opened = await rpc.request<{ thread?: { id?: string } }>(
-          "thread/resume",
-          {
-            threadId: resume.threadId,
-            ...buildThreadStartParams({
-              cwd: input.cwd,
-              runtimeMode: input.runtimeMode,
-              controlsAgents: input.controlsAgents,
-              model,
-              serviceTier,
-            }),
-          },
-        );
+        const opened = await rpc.request<{
+          thread?: { id?: string };
+          model?: string;
+        }>("thread/resume", {
+          threadId: resume.threadId,
+          ...buildThreadStartParams({
+            cwd: input.cwd,
+            runtimeMode: input.runtimeMode,
+            controlsAgents: input.controlsAgents,
+            model,
+            serviceTier,
+          }),
+        });
         threadId = opened.thread?.id ?? resume.threadId;
+        model = opened.model?.trim() || model;
         didResume = true;
       } catch (error) {
         if (!isRecoverableThreadResumeError(error)) throw error;
@@ -513,7 +515,10 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     }
 
     if (!threadId) {
-      const opened = await rpc.request<{ thread?: { id?: string } }>(
+      const opened = await rpc.request<{
+        thread?: { id?: string };
+        model?: string;
+      }>(
         "thread/start",
         buildThreadStartParams({
           cwd: input.cwd,
@@ -524,6 +529,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
         }),
       );
       threadId = opened.thread?.id?.trim();
+      model = opened.model?.trim() || model;
     }
 
     if (!threadId) throw new Error("Codex did not return a thread id");
@@ -534,6 +540,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     const live: Live = {
       rpc,
       threadId,
+      model,
       cwd: input.cwd,
       providerAccountId: input.providerAccountId,
       runtimeMode: input.runtimeMode,
@@ -577,7 +584,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
 }
 
 async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
-  const model = nativeModelId(input.model, input.cwd);
+  // Collaboration settings require a concrete model, even for "Default".
+  const model = nativeModelId(input.model, input.cwd) || live.model;
   const effort = input.modelSettings?.reasoningEffort;
   const serviceTier = input.modelSettings?.serviceTier;
 
@@ -611,6 +619,7 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
       "turn/start",
       params,
     );
+    live.model = model;
     input.onAccepted?.();
     const turnId = response.turn?.id ?? live.activeTurnId;
     // turn/completed can arrive before turn/start returns; don't resurrect a
