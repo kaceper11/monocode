@@ -27,7 +27,6 @@ import {
   RefreshCw,
   Search,
   SlidersHorizontal,
-  Tag,
   Trash2,
   X,
   Zap,
@@ -119,7 +118,9 @@ import {
   boardFromSnapshot,
   boardSnapshot,
   createGroup,
+  DEFAULT_BOARD_FILTER,
   DEFAULT_COLUMN_IDS,
+  deleteBoardFilter,
   deleteGroup,
   hideCards,
   loadBoard,
@@ -132,24 +133,28 @@ import {
   removeCardFromGroup,
   removeColumn,
   removeLocalCard,
+  renameBoardFilter,
   renameColumn,
   renameGroup,
+  sameBoardFilterSpec,
+  saveBoardFilter,
   setCardGroups,
   snoozeCard,
   subscribeBoard,
+  UNGROUPED,
   unarchiveAll,
   unplaceCard,
   unsnoozeCard,
   updateTask,
   type BoardColumn,
   type BoardColumnId,
+  type BoardFilterSpec,
   type BoardGroup,
+  type SavedBoardFilter,
   type TaskWorkstream,
 } from "./boardStore";
 
 const DRAG_THRESHOLD = 5;
-/** Group-filter sentinel for cards with no group assigned. */
-const UNGROUPED = "__ungrouped__";
 
 const BOARD_TIME_OPTIONS: { id: InboxTimeFilter; label: string }[] = [
   { id: "all", label: "All time" },
@@ -472,6 +477,9 @@ export function BoardView({
     new Set(),
   );
   const [actionOnly, setActionOnly] = useState(false);
+  // Attention-first is a per-column sort, but it lives in the same spec so a
+  // saved filter restores the ordering too.
+  const [attentionFirst, setAttentionFirst] = useState(false);
   // Item kinds to hide (issues vs pull requests) — task/local cards always
   // pass; the filter trims standalone provider cards.
   const [hiddenKinds, setHiddenKinds] = useState<
@@ -479,17 +487,64 @@ export function BoardView({
   >(new Set());
   const [timeFilter, setTimeFilter] = useState<InboxTimeFilter>("all");
   const [filterAnchor, setFilterAnchor] = useState<HTMLElement | null>(null);
-  const [projectPickerAnchor, setProjectPickerAnchor] =
-    useState<HTMLElement | null>(null);
-  const [groupPickerAnchor, setGroupPickerAnchor] =
-    useState<HTMLElement | null>(null);
   // Column editor popover — rename/delete the target column, or flip to
   // add mode for a new one.
   const [columnEdit, setColumnEdit] = useState<{
     anchor: HTMLElement;
     column: BoardColumn;
   } | null>(null);
-  const [projectSearch, setProjectSearch] = useState("");
+
+  // The whole filter-bar state as one spec — what a saved filter stores and
+  // what applying one writes back.
+  const currentSpec = useMemo<BoardFilterSpec>(
+    () => ({
+      project: projectFilter,
+      groups: [...groupFilter],
+      mineOnly,
+      time: timeFilter,
+      hiddenKinds: [...hiddenKinds],
+      actionOnly,
+      attentionFirst,
+    }),
+    [
+      projectFilter,
+      groupFilter,
+      mineOnly,
+      timeFilter,
+      hiddenKinds,
+      actionOnly,
+      attentionFirst,
+    ],
+  );
+  const applySpec = useCallback((spec: BoardFilterSpec) => {
+    setProjectFilter(spec.project);
+    setGroupFilter(new Set(spec.groups));
+    setMineOnly(spec.mineOnly);
+    setTimeFilter(spec.time);
+    setHiddenKinds(new Set(spec.hiddenKinds));
+    setActionOnly(spec.actionOnly);
+    setAttentionFirst(spec.attentionFirst);
+  }, []);
+  const filtersActive = !sameBoardFilterSpec(
+    currentSpec,
+    DEFAULT_BOARD_FILTER,
+  );
+  // The last explicitly applied saved filter — kept while the user tweaks
+  // criteria (the panel marks it modified rather than dropping it).
+  const [appliedFilterId, setAppliedFilterId] = useState<string | null>(null);
+  // An exact spec match always wins — if the state matches another saved
+  // filter, that is the view being shown. Otherwise the applied id holds.
+  const activeFilter =
+    board.filters.find((filter) =>
+      sameBoardFilterSpec(filter.spec, currentSpec),
+    ) ?? board.filters.find((filter) => filter.id === appliedFilterId);
+  const applyFilter = useCallback(
+    (filter: SavedBoardFilter | null) => {
+      setAppliedFilterId(filter?.id ?? null);
+      applySpec(filter?.spec ?? DEFAULT_BOARD_FILTER);
+    },
+    [applySpec],
+  );
 
   const visibleSources = useMemo(
     () => visibleInboxSources(connections),
@@ -604,7 +659,7 @@ export function BoardView({
   );
 
   // Deleted groups shouldn't linger in the filter — they'd match nothing
-  // but still count in the button badge.
+  // but still mark the spec as filtered.
   useEffect(() => {
     const valid = new Set(board.groups.map((group) => group.id));
     if ([...groupFilter].some((id) => id !== UNGROUPED && !valid.has(id))) {
@@ -638,7 +693,6 @@ export function BoardView({
       if (placement.pinned) ids.add(id);
     return ids;
   }, [board.locals, board.placements]);
-  const [attentionFirst, setAttentionFirst] = useState(false);
   const cardsByColumn = useMemo(() => {
     const map = new Map<BoardColumnId, BoardCard[]>();
     for (const column of board.columns) {
@@ -1417,106 +1471,28 @@ export function BoardView({
           })}
           <button
             type="button"
-            aria-label="Filter by project"
-            title={projectFilter ? projectName(projectFilter) : "All projects"}
-            className={`flex h-7 max-w-44 items-center gap-1.5 rounded-md px-1.5 text-[11px] font-medium ${
-              projectFilter
-                ? "bg-accent/12 text-content"
-                : "text-content/55 hover:bg-content/8 hover:text-content"
-            }`}
-            onClick={(event) => {
-              setProjectSearch("");
-              setProjectPickerAnchor(event.currentTarget);
-            }}
-          >
-            {projectFilter ? (
-              <BoardProjectMark path={projectFilter} />
-            ) : (
-              <Folder
-                className="size-3.5 shrink-0 text-content/40"
-                strokeWidth={1.75}
-              />
-            )}
-            <span className="min-w-0 truncate">
-              {projectFilter ? projectName(projectFilter) : "All projects"}
-            </span>
-            <ChevronDown
-              className="size-3 shrink-0 text-content/35"
-              strokeWidth={2}
-            />
-          </button>
-          <button
-            type="button"
-            aria-label="Filter by group"
-            title={
-              groupFilter.size
-                ? `${groupFilter.size} group${groupFilter.size > 1 ? "s" : ""} selected`
-                : "Filter by group"
-            }
-            className={`flex h-7 items-center gap-1.5 rounded-md px-1.5 text-[11px] font-medium ${
-              groupFilter.size
-                ? "bg-accent/12 text-content"
-                : "text-content/55 hover:bg-content/8 hover:text-content"
-            }`}
-            onClick={(event) =>
-              setGroupPickerAnchor(event.currentTarget as HTMLElement)
-            }
-          >
-            <Tag
-              className="size-3.5 shrink-0 text-content/40"
-              strokeWidth={1.75}
-            />
-            <span className="min-w-0 truncate">
-              {groupFilter.size ? `Groups · ${groupFilter.size}` : "Groups"}
-            </span>
-            <ChevronDown
-              className="size-3 shrink-0 text-content/35"
-              strokeWidth={2}
-            />
-          </button>
-          <button
-            type="button"
             aria-label="Board filters"
-            aria-pressed={!mineOnly || timeFilter !== "all" || hiddenKinds.size > 0}
-            title="Board filters"
+            aria-pressed={filtersActive}
+            title={
+              activeFilter
+                ? `Saved filter: ${activeFilter.name}`
+                : "Board filters"
+            }
             className={`flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium ${
-              !mineOnly || timeFilter !== "all" || hiddenKinds.size > 0
+              filtersActive
                 ? "bg-accent/15 text-accent"
                 : "text-content/50 hover:bg-content/8 hover:text-content"
             }`}
             onClick={(event) => setFilterAnchor(event.currentTarget)}
           >
             <SlidersHorizontal className="size-3.5" strokeWidth={1.75} />
-            Filters
-          </button>
-          <button
-            type="button"
-            aria-pressed={actionOnly}
-            title="Only cards that need action"
-            className={`flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium ${
-              actionOnly
-                ? "bg-accent/15 text-accent"
-                : "text-content/50 hover:bg-content/8 hover:text-content"
-            }`}
-            onClick={() => setActionOnly((value) => !value)}
-          >
-            <ListFilter className="size-3.5" strokeWidth={1.75} />
-            Action
-          </button>
-          <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 bg-content/10" />
-          <button
-            type="button"
-            aria-pressed={attentionFirst}
-            title="Sort each column by what needs action first (pins still win)"
-            className={`flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium ${
-              attentionFirst
-                ? "bg-accent/15 text-accent"
-                : "text-content/50 hover:bg-content/8 hover:text-content"
-            }`}
-            onClick={() => setAttentionFirst((value) => !value)}
-          >
-            <Zap className="size-3.5" strokeWidth={1.75} />
-            Attention
+            <span className="min-w-0 max-w-36 truncate">
+              {activeFilter?.name ?? "Filters"}
+            </span>
+            <ChevronDown
+              className="size-3 shrink-0 text-content/35"
+              strokeWidth={2}
+            />
           </button>
           {snoozedIds.length ? (
             <button
@@ -1872,92 +1848,17 @@ export function BoardView({
           )}
         </div>
       ) : null}
-      {projectPickerAnchor ? (
-        <Popover
-          anchor={projectPickerAnchor}
-          onDismiss={() => setProjectPickerAnchor(null)}
-          width={256}
-        >
-          <div className="p-1.5">
-            <input
-              autoFocus
-              value={projectSearch}
-              onChange={(event) => setProjectSearch(event.target.value)}
-              placeholder="Search projects…"
-              aria-label="Search projects"
-              className="mb-1 h-7 w-full rounded-md bg-content/6 px-2 text-[12px] text-content outline-none placeholder:text-content/40 focus:ring-1 focus:ring-accent/40"
-            />
-            <ProjectPickRow
-              label="All projects"
-              selected={!projectFilter}
-              onPick={() => {
-                setProjectFilter("");
-                setProjectPickerAnchor(null);
-              }}
-            />
-            {recents
-              .filter(
-                (project) =>
-                  !projectSearch ||
-                  projectName(project.path)
-                    .toLowerCase()
-                    .includes(projectSearch.toLowerCase()) ||
-                  project.path
-                    .toLowerCase()
-                    .includes(projectSearch.toLowerCase()),
-              )
-              .map((project) => (
-                <ProjectPickRow
-                  key={project.path}
-                  label={projectName(project.path)}
-                  mark={<BoardProjectMark path={project.path} />}
-                  selected={sameProjectPath(project.path, projectFilter)}
-                  onPick={() => {
-                    setProjectFilter(project.path);
-                    setProjectPickerAnchor(null);
-                  }}
-                />
-              ))}
-          </div>
-        </Popover>
-      ) : null}
       {filterAnchor ? (
         <BoardFiltersPopover
           anchor={filterAnchor}
-          mineOnly={mineOnly}
-          time={timeFilter}
-          hiddenKinds={hiddenKinds}
-          onMineOnly={() => setMineOnly((value) => !value)}
-          onTime={setTimeFilter}
-          onToggleKind={(kind) =>
-            setHiddenKinds((current) => {
-              const next = new Set(current);
-              if (next.has(kind)) next.delete(kind);
-              else next.add(kind);
-              return next;
-            })
-          }
-          onClose={() => setFilterAnchor(null)}
-        />
-      ) : null}
-      {groupPickerAnchor ? (
-        <GroupFilterPopover
-          anchor={groupPickerAnchor}
+          recents={recents}
           groups={board.groups}
-          filter={groupFilter}
-          onToggle={(id) =>
-            setGroupFilter((current) => {
-              const next = new Set(current);
-              if (next.has(id)) next.delete(id);
-              else next.add(id);
-              return next;
-            })
-          }
-          onClear={() => {
-            setGroupFilter(new Set());
-            setGroupPickerAnchor(null);
-          }}
-          onClose={() => setGroupPickerAnchor(null)}
+          saved={board.filters}
+          spec={currentSpec}
+          appliedId={appliedFilterId}
+          onSpec={applySpec}
+          onApply={applyFilter}
+          onClose={() => setFilterAnchor(null)}
         />
       ) : null}
       {columnEdit ? (
@@ -2059,67 +1960,396 @@ function BoardProjectMark({ path }: { path: string }) {
   );
 }
 
-/** Board-wide filters: assignment narrows the provider fetch itself;
- * updated-window and kind trim the fetched cards. */
+const FILTER_SECTION =
+  "px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-content/40";
+
+/** All board filters in one popover: project, groups, fetch/view filters,
+ * the action/attention switches — plus the saved-filter list. Pick a saved
+ * filter to apply it (click again to clear); a diverged applied filter keeps
+ * its name and offers an Update chip — pencil renames, X deletes, and the
+ * save input stores the current spec (reusing a name overwrites it). */
 function BoardFiltersPopover({
   anchor,
-  mineOnly,
-  time,
-  hiddenKinds,
-  onMineOnly,
-  onTime,
-  onToggleKind,
+  recents,
+  groups,
+  saved,
+  spec,
+  appliedId,
+  onSpec,
+  onApply,
   onClose,
 }: {
   anchor: HTMLElement;
-  mineOnly: boolean;
-  time: InboxTimeFilter;
-  hiddenKinds: ReadonlySet<"issue" | "pr">;
-  onMineOnly: () => void;
-  onTime: (time: InboxTimeFilter) => void;
-  onToggleKind: (kind: "issue" | "pr") => void;
+  recents: RecentProject[];
+  groups: BoardGroup[];
+  saved: SavedBoardFilter[];
+  spec: BoardFilterSpec;
+  appliedId: string | null;
+  onSpec: (spec: BoardFilterSpec) => void;
+  onApply: (filter: SavedBoardFilter | null) => void;
   onClose: () => void;
 }) {
+  const [projectSearch, setProjectSearch] = useState("");
+  const [newGroup, setNewGroup] = useState("");
+  const [saveName, setSaveName] = useState("");
+  // Inline rename — saved filters and groups share the one input slot.
+  const [rename, setRename] = useState<{
+    kind: "filter" | "group";
+    id: string;
+    value: string;
+  } | null>(null);
+
+  const toggleGroup = (id: string) =>
+    onSpec({
+      ...spec,
+      groups: spec.groups.includes(id)
+        ? spec.groups.filter((entry) => entry !== id)
+        : [...spec.groups, id],
+    });
+  const toggleKind = (kind: "issue" | "pr") =>
+    onSpec({
+      ...spec,
+      hiddenKinds: spec.hiddenKinds.includes(kind)
+        ? spec.hiddenKinds.filter((entry) => entry !== kind)
+        : [...spec.hiddenKinds, kind],
+    });
+  const commitRename = () => {
+    if (!rename) return;
+    if (rename.kind === "filter") renameBoardFilter(rename.id, rename.value);
+    else renameGroup(rename.id, rename.value);
+    setRename(null);
+  };
+  const dirty = !sameBoardFilterSpec(spec, DEFAULT_BOARD_FILTER);
+  const projectRows = recents.filter(
+    (project) =>
+      !projectSearch ||
+      projectName(project.path)
+        .toLowerCase()
+        .includes(projectSearch.toLowerCase()) ||
+      project.path.toLowerCase().includes(projectSearch.toLowerCase()),
+  );
+
+  const renameInput = (
+    <input
+      autoFocus
+      value={rename?.value ?? ""}
+      aria-label={
+        rename?.kind === "filter" ? "Rename filter" : "Rename group"
+      }
+      onChange={(event) =>
+        setRename((current) =>
+          current ? { ...current, value: event.target.value } : current,
+        )
+      }
+      onKeyDown={(event) => {
+        if (event.key === "Enter") commitRename();
+        else if (event.key === "Escape") setRename(null);
+      }}
+      onBlur={commitRename}
+      className="h-7 min-w-0 flex-1 rounded bg-content/8 px-2 text-[12px] text-content outline-none focus:ring-1 focus:ring-accent/50"
+    />
+  );
+
   return (
     <Popover
       anchor={anchor}
       onDismiss={onClose}
-      width={208}
+      width={252}
       aria-label="Board filters"
+      className="overflow-y-auto"
     >
       <div className="p-1.5" role="group" aria-label="Board filters">
+        <div className="mb-1 flex items-center justify-between border-b border-content/8 px-2 pb-1.5">
+          <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-content/40">
+            Filters
+          </span>
+          {dirty ? (
+            <button
+              type="button"
+              className="text-[11px] font-medium text-content/50 transition-colors hover:text-content"
+              onClick={() => onApply(null)}
+            >
+              Clear
+            </button>
+          ) : null}
+        </div>
+
+        <p className={FILTER_SECTION}>Saved</p>
+        {saved.map((filter) => {
+          const exact = sameBoardFilterSpec(filter.spec, spec);
+          const applied = exact || filter.id === appliedId;
+          // Applied but criteria since changed — offer to write the current
+          // spec back instead of dropping the filter's active state.
+          const modified = filter.id === appliedId && !exact;
+          return (
+            <div
+              key={filter.id}
+              className="group flex items-center gap-0.5 rounded-md hover:bg-content/6"
+            >
+              {rename?.kind === "filter" && rename.id === filter.id ? (
+                renameInput
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    aria-pressed={applied}
+                    title={
+                      exact
+                        ? `${filter.name} applied — click to clear`
+                        : modified
+                          ? `${filter.name} applied, modified — click to restore it`
+                          : `Apply filter ${filter.name}`
+                    }
+                    className={`flex h-7 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-[12px] ${
+                      applied ? "text-content" : "text-content/70 hover:text-content"
+                    }`}
+                    onClick={() => onApply(exact ? null : filter)}
+                  >
+                    <ListFilter
+                      className="size-3 shrink-0 text-content/40"
+                      strokeWidth={1.75}
+                    />
+                    <span className="min-w-0 flex-1 truncate">
+                      {filter.name}
+                    </span>
+                    {exact ? (
+                      <Check
+                        className="size-3.5 shrink-0 text-accent"
+                        strokeWidth={2.5}
+                      />
+                    ) : null}
+                  </button>
+                  {modified ? (
+                    <button
+                      type="button"
+                      title="Update this filter with the current settings"
+                      className="shrink-0 rounded px-1 text-[10px] font-medium text-accent hover:bg-accent/15"
+                      onClick={() => saveBoardFilter(filter.name, spec)}
+                    >
+                      Update
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    aria-label={`Rename filter ${filter.name}`}
+                    className="grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
+                    onClick={() =>
+                      setRename({
+                        kind: "filter",
+                        id: filter.id,
+                        value: filter.name,
+                      })
+                    }
+                  >
+                    <Pencil className="size-3" strokeWidth={1.75} />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Delete filter ${filter.name}`}
+                    className="mr-1 grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
+                    onClick={() => deleteBoardFilter(filter.id)}
+                  >
+                    <X className="size-3" strokeWidth={1.75} />
+                  </button>
+                </>
+              )}
+            </div>
+          );
+        })}
+        <label
+          title="Save the current filters — reuse an existing name to overwrite it"
+          className="mt-0.5 flex h-7 items-center gap-1.5 rounded-md px-1.5 text-content/40 focus-within:bg-content/6 focus-within:text-content/60"
+        >
+          <Plus className="size-3 shrink-0" strokeWidth={2} />
+          <input
+            value={saveName}
+            onChange={(event) => setSaveName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter") return;
+              if (saveBoardFilter(saveName, spec)) setSaveName("");
+            }}
+            placeholder="Save current filters…"
+            aria-label="Save current filters as"
+            className="min-w-0 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/40"
+          />
+        </label>
+
+        <p className={FILTER_SECTION}>Project</p>
+        {recents.length > 5 ? (
+          <input
+            value={projectSearch}
+            onChange={(event) => setProjectSearch(event.target.value)}
+            placeholder="Search projects…"
+            aria-label="Search projects"
+            className="mb-1 h-7 w-full rounded-md bg-content/6 px-2 text-[12px] text-content outline-none placeholder:text-content/40 focus:ring-1 focus:ring-accent/40"
+          />
+        ) : null}
+        <ProjectPickRow
+          label="All projects"
+          selected={!spec.project}
+          onPick={() => onSpec({ ...spec, project: "" })}
+        />
+        <div className="max-h-36 overflow-y-auto">
+          {projectRows.map((project) => (
+            <ProjectPickRow
+              key={project.path}
+              label={projectName(project.path)}
+              mark={<BoardProjectMark path={project.path} />}
+              selected={sameProjectPath(project.path, spec.project)}
+              onPick={() => onSpec({ ...spec, project: project.path })}
+            />
+          ))}
+        </div>
+
+        <p className={FILTER_SECTION}>Groups</p>
+        <div className="max-h-36 overflow-y-auto">
+          {groups.map((group) => {
+            const swatch = groupSwatch(group.color);
+            const selected = spec.groups.includes(group.id);
+            return (
+              <div
+                key={group.id}
+                className="group flex items-center gap-0.5 rounded-md hover:bg-content/6"
+              >
+                {rename?.kind === "group" && rename.id === group.id ? (
+                  renameInput
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      aria-pressed={selected}
+                      className={`flex h-7 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-[12px] ${
+                        selected ? "text-content" : "text-content/70 hover:text-content"
+                      }`}
+                      onClick={() => toggleGroup(group.id)}
+                    >
+                      <span
+                        aria-hidden
+                        className={`size-2 shrink-0 rounded-full ${swatch.dot}`}
+                      />
+                      <span className="min-w-0 flex-1 truncate">
+                        {group.name}
+                      </span>
+                      {selected ? (
+                        <Check
+                          className="size-3.5 shrink-0 text-accent"
+                          strokeWidth={2.5}
+                        />
+                      ) : null}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Rename ${group.name}`}
+                      className="grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
+                      onClick={() =>
+                        setRename({
+                          kind: "group",
+                          id: group.id,
+                          value: group.name,
+                        })
+                      }
+                    >
+                      <Pencil className="size-3" strokeWidth={1.75} />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Delete group ${group.name}`}
+                      className="mr-1 grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
+                      onClick={() => deleteGroup(group.id)}
+                    >
+                      <X className="size-3" strokeWidth={1.75} />
+                    </button>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <button
+          type="button"
+          aria-pressed={spec.groups.includes(UNGROUPED)}
+          className={`flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] ${
+            spec.groups.includes(UNGROUPED)
+              ? "text-content"
+              : "text-content/70 hover:bg-content/6 hover:text-content"
+          }`}
+          onClick={() => toggleGroup(UNGROUPED)}
+        >
+          <span
+            aria-hidden
+            className="size-2 shrink-0 rounded-full border border-content/30"
+          />
+          <span className="min-w-0 flex-1 truncate text-content/60">
+            Ungrouped
+          </span>
+          {spec.groups.includes(UNGROUPED) ? (
+            <Check className="size-3.5 shrink-0 text-accent" strokeWidth={2.5} />
+          ) : null}
+        </button>
+        {!groups.length ? (
+          <p className="px-2 py-1.5 text-[11px] text-content/40">
+            No groups yet — create one to tag tasks.
+          </p>
+        ) : null}
+        <label className="mt-0.5 flex h-7 items-center gap-1.5 rounded-md px-1.5 text-content/40 focus-within:bg-content/6 focus-within:text-content/60">
+          <Plus className="size-3 shrink-0" strokeWidth={2} />
+          <input
+            value={newGroup}
+            onChange={(event) => setNewGroup(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter") return;
+              if (createGroup(newGroup)) setNewGroup("");
+            }}
+            placeholder="New group…"
+            aria-label="New group name"
+            className="min-w-0 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/40"
+          />
+        </label>
+
+        <p className={FILTER_SECTION}>Show</p>
         <BoardFilterRow
           label="Assigned to me"
-          checked={mineOnly}
-          onClick={onMineOnly}
+          checked={spec.mineOnly}
+          onClick={() => onSpec({ ...spec, mineOnly: !spec.mineOnly })}
         />
-        <p className="px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-content/40">
-          Updated
-        </p>
+        <BoardFilterRow
+          label="Needs action only"
+          checked={spec.actionOnly}
+          icon={<ListFilter className="size-3.5 shrink-0" strokeWidth={1.75} />}
+          onClick={() => onSpec({ ...spec, actionOnly: !spec.actionOnly })}
+        />
+        <p className={FILTER_SECTION}>Updated</p>
         {BOARD_TIME_OPTIONS.map((option) => (
           <BoardFilterRow
             key={option.id}
             label={option.label}
-            checked={time === option.id}
-            onClick={() => onTime(option.id)}
+            checked={spec.time === option.id}
+            onClick={() => onSpec({ ...spec, time: option.id })}
           />
         ))}
-        <p className="px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-content/40">
-          Type
-        </p>
+        <p className={FILTER_SECTION}>Type</p>
         <BoardFilterRow
           label="Issues"
-          checked={!hiddenKinds.has("issue")}
+          checked={!spec.hiddenKinds.includes("issue")}
           icon={<CircleDot className="size-3.5 shrink-0" strokeWidth={1.75} />}
-          onClick={() => onToggleKind("issue")}
+          onClick={() => toggleKind("issue")}
         />
         <BoardFilterRow
           label="Pull requests"
-          checked={!hiddenKinds.has("pr")}
+          checked={!spec.hiddenKinds.includes("pr")}
           icon={
             <GitPullRequest className="size-3.5 shrink-0" strokeWidth={1.75} />
           }
-          onClick={() => onToggleKind("pr")}
+          onClick={() => toggleKind("pr")}
+        />
+        <p className={FILTER_SECTION}>Sort</p>
+        <BoardFilterRow
+          label="Attention first"
+          checked={spec.attentionFirst}
+          icon={<Zap className="size-3.5 shrink-0" strokeWidth={1.75} />}
+          onClick={() =>
+            onSpec({ ...spec, attentionFirst: !spec.attentionFirst })
+          }
         />
       </div>
     </Popover>
@@ -2152,159 +2382,6 @@ function BoardFilterRow({
         <Check className="size-3.5 shrink-0" strokeWidth={2.25} />
       ) : null}
     </button>
-  );
-}
-
-/** Groups filter + editor — toggle which groups filter the board, and
- * create/rename/delete the shared list in place. */
-function GroupFilterPopover({
-  anchor,
-  groups,
-  filter,
-  onToggle,
-  onClear,
-  onClose,
-}: {
-  anchor: HTMLElement;
-  groups: BoardGroup[];
-  filter: ReadonlySet<string>;
-  onToggle: (groupId: string) => void;
-  onClear: () => void;
-  onClose: () => void;
-}) {
-  const [renaming, setRenaming] = useState<string | null>(null);
-  const [renameValue, setRenameValue] = useState("");
-  const [newName, setNewName] = useState("");
-  return (
-    <Popover anchor={anchor} onDismiss={onClose} width={236}>
-      <div className="p-1.5" role="group" aria-label="Filter by group">
-        {groups.map((group) => {
-          const swatch = groupSwatch(group.color);
-          const selected = filter.has(group.id);
-          return (
-            <div
-              key={group.id}
-              className="group flex items-center gap-0.5 rounded-md hover:bg-content/6"
-            >
-              {renaming === group.id ? (
-                <input
-                  autoFocus
-                  value={renameValue}
-                  aria-label={`Rename ${group.name}`}
-                  onChange={(event) => setRenameValue(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      renameGroup(group.id, renameValue);
-                      setRenaming(null);
-                    } else if (event.key === "Escape") {
-                      setRenaming(null);
-                    }
-                  }}
-                  onBlur={() => {
-                    renameGroup(group.id, renameValue);
-                    setRenaming(null);
-                  }}
-                  className="h-7 min-w-0 flex-1 rounded bg-content/8 px-2 text-[12px] text-content outline-none focus:ring-1 focus:ring-accent/50"
-                />
-              ) : (
-                <>
-                  <button
-                    type="button"
-                    aria-pressed={selected}
-                    className={`flex h-7 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-[12px] ${
-                      selected ? "text-content" : "text-content/70 hover:text-content"
-                    }`}
-                    onClick={() => onToggle(group.id)}
-                  >
-                    <span
-                      aria-hidden
-                      className={`size-2 shrink-0 rounded-full ${swatch.dot}`}
-                    />
-                    <span className="min-w-0 flex-1 truncate">
-                      {group.name}
-                    </span>
-                    {selected ? (
-                      <Check
-                        className="size-3.5 shrink-0 text-accent"
-                        strokeWidth={2.5}
-                      />
-                    ) : null}
-                  </button>
-                  <button
-                    type="button"
-                    aria-label={`Rename ${group.name}`}
-                    className="grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
-                    onClick={() => {
-                      setRenaming(group.id);
-                      setRenameValue(group.name);
-                    }}
-                  >
-                    <Pencil className="size-3" strokeWidth={1.75} />
-                  </button>
-                  <button
-                    type="button"
-                    aria-label={`Delete group ${group.name}`}
-                    className="mr-1 grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
-                    onClick={() => deleteGroup(group.id)}
-                  >
-                    <X className="size-3" strokeWidth={1.75} />
-                  </button>
-                </>
-              )}
-            </div>
-          );
-        })}
-        <button
-          type="button"
-          aria-pressed={filter.has(UNGROUPED)}
-          className={`flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] ${
-            filter.has(UNGROUPED)
-              ? "bg-accent/12 text-content"
-              : "text-content/70 hover:bg-content/6 hover:text-content"
-          }`}
-          onClick={() => onToggle(UNGROUPED)}
-        >
-          <span
-            aria-hidden
-            className="size-2 shrink-0 rounded-full border border-content/30"
-          />
-          <span className="min-w-0 flex-1 truncate text-content/60">
-            Ungrouped
-          </span>
-          {filter.has(UNGROUPED) ? (
-            <Check className="size-3.5 shrink-0 text-accent" strokeWidth={2.5} />
-          ) : null}
-        </button>
-        {!groups.length ? (
-          <p className="px-2 py-1.5 text-[11px] text-content/40">
-            No groups yet — create one to tag tasks.
-          </p>
-        ) : null}
-        {filter.size ? (
-          <button
-            type="button"
-            className="mt-1 flex h-7 w-full items-center justify-center rounded-md border-t border-stroke pt-1 text-[11px] text-content/50 hover:bg-content/6 hover:text-content"
-            onClick={onClear}
-          >
-            Clear filter
-          </button>
-        ) : null}
-        <label className="mt-1 flex h-7 items-center gap-1.5 border-t border-stroke px-1.5 pt-1 text-content/40 focus-within:text-content/60">
-          <Plus className="size-3 shrink-0" strokeWidth={2} />
-          <input
-            value={newName}
-            onChange={(event) => setNewName(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key !== "Enter") return;
-              if (createGroup(newName)) setNewName("");
-            }}
-            placeholder="New group…"
-            aria-label="New group name"
-            className="min-w-0 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/40"
-          />
-        </label>
-      </div>
-    </Popover>
   );
 }
 

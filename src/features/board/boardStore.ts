@@ -1,4 +1,9 @@
 import type { LinkedWorkItem } from "../sessions/model/session";
+import type { InboxTimeFilter } from "../inbox/model/inboxFilters";
+import { pathKey } from "../../shared/lib/paths";
+
+/** Group-filter sentinel for cards with no group assigned. */
+export const UNGROUPED = "__ungrouped__";
 
 /**
  * The board's own records — manual column placements, board-local cards,
@@ -104,6 +109,41 @@ export type BoardGroup = {
   color: number;
 };
 
+/** The board's whole filter-bar state — saved filters store and restore
+ * this wholesale, so every criterion the toolbar controls lives here. */
+export type BoardFilterSpec = {
+  /** Project path, "" = all projects. */
+  project: string;
+  /** Group ids, plus UNGROUPED for cards with no group. */
+  groups: string[];
+  /** Narrows the provider fetch itself, not just the view. */
+  mineOnly: boolean;
+  time: InboxTimeFilter;
+  /** Item kinds to hide; task/local/session cards always pass. */
+  hiddenKinds: ("issue" | "pr")[];
+  /** Only cards that need action. */
+  actionOnly: boolean;
+  /** Sort each column by attention score — a sort, but saved as part of
+   * the view like the filters it travels with. */
+  attentionFirst: boolean;
+};
+
+export type SavedBoardFilter = {
+  id: string;
+  name: string;
+  spec: BoardFilterSpec;
+};
+
+export const DEFAULT_BOARD_FILTER: BoardFilterSpec = {
+  project: "",
+  groups: [],
+  mineOnly: true,
+  time: "all",
+  hiddenKinds: [],
+  actionOnly: false,
+  attentionFirst: false,
+};
+
 type Store = {
   placements: Record<string, BoardPlacement>;
   locals: BoardLocalCard[];
@@ -119,6 +159,8 @@ type Store = {
   /** Non-task card id → group ids. Tasks carry `groupIds` on their record;
    * derived cards (items/locals) keep membership here keyed by card id. */
   cardGroups: Record<string, string[]>;
+  /** User-saved filter combinations, in creation order. */
+  filters: SavedBoardFilter[];
 };
 
 const KEY = "monocode.board.v1";
@@ -134,6 +176,8 @@ const MAX_HIDDEN = 500;
 const MAX_CARD_GROUPS = 200;
 const MAX_TEXT = 300;
 const MAX_GROUP_NAME = 48;
+const MAX_SAVED_FILTERS = 20;
+const MAX_FILTER_NAME = 48;
 const MAX_COLUMNS = 12;
 const MAX_COLUMN_LABEL = 24;
 
@@ -286,6 +330,56 @@ function sanitizeTasks(value: unknown): BoardTask[] {
   return tasks;
 }
 
+const BOARD_TIME_IDS = new Set<string>(["all", "today", "7d", "30d"]);
+const BOARD_KIND_IDS = new Set<string>(["issue", "pr"]);
+
+/** Coerces anything into a complete spec — missing/corrupt fields fall back
+ * to defaults so an old or hand-edited record still applies cleanly. */
+function cleanFilterSpec(value: unknown): BoardFilterSpec {
+  const raw = isRecord(value) ? value : {};
+  const groups = Array.isArray(raw.groups)
+    ? raw.groups
+        .map((entry) => cleanString(entry, 120))
+        .filter((entry): entry is string => !!entry)
+        .filter((entry, index, list) => list.indexOf(entry) === index)
+        .slice(0, MAX_GROUPS + 1)
+    : [];
+  const hiddenKinds = Array.isArray(raw.hiddenKinds)
+    ? raw.hiddenKinds
+        .filter(
+          (entry): entry is "issue" | "pr" =>
+            typeof entry === "string" && BOARD_KIND_IDS.has(entry),
+        )
+        .filter((entry, index, list) => list.indexOf(entry) === index)
+    : [];
+  return {
+    project: cleanString(raw.project, 600) ?? "",
+    groups,
+    mineOnly: raw.mineOnly !== false,
+    time:
+      typeof raw.time === "string" && BOARD_TIME_IDS.has(raw.time)
+        ? (raw.time as InboxTimeFilter)
+        : "all",
+    hiddenKinds,
+    actionOnly: raw.actionOnly === true,
+    attentionFirst: raw.attentionFirst === true,
+  };
+}
+
+function sanitizeFilters(value: unknown): SavedBoardFilter[] {
+  if (!Array.isArray(value)) return [];
+  const filters: SavedBoardFilter[] = [];
+  for (const raw of value) {
+    if (filters.length >= MAX_SAVED_FILTERS) break;
+    if (!isRecord(raw)) continue;
+    const id = cleanString(raw.id, 120);
+    const name = cleanString(raw.name, MAX_FILTER_NAME);
+    if (!id || !name) continue;
+    filters.push({ id, name, spec: cleanFilterSpec(raw.spec) });
+  }
+  return filters;
+}
+
 function sanitizeGroups(value: unknown): BoardGroup[] {
   if (!Array.isArray(value)) return [];
   const groups: BoardGroup[] = [];
@@ -337,6 +431,7 @@ function sanitizeStore(value: unknown): Store {
   const locals: BoardLocalCard[] = [];
   let tasks: BoardTask[] = [];
   let groups: BoardGroup[] = [];
+  let filters: SavedBoardFilter[] = [];
   const hidden: string[] = [];
   const snoozed: Record<string, Snooze> = {};
   const cardGroups: Record<string, string[]> = {};
@@ -385,6 +480,7 @@ function sanitizeStore(value: unknown): Store {
     }
     tasks = sanitizeTasks(value.tasks);
     groups = sanitizeGroups(value.groups);
+    filters = sanitizeFilters(value.filters);
     if (Array.isArray(value.hidden)) {
       for (const entry of value.hidden) {
         if (hidden.length >= MAX_HIDDEN) break;
@@ -434,6 +530,15 @@ function sanitizeStore(value: unknown): Store {
     cardGroups[cardId] = cardGroups[cardId].filter((id) => valid.has(id));
     if (!cardGroups[cardId].length) delete cardGroups[cardId];
   }
+  filters = filters.map((filter) => ({
+    ...filter,
+    spec: {
+      ...filter.spec,
+      groups: filter.spec.groups.filter(
+        (id) => id === UNGROUPED || valid.has(id),
+      ),
+    },
+  }));
   return {
     placements,
     locals,
@@ -443,6 +548,7 @@ function sanitizeStore(value: unknown): Store {
     hidden,
     snoozed,
     cardGroups,
+    filters,
   };
 }
 
@@ -466,6 +572,7 @@ const EMPTY_STORE: Store = {
   hidden: [],
   snoozed: {},
   cardGroups: {},
+  filters: [],
 };
 
 export function loadBoard(): Store {
@@ -1006,5 +1113,86 @@ export function removeColumn(id: string, target?: string) {
         ? { ...card, column: appendTo, order: (order += 1024), placedAt: now }
         : card,
     ),
+  });
+}
+
+// --- saved filters ---------------------------------------------------------
+
+/** Field-by-field compare — groups/kinds are sets (order is incidental) and
+ * the project compares by path key so case/trailing-slash noise doesn't
+ * make an identical filter look different. */
+export function sameBoardFilterSpec(
+  a: BoardFilterSpec,
+  b: BoardFilterSpec,
+): boolean {
+  const ids = (list: readonly string[]) => [...list].sort().join("\n");
+  return (
+    pathKey(a.project) === pathKey(b.project) &&
+    a.mineOnly === b.mineOnly &&
+    a.time === b.time &&
+    a.actionOnly === b.actionOnly &&
+    a.attentionFirst === b.attentionFirst &&
+    ids(a.groups) === ids(b.groups) &&
+    ids(a.hiddenKinds) === ids(b.hiddenKinds)
+  );
+}
+
+/** Save `spec` under `name`. A name that already exists (case-insensitive)
+ * overwrites that filter — that's how a saved filter's criteria get edited.
+ * Returns the filter's id, or null when the name is empty or the cap hit. */
+export function saveBoardFilter(
+  name: string,
+  spec: BoardFilterSpec,
+): string | null {
+  const cleaned = name.trim().slice(0, MAX_FILTER_NAME);
+  if (!cleaned) return null;
+  const store = loadBoard();
+  const valid = new Set(store.groups.map((group) => group.id));
+  const clean = cleanFilterSpec(spec);
+  clean.groups = clean.groups.filter(
+    (id) => id === UNGROUPED || valid.has(id),
+  );
+  const existing = store.filters.find(
+    (filter) => filter.name.toLowerCase() === cleaned.toLowerCase(),
+  );
+  if (existing) {
+    writeStore({
+      ...store,
+      filters: store.filters.map((filter) =>
+        filter.id === existing.id
+          ? { ...filter, name: cleaned, spec: clean }
+          : filter,
+      ),
+    });
+    return existing.id;
+  }
+  if (store.filters.length >= MAX_SAVED_FILTERS) return null;
+  const id = newEntityId("flt");
+  writeStore({
+    ...store,
+    filters: [...store.filters, { id, name: cleaned, spec: clean }],
+  });
+  return id;
+}
+
+export function renameBoardFilter(id: string, name: string) {
+  const cleaned = name.trim().slice(0, MAX_FILTER_NAME);
+  if (!cleaned) return;
+  const store = loadBoard();
+  if (!store.filters.some((filter) => filter.id === id)) return;
+  writeStore({
+    ...store,
+    filters: store.filters.map((filter) =>
+      filter.id === id ? { ...filter, name: cleaned } : filter,
+    ),
+  });
+}
+
+export function deleteBoardFilter(id: string) {
+  const store = loadBoard();
+  if (!store.filters.some((filter) => filter.id === id)) return;
+  writeStore({
+    ...store,
+    filters: store.filters.filter((filter) => filter.id !== id),
   });
 }

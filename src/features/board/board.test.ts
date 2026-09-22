@@ -51,6 +51,8 @@ import {
   addTask,
   archiveTasks,
   createGroup,
+  DEFAULT_BOARD_FILTER,
+  deleteBoardFilter,
   deleteGroup,
   hideCards,
   loadBoard,
@@ -60,15 +62,20 @@ import {
   removeColumn,
   removeLocalCard,
   removeTask,
+  renameBoardFilter,
   renameColumn,
   renameGroup,
   renameLocalCard,
+  sameBoardFilterSpec,
+  saveBoardFilter,
   setCardGroups,
   snoozeCard,
+  UNGROUPED,
   unarchiveAll,
   unplaceCard,
   unsnoozeCard,
   updateTask,
+  type BoardFilterSpec,
   type BoardTask,
   type TaskWorkstream,
 } from "./boardStore";
@@ -1775,6 +1782,99 @@ describe("groups", () => {
     expect(
       (units[0] as Extract<ColumnUnit, { type: "group" }>).cards,
     ).toHaveLength(3);
+  });
+});
+
+describe("saved filters", () => {
+  const spec: BoardFilterSpec = {
+    project: "/repo",
+    groups: [],
+    mineOnly: false,
+    time: "7d",
+    hiddenKinds: ["pr"],
+    actionOnly: true,
+    attentionFirst: true,
+  };
+
+  it("saves, overwrites by name, renames and deletes filters", () => {
+    const id = saveBoardFilter("Needs review", spec)!;
+    expect(id).toMatch(/^flt:/);
+    expect(loadBoard().filters).toEqual([
+      { id, name: "Needs review", spec },
+    ]);
+
+    // Saving under the same name (any case) edits criteria in place.
+    const next = { ...spec, actionOnly: false };
+    expect(saveBoardFilter("needs review", next)).toBe(id);
+    let store = loadBoard();
+    expect(store.filters).toHaveLength(1);
+    expect(store.filters[0]!.spec.actionOnly).toBe(false);
+
+    // Unrelated board writes must not drop saved filters.
+    createGroup("aux");
+    hideCards(["item:x"]);
+    expect(loadBoard().filters).toHaveLength(1);
+
+    renameBoardFilter(id, "Review queue");
+    expect(loadBoard().filters[0]!.name).toBe("Review queue");
+    deleteBoardFilter(id);
+    expect(loadBoard().filters).toHaveLength(0);
+  });
+
+  it("sanitizes stored filters and prunes dead group refs", () => {
+    storage.set(
+      "monocode.board.v1",
+      JSON.stringify({
+        groups: [{ id: "g1", name: "Kept", color: 0 }],
+        filters: [
+          {
+            id: "f1",
+            name: "Ok",
+            spec: {
+              project: "/r",
+              groups: ["g1", "gone", UNGROUPED, "g1"],
+              mineOnly: false,
+              time: "bogus",
+              hiddenKinds: ["pr", "nope"],
+              actionOnly: true,
+            },
+          },
+          { name: "no id" },
+          "junk",
+        ],
+      }),
+    );
+    const store = loadBoard();
+    expect(store.filters).toHaveLength(1);
+    expect(store.filters[0]!.spec).toEqual({
+      project: "/r",
+      groups: ["g1", UNGROUPED],
+      mineOnly: false,
+      time: "all",
+      hiddenKinds: ["pr"],
+      actionOnly: true,
+      attentionFirst: false,
+    });
+  });
+
+  it("sameBoardFilterSpec ignores list order and path noise", () => {
+    const a: BoardFilterSpec = {
+      ...DEFAULT_BOARD_FILTER,
+      project: "/repo/",
+      groups: ["g1", "g2"],
+      hiddenKinds: ["issue"],
+    };
+    expect(
+      sameBoardFilterSpec(a, {
+        ...a,
+        project: "/repo",
+        groups: ["g2", "g1"],
+      }),
+    ).toBe(true);
+    expect(sameBoardFilterSpec(a, DEFAULT_BOARD_FILTER)).toBe(false);
+    expect(
+      sameBoardFilterSpec(DEFAULT_BOARD_FILTER, DEFAULT_BOARD_FILTER),
+    ).toBe(true);
   });
 });
 
