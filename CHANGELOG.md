@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Hermes turns stay busy while detached subagents are running and resume automatically with their completed transcripts instead of requiring a manual Continue. Hermes ACP usage updates also populate the context meter. In #335.
 
+## [0.3.4] - 2026-09-22
+
+### Added
+
+- Board filters: an **Assigned to me** toggle (on by default for every provider), an **Updated** window that hides stale provider cards such as long-done items, and a **Type** filter for issues vs pull requests.
+
+### Fixed
+
+- The board's assigned-only listing now reaches Jira — a saved Jira filter or an unchecked inbox toggle no longer leaks unassigned tickets onto the board.
+
 ## [0.3.3] - 2026-09-22
 
 ### Added
