@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { Checkbox } from "./controls";
+import { Checkbox } from "../../../shared/ui/Checkbox";
 import { Modal } from "../../../shared/ui/Modal.tsx";
 import { Select } from "./Select";
 import { AgentMarkdown } from "./AgentMarkdown";

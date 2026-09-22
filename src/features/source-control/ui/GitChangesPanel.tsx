@@ -507,6 +507,7 @@ function ChangedFiles({
       content.body,
       content.base,
       content.head,
+      false,
     );
     const number = Number(/\/pull\/(\d+)(?:[/?#]|$)/.exec(url)?.[1]);
     if (Number.isInteger(number) && number > 0) recordPrActivity(number);

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Modal } from "../../shared/ui/Modal";
+import { Checkbox } from "../../shared/ui/Checkbox";
 import { SearchableSelect } from "../../shared/ui/SearchableSelect";
 import {
   ExternalLink,
@@ -22,6 +23,10 @@ export type PrSubmit = {
   body: string;
   /** Chosen target branch per lane, keyed by workstream id. */
   bases: ReadonlyMap<string, string>;
+  /** Per-lane description text prepended to each rendered body. */
+  descriptions: ReadonlyMap<string, string>;
+  /** Create as draft — both routed providers (GitHub, Azure) support it. */
+  draft: boolean;
 };
 
 type LaneCheck =
@@ -42,11 +47,16 @@ function LaneRow({
   value,
   onChange,
   onCheck,
+  description,
+  onDescription,
 }: {
   row: BoardWorkstreamRow;
   value: string;
   onChange: (base: string) => void;
   onCheck: (workstreamId: string, check: LaneCheck) => void;
+  /** Per-lane body text — shown only for multi-lane runs. */
+  description?: string;
+  onDescription?: (text: string) => void;
 }) {
   const { branches } = useProjectBranchesState(row.projectPath, true);
   const options = useMemo(() => {
@@ -152,6 +162,16 @@ function LaneRow({
           {check.pushed ? "" : " — not pushed yet, pushes on create"}
         </p>
       )}
+      {onDescription ? (
+        <textarea
+          value={description ?? ""}
+          onChange={(event) => onDescription(event.target.value)}
+          rows={2}
+          placeholder={`What the ${laneName(row)} change does…`}
+          spellCheck={false}
+          className="mt-1.5 w-full resize-y rounded-md border border-content/10 bg-background-base px-2 py-1.5 text-[11.5px] leading-relaxed text-content outline-none placeholder:text-content/40 focus:border-content/25"
+        />
+      ) : null}
     </div>
   );
 }
@@ -179,6 +199,10 @@ export function CreatePrsDialog({
 }) {
   const [title, setTitle] = useState(task.title);
   const [body, setBody] = useState(DEFAULT_PR_TEMPLATE);
+  const [descriptions, setDescriptions] = useState<ReadonlyMap<string, string>>(
+    () => new Map(),
+  );
+  const [draft, setDraft] = useState(false);
   const [bases, setBases] = useState<ReadonlyMap<string, string>>(
     () => new Map(rows.map((row) => [row.id, row.base])),
   );
@@ -216,7 +240,13 @@ export function CreatePrsDialog({
     // `onSubmit` is async upstream — swallow the rejection so a wholesale
     // failure doesn't surface as an unhandled promise rejection.
     void Promise.resolve(
-      onSubmit(new Set(validIds), { title: title.trim(), body, bases }),
+      onSubmit(new Set(validIds), {
+        title: title.trim(),
+        body,
+        bases,
+        descriptions,
+        draft,
+      }),
     ).catch(() => {});
   };
 
@@ -254,6 +284,17 @@ export function CreatePrsDialog({
                   setBases((current) => new Map(current).set(row.id, base))
                 }
                 onCheck={reportCheck}
+                description={
+                  rows.length > 1 ? (descriptions.get(row.id) ?? "") : undefined
+                }
+                onDescription={
+                  rows.length > 1
+                    ? (text) =>
+                        setDescriptions(
+                          (current) => new Map(current).set(row.id, text),
+                        )
+                    : undefined
+                }
               />
             ))}
           </div>
@@ -302,7 +343,7 @@ export function CreatePrsDialog({
 
         <label className="flex flex-col gap-1.5 text-[12px] text-content/70">
           <span className="flex items-center justify-between">
-            Description
+            {rows.length > 1 ? "Shared body template" : "Description"}
             <button
               type="button"
               className="text-[10.5px] font-normal text-content/45 hover:text-content"
@@ -322,6 +363,17 @@ export function CreatePrsDialog({
             Tokens: {"{task} {branch} {base}"} — per lane;{" "}
             {"{tickets} {prs} {branches}"} expand to sections (dropped when empty).
           </span>
+        </label>
+
+        <label className="flex items-center gap-2 text-[12px] text-content/70">
+          <Checkbox
+            label="Create as draft"
+            checked={draft}
+            disabled={busy}
+            onChange={() => setDraft((value) => !value)}
+            className=""
+          />
+          Create as draft
         </label>
 
         <div className="mt-1 flex items-center justify-end gap-2">
@@ -344,8 +396,8 @@ export function CreatePrsDialog({
             {checking
               ? "Checking…"
               : validIds.length > 1
-                ? `Create ${validIds.length} PRs`
-                : "Create PR"}
+                ? `Create ${validIds.length}${draft ? " draft" : ""} PRs`
+                : `Create${draft ? " draft" : ""} PR`}
           </button>
         </div>
       </form>

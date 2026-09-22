@@ -1,4 +1,4 @@
-import { Check } from "../../../shared/ui/icons.tsx";
+import { Check } from "./icons";
 
 export function Checkbox({
   label,

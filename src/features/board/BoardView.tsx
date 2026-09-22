@@ -1236,6 +1236,8 @@ export function BoardView({
             title: opts.title,
             body: opts.body,
             bases: opts.bases,
+            descriptions: opts.descriptions,
+            draft: opts.draft,
           });
         }),
       onUpdateBranches: () =>

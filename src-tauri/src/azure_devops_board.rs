@@ -440,6 +440,7 @@ pub async fn azure_devops_pr_create(
     body: String,
     base: String,
     head: String,
+    draft: bool,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         if title.trim().is_empty() {
@@ -461,6 +462,7 @@ pub async fn azure_devops_pr_create(
                 "targetRefName": ref_name(&base),
                 "title": title.trim(),
                 "description": body,
+                "isDraft": draft,
             }),
         )?;
         let number = response

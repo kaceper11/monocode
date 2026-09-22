@@ -321,8 +321,16 @@ export function azureDevOpsPrCreate(
   body: string,
   base: string,
   head: string,
+  draft: boolean,
 ): Promise<string> {
-  return invoke<string>("azure_devops_pr_create", { cwd, title, body, base, head });
+  return invoke<string>("azure_devops_pr_create", {
+    cwd,
+    title,
+    body,
+    base,
+    head,
+    draft,
+  });
 }
 
 /** Replace a pull request's description — `prId` targets the exact PR the

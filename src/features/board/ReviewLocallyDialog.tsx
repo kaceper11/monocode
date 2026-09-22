@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { Modal } from "../../shared/ui/Modal";
+import { Checkbox } from "../../shared/ui/Checkbox";
 import { SearchableSelect } from "../../shared/ui/SearchableSelect";
 import { GitPullRequest, LoaderCircle } from "../../shared/ui/icons";
 import { projectName } from "../../shared/lib/paths";
@@ -215,12 +216,12 @@ export function ReviewLocallyDialog({
           />
         </label>
         <label className="flex items-center gap-2 text-[12px] text-content/70">
-          <input
-            type="checkbox"
+          <Checkbox
+            label="Start an agent review session in the worktree"
             checked={spawnSession}
             disabled={busy}
-            onChange={(event) => setSpawnSession(event.target.checked)}
-            className="size-3.5 accent-[var(--color-accent)]"
+            onChange={() => setSpawnSession((value) => !value)}
+            className=""
           />
           Start an agent review session in the worktree
         </label>

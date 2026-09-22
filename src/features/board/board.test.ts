@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  composePrBody,
   laneProblem,
   prHeadRemoteRef,
   prIsOpen,
@@ -330,6 +331,52 @@ describe("buildBoardCards", () => {
         "Related branches:",
         "- `mc/auth-b`",
       ].join("\n"),
+    );
+  });
+
+  it("composePrBody prepends the lane description and guarantees sibling links", () => {
+    const t = task({
+      title: "Auth rework",
+      workstreams: [
+        { id: "w1", projectPath: "/a", branch: "mc/auth-a", base: "main" },
+        { id: "w2", projectPath: "/b", branch: "mc/auth-b", base: "main" },
+      ],
+    });
+    const opts = {
+      descriptions: new Map([
+        ["w1", "Reworks the API auth flow"],
+        ["w2", "Updates the web login form"],
+      ]),
+    };
+    const first = composePrBody(
+      t,
+      t.workstreams[0]!,
+      ["https://x/pr/2"],
+      "main",
+      opts,
+    );
+    const second = composePrBody(
+      t,
+      t.workstreams[1]!,
+      ["https://x/pr/1"],
+      "main",
+      opts,
+    );
+    // Each lane's own text leads — the bodies differ.
+    expect(first).toMatch(/^Reworks the API auth flow\n\n/);
+    expect(second).toMatch(/^Updates the web login form\n\n/);
+    // Cross-links survive even when the template drops {prs}.
+    const stripped = composePrBody(
+      t,
+      t.workstreams[0]!,
+      ["https://x/pr/2"],
+      "main",
+      { ...opts, body: "Part of task: **{task}**" },
+    );
+    expect(stripped).toContain("Related pull requests:\n- https://x/pr/2");
+    // No description, no siblings → just the template render.
+    expect(composePrBody(t, t.workstreams[0]!, [], "main")).toBe(
+      "Part of task: **Auth rework**\n\nRelated branches:\n- `mc/auth-b`",
     );
   });
 

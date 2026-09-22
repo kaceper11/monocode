@@ -1021,6 +1021,8 @@ struct GitPrCreateInput {
     body: String,
     base: String,
     head: String,
+    #[serde(default)]
+    draft: bool,
 }
 
 /// Create a GitHub pull request with `gh` and return its URL.
@@ -1031,6 +1033,7 @@ pub async fn git_pr_create(
     body: String,
     base: String,
     head: String,
+    draft: bool,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         git_pr_create_for(
@@ -1040,6 +1043,7 @@ pub async fn git_pr_create(
                 body,
                 base,
                 head,
+                draft,
             },
         )
     })
@@ -4255,21 +4259,23 @@ fn git_pr_create_for(root: &Path, input: &GitPrCreateInput) -> Result<String, St
         .unwrap_or(0);
     let body_path = std::env::temp_dir().join(format!("monocode-pr-{stamp}.md"));
     std::fs::write(&body_path, input.body.trim()).map_err(|e| e.to_string())?;
-    let result = gh_checked(
-        root,
-        &[
-            "pr",
-            "create",
-            "--title",
-            title,
-            "--body-file",
-            &body_path.to_string_lossy(),
-            "--base",
-            input.base.trim(),
-            "--head",
-            input.head.trim(),
-        ],
-    );
+    let body_file = body_path.to_string_lossy();
+    let mut args = vec![
+        "pr",
+        "create",
+        "--title",
+        title,
+        "--body-file",
+        &body_file,
+        "--base",
+        input.base.trim(),
+        "--head",
+        input.head.trim(),
+    ];
+    if input.draft {
+        args.push("--draft");
+    }
+    let result = gh_checked(root, &args);
     let _ = std::fs::remove_file(&body_path);
     result.and_then(|output| {
         output

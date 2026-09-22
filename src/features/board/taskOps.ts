@@ -306,7 +306,31 @@ export type PrCreateOptions = {
   body?: string;
   /** Per-lane target branch overrides, keyed by workstream id. */
   bases?: ReadonlyMap<string, string>;
+  /** Per-lane description text prepended to the rendered body. */
+  descriptions?: ReadonlyMap<string, string>;
+  /** Create as draft — GitHub `--draft`, Azure `isDraft`. */
+  draft?: boolean;
 };
+
+/** One lane's PR body — the lane's own description ahead of the shared
+ * template render. Sibling PR URLs always land in the body, even when a
+ * custom template drops `{prs}` — the links are how lanes cross-reference. */
+export function composePrBody(
+  task: BoardTask,
+  workstream: TaskWorkstream,
+  siblings: readonly string[],
+  base: string,
+  opts?: PrCreateOptions,
+): string {
+  const description = opts?.descriptions?.get(workstream.id)?.trim();
+  let body = renderPrBody(task, workstream, siblings, base, opts?.body);
+  if (siblings.length && !siblings.some((url) => body.includes(url))) {
+    body += `\n\nRelated pull requests:\n${siblings
+      .map((url) => `- ${url}`)
+      .join("\n")}`;
+  }
+  return description ? `${description}\n\n${body}` : body;
+}
 
 export async function createTaskPrs(
   task: BoardTask,
@@ -386,12 +410,17 @@ export async function createTaskPrs(
       const url = await ops.create(
         cwd,
         opts?.title?.trim() || task.title,
-        renderPrBody(task, ws, siblings, base, opts?.body),
+        composePrBody(task, ws, siblings, base, opts),
         base,
         ws.branch,
+        opts?.draft ?? false,
       );
       created.push({ ws, url, base });
-      results.push({ workstreamId: ws.id, ok: true, message: "PR created" });
+      results.push({
+        workstreamId: ws.id,
+        ok: true,
+        message: opts?.draft ? "Draft PR created" : "PR created",
+      });
     } catch (error) {
       results.push({ workstreamId: ws.id, ok: false, message: shortError(error) });
     }
@@ -409,7 +438,7 @@ export async function createTaskPrs(
         ?.updateBody(
           cwd,
           entry.url,
-          renderPrBody(task, entry.ws, siblings, entry.base, opts?.body),
+          composePrBody(task, entry.ws, siblings, entry.base, opts),
         )
         .catch(() => undefined);
     }

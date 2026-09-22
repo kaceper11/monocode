@@ -347,8 +347,9 @@ export function gitPrCreate(
   body: string,
   base: string,
   head: string,
+  draft: boolean,
 ): Promise<string> {
-  return invoke<string>("git_pr_create", { cwd, title, body, base, head });
+  return invoke<string>("git_pr_create", { cwd, title, body, base, head, draft });
 }
 
 export type GitPrCheck = {
