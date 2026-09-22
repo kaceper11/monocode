@@ -12,7 +12,7 @@ To build locally instead, clone the tested branch into a Windows directory, inst
 
 ## Opening a project
 
-From Projects → Open project (or the existing File menu), Windows users choose **This Windows PC** or **WSL · distribution**. Native projects use the stock folder picker. WSL projects accept an absolute Linux folder, validate it in that distribution, and open the ordinary workspace. The current project's distribution/path are prefilled on subsequent opens. Errors preserve those values; Cancel ignores a late connection result.
+From Projects → Open project (or the existing File menu), Windows users choose **This Windows PC** or **WSL · distribution**; when no distribution can be offered the host dialog is skipped and the stock folder picker opens directly. The picker accepts multiple folders at once everywhere, and a folder browsed under `\\wsl.localhost` connects through its own distribution. The WSL form accepts one absolute Linux folder per line, validates each in that distribution, and opens the ordinary workspace. Selecting a distribution offers its default Linux home as the starting folder; the current project's distribution/path are prefilled on subsequent opens. Errors preserve those values; Cancel ignores a late connection result.
 
 The WSL badge beside project/composer identity opens connection details and Reconnect. Branch/worktree creation uses the existing branch controls and displays Linux destination paths. Files, Changes, search, terminals and agent chat keep their existing surfaces.
 

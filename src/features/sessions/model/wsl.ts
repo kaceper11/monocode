@@ -46,6 +46,11 @@ export function wslDistributionsPeek(): string[] | null {
   return distributionsValue?.names ?? null;
 }
 
+/** Default user's Linux home, probed without opening a bridge. */
+export function wslHome(distribution: string): Promise<string> {
+  return invoke<string>("wsl_home", { distribution });
+}
+
 /** @internal test-only: drop the cached probe and value. */
 export function __wslDistributionsReset() {
   distributionsProbe = null;

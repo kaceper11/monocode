@@ -4,15 +4,22 @@ import { listen } from "@tauri-apps/api/event";
 import { pickFolder } from "../../platform/tauri/fs";
 import { wslLocation } from "../lib/paths";
 import { IS_WIN } from "../../platform/tauri/platform";
-import { connectWslProject, invalidateWslDiscovery, wslDistributions } from "../../features/sessions/model/wsl";
+import { connectWslProject, invalidateWslDiscovery, wslDistributions, wslDistributionsPeek } from "../../features/sessions/model/wsl";
 import { setWslStatus, wslStatusFor } from "../../features/sessions/model/wslStatus";
 
 /** Connect the selected execution host before entering upstream's project flow. */
-export function useWslProjects(projectCwd: string, selectProject: (path: string) => void) {
+export function useWslProjects(
+  projectCwd: string,
+  selectProjects: (paths: string[], allowBlankReuse?: boolean) => void,
+) {
   const [wslOpening, setWslOpening] = useState<{
     path: string;
     busy: boolean;
     error?: string;
+    /** Picks still waiting behind a failed connect — retry resumes there. */
+    queue?: string[];
+    /** Whether the resumed batch may still absorb a blank session. */
+    blankReuse?: boolean;
   } | null>(null);
   const wslOpenRequest = useRef<AbortController | null>(null);
   useEffect(() => () => wslOpenRequest.current?.abort(), []);
@@ -119,48 +126,71 @@ export function useWslProjects(projectCwd: string, selectProject: (path: string)
       void unlisten.then((stop) => stop()).catch(() => {});
     };
   }, []);
-  const onSelectProject = useCallback(
-    (path: string) => {
+  const onSelectProjects = useCallback(
+    (paths: string[], allowBlankReuse = true) => {
       wslOpenRequest.current?.abort();
-      if (!wslLocation(path)) {
-        setWslOpening(null);
-        selectProject(path);
-        return;
-      }
+      if (!paths.length) return;
       const controller = new AbortController();
       wslOpenRequest.current = controller;
-      setWslOpening({ path, busy: true });
-      void connectWslProject(path, controller.signal)
-        .then((canonical) => {
-          if (controller.signal.aborted) return;
-          setWslOpening(null);
-          selectProject(canonical);
-        })
-        .catch((error) => {
-          if (!controller.signal.aborted)
-            setWslOpening({ path, busy: false, error: String(error) });
-        });
+      void (async () => {
+        const resolved: string[] = [];
+        const remaining = [...paths];
+        while (remaining.length && !controller.signal.aborted) {
+          const path = remaining[0];
+          if (!wslLocation(path)) {
+            resolved.push(path);
+            remaining.shift();
+            continue;
+          }
+          setWslOpening({ path, busy: true });
+          try {
+            resolved.push(await connectWslProject(path, controller.signal));
+          } catch (error) {
+            if (controller.signal.aborted) return;
+            // Keep the progress already made; the rest waits behind Retry.
+            if (resolved.length) selectProjects(resolved, allowBlankReuse);
+            setWslOpening({
+              path,
+              busy: false,
+              error: String(error),
+              queue: remaining,
+              blankReuse: allowBlankReuse && resolved.length === 0,
+            });
+            return;
+          }
+          remaining.shift();
+        }
+        if (controller.signal.aborted) return;
+        setWslOpening(null);
+        selectProjects(resolved, allowBlankReuse);
+      })();
     },
-    [selectProject],
+    [selectProjects],
+  );
+  const onSelectProject = useCallback(
+    (path: string) => onSelectProjects([path]),
+    [onSelectProjects],
   );
 
   const [wslPickerOpen, setWslPickerOpen] = useState(false);
   const pickProject = useCallback(async () => {
     if (IS_WIN) {
-      // Only a successful empty probe skips the dialog — a failure can't
-      // prove WSL is absent, so the dialog opens for its error and retry.
-      const distributions = await wslDistributions().catch(() => null);
-      if (distributions === null || distributions.length) {
+      // A failed probe can't prove WSL is absent — the last known list still
+      // justifies the host dialog; nothing to choose means the folder picker.
+      const distributions = await wslDistributions().catch(
+        () => wslDistributionsPeek() ?? [],
+      );
+      if (distributions.length) {
         setWslPickerOpen(true);
         return;
       }
     }
-    const path = await pickFolder();
-    if (path) onSelectProject(path);
-  }, [onSelectProject]);
+    const paths = await pickFolder();
+    if (paths) onSelectProjects(paths);
+  }, [onSelectProjects]);
 
 
-  return { onSelectProject, pickProject, wslPickerOpen,
+  return { onSelectProject, onSelectProjects, pickProject, wslPickerOpen,
     closePicker: () => setWslPickerOpen(false),
     wslOpening,
     dismissOpening: () => { wslOpenRequest.current?.abort(); setWslOpening(null); },

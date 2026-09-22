@@ -555,14 +555,17 @@ export function homeDir(cwd?: string): Promise<string> {
 export async function pickFolder(
   title = "Open project",
   defaultPath?: string,
-): Promise<string | null> {
+): Promise<string[] | null> {
   const selected = await open({
     directory: true,
-    multiple: false,
+    multiple: true,
     title,
     defaultPath,
   });
-  return typeof selected === "string" && selected ? slash(selected) : null;
+  const paths = (Array.isArray(selected) ? selected : selected ? [selected] : [])
+    .filter((path): path is string => Boolean(path))
+    .map(slash);
+  return paths.length > 0 ? paths : null;
 }
 
 export async function pickFiles(title = "Attach files"): Promise<string[] | null> {

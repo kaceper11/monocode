@@ -522,6 +522,32 @@ pub fn wsl_distributions() -> Result<Vec<String>, String> {
     decode_distributions(&output.stdout)
 }
 
+/// The default user's Linux home, probed without a bridge so the project
+/// picker can offer it before any checkout is connected.
+#[tauri::command(async)]
+pub fn wsl_home(distribution: String) -> Result<String, String> {
+    let location = Location::new(&distribution, "/")?;
+    let output = crate::bounded_process::output(
+        wsl_command()?.args(wsl_args(
+            &location.distribution,
+            "/",
+            "/bin/sh",
+            &["-c".into(), "printf %s \"$HOME\"".into()],
+        )),
+        Duration::from_secs(10),
+        8 * 1024,
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not read the Linux home in {}: {}",
+            location.distribution,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let home = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok(location.with_path(&home)?.path)
+}
+
 struct Process {
     child: Child,
     #[cfg(windows)]

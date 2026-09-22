@@ -4750,7 +4750,7 @@ export default function App({
   );
 
   const selectProject = useCallback(
-    (path: string) => {
+    (path: string, allowBlankReuse = true) => {
       setSearchViewOpen(false);
       setInboxViewOpen(false);
       setNotesViewOpen(false);
@@ -4779,12 +4779,23 @@ export default function App({
           setRecents(rememberProject(normalized));
           return;
         case "reuse-blank":
-          onCwdChange(decision.sessionId, normalized);
-          return;
+          // A batch only gets one draft — retargeting it again would move the
+          // project the previous pick just claimed.
+          if (allowBlankReuse) {
+            onCwdChange(decision.sessionId, normalized);
+            // Later picks in the same batch read the stale ref — publish the
+            // new project so the session isn't matched against its old one.
+            sessionsRef.current = sessionsRef.current.map((s) =>
+              s.id === decision.sessionId ? { ...s, cwd: normalized } : s,
+            );
+            return;
+          }
+          break;
         case "activate":
           setProjectCwd(normalized);
           setRecents(rememberProject(normalized));
           activateTab(decision.tabId, decision.paneId);
+          activeTabIdRef.current = decision.tabId;
           return;
         case "create":
           break;
@@ -4808,12 +4819,23 @@ export default function App({
       setSessions((prev) => [...prev, session]);
       appendTab(tab, normalized);
       setActiveTabId(tab.id);
+      activeTabIdRef.current = tab.id;
       setComposerFocused(true);
     },
     [activateTab, appendTab, onCwdChange, readProjectReturnMemory],
   );
 
-  const { onSelectProject, pickProject, wslPickerOpen, closePicker, wslOpening, dismissOpening } = useWslProjects(projectCwd, selectProject);
+  /** Batch entry: only the first pick may absorb a blank session. */
+  const selectProjects = useCallback(
+    (paths: string[], allowBlankReuse = true) => {
+      paths.forEach((path, index) =>
+        selectProject(path, allowBlankReuse && index === 0),
+      );
+    },
+    [selectProject],
+  );
+
+  const { onSelectProject, onSelectProjects, pickProject, wslPickerOpen, closePicker, wslOpening, dismissOpening } = useWslProjects(projectCwd, selectProjects);
 
   const onPlaceSessionInFolder = useCallback(
     (sessionId: string, target: SessionFolderTarget) => {
@@ -8961,9 +8983,9 @@ export default function App({
               onDismissUpdate={() => setUpdateNotice(null)}
             />
 
-            {wslPickerOpen && <WslProjectDialog cwd={projectCwd} onOpen={(paths) => { if (paths[0]) selectProject(paths[0]); }} onClose={closePicker} />}
+            {wslPickerOpen && <WslProjectDialog cwd={projectCwd} onOpen={selectProjects} onClose={closePicker} />}
             <div className="body-glass flex min-h-0 min-w-0 flex-1 flex-col">
-              {wslOpening && <WslConnectionStatus opening={wslOpening} onRetry={() => onSelectProject(wslOpening.path)} onDismiss={dismissOpening} />}
+              {wslOpening && <WslConnectionStatus opening={wslOpening} onRetry={() => onSelectProjects(wslOpening.queue ?? [wslOpening.path], wslOpening.blankReuse ?? true)} onDismiss={dismissOpening} />}
               <div
                 className={
                   searchViewOpen ||

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { prettyCwd, wslLocation, wslPath } from "../../../shared/lib/paths";
-import { connectWslProject, wslDistributions, wslDistributionsPeek } from "../model/wsl";
+import { connectWslProject, wslDistributions, wslDistributionsPeek, wslHome } from "../model/wsl";
 import { useWslStatus } from "../model/wslStatus";
 import { pickFolder } from "../../../platform/tauri/fs";
 import { Select } from "./Select";
@@ -24,7 +24,7 @@ export function WslProjectDialog({
       const controls = form.current
         ?.closest('[role="dialog"]')
         ?.querySelectorAll<HTMLElement>(
-          "button:not(:disabled), input:not(:disabled), select:not(:disabled)",
+          "button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)",
         );
       if (!controls?.length) return;
       const first = controls[0],
@@ -52,6 +52,30 @@ export function WslProjectDialog({
   );
   const [distribution, setDistribution] = useState(current?.distribution ?? "");
   const [path, setPath] = useState(current?.path ?? "");
+  const selectedDistro = useRef(current?.distribution ?? "");
+  const pathTouched = useRef(Boolean(current));
+  useEffect(() => {
+    selectedDistro.current = distribution;
+  }, [distribution]);
+  const selectDistribution = (name: string) => {
+    setDistribution(name);
+    selectedDistro.current = name;
+    if (!name) return;
+    pathTouched.current = false;
+    setPath("");
+    // Offer the default user's home before any checkout connects; a typed or
+    // switched-away value must not be overwritten by the late probe.
+    void wslHome(name)
+      .then((home) => {
+        if (
+          typeof home === "string" &&
+          selectedDistro.current.toLowerCase() === name.toLowerCase() &&
+          !pathTouched.current
+        )
+          setPath(home);
+      })
+      .catch(() => undefined);
+  };
   const [loading, setLoading] = useState(() => wslDistributionsPeek() == null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -91,7 +115,7 @@ export function WslProjectDialog({
     onClose();
   };
   const field =
-    "h-8 w-full rounded-md border border-content/10 bg-content/5 px-2 text-[13px] text-content outline-none focus:border-content/30 disabled:opacity-50";
+    "w-full rounded-md border border-content/10 bg-content/5 px-2 py-1.5 text-[13px] text-content outline-none focus:border-content/30 disabled:opacity-50";
   return (
     <Modal
       size="sm"
@@ -112,24 +136,39 @@ export function WslProjectDialog({
           setError("");
           void Promise.resolve()
             .then(async () => {
-              if (distribution)
-                return [
-                  await connectWslProject(
-                    wslPath(distribution, path),
-                    controller.signal,
-                  ),
-                ];
+              if (distribution) {
+                const canonicals: string[] = [];
+                for (const line of path
+                  .split(/\r?\n/)
+                  .map((entry) => entry.trim())
+                  .filter(Boolean)) {
+                  let target: string;
+                  try {
+                    target = wslPath(distribution, line);
+                  } catch (reason) {
+                    throw new Error(
+                      `${line} — ${reason instanceof Error ? reason.message : String(reason)}`,
+                    );
+                  }
+                  canonicals.push(
+                    await connectWslProject(target, controller.signal),
+                  );
+                }
+                return canonicals;
+              }
               const selected = await pickFolder();
-              const paths = Array.isArray(selected)
-                ? selected
-                : selected
-                  ? [selected]
-                  : null;
-              if (paths?.some((picked) => wslLocation(picked)))
-                throw new Error(
-                  "Choose that WSL distribution as the execution location, then enter its Linux path.",
+              if (!selected) return null;
+              // A folder browsed under \\wsl.localhost is bound to its
+              // distribution — connect it like an explicit WSL choice.
+              const resolved: string[] = [];
+              for (const picked of selected) {
+                resolved.push(
+                  wslLocation(picked)
+                    ? await connectWslProject(picked, controller.signal)
+                    : picked,
                 );
-              return paths;
+              }
+              return resolved;
             })
             .then((canonical) => {
               if (canonical?.length && !controller.signal.aborted) {
@@ -152,7 +191,7 @@ export function WslProjectDialog({
             label="Execution location"
             value={distribution}
             disabled={busy}
-            onChange={setDistribution}
+            onChange={selectDistribution}
             options={[
               { value: "", label: "This Windows PC" },
               ...(distribution && !distributions.includes(distribution)
@@ -186,15 +225,19 @@ export function WslProjectDialog({
           )}
         {distribution && (
           <label className="block space-y-1 text-[12px] text-content/75">
-            <span>Linux folder</span>
-            <input
+            <span>Linux folders — one per line</span>
+            <textarea
               className={field}
               value={path}
               disabled={busy}
-              placeholder="/home/you/projects/repo"
+              placeholder={"/home/you/projects/repo\n/home/you/projects/other"}
               required
+              rows={3}
               spellCheck={false}
-              onChange={(event) => setPath(event.target.value)}
+              onChange={(event) => {
+                pathTouched.current = true;
+                setPath(event.target.value);
+              }}
             />
           </label>
         )}
@@ -227,7 +270,7 @@ export function WslProjectDialog({
           </button>
           <button
             type="submit"
-            disabled={busy || Boolean(distribution && (loading || !path))}
+            disabled={busy || Boolean(distribution && (loading || !path.trim()))}
             className="rounded-md bg-content px-3 py-1.5 text-background-base disabled:opacity-40"
           >
             {busy ? "Opening…" : distribution ? "Open" : "Browse…"}

@@ -287,6 +287,7 @@ pub fn run() {
             browser_preview::browser_preview_open,
             browser_preview::browser_preview_action,
             wsl::wsl_distributions,
+            wsl::wsl_home,
             wsl::wsl_connect,
             wsl::wsl_resolve_harness,
             wsl::wsl_resolve_agents,

@@ -469,7 +469,9 @@ def handle(request):
         for provider in AGENT_PROVIDERS:
             try:
                 resolved[provider] = {"path": find_agent(provider), "authenticated": agent_authenticated(provider)}
-            except ValueError as error:
+            # A provider that fails unexpectedly (e.g. a symlink loop mid-scan)
+            # reports its own error instead of voiding every provider's result.
+            except Exception as error:
                 resolved[provider] = {"error": str(error)}
         return resolved
     if op == "agent_exec":
