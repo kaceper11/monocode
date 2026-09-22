@@ -15,8 +15,10 @@ import {
   ChartBreakoutSquare,
   Check,
   ChevronDown,
+  CircleDot,
   Clock,
   Folder,
+  GitPullRequest,
   ListBullet,
   ListFilter,
   LoaderCircle,
@@ -24,6 +26,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  SlidersHorizontal,
   Tag,
   Trash2,
   X,
@@ -40,11 +43,14 @@ import {
   type InboxItem,
   type InboxProvider,
   type InboxProviderErrors,
+  type InboxQuery,
 } from "../inbox/model/githubTasks";
 import {
   INBOX_SOURCE_LABELS,
   visibleInboxSources,
+  type InboxTimeFilter,
 } from "../inbox/model/inboxFilters";
+import { timeFilterStart } from "../sessions/model/sessionFilters";
 import { IS_MAC } from "../../platform/tauri/platform";
 import { projectKey, projectName } from "../../shared/lib/paths";
 import { sameProjectPath, type RecentProject } from "../projects/model/recents";
@@ -140,13 +146,15 @@ import {
 } from "./boardStore";
 
 const DRAG_THRESHOLD = 5;
-const BOARD_QUERY = {
-  assignedToMe: true,
-  state: "all" as const,
-  search: "",
-};
 /** Group-filter sentinel for cards with no group assigned. */
 const UNGROUPED = "__ungrouped__";
+
+const BOARD_TIME_OPTIONS: { id: InboxTimeFilter; label: string }[] = [
+  { id: "all", label: "All time" },
+  { id: "today", label: "Today" },
+  { id: "7d", label: "Last 7 days" },
+  { id: "30d", label: "Last 30 days" },
+];
 
 type DragState = {
   cardId: string;
@@ -221,7 +229,13 @@ export function BoardView({
     [recents, cwd],
   );
   const connections = useInboxConnections();
-  const query = BOARD_QUERY;
+  // Fetch-level "my work" filter — every provider honors it (Jira via the
+  // merged filter in listInboxIntegrations); off shows the wider listing.
+  const [mineOnly, setMineOnly] = useState(true);
+  const query = useMemo<InboxQuery>(
+    () => ({ assignedToMe: mineOnly, state: "all", search: "" }),
+    [mineOnly],
+  );
 
   const [items, setItems] = useState<InboxItem[]>(
     () => peekInboxList(projects, query)?.items ?? [],
@@ -447,6 +461,13 @@ export function BoardView({
     new Set(),
   );
   const [actionOnly, setActionOnly] = useState(false);
+  // Item kinds to hide (issues vs pull requests) — task/local cards always
+  // pass; the filter trims standalone provider cards.
+  const [hiddenKinds, setHiddenKinds] = useState<
+    ReadonlySet<"issue" | "pr">
+  >(new Set());
+  const [timeFilter, setTimeFilter] = useState<InboxTimeFilter>("all");
+  const [filterAnchor, setFilterAnchor] = useState<HTMLElement | null>(null);
   const [projectPickerAnchor, setProjectPickerAnchor] =
     useState<HTMLElement | null>(null);
   const [groupPickerAnchor, setGroupPickerAnchor] =
@@ -479,11 +500,23 @@ export function BoardView({
     const tokens = search.trim().toLowerCase().split(/\s+/).filter(Boolean);
     const hidden = new Set(hiddenProviders);
     const hiddenCards = new Set(board.hidden);
+    const timeStart =
+      timeFilter === "all" ? 0 : timeFilterStart(timeFilter, Date.now());
     return cards.filter((card) => {
       if (hiddenCards.has(card.id)) return false;
       // Snoozed — until the time passes or the wake fingerprint changes.
       if (isCardSnoozed(card, board.snoozed[card.id])) return false;
       if (card.provider && hidden.has(card.provider)) return false;
+      // The updated window trims provider noise (e.g. ancient done items);
+      // tasks, locals and link-only cards are board state and always pass.
+      if (timeStart && card.item && card.updatedAt < timeStart) return false;
+      if (
+        hiddenKinds.size > 0 &&
+        card.kind === "item" &&
+        card.itemKind &&
+        hiddenKinds.has(card.itemKind)
+      )
+        return false;
       // Cards without a project (locals, linked-only items) pass any filter.
       // Tasks match when any workstream lives in the filtered project.
       if (projectFilter) {
@@ -541,6 +574,8 @@ export function BoardView({
     cards,
     search,
     hiddenProviders,
+    hiddenKinds,
+    timeFilter,
     projectFilter,
     groupFilter,
     actionOnly,
@@ -1374,6 +1409,21 @@ export function BoardView({
           </button>
           <button
             type="button"
+            aria-label="Board filters"
+            aria-pressed={!mineOnly || timeFilter !== "all" || hiddenKinds.size > 0}
+            title="Board filters"
+            className={`flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium ${
+              !mineOnly || timeFilter !== "all" || hiddenKinds.size > 0
+                ? "bg-accent/15 text-accent"
+                : "text-content/50 hover:bg-content/8 hover:text-content"
+            }`}
+            onClick={(event) => setFilterAnchor(event.currentTarget)}
+          >
+            <SlidersHorizontal className="size-3.5" strokeWidth={1.75} />
+            Filters
+          </button>
+          <button
+            type="button"
             aria-pressed={actionOnly}
             title="Only cards that need action"
             className={`flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium ${
@@ -1802,6 +1852,25 @@ export function BoardView({
           </div>
         </Popover>
       ) : null}
+      {filterAnchor ? (
+        <BoardFiltersPopover
+          anchor={filterAnchor}
+          mineOnly={mineOnly}
+          time={timeFilter}
+          hiddenKinds={hiddenKinds}
+          onMineOnly={() => setMineOnly((value) => !value)}
+          onTime={setTimeFilter}
+          onToggleKind={(kind) =>
+            setHiddenKinds((current) => {
+              const next = new Set(current);
+              if (next.has(kind)) next.delete(kind);
+              else next.add(kind);
+              return next;
+            })
+          }
+          onClose={() => setFilterAnchor(null)}
+        />
+      ) : null}
       {groupPickerAnchor ? (
         <GroupFilterPopover
           anchor={groupPickerAnchor}
@@ -1916,6 +1985,102 @@ function BoardProjectMark({ path }: { path: string }) {
       name={resolveTabGroupMascot(key, loadTabGroupMascots())}
       className="size-3.5 shrink-0"
     />
+  );
+}
+
+/** Board-wide filters: assignment narrows the provider fetch itself;
+ * updated-window and kind trim the fetched cards. */
+function BoardFiltersPopover({
+  anchor,
+  mineOnly,
+  time,
+  hiddenKinds,
+  onMineOnly,
+  onTime,
+  onToggleKind,
+  onClose,
+}: {
+  anchor: HTMLElement;
+  mineOnly: boolean;
+  time: InboxTimeFilter;
+  hiddenKinds: ReadonlySet<"issue" | "pr">;
+  onMineOnly: () => void;
+  onTime: (time: InboxTimeFilter) => void;
+  onToggleKind: (kind: "issue" | "pr") => void;
+  onClose: () => void;
+}) {
+  return (
+    <Popover
+      anchor={anchor}
+      onDismiss={onClose}
+      width={208}
+      aria-label="Board filters"
+    >
+      <div className="p-1.5" role="group" aria-label="Board filters">
+        <BoardFilterRow
+          label="Assigned to me"
+          checked={mineOnly}
+          onClick={onMineOnly}
+        />
+        <p className="px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-content/40">
+          Updated
+        </p>
+        {BOARD_TIME_OPTIONS.map((option) => (
+          <BoardFilterRow
+            key={option.id}
+            label={option.label}
+            checked={time === option.id}
+            onClick={() => onTime(option.id)}
+          />
+        ))}
+        <p className="px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-content/40">
+          Type
+        </p>
+        <BoardFilterRow
+          label="Issues"
+          checked={!hiddenKinds.has("issue")}
+          icon={<CircleDot className="size-3.5 shrink-0" strokeWidth={1.75} />}
+          onClick={() => onToggleKind("issue")}
+        />
+        <BoardFilterRow
+          label="Pull requests"
+          checked={!hiddenKinds.has("pr")}
+          icon={
+            <GitPullRequest className="size-3.5 shrink-0" strokeWidth={1.75} />
+          }
+          onClick={() => onToggleKind("pr")}
+        />
+      </div>
+    </Popover>
+  );
+}
+
+function BoardFilterRow({
+  label,
+  checked,
+  icon,
+  onClick,
+}: {
+  label: string;
+  checked: boolean;
+  icon?: React.ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitemcheckbox"
+      aria-checked={checked}
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={onClick}
+      className="flex h-7 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] leading-none text-content hover:bg-content/5 focus-visible:outline focus-visible:outline-1 focus-visible:outline-content/50"
+    >
+      {icon}
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      {checked ? (
+        <Check className="size-3.5 shrink-0" strokeWidth={2.25} />
+      ) : null}
+    </button>
   );
 }
 

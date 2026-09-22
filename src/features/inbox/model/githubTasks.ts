@@ -683,7 +683,10 @@ async function fetchInboxItems(
   projects: readonly { path: string }[],
   query: InboxQuery,
 ): Promise<InboxListResult> {
-  const integrations = listInboxIntegrations(query.state);
+  const integrations = listInboxIntegrations(
+    query.state,
+    query.assignedToMe,
+  );
   const unique = uniqueInboxProjects(projects);
   const preferredPaths = unique.map((project) => project.path);
   const discovery = await Promise.allSettled(

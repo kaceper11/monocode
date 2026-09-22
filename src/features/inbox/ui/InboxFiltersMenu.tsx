@@ -156,7 +156,14 @@ export function InboxFiltersMenu({
             ? "Needs attention"
             : "Assigned to me"
         }
-        checked={source === "jira" ? jiraFilter.assigned : filters.assignedToMe}
+        checked={
+          source === "jira"
+            ? jiraFilter.assigned || filters.assignedToMe
+            : filters.assignedToMe
+        }
+        // The shared flag already narrows the Jira fetch — the per-source
+        // toggle only takes over once the shared one is off.
+        disabled={source === "jira" && filters.assignedToMe}
         onClick={
           source === "jira"
             ? () =>

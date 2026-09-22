@@ -217,7 +217,7 @@ export function useInboxActivity(
         // Preserve upstream's no-project boundary; added services are project-independent.
         const listed = projects.length
           ? await listInboxItems(projects, query, { force })
-          : await listInboxIntegrations(query.state);
+          : await listInboxIntegrations(query.state, query.assignedToMe);
         if (cancelled) return;
         const visible = applyInboxFilters(listed.items, filters, "");
         rememberNotificationProjects(

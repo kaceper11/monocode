@@ -198,12 +198,15 @@ it("passes the selected saved filter and preserves other providers on Jira failu
     state: "all",
     search: "",
   });
+  // The saved filter's project/filter ids pass through, but an
+  // assigned-only query forces `assigned` — a wider saved filter must not
+  // leak unassigned tickets into it (e.g. the board).
   expect(call).toHaveBeenCalledWith("jira_list_issues", {
     site: item.site,
     accountId: "email:ada@example.test",
     project: "12",
     filter: "34",
-    assigned: false,
+    assigned: true,
     state: "all",
   });
   expect(result.errors.jira).toBe("Jira denied access");
