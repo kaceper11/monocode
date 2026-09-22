@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-09-22
+
+### Added
+
+- The board's Projects, Groups, Filters, Action, and Attention controls are now one Filters panel, and custom filter combinations can be saved, applied, renamed, updated in place, and deleted.
+
 ### Fixed
 
 - Hermes turns stay busy while detached subagents are running and resume automatically with their completed transcripts instead of requiring a manual Continue. Hermes ACP usage updates also populate the context meter. In #335.
