@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Hermes turns stay busy while detached subagents are running and resume automatically with their completed transcripts instead of requiring a manual Continue. Hermes ACP usage updates also populate the context meter. In #335.
 
+## [0.3.5] - 2026-09-22
+
+### Added
+
+- GitHub issue and pull request links on sessions, with linked work items shown in the session header.
+- Edit-and-resend for the latest user message across agent harnesses, with hardened recovery for edited turns.
+- The composer draft survives closing and reopening the session pane.
+- Event automations can be linked to work items, and session titles refresh from linked items.
+- Diff counts format with thousands separators.
+
 ## [0.3.4] - 2026-09-22
 
 ### Added
