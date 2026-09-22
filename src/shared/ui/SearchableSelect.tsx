@@ -33,6 +33,7 @@ export function SearchableSelect({
   align = "start",
   minMenuWidth,
   creatable,
+  exclude,
 }: {
   label: string;
   value: string;
@@ -55,6 +56,9 @@ export function SearchableSelect({
    * Requires the default `searchable` — with it off there is no query to
    * create from. */
   creatable?: string;
+  /** Raw values the creatable row must never offer — e.g. a typed name that
+   * is already claimed, which would only fail downstream. */
+  exclude?: ReadonlySet<string>;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -78,10 +82,15 @@ export function SearchableSelect({
         )
       : [...options];
     const draft = query.trim();
-    if (creatable && draft && !options.some((option) => option.value === draft))
+    if (
+      creatable &&
+      draft &&
+      !exclude?.has(draft) &&
+      !options.some((option) => option.value === draft)
+    )
       list.push({ value: draft, label: `${creatable} "${draft}"` });
     return list;
-  }, [normalizedQuery, options, creatable, query]);
+  }, [normalizedQuery, options, creatable, exclude, query]);
   const activeId =
     filtered[active] != null ? `${listId}-option-${active}` : undefined;
   const popoverLayer =

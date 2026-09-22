@@ -53,6 +53,7 @@ export function ReviewLocallyDialog({
   reviewColumnIds,
   onSpawnSession,
   onSendToSession,
+  onRemoveWorktree,
   onCreated,
   onClose,
 }: {
@@ -67,6 +68,14 @@ export function ReviewLocallyDialog({
     },
   ) => Promise<{ sessionId: string; worktreePath: string }>;
   onSendToSession: (sessionId: string, text: string) => void;
+  /** App-level worktree removal — used only when the task can't be stored
+   * after the worktree already exists. */
+  onRemoveWorktree: (
+    cwd: string,
+    path: string,
+    force: boolean,
+    keepSessions?: boolean,
+  ) => Promise<unknown>;
   onCreated: (taskCardId: string) => void;
   onClose: () => void;
 }) {
@@ -83,7 +92,7 @@ export function ReviewLocallyDialog({
   const supported = FETCHABLE.has(item.provider);
 
   const submit = async () => {
-    if (!projectPath) return;
+    if (!projectPath || busy) return;
     setBusy(true);
     setError("");
     try {
@@ -96,6 +105,18 @@ export function ReviewLocallyDialog({
           `${projectName(projectPath)} has no git remote to fetch the PR from.`,
         );
       const branch = `pr/${item.number}`;
+      // A branch serves one lane board-wide — an archived review task's
+      // lane still owns its worktree, so claims include archived tasks.
+      if (
+        loadBoard().tasks.some((entry) =>
+          entry.workstreams.some(
+            (ws) =>
+              sameProjectPath(ws.projectPath, projectPath) &&
+              ws.branch === branch,
+          ),
+        )
+      )
+        throw new Error(`A lane already tracks ${branch}.`);
       // PR refs live on the base repo, so fork PRs resolve too; Azure
       // fetches the source branch (or the merge ref when it's unknown).
       await gitFetchBranch(
@@ -153,7 +174,16 @@ export function ReviewLocallyDialog({
           },
         ],
       });
-      if (!taskId) throw new Error("Board is full — archive some tasks first.");
+      if (!taskId) {
+        // Don't orphan the worktree just created — this dialog only ever
+        // creates new copies, never binds existing ones. The session stays
+        // reachable in the sessions view. Awaited so a resubmit can't
+        // collide with the still-registered copy.
+        await onRemoveWorktree(projectPath, worktreePath, false, true).catch(
+          () => {},
+        );
+        throw new Error("Board is full — archive some tasks first.");
+      }
       // Land in Review — the card id is the task id verbatim.
       placeColumnOrder("review", [...reviewColumnIds, taskId]);
       if (sessionIds[0])

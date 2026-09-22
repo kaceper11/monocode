@@ -103,6 +103,7 @@ import { useInboxConnections } from "./useInboxConnections";
 import {
   createTaskPrs,
   probeWorkstream,
+  shortError,
   updateWorkstreamFromBase,
   type WorkstreamResult,
 } from "./taskOps";
@@ -124,6 +125,7 @@ import {
   loadBoard,
   MAX_TASK_GROUPS,
   MAX_TASKS,
+  MAX_WORKSTREAMS,
   newEntityId,
   pinCard,
   placeColumnOrder,
@@ -1099,6 +1101,14 @@ export function BoardView({
       const workstreams: TaskWorkstream[] = [];
       const errors: string[] = [];
       const failed = new Map<string, WorkstreamResult>();
+      // Paths the spec binds rather than creates — failure cleanup must
+      // never remove a pre-existing worktree the user only pointed at.
+      const boundPaths = new Set(
+        spec.workstreams
+          .map((ws) => ws.worktreePath)
+          .filter((path): path is string => !!path)
+          .map(pathKey),
+      );
       // A failed lane stays on the task as a row without a worktree — the
       // details panel's "Create worktree" retries it.
       const failLane = (ws: TaskWorkstreamSpec, reason: string) => {
@@ -1132,6 +1142,10 @@ export function BoardView({
         );
       };
       for (const ws of spec.workstreams) {
+        if (workstreams.length >= MAX_WORKSTREAMS) {
+          failLane(ws, `a task can hold at most ${MAX_WORKSTREAMS} lanes`);
+          continue;
+        }
         if (claimed(ws)) {
           failLane(ws, `a lane already tracks ${ws.branch}`);
           continue;
@@ -1151,7 +1165,7 @@ export function BoardView({
             sessionIds: [spawned.sessionId],
           });
         } catch (error) {
-          failLane(ws, String(error));
+          failLane(ws, shortError(error));
         }
       }
       setTaskBusy(false);
@@ -1169,19 +1183,20 @@ export function BoardView({
         groupIds: spec.groupIds,
       });
       if (!id) {
-        // The board filled since the pre-check — don't leave the worktrees
-        // just created behind. Sessions stay reachable in the sessions
-        // view; deleting them isn't BoardView's call.
-        for (const ws of workstreams) {
-          if (ws.worktreePath) {
-            void onRemoveWorktree(
-              ws.projectPath,
-              ws.worktreePath,
-              false,
-              true,
-            ).catch(() => {});
-          }
-        }
+        // The board filled since the pre-check — remove worktrees the
+        // spawns created, never bound paths (those are the user's own
+        // working copies). Sessions stay reachable in the sessions view.
+        // Awaited so a resubmit can't collide with a still-registered copy.
+        await Promise.allSettled(
+          workstreams
+            .filter(
+              (ws) =>
+                ws.worktreePath && !boundPaths.has(pathKey(ws.worktreePath)),
+            )
+            .map((ws) =>
+              onRemoveWorktree(ws.projectPath, ws.worktreePath!, false, true),
+            ),
+        );
         setTaskError("Board is full — remove a task first");
         return;
       }
@@ -1207,7 +1222,14 @@ export function BoardView({
       // Surface partial spawn failures on their workstream rows.
       if (failed.size) setActionResults(failed);
     },
-    [onSpawnSession, promoteFrom, cards, board.placements, board.locals],
+    [
+      onSpawnSession,
+      onRemoveWorktree,
+      promoteFrom,
+      cards,
+      board.placements,
+      board.locals,
+    ],
   );
 
   const refreshNow = useCallback(() => setRefresh((value) => value + 1), []);
@@ -1958,6 +1980,7 @@ export function BoardView({
         <NewTaskDialog
           items={items}
           recents={recents}
+          lanes={boardLanes}
           busy={taskBusy}
           error={taskError}
           initialTitle={promoteFrom?.title}
@@ -1977,6 +2000,7 @@ export function BoardView({
           )}
           onSpawnSession={onSpawnSession}
           onSendToSession={onSendToSession}
+          onRemoveWorktree={onRemoveWorktree}
           onCreated={setSelectedCardId}
           onClose={() => setReviewItem(null)}
         />

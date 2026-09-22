@@ -16,7 +16,7 @@ import { Check, GitBranch, LoaderCircle, Plus, Search, X } from "../../shared/ui
 import { inboxItemRef, type InboxItem } from "../inbox/model/githubTasks";
 import { LAYER } from "../../shared/lib/layers";
 import { pathKey, prettyCwd, projectName } from "../../shared/lib/paths";
-import type { RecentProject } from "../projects/model/recents";
+import { sameProjectPath, type RecentProject } from "../projects/model/recents";
 import type { LinkedWorkItem } from "../sessions/model/session";
 import { linkedWorkItemInboxKey } from "../sessions/model/sessionWorkItem";
 import {
@@ -32,7 +32,12 @@ import {
 import { useProjectWorktrees } from "../source-control/hooks/useProjectWorktrees";
 import { gitBranches, type GitBranches } from "../../platform/tauri/fs";
 import { boardTicketOptions, groupSwatch } from "./boardData";
-import { createGroup, loadBoard } from "./boardStore";
+import {
+  createGroup,
+  loadBoard,
+  MAX_WORKSTREAMS,
+  type TaskWorkstream,
+} from "./boardStore";
 
 export type TaskWorkstreamSpec = {
   projectPath: string;
@@ -166,6 +171,7 @@ export function WorkstreamFields({
   compact,
   layer,
   excludeWorktreePaths,
+  excludeBranches,
 }: {
   draft: {
     projectPath: string;
@@ -189,6 +195,9 @@ export function WorkstreamFields({
   /** pathKey'd worktree paths another lane already claims — offering one
    * would only fail at submit, so keep it out of the picker. */
   excludeWorktreePaths?: ReadonlySet<string>;
+  /** Branch names another lane already tracks — claimed options and
+   * worktrees checked out on them are equally unpickable. */
+  excludeBranches?: ReadonlySet<string>;
 }) {
   const { branches } = useProjectBranchesState(
     draft.projectPath,
@@ -203,8 +212,13 @@ export function WorkstreamFields({
   // spawn path creates a new branch from base for anything else it can't
   // adopt. "" keeps the auto-generated name.
   const branchOptions = useMemo(
-    () => [{ value: "", label: "Auto from task" }, ...localBranchOptions(branches)],
-    [branches],
+    () => [
+      { value: "", label: "Auto from task" },
+      ...localBranchOptions(branches).filter(
+        (option) => !excludeBranches?.has(option.value),
+      ),
+    ],
+    [branches, excludeBranches],
   );
   // Existing worktrees of the chosen repo — a lane can bind one instead of
   // creating a fresh copy. Branch follows the pick (a bound lane's branch
@@ -213,11 +227,15 @@ export function WorkstreamFields({
     () =>
       worktreeLaneOptions(
         (worktrees?.worktrees ?? []).filter(
-          (tree) => !excludeWorktreePaths?.has(pathKey(tree.path)),
+          // A bound pick syncs the lane's branch to the tree's — a tree on
+          // a claimed branch would claim that branch too.
+          (tree) =>
+            !excludeWorktreePaths?.has(pathKey(tree.path)) &&
+            !(tree.branch && excludeBranches?.has(tree.branch)),
         ),
         draft.worktreePath,
       ),
-    [worktrees, draft.worktreePath, excludeWorktreePaths],
+    [worktrees, draft.worktreePath, excludeWorktreePaths, excludeBranches],
   );
   const repoSelect = (
     <SearchableSelect
@@ -281,6 +299,7 @@ export function WorkstreamFields({
       placeholder={branches ? "mc/branch…" : "…"}
       searchPlaceholder="Pick or type a branch…"
       creatable="New branch"
+      exclude={excludeBranches}
       disabled={!draft.projectPath || !!draft.worktreePath}
       layer={layer}
       minMenuWidth={240}
@@ -328,6 +347,7 @@ export function WorkstreamFields({
 export function NewTaskDialog({
   items,
   recents,
+  lanes,
   busy,
   error,
   initialTitle,
@@ -336,6 +356,9 @@ export function NewTaskDialog({
 }: {
   items: InboxItem[];
   recents: RecentProject[];
+  /** All board lanes — claimed worktree paths and branches are excluded
+   * from the pickers (a pick that can only fail at submit is no option). */
+  lanes: TaskWorkstream[];
   busy: boolean;
   /** Per-workstream errors from the last submit, joined for display. */
   error: string;
@@ -357,6 +380,9 @@ export function NewTaskDialog({
   const [groups, setGroups] = useState(() => loadBoard().groups);
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
   const [newGroupName, setNewGroupName] = useState("");
+  // `busy` (parent) only starts once onSubmit runs — `submitting` covers
+  // the async branch-refresh span before it, blocking re-submit + cancel.
+  const [submitting, setSubmitting] = useState(false);
   const nextKey = useRef(1);
   const titleRef = useRef<HTMLInputElement>(null);
   // The modal focuses its close button on mount — land title focus a frame
@@ -387,43 +413,48 @@ export function NewTaskDialog({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (busy) return;
-    const links = [...selected.values()];
-    const fallback = suggestedBranch(title, links);
-    // Fresh branch lists — a stale cache would wrap a branch created
-    // outside the app in `mc/` instead of adopting it.
-    const fresh = new Map<string, GitBranches | null>();
-    for (const stream of streams) {
-      if (stream.projectPath && !fresh.has(stream.projectPath)) {
-        fresh.set(
-          stream.projectPath,
-          await gitBranches(stream.projectPath).catch(() => null),
-        );
+    if (busy || submitting) return;
+    setSubmitting(true);
+    try {
+      const links = [...selected.values()];
+      const fallback = suggestedBranch(title, links);
+      // Fresh branch lists — a stale cache would wrap a branch created
+      // outside the app in `mc/` instead of adopting it.
+      const fresh = new Map<string, GitBranches | null>();
+      for (const stream of streams) {
+        if (stream.projectPath && !fresh.has(stream.projectPath)) {
+          fresh.set(
+            stream.projectPath,
+            await gitBranches(stream.projectPath).catch(() => null),
+          );
+        }
       }
+      onSubmit({
+        title: title.trim(),
+        links,
+        workstreams: streams
+          .filter((stream) => stream.projectPath)
+          .map((stream) => ({
+            projectPath: stream.projectPath,
+            // A bound worktree carries its own branch — resolveLaneBranch
+            // would only be needed for fresh creations.
+            branch: stream.worktreePath
+              ? stream.branch
+              : resolveLaneBranch(
+                  stream.projectPath,
+                  stream.branch,
+                  fresh.get(stream.projectPath),
+                ) || fallback,
+            base: stream.base.trim() || "HEAD",
+            ...(stream.worktreePath
+              ? { worktreePath: stream.worktreePath }
+              : {}),
+          })),
+        groupIds: [...selectedGroups],
+      });
+    } finally {
+      setSubmitting(false);
     }
-    onSubmit({
-      title: title.trim(),
-      links,
-      workstreams: streams
-        .filter((stream) => stream.projectPath)
-        .map((stream) => ({
-          projectPath: stream.projectPath,
-          // A bound worktree carries its own branch — resolveLaneBranch
-          // would only be needed for fresh creations.
-          branch: stream.worktreePath
-            ? stream.branch
-            : resolveLaneBranch(
-                stream.projectPath,
-                stream.branch,
-                fresh.get(stream.projectPath),
-              ) || fallback,
-          base: stream.base.trim() || "HEAD",
-          ...(stream.worktreePath
-            ? { worktreePath: stream.worktreePath }
-            : {}),
-        })),
-      groupIds: [...selectedGroups],
-    });
   };
 
   return (
@@ -432,7 +463,7 @@ export function NewTaskDialog({
       description="Link tickets to workstreams — each repo lane gets a branch and worktree."
       size="md"
       onClose={() => {
-        if (!busy) onCancel();
+        if (!busy && !submitting) onCancel();
       }}
     >
       <form onSubmit={submit} className="flex flex-col gap-4 px-4 pb-4 pt-1">
@@ -612,25 +643,51 @@ export function NewTaskDialog({
             </h3>
             <button
               type="button"
+              disabled={streams.length >= MAX_WORKSTREAMS}
               onClick={() =>
                 setStreams((current) => [
                   ...current,
                   { key: nextKey.current++, projectPath: "", branch: "", base: "" },
                 ])
               }
-              className="flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium text-content/55 outline-none hover:bg-content/8 hover:text-content focus-visible:ring-1 focus-visible:ring-accent/60"
+              className="flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium text-content/55 outline-none hover:bg-content/8 hover:text-content focus-visible:ring-1 focus-visible:ring-accent/60 disabled:opacity-40"
             >
               <Plus className="size-3" strokeWidth={2} />
               Add repo
             </button>
           </div>
           <div className="flex flex-col gap-1.5">
-            {streams.map((stream) => (
+            {streams.map((stream) => {
+              // Claims against this row's repo: board lanes own their
+              // paths+branches; sibling rows claim each picked worktree
+              // and the branch it synced.
+              const excludePaths = new Set<string>();
+              const excludeBranches = new Set<string>();
+              for (const ws of lanes) {
+                if (!sameProjectPath(ws.projectPath, stream.projectPath))
+                  continue;
+                excludeBranches.add(ws.branch);
+                if (ws.worktreePath) excludePaths.add(pathKey(ws.worktreePath));
+              }
+              for (const other of streams) {
+                if (
+                  other === stream ||
+                  !sameProjectPath(other.projectPath, stream.projectPath)
+                )
+                  continue;
+                // "" is the auto-name sentinel, never a real claim.
+                if (other.branch) excludeBranches.add(other.branch);
+                if (other.worktreePath)
+                  excludePaths.add(pathKey(other.worktreePath));
+              }
+              return (
               <WorkstreamFields
                 key={stream.key}
                 draft={stream}
                 projects={projects}
                 layer={LAYER.dialogPopover}
+                excludeWorktreePaths={excludePaths}
+                excludeBranches={excludeBranches}
                 onChange={(patch) =>
                   setStreams((current) =>
                     current.map((entry) =>
@@ -655,7 +712,8 @@ export function NewTaskDialog({
                   ) : null
                 }
               />
-            ))}
+              );
+            })}
           </div>
           <p className="mt-1.5 flex items-center gap-1 text-[11px] text-content/40">
             <GitBranch className="size-3 shrink-0" strokeWidth={1.75} />
@@ -674,17 +732,17 @@ export function NewTaskDialog({
           <button
             type="button"
             onClick={onCancel}
-            disabled={busy}
+            disabled={busy || submitting}
             className="rounded-md px-3 py-1.5 text-[12px] text-content/70 outline-none hover:bg-content/8 focus-visible:ring-2 focus-visible:ring-accent/60 active:scale-[0.97] disabled:opacity-50"
           >
             Cancel
           </button>
           <button
             type="submit"
-            disabled={busy || !title.trim()}
+            disabled={busy || submitting || !title.trim()}
             className="inline-flex items-center gap-1.5 rounded-md bg-content px-3 py-1.5 text-[12px] font-medium text-background-base outline-none transition-transform focus-visible:ring-2 focus-visible:ring-accent active:scale-[0.97] disabled:opacity-40"
           >
-            {busy ? (
+            {busy || submitting ? (
               <LoaderCircle
                 className="size-3.5 animate-spin"
                 strokeWidth={2}

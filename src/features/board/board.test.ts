@@ -417,6 +417,39 @@ describe("buildBoardCards", () => {
     );
   });
 
+  it("composePrBody appends only the sibling URLs the body lacks", () => {
+    const t = task({
+      title: "Auth rework",
+      workstreams: [
+        { id: "w1", projectPath: "/a", branch: "mc/auth-a", base: "main" },
+        { id: "w2", projectPath: "/b", branch: "mc/auth-b", base: "main" },
+      ],
+    });
+    // The template already quotes one sibling — the other must still land.
+    const partial = composePrBody(
+      t,
+      t.workstreams[0]!,
+      ["https://x/pr/2", "https://x/pr/3"],
+      "main",
+      { body: "See https://x/pr/2 for the first lane" },
+    );
+    expect(partial).toContain("See https://x/pr/2");
+    expect(partial).toContain("Related pull requests:\n- https://x/pr/3");
+    expect(partial).not.toContain("- https://x/pr/2\n- https://x/pr/3");
+    // A URL that is a strict prefix of a present one is still missing —
+    // `…/pullrequest/2` inside `…/pullrequest/22` doesn't count.
+    const prefixed = composePrBody(
+      t,
+      t.workstreams[0]!,
+      ["https://x/pullrequest/2"],
+      "main",
+      { body: "See https://x/pullrequest/22" },
+    );
+    expect(prefixed).toContain(
+      "Related pull requests:\n- https://x/pullrequest/2",
+    );
+  });
+
   it("drops empty template sections and substitutes lane tokens", () => {
     const t = task({
       title: "Solo",
@@ -1351,6 +1384,75 @@ describe("boardStore", () => {
     expect(store.tasks).toHaveLength(1);
     expect(store.tasks[0]!.links).toHaveLength(1);
     expect(store.tasks[0]!.workstreams[0]!.base).toBe("HEAD");
+  });
+
+  it("addTask counts only live tasks toward the cap", () => {
+    const seed = (archivedCount: number) =>
+      storage.set(
+        "monocode.board.v1",
+        JSON.stringify({
+          tasks: Array.from({ length: 100 }, (_, index) => ({
+            id: `t${index}`,
+            title: `Task ${index}`,
+            workstreams: [],
+            createdAt: index,
+            ...(index >= 100 - archivedCount ? { archived: true } : {}),
+          })),
+        }),
+      );
+    // 98 live + 2 archived — the cap must not count the archived pair,
+    // and the stored task must survive the next load's sanitize.
+    seed(2);
+    expect(
+      addTask({ title: "New", links: [], workstreams: [] }),
+    ).toBeTruthy();
+    expect(loadBoard().tasks).toHaveLength(101);
+    // 100 live — the cap still bites.
+    seed(0);
+    expect(addTask({ title: "New", links: [], workstreams: [] })).toBeNull();
+  });
+
+  it("keeps the newest session ids when a lane exceeds the cap", () => {
+    storage.set(
+      "monocode.board.v1",
+      JSON.stringify({
+        tasks: [
+          {
+            id: "t1",
+            title: "kept",
+            workstreams: [
+              {
+                id: "w1",
+                projectPath: "/r",
+                branch: "mc/x",
+                sessionIds: [
+                  "s1",
+                  "s2",
+                  "s3",
+                  "s4",
+                  "s5",
+                  "s6",
+                  "s7",
+                  "s8",
+                  "s9",
+                  "s10",
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(loadBoard().tasks[0]!.workstreams[0]!.sessionIds).toEqual([
+      "s3",
+      "s4",
+      "s5",
+      "s6",
+      "s7",
+      "s8",
+      "s9",
+      "s10",
+    ]);
   });
 
   it("drops malformed persisted state instead of throwing", () => {

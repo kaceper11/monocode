@@ -213,9 +213,14 @@ function cleanLinkedItem(value: unknown, depth = 0): LinkedWorkItem | null {
 function sanitizeTasks(value: unknown): BoardTask[] {
   if (!Array.isArray(value)) return [];
   const tasks: BoardTask[] = [];
+  // Live and archived cap separately — `addTask` only counts live tasks,
+  // so a shared cap would silently drop whichever task landed last.
+  let live = 0;
+  let archived = 0;
   for (const raw of value) {
-    if (tasks.length >= MAX_TASKS) break;
     if (!isRecord(raw)) continue;
+    const isArchived = raw.archived === true;
+    if ((isArchived ? archived : live) >= MAX_TASKS) continue;
     const id = cleanString(raw.id, 120);
     const title = cleanString(raw.title);
     if (!id || !title) continue;
@@ -233,15 +238,17 @@ function sanitizeTasks(value: unknown): BoardTask[] {
         const projectPath = cleanString(ws.projectPath, 600);
         const branch = cleanString(ws.branch, 200);
         if (!wsId || !projectPath || !branch) continue;
-        // `sessionId` (string) predates `sessionIds` — fold it in.
+        // `sessionId` (string) predates `sessionIds` — fold it in ahead of
+        // the list so the newest-8 trim can't displace a real session for it.
         const sessionIds = [
-          ...(Array.isArray(ws.sessionIds) ? ws.sessionIds : []),
           ws.sessionId,
+          ...(Array.isArray(ws.sessionIds) ? ws.sessionIds : []),
         ]
           .map((entry) => cleanString(entry, 120))
           .filter((entry): entry is string => !!entry)
           .filter((entry, index, list) => list.indexOf(entry) === index)
-          .slice(0, 8);
+          // Writers append — keep the newest, not the oldest.
+          .slice(-8);
         workstreams.push({
           id: wsId,
           projectPath,
@@ -271,8 +278,10 @@ function sanitizeTasks(value: unknown): BoardTask[] {
       workstreams,
       ...(groupIds.length ? { groupIds } : {}),
       createdAt: cleanNumber(raw.createdAt) ?? Date.now(),
-      ...(raw.archived === true ? { archived: true } : {}),
+      ...(isArchived ? { archived: true } : {}),
     });
+    if (isArchived) archived++;
+    else live++;
   }
   return tasks;
 }
@@ -732,13 +741,18 @@ export function unsnoozeCard(cardId: string) {
 /** Restore everything archived: hidden derived cards + archived tasks. */
 export function unarchiveAll() {
   const store = loadBoard();
+  // Restoring past the live cap would push tasks off the board on the next
+  // sanitize — restore only what fits, leave the overflow archived.
+  let live = store.tasks.filter((task) => !task.archived).length;
   writeStore({
     ...store,
     hidden: [],
     snoozed: {},
-    tasks: store.tasks.map((task) =>
-      task.archived ? { ...task, archived: false } : task,
-    ),
+    tasks: store.tasks.map((task) => {
+      if (!task.archived || live >= MAX_TASKS) return task;
+      live++;
+      return { ...task, archived: false };
+    }),
   });
 }
 
@@ -749,11 +763,17 @@ export function archiveTasks(ids: readonly string[]) {
   const store = loadBoard();
   if (!store.tasks.some((task) => wanted.has(task.id) && !task.archived))
     return;
+  // A full archive pool can't take more — overflow would be dropped on
+  // the next sanitize, so those tasks stay live instead of lost.
+  let archived = store.tasks.filter((task) => task.archived).length;
   writeStore({
     ...store,
-    tasks: store.tasks.map((task) =>
-      wanted.has(task.id) ? { ...task, archived: true } : task,
-    ),
+    tasks: store.tasks.map((task) => {
+      if (!wanted.has(task.id) || task.archived || archived >= MAX_TASKS)
+        return task;
+      archived++;
+      return { ...task, archived: true };
+    }),
   });
 }
 
@@ -766,7 +786,10 @@ export function addTask(input: {
   const title = input.title.trim().slice(0, MAX_TEXT);
   if (!title) return null;
   const store = loadBoard();
-  if (store.tasks.length >= MAX_TASKS) return null;
+  // Archived tasks don't render — matching the callers' pre-check, they
+  // don't count toward the cap either.
+  if (store.tasks.filter((task) => !task.archived).length >= MAX_TASKS)
+    return null;
   const id = newEntityId("task");
   const groupIds = (input.groupIds ?? [])
     .filter((groupId) => store.groups.some((group) => group.id === groupId))

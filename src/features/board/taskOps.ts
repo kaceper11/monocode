@@ -23,7 +23,7 @@ import {
   type Worktree,
 } from "../source-control/model/worktrees";
 import type { BoardTask, TaskWorkstream } from "./boardStore";
-import { prIsOpen, type WorkstreamStatus } from "./boardData";
+import { escapeRegExp, prIsOpen, type WorkstreamStatus } from "./boardData";
 
 export { prIsOpen };
 
@@ -369,8 +369,15 @@ export function composePrBody(
 ): string {
   const description = opts?.descriptions?.get(workstream.id)?.trim();
   let body = renderPrBody(task, workstream, siblings, base, opts?.body);
-  if (siblings.length && !siblings.some((url) => body.includes(url))) {
-    body += `\n\nRelated pull requests:\n${siblings
+  // Append only the URLs not already present — a template hardcoding one
+  // sibling must not swallow the rest. The boundary lookahead keeps a URL
+  // that is a prefix of another (`…/pullrequest/2` inside `…/pullrequest/22`)
+  // from counting as present.
+  const missing = siblings.filter(
+    (url) => !new RegExp(`${escapeRegExp(url)}(?![\\w/-])`).test(body),
+  );
+  if (missing.length) {
+    body += `\n\nRelated pull requests:\n${missing
       .map((url) => `- ${url}`)
       .join("\n")}`;
   }

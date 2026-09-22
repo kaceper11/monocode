@@ -386,6 +386,15 @@ function AddWorkstreamRow({
       ),
     [lanes, draft.projectPath],
   );
+  const claimedBranches = useMemo(
+    () =>
+      new Set(
+        lanes
+          .filter((ws) => sameProjectPath(ws.projectPath, draft.projectPath))
+          .map((ws) => ws.branch),
+      ),
+    [lanes, draft.projectPath],
+  );
   return (
     <div className="mt-1.5">
       <WorkstreamFields
@@ -393,6 +402,7 @@ function AddWorkstreamRow({
         projects={projects}
         compact
         excludeWorktreePaths={claimedPaths}
+        excludeBranches={claimedBranches}
         onChange={(patch) => setDraft((current) => ({ ...current, ...patch }))}
         tail={
           <button
@@ -1120,9 +1130,7 @@ export function TaskDetailsPanel({
                 // offer rendered — binding it now would join two lanes
                 // on one worktree.
                 if (laneOwnsPath(offer.path, row.id))
-                  throw new Error(
-                    `That worktree already has a lane on this task`,
-                  );
+                  throw new Error("That worktree already serves another lane");
                 await spawnForRow(row, offer.path);
                 setBindOffer(null);
               }}
@@ -1139,7 +1147,7 @@ export function TaskDetailsPanel({
                   if (clash) {
                     if (laneOwnsPath(clash.path, row.id))
                       throw new Error(
-                        `That worktree already has a lane on this task`,
+                        "That worktree already serves another lane",
                       );
                     setBindOffer({ workstreamId: row.id, path: clash.path });
                     return;
@@ -1352,11 +1360,7 @@ export function TaskDetailsPanel({
               <WorkstreamEditor
                 anchor={editAt.anchor}
                 row={editRow}
-                siblings={lanes.filter(
-                  (ws) =>
-                    ws.id !== editRow.id &&
-                    pathKey(ws.projectPath) === pathKey(editRow.projectPath),
-                )}
+                lanes={lanes}
                 busy={busyAction === `cleanup:${editRow.id}`}
                 onPatch={(patch) =>
                   updateTask(task.id, (current) => ({
@@ -2011,7 +2015,7 @@ function WorkstreamCard({
 function WorkstreamEditor({
   anchor,
   row,
-  siblings,
+  lanes,
   busy,
   onPatch,
   onRemoveWorktree,
@@ -2019,9 +2023,8 @@ function WorkstreamEditor({
 }: {
   anchor: HTMLElement;
   row: BoardWorkstreamRow;
-  /** Other lanes on the same repo — their branches and bound worktrees are
-   * claimed; a branch lives in one worktree and a worktree serves one lane. */
-  siblings: TaskWorkstream[];
+  /** All board lanes — the editor derives this row's siblings from it. */
+  lanes: TaskWorkstream[];
   /** Lane-level cleanup in flight — the remove button waits on it. */
   busy: boolean;
   onPatch: (
@@ -2048,6 +2051,17 @@ function WorkstreamEditor({
   // An armed confirm must not survive a rebind — it would remove the new
   // pick's worktree instead of the one the user armed against.
   useEffect(() => setArmed(false), [row.worktreePath]);
+  // Other lanes on the same repo — their branches and bound worktrees are
+  // claimed; a branch lives in one worktree and a worktree serves one lane.
+  const siblings = useMemo(
+    () =>
+      lanes.filter(
+        (ws) =>
+          ws.id !== row.id &&
+          pathKey(ws.projectPath) === pathKey(row.projectPath),
+      ),
+    [lanes, row.id, row.projectPath],
+  );
   const claimedPaths = useMemo(
     () =>
       new Set(
@@ -2085,6 +2099,34 @@ function WorkstreamEditor({
       ),
     [branches, claimedBranches],
   );
+  // Siblings are render-time — a claim can land between render and pick.
+  // Re-read the store at patch time so a race can't write a duplicate
+  // branch or worktree binding.
+  const storeClaim = (patch: {
+    branch?: string;
+    worktreePath?: string;
+  }): string => {
+    for (const entry of loadBoard().tasks) {
+      for (const ws of entry.workstreams) {
+        if (ws.id === row.id) continue;
+        if (!sameProjectPath(ws.projectPath, row.projectPath)) continue;
+        if (patch.branch && ws.branch === patch.branch)
+          return `A lane already tracks ${patch.branch}`;
+        if (
+          patch.worktreePath &&
+          ws.worktreePath &&
+          pathKey(ws.worktreePath) === pathKey(patch.worktreePath)
+        )
+          return "That worktree already serves another lane";
+      }
+    }
+    return "";
+  };
+  const boundTree = row.worktreePath
+    ? worktrees?.worktrees.find(
+        (tree) => pathKey(tree.path) === pathKey(row.worktreePath!),
+      )
+    : undefined;
   return (
     <Popover
       anchor={anchor}
@@ -2109,13 +2151,20 @@ function WorkstreamEditor({
             const tree = bindableWorktrees(worktrees?.worktrees ?? []).find(
               (entry) => entry.path === path,
             );
-            onPatch({
+            const patch = {
               worktreePath: path || undefined,
               ...(tree?.branch ? { branch: tree.branch } : {}),
               // Unbinding keeps the lane's probed PR alive — a lane without
               // a worktree only tracks a PR when one's pinned.
               ...(!path && row.pr?.url ? { prUrl: row.pr.url } : {}),
-            });
+            };
+            const claim = storeClaim(patch);
+            if (claim) {
+              setError(claim);
+              return;
+            }
+            setError("");
+            onPatch(patch);
           }}
           placeholder="Create on spawn"
           searchPlaceholder="Search worktrees…"
@@ -2132,18 +2181,30 @@ function WorkstreamEditor({
             value={row.branch}
             options={branchOptions}
             onChange={(branch) => {
-              const next =
-                resolveLaneBranch(row.projectPath, branch) ?? row.branch;
-              // A typed name can still resolve onto a sibling lane's branch.
-              if (claimedBranches.has(next)) {
-                setError(`A lane already tracks ${next}`);
-                return;
-              }
-              setError("");
-              onPatch({ branch: next });
+              // Fresh list — the cache can lag a branch created outside the
+              // app; wrapping a real branch in `mc/` would silently fork it.
+              void gitBranches(row.projectPath)
+                .catch(() => null)
+                .then((fresh) => {
+                  const next =
+                    resolveLaneBranch(row.projectPath, branch, fresh) ??
+                    row.branch;
+                  // A typed name can still resolve onto a sibling lane's
+                  // branch — render-time claims are only a hint.
+                  const claim = claimedBranches.has(next)
+                    ? `A lane already tracks ${next}`
+                    : storeClaim({ branch: next });
+                  if (claim) {
+                    setError(claim);
+                    return;
+                  }
+                  setError("");
+                  onPatch({ branch: next });
+                });
             }}
             searchPlaceholder="Pick or type a branch…"
             creatable="New branch"
+            exclude={claimedBranches}
             disabled={!!row.worktreePath}
             layer={LAYER.submenu}
             minMenuWidth={220}
@@ -2162,7 +2223,7 @@ function WorkstreamEditor({
           />
         </div>
       </div>
-      {row.worktreePath ? (
+      {row.worktreePath && !boundTree?.isMain ? (
         <button
           type="button"
           disabled={busy || removing}

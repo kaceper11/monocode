@@ -614,7 +614,7 @@ export function ticketKeys(link: LinkedWorkItem): string[] {
   return keys;
 }
 
-const escapeRegExp = (text: string) =>
+export const escapeRegExp = (text: string) =>
   text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /** Boundary pattern for a ticket key — matches `PROJ-123` but not
