@@ -11,6 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Hermes turns stay busy while detached subagents are running and resume automatically with their completed transcripts instead of requiring a manual Continue. Hermes ACP usage updates also populate the context meter. In #335.
 
+## [0.3.3] - 2026-09-22
+
+### Added
+
+- Open several project folders at once: the folder picker accepts multiple selections on every platform, folders browsed under `\\wsl.localhost` connect through their own distribution, and the WSL form takes one Linux folder per line connected in order.
+- Selecting a WSL distribution offers its default Linux home as the starting folder, so adding a WSL project no longer starts from a blank path.
+
+### Changed
+
+- On Windows, the host picker opens only when a WSL distribution is offered — a failed probe falls back to the last known list, otherwise the folder picker opens directly.
+
+### Fixed
+
+- A provider that fails unexpectedly during batched WSL agent discovery reports its own error instead of voiding every provider's result.
+- Restore the macOS 10.15 minimum dropped by the upstream merge.
+- Align tauri-plugin-updater with the npm plugin version.
+
 ## [0.3.2] - 2026-09-21
 
 ### Changed
