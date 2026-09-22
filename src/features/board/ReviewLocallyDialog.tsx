@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { Modal } from "../../shared/ui/Modal";
 import { Checkbox } from "../../shared/ui/Checkbox";
 import { SearchableSelect } from "../../shared/ui/SearchableSelect";
@@ -77,6 +77,8 @@ export function ReviewLocallyDialog({
   const [spawnSession, setSpawnSession] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // The submit button lives in the pinned footer, outside the form.
+  const formId = useId();
 
   const supported = FETCHABLE.has(item.provider);
 
@@ -181,9 +183,33 @@ export function ReviewLocallyDialog({
         if (!busy) onClose();
       }}
       size="sm"
+      footer={
+        <div className="flex items-center justify-end gap-2 px-4 py-3">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onClose}
+            className="flex h-8 items-center rounded-md px-3 text-[12px] font-medium text-content/60 hover:bg-content/8 hover:text-content disabled:opacity-40"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            form={formId}
+            disabled={busy || !projectPath || !supported}
+            className="flex h-8 items-center gap-1.5 rounded-md bg-accent/20 px-3 text-[12px] font-medium text-accent hover:bg-accent/30 disabled:opacity-40"
+          >
+            {busy ? (
+              <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
+            ) : null}
+            Create review lane
+          </button>
+        </div>
+      }
     >
       <form
-        className="flex flex-col gap-3"
+        id={formId}
+        className="flex flex-col gap-3 px-4 pb-4 pt-1"
         onSubmit={(event) => {
           event.preventDefault();
           void submit();
@@ -230,26 +256,6 @@ export function ReviewLocallyDialog({
             {error}
           </p>
         ) : null}
-        <div className="mt-1 flex items-center justify-end gap-2">
-          <button
-            type="button"
-            disabled={busy}
-            onClick={onClose}
-            className="flex h-8 items-center rounded-md px-3 text-[12px] font-medium text-content/60 hover:bg-content/8 hover:text-content disabled:opacity-40"
-          >
-            Cancel
-          </button>
-          <button
-            type="submit"
-            disabled={busy || !projectPath || !supported}
-            className="flex h-8 items-center gap-1.5 rounded-md bg-accent/20 px-3 text-[12px] font-medium text-accent hover:bg-accent/30 disabled:opacity-40"
-          >
-            {busy ? (
-              <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
-            ) : null}
-            Create review lane
-          </button>
-        </div>
       </form>
     </Modal>
   );

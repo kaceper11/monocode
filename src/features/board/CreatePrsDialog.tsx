@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Modal } from "../../shared/ui/Modal";
 import { Checkbox } from "../../shared/ui/Checkbox";
@@ -209,6 +216,8 @@ export function CreatePrsDialog({
   const [checks, setChecks] = useState<ReadonlyMap<string, LaneCheck>>(
     () => new Map(),
   );
+  // The submit button lives in the pinned footer, outside the form.
+  const formId = useId();
   // Stable identity — LaneRows depend on it in their validation effect.
   const reportCheck = useCallback((workstreamId: string, check: LaneCheck) => {
     setChecks((current) => {
@@ -258,8 +267,39 @@ export function CreatePrsDialog({
       onClose={() => {
         if (!busy) onCancel();
       }}
+      footer={
+        <div className="flex items-center justify-end gap-2 px-4 py-3">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onCancel}
+            className="flex h-8 items-center rounded-md px-3 text-[12px] font-medium text-content/60 hover:bg-content/8 hover:text-content disabled:opacity-40"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            form={formId}
+            disabled={busy || checking || !validIds.length || !title.trim()}
+            className="flex h-8 items-center gap-1.5 rounded-md bg-accent/20 px-3 text-[12px] font-medium text-accent hover:bg-accent/30 disabled:opacity-40"
+          >
+            {busy || checking ? (
+              <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
+            ) : null}
+            {checking
+              ? "Checking…"
+              : validIds.length > 1
+                ? `Create ${validIds.length}${draft ? " draft" : ""} PRs`
+                : `Create${draft ? " draft" : ""} PR`}
+          </button>
+        </div>
+      }
     >
-      <form onSubmit={submit} className="flex flex-col gap-3 px-4 pb-4 pt-1">
+      <form
+        id={formId}
+        onSubmit={submit}
+        className="flex flex-col gap-3 px-4 pb-4 pt-1"
+      >
         <label className="flex flex-col gap-1.5 text-[12px] text-content/70">
           Title
           <input
@@ -375,31 +415,6 @@ export function CreatePrsDialog({
           />
           Create as draft
         </label>
-
-        <div className="mt-1 flex items-center justify-end gap-2">
-          <button
-            type="button"
-            disabled={busy}
-            onClick={onCancel}
-            className="flex h-8 items-center rounded-md px-3 text-[12px] font-medium text-content/60 hover:bg-content/8 hover:text-content disabled:opacity-40"
-          >
-            Cancel
-          </button>
-          <button
-            type="submit"
-            disabled={busy || checking || !validIds.length || !title.trim()}
-            className="flex h-8 items-center gap-1.5 rounded-md bg-accent/20 px-3 text-[12px] font-medium text-accent hover:bg-accent/30 disabled:opacity-40"
-          >
-            {busy || checking ? (
-              <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
-            ) : null}
-            {checking
-              ? "Checking…"
-              : validIds.length > 1
-                ? `Create ${validIds.length}${draft ? " draft" : ""} PRs`
-                : `Create${draft ? " draft" : ""} PR`}
-          </button>
-        </div>
       </form>
     </Modal>
   );

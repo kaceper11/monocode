@@ -26,6 +26,8 @@ type Props = {
   minimalHeader?: boolean;
   /** Extra classes on the panel (fixed height, etc). */
   className?: string;
+  /** Pinned below the scrollable content — dialog action buttons. */
+  footer?: ReactNode;
   children: ReactNode;
 };
 
@@ -36,6 +38,7 @@ export function ModalPanel({
   size = "md",
   minimalHeader = false,
   className,
+  footer,
   children,
 }: Props) {
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -67,7 +70,7 @@ export function ModalPanel({
 
   return (
     <div
-      className={`absolute left-1/2 ${TOP[size]} ${WIDTH[size]} -translate-x-1/2`}
+      className={`absolute bottom-4 left-1/2 ${TOP[size]} ${WIDTH[size]} -translate-x-1/2`}
     >
       <div
         role="dialog"
@@ -75,7 +78,7 @@ export function ModalPanel({
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
         onMouseDown={(event) => event.stopPropagation()}
-        className={`relative isolate flex flex-col overflow-hidden rounded-2xl border border-content/7 shadow-2xl ${className ?? ""}`}
+        className={`relative isolate flex max-h-full flex-col overflow-hidden rounded-2xl border border-content/7 shadow-2xl ${className ?? ""}`}
       >
         <GlassBackdrop className="bg-background-base/55" />
         <div className="modal-panel relative z-[1] flex min-h-0 flex-1 flex-col">
@@ -120,6 +123,9 @@ export function ModalPanel({
           >
             {children}
           </div>
+          {footer ? (
+            <div className="shrink-0 border-t border-content/10">{footer}</div>
+          ) : null}
         </div>
       </div>
     </div>
