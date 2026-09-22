@@ -1,3 +1,7 @@
+import * as availability from "../../../integrations/harness/core/availability";
+import * as registry from "../../../integrations/harness/core/registry";
+import { resetHarnessModelOverlays, refreshModelCatalog } from "../../sessions/model/models";
+import { setWslStatus } from "../../sessions/model/wslStatus";
 // @vitest-environment happy-dom
 import { act, createElement, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -522,4 +526,34 @@ describe("settings search", () => {
     const row = container.querySelector('[data-setting-id="sounds"]')!;
     expect(row.className).toContain("bg-accent/10");
   });
+});
+
+it.each(["/native/repo", "//wsl.localhost/SettingsModels/repo"])("discovers bundled-only provider models and reports a failure accurately (%s)", async cwd => {
+  resetHarnessModelOverlays();
+  vi.spyOn(availability, "isHarnessAvailable").mockImplementation(id => id === "codex" || id === "claude");
+  vi.spyOn(availability, "probeHarnessAvailability").mockResolvedValue();
+  let fail = true;
+  const refresh = vi.spyOn(registry, "refreshHarnessCatalogs").mockImplementation(async (ids, projectCwd) => {
+    await Promise.all([...ids].map(harness => refreshModelCatalog(harness, projectCwd, async () => {
+      if (fail) throw new Error("Linux probe failed");
+      return [{ id: `${harness}:discovered`, harness, name: `${harness} discovered`, nativeId: "discovered" }];
+    })));
+  });
+  setWslStatus("SettingsModels", { state: "connecting" });
+  try {
+    await render("providers", { cwd });
+    if (cwd.startsWith("//")) {
+      expect(refresh).not.toHaveBeenCalled();
+      await act(async () => setWslStatus("SettingsModels", { state: "connected" }));
+    }
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(container.textContent).toContain("Bundled models · Error: Linux probe failed");
+    expect(container.textContent).not.toContain("1 model available");
+    fail = false;
+    const retry = [...container.querySelectorAll('button')].find(button => button.textContent === "Retry models")!;
+    await act(async () => retry.click());
+    expect(refresh).toHaveBeenCalledTimes(3);
+    expect(container.textContent).toContain("discovered");
+    expect(container.textContent).toContain("1 model available");
+  } finally { await act(async () => resetHarnessModelOverlays()); }
 });

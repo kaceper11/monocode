@@ -1,3 +1,5 @@
+import { wslLocation } from "../../../shared/lib/paths";
+import { useWslStatus } from "../model/wslStatus";
 import {
   Check,
   ChevronDown,
@@ -27,6 +29,9 @@ import {
   loadFavoriteModels,
   loadRecentModelChoices,
   modelCatalogError,
+  modelCatalogStatus,
+  hasLiveCatalog,
+  isModelCatalogRefreshing,
   modelCatalogKey,
   modelsFor,
   resolveModel,
@@ -228,6 +233,7 @@ export function ModelPicker({
     getModelSnapshot,
     getModelSnapshot,
   );
+  const wslStatus = useWslStatus(wslLocation(cwd ?? "")?.distribution);
   const availabilityVersion = useSyncExternalStore(
     subscribeHarnessAvailability,
     getHarnessAvailabilitySnapshot,
@@ -375,8 +381,6 @@ export function ModelPicker({
 
   useEffect(() => {
     if (!open) return;
-    void probeHarnessAvailability({ cwd });
-    void refreshHarnessCatalogs([current.harness], cwd);
     setTab(
       coerceModelPickerTab(current.harness, (id) =>
         pickerHarnesses.includes(id),
@@ -390,6 +394,12 @@ export function ModelPicker({
     setFavorites(loadFavoriteModels());
   }, [open, current.harness, cwd, hideSettings]);
 
+  useEffect(() => {
+    if (!open) return;
+    void probeHarnessAvailability({ cwd });
+    void refreshHarnessCatalogs([current.harness], cwd);
+  }, [open, current.harness, cwd, wslStatus]);
+
   useEffect(() => { setRecentMenu(null); }, [cwd]);
 
   useEffect(() => {
@@ -402,7 +412,7 @@ export function ModelPicker({
       return;
     }
     void refreshHarnessCatalogs([visibleTab], cwd);
-  }, [open, submenu?.kind, visibleTab, cwd]);
+  }, [open, submenu?.kind, visibleTab, cwd, wslStatus]);
 
   useEffect(() => {
     if (!open) return;
@@ -654,6 +664,7 @@ export function ModelPicker({
 
       {open && hideSettings ? (
         <ModelFlyout
+          cwd={cwd}
           anchor={button}
           side="top"
           autoFocusSearch
@@ -1236,6 +1247,17 @@ function ModelFlyout({
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const activeRef = useRef<HTMLButtonElement>(null);
   const groups = modelGroups(tab, models);
+  const distribution = wslLocation(cwd ?? "")?.distribution;
+  const wslStatus = useWslStatus(distribution);
+  const ready = !distribution || wslStatus.state === "connected";
+  const refreshing = tab !== "favorites" && isModelCatalogRefreshing(tab, cwd);
+  const catalogHint = tab !== "favorites" && (distribution || ["devin", "copilot", "muse"].includes(tab))
+    ? !ready
+      ? wslStatus.error ?? (wslStatus.state === "connecting" ? "Connecting to WSL…" : "Connect WSL to discover models.")
+      : !hasLiveCatalog(tab, cwd) || refreshing || modelCatalogError(tab, cwd)
+        ? modelCatalogStatus(tab, cwd)
+        : undefined
+    : undefined;
   const integrationHint = tab !== "favorites" && !query.trim() &&
     (modelCatalogKey(cwd) !== "native" || ["devin", "copilot", "muse"].includes(tab))
     ? modelCatalogError(tab, cwd) ?? harnessAuthHint(tab, cwd)
@@ -1364,6 +1386,20 @@ function ModelFlyout({
             onKeyDown={onSearchKey}
           />
         </label>
+
+        {catalogHint && tab !== "favorites" && (
+          <div className="flex items-center gap-2 border-b border-stroke px-3 py-2 text-[12px] text-content/60">
+            <span role="status" className="min-w-0 flex-1 break-words">{catalogHint}</span>
+            <button
+              type="button"
+              disabled={!ready || refreshing}
+              className="shrink-0 whitespace-nowrap rounded px-2 py-1 hover:bg-content/10 focus-visible:ring-1 focus-visible:ring-content/30 disabled:opacity-40"
+              onClick={() => { void refreshHarnessCatalogs([tab], cwd, true); }}
+            >
+              {refreshing ? "Refreshing…" : "Retry models"}
+            </button>
+          </div>
+        )}
 
         <div
           ref={lockOverscroll}

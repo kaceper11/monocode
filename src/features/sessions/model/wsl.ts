@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { invalidateHarnessAvailability } from "../../../integrations/harness/core/availability.ts";
 import { invalidateModelCatalogs } from "./models";
-import { wslLocation, wslPath } from "../../../shared/lib/paths.ts";
+import { pathKey, wslLocation, wslPath } from "../../../shared/lib/paths.ts";
 import { setWslStatus } from "./wslStatus";
 
 /** Long enough to keep the project dialog warm, short enough to notice a distro installed mid-session. */
@@ -64,13 +64,29 @@ export function invalidateWslDiscovery(path: string) {
   invalidateModelCatalogs(path);
 }
 
-/** Cancellation abandons this read-only open; it never retargets a session. */
+const pendingConnections = new Map<string, Promise<string>>();
+
+/** Each caller can abandon a shared read-only connection without cancelling its peers. */
 export async function connectWslProject(
   path: string,
   signal?: AbortSignal,
   refresh = false,
 ): Promise<string> {
   signal?.throwIfAborted();
+  const key = `${pathKey(path)}:${refresh}`;
+  let pending = pendingConnections.get(key);
+  if (!pending) {
+    pending = connectWslProjectRequest(path, refresh).finally(() => {
+      if (pendingConnections.get(key) === pending) pendingConnections.delete(key);
+    });
+    pendingConnections.set(key, pending);
+  }
+  const canonical = await pending;
+  signal?.throwIfAborted();
+  return canonical;
+}
+
+async function connectWslProjectRequest(path: string, refresh: boolean): Promise<string> {
   const location = wslLocation(path);
   if (!location)
     throw new Error("Choose a folder inside the selected WSL distribution");
@@ -86,24 +102,19 @@ export async function connectWslProject(
       generation?: number;
     }>("wsl_connect", refresh ? { ...location, refresh: true } : location);
   } catch (error) {
-    // An aborted request leaves the link's true state unknown, but it must
-    // not sit in "connecting" forever — treat it as not connected.
     if (connectionRequests.get(host) === request) setWslStatus(
       location.distribution,
-      signal?.aborted
-        ? { state: "disconnected" }
-        : { state: "error", error: String(error) },
+      { state: "error", error: String(error) },
     );
     if (connectionRequests.get(host) === request) connectionRequests.delete(host);
     throw error;
   }
   const current = connectionRequests.get(host) === request;
   if (current) connectionRequests.delete(host);
-  // The link is up even when the caller walked away mid-request.
-  if (current) setWslStatus(connected.distribution, { state: "connected" });
   if (
     connected.distribution.toLowerCase() !== location.distribution.toLowerCase()
   ) {
+    if (current) setWslStatus(connected.distribution, { state: "connected" });
     if (current) setWslStatus(location.distribution, {
       state: "error",
       error: "WSL returned a different distribution",
@@ -123,6 +134,6 @@ export async function connectWslProject(
     if (connected.generation != null)
       generations.set(host, connected.generation);
   }
-  signal?.throwIfAborted();
+  if (current) setWslStatus(connected.distribution, { state: "connected" });
   return wslPath(connected.distribution, connected.path);
 }

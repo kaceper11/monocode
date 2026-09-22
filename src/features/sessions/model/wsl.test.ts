@@ -162,3 +162,18 @@ it("does not let an older failed connection overwrite a newer success", async ()
   await rejected;
   expect(wslStatusFor("Ubuntu").state).toBe("connected");
 });
+
+it("shares simultaneous project connections while cancellation belongs to each caller", async () => {
+  const path = "//wsl.localhost/Ubuntu/shared";
+  let finish!: (value: unknown) => void;
+  vi.mocked(invoke).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  const controller = new AbortController();
+  const abandoned = connectWslProject(path, controller.signal);
+  const current = connectWslProject("//wsl$/ubuntu/shared");
+  expect(invoke).toHaveBeenCalledTimes(1);
+  controller.abort();
+  finish({ distribution: "Ubuntu", path: "/shared", generation: 500 });
+  await expect(abandoned).rejects.toThrow();
+  await expect(current).resolves.toBe(path);
+  expect(wslStatusFor("Ubuntu").state).toBe("connected");
+});

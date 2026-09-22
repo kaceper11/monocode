@@ -1,3 +1,4 @@
+import { wslStatusFor } from "../../../features/sessions/model/wslStatus";
 import { wslLocation } from "../../../shared/lib/paths";
 import type { HarnessId } from "../../../features/sessions/model/session";
 import { HARNESSES } from "../../../features/sessions/model/session";
@@ -167,6 +168,8 @@ export function probeHarnessAvailability(options?: {
   force?: boolean;
   cwd?: string;
 }): Promise<void> {
+  const distribution = wslLocation(options?.cwd ?? "")?.distribution;
+  if (distribution && wslStatusFor(distribution).state !== "connected") return Promise.resolve();
   const key = hostKey(options?.cwd);
   let probe = probes.get(key);
   if (!probe) {

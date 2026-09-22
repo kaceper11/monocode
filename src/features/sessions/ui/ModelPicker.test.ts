@@ -1,3 +1,5 @@
+import * as registry from "../../../integrations/harness/core/registry";
+import { setWslStatus } from "../model/wslStatus";
 // @vitest-environment happy-dom
 import { act, createElement, type CSSProperties, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -1083,4 +1085,46 @@ describe("model picker", () => {
       container.querySelector('[role="menu"][aria-label="Model and settings"]'),
     ).toBeNull();
   });
+});
+
+it("shows a failed WSL discovery beside Default and replaces it after Retry without a retry loop", async () => {
+  const cwd = "//wsl.localhost/Ubuntu/retry";
+  setWslStatus("Ubuntu", { state: "connected" });
+  act(() => root.render(createElement(ModelPicker, {
+    cwd, harness: "codex", model: "codex:default", values: {}, hideSettings: true,
+    onChange: vi.fn(), onSettingsChange: vi.fn(),
+  })));
+  await act(async () => container.querySelector<HTMLButtonElement>('button[aria-haspopup="dialog"]')!.click());
+  await act(async () => modelLibrary.refreshModelCatalog("codex", cwd, async () => { throw new Error("Linux Codex probe failed"); }));
+  const menu = () => container.querySelector('[role="dialog"][aria-label="Models"]')!;
+  expect(menu().textContent).toContain("Default");
+  expect(menu().textContent).toContain("Linux Codex probe failed");
+  let finish!: (models: modelLibrary.AgentModel[]) => void;
+  const refresh = vi.spyOn(registry, "refreshHarnessCatalogs").mockImplementation((_ids, cwd) =>
+    modelLibrary.refreshModelCatalog("codex", cwd, () => new Promise(resolve => { finish = resolve; })),
+  );
+  const retry = [...menu().querySelectorAll('button')].find(button => button.textContent === "Retry models")!;
+  await act(async () => retry.click());
+  expect(refresh).toHaveBeenCalledExactlyOnceWith(["codex"], cwd, true);
+  expect(menu().textContent).toContain("Refreshing models");
+  expect(retry.disabled).toBe(true);
+  await act(async () => finish([{ id: "codex:linux", harness: "codex", name: "Linux model", nativeId: "linux" }]));
+  expect(menu().textContent).toContain("Linux model");
+  expect(menu().textContent).not.toContain("Linux Codex probe failed");
+  expect(refresh).toHaveBeenCalledTimes(1);
+});
+
+it("refreshes an already open picker after WSL connects", async () => {
+  const cwd = "//wsl.localhost/PickerReconnect/repo";
+  setWslStatus("PickerReconnect", { state: "connecting" });
+  const refresh = vi.spyOn(registry, "refreshHarnessCatalogs");
+  act(() => root.render(createElement(ModelPicker, {
+    cwd, harness: "codex", model: "codex:default", values: {}, hideSettings: true,
+    onChange: vi.fn(), onSettingsChange: vi.fn(),
+  })));
+  await act(async () => container.querySelector<HTMLButtonElement>('button[aria-haspopup="dialog"]')!.click());
+  expect(container.textContent).toContain("Connecting to WSL");
+  refresh.mockClear();
+  await act(async () => setWslStatus("PickerReconnect", { state: "connected" }));
+  expect(refresh).toHaveBeenCalledWith(["codex"], cwd);
 });

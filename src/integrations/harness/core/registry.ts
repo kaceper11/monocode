@@ -1,3 +1,5 @@
+import { wslLocation } from "../../../shared/lib/paths";
+import { wslStatusFor } from "../../../features/sessions/model/wslStatus";
 import type { HarnessId } from "../../../features/sessions/model/session";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { GeneratedSessionTitle } from "../../../features/sessions/model/sessionTitle";
@@ -391,6 +393,8 @@ export async function refreshHarnessCatalogs(
   cwd?: string,
   force = false,
 ): Promise<void> {
+  const distribution = wslLocation(cwd ?? "")?.distribution;
+  if (distribution && wslStatusFor(distribution).state !== "connected") return;
   const wanted = new Set(ids);
   if (wanted.size === 0) return;
   await Promise.all(

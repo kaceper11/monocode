@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { pickFolder } from "../../platform/tauri/fs";
-import { wslLocation } from "../lib/paths";
+import { pathKey, wslLocation } from "../lib/paths";
 import { IS_WIN } from "../../platform/tauri/platform";
 import { connectWslProject, invalidateWslDiscovery, wslDistributions, wslDistributionsPeek } from "../../features/sessions/model/wsl";
 import { setWslStatus, wslStatusFor } from "../../features/sessions/model/wslStatus";
@@ -11,6 +11,7 @@ import { setWslStatus, wslStatusFor } from "../../features/sessions/model/wslSta
 export function useWslProjects(
   projectCwd: string,
   selectProjects: (paths: string[], allowBlankReuse?: boolean) => void,
+  activeSessionId?: string,
 ) {
   const [wslOpening, setWslOpening] = useState<{
     path: string;
@@ -20,60 +21,45 @@ export function useWslProjects(
     queue?: string[];
     /** Whether the resumed batch may still absorb a blank session. */
     blankReuse?: boolean;
+    /** Reconnect an attached session without opening or retargeting it. */
+    attached?: boolean;
   } | null>(null);
   const wslOpenRequest = useRef<AbortController | null>(null);
   useEffect(() => () => wslOpenRequest.current?.abort(), []);
-  useEffect(() => {
-    const location = wslLocation(projectCwd);
-    if (!location) return;
-    let disposed = false;
-    const openingAtStart = wslOpenRequest.current;
-    // Publish the probe only when nothing fresher landed meanwhile — a
-    // connect started (or finished) during the probe outranks its result.
-    const statusBefore = wslStatusFor(location.distribution);
-    void invoke<boolean>("wsl_connected", {
-      distribution: location.distribution,
-    })
-      .then((connected) => {
-        if (disposed || wslStatusFor(location.distribution) !== statusBefore) return;
-        setWslStatus(location.distribution, {
-          state: connected ? "connected" : "disconnected",
-        });
-        if (
-          !disposed &&
-          wslOpenRequest.current === openingAtStart &&
-          !connected
-        )
-          setWslOpening(
-            (current) =>
-              current ?? {
-                path: projectCwd,
-                busy: false,
-                error:
-                  "Reconnect WSL to access this project. Windows execution will not be used.",
-              },
-          );
+  const reconnectAttached = useCallback((path: string) => {
+    wslOpenRequest.current?.abort();
+    const controller = new AbortController();
+    wslOpenRequest.current = controller;
+    setWslOpening({ path, busy: true, attached: true });
+    void connectWslProject(path, controller.signal)
+      .then((canonical) => {
+        if (controller.signal.aborted) return;
+        if (pathKey(canonical) !== pathKey(path))
+          throw new Error("This folder resolves to a different path. Choose it again from Open project.");
+        setWslOpening(null);
       })
       .catch((error) => {
-        if (disposed || wslStatusFor(location.distribution) !== statusBefore) return;
-        setWslStatus(location.distribution, {
-          state: "error",
-          error: String(error),
-        });
-        if (!disposed && wslOpenRequest.current === openingAtStart)
-          setWslOpening(
-            (current) =>
-              current ?? {
-                path: projectCwd,
-                busy: false,
-                error: String(error),
-              },
-          );
+        if (!controller.signal.aborted)
+          setWslOpening({ path, busy: false, error: String(error), attached: true });
+      })
+      .finally(() => {
+        if (wslOpenRequest.current === controller) wslOpenRequest.current = null;
       });
-    return () => {
-      disposed = true;
-    };
-  }, [projectCwd]);
+    return controller;
+  }, []);
+  useEffect(() => {
+    // A partially opened batch owns its Retry queue until dismissed or resumed.
+    if (wslOpening?.queue) return;
+    if (!wslLocation(projectCwd)) {
+      wslOpenRequest.current?.abort();
+      setWslOpening(null);
+      return;
+    }
+    reconnectAttached(projectCwd);
+    return () => wslOpenRequest.current?.abort();
+    // Connection-state changes do not retry interrupted work.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectCwd, activeSessionId, reconnectAttached]);
   const projectCwdRef = useRef(projectCwd);
   projectCwdRef.current = projectCwd;
   useEffect(() => {
@@ -81,7 +67,6 @@ export function useWslProjects(
     const unlisten = listen<string>("wsl:disconnected", (event) => {
       if (disposed) return;
       const distribution = event.payload;
-      invalidateWslDiscovery(`//wsl.localhost/${distribution}/`);
       // The emit fires for any failed request on the bridge's owner — a
       // request holding a stale bridge can report after a fresh bridge
       // already reconnected. Confirm before flagging the distro down.
@@ -92,6 +77,7 @@ export function useWslProjects(
           // A connect in flight reports its own failure; don't pre-empt it.
           if (alive || wslStatusFor(distribution).state === "connecting")
             return;
+          invalidateWslDiscovery(`//wsl.localhost/${distribution}/`);
           setWslStatus(distribution, {
             state: "disconnected",
             error: "WSL connection interrupted",
@@ -107,6 +93,7 @@ export function useWslProjects(
                 : {
                     path,
                     busy: false,
+                    attached: true,
                     error:
                       "WSL connection interrupted. Reconnect, then inspect any in-flight action before retrying it.",
                   },
@@ -115,6 +102,7 @@ export function useWslProjects(
         .catch(() => {
           if (disposed || wslStatusFor(distribution) !== statusBefore) return;
           if (wslStatusFor(distribution).state === "connecting") return;
+          invalidateWslDiscovery(`//wsl.localhost/${distribution}/`);
           setWslStatus(distribution, {
             state: "disconnected",
             error: "WSL connection interrupted",
@@ -193,6 +181,11 @@ export function useWslProjects(
   return { onSelectProject, onSelectProjects, pickProject, wslPickerOpen,
     closePicker: () => setWslPickerOpen(false),
     wslOpening,
+    retryOpening: () => {
+      if (!wslOpening) return;
+      if (wslOpening.attached) reconnectAttached(wslOpening.path);
+      else onSelectProjects(wslOpening.queue ?? [wslOpening.path], wslOpening.blankReuse ?? true);
+    },
     dismissOpening: () => { wslOpenRequest.current?.abort(); setWslOpening(null); },
   };
 }

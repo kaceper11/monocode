@@ -2,10 +2,11 @@
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
+import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { setWslStatus } from "../../features/sessions/model/wslStatus";
 import { useWslProjects } from "./useWslProjects";
-import { connectWslProject, wslDistributions, wslDistributionsPeek } from "../../features/sessions/model/wsl";
+import { connectWslProject, invalidateWslDiscovery, wslDistributions, wslDistributionsPeek } from "../../features/sessions/model/wsl";
 import { pickFolder } from "../../platform/tauri/fs";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn().mockResolvedValue(false) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
@@ -43,19 +44,61 @@ it("enters only the latest connected WSL project and never falls back to native 
   } finally { await act(async () => root.unmount());vi.unstubAllGlobals(); }
 });
 
-it("does not show an offline banner when a stale probe finishes after reconnect", async () => {
+it("connects restored sessions and new sessions in the same project without opening another tab", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  let resolve!: (value: boolean) => void;
-  vi.mocked(invoke).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
-  setWslStatus("Ubuntu", { state: "disconnected" });
+  const cwd = "//wsl.localhost/Ubuntu/repo";
+  const select = vi.fn();
   let hook!: ReturnType<typeof useWslProjects>;
-  function Fixture() { hook = useWslProjects("//wsl.localhost/Ubuntu/repo", vi.fn()); return null; }
+  vi.mocked(connectWslProject).mockReset().mockResolvedValue(cwd);
+  function Fixture({ id }: { id: string }) { hook = useWslProjects(cwd, select, id); return null; }
+  const root = createRoot(document.createElement("div"));
+  try {
+    await act(async () => root.render(createElement(Fixture, { id: "restored" })));
+    expect(connectWslProject).toHaveBeenCalledTimes(1);
+    expect(hook.wslOpening).toBeNull();
+    await act(async () => root.render(createElement(Fixture, { id: "new" })));
+    expect(connectWslProject).toHaveBeenCalledTimes(2);
+    expect(select).not.toHaveBeenCalled();
+    await act(async () => setWslStatus("Ubuntu", { state: "disconnected" }));
+    expect(connectWslProject).toHaveBeenCalledTimes(2);
+  } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
+});
+
+it("keeps an attached session on connection failure and retries without retargeting it", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const cwd = "//wsl.localhost/Ubuntu/repo";
+  const select = vi.fn();
+  let hook!: ReturnType<typeof useWslProjects>;
+  vi.mocked(connectWslProject).mockReset().mockRejectedValueOnce(new Error("bridge unavailable")).mockResolvedValue(cwd);
+  function Fixture() { hook = useWslProjects(cwd, select); return null; }
   const root = createRoot(document.createElement("div"));
   try {
     await act(async () => root.render(createElement(Fixture)));
-    setWslStatus("Ubuntu", { state: "connected" });
-    await act(async () => resolve(false));
+    expect(hook.wslOpening).toMatchObject({ path: cwd, busy: false, attached: true, error: "Error: bridge unavailable" });
+    await act(async () => hook.retryOpening());
     expect(hook.wslOpening).toBeNull();
+    vi.mocked(connectWslProject).mockResolvedValueOnce("//wsl.localhost/Ubuntu/other");
+    await act(async () => root.render(createElement(Fixture, { key: "another-session" })));
+    expect(hook.wslOpening?.error).toContain("different path");
+    expect(select).not.toHaveBeenCalled();
+  } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
+});
+
+it("ignores an abandoned automatic connect after switching to a native project", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const select = vi.fn();
+  let hook!: ReturnType<typeof useWslProjects>;
+  let finish!: (path: string) => void;
+  vi.mocked(connectWslProject).mockReset().mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  function Fixture({ cwd }: { cwd: string }) { hook = useWslProjects(cwd, select); return null; }
+  const root = createRoot(document.createElement("div"));
+  try {
+    await act(async () => root.render(createElement(Fixture, { cwd: "//wsl.localhost/Ubuntu/repo" })));
+    expect(hook.wslOpening?.busy).toBe(true);
+    await act(async () => root.render(createElement(Fixture, { cwd: "/native" })));
+    await act(async () => finish("//wsl.localhost/Ubuntu/repo"));
+    expect(hook.wslOpening).toBeNull();
+    expect(select).not.toHaveBeenCalled();
   } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
 });
 
@@ -164,5 +207,41 @@ it("opens resolved picks before a failed connect and resumes the rest on retry",
     await act(async () => pending[2].resolve("//wsl.localhost/Debian/cy"));
     expect(select).toHaveBeenCalledExactlyOnceWith(["//wsl.localhost/Debian/cy", "/native/z"], false);
     expect(hook.wslOpening).toBeNull();
+  } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
+});
+
+it("abandons an attached manual retry when switching to a native session", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const cwd = "//wsl.localhost/Ubuntu/retry";
+  let hook!: ReturnType<typeof useWslProjects>;
+  let finish!: (path: string) => void;
+  vi.mocked(connectWslProject).mockReset().mockRejectedValueOnce(new Error("offline"))
+    .mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  function Fixture({ cwd }: { cwd: string }) { hook = useWslProjects(cwd, vi.fn()); return null; }
+  const root = createRoot(document.createElement("div"));
+  try {
+    await act(async () => root.render(createElement(Fixture, { cwd })));
+    await act(async () => hook.retryOpening());
+    const signal = vi.mocked(connectWslProject).mock.calls[1][1];
+    await act(async () => root.render(createElement(Fixture, { cwd: "/native" })));
+    expect(signal?.aborted).toBe(true);
+    await act(async () => finish("//wsl.localhost/Ubuntu/different"));
+    expect(hook.wslOpening).toBeNull();
+  } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
+});
+
+it("keeps recovered catalogs when a stale disconnect event arrives", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.mocked(listen).mockClear();
+  vi.mocked(invalidateWslDiscovery).mockClear();
+  vi.mocked(invoke).mockResolvedValue(true);
+  setWslStatus("Recovered", { state: "connected" });
+  function Fixture() { useWslProjects("/native", vi.fn()); return null; }
+  const root = createRoot(document.createElement("div"));
+  try {
+    await act(async () => root.render(createElement(Fixture)));
+    const onDisconnect = vi.mocked(listen).mock.calls.find(([event]) => event === "wsl:disconnected")![1];
+    await act(async () => onDisconnect({ event: "wsl:disconnected", id: 1, payload: "Recovered" }));
+    expect(invalidateWslDiscovery).not.toHaveBeenCalled();
   } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
 });

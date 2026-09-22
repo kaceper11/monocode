@@ -369,6 +369,10 @@ export function refreshModelCatalog(
   emit();
   return pending;
 }
+export function isModelCatalogRefreshing(harness: HarnessId, cwd?: string): boolean {
+  return Boolean(catalogs.get(modelCatalogKey(cwd))?.[harness]?.inflight);
+}
+
 export function modelCatalogStatus(harness: HarnessId, cwd?: string): string {
   const entry = catalogs.get(modelCatalogKey(cwd))?.[harness];
   if (entry?.inflight) return "Refreshing models…";

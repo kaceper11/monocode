@@ -1,3 +1,4 @@
+import { useWslStatus } from "../features/sessions/model/wslStatus";
 import { SavedCommandsControl } from "../features/sessions/ui/SavedCommandsControl";
 import { prepareSavedCommandLaunch, type SavedCommandLaunch } from "../features/sessions/model/savedCommandLaunch";
 import { pruneQueuedSavedCommands } from "../features/sessions/model/savedCommandRun";
@@ -1373,10 +1374,12 @@ export default function App({
    * dedupes via hasLiveCatalog and its inflight map. */
   const activeHarness = active?.harness;
   const activeModelCwd = active ? sessionWorkCwd(active) : undefined;
+  const activeWslStatus = useWslStatus(wslLocation(activeModelCwd ?? "")?.distribution);
   useEffect(() => {
     if (!activeHarness || !isLiveHarness(activeHarness)) return;
+    void probeHarnessAvailability({ cwd: activeModelCwd });
     void refreshHarnessCatalogs([activeHarness], activeModelCwd);
-  }, [activeHarness, activeModelCwd]);
+  }, [activeHarness, activeModelCwd, activeWslStatus]);
 
   const usageProviders = useMemo(() => {
     if (
@@ -4922,7 +4925,7 @@ export default function App({
     [selectProject],
   );
 
-  const { onSelectProject, onSelectProjects, pickProject, wslPickerOpen, closePicker, wslOpening, dismissOpening } = useWslProjects(projectCwd, selectProjects);
+  const { onSelectProject, pickProject, wslPickerOpen, closePicker, wslOpening, dismissOpening, retryOpening } = useWslProjects(activeModelCwd ?? projectCwd, selectProjects, active?.id);
 
   const onPlaceSessionInFolder = useCallback(
     (sessionId: string, target: SessionFolderTarget) => {
@@ -9217,7 +9220,7 @@ export default function App({
 
             {wslPickerOpen && <WslProjectDialog cwd={projectCwd} onOpen={selectProjects} onClose={closePicker} />}
             <div className="body-glass flex min-h-0 min-w-0 flex-1 flex-col">
-              {wslOpening && <WslConnectionStatus opening={wslOpening} onRetry={() => onSelectProjects(wslOpening.queue ?? [wslOpening.path], wslOpening.blankReuse ?? true)} onDismiss={dismissOpening} />}
+              {wslOpening && <WslConnectionStatus opening={wslOpening} onRetry={retryOpening} onDismiss={dismissOpening} />}
               <div
                 className={
                   searchViewOpen ||

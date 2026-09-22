@@ -1,3 +1,4 @@
+import { setWslStatus } from "../../../features/sessions/model/wslStatus";
 import { expect, it, vi } from "vitest";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
@@ -37,6 +38,13 @@ it("keeps native and distribution probes separate, coalesces requests and refres
   expect(isHarnessAvailable("codex")).toBe(true);
   expect(isHarnessAvailable("codex", cwd)).toBe(false);
   expect(hasProbedHarnessAvailability(cwd)).toBe(false);
+  const beforeConnect = invoke.mock.calls.length;
+  setWslStatus("Ubuntu", { state: "connecting" });
+  await probeHarnessAvailability({ cwd });
+  expect(invoke).toHaveBeenCalledTimes(beforeConnect);
+  expect(hasProbedHarnessAvailability(cwd)).toBe(false);
+  setWslStatus("Ubuntu", { state: "connected" });
+  setWslStatus("Debian", { state: "connected" });
   const first = probeHarnessAvailability({ cwd });
   expect(probeHarnessAvailability({ cwd })).toBe(first);
   await first;

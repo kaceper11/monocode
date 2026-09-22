@@ -1,3 +1,4 @@
+import { useWslStatus } from "../../sessions/model/wslStatus";
 import { KeepAwakeControl } from "../../sessions/ui/KeepAwakeControl";
 import { wslLocation } from "../../../shared/lib/paths";
 import { JIRA_CHANGE_EVENT, jiraConnected, saveJiraConfig, type JiraStatus } from "../../sessions/model/jira";
@@ -140,6 +141,10 @@ import { loginHarness } from "../../../integrations/harness/core/auth";
 import {
   defaultModelId,
   getModelSnapshot,
+  hasLiveCatalog,
+  isModelCatalogRefreshing,
+  modelCatalogError,
+  modelCatalogStatus,
   isPickerProviderVisible,
   loadDefaultModels,
   loadLastModelChoice,
@@ -2428,6 +2433,7 @@ function ProvidersPage({ cwd }: { cwd: string }) {
 }
 
 function ProvidersForLocation({ cwd }: { cwd?: string }) {
+  const wslStatus = useWslStatus(wslLocation(cwd ?? "")?.distribution);
   useSyncExternalStore(subscribeModels, getModelSnapshot, getModelSnapshot);
   useSyncExternalStore(
     subscribeHarnessAvailability,
@@ -2440,7 +2446,7 @@ function ProvidersForLocation({ cwd }: { cwd?: string }) {
 
   useEffect(() => {
     void probeHarnessAvailability({ cwd });
-  }, []);
+  }, [cwd, wslStatus]);
 
   const onClaudeHooks = (next: boolean) => {
     saveClaudeHooks(next);
@@ -2814,7 +2820,13 @@ function ProviderRow({
   onDefault: (harness: HarnessId, model: string) => void;
   onModelChange: (harness: HarnessId, model: string) => void;
 }) {
+  const distribution = wslLocation(cwd ?? "")?.distribution;
+  const wslStatus = useWslStatus(distribution);
+  const ready = !distribution || wslStatus.state === "connected";
   const models = modelsFor(harness, cwd);
+  const live = hasLiveCatalog(harness, cwd);
+  const refreshing = isModelCatalogRefreshing(harness, cwd);
+  const error = modelCatalogError(harness, cwd);
   const available = isHarnessAvailable(harness, cwd);
   const current =
     models.length > 0 ? resolveModel(harness, selectedModel, cwd) : null;
@@ -2823,9 +2835,9 @@ function ProviderRow({
   );
 
   useEffect(() => {
-    if (!available || models.length > 0) return;
+    if (!available || !ready) return;
     void refreshHarnessCatalogs([harness], cwd);
-  }, [available, harness, models.length, cwd]);
+  }, [available, ready, harness, cwd, wslStatus]);
 
   const onPickerVisible = (visible: boolean) => {
     savePickerProviderVisible(harness, visible);
@@ -2846,11 +2858,23 @@ function ProviderRow({
         </span>
       }
       description={
-        available
-          ? `${models.length} ${models.length === 1 ? "model" : "models"} available.`
-          : harnessUnavailableHint(harness, cwd)
+        !ready
+          ? wslStatus.error ?? (wslStatus.state === "connecting" ? "Connecting to WSL…" : "Connect WSL to discover models.")
+          : available
+            ? live && !refreshing && !error
+              ? `${models.length} ${models.length === 1 ? "model" : "models"} available.`
+              : modelCatalogStatus(harness, cwd)
+            : harnessUnavailableHint(harness, cwd)
       }
     >
+      {available && (!live || error) ? (
+        <SecondaryButton
+          disabled={!ready || refreshing}
+          onClick={() => { void refreshHarnessCatalogs([harness], cwd, true); }}
+        >
+          {refreshing ? "Refreshing…" : "Retry models"}
+        </SecondaryButton>
+      ) : null}
       {current ? (
         <Select
           label={`${HARNESS_TITLE[harness]} model`}
