@@ -24,6 +24,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type ReactNode,
 } from "react";
 import { flushSync } from "react-dom";
@@ -119,8 +120,24 @@ import {
   type TurnItem,
 } from "../model/transcriptActivity";
 import { lastUserTurnBlock } from "../model/editLastTurn";
+import {
+  clearTranscriptHighlights,
+  paintTranscriptHighlights,
+  transcriptWordRanges,
+} from "../model/transcriptHighlights";
 
 const NEAR_BOTTOM_PX = 16;
+/*
+ * Tool calls often land in a burst. Each arrival waits for the one before it
+ * to finish its whole entrance — rail, branch, row — before starting its own.
+ * The first few play at STEP_ENTRANCE_MS; a queue running past
+ * STEP_QUEUE_CALM_MS plays the rest faster, down to STEP_ENTRANCE_MIN_MS by
+ * STEP_QUEUE_MS, so a long burst still catches up.
+ */
+const STEP_ENTRANCE_MS = 480;
+const STEP_ENTRANCE_MIN_MS = 160;
+const STEP_QUEUE_CALM_MS = 960;
+const STEP_QUEUE_MS = 2000;
 const INITIAL_TURNS = 20;
 const TURN_PAGE_SIZE = 20;
 
@@ -150,10 +167,16 @@ type Props = {
   onJumpToBottomReady?: (jump: () => void) => void;
   /** Passes a function that renders the turn that holds a block. The render completes before the function returns. */
   onRevealReady?: (reveal: (blockId: string) => boolean) => void;
+  onNavigateReady?: (
+    navigate: (blockId: string | null, query?: string) => boolean,
+  ) => void;
   /** Session-level output shown after the latest reply and before its action row. */
   latestTurnAccessory?: ReactNode;
   /** False while another tab is in front; local transcript state is retained. */
   visible?: boolean;
+  /** Kept mounted after its pane closed. Showing it again counts as a new visit. */
+  parked?: boolean;
+  onScrollerChange?: (el: HTMLDivElement | null) => void;
   /** A worker's transcript: show the orchestrator's turns instead of hiding them. */
   managed?: boolean;
 };
@@ -183,8 +206,11 @@ function AgentTranscriptComponent({
   onJumpToBottomChange,
   onJumpToBottomReady,
   onRevealReady,
+  onNavigateReady,
   latestTurnAccessory,
   visible = true,
+  parked = false,
+  onScrollerChange,
   managed = false,
 }: Props) {
   const blocks = useMemo(() => {
@@ -216,6 +242,9 @@ function AgentTranscriptComponent({
   const [visibleTurnCount, setVisibleTurnCount] = useState(INITIAL_TURNS);
   // Turns whose folded work the reader has opened, by turn id.
   const [openWork, setOpenWork] = useState<Record<string, boolean>>({});
+  const [searchCurrent, setSearchCurrent] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const highlightOwner = useRef(Symbol("transcript-search"));
   const toggleWork = useCallback((turnId: string, currentlyOpen: boolean) => {
     setOpenWork((open) => ({ ...open, [turnId]: !currentlyOpen }));
   }, []);
@@ -223,6 +252,19 @@ function AgentTranscriptComponent({
   // the tab is a new visit: the remount uses the true transcript height so
   // the latest reply sits on the composer instead of a hole of empty space.
   const [anchorTurn, setAnchorTurn] = useState(!!busy);
+  // Parking detaches the scroller, which drops its scroll offset.
+  const restoreScroll = useRef(false);
+  const wasParked = useRef(parked);
+  if (wasParked.current !== parked) {
+    wasParked.current = parked;
+    if (parked) {
+      restoreScroll.current = true;
+      setSearchCurrent(null);
+      setSearchQuery("");
+    } else if (anchorTurn !== !!busy) {
+      setAnchorTurn(!!busy);
+    }
+  }
   const { selection, dismissSelection } = useTranscriptSelection(
     scrollerEl,
     onAddToChat !== undefined || onSaveSelectionNote !== undefined,
@@ -286,6 +328,16 @@ function AgentTranscriptComponent({
     onJumpToBottomReady?.(jumpToBottom);
   }, [jumpToBottom, onJumpToBottomReady]);
 
+  // A pooled transcript outlives its pane; tell each new owner where it stands.
+  useEffect(() => {
+    onJumpToBottomChange?.(showJumpRef.current);
+  }, [onJumpToBottomChange]);
+
+  useLayoutEffect(() => {
+    onScrollerChange?.(scrollerEl);
+    return () => onScrollerChange?.(null);
+  }, [onScrollerChange, scrollerEl]);
+
   useEffect(() => {
     if (!visible || !scrollerEl) return;
     syncPinned(scrollerEl);
@@ -340,12 +392,19 @@ function AgentTranscriptComponent({
     const el = scroller.current;
     if (!el) return;
     syncTranscriptViewport(el);
+    const restore = restoreScroll.current;
+    restoreScroll.current = false;
     // Previously opened tabs normally retain their scroll position. Only pin
     // when the scroller looks empty after being hidden with `display: none`.
     if (el.scrollHeight <= el.clientHeight + NEAR_BOTTOM_PX) {
       stickToBottom.current = true;
       setShowJump(false);
       pinToBottom(el);
+    } else if (restore && !stickToBottom.current) {
+      el.scrollTop = Math.max(
+        0,
+        el.scrollHeight - el.clientHeight - distanceFromBottom.current,
+      );
     }
   }, [visible, setShowJump]);
 
@@ -361,6 +420,8 @@ function AgentTranscriptComponent({
     const inner = el?.firstElementChild;
     if (!visible || !el || !inner) return;
     const onResize = () => {
+      // A parked transcript's scroller is detached and measures zero.
+      if (!el.isConnected) return;
       syncTranscriptViewport(el);
       const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
       if (stickToBottom.current) {
@@ -429,6 +490,88 @@ function AgentTranscriptComponent({
   useEffect(() => {
     onRevealReady?.(revealBlock);
   }, [revealBlock, onRevealReady]);
+
+  const navigateToBlock = useCallback(
+    (blockId: string | null, query = ""): boolean => {
+      if (!blockId) {
+        setSearchCurrent(null);
+        setSearchQuery("");
+        return true;
+      }
+      const turn = turnsRef.current.find((item) =>
+        item.some((block) => block.id === blockId),
+      );
+      if (!turn || !revealBlock(blockId)) return false;
+      const turnId = turn[0].id;
+      // A result inside folded work needs its row rendered before measuring it.
+      flushSync(() => {
+        setOpenWork((current) =>
+          current[turnId] ? current : { ...current, [turnId]: true },
+        );
+        setSearchCurrent(blockId);
+        setSearchQuery(query);
+      });
+      const el = scroller.current;
+      if (!el) return false;
+      el.dispatchEvent(new WheelEvent("wheel", { deltaY: -1 }));
+      const align = () => {
+        const target =
+          el.querySelector<HTMLElement>(
+            '[data-transcript-search-current="true"]',
+          ) ??
+          el.querySelector<HTMLElement>(
+            `[data-transcript-turn="${CSS.escape(turnId)}"]`,
+          );
+        if (!target) return;
+        const wordRect = query
+          ? transcriptWordRanges(el, query).current?.getBoundingClientRect?.()
+          : null;
+        const targetTop =
+          wordRect && wordRect.height > 0
+            ? wordRect.top
+            : target.getBoundingClientRect().top;
+        const delta = targetTop - el.getBoundingClientRect().top - 42;
+        if (Math.abs(delta) > 2) el.scrollTop += delta;
+      };
+      align();
+      requestAnimationFrame(align);
+      return true;
+    },
+    [revealBlock],
+  );
+
+  useEffect(() => {
+    onNavigateReady?.(navigateToBlock);
+  }, [navigateToBlock, onNavigateReady]);
+
+  useEffect(() => {
+    const el = scroller.current;
+    const owner = highlightOwner.current;
+    if (!el || !visible || !searchQuery) {
+      clearTranscriptHighlights(owner);
+      return;
+    }
+    let frame = 0;
+    const paint = () => {
+      frame = 0;
+      const { matches, current } = transcriptWordRanges(el, searchQuery);
+      paintTranscriptHighlights(owner, matches, current);
+    };
+    const observer = new MutationObserver(() => {
+      if (!frame) frame = requestAnimationFrame(paint);
+    });
+    observer.observe(el, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+    });
+    paint();
+    return () => {
+      observer.disconnect();
+      if (frame) cancelAnimationFrame(frame);
+      clearTranscriptHighlights(owner);
+    };
+  }, [visible, searchQuery, searchCurrent, visibleTurnCount, openWork]);
 
   return (
     <div
@@ -524,6 +667,10 @@ function AgentTranscriptComponent({
             : firstWork >= 0
               ? firstWork
               : items.length;
+          const isCurrentItem = (item: TurnItem) =>
+            item.type === "block"
+              ? item.block.id === searchCurrent
+              : item.blocks.some((block) => block.id === searchCurrent);
           const renderItem = (item: TurnItem, itemIndex: number) =>
             item.type === "subagents" ? (
               <SubagentStack
@@ -631,6 +778,7 @@ function AgentTranscriptComponent({
           return (
             <div
               key={turn[0].id}
+              data-transcript-turn={turnId}
               className={`transcript-turn flex min-w-0 flex-col${
                 isLastTurn ? " transcript-turn-live" : ""
               }${
@@ -651,6 +799,10 @@ function AgentTranscriptComponent({
                         foldWork.map(({ entry, index }, offset) => (
                           <div
                             key={turnItemKey(entry)}
+                            data-transcript-search-item
+                            data-transcript-search-current={
+                              isCurrentItem(entry) || undefined
+                            }
                             className={`flow-root pb-1 last:pb-0 pl-5 zen-fold-rail ${
                               offset === foldWork.length - 1
                                 ? "zen-fold-tail"
@@ -675,14 +827,28 @@ function AgentTranscriptComponent({
                     // and reading them as the first steps of the main trail
                     // is what made them look like its work.
                     ...foldSubagents.map(({ entry, index }) => (
-                      <div key={turnItemKey(entry)} className="flow-root pb-1">
+                      <div
+                        key={turnItemKey(entry)}
+                        data-transcript-search-item
+                        data-transcript-search-current={
+                          isCurrentItem(entry) || undefined
+                        }
+                        className="flow-root pb-1"
+                      >
                         {renderItem(entry, index)}
                       </div>
                     )),
                   ];
                 }
                 const row = (
-                  <div key={turnItemKey(item)} className="flow-root pb-1">
+                  <div
+                    key={turnItemKey(item)}
+                    data-transcript-search-item
+                    data-transcript-search-current={
+                      isCurrentItem(item) || undefined
+                    }
+                    className="flow-root pb-1"
+                  >
                     {renderItem(item, itemIndex)}
                   </div>
                 );
@@ -702,7 +868,10 @@ function AgentTranscriptComponent({
                       <OrchestrationPreview block={block} busy={!!busy} />
                     </div>
                   ))}
-              {isLastTurn && latestTurnAccessory ? latestTurnAccessory : null}
+              {/* The accessory keeps the pane's props, which go stale once parked. */}
+              {isLastTurn && latestTurnAccessory && !parked
+                ? latestTurnAccessory
+                : null}
               {durationMs != null && settled ? (
                 <TurnDuration
                   cwd={cwd}
@@ -1830,6 +1999,14 @@ function ActivityPhaseGroup({
   const open = waiting || (override ?? active);
   const [liveScroller, setLiveScroller] = useState<HTMLDivElement | null>(null);
   useLivePhaseScroll(liveScroller, active && open, phase.steps);
+  // Steps already here when the group mounted, or that landed while it was
+  // folded, are history: only a step you watch arrive gets the entrance.
+  const settled = useRef<Set<Block["id"]> | null>(null);
+  settled.current ??= new Set(phase.steps.map((step) => step.id));
+  useEffect(() => {
+    for (const step of phase.steps) settled.current?.add(step.id);
+  }, [phase.steps]);
+  const turnFor = useStepQueue();
   const title = activityPhaseTitle(phase, active);
   // Opening a group on purpose is also how you read the line that titled it,
   // whole. The auto-open while it runs is a live view, not a reading one, and
@@ -1932,25 +2109,114 @@ function ActivityPhaseGroup({
                   />
                 </div>
               ) : null}
-              {phase.steps.map((block) => (
-                <div
-                  key={block.id}
-                  className={`zen-phase-step${active ? " zen-step-in" : ""}`}
-                >
-                  <ActivityRow
-                    block={block}
-                    cwd={cwd}
+              {phase.steps.map((block) => {
+                const arriving = active && !settled.current?.has(block.id);
+                return (
+                  <PhaseStep
+                    key={block.id}
                     live={active}
-                    onApproval={onApproval}
-                    onOpenFile={onOpenFile}
-                    onOpenDiff={onOpenDiff}
-                  />
-                </div>
-              ))}
+                    turn={arriving ? turnFor(block.id) : undefined}
+                  >
+                    <ActivityRow
+                      block={block}
+                      cwd={cwd}
+                      live={active}
+                      onApproval={onApproval}
+                      onOpenFile={onOpenFile}
+                      onOpenDiff={onOpenDiff}
+                    />
+                  </PhaseStep>
+                );
+              })}
             </div>
           </div>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+type StepTurn = { wait: number; pace: number };
+
+/**
+ * A group's queue of arriving steps: how long each one waits for the step
+ * before it to finish, and how long its own entrance then takes. A step keeps
+ * the turn it was first given however often the group renders.
+ */
+function useStepQueue() {
+  const queue = useRef({ next: 0, turns: new Map<Block["id"], StepTurn>() });
+
+  return (id: Block["id"]) => {
+    const { turns } = queue.current;
+    let turn = turns.get(id);
+    if (!turn) {
+      const now = performance.now();
+      const start = Math.max(now, queue.current.next);
+      const wait = start - now;
+      const backlog =
+        (STEP_QUEUE_MS - wait) / (STEP_QUEUE_MS - STEP_QUEUE_CALM_MS);
+      const pace = Math.max(
+        STEP_ENTRANCE_MIN_MS,
+        STEP_ENTRANCE_MS * Math.min(1, backlog),
+      );
+      queue.current.next = start + pace;
+      turn = { wait, pace };
+      turns.set(id, turn);
+    }
+    return turn;
+  };
+}
+
+/**
+ * One step on a phase's rail. A step that lands while you watch makes room
+ * first — what is below glides down, the rail runs into the gap and branches
+ * off — and only then does the row fade in. One that lands behind others
+ * stays out of the layout until its turn. The grid and clipping that does
+ * that come off once the row has settled, so nothing inside stays clipped.
+ */
+function PhaseStep({
+  live,
+  turn: arrival,
+  children,
+}: {
+  live: boolean;
+  /** Set only on the render a step arrives in; later renders drop it. */
+  turn?: StepTurn;
+  children: ReactNode;
+}) {
+  const [turn] = useState(arrival);
+  const [stage, setStage] = useState<"waiting" | "entering" | "settled">(() =>
+    !turn ? "settled" : turn.wait > 0 ? "waiting" : "entering",
+  );
+
+  useEffect(() => {
+    if (stage !== "waiting" || !turn) return;
+    const timer = window.setTimeout(() => setStage("entering"), turn.wait);
+    return () => window.clearTimeout(timer);
+  }, [stage, turn]);
+
+  return (
+    <div
+      className="zen-phase-step"
+      style={
+        turn
+          ? ({ "--step-ms": `${Math.round(turn.pace)}ms` } as CSSProperties)
+          : undefined
+      }
+      data-live={live || undefined}
+      data-waiting={stage === "waiting" || undefined}
+      data-entering={stage === "entering" || undefined}
+      onAnimationEnd={(e) => {
+        // The row's own fade is the last beat; nested rails bubble theirs.
+        if (
+          e.animationName === "zen-step-in" &&
+          (e.target as Element).parentElement === e.currentTarget
+        ) {
+          setStage("settled");
+        }
+      }}
+    >
+      {children}
     </div>
   );
 }

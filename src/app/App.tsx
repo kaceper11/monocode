@@ -330,6 +330,7 @@ import {
   filterTabsForProject,
   findOpenSessionTab,
   planWorkspaceTabClose,
+  switchSessionInTab,
   workspaceTabCwd,
   focusedWorkspaceTabCwd,
 } from "../features/workspace/model/workspaceTabGroups";
@@ -399,6 +400,10 @@ import {
   type SessionSummary,
 } from "../features/sessions/data/sessionStore";
 import { rememberLoadedSession } from "../features/sessions/data/sessionCache";
+import {
+  TranscriptPool,
+  TranscriptPoolOutlet,
+} from "../features/sessions/ui/TranscriptPool";
 import { syncDockBadge } from "../features/notifications/model/dockBadge";
 import { liveAgentsFromSessions } from "../features/sessions/model/liveAgents";
 import { hiddenApprovalNotices } from "../features/notifications/model/approvalToast";
@@ -469,6 +474,7 @@ import { SessionPane } from "../features/sessions/ui/SessionPane";
 import { SessionSurface } from "../features/sessions/ui/SessionSurface";
 import { ProjectTerminalDock } from "../features/terminal/ui/ProjectTerminalDock";
 import { SearchView } from "../features/search/ui/SearchView";
+import { requestTranscriptJump } from "../features/sessions/model/transcriptJump";
 import { SettingsView, type SettingsAnchor } from "../features/settings/ui/SettingsView";
 import type { ConnectableInboxSource } from "../features/inbox/model/inboxFilters";
 import { InboxView, LinkedWorkItemPanel } from "../features/inbox/ui/InboxView";
@@ -1051,6 +1057,7 @@ export default function App({
   const sessionLoadEpochs = useRef(new Map<string, number>());
   const openingSessionIds = useRef(new Set<string>());
   const activeSessionPrefetch = useRef<Promise<Session | null> | null>(null);
+  const [transcriptPool] = useState(() => new TranscriptPool());
   // Tokens arrive many times per frame; apply them once so React/markdown aren't
   // recomputed for every delta.
   const harnessQueued = useRef(new Map<string, HarnessEvent[]>());
@@ -1684,6 +1691,9 @@ export default function App({
     )
       return;
     const fingerprint = persistFingerprint(session);
+    // Leaving a session flushes it. An unchanged one would still rewrite and
+    // re-diff its whole transcript under the store lock, stalling the next load.
+    if (lastPersisted.current.get(session.id) === fingerprint) return;
     void upsertSession(session)
       .then((summary) => {
         if (!summary) return;
@@ -8615,7 +8625,7 @@ export default function App({
   }, []);
 
   const onNavigateSessionList = useCallback(
-    (delta: number) => {
+    (delta: number, inCurrentTab = false) => {
       const activeWorkspace = tabsRef.current.find(
         (entry) => entry.id === activeTabIdRef.current,
       );
@@ -8631,9 +8641,42 @@ export default function App({
         delta,
       );
       if (!next || next === current.id) return;
-      void onSelectHistorySession(next);
+      // Stepping gives no hover to warm the transcript, so load the one a
+      // further step away once this switch has its own session.
+      const prefetchAhead = () => {
+        const ahead = adjacentItemId(
+          sessionNavigationIdsRef.current,
+          next,
+          delta,
+        );
+        if (ahead && ahead !== current.id) onPrefetchHistorySession(ahead);
+      };
+      if (!inCurrentTab) {
+        void onSelectHistorySession(next).then(prefetchAhead);
+        return;
+      }
+      const activeTabId = activeWorkspace.id;
+      const focusedId = current.id;
+      void ensureOpenSession(next).then((session) => {
+        prefetchAhead();
+        if (!session || session.inboxAsk) return;
+        if (activeTabIdRef.current !== activeTabId) return;
+        const currentTab = tabsRef.current.find((tab) => tab.id === activeTabId);
+        if (currentTab?.focusedId !== focusedId) return;
+        setTabs((prev) =>
+          switchSessionInTab(prev, activeTabId, focusedId, next) ?? prev,
+        );
+        setComposerFocused(true);
+        const linkedUpdate = linkedSessionUpdatesRef.current.get(next);
+        if (linkedUpdate) revealLinkedSessionUpdate(next, linkedUpdate);
+      });
     },
-    [onSelectHistorySession],
+    [
+      ensureOpenSession,
+      onPrefetchHistorySession,
+      onSelectHistorySession,
+      revealLinkedSessionUpdate,
+    ],
   );
 
   const onNavigateProjectList = useCallback(
@@ -8763,6 +8806,8 @@ export default function App({
         const listNavigation =
           cmd === "prev-session" ||
           cmd === "next-session" ||
+          cmd === "prev-session-in-tab" ||
+          cmd === "next-session-in-tab" ||
           cmd === "prev-project" ||
           cmd === "next-project";
         if (listNavigation) {
@@ -8842,13 +8887,18 @@ export default function App({
           run("prev-session", () => a.onNavigateSessionList(-1));
         else if (cmd === "next-session")
           run("next-session", () => a.onNavigateSessionList(1));
+        else if (cmd === "prev-session-in-tab")
+          run("prev-session-in-tab", () => a.onNavigateSessionList(-1, true));
+        else if (cmd === "next-session-in-tab")
+          run("next-session-in-tab", () => a.onNavigateSessionList(1, true));
         else if (cmd === "prev-project")
           run("prev-project", () => a.onNavigateProjectList(-1));
         else if (cmd === "next-project")
           run("next-project", () => a.onNavigateProjectList(1));
-        else if ("focus" in cmd)
+        else if (typeof cmd === "object" && "focus" in cmd)
           run(`focus-${cmd.focus}`, () => a.onFocusDir(cmd.focus));
-        else run(`activate-${cmd.activate}`, () => a.onActivate(cmd.activate));
+        else if (typeof cmd === "object" && "activate" in cmd)
+          run(`activate-${cmd.activate}`, () => a.onActivate(cmd.activate));
         return;
       }
       if (
@@ -8857,6 +8907,10 @@ export default function App({
         !boardViewOpenRef.current &&
         !notesViewOpenRef.current &&
         !automationsViewOpenRef.current &&
+        !(
+          e.target instanceof Element &&
+          e.target.closest("[data-session-drop], [data-agent-tab]")
+        ) &&
         handleEditorFindKey(e)
       ) {
         e.stopPropagation();
@@ -9437,6 +9491,7 @@ export default function App({
                                 onReorderFiles={onReorderFiles}
                                 onFileDirtyChange={onFileDirtyChange}
                                 onFileErrorCountChange={onFileErrorCountChange}
+                                transcriptPool={transcriptPool}
                                 onRatio={(splitId, index, ratio) =>
                                   onRatio(tab.id, splitId, index, ratio)
                                 }
@@ -9500,7 +9555,10 @@ export default function App({
                   onClose={onLeaveSearch}
                   onToggleSidebar={onToggleSidebar}
                   onOpenFile={onOpenFile}
-                  onOpenSession={onSelectHistorySession}
+                  onOpenSession={(sessionId, blockId, query) => {
+                    if (blockId) requestTranscriptJump(sessionId, blockId, query);
+                    void onSelectHistorySession(sessionId);
+                  }}
                   onOpenProject={onSelectProject}
                 />
               ) : null}
@@ -9708,6 +9766,7 @@ export default function App({
             />
           ) : null}
         </div>
+        <TranscriptPoolOutlet pool={transcriptPool} />
       </OrchestrationWorkers.Provider>
     </OrchestrationActions.Provider>
   );

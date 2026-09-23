@@ -554,6 +554,10 @@ export function revealPath(path: string): Promise<void> {
   return invoke<void>("reveal_path", { path });
 }
 
+export function openPathWithDefaultApp(path: string): Promise<void> {
+  return invoke<void>("open_path_with_default_app", { path });
+}
+
 export function homeDir(cwd?: string): Promise<string> {
   return cwd && wslLocation(cwd)
     ? invoke<string>("home_dir", { cwd })

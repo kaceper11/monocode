@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-09-23
+
+### Added
+
+- Upstream changes through 82b9cdb: transcript search and result navigation, same-tab session navigation, and the Opus model welcome screen.
+
+### Fixed
+
+- Surface file-action failures and open files reliably with the default application.
+- Keep recent transcripts mounted across pane switches and avoid redundant session persistence.
+
+### Changed
+
+- Refined transcript reveal animations and diff-stat spacing.
+
 ## [0.3.9] - 2026-09-23
 
 ### Added

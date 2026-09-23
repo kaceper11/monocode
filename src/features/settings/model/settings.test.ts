@@ -269,6 +269,22 @@ describe("workspace navigation keybindings", () => {
       ),
     ).toBe(true);
   });
+  it("documents same-tab session switching", () => {
+    expect(
+      KEYBINDINGS.filter((row) => row.command.includes("in Current Tab")),
+    ).toEqual([
+      {
+        command: "Session: Previous in Current Tab",
+        keys: `${MOD}↑`,
+        when: "!overlay && (!textFocus || emptyComposer)",
+      },
+      {
+        command: "Session: Next in Current Tab",
+        keys: `${MOD}↓`,
+        when: "!overlay && (!textFocus || emptyComposer)",
+      },
+    ]);
+  });
 });
 
 describe("diff viewer setting", () => {

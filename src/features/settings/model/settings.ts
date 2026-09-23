@@ -870,6 +870,16 @@ export const KEYBINDINGS: KeybindingRow[] = [
     when: "!overlay && (!textFocus || emptyComposer)",
   },
   {
+    command: "Session: Previous in Current Tab",
+    keys: `${MOD}↑`,
+    when: "!overlay && (!textFocus || emptyComposer)",
+  },
+  {
+    command: "Session: Next in Current Tab",
+    keys: `${MOD}↓`,
+    when: "!overlay && (!textFocus || emptyComposer)",
+  },
+  {
     command: "Project: Previous",
     keys: `${MOD}${SHIFT}←`,
     when: "!overlay && (!textFocus || emptyComposer)",
