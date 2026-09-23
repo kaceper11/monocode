@@ -26,7 +26,10 @@ import {
   type ApprovalDecision,
   type UserQuestionReply,
 } from "../../../integrations/harness";
-import { looksLikeProject, type RecentProject } from "../../projects/model/recents";
+import {
+  looksLikeProject,
+  type RecentProject,
+} from "../../projects/model/recents";
 import {
   sessionDisplayTitle,
   sessionDraftBlock,
@@ -44,6 +47,7 @@ import {
 } from "../model/session";
 import { AgentTranscript } from "./AgentTranscript";
 import { EmptySession } from "./EmptySession";
+import { useComposerDockMotion } from "./useComposerDockMotion";
 import { MOD } from "../../../platform/tauri/platform";
 import {
   acknowledgeQuoteRequest,
@@ -52,7 +56,10 @@ import {
   type QuoteRequest,
 } from "../model/quoteDraft";
 import { createNote, noteTitle } from "../../notes";
-import { loadNotesEnabled, subscribeNotesEnabled } from "../../settings/model/settings";
+import {
+  loadNotesEnabled,
+  subscribeNotesEnabled,
+} from "../../settings/model/settings";
 import { getComposerDraft, setComposerDraft } from "../model/draftCache";
 import { resolveModel } from "../model/models";
 import { isAstraModel } from "../model/astraWelcome";
@@ -61,10 +68,11 @@ import { projectKey } from "../../../shared/lib/paths";
 import { canEditLastTurn, lastTurnRecall } from "../model/editLastTurn";
 import {
   loadProjectChatBackgroundSettings,
+  projectChatBackgroundImageRevision,
   projectChatBackgroundRevision,
   subscribeProjectChatBackground,
 } from "../../projects/model/projectChatBackground";
-import { projectChatBackgroundSrc } from "../../projects/model/chatBackground";
+import { useProjectBackgroundEffect } from "../../projects/ui/useProjectBackgroundEffect";
 import {
   loadChatBackgroundPath,
   subscribeChatBackgroundPath,
@@ -235,7 +243,7 @@ export const SessionPane = memo(function SessionPane({
   const editLastTurnSupported = canEditLastTurn(session);
   const turnRecall = editLastTurnSupported ? lastTurnRecall(session) : null;
   const draftBlock = sessionDraftBlock(session);
-  const backgroundRevision = useSyncExternalStore(
+  useSyncExternalStore(
     subscribeProjectChatBackground,
     projectChatBackgroundRevision,
     projectChatBackgroundRevision,
@@ -248,11 +256,16 @@ export const SessionPane = memo(function SessionPane({
   const projectBackground = loadProjectChatBackgroundSettings(
     projectKey(session.cwd),
   );
+  const projectBackgroundUrl = useProjectBackgroundEffect(
+    projectBackground?.path ?? null,
+    projectBackground?.effect ?? "none",
+    projectChatBackgroundImageRevision(),
+  );
   const projectBackgroundStyle = projectBackground
     ? ({
-        "--chat-background-image": `url(${JSON.stringify(
-          projectChatBackgroundSrc(projectBackground.path, backgroundRevision),
-        )})`,
+        "--chat-background-image": projectBackgroundUrl
+          ? `url(${JSON.stringify(projectBackgroundUrl)})`
+          : "none",
         "--chat-background-empty-opacity": String(
           projectBackground.emptyOpacity,
         ),
@@ -368,6 +381,7 @@ export const SessionPane = memo(function SessionPane({
   const dockComposer =
     !draftBlock && (!isEmpty || inSplit || !!session.inboxAsk);
   const [composerHost, setComposerHost] = useState<HTMLDivElement | null>(null);
+  const composerDockMotion = useComposerDockMotion(dockComposer);
   const draftRef = useRef<string | undefined>(getComposerDraft(session.id));
   const composer = (
     <Composer
@@ -460,9 +474,10 @@ export const SessionPane = memo(function SessionPane({
       onSaveDraft={(text, attachments) =>
         onSaveDraft(session.id, text, attachments)
       }
-      onSubmit={(text, attachments, options) =>
-        onSubmit(session.id, text, attachments, options)
-      }
+      onSubmit={(text, attachments, options) => {
+        if (!dockComposer) composerDockMotion.captureLaunch();
+        return onSubmit(session.id, text, attachments, options);
+      }}
       onStop={() => onStop(session.id)}
       onCompactContext={() => onCompactContext(session.id)}
       onPlaceInFolder={(target) => onPlaceSessionInFolder(session.id, target)}
@@ -595,7 +610,7 @@ export const SessionPane = memo(function SessionPane({
                 hasChatBackground={Boolean(
                   projectBackground || globalBackgroundPath,
                 )}
-                composer={dockComposer ? undefined : <div ref={setComposerHost} />}
+                composer={dockComposer ? undefined : <div ref={composerDockMotion.centeredRef}><div ref={setComposerHost} /></div>}
               />
             )
           ) : (
@@ -709,7 +724,7 @@ export const SessionPane = memo(function SessionPane({
             </>
           )}
         </div>
-        <div className={dockComposer ? "mx-auto w-full max-w-4xl shrink-0" : "hidden"}>
+        <div ref={composerDockMotion.dockedRef} className={dockComposer ? "mx-auto w-full max-w-4xl shrink-0" : "hidden"}>
           <SessionSurface host={dockComposer ? undefined : (composerHost ?? undefined)}>{composer}</SessionSurface>
         </div>
       </div>

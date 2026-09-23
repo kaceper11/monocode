@@ -396,6 +396,27 @@ describe("live catalog overlays", () => {
     resetHarnessModelOverlays();
     expect(resolveModel("claude", "claude:opus").id).toBe("claude:opus-5");
   });
+
+  it("keeps a live Opus 5.5 id on Opus 5.5 across relaunch", () => {
+    setHarnessModels("claude", [
+      {
+        id: "claude:opus-5-5",
+        harness: "claude" as const,
+        name: "Claude Opus 5.5",
+        nativeId: "claude-opus-5-5",
+      },
+    ]);
+    expect(resolveModel("claude", "claude:opus-5-5").nativeId).toBe(
+      "claude-opus-5-5",
+    );
+
+    resetHarnessModelOverlays();
+    expect(resolveModel("claude", "claude:opus-5-5").id).toBe(
+      "claude:opus-5-5",
+    );
+    expect(resolveModel("claude", "claude:opus-5").id).toBe("claude:opus-5");
+    expect(resolveModel("claude", "claude:opus").id).toBe("claude:opus-5");
+  });
 });
 
 it("resolveModel maps a persisted variant-level id to its grouped model", () => {

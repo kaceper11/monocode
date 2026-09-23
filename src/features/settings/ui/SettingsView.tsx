@@ -71,6 +71,7 @@ import {
   loadChatBackgroundPath,
   loadChatBackgroundSessionOpacity,
   loadChatBackgroundScope,
+  loadNewThreadBackgroundEffect,
   loadThemeDarkLightness,
   loadThemePreference,
   loadSidebarBlur,
@@ -85,6 +86,7 @@ import {
   saveChatBackgroundPath,
   saveChatBackgroundSessionOpacity,
   saveChatBackgroundScope,
+  setNewThreadBackgroundEffect,
   saveThemeDarkLightness,
   saveThemePreference,
   saveSidebarBlur,
@@ -114,6 +116,11 @@ import {
   THEME_SATURATION_MIN,
   type ThemePreference,
   type ChatBackgroundScope,
+  NEW_THREAD_BACKGROUND_EFFECTS,
+  NEW_THREAD_BACKGROUND_EFFECT_LABELS,
+  NEW_THREAD_BACKGROUND_EFFECT_DESCRIPTIONS,
+  NEW_THREAD_BACKGROUND_EFFECT_DEFAULT,
+  type NewThreadBackgroundEffect,
   type TranscriptLayout,
 } from "../model/appearance";
 import {
@@ -213,7 +220,10 @@ import {
   saveLinearToken,
   type LinearTeam,
 } from "../../inbox/model/linear";
-import { loadTabGroupLabels, resolveTabGroupLabel } from "../../workspace/model/tabGroups";
+import {
+  loadTabGroupLabels,
+  resolveTabGroupLabel,
+} from "../../workspace/model/tabGroups";
 import {
   filterKeybindings,
   KEYBINDINGS,
@@ -273,7 +283,10 @@ import {
 import { SkillsPage } from "../../skills/ui/SkillsPage";
 import { ProjectNotificationSettings } from "../../notifications/ui/ProjectNotificationSettings";
 import { WorktreesPage } from "../../source-control/ui/WorktreesPage";
-import { removeWorktree, type RemoveWorktree } from "../../source-control/model/worktrees";
+import {
+  removeWorktree,
+  type RemoveWorktree,
+} from "../../source-control/model/worktrees";
 import type { Session } from "../../sessions/model/session";
 
 /**
@@ -1836,6 +1849,8 @@ function useAppearanceSettings(
     useState(loadChatBackgroundSessionOpacity);
   const [chatBackgroundScope, setChatBackgroundScope] =
     useState<ChatBackgroundScope>(loadChatBackgroundScope);
+  const [newThreadBackgroundEffect, setBackgroundEffect] =
+    useState<NewThreadBackgroundEffect>(loadNewThreadBackgroundEffect);
   const [chatBackgroundBusy, setChatBackgroundBusy] = useState(false);
   const [chatBackgroundError, setChatBackgroundError] = useState<string | null>(
     null,
@@ -1950,6 +1965,14 @@ function useAppearanceSettings(
     setChatBackgroundScope(next);
   }, []);
 
+  const onNewThreadBackgroundEffect = useCallback(
+    (next: NewThreadBackgroundEffect) => {
+      setNewThreadBackgroundEffect(next);
+      setBackgroundEffect(next);
+    },
+    [],
+  );
+
   const onUiScale = useCallback((percent: number) => {
     const next = saveUiScale(percent / 100);
     setUiScale(next);
@@ -1981,6 +2004,7 @@ function useAppearanceSettings(
       Math.round(CHAT_BACKGROUND_SESSION_OPACITY_DEFAULT * 100),
     );
     onChatBackgroundScope(CHAT_BACKGROUND_SCOPE_DEFAULT);
+    onNewThreadBackgroundEffect(NEW_THREAD_BACKGROUND_EFFECT_DEFAULT);
     if (chatBackgroundPath) void onClearChatBackground();
     onUiScale(Math.round(UI_SCALE_DEFAULT * 100));
     onCollapsedProjectRailMode(COLLAPSED_PROJECT_RAIL_MODE_DEFAULT);
@@ -1991,6 +2015,7 @@ function useAppearanceSettings(
     onChatBackgroundEmptyOpacity,
     onChatBackgroundSessionOpacity,
     onChatBackgroundScope,
+    onNewThreadBackgroundEffect,
     onClearChatBackground,
     onAccentColor,
     onShowExcludedFiles,
@@ -2016,6 +2041,7 @@ function useAppearanceSettings(
     chatBackgroundEmptyOpacity,
     chatBackgroundSessionOpacity,
     chatBackgroundScope,
+    newThreadBackgroundEffect,
     chatBackgroundBusy,
     chatBackgroundError,
     uiScale,
@@ -2033,6 +2059,7 @@ function useAppearanceSettings(
     onChatBackgroundEmptyOpacity,
     onChatBackgroundSessionOpacity,
     onChatBackgroundScope,
+    onNewThreadBackgroundEffect,
     onUiScale,
     onCollapsedProjectRailMode,
     restoreDefaults,
@@ -2258,12 +2285,13 @@ function ChatBackgroundCard({
         <div className="overflow-hidden rounded-lg border border-content/10">
           {hasImage ? (
             <div className="relative h-36">
-              <img
-                src={src ?? undefined}
-                alt=""
-                draggable={false}
-                className="size-full object-cover"
-                style={{ opacity: appearance.chatBackgroundEmptyOpacity }}
+              <div
+                aria-hidden
+                className="size-full bg-cover bg-center bg-no-repeat"
+                style={{
+                  backgroundImage: "var(--chat-background-image)",
+                  opacity: appearance.chatBackgroundEmptyOpacity,
+                }}
               />
               <span className="pointer-events-none absolute bottom-2 left-2 text-[11px] text-content/40">
                 Empty chat preview at {emptyVisibility}%
@@ -2313,6 +2341,25 @@ function ChatBackgroundCard({
       </div>
       {hasImage ? (
         <>
+          <Row
+            label="Background effect"
+            description={
+              NEW_THREAD_BACKGROUND_EFFECT_DESCRIPTIONS[
+                appearance.newThreadBackgroundEffect
+              ]
+            }
+          >
+            <Segmented
+              label="Background effect"
+              value={appearance.newThreadBackgroundEffect}
+              options={NEW_THREAD_BACKGROUND_EFFECTS.map((effect) => ({
+                value: effect,
+                label: NEW_THREAD_BACKGROUND_EFFECT_LABELS[effect],
+              }))}
+              onChange={appearance.onNewThreadBackgroundEffect}
+              optionIdPrefix="new-thread-background-effect"
+            />
+          </Row>
           <Row
             label="Show on"
             description="Empty sessions only, or every conversation."
@@ -3206,11 +3253,13 @@ function Segmented<T extends string>({
   value,
   options,
   onChange,
+  optionIdPrefix,
 }: {
   label: string;
   value: T;
   options: { value: T; label: string }[];
   onChange: (value: T) => void;
+  optionIdPrefix?: string;
 }) {
   return (
     <div
@@ -3223,6 +3272,11 @@ function Segmented<T extends string>({
     >
       {options.map((option) => (
         <button
+          id={
+            optionIdPrefix
+              ? `${optionIdPrefix}-${option.value.toLowerCase()}`
+              : undefined
+          }
           key={option.value}
           type="button"
           role="radio"

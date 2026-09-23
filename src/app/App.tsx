@@ -93,8 +93,10 @@ import { useProjectBranches } from "../features/source-control/hooks/useProjectB
 import { useInboxActivity } from "../features/inbox/hooks/useInboxUnseen";
 import {
   loadProjectRailOpen,
+  loadSessionSidebarOpen,
   loadSidebarTabOrder,
   saveProjectRailOpen,
+  saveSessionSidebarOpen,
   type SidebarTabId,
 } from "../features/settings/model/appearance";
 import { HAS_NATIVE_GLASS, IS_MAC } from "../platform/tauri/platform";
@@ -831,6 +833,9 @@ export default function App({
     [],
   );
   const [projectRailOpen, setProjectRailOpen] = useState(loadProjectRailOpen);
+  const [sessionSidebarOpen, setSessionSidebarOpen] = useState(
+    loadSessionSidebarOpen,
+  );
   const tabCloseScope = "project" as const;
   const currentProjectDock = findProjectTerminal(projectTerminals, projectCwd);
   const dockVisible = !!currentProjectDock?.open;
@@ -8129,6 +8134,14 @@ export default function App({
     });
   }, []);
 
+  const onToggleSessionSidebar = useCallback(() => {
+    setSessionSidebarOpen((open) => {
+      const next = !open;
+      saveSessionSidebarOpen(next);
+      return next;
+    });
+  }, []);
+
   const onToggleProjectRail = useCallback(() => {
     setProjectRailOpen((open) => {
       const next = !open;
@@ -8625,6 +8638,7 @@ export default function App({
     onSplit,
     onFocusDir,
     onToggleSidebar,
+    onToggleSessionSidebar,
     onGoToFile,
     onOpenCommandPalette,
     onReload,
@@ -8656,6 +8670,7 @@ export default function App({
     onSplit,
     onFocusDir,
     onToggleSidebar,
+    onToggleSessionSidebar,
     onGoToFile,
     onOpenCommandPalette,
     onReload,
@@ -8842,6 +8857,12 @@ export default function App({
         run("toggle_sidebar", actions.current.onToggleSidebar);
         return;
       }
+      if (mod && !e.altKey && e.shiftKey && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        e.stopPropagation();
+        run("toggle_session_sidebar", actions.current.onToggleSessionSidebar);
+        return;
+      }
       if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "p") {
         e.preventDefault();
         e.stopPropagation();
@@ -8931,6 +8952,9 @@ export default function App({
       ),
       listen("toggle_sidebar", () =>
         run("toggle_sidebar", actions.current.onToggleSidebar),
+      ),
+      listen("toggle_session_sidebar", () =>
+        run("toggle_session_sidebar", actions.current.onToggleSessionSidebar),
       ),
       listen("open_project", () => {
         void actions.current.pickProject();
@@ -9088,12 +9112,14 @@ export default function App({
       activeId={activeTabId}
       cwd={sidebarCwd}
       projectRailOpen={projectRailOpen}
+      sessionSidebarOpen={sessionSidebarOpen}
       compactRail={compactTitleBar}
       canGoBack={tabVisitNav.canBack}
       canGoForward={tabVisitNav.canForward}
       onGoBack={onRailBack}
       onGoForward={onRailForward}
       onToggleSidebar={onToggleSidebar}
+      onToggleSessionSidebar={onToggleSessionSidebar}
       onSelect={activateTab}
       onNew={onNew}
       onNewTerminal={onNewTerminal}
@@ -9125,7 +9151,7 @@ export default function App({
               cwd={sidebarCwd}
               gitCwd={gitCwd}
               explorerRootLabel={explorerRootLabel}
-              open
+              open={sessionSidebarOpen}
               tab={sidebarTab}
               onTabChange={setSidebarTab}
               filesSearchOpen={filesSearchOpen}
@@ -9267,6 +9293,7 @@ export default function App({
                     onOpenBrowser={() => onOpenBrowser("")}
                     onGoToFile={onGoToFile}
                     onToggleSidebar={onToggleSidebar}
+                    onToggleSessionSidebar={onToggleSessionSidebar}
                     onShowSourceControl={onToggleChanges}
                     onCloseCurrentTab={
                       activeTabId ? () => onCloseTab(activeTabId) : undefined

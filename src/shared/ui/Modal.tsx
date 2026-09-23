@@ -28,6 +28,8 @@ type Props = {
   className?: string;
   /** Pinned below the scrollable content — dialog action buttons. */
   footer?: ReactNode;
+  /** Keep taller dialogs inside the viewport, scrolling their content. */
+  fitViewport?: boolean;
   children: ReactNode;
 };
 
@@ -39,6 +41,7 @@ export function ModalPanel({
   minimalHeader = false,
   className,
   footer,
+  fitViewport = false,
   children,
 }: Props) {
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -70,7 +73,7 @@ export function ModalPanel({
 
   return (
     <div
-      className={`absolute bottom-4 left-1/2 ${TOP[size]} ${WIDTH[size]} -translate-x-1/2`}
+      className={`absolute left-1/2 ${fitViewport ? "top-1/2 -translate-y-1/2" : `bottom-4 ${TOP[size]}`} ${WIDTH[size]} -translate-x-1/2`}
     >
       <div
         role="dialog"
@@ -78,7 +81,7 @@ export function ModalPanel({
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
         onMouseDown={(event) => event.stopPropagation()}
-        className={`relative isolate flex max-h-full flex-col overflow-hidden rounded-2xl border border-content/7 shadow-2xl ${className ?? ""}`}
+        className={`relative isolate flex flex-col overflow-hidden rounded-2xl border border-content/7 shadow-2xl ${fitViewport ? "max-h-[calc(100dvh-32px)]" : "max-h-full"} ${className ?? ""}`}
       >
         <GlassBackdrop className="bg-background-base/55" />
         <div className="modal-panel relative z-[1] flex min-h-0 flex-1 flex-col">

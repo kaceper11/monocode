@@ -312,6 +312,27 @@ function AgentTranscriptComponent({
     pinToBottom(el);
   }, [lastUserId, setShowJump]);
 
+  // In the chat layout a sent prompt rises from the upper screen into its
+  // anchored spot at the top. On mount this only plays for a session's first
+  // send.
+  const introducePrompt = useRef({ chat: false, anchor: false, visible });
+  introducePrompt.current = {
+    chat: transcriptLayout === "chat",
+    anchor: promptAnchor && anchorTurn,
+    visible,
+  };
+  const introducedPromptMount = useRef(false);
+  useLayoutEffect(() => {
+    const mounting = !introducedPromptMount.current;
+    introducedPromptMount.current = true;
+    const { chat, anchor, visible } = introducePrompt.current;
+    if (!lastUserId || !chat || !anchor || !visible) return;
+    if (mounting && !(busy && userTurnCount(blocks, managed) === 1)) return;
+    return riseIntoAnchor(scroller.current, lastUserId);
+    // Only a new prompt starts the motion; later renders must not replay it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lastUserId]);
+
   useLayoutEffect(() => {
     const opened = visible && !wasVisible.current;
     wasVisible.current = visible;
@@ -3198,6 +3219,59 @@ function turnUserBlock(blocks: Block[], managed = false): Block | undefined {
     if (block.role === "user" && (managed || !block.internal)) return block;
   }
   return undefined;
+}
+
+function userTurnCount(blocks: Block[], managed = false): number {
+  return blocks.filter(
+    (block) => block.role === "user" && (managed || !block.internal),
+  ).length;
+}
+
+const PROMPT_RISE_MS = 560;
+// Keep in sync with the prompt-turn-reveal animation in index.css.
+const PROMPT_REVEAL_MS = 320;
+const PROMPT_FADE_MS = 480;
+// Where the prompt starts, as a fraction of the viewport height from the top.
+const PROMPT_RISE_FROM = 0.3;
+
+/** Fades the prompt in while sliding it from the upper viewport to its row. */
+function riseIntoAnchor(scroller: HTMLElement | null, blockId: string) {
+  const row = scroller?.querySelector<HTMLElement>(
+    `[data-prompt-anchor="${CSS.escape(blockId)}"]`,
+  );
+  if (!scroller || !row || typeof row.animate !== "function") return;
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  const view = scroller.getBoundingClientRect();
+  const dy =
+    view.top + view.height * PROMPT_RISE_FROM - row.getBoundingClientRect().top;
+  if (dy <= 1) return;
+  const animation = row.animate(
+    [{ transform: `translateY(${dy}px)` }, { transform: "translateY(0)" }],
+    { duration: PROMPT_RISE_MS, easing: "cubic-bezier(0.22, 1, 0.36, 1)" },
+  );
+  // The fade gets its own gentler curve; on the rise's sharp ease-out it
+  // would be over before the eye catches it.
+  const fade = row.animate([{ opacity: 0 }, { opacity: 1 }], {
+    duration: PROMPT_FADE_MS,
+    easing: "ease-out",
+  });
+  // The rest of the turn waits until the prompt lands, then fades in.
+  const turn = row.closest<HTMLElement>(".transcript-turn");
+  let revealTimer: ReturnType<typeof setTimeout> | undefined;
+  turn?.setAttribute("data-prompt-rise", "rising");
+  animation.onfinish = () => {
+    turn?.setAttribute("data-prompt-rise", "revealing");
+    revealTimer = setTimeout(
+      () => turn?.removeAttribute("data-prompt-rise"),
+      PROMPT_REVEAL_MS,
+    );
+  };
+  return () => {
+    animation.cancel();
+    fade.cancel();
+    clearTimeout(revealTimer);
+    turn?.removeAttribute("data-prompt-rise");
+  };
 }
 
 function isNearBottom(el: HTMLElement): boolean {

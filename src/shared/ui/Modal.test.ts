@@ -22,6 +22,17 @@ describe("ModalPanel", () => {
     expect(markup).toContain('aria-label="Close"');
   });
 
+  it("keeps pinned actions when fitting a tall dialog to the viewport", () => {
+    const markup = renderToStaticMarkup(createElement(ModalPanel, {
+      title: "Background", onClose: vi.fn(), fitViewport: true,
+      footer: "Save changes", children: "Scrollable settings",
+    }));
+    expect(markup).toContain("max-h-[calc(100dvh-32px)]");
+    expect(markup).not.toContain("bottom-4");
+    expect(markup).toContain("overflow-y-auto");
+    expect(markup).toContain("Save changes");
+  });
+
   it("can preserve an accessible title with a minimal visual header", () => {
     const markup = renderToStaticMarkup(
       createElement(ModalPanel, {

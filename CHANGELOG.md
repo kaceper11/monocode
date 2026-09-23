@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-09-23
+
+### Added
+
+- Upstream changes through fa40f97: session sidebar toggle, project background effects, prompt and composer animations, Markdown preview search, broader syntax highlighting, and a Pull action in Changes.
+- Claude Opus 5.5 catalog support and resolved version labels for live Claude models.
+- Saved provider-status filters and compact Board controls.
+
+### Fixed
+
+- Natural sorting of numbered explorer entries and native macOS window tiling actions.
+- Azure Inbox work-item loading and partial-error reporting.
+- Preserve the mounted composer and pinned dialog actions while integrating upstream UI improvements.
+
+### Changed
+
+- New installations default to the chat transcript layout.
+
 ## [0.3.8] - 2026-09-22
 
 ### Added

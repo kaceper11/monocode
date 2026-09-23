@@ -822,6 +822,11 @@ export const KEYBINDINGS: KeybindingRow[] = [
   { command: "App: Open Project", keys: `${MOD}O`, when: "Always" },
   { command: "App: New Window", keys: `${MOD}${SHIFT}N`, when: "Always" },
   { command: "App: Toggle Sidebar", keys: `${MOD}B`, when: "Always" },
+  {
+    command: "App: Toggle Session Sidebar",
+    keys: `${MOD}${SHIFT}B`,
+    when: "Always",
+  },
   { command: "App: Switch Model", keys: `${MOD}.`, when: "Always" },
   {
     command: "Composer: Toggle Workspace",

@@ -210,6 +210,22 @@ describe("grid arcade enabled setting", () => {
 });
 
 describe("workspace navigation keybindings", () => {
+  it("keeps separate shortcuts for the project rail and session sidebar", () => {
+    expect(
+      KEYBINDINGS.filter((row) =>
+        ["App: Toggle Sidebar", "App: Toggle Session Sidebar"].includes(
+          row.command,
+        ),
+      ),
+    ).toEqual([
+      { command: "App: Toggle Sidebar", keys: `${MOD}B`, when: "Always" },
+      {
+        command: "App: Toggle Session Sidebar",
+        keys: `${MOD}${SHIFT}B`,
+        when: "Always",
+      },
+    ]);
+  });
   it("documents the command palette and reload shortcuts", () => {
     expect(
       KEYBINDINGS.filter((row) =>
