@@ -1,10 +1,10 @@
+import { deliveryKey, probeDelivery } from "./delivery";
 import {
   gitBehindBase,
   gitBranches,
   gitCurrentBranch,
   gitMergeFrom,
   gitMergeInProgress,
-  gitPrChecks,
   gitPrCreate,
   gitPrStatus,
   gitPrUpdate,
@@ -30,16 +30,21 @@ export { prIsOpen };
 /**
  * Task-level IO — workstream PR/CI probes and the bulk git operations the
  * details panel exposes. Everything else on the board stays a pure join.
- * PR/CI calls route per worktree: Azure DevOps remotes go through the
- * `azure_devops_*` commands, everything else through upstream's `gh`-backed
- * `git_pr_*` surface.
+ * Read-only delivery probes support each configured provider and CI binding.
+ * Publishing keeps the existing GitHub and Azure DevOps commands.
  */
 
 /** The PR-create surface for one worktree — Azure when its remote resolves
  * to the configured org, GitHub/`gh` otherwise. An Azure-shaped remote that
  * isn't configured throws a readable error rather than falling to `gh`. */
-async function prOps(cwd: string) {
-  const azure = await azureDevOpsRepoMatch(cwd);
+async function prOps(cwd: string, provider?: string) {
+  if (provider === "gitlab")
+    throw new Error(
+      "Create or update this merge request on GitLab; in-app GitLab publishing is not supported.",
+    );
+  const azure = provider
+    ? provider === "azuredevops"
+    : await azureDevOpsRepoMatch(cwd);
   return azure
     ? {
         // The probe surface is the one that honours a pinned `prUrl`.
@@ -77,51 +82,18 @@ export async function probeWorkstream(
   try {
     // A worktree someone checked out onto another branch feeds every
     // checkout-based signal — detect drift before it misreports.
-    const [actual, azure] = await Promise.all([
-      worktree
-        ? gitCurrentBranch(cwd).then((branch) => branch ?? "")
-        : Promise.resolve(workstream.branch),
-      azureDevOpsRepoMatch(cwd),
-    ]);
+    const actual = worktree ? (await gitCurrentBranch(cwd) ?? "") : workstream.branch;
     const drifted = actual !== workstream.branch;
-    const drift = drifted
-      ? `Worktree is on ${actual || "a detached HEAD"}, expected ${workstream.branch}`
-      : undefined;
-    // Local-worktree signals are meaningless against the project fallback —
-    // and describe the wrong HEAD on a drifted checkout.
-    const merging =
-      worktree && !drifted
-        ? gitMergeInProgress(cwd).catch(() => false)
-        : Promise.resolve(false);
-    // Behind-base is local refs only — it must never fetch per lane.
-    const behind =
-      worktree && !drifted
-        ? gitBehindBase(cwd, workstream.base).catch(() => 0)
-        : Promise.resolve(0);
-    if (azure) {
-      // PR + pipelines in one round trip; Azure branch builds exist pre-PR.
-      // The branch-anchored probe stays correct under drift — pass the
-      // lane's branch, not whatever is checked out.
-      return {
-        ...(await azureDevOpsPrProbe(cwd, prUrl, workstream.branch)),
-        provider: "azuredevops",
-        merging: await merging,
-        behind: await behind,
-        ...(drift ? { error: drift } : {}),
-      };
-    }
-    // `gh` infers the PR from the checked-out branch — under drift only a
-    // pinned URL still resolves the lane's PR.
-    const pr = drifted && !prUrl ? null : await gitPrStatus(cwd, prUrl);
-    const checks = pr ? await gitPrChecks(cwd, prUrl).catch(() => []) : [];
-    return {
-      provider: "github",
-      pr,
-      checks,
-      merging: await merging,
-      behind: await behind,
-      ...(drift ? { error: drift } : {}),
-    };
+    if (drifted && !prUrl) throw new Error(`Worktree is on ${actual || "a detached HEAD"}, expected ${workstream.branch}`);
+    const [delivery, merging, behind] = await Promise.all([
+      probeDelivery(workstream),
+      worktree && !drifted ? gitMergeInProgress(cwd).catch(() => false) : false,
+      worktree && !drifted ? gitBehindBase(cwd, workstream.base).catch(() => 0) : 0,
+    ]);
+    return { provider: delivery.source.provider, pr: delivery.pr, checks: delivery.checks, delivery,
+      ciError: delivery.ciError, requestKey: deliveryKey(workstream), fetchedAt: Date.now(), merging, behind,
+      ...(drifted ? { error: `Worktree is on ${actual || "a detached HEAD"}, expected ${workstream.branch}` } : {}) };
+
   } catch (error) {
     // Keep a visible failure — a deleted worktree or missing `gh` must not
     // silently erase the row's PR/CI state.
@@ -129,6 +101,7 @@ export async function probeWorkstream(
       pr: null,
       checks: [],
       error: shortError(error, 120),
+      requestKey: deliveryKey(workstream),
     };
   }
 }
@@ -432,7 +405,8 @@ export async function createTaskPrs(
       if (context.branch !== ws.branch)
         throw new Error(branchMismatch(ws, context.branch));
       if (!context.remotes.size) throw new Error("No git remote");
-      const ops = await prOps(cwd);
+      const delivery = await probeDelivery(ws);
+      const ops = await prOps(cwd, delivery.source.provider);
       // Push-only: a pull mid-submit could leave merge commits (or a
       // conflicted MERGE_HEAD) nobody asked for. A rejected non-ff push
       // tells the user to Update the lane first.
@@ -487,7 +461,7 @@ export async function createTaskPrs(
         .filter(([id]) => id !== entry.ws.id)
         .map(([, url]) => url);
       const cwd = entry.ws.worktreePath!;
-      const ops = await prOps(cwd).catch(() => null);
+      const ops = await prOps(cwd, entry.ws.prProvider ?? status.get(entry.ws.id)?.provider).catch(() => null);
       await ops
         ?.updateBody(
           cwd,

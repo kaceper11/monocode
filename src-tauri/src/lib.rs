@@ -39,6 +39,7 @@ mod reminders;
 mod search;
 mod session_store;
 mod skills;
+mod task_delivery;
 #[cfg(target_os = "windows")]
 mod tray;
 mod window;
@@ -350,6 +351,9 @@ pub fn run() {
             fs::git_pull,
             fs::git_sync,
             fs::git_range_context,
+            task_delivery::task_delivery_probe,
+            task_delivery::task_delivery_log,
+            task_delivery::task_delivery_definitions,
             fs::git_pr_status,
             fs::git_pr_create,
             fs::git_pr_checks,

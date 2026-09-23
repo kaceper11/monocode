@@ -1,3 +1,4 @@
+import { matchesTarget, type DeliveryTarget } from "../features/board/delivery";
 import {
   startHarnessTiming, markHarnessTiming, finishHarnessTiming, measureHarnessTiming,
   queueHarnessTimingCommit, commitHarnessTiming, type HarnessTiming,
@@ -8256,15 +8257,24 @@ export default function App({
   );
 
   const onBoardSendToSession = useCallback(
-    (sessionId: string, text: string) => {
-      boardReturnRef.current = true;
-      setBoardViewOpen(false);
-      setSidebarTab("sessions");
-      // ensureOpenSession mutates sessionsRef synchronously, so the dispatch
-      // below lands even for sessions that were only stored summaries.
-      void onSelectHistorySession(sessionId).then(() => {
-        onSubmit(sessionId, text, []);
-      });
+    async (sessionId: string, text: string, target?: DeliveryTarget): Promise<boolean> => {
+      await onSelectHistorySession(sessionId);
+      const session = sessionsRef.current.find(s => s.id === sessionId);
+      if (!session) throw new Error("The selected session could not be loaded.");
+      if (target) {
+        if (!matchesTarget(session, target)) throw new Error("The selected agent's working copy changed. Review the destination again.");
+        const trees = await listWorktrees(session.cwd);
+        const tree = trees.worktrees.find(t => pathKey(t.path) === pathKey(target.cwd));
+        const current = sessionsRef.current.find(s => s.id === sessionId);
+        if (!tree || tree.missing || tree.branch !== target.branch || tree.head !== target.head || !current || !matchesTarget(current, target)) throw new Error("The working copy changed before dispatch. Refresh the review.");
+      }
+      const accepted = onSubmit(sessionId, text, []);
+      if (accepted) {
+        boardReturnRef.current = true;
+        setBoardViewOpen(false);
+        setSidebarTab("sessions");
+      }
+      return accepted;
     },
     [onSelectHistorySession, onSubmit],
   );

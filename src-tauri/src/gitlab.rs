@@ -21,9 +21,9 @@ pub struct GitlabStatus {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct GitlabConfig {
-    url: String,
-    token: String,
+pub(crate) struct GitlabConfig {
+    pub url: String,
+    pub token: String,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -338,6 +338,32 @@ fn gitlab_work_item_thread_for(
     number: i64,
 ) -> Result<GitlabWorkItemThread, String> {
     validate_item(kind, number)?;
+    if kind == "pr" {
+        let mut rows = Vec::new();
+        let mut truncated = false;
+        for page in 1..=5 {
+            let response = gitlab_get(
+                config,
+                &format!(
+                    "{}/discussions?per_page=100&page={page}",
+                    item_path(repo, kind, number)
+                ),
+            )?;
+            rows.extend(
+                response
+                    .value
+                    .as_array()
+                    .ok_or("GitLab did not return discussions")?
+                    .iter()
+                    .cloned(),
+            );
+            truncated = response.has_next_page;
+            if !truncated {
+                break;
+            }
+        }
+        return parse_mr_discussions(&rows, &config.url, repo, number, truncated);
+    }
     let path = format!(
         "{}/notes?order_by=created_at&sort=desc&per_page=100",
         item_path(repo, kind, number)
@@ -351,6 +377,57 @@ fn gitlab_work_item_thread_for(
         number,
         response.has_next_page,
     )
+}
+
+fn parse_mr_discussions(
+    rows: &[Value],
+    base_url: &str,
+    repo: &str,
+    number: i64,
+    truncated: bool,
+) -> Result<GitlabWorkItemThread, String> {
+    let mut comments = Vec::new();
+    for discussion in rows {
+        let Some(notes) = discussion.get("notes").and_then(Value::as_array) else {
+            continue;
+        };
+        let mut parsed = Vec::new();
+        for note in notes {
+            let thread = parse_work_item_thread(
+                &serde_json::json!([note]),
+                base_url,
+                repo,
+                "pr",
+                number,
+                false,
+            )?;
+            if let Some(mut comment) = thread.comments.into_iter().next() {
+                comment.thread_id = string_field(discussion, "id").unwrap_or_default();
+                if let Some(position) = note.get("position") {
+                    comment.path = string_field(position, "new_path")
+                        .or_else(|| string_field(position, "old_path"))
+                        .unwrap_or_default();
+                    comment.line = position
+                        .get("new_line")
+                        .and_then(Value::as_i64)
+                        .or_else(|| position.get("old_line").and_then(Value::as_i64));
+                }
+                parsed.push(comment);
+            }
+        }
+        let mut notes = parsed.into_iter();
+        if let Some(mut root) = notes.next() {
+            root.replies = notes.collect();
+            comments.push(root);
+        }
+    }
+    Ok(GitlabWorkItemThread {
+        comments,
+        truncated,
+        review_decision: String::new(),
+        base_ref_name: String::new(),
+        head_ref_name: String::new(),
+    })
 }
 
 fn gitlab_work_item_comment_for(
@@ -495,7 +572,7 @@ fn parse_work_item(row: &Value, kind: &str, repo: &str) -> Option<GitlabWorkItem
     })
 }
 
-fn validate_repo(repo: &str) -> Result<String, String> {
+pub(crate) fn validate_repo(repo: &str) -> Result<String, String> {
     let repo = repo.trim();
     if valid_project_path(repo) {
         Ok(repo.to_string())
@@ -801,12 +878,12 @@ fn string_field_preserve(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
-struct GitlabResponse {
-    value: Value,
-    has_next_page: bool,
+pub(crate) struct GitlabResponse {
+    pub value: Value,
+    pub has_next_page: bool,
 }
 
-fn gitlab_get(config: &GitlabConfig, path: &str) -> Result<GitlabResponse, String> {
+pub(crate) fn gitlab_get(config: &GitlabConfig, path: &str) -> Result<GitlabResponse, String> {
     let url = format!("{}/api/v4{}", config.url.trim_end_matches('/'), path);
     let agent = gitlab_agent();
     read_gitlab_response(
@@ -836,7 +913,7 @@ fn gitlab_post_form(
     )
 }
 
-fn gitlab_agent() -> ureq::Agent {
+pub(crate) fn gitlab_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(HTTP_TIMEOUT)
         .redirects(0)
@@ -929,7 +1006,7 @@ fn normalize_gitlab_url(raw: &str) -> Result<String, String> {
     Ok(normalized.trim_end_matches('/').to_string())
 }
 
-fn encode_path_component(value: &str) -> String {
+pub(crate) fn encode_path_component(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.as_bytes() {
         if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~') {
@@ -941,7 +1018,7 @@ fn encode_path_component(value: &str) -> String {
     encoded
 }
 
-fn gitlab_repo_for(root: &Path, gitlab_url: &str) -> Result<String, String> {
+pub(crate) fn gitlab_repo_for(root: &Path, gitlab_url: &str) -> Result<String, String> {
     let output = if let Some(location) = crate::wsl::path_location(root)? {
         crate::wsl::git(
             &location,
@@ -1060,7 +1137,7 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
         .join("gitlab-config.json"))
 }
 
-fn read_config(app: &AppHandle) -> Result<Option<GitlabConfig>, String> {
+pub(crate) fn read_config(app: &AppHandle) -> Result<Option<GitlabConfig>, String> {
     let path = config_path(app)?;
     match fs::read_to_string(path) {
         Ok(raw) => {
@@ -1079,7 +1156,7 @@ fn read_config(app: &AppHandle) -> Result<Option<GitlabConfig>, String> {
     }
 }
 
-fn require_config(app: &AppHandle) -> Result<GitlabConfig, String> {
+pub(crate) fn require_config(app: &AppHandle) -> Result<GitlabConfig, String> {
     read_config(app)?.ok_or_else(|| "Connect GitLab in Settings".to_string())
 }
 
@@ -1142,6 +1219,21 @@ fn expand_home(input: &str) -> PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn review_discussions_preserve_file_lines_replies_and_resolution() {
+        let rows = vec![serde_json::json!({"id":"thread-1","notes":[
+          {"id":1,"body":"Check this","author":{"username":"reviewer"},"resolved":true,"position":{"new_path":"a.rs","new_line":12}},
+          {"id":2,"body":"Fixed","author":{"username":"author"}}
+        ]})];
+        let result =
+            parse_mr_discussions(&rows, "https://gitlab.com", "team/repo", 42, false).unwrap();
+        assert_eq!(result.comments[0].path, "a.rs");
+        assert_eq!(result.comments[0].line, Some(12));
+        assert!(result.comments[0].resolved);
+        assert_eq!(result.comments[0].replies[0].body, "Fixed");
+        assert_eq!(result.comments[0].thread_id, "thread-1");
+    }
 
     #[test]
     fn normalizes_host_and_api_suffix() {

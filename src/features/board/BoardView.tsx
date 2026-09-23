@@ -1,3 +1,5 @@
+import { AgentHandoffDialog, type HandoffKind } from "./AgentHandoffDialog";
+import { currentDeliveryStatuses, deliveryKey, type SendToSession } from "./delivery";
 import {
   useCallback,
   useEffect,
@@ -215,7 +217,7 @@ export function BoardView({
   onToggleSidebar: () => void;
   onOpenSession: (sessionId: string) => void;
   onStartItem: (item: InboxItem) => void;
-  onSendToSession: (sessionId: string, text: string) => void;
+  onSendToSession: SendToSession;
   /** Create a worktree (when needed) + a bound live session for a workstream. */
   onSpawnSession: (
     spec: TaskWorkstreamSpec & {
@@ -307,7 +309,9 @@ export function BoardView({
         setRefresh((value) => value + 1);
       }
     }, 30_000);
-    return () => window.clearInterval(id);
+    const onVisible = () => { if (document.visibilityState === "visible") setRefresh(value => value + 1); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { window.clearInterval(id); document.removeEventListener("visibilitychange", onVisible); };
   }, []);
 
   // Per-workstream PR + checks probe — refreshed with the inbox tick. The
@@ -333,16 +337,17 @@ export function BoardView({
   const probeKey = probeStreams
     .map(
       (ws) =>
-        `${ws.id}:${ws.worktreePath}:${ws.branch}:${ws.base}:${ws.prUrl ?? ""}`,
+        deliveryKey(ws),
     )
     .join("\n");
   const probeRef = useRef(probeStreams);
   useEffect(() => {
     probeRef.current = probeStreams;
   });
-  const [wsStatus, setWsStatus] = useState<
+  const [probedStatus, setWsStatus] = useState<
     ReadonlyMap<string, WorkstreamStatus>
   >(new Map());
+  const wsStatus = useMemo(() => currentDeliveryStatuses(probeStreams, probedStatus), [probeStreams, probedStatus]);
   useEffect(() => {
     let cancelled = false;
     const streams = probeRef.current;
@@ -356,26 +361,14 @@ export function BoardView({
       ),
     ).then((results) => {
       if (cancelled) return;
-      setWsStatus((prev) => {
+      setWsStatus(() => {
         const next = new Map<string, WorkstreamStatus>();
         for (const result of results) {
           if (result.status !== "fulfilled" || !result.value[1]) continue;
           const status = result.value[1];
-          const prior = prev.get(result.value[0]);
-          // A failed probe (offline, deleted worktree, gh hiccup) must not
-          // erase known PR/CI state — carry it forward so cards don't lose
-          // badges or jump columns on a transient error.
-          next.set(
-            result.value[0],
-            status.error && prior
-              ? {
-                  ...status,
-                  pr: status.pr ?? prior.pr ?? null,
-                  provider: status.pr ? status.provider : prior.provider,
-                  checks: status.checks.length ? status.checks : prior.checks,
-                }
-              : status,
-          );
+          // A failed request cannot establish the current revision. Do not carry
+          // another checkout's or an older revision's green checks forward.
+          next.set(result.value[0], status);
         }
         return next;
       });
@@ -997,16 +990,23 @@ export function BoardView({
   );
 
   // --- actions -----------------------------------------------------------
-  // Dispatch needs a live (loaded) session — stored summaries can't take a
-  // turn, so fix/comment actions stay hidden until a session is open.
-  const firstLiveSession = (card: BoardCard) =>
-    card.sessions.find((session) => session.live);
-  const sendToFirstLive = (card: BoardCard, text: string) => {
-    const session = firstLiveSession(card);
-    if (!session) return;
-    onSendToSession(session.id, text);
-    onOpenSession(session.id);
-  };
+  const [handoff, setHandoff] = useState<{ workstreams: TaskWorkstream[]; taskId?: string; kind: HandoffKind; title: string; links: LinkedWorkItem[] } | null>(null);
+  const openHandoff = useCallback((card: BoardCard, kind: HandoffKind, workstreamId?: string) => {
+    if (card.task) {
+      setHandoff({workstreams: card.task.workstreams.filter(w => !workstreamId || w.id === workstreamId), taskId: card.task.id, kind, title: card.title, links: card.task.links});
+      return;
+    }
+    const ids = new Set(card.sessions.map(s => s.id));
+    const candidates = [...sessions, ...linkedSessions.filter(s => !sessions.some(live => live.id === s.id))].filter(s => ids.has(s.id) && !s.worktreeRemoved);
+    const rows = new Map<string, TaskWorkstream>();
+    for (const session of candidates) {
+      const cwd = session.worktreeCwd || session.cwd;
+      const row = rows.get(cwd);
+      if (row) row.sessionIds!.push(session.id);
+      else rows.set(cwd, {id: session.id, projectPath: session.cwd, worktreePath: cwd, branch: session.branch || "", base: "HEAD", sessionIds:[session.id], prUrl: card.itemKind === "pr" ? card.url : undefined, prProvider: card.provider === "github" || card.provider === "gitlab" || card.provider === "azuredevops" ? card.provider : undefined});
+    }
+    setHandoff({workstreams:[...rows.values()],kind,title:card.title,links:[]});
+  }, [sessions, linkedSessions]);
 
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
   /** PR inbox item being checked out into a review lane. */
@@ -1071,25 +1071,8 @@ export function BoardView({
             wake: action.wakeOnChange ? snoozeWakeKey(card) : undefined,
           });
           return;
-        case "fix-ci": {
-          const ref = card.identifier ?? card.title;
-          sendToFirstLive(
-            card,
-            `CI is failing for ${ref}${card.url ? ` (${card.url})` : ""}. ` +
-              `Please investigate the failing checks, fix the cause, and verify.`,
-          );
-          return;
-        }
-        case "comments": {
-          const ref = card.identifier ?? card.title;
-          sendToFirstLive(
-            card,
-            `There is new review activity on ${ref}${
-              card.url ? ` (${card.url})` : ""
-            }. Please read the latest comments and address them.`,
-          );
-          return;
-        }
+        case "fix-ci": openHandoff(card, "ci"); return;
+        case "comments": openHandoff(card, "comments"); return;
         case "ungroup":
           if (card.kind === "task" && card.task) {
             updateTask(card.task.id, (current) => ({
@@ -1141,6 +1124,7 @@ export function BoardView({
       onOpenSession,
       onSendToSession,
       onStartItem,
+      openHandoff,
     ],
   );
 
@@ -1755,6 +1739,7 @@ export function BoardView({
         {selectedCard ? (
           selectedCard.kind === "task" && taskOpsHandlers ? (
             <TaskDetailsPanel
+              onHandoff={(id, kind) => openHandoff(selectedCard!, kind, id)}
             key={selectedCard.id}
             card={selectedCard}
             lanes={boardLanes}
@@ -1911,6 +1896,11 @@ export function BoardView({
           }}
         />
       ) : null}
+      {handoff && <AgentHandoffDialog key={`${handoff.taskId || handoff.title}:${handoff.kind}:${handoff.workstreams.map(w => w.id).join()}`} workstreams={handoff.workstreams} taskId={handoff.taskId} kind={handoff.kind} sessions={sessions} onSend={onSendToSession} onClose={() => setHandoff(null)} onSpawn={async ws => {
+        const created = await onSpawnSession({...ws, title: handoff.title, links: handoff.links});
+        if (handoff.taskId) updateTask(handoff.taskId, current => ({workstreams: current.workstreams.map(w => w.id === ws.id ? {...w, sessionIds: [...new Set([...(w.sessionIds || []), created.sessionId])]} : w)}));
+        return created;
+      }}/>}
       {reviewItem ? (
         <ReviewLocallyDialog
           item={reviewItem}

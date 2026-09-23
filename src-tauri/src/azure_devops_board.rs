@@ -79,7 +79,7 @@ fn pick_pr_row(rows: &mut [Value]) -> Option<Value> {
         .cloned()
 }
 
-fn pr_for_branch(
+pub(crate) fn pr_for_branch(
     config: &AzureDevOpsConfig,
     project: &str,
     repo: &str,
@@ -118,7 +118,7 @@ fn pr_id_from_url(url: &str, project: &str, repo: &str) -> Option<i64> {
 /// One PR by id — review lanes need it: their `pr/<N>` branch never
 /// matches the PR's `sourceRefName`. Errors propagate — Azure PRs can't
 /// be deleted, so a failed fetch is an outage/auth problem, not "no PR".
-fn pr_row_by_id(
+pub(crate) fn pr_row_by_id(
     config: &AzureDevOpsConfig,
     project: &str,
     repo: &str,
@@ -161,7 +161,7 @@ fn reviewers_decision(row: &Value) -> Option<String> {
     )
 }
 
-fn pr_to_git_pr(
+pub(crate) fn pr_to_git_pr(
     row: &Value,
     project: &str,
     repo: &str,
@@ -201,7 +201,7 @@ fn normalize_azure_merge_state(row: &Value) -> Option<String> {
 
 /// Active review threads on a PR — Azure's "unresolved comments" count.
 /// Best-effort: a failed call just leaves the badge empty.
-fn active_thread_count(
+pub(crate) fn active_thread_count(
     config: &AzureDevOpsConfig,
     project: &str,
     repo: &str,

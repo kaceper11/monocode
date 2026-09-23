@@ -1,3 +1,4 @@
+import { checkState, type DeliverySnapshot } from "./delivery";
 import {
   inboxItemKey,
   inboxItemRef,
@@ -191,9 +192,15 @@ export type BoardWorkstreamRow = {
   merging?: boolean;
   /** Probe failure — deleted worktree, missing `gh`, auth. */
   probeError?: string;
+  ciError?: string;
+  ciBlocked?: boolean;
 };
 
 export type WorkstreamStatus = {
+  delivery?: DeliverySnapshot;
+  requestKey?: string;
+  fetchedAt?: number;
+  ciError?: string;
   provider?: InboxProvider;
   pr: GitPr | null;
   checks: GitPrCheck[];
@@ -432,7 +439,7 @@ export const prIsOpen = (state?: string) => {
  * conflicts-only `mergeStatus` can't rule out. Threads must be a known
  * zero — a failed count probe isn't "no threads". Drafts never signal. */
 export function lanePrSignal(
-  row: Pick<BoardWorkstreamRow, "pr" | "ciFailing" | "ciRunning">,
+  row: Pick<BoardWorkstreamRow, "pr" | "ciFailing" | "ciRunning" | "ciError" | "ciBlocked" | "probeError">,
 ): "ready" | "conflicts" | "blocked" | "behind" | null {
   const pr = row.pr;
   if (!pr || !prIsOpen(pr.state) || pr.draft) return null;
@@ -443,6 +450,7 @@ export function lanePrSignal(
     pr.mergeState === "clean" &&
     !row.ciFailing &&
     !row.ciRunning &&
+    !row.ciError && !row.ciBlocked && !row.probeError &&
     pr.reviewDecision !== "CHANGES_REQUESTED" &&
     pr.reviewDecision !== "REVIEW_REQUIRED" &&
     pr.unresolvedThreads === 0
@@ -920,6 +928,8 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
       };
       const status = input.workstreamStatus?.get(ws.id);
       if (status?.error) row.probeError = status.error;
+      row.ciError = status?.ciError || (status?.fetchedAt && Date.now() - status.fetchedAt > 60_000 ? "CI status is stale" : undefined);
+      row.ciBlocked = status?.checks.some(c => ["unknown", "blocked", "canceled"].includes(checkState(c)));
       if (status?.merging) row.merging = true;
       if (status?.behind) row.behind = status.behind;
       if (status?.pr) {

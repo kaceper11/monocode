@@ -2862,7 +2862,7 @@ fn git_range_context_for(root: &Path) -> Result<GitRangeContext, String> {
     })
 }
 
-fn git_pr_status_for(root: &Path, url: Option<&str>) -> Result<Option<GitPr>, String> {
+pub(crate) fn git_pr_status_for(root: &Path, url: Option<&str>) -> Result<Option<GitPr>, String> {
     let url = url
         .map(str::trim)
         .filter(|u| !u.is_empty() && !u.starts_with('-'));
@@ -4359,7 +4359,7 @@ fn gh_stdout(root: &Path, args: &[&str]) -> Option<String> {
     gh_run(root, args, false).ok()
 }
 
-fn gh_checked(root: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn gh_checked(root: &Path, args: &[&str]) -> Result<String, String> {
     gh_run(root, args, false)
 }
 
@@ -4476,7 +4476,7 @@ fn git_blob(root: &Path, spec: &str) -> Option<Vec<u8>> {
     git_output(root, &["cat-file", "-p", spec])
 }
 
-fn git_run(root: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git_run(root: &Path, args: &[&str]) -> Option<String> {
     git_output(root, args).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 

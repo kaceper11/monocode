@@ -1,3 +1,4 @@
+import type { CiBinding, DeliveryProvider } from "./delivery";
 import type { InboxProvider } from "../inbox/model/githubTasks";
 import type { LinkedWorkItem } from "../sessions/model/session";
 import type { InboxTimeFilter } from "../inbox/model/inboxFilters";
@@ -82,6 +83,8 @@ export type TaskWorkstream = {
   /** Pinned provider PR — review lanes fetch `pr/<N>` branches that never
    * match the PR's real head name, so probes target this url directly. */
   prUrl?: string;
+  prProvider?: DeliveryProvider;
+  ci?: CiBinding;
   /** Bound sessions — a lane can hold multiple conversations. First is
    * treated as primary on the board card. */
   sessionIds?: string[];
@@ -313,6 +316,8 @@ function sanitizeTasks(value: unknown): BoardTask[] {
           ...(cleanString(ws.prUrl, 600)
             ? { prUrl: cleanString(ws.prUrl, 600) }
             : {}),
+          ...(["github", "gitlab", "azuredevops"].includes(String(ws.prProvider)) ? { prProvider: ws.prProvider as DeliveryProvider } : {}),
+          ...(cleanCiBinding(ws.ci) ? { ci: cleanCiBinding(ws.ci) } : {}),
           ...(sessionIds.length ? { sessionIds } : {}),
         });
       }
@@ -609,9 +614,20 @@ export function loadBoard(): Store {
   }
 }
 
+function cleanCiBinding(value: unknown): CiBinding | undefined {
+  if (!isRecord(value) || !["github", "gitlab", "azuredevops"].includes(String(value.provider))) return undefined;
+  return { provider: value.provider as DeliveryProvider,
+    repo: cleanString(value.repo, 600), project: cleanString(value.project, 200), host: cleanString(value.host, 600),
+    definitionIds: Array.isArray(value.definitionIds) ? [...new Set(value.definitionIds.filter((id): id is number => typeof id === "number" && Number.isSafeInteger(id) && id > 0))].slice(0, 100) : undefined };
+}
+
 function writeStore(store: Store) {
   const raw = JSON.stringify(store);
   try {
+    if (store.tasks.some(task => task.workstreams.some(ws => ws.ci || ws.prProvider)) && !localStorage.getItem(`${KEY}.before-delivery`)) {
+      const previous = localStorage.getItem(KEY);
+      if (previous) localStorage.setItem(`${KEY}.before-delivery`, previous);
+    }
     localStorage.setItem(KEY, raw);
     memoryRaw = null;
   } catch {

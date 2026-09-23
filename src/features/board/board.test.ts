@@ -1,3 +1,4 @@
+import { probeDelivery } from "./delivery";
 import { linkedWorkItemInboxKey } from "../sessions/model/sessionWorkItem";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -86,6 +87,7 @@ import {
   type TaskWorkstream,
 } from "./boardStore";
 
+vi.mock("./delivery", async importOriginal => ({...(await importOriginal<typeof import("./delivery")>()), probeDelivery: vi.fn()}));
 // IO boundaries mocked module-wide — everything tested here stays pure.
 vi.mock("../../platform/tauri/fs", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../platform/tauri/fs")>()),
@@ -2746,6 +2748,7 @@ describe("probeWorkstream", () => {
   };
 
   beforeEach(() => {
+    vi.mocked(probeDelivery).mockReset().mockResolvedValue({pr, source: {provider: "github", repo: "owner/repo", host: "github.com", account: "1"}, headSha: "abc", localHead: "abc", checks: []});
     vi.mocked(gitCurrentBranch).mockReset().mockResolvedValue("feat");
     vi.mocked(azureDevOpsRepoMatch).mockReset().mockResolvedValue(false);
     vi.mocked(gitMergeInProgress).mockReset().mockResolvedValue(false);
@@ -2762,7 +2765,7 @@ describe("probeWorkstream", () => {
     expect(status?.pr).toBeNull();
     expect(status?.error).toContain("other");
     expect(status?.error).toContain("feat");
-    expect(vi.mocked(gitPrStatus)).not.toHaveBeenCalled();
+    expect(vi.mocked(probeDelivery)).not.toHaveBeenCalled();
     expect(vi.mocked(gitBehindBase)).not.toHaveBeenCalled();
   });
 
@@ -2838,4 +2841,15 @@ describe("existing task ownership", () => {
     expect(cards.map(card => card.id)).toEqual(["task:a", "task:b"]);
     expect(cards.every(card => card.tickets![0]!.state === "open")).toBe(true);
   });
+});
+
+it("preserves existing task data and backs it up before storing independent delivery bindings", () => {
+  const original = JSON.stringify({tasks:[{id:"legacy",title:"Legacy",createdAt:1,links:[],workstreams:[{id:"lane",projectPath:"/repo",worktreePath:"/repo-wt",branch:"feature",base:"main",sessionIds:["session"]}]}]});
+  localStorage.setItem("monocode.board.v1",original);
+  updateTask("legacy",current=>({workstreams:current.workstreams.map(ws=>({...ws,prProvider:"github",ci:{provider:"azuredevops",project:"Platform",host:"https://dev.azure.com/team",definitionIds:[1,2]}}))}));
+  expect(localStorage.getItem("monocode.board.v1.before-delivery")).toBe(original);
+  const lane=loadBoard().tasks[0].workstreams[0];
+  expect(lane).toMatchObject({id:"lane",worktreePath:"/repo-wt",sessionIds:["session"],prProvider:"github",ci:{provider:"azuredevops",project:"Platform",definitionIds:[1,2]}});
+  updateTask("legacy",{title:"Renamed"});
+  expect(localStorage.getItem("monocode.board.v1.before-delivery")).toBe(original);
 });

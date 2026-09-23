@@ -178,14 +178,14 @@ function CardMenu({
           onClick={run({ kind: "start" })}
         />
       ) : null}
-      {card.ciFailing > 0 && liveSession ? (
+      {card.ciFailing > 0 && (anySession || card.task?.workstreams.length) ? (
         <MenuRow
           icon={RefreshCw}
           label="Fix CI"
           onClick={run({ kind: "fix-ci" })}
         />
       ) : null}
-      {card.hasUpdate && liveSession ? (
+      {card.hasUpdate && (anySession || card.task?.workstreams.length) ? (
         <MenuRow
           icon={MessageSquare}
           label="Address updates"
@@ -300,8 +300,8 @@ export function BoardCardView({
     (group) => group.id !== inGroup,
   );
   const showStart = card.kind === "item" && !anySession;
-  const showFixCi = card.ciFailing > 0 && !!liveSession;
-  const showUpdates = card.hasUpdate && !!liveSession;
+  const showFixCi = card.ciFailing > 0 && !!(anySession || card.task?.workstreams.length);
+  const showUpdates = card.hasUpdate && !!(anySession || card.task?.workstreams.length);
   const hasActions =
     showStart || showFixCi || showUpdates || card.kind === "local";
   // Column age — surfaced at a glance; the card dims once it's idled past
