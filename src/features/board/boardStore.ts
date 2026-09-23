@@ -96,6 +96,8 @@ export type TaskWorkstream = {
  */
 export type BoardTask = {
   id: string;
+  /** Main conversation spanning the task working copies; older lane sessions remain valid. */
+  primarySessionId?: string;
   title: string;
   links: LinkedWorkItem[];
   workstreams: TaskWorkstream[];
@@ -334,6 +336,7 @@ function sanitizeTasks(value: unknown): BoardTask[] {
       title,
       links,
       workstreams,
+      ...(cleanString(raw.primarySessionId, 120) ? { primarySessionId: cleanString(raw.primarySessionId, 120) } : {}),
       ...(groupIds.length ? { groupIds } : {}),
       createdAt: cleanNumber(raw.createdAt) ?? Date.now(),
       ...(isArchived ? { archived: true } : {}),
@@ -929,6 +932,7 @@ export function addTask(input: {
   links: LinkedWorkItem[];
   workstreams: TaskWorkstream[];
   groupIds?: string[];
+  primarySessionId?: string;
 }): string | null {
   const title = input.title.trim().slice(0, MAX_TEXT);
   if (!title) return null;
@@ -950,6 +954,7 @@ export function addTask(input: {
         title,
         links: input.links.slice(0, MAX_LINKS),
         workstreams: input.workstreams.slice(0, MAX_WORKSTREAMS),
+        ...(input.primarySessionId ? { primarySessionId: input.primarySessionId } : {}),
         ...(groupIds.length ? { groupIds } : {}),
         createdAt: Date.now(),
       },

@@ -104,7 +104,7 @@ export function CiBadge({
   return (
     <>
       <button
-        className={`${buttonClass} ${tone} ring-1 ring-inset font-medium ${error || !states.length ? "bg-content/5 ring-content/10" : appearance.badge}`}
+        className={`${buttonClass} min-w-0 ${tone} ring-1 ring-inset font-medium ${error || !states.length ? "bg-content/5 ring-content/10" : appearance.badge}`}
         title={`${summaryLabel} · Show check details`}
         aria-label="Show CI checks"
         aria-expanded={!!anchor}
@@ -115,9 +115,9 @@ export function CiBadge({
           className="size-3 shrink-0"
           strokeWidth={1.75}
         />
-        {summaryLabel}
+        <span className="min-w-0 truncate">{summaryLabel}</span>
         <ChevronRight
-          className={`size-3 opacity-45 transition-transform ${anchor ? "rotate-90" : ""}`}
+          className={`size-3 shrink-0 opacity-45 transition-transform ${anchor ? "rotate-90" : ""}`}
         />
       </button>
       {anchor && (
@@ -152,7 +152,7 @@ export function CiBadge({
           {error && (
             <p
               role="alert"
-              className="mb-2 text-[12px] text-amber-700 dark:text-amber-300"
+              className="mb-2 whitespace-pre-wrap [overflow-wrap:anywhere] text-[12px] text-amber-700 dark:text-amber-300"
             >
               {error}
             </p>

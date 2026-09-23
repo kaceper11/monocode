@@ -1,4 +1,5 @@
 import { SessionSurface } from "./SessionSurface";
+import { SessionTaskControl } from "../../board/SessionTaskControl";
 import { ChevronDown, GripVertical, X } from "../../../shared/ui/icons";
 import {
   memo,
@@ -625,6 +626,7 @@ export const SessionPane = memo(function SessionPane({
           </button>
         </div>
       ) : null}
+      {visible && !session.inboxAsk && !managed ? <SessionTaskControl key={session.id} session={session} /> : null}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div
           ref={transcriptScope}

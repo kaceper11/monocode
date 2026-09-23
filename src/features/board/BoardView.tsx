@@ -1,3 +1,4 @@
+import { inboxIntegrationCacheKey } from "../sessions/model/inboxIntegrations";
 import { AgentHandoffDialog, type HandoffKind } from "./AgentHandoffDialog";
 import { currentDeliveryStatuses, deliveryKey, type SendToSession } from "./delivery";
 import {
@@ -43,6 +44,7 @@ import {
   inboxProjectsForRail,
   listInboxItems,
   peekInboxList,
+  inboxItemKey,
   type InboxItem,
   type InboxProvider,
   type InboxProviderErrors,
@@ -56,7 +58,7 @@ import {
 import { timeFilterStart } from "../sessions/model/sessionFilters";
 import { IS_MAC } from "../../platform/tauri/platform";
 import { pathKey, projectKey, projectName } from "../../shared/lib/paths";
-import { sameProjectPath, type RecentProject } from "../projects/model/recents";
+import { looksLikeProject, sameProjectPath, type RecentProject } from "../projects/model/recents";
 import type { LinkedWorkItem, Session } from "../sessions/model/session";
 import {
   loadTabGroupColors,
@@ -82,6 +84,7 @@ import type { GitPrCheck } from "../../platform/tauri/fs";
 import {
   attentionScore,
   buildBoardCards,
+  boardLinkFromInboxItem,
   boardStatusOptions,
   matchesBoardStatuses,
   cardColumn,
@@ -191,7 +194,19 @@ type DragState = {
   overGroup: string | null;
 };
 
+// Presentation snapshots survive navigation. Mutations still probe live delivery state.
+let boardStatusSnapshot: {
+  scope: string;
+  statuses: ReadonlyMap<string, WorkstreamStatus>;
+} | undefined;
+let boardChecksSnapshot: {
+  scope: string;
+  checks: ReadonlyMap<string, GitPrCheck[]>;
+} | undefined;
+
 export function BoardView({
+  taskRequest,
+  newTaskRequest,
   besideRail = false,
   recents,
   cwd,
@@ -203,9 +218,12 @@ export function BoardView({
   onStartItem,
   onSendToSession,
   onSpawnSession,
+  onPrepareWorktree,
   onBindSession,
   onRemoveWorktree,
 }: {
+  taskRequest?: { id: string } | null;
+  newTaskRequest?: { item: InboxItem } | null;
   besideRail?: boolean;
   recents: RecentProject[];
   cwd: string;
@@ -218,6 +236,7 @@ export function BoardView({
   onOpenSession: (sessionId: string) => void;
   onStartItem: (item: InboxItem) => void;
   onSendToSession: SendToSession;
+  onPrepareWorktree: (spec: TaskWorkstreamSpec) => Promise<string>;
   /** Create a worktree (when needed) + a bound live session for a workstream. */
   onSpawnSession: (
     spec: TaskWorkstreamSpec & {
@@ -344,12 +363,24 @@ export function BoardView({
   useEffect(() => {
     probeRef.current = probeStreams;
   });
+  const statusScope = inboxIntegrationCacheKey();
   const [probedStatus, setWsStatus] = useState<
     ReadonlyMap<string, WorkstreamStatus>
-  >(new Map());
-  const wsStatus = useMemo(() => currentDeliveryStatuses(probeStreams, probedStatus), [probeStreams, probedStatus]);
+  >(() =>
+    boardStatusSnapshot?.scope === statusScope
+      ? boardStatusSnapshot.statuses
+      : new Map(),
+  );
+  const wsStatus = useMemo(
+    () => currentDeliveryStatuses(
+      probeStreams,
+      boardStatusSnapshot?.scope === statusScope ? probedStatus : new Map(),
+    ),
+    [probeStreams, probedStatus, statusScope],
+  );
   useEffect(() => {
     let cancelled = false;
+    if (boardStatusSnapshot?.scope !== statusScope) setWsStatus(new Map());
     const streams = probeRef.current;
     if (!streams.length) {
       setWsStatus(new Map());
@@ -361,26 +392,35 @@ export function BoardView({
       ),
     ).then((results) => {
       if (cancelled) return;
-      setWsStatus(() => {
-        const next = new Map<string, WorkstreamStatus>();
-        for (const result of results) {
-          if (result.status !== "fulfilled" || !result.value[1]) continue;
-          const status = result.value[1];
-          // A failed request cannot establish the current revision. Do not carry
-          // another checkout's or an older revision's green checks forward.
-          next.set(result.value[0], status);
-        }
-        return next;
-      });
+      const next = new Map<string, WorkstreamStatus>();
+      for (const result of results) {
+        if (result.status !== "fulfilled" || !result.value[1]) continue;
+        const status = result.value[1];
+        // A failed request cannot establish the current revision. Do not carry
+        // another checkout's or an older revision's green checks forward.
+        next.set(result.value[0], status);
+      }
+      boardStatusSnapshot = { scope: statusScope, statuses: next };
+      setWsStatus(next);
     });
     return () => {
       cancelled = true;
     };
-  }, [probeKey, refresh]);
+  }, [probeKey, refresh, statusScope]);
 
+  const checksScope = JSON.stringify([
+    statusScope,
+    items
+      .filter(item => item.provider === "azuredevops" && item.kind === "pr")
+      .map(item => [inboxItemKey(item), item.repo, item.sourceRefName, item.updatedAt]),
+  ]);
   const [cardChecks, setCardChecks] = useState<
     ReadonlyMap<string, GitPrCheck[]>
-  >(new Map());
+  >(() =>
+    boardChecksSnapshot?.scope === checksScope
+      ? boardChecksSnapshot.checks
+      : new Map(),
+  );
 
   const cards = useMemo(
     () =>
@@ -394,7 +434,7 @@ export function BoardView({
         groups: board.groups,
         cardGroups: board.cardGroups,
         workstreamStatus: wsStatus,
-        cardChecks,
+        cardChecks: boardChecksSnapshot?.scope === checksScope ? cardChecks : new Map(),
       }),
     [
       items,
@@ -407,6 +447,7 @@ export function BoardView({
       board.cardGroups,
       wsStatus,
       cardChecks,
+      checksScope,
     ],
   );
 
@@ -439,6 +480,7 @@ export function BoardView({
   useEffect(() => {
     let cancelled = false;
     const targets = azureCheckRef.current;
+    if (boardChecksSnapshot?.scope !== checksScope) setCardChecks(new Map());
     if (!targets.length) {
       setCardChecks(new Map());
       return;
@@ -461,12 +503,13 @@ export function BoardView({
       for (const result of results)
         if (result.status === "fulfilled")
           next.set(result.value[0], result.value[1]);
+      boardChecksSnapshot = { scope: checksScope, checks: next };
       setCardChecks(next);
     });
     return () => {
       cancelled = true;
     };
-  }, [azureCheckKey, refresh]);
+  }, [azureCheckKey, refresh, checksScope]);
 
   // --- filters -----------------------------------------------------------
   const [search, setSearch] = useState("");
@@ -1009,6 +1052,9 @@ export function BoardView({
   }, [sessions, linkedSessions]);
 
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+  useEffect(() => {
+    if (taskRequest) setSelectedCardId(taskRequest.id);
+  }, [taskRequest]);
   /** PR inbox item being checked out into a review lane. */
   const [reviewItem, setReviewItem] = useState<InboxItem | null>(null);
   const [standupOpen, setStandupOpen] = useState(false);
@@ -1104,6 +1150,7 @@ export function BoardView({
         case "promote": {
           // The record's own column — not the filtered view, so a card
           // promoted while filtered out still returns to its slot.
+          setTaskFromInbox(null);
           setPromoteFrom({
             id: card.id,
             title: card.title,
@@ -1138,6 +1185,20 @@ export function BoardView({
   } | null>(null);
   const [taskBusy, setTaskBusy] = useState(false);
   const [taskError, setTaskError] = useState("");
+  const [taskFromInbox, setTaskFromInbox] = useState<InboxItem | null>(null);
+  useEffect(() => {
+    if (!newTaskRequest) return;
+    setTaskFromInbox(newTaskRequest.item);
+    setPromoteFrom(null);
+    setTaskError("");
+    setTaskDialogOpen(true);
+  }, [newTaskRequest]);
+  const [createdSessionId, setCreatedSessionId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!createdSessionId || !sessions.some(session => session.id === createdSessionId)) return;
+    setCreatedSessionId(null);
+    onOpenSession(createdSessionId);
+  }, [createdSessionId, sessions, onOpenSession]);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [actionResults, setActionResults] = useState<
     ReadonlyMap<string, WorkstreamResult>
@@ -1145,8 +1206,7 @@ export function BoardView({
 
   const onCreateTask = useCallback(
     async (spec: NewTaskSpec) => {
-      // A full board must fail before any spawn — `addTask` returning null
-      // after spawning would orphan fresh worktrees/sessions.
+      // Reject a full board before preparing any working copies.
       // Archived tasks don't render — they shouldn't count toward the cap.
       if (loadBoard().tasks.filter((task) => !task.archived).length >= MAX_TASKS) {
         setTaskError("Board is full — archive some tasks first.");
@@ -1207,26 +1267,21 @@ export function BoardView({
           continue;
         }
         try {
-          const spawned = await onSpawnSession({
-            ...ws,
-            title: spec.title,
-            links: spec.links,
-          });
+          const worktreePath = await onPrepareWorktree(ws);
           workstreams.push({
             id: newEntityId("ws"),
             projectPath: ws.projectPath,
             branch: ws.branch,
             base: ws.base,
-            worktreePath: spawned.worktreePath,
-            sessionIds: [spawned.sessionId],
+            worktreePath,
           });
         } catch (error) {
           failLane(ws, shortError(error));
         }
       }
-      setTaskBusy(false);
       // Total failure keeps the dialog open — no phantom task to resubmit.
       if (errors.length === spec.workstreams.length && errors.length) {
+        setTaskBusy(false);
         setTaskError(errors.join(" · "));
         return;
       }
@@ -1239,9 +1294,8 @@ export function BoardView({
         groupIds: spec.groupIds,
       });
       if (!id) {
-        // The board filled since the pre-check — remove worktrees the
-        // spawns created, never bound paths (those are the user's own
-        // working copies). Sessions stay reachable in the sessions view.
+        // The board filled since the pre-check — remove newly prepared
+        // worktrees, never the existing working copies the user selected.
         // Awaited so a resubmit can't collide with a still-registered copy.
         await Promise.allSettled(
           workstreams
@@ -1253,9 +1307,22 @@ export function BoardView({
               onRemoveWorktree(ws.projectPath, ws.worktreePath!, false, true),
             ),
         );
+        setTaskBusy(false);
         setTaskError("Board is full — remove a task first");
         return;
       }
+      let primarySessionId: string | undefined;
+      const primary = workstreams.find((ws) => ws.worktreePath);
+      if (primary) {
+        try {
+          const spawned = await onSpawnSession({ ...primary, title: spec.title, links: spec.links });
+          primarySessionId = spawned.sessionId;
+          updateTask(id, { primarySessionId });
+        } catch (error) {
+          failed.set(primary.id, { workstreamId: primary.id, ok: false, message: `Task session: ${shortError(error)}` });
+        }
+      }
+      setTaskBusy(false);
       setTaskDialogOpen(false);
       setSelectedCardId(id);
       // A promoted local card is consumed — the task takes its exact slot.
@@ -1275,11 +1342,13 @@ export function BoardView({
         }
         setPromoteFrom(null);
       }
-      // Surface partial spawn failures on their workstream rows.
+      // Keep partial preparation or session failures visible on the Board.
       if (failed.size) setActionResults(failed);
+      else setCreatedSessionId(primarySessionId ?? null);
     },
     [
       onSpawnSession,
+      onPrepareWorktree,
       onRemoveWorktree,
       promoteFrom,
       cards,
@@ -1527,10 +1596,12 @@ export function BoardView({
           <button
             type="button"
             title="New task"
+            aria-label="New task"
             className="flex h-7 items-center gap-1 rounded-md bg-accent/12 px-1.5 text-[11px] font-medium text-accent hover:bg-accent/20"
             onClick={() => {
               setTaskError("");
               setPromoteFrom(null);
+              setTaskFromInbox(null);
               setTaskDialogOpen(true);
             }}
           >
@@ -1750,8 +1821,10 @@ export function BoardView({
             results={actionResults}
             onClose={taskOpsHandlers.onClose}
             onOpenSession={taskOpsHandlers.onOpenSession}
+            onSessionCreated={setCreatedSessionId}
             onSendToSession={taskOpsHandlers.onSendToSession}
             onSpawnSession={taskOpsHandlers.onSpawnSession}
+            onPrepareWorktree={onPrepareWorktree}
             onBindSession={taskOpsHandlers.onBindSession}
             wsStatus={wsStatus}
             onUpdateBranches={taskOpsHandlers.onUpdateBranches}
@@ -1772,6 +1845,7 @@ export function BoardView({
               onPromote={
                 selectedCard.kind === "local"
                   ? () => {
+                      setTaskFromInbox(null);
                       setPromoteFrom({
                         id: selectedCard.id,
                         title: selectedCard.title,
@@ -1883,12 +1957,15 @@ export function BoardView({
       ) : null}
       {taskDialogOpen ? (
         <NewTaskDialog
-          items={items}
+          items={taskFromInbox ? [taskFromInbox, ...items.filter(item => inboxItemKey(item) !== inboxItemKey(taskFromInbox))] : items}
           recents={recents}
           lanes={boardLanes}
           busy={taskBusy}
           error={taskError}
-          initialTitle={promoteFrom?.title}
+          key={taskFromInbox ? inboxItemKey(taskFromInbox) : "new-task"}
+          initialTitle={taskFromInbox?.title ?? promoteFrom?.title}
+          initialLinks={taskFromInbox ? [boardLinkFromInboxItem(taskFromInbox)].filter((link): link is LinkedWorkItem => !!link) : undefined}
+          initialProject={taskFromInbox ? (looksLikeProject(taskFromInbox.projectPath) ? taskFromInbox.projectPath : undefined) : looksLikeProject(cwd) ? cwd : undefined}
           onSubmit={onCreateTask}
           onCancel={() => {
             setTaskDialogOpen(false);
@@ -2740,4 +2817,3 @@ function ProjectPickRow({
     </button>
   );
 }
-

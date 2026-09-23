@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   applySkillsToTurn: vi.fn(),
   events: [] as string[],
   warmNativeSkills: vi.fn(),
+  taskSessionPrompt: vi.fn(),
 }));
 
 vi.mock("../../files/model/fileMentions", () => ({
@@ -29,6 +30,7 @@ vi.mock("./attachments", () => ({
   prepareAttachments: mocks.prepareAttachments,
 }));
 vi.mock("./checkpoint", () => ({ beginSessionTurn: mocks.beginSessionTurn }));
+vi.mock("../../board/taskSession", () => ({ taskSessionPrompt: mocks.taskSessionPrompt }));
 
 import { preparePrompt, prepareTurn } from "./promptPreparation";
 
@@ -42,6 +44,7 @@ function deferred<T>() {
 
 beforeEach(() => {
   mocks.events.length = 0;
+  mocks.taskSessionPrompt.mockReset().mockImplementation((text: string) => text);
   mocks.prepareAttachments.mockReset().mockResolvedValue([]);
   mocks.beginSessionTurn.mockReset().mockResolvedValue(undefined);
   mocks.applyFileMentionsToTurn.mockReset();
@@ -93,6 +96,20 @@ describe("preparePrompt", () => {
 
 describe("prepareTurn", () => {
   const context = { harness: "codex" as const, sessionId: "s", cwd: "/repo" };
+
+  it.each([false, true])("adds task context to dispatched turns, including literal builds (%s)", async literal => {
+    mocks.applyFileMentionsToTurn.mockResolvedValue("expanded");
+    mocks.applySkillsToTurn.mockImplementation(async (text: string) => text);
+    mocks.taskSessionPrompt.mockImplementation((text: string) => `task: ${text}`);
+    const result = await prepareTurn("approved plan", [], context, { literal });
+    expect(result.text).toBe(`task: ${literal ? "approved plan" : "expanded"}`);
+    expect(mocks.taskSessionPrompt).toHaveBeenCalledWith(literal ? "approved plan" : "expanded", "s", "/repo");
+  });
+
+  it("does not enrich native commands, including steering", async () => {
+    await expect(prepareTurn("/omp:compact keep arguments", [], { ...context, harness: "omp" })).resolves.toMatchObject({ text: "/compact keep arguments" });
+    expect(mocks.taskSessionPrompt).not.toHaveBeenCalled();
+  });
 
   it("overlaps independent preparation but waits for the durable snapshot", async () => {
     const checkpoint = deferred<void>();

@@ -1,3 +1,4 @@
+import { InboxTaskLinks } from "../../board/InboxTaskLinks";
 import {
   inboxProvider,
   type InboxThread,
@@ -2278,6 +2279,7 @@ export function InboxDetail({
                   </>
                 ) : null}
               </div>
+              <InboxTaskLinks item={item} />
               {!panel && relatedSessions.length > 0 ? (
                 <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
                   <span className="mr-0.5 inline-flex shrink-0 items-center gap-1 text-[11px] text-content/45">

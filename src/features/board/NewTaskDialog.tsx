@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -12,7 +13,14 @@ import {
   SearchableSelect,
   type SearchableSelectOption,
 } from "../../shared/ui/SearchableSelect";
-import { Check, GitBranch, LoaderCircle, Plus, Search, X } from "../../shared/ui/icons";
+import {
+  Check,
+  GitBranch,
+  LoaderCircle,
+  Plus,
+  Search,
+  X,
+} from "../../shared/ui/icons";
 import { inboxItemRef, type InboxItem } from "../inbox/model/githubTasks";
 import { LAYER } from "../../shared/lib/layers";
 import { pathKey, prettyCwd, projectName } from "../../shared/lib/paths";
@@ -64,7 +72,10 @@ function branchSlug(text: string): string {
     .slice(0, 48);
 }
 
-export function suggestedBranch(title: string, links: LinkedWorkItem[]): string {
+export function suggestedBranch(
+  title: string,
+  links: LinkedWorkItem[],
+): string {
   const key = links
     .map((link) => link.identifier ?? "")
     .find((identifier) => /[A-Za-z][A-Za-z0-9]+-\d+/.test(identifier));
@@ -142,7 +153,9 @@ export function worktreeLaneOptions(
   ) {
     // The bound path isn't bindable — name the actual state so the user
     // knows whether to repoint (gone) or re-branch it (detached).
-    const stale = trees.find((tree) => pathKey(tree.path) === pathKey(boundPath));
+    const stale = trees.find(
+      (tree) => pathKey(tree.path) === pathKey(boundPath),
+    );
     options.push({
       value: boundPath,
       label: `${prettyCwd(boundPath)} — ${stale && !stale.missing ? "detached" : "missing"}`,
@@ -172,6 +185,7 @@ export function WorkstreamFields({
   layer,
   excludeWorktreePaths,
   excludeBranches,
+  defaultBranch = "mc/task",
 }: {
   draft: {
     projectPath: string;
@@ -190,6 +204,7 @@ export function WorkstreamFields({
   ) => void;
   tail: ReactNode;
   compact?: boolean;
+  defaultBranch?: string;
   /** Popover layer — pass `LAYER.dialogPopover` when inside a modal. */
   layer?: number;
   /** pathKey'd worktree paths another lane already claims — offering one
@@ -199,6 +214,7 @@ export function WorkstreamFields({
    * worktrees checked out on them are equally unpickable. */
   excludeBranches?: ReadonlySet<string>;
 }) {
+  const branchListId = useId();
   const { branches } = useProjectBranchesState(
     draft.projectPath,
     !!draft.projectPath,
@@ -242,23 +258,27 @@ export function WorkstreamFields({
       label="Repository"
       value={draft.projectPath}
       options={projects}
-      onChange={(projectPath) =>
-        onChange({ projectPath, worktreePath: undefined })
-      }
+      onChange={(projectPath) => {
+        if (sameProjectPath(projectPath, draft.projectPath)) return;
+        onChange({
+          projectPath,
+          worktreePath: undefined,
+          branch: "",
+          base: "",
+        });
+      }}
       placeholder={compact ? "Repo…" : "Choose repo…"}
       searchPlaceholder="Search projects…"
       layer={layer}
     />
   );
-  const worktreeSelect = worktreeOptions.length ? (
+  const worktreeSelect = (
     <SearchableSelect
       label="Worktree"
       value={draft.worktreePath ?? ""}
       options={[{ value: "", label: "New worktree" }, ...worktreeOptions]}
       onChange={(path) => {
-        const tree = worktrees?.worktrees.find(
-          (entry) => entry.path === path,
-        );
+        const tree = worktrees?.worktrees.find((entry) => entry.path === path);
         onChange({
           // `path` may be the stale-bound synthetic option — keep it so the
           // pick stays visible instead of silently unbinding. Reverting to
@@ -276,14 +296,14 @@ export function WorkstreamFields({
       layer={layer}
       minMenuWidth={280}
     />
-  ) : null;
+  );
   const baseSelect = (
     <SearchableSelect
       label="Base branch"
       value={draft.base}
       options={baseOptions}
       onChange={(base) => onChange({ base })}
-      placeholder={branches ? "base…" : "…"}
+      placeholder="HEAD (current checkout)"
       searchPlaceholder="Branches…"
       disabled={!draft.projectPath}
       layer={layer}
@@ -320,26 +340,52 @@ export function WorkstreamFields({
       </div>
     );
   }
-  // With a worktree pick the row wraps: repo+worktree on top, branch+base
-  // underneath — four selects can't share one readable line.
-  return worktreeSelect ? (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex items-center gap-1.5">
-        <div className="min-w-0 flex-1">{repoSelect}</div>
-        <div className="w-56 shrink-0">{worktreeSelect}</div>
+  return (
+    <div className="min-w-0 rounded-lg border border-content/10 p-3">
+      <div className="mb-3 flex min-w-0 items-center gap-2">
+        <GitBranch className="size-4 shrink-0 text-content/45" />
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-[12px] font-medium text-content">
+            {projectName(draft.projectPath)}
+          </p>
+          <p
+            className="truncate text-[10px] text-content/40"
+            title={draft.projectPath}
+          >
+            {prettyCwd(draft.projectPath)}
+          </p>
+        </div>
         {tail}
       </div>
-      <div className="flex items-center gap-1.5">
-        <div className="min-w-0 flex-1">{branchSelect}</div>
-        <div className="w-40 shrink-0">{baseSelect}</div>
+      <div className="mb-2 min-w-0">{worktreeSelect}</div>
+      <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2">
+        {!draft.worktreePath && (
+          <label className="min-w-0 text-[10px] text-content/50">
+            Branch
+            <input
+              aria-label="Branch"
+              list={branchListId}
+              value={draft.branch}
+              onChange={(event) => onChange({ branch: event.target.value })}
+              placeholder={defaultBranch}
+              className="mt-1 h-8 w-full min-w-0 rounded-md border border-content/10 bg-background-base px-2 text-[12px] text-content outline-none placeholder:text-content/40 focus:border-content/30"
+            />
+            <datalist id={branchListId}>
+              {branchOptions
+                .filter((option) => option.value)
+                .map((option) => (
+                  <option key={option.value} value={option.value} />
+                ))}
+            </datalist>
+          </label>
+        )}
+        <div className="min-w-0">
+          <p className="mb-1 text-[10px] text-content/50">
+            {draft.worktreePath ? "PR base branch" : "Create from"}
+          </p>
+          {baseSelect}
+        </div>
       </div>
-    </div>
-  ) : (
-    <div className="flex items-center gap-1.5">
-      <div className="min-w-0 flex-1">{repoSelect}</div>
-      <div className="w-44 shrink-0">{branchSelect}</div>
-      <div className="w-40 shrink-0">{baseSelect}</div>
-      {tail}
     </div>
   );
 }
@@ -351,6 +397,9 @@ export function NewTaskDialog({
   busy,
   error,
   initialTitle,
+  initialProject,
+  fixedWorkstream,
+  initialLinks = [],
   onSubmit,
   onCancel,
 }: {
@@ -364,17 +413,33 @@ export function NewTaskDialog({
   error: string;
   /** Prefilled title — used when promoting a board-local card. */
   initialTitle?: string;
+  initialProject?: string;
+  /** Creating from chat binds this existing checkout and session. */
+  fixedWorkstream?: TaskWorkstreamSpec;
+  initialLinks?: LinkedWorkItem[];
   onSubmit: (spec: NewTaskSpec) => void;
   onCancel: () => void;
 }) {
+  const formId = useId();
   const [title, setTitle] = useState(initialTitle ?? "");
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Map<string, LinkedWorkItem>>(
-    new Map(),
+    new Map(initialLinks.map((link) => [linkedWorkItemInboxKey(link), link])),
   );
-  const [streams, setStreams] = useState<DraftWorkstream[]>([
-    { key: 0, projectPath: "", branch: "", base: "" },
-  ]);
+  const [streams, setStreams] = useState<DraftWorkstream[]>(
+    fixedWorkstream || initialProject
+      ? [
+          {
+            key: 0,
+            ...(fixedWorkstream ?? {
+              projectPath: initialProject ?? "",
+              branch: "",
+              base: "",
+            }),
+          },
+        ]
+      : [],
+  );
   // Group ids the task starts in; the list is read fresh on open and grows
   // when a new group is created inline.
   const [groups, setGroups] = useState(() => loadBoard().groups);
@@ -392,7 +457,18 @@ export function NewTaskDialog({
     return () => cancelAnimationFrame(frame);
   }, []);
 
-  const projects = useMemo(() => workstreamProjectOptions(recents), [recents]);
+  const projects = useMemo(() => {
+    const options = workstreamProjectOptions(recents);
+    if (
+      initialProject &&
+      !options.some((option) => sameProjectPath(option.value, initialProject))
+    )
+      options.unshift({
+        value: initialProject,
+        label: projectName(initialProject),
+      });
+    return options;
+  }, [recents, initialProject]);
 
   // Ticket picker lists everything the inbox knows that can become a link —
   // issues and PRs; delivery runs are status rows, not tickets.
@@ -413,7 +489,7 @@ export function NewTaskDialog({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (busy || submitting) return;
+    if (busy || submitting || !title.trim()) return;
     setSubmitting(true);
     try {
       const links = [...selected.values()];
@@ -422,7 +498,11 @@ export function NewTaskDialog({
       // outside the app in `mc/` instead of adopting it.
       const fresh = new Map<string, GitBranches | null>();
       for (const stream of streams) {
-        if (stream.projectPath && !fresh.has(stream.projectPath)) {
+        if (
+          !stream.worktreePath &&
+          stream.projectPath &&
+          !fresh.has(stream.projectPath)
+        ) {
           fresh.set(
             stream.projectPath,
             await gitBranches(stream.projectPath).catch(() => null),
@@ -460,13 +540,47 @@ export function NewTaskDialog({
   return (
     <Modal
       title="New task"
-      description="Link tickets to workstreams — each repo lane gets a branch and worktree."
+      description={
+        fixedWorkstream
+          ? "Keep this conversation and its working copy together."
+          : "Create one conversation across your working copies."
+      }
+      fitViewport
+      footer={
+        <div className="flex justify-end gap-2 p-3">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={busy || submitting}
+            className="rounded-md px-3 py-1.5 text-[12px] text-content/70 outline-none hover:bg-content/8 focus-visible:ring-2 focus-visible:ring-accent/60 active:scale-[0.97] disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            form={formId}
+            disabled={busy || submitting || !title.trim()}
+            className="inline-flex items-center gap-1.5 rounded-md bg-content px-3 py-1.5 text-[12px] font-medium text-background-base outline-none transition-transform focus-visible:ring-2 focus-visible:ring-accent active:scale-[0.97] disabled:opacity-40"
+          >
+            {busy || submitting ? (
+              <LoaderCircle className="size-3.5 animate-spin" strokeWidth={2} />
+            ) : null}
+            {!fixedWorkstream && streams.length > 0
+              ? "Create & open agent"
+              : "Create task"}
+          </button>
+        </div>
+      }
       size="md"
       onClose={() => {
         if (!busy && !submitting) onCancel();
       }}
     >
-      <form onSubmit={submit} className="flex flex-col gap-4 px-4 pb-4 pt-1">
+      <form
+        id={formId}
+        onSubmit={submit}
+        className="flex flex-col gap-4 px-4 pb-4 pt-1"
+      >
         <label className="flex flex-col gap-1.5 text-[12px] text-content/70">
           Title
           <input
@@ -478,6 +592,117 @@ export function NewTaskDialog({
             className="h-9 rounded-md border border-content/10 bg-background-base px-2.5 text-[13px] text-content outline-none placeholder:text-content/40 focus:border-content/25"
           />
         </label>
+
+        {fixedWorkstream ? (
+          <p className="break-words text-[12px] text-content/65">
+            Current working copy:{" "}
+            {prettyCwd(
+              fixedWorkstream.worktreePath ?? fixedWorkstream.projectPath,
+            )}
+            {" · "}
+            {fixedWorkstream.branch}. This conversation will be linked to the
+            task. Add more repositories from task details.
+          </p>
+        ) : (
+          <section className="min-w-0">
+            <h3 className="mb-2 text-[12px] font-medium text-content/75">
+              Repositories
+            </h3>
+            <div className="flex min-w-0 flex-col gap-2">
+              {streams.map((stream) => {
+                // Claims against this row's repo: board lanes own their
+                // paths+branches; sibling rows claim each picked worktree
+                // and the branch it synced.
+                const excludePaths = new Set<string>();
+                const excludeBranches = new Set<string>();
+                for (const ws of lanes) {
+                  if (!sameProjectPath(ws.projectPath, stream.projectPath))
+                    continue;
+                  excludeBranches.add(ws.branch);
+                  if (ws.worktreePath)
+                    excludePaths.add(pathKey(ws.worktreePath));
+                }
+                for (const other of streams) {
+                  if (
+                    other === stream ||
+                    !sameProjectPath(other.projectPath, stream.projectPath)
+                  )
+                    continue;
+                  // "" is the auto-name sentinel, never a real claim.
+                  if (other.branch) excludeBranches.add(other.branch);
+                  if (other.worktreePath)
+                    excludePaths.add(pathKey(other.worktreePath));
+                }
+                return (
+                  <WorkstreamFields
+                    key={stream.key}
+                    draft={stream}
+                    defaultBranch={suggestedBranch(title, [
+                      ...selected.values(),
+                    ])}
+                    projects={projects}
+                    layer={LAYER.dialogPopover}
+                    excludeWorktreePaths={excludePaths}
+                    excludeBranches={excludeBranches}
+                    onChange={(patch) =>
+                      setStreams((current) =>
+                        current.map((entry) =>
+                          entry.key === stream.key
+                            ? { ...entry, ...patch }
+                            : entry,
+                        ),
+                      )
+                    }
+                    tail={
+                      <button
+                        type="button"
+                        aria-label={`Remove ${stream.projectPath ? projectName(stream.projectPath) : "repository"}`}
+                        onClick={() =>
+                          setStreams((current) =>
+                            current.filter((entry) => entry.key !== stream.key),
+                          )
+                        }
+                        className="grid size-7 shrink-0 place-items-center rounded-md text-content/40 outline-none hover:bg-content/8 hover:text-content focus-visible:ring-1 focus-visible:ring-accent/60"
+                      >
+                        <X className="size-3.5" strokeWidth={1.75} />
+                      </button>
+                    }
+                  />
+                );
+              })}
+            </div>
+            <div className="mt-2">
+              <SearchableSelect
+                label="Add repository"
+                value=""
+                options={projects}
+                placeholder="Add repository…"
+                searchPlaceholder="Search repositories…"
+                layer={LAYER.dialogPopover}
+                disabled={
+                  busy || submitting || streams.length >= MAX_WORKSTREAMS
+                }
+                onChange={(projectPath) => {
+                  if (projectPath)
+                    setStreams((current) => [
+                      ...current,
+                      {
+                        key: nextKey.current++,
+                        projectPath,
+                        branch: "",
+                        base: "",
+                      },
+                    ]);
+                }}
+              />
+            </div>
+            <p className="mt-2 text-[11px] leading-relaxed text-content/45">
+              {streams.length
+                ? "One agent session across these working copies. Nothing runs until you send a message."
+                : "Add a repository to start an agent, or create the task and set it up later."}
+            </p>
+          </section>
+        )}
 
         <section>
           <div className="mb-1 flex items-center justify-between">
@@ -636,121 +861,11 @@ export function NewTaskDialog({
           </div>
         </section>
 
-        <section>
-          <div className="mb-1 flex items-center justify-between">
-            <h3 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-content/40">
-              Workstreams
-            </h3>
-            <button
-              type="button"
-              disabled={streams.length >= MAX_WORKSTREAMS}
-              onClick={() =>
-                setStreams((current) => [
-                  ...current,
-                  { key: nextKey.current++, projectPath: "", branch: "", base: "" },
-                ])
-              }
-              className="flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium text-content/55 outline-none hover:bg-content/8 hover:text-content focus-visible:ring-1 focus-visible:ring-accent/60 disabled:opacity-40"
-            >
-              <Plus className="size-3" strokeWidth={2} />
-              Add repo
-            </button>
-          </div>
-          <div className="flex flex-col gap-1.5">
-            {streams.map((stream) => {
-              // Claims against this row's repo: board lanes own their
-              // paths+branches; sibling rows claim each picked worktree
-              // and the branch it synced.
-              const excludePaths = new Set<string>();
-              const excludeBranches = new Set<string>();
-              for (const ws of lanes) {
-                if (!sameProjectPath(ws.projectPath, stream.projectPath))
-                  continue;
-                excludeBranches.add(ws.branch);
-                if (ws.worktreePath) excludePaths.add(pathKey(ws.worktreePath));
-              }
-              for (const other of streams) {
-                if (
-                  other === stream ||
-                  !sameProjectPath(other.projectPath, stream.projectPath)
-                )
-                  continue;
-                // "" is the auto-name sentinel, never a real claim.
-                if (other.branch) excludeBranches.add(other.branch);
-                if (other.worktreePath)
-                  excludePaths.add(pathKey(other.worktreePath));
-              }
-              return (
-              <WorkstreamFields
-                key={stream.key}
-                draft={stream}
-                projects={projects}
-                layer={LAYER.dialogPopover}
-                excludeWorktreePaths={excludePaths}
-                excludeBranches={excludeBranches}
-                onChange={(patch) =>
-                  setStreams((current) =>
-                    current.map((entry) =>
-                      entry.key === stream.key ? { ...entry, ...patch } : entry,
-                    ),
-                  )
-                }
-                tail={
-                  streams.length > 1 ? (
-                    <button
-                      type="button"
-                      aria-label="Remove workstream"
-                      onClick={() =>
-                        setStreams((current) =>
-                          current.filter((entry) => entry.key !== stream.key),
-                        )
-                      }
-                      className="grid size-7 shrink-0 place-items-center rounded-md text-content/40 outline-none hover:bg-content/8 hover:text-content focus-visible:ring-1 focus-visible:ring-accent/60"
-                    >
-                      <X className="size-3.5" strokeWidth={1.75} />
-                    </button>
-                  ) : null
-                }
-              />
-              );
-            })}
-          </div>
-          <p className="mt-1.5 flex items-center gap-1 text-[11px] text-content/40">
-            <GitBranch className="size-3 shrink-0" strokeWidth={1.75} />
-            Each repo gets a new worktree on its branch, with a session bound
-            to it.
-          </p>
-        </section>
-
         {error ? (
           <p role="alert" className="text-[12px] text-red-300">
             {error}
           </p>
         ) : null}
-
-        <div className="flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onCancel}
-            disabled={busy || submitting}
-            className="rounded-md px-3 py-1.5 text-[12px] text-content/70 outline-none hover:bg-content/8 focus-visible:ring-2 focus-visible:ring-accent/60 active:scale-[0.97] disabled:opacity-50"
-          >
-            Cancel
-          </button>
-          <button
-            type="submit"
-            disabled={busy || submitting || !title.trim()}
-            className="inline-flex items-center gap-1.5 rounded-md bg-content px-3 py-1.5 text-[12px] font-medium text-background-base outline-none transition-transform focus-visible:ring-2 focus-visible:ring-accent active:scale-[0.97] disabled:opacity-40"
-          >
-            {busy || submitting ? (
-              <LoaderCircle
-                className="size-3.5 animate-spin"
-                strokeWidth={2}
-              />
-            ) : null}
-            Create task
-          </button>
-        </div>
       </form>
     </Modal>
   );

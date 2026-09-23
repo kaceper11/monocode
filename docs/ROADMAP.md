@@ -15,6 +15,8 @@ These steps describe intended work, not completed acceptance. WSL and existing s
 
 ## Ongoing policy
 
+The approved task-awareness slice extends the existing Board with session-header membership controls, derived sidebar task groups, and bounded task context on normal sends. Board task creation prepares the selected working copies and opens one task-level primary session. Adding a repository prepares its working copy without creating another session; older repository sessions remain available and can be selected as the primary conversation. Inbox details show all matching linked tasks and open the shared task draft with the selected ticket, retaining Board ownership checks and provider/account identity. Preserve upstream session persistence, worktree lifecycle, provider dispatch, and queue behavior; do not add another task or orchestration engine.
+
 Follow upstream for core features. Retire duplicate implementations when upstream supplies them. Keep provider choices independent and make unsupported operations explicit. Do not reinstate the old custom tasks/projects, action dispatchers, repairs, schedules/watchers or extensions-manager backlog. The browser side panel, Keep Awake, saved project commands without task scope, draft-only Actions prompts, terminal resource manager and dictation remain in scope. Features supplied by upstream remain available.
 
 Keep the existing fork identity, session/credential isolation, licences and release safeguards. No roadmap item authorizes publication or external mutations.

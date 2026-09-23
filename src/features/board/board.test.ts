@@ -2853,3 +2853,12 @@ it("preserves existing task data and backs it up before storing independent deli
   updateTask("legacy",{title:"Renamed"});
   expect(localStorage.getItem("monocode.board.v1.before-delivery")).toBe(original);
 });
+
+it("keeps the primary task conversation reachable without lane bindings or a loaded ticket summary", () => {
+  const build = (sessions: Session[]) => buildBoardCards({ items: [], summaries: [], sessions, locals: [], tasks: [task({ primarySessionId: "lead" })] });
+  expect(build([])[0].sessions).toEqual([{ id: "lead", title: "Task", live: false, busy: false, needsInput: false }]);
+  const cards = build([liveSession({ id: "lead", busy: true })]);
+  expect(cards).toHaveLength(1);
+  expect(cards[0].sessions).toHaveLength(1);
+  expect(cards[0].sessions[0]).toMatchObject({ id: "lead", live: true, busy: true });
+});

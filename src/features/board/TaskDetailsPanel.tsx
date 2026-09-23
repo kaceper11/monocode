@@ -608,9 +608,11 @@ export function TaskDetailsPanel({
   results,
   onClose,
   onOpenSession,
+  onSessionCreated,
   onSendToSession,
   onHandoff,
   onSpawnSession,
+  onPrepareWorktree,
   onBindSession,
   wsStatus,
   onUpdateBranches,
@@ -633,10 +635,12 @@ export function TaskDetailsPanel({
   results: ReadonlyMap<string, WorkstreamResult>;
   onClose: () => void;
   onOpenSession: (sessionId: string) => void;
+  onSessionCreated: (sessionId: string) => void;
   /** Open `sessionId` and submit `text` — used to hand a conflicted lane a
    * resolve prompt in a freshly spawned worktree session. */
   onSendToSession: SendToSession;
   onHandoff: (workstreamId: string, kind: HandoffKind) => void;
+  onPrepareWorktree: (spec: NewTaskSpec["workstreams"][number]) => Promise<string>;
   onSpawnSession: (spec: NewTaskSpec["workstreams"][number]) => Promise<{
     sessionId: string;
     worktreePath: string;
@@ -666,6 +670,26 @@ export function TaskDetailsPanel({
   const [sourceLane, setSourceLane] = useState<string>();
   const [addingStream, setAddingStream] = useState(false);
   const [streamError, setStreamError] = useState("");
+  const [creatingSession, setCreatingSession] = useState(false);
+  const createPrimarySession = async () => {
+    if (creatingSession) return;
+    const current = loadBoard().tasks.find((entry) => entry.id === task.id);
+    if (!current) return;
+    if (current.primarySessionId) { onOpenSession(current.primarySessionId); return; }
+    const ws = current.workstreams.find((row) => row.worktreePath);
+    if (!ws) { setShowAddStream(true); return; }
+    setCreatingSession(true);
+    setStreamError("");
+    try {
+      const spawned = await onSpawnSession(ws);
+      updateTask(task.id, { primarySessionId: spawned.sessionId });
+      onSessionCreated(spawned.sessionId);
+    } catch (error) {
+      setStreamError(shortError(error));
+    } finally {
+      setCreatingSession(false);
+    }
+  };
   /** A create that found a worktree already on the branch — confirm binds
    * that copy instead of failing. Lane-scoped when `workstreamId` is set. */
   const [bindOffer, setBindOffer] = useState<{
@@ -689,9 +713,11 @@ export function TaskDetailsPanel({
   // picker opens so a pick can't steal a binding from another task.
   const boundSessionIds = useMemo(() => {
     const ids = new Set<string>();
-    for (const entry of loadBoard().tasks)
+    for (const entry of loadBoard().tasks) {
+      if (entry.primarySessionId) ids.add(entry.primarySessionId);
       for (const ws of entry.workstreams)
         for (const id of ws.sessionIds ?? []) ids.add(id);
+    }
     return ids;
   }, [bindAt]);
   // Bound sessions carry the same link bundle spawned sessions get.
@@ -785,7 +811,7 @@ export function TaskDetailsPanel({
           return;
         }
       }
-      const spawned = await onSpawnSession({
+      const worktreePath = await onPrepareWorktree({
         projectPath: spec.projectPath,
         branch: resolved,
         base: spec.base,
@@ -799,8 +825,7 @@ export function TaskDetailsPanel({
             projectPath: spec.projectPath,
             branch: resolved,
             base: spec.base,
-            worktreePath: spawned.worktreePath,
-            sessionIds: [spawned.sessionId],
+            worktreePath,
           },
         ],
       }));
@@ -842,14 +867,13 @@ export function TaskDetailsPanel({
     return true;
   };
 
-  /** Spawn a session for a lane — bound to `worktreePath` when given (the
-   * bind-offer accept), else the lane's own worktree/create flow. */
-  const spawnForRow = async (
+  /** Prepare or rebind a working copy without creating another conversation. */
+  const prepareForRow = async (
     row: BoardWorkstreamRow,
     worktreePath?: string,
   ) => {
     const bound = worktreePath ?? row.worktreePath;
-    const spawned = await onSpawnSession({
+    const preparedPath = await onPrepareWorktree({
       projectPath: row.projectPath,
       branch: row.branch,
       base: row.base,
@@ -860,19 +884,17 @@ export function TaskDetailsPanel({
         ws.id === row.id
           ? {
               ...ws,
-              // A rebind landed mid-spawn wins — writing the spawn's own
+              // A rebind landed mid-prepare wins — writing the preparation's own
               // path would clobber the user's pick.
               worktreePath:
                 ws.worktreePath === row.worktreePath
-                  ? spawned.worktreePath
+                  ? preparedPath
                   : ws.worktreePath,
-              sessionIds: [...(ws.sessionIds ?? []), spawned.sessionId],
             }
           : ws,
       ),
     }));
-    // Spawning is an intent to chat — take the user to it.
-    onOpenSession(spawned.sessionId);
+
   };
 
   return (
@@ -884,6 +906,38 @@ export function TaskDetailsPanel({
       onClose={onClose}
     >
       <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-none px-3 py-3">
+        <div className="mb-4 rounded-lg border border-content/10 p-2.5">
+          <div className="mb-1 text-[11px] font-medium text-content/85">Task session</div>
+          <p className="mb-2 text-[11px] text-content/50">One conversation across this task’s working copies.</p>
+          <button
+            type="button"
+            disabled={creatingSession || !!busyAction}
+            onClick={() => void createPrimarySession()}
+            className="rounded-md bg-accent/10 px-2 py-1.5 text-[11px] font-medium text-accent hover:bg-accent/20 disabled:opacity-40"
+          >
+            {creatingSession ? "Creating…" : task.primarySessionId ? "Open task session" : "Create task session"}
+          </button>
+          {!task.primarySessionId && card.sessions.length > 0 && (
+            <select
+              aria-label="Use existing task session"
+              value=""
+              disabled={creatingSession || !!busyAction}
+              className="mt-2 w-full min-w-0 rounded border border-content/10 bg-field px-2 py-1 text-[11px]"
+              onChange={(event) => {
+                const id = event.target.value;
+                const tasks = loadBoard().tasks;
+                if (tasks.some((entry) => entry.id !== task.id && (entry.primarySessionId === id || entry.workstreams.some((ws) => ws.sessionIds?.includes(id))))) {
+                  setStreamError("This conversation already belongs to another task.");
+                  return;
+                }
+                if (task.workstreams.some((ws) => ws.sessionIds?.includes(id))) updateTask(task.id, { primarySessionId: id });
+              }}
+            >
+              <option value="">Use an existing conversation…</option>
+              {card.sessions.filter((session) => task.workstreams.some((ws) => ws.sessionIds?.includes(session.id))).map((session) => <option key={session.id} value={session.id}>{session.title}</option>)}
+            </select>
+          )}
+        </div>
         {/* Tickets -------------------------------------------------- */}
         <div className="mb-1.5 flex items-center justify-between">
           <SectionLabel>Tickets</SectionLabel>
@@ -1082,7 +1136,7 @@ export function TaskDetailsPanel({
           />
         ) : null}
         {streamError ? (
-          <p role="alert" className="mt-1 break-words text-[11px] text-red-300">
+          <p role="alert" className="mt-1 whitespace-pre-wrap [overflow-wrap:anywhere] text-[11px] text-red-300">
             {streamError}
           </p>
         ) : null}
@@ -1118,7 +1172,7 @@ export function TaskDetailsPanel({
                 // on one worktree.
                 if (laneOwnsPath(offer.path, row.id))
                   throw new Error("That worktree already serves another lane");
-                await spawnForRow(row, offer.path);
+                await prepareForRow(row, offer.path);
                 setBindOffer(null);
               }}
               onOfferDismiss={() => setBindOffer(null)}
@@ -1141,7 +1195,7 @@ export function TaskDetailsPanel({
                   }
                 }
                 try {
-                  await spawnForRow(row);
+                  await prepareForRow(row);
                 } catch (error) {
                   // The probe→create race can still collide — same offer,
                   // second chance instead of a dead-end error.
@@ -1627,7 +1681,7 @@ function WorkstreamCard({
     if (!cleanupOffered) setArmed(false);
   }, [cleanupOffered]);
   return (
-    <div className="rounded-lg border border-content/8 bg-content/[0.015] px-2 py-1.5">
+    <div className="min-w-0 rounded-lg border border-content/8 bg-content/[0.015] px-2 py-1.5">
       <button
         type="button"
         aria-label={`Repository details for ${projectName(row.projectPath)}`}
@@ -1769,7 +1823,7 @@ function WorkstreamCard({
           </button>
         ) : null}
       </div>
-      <div className="mt-1 flex items-center justify-between gap-1">
+      <div className="mt-1 flex min-w-0 flex-wrap items-center justify-between gap-1">
         <CiBadge status={status} onFix={() => onHandoff("ci")} />
         <button
           type="button"
@@ -1783,12 +1837,27 @@ function WorkstreamCard({
           className="inline-flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-[10px] text-content/40 hover:bg-content/8 hover:text-content/70 focus-visible:outline-accent"
         >
           <FolderTree className="size-3" />
-          {row.worktreePath ? "Attached" : "No worktree"}
+          {row.worktreePath ? "Prepared" : "No worktree"}
           {row.sessionIds.length
             ? ` · ${row.sessionIds.length} agent${row.sessionIds.length === 1 ? "" : "s"}`
             : ""}
         </button>
       </div>
+      {!row.worktreePath && <div className="mt-2 flex items-center justify-end border-t border-content/6 pt-1.5">
+        <button
+          type="button"
+          disabled={laneBusy}
+          className="flex items-center gap-1.5 rounded-md bg-accent/10 px-2 py-1 text-[11px] font-medium text-accent hover:bg-accent/20 disabled:opacity-40"
+          onClick={() => void runAction("spawn", onSpawnSession)}
+        >
+          {pending === "spawn" ? (
+            <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
+          ) : (
+            <Plus className="size-3" strokeWidth={2} />
+          )}
+          Prepare worktree
+        </button>
+      </div>}
       {row.merging && !expanded && (
         <button
           className="mt-1 text-[11px] text-red-500"
@@ -2041,23 +2110,7 @@ function WorkstreamCard({
               <GitMerge className="size-3" strokeWidth={1.75} />
               Update
             </button>
-            <button
-              type="button"
-              disabled={laneBusy}
-              className="flex items-center gap-1 rounded px-1 py-0.5 text-[11px] text-content/50 hover:bg-content/8 hover:text-content disabled:opacity-40"
-              onClick={() => void runAction("spawn", onSpawnSession)}
-            >
-              {pending === "spawn" ? (
-                <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
-              ) : (
-                <Plus className="size-3" strokeWidth={2} />
-              )}
-              {row.sessionIds.length
-                ? "New chat"
-                : row.worktreePath
-                  ? "Start session"
-                  : "Create worktree"}
-            </button>
+
             <button
               type="button"
               disabled={laneBusy}
@@ -2088,24 +2141,26 @@ function WorkstreamCard({
         </div>
       )}
       {row.probeError ? (
-        <p
-          className="mt-1 break-words text-[10px] text-amber-700 dark:text-amber-300"
-          title={row.probeError}
-        >
-          {row.probeError}
-        </p>
+        <details className="mt-2 min-w-0 rounded-md bg-amber-500/8 px-2 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">
+          <summary className="cursor-pointer focus-visible:outline-accent">
+            Worktree status unavailable
+          </summary>
+          <p className="mt-1.5 whitespace-pre-wrap [overflow-wrap:anywhere]">
+            {row.probeError}
+          </p>
+        </details>
       ) : null}
       {actionError ? (
         <p
           role="alert"
-          className="mt-1 break-words text-[10px] text-red-700 dark:text-red-300"
+          className="mt-1 whitespace-pre-wrap [overflow-wrap:anywhere] text-[10px] text-red-700 dark:text-red-300"
         >
           {actionError}
         </p>
       ) : null}
       {result ? (
         <p
-          className={`mt-1 break-words text-[10px] ${
+          className={`mt-1 whitespace-pre-wrap [overflow-wrap:anywhere] text-[10px] ${
             result.ok ? "text-content/40" : "text-red-700 dark:text-red-300"
           }`}
         >
@@ -2372,7 +2427,7 @@ function WorkstreamEditor({
         </button>
       ) : null}
       {error ? (
-        <p role="alert" className="break-words text-[10px] text-red-700 dark:text-red-300">
+        <p role="alert" className="whitespace-pre-wrap [overflow-wrap:anywhere] text-[10px] text-red-700 dark:text-red-300">
           {error}
         </p>
       ) : null}

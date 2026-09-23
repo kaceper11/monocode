@@ -8,6 +8,7 @@ import {
   ArrowUp,
   Bot,
   CircleDot,
+  ChevronRight,
   Clock,
   ExternalLink,
   FolderTree,
@@ -281,6 +282,7 @@ export function BoardCardView({
   onAction: (card: BoardCard, action: BoardCardAction) => void;
   onDragStart: (card: BoardCard, event: React.PointerEvent) => void;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
   const lines = cardAttentionLines(card, column);
   const liveSession = card.sessions.find((session) => session.live);
@@ -352,7 +354,7 @@ export function BoardCardView({
           onAction(card, { kind: "open-task" });
         }
       }}
-      className={`group relative cursor-grab rounded-xl border px-2.5 py-2 outline-none transition-opacity focus-visible:ring-1 focus-visible:ring-accent/60 ${groupWash} ${
+      className={`group relative min-w-0 cursor-grab rounded-xl border px-2.5 py-2 outline-none transition-opacity focus-visible:ring-1 focus-visible:ring-accent/60 ${groupWash} ${
         dragging ? "opacity-40" : stale ? "opacity-60" : ""
       }`}
     >
@@ -462,6 +464,24 @@ export function BoardCardView({
         </div>
       ) : null}
       {card.kind === "task" ? (
+        <button
+          type="button"
+          aria-label={`Details for ${card.title}`}
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+          className="mt-1.5 flex w-full min-w-0 items-center gap-1 rounded py-1 text-left text-[11px] text-content/55 hover:bg-content/5 hover:text-content focus-visible:outline-accent"
+        >
+          <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+            {card.workstreams?.length ?? 0} {card.workstreams?.length === 1 ? "repo" : "repos"} · {card.sessions.length} {card.sessions.length === 1 ? "agent" : "agents"}
+            {card.tickets?.length ? ` · ${card.tickets.length} ${card.tickets.length === 1 ? "ticket" : "tickets"}` : ""}
+          </span>
+          <ChevronRight className={`size-3 shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`} />
+        </button>
+      ) : null}
+      {card.kind === "task" && card.workstreams?.some((row) => row.probeError) ? (
+        <p className="mt-1 text-[10px] text-amber-700 dark:text-amber-300">Worktree needs attention</p>
+      ) : null}
+      {card.kind === "task" && expanded ? (
         <TaskMeta
           card={card}
           onOpenSession={(sessionId) =>
@@ -525,7 +545,7 @@ export function BoardCardView({
 
       {/* Footer only renders when there's a real action — details is reached
        * via the title or ⋯ menu. */}
-      {hasActions ? (
+      {hasActions && (card.kind !== "task" || expanded) ? (
         <div className="mt-1.5 flex flex-wrap items-center gap-1">
           {showStart ? (
             <button

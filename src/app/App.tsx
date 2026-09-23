@@ -479,6 +479,8 @@ import { SettingsView, type SettingsAnchor } from "../features/settings/ui/Setti
 import type { ConnectableInboxSource } from "../features/inbox/model/inboxFilters";
 import { InboxView, LinkedWorkItemPanel } from "../features/inbox/ui/InboxView";
 import { BoardView } from "../features/board/BoardView";
+import { CREATE_TASK_EVENT } from "../features/board/InboxTaskLinks";
+import { OPEN_TASK_EVENT } from "../features/board/taskSession";
 import type { TaskWorkstreamSpec } from "../features/board/NewTaskDialog";
 import {
   boardSnapshot,
@@ -861,6 +863,8 @@ export default function App({
   const [searchViewFocusToken, setSearchViewFocusToken] = useState(0);
   const [inboxViewOpen, setInboxViewOpen] = useState(false);
   const [boardViewOpen, setBoardViewOpen] = useState(false);
+  const [boardNewTaskRequest, setBoardNewTaskRequest] = useState<{ item: InboxItem } | null>(null);
+  const [boardTaskRequest, setBoardTaskRequest] = useState<{ id: string } | null>(null);
   const [linkedWorkItemPanels, setLinkedWorkItemPanels] = useState<
     ReadonlyMap<string, LinkedWorkItemPanelState>
   >(() => new Map());
@@ -8240,6 +8244,8 @@ export default function App({
   }, []);
 
   const onOpenBoard = useCallback(() => {
+    setBoardTaskRequest(null);
+    setBoardNewTaskRequest(null);
     setFilePickerOpen(false);
     setSettingsOpen(false);
     setSearchViewOpen(false);
@@ -8254,6 +8260,27 @@ export default function App({
     boardReturnRef.current = false;
     setBoardViewOpen(false);
   }, []);
+
+  useEffect(() => {
+    const openTask = (event: Event) => {
+      const id: unknown = (event as CustomEvent).detail;
+      if (typeof id !== "string") return;
+      onOpenBoard();
+      setBoardTaskRequest({ id });
+    };
+    const createTask = (event: Event) => {
+      const item = (event as CustomEvent<InboxItem>).detail;
+      if (!item || typeof item.title !== "string" || typeof item.url !== "string") return;
+      onOpenBoard();
+      setBoardNewTaskRequest({ item });
+    };
+    window.addEventListener(OPEN_TASK_EVENT, openTask);
+    window.addEventListener(CREATE_TASK_EVENT, createTask);
+    return () => {
+      window.removeEventListener(OPEN_TASK_EVENT, openTask);
+      window.removeEventListener(CREATE_TASK_EVENT, createTask);
+    };
+  }, [onOpenBoard]);
 
   const onOpenBoardSession = useCallback(
     (sessionId: string) => {
@@ -8289,15 +8316,9 @@ export default function App({
     [onSelectHistorySession, onSubmit],
   );
 
-  // Board task workstreams are eager: the worktree exists (or is created now)
-  // and the session starts bound to it — unlike the composer's lazy worktrees.
-  const onBoardSpawnSession = useCallback(
-    async (
-      spec: TaskWorkstreamSpec & {
-        title: string;
-        links: LinkedWorkItem[];
-      },
-    ) => {
+  // Board working copies are prepared independently of conversations.
+  const onBoardPrepareWorktree = useCallback(
+    async (spec: TaskWorkstreamSpec) => {
       let worktreePath = spec.worktreePath;
       if (!worktreePath) {
         // A partial earlier attempt can leave the branch behind — adopt it
@@ -8337,6 +8358,14 @@ export default function App({
           );
         }
       }
+      return worktreePath;
+    },
+    [],
+  );
+
+  const onBoardSpawnSession = useCallback(
+    async (spec: TaskWorkstreamSpec & { title: string; links: LinkedWorkItem[] }) => {
+      const worktreePath = await onBoardPrepareWorktree(spec);
       const linkedWorkItem = linkBundleFromLinks(spec.links) ?? undefined;
       const session = {
         ...newDefaultSession(spec.projectPath, sessionDefaults?.runtimeMode),
@@ -8351,7 +8380,7 @@ export default function App({
       persistSession(session);
       return { sessionId: session.id, worktreePath };
     },
-    [appendTab, sessionDefaults?.runtimeMode],
+    [appendTab, sessionDefaults?.runtimeMode, onBoardPrepareWorktree],
   );
 
   const onBoardBindSession = useCallback(
@@ -9605,6 +9634,8 @@ export default function App({
               ) : null}
               {boardViewOpen ? (
                 <BoardView
+                  taskRequest={boardTaskRequest}
+                  newTaskRequest={boardNewTaskRequest}
                   cwd={sidebarCwd}
                   recents={recents}
                   besideRail={projectRailOpen || compactProjectRail}
@@ -9616,6 +9647,7 @@ export default function App({
                   onStartItem={onStartInboxItem}
                   onSendToSession={onBoardSendToSession}
                   onSpawnSession={onBoardSpawnSession}
+                  onPrepareWorktree={onBoardPrepareWorktree}
                   onBindSession={onBoardBindSession}
                   onRemoveWorktree={onRemoveWorktree}
                 />

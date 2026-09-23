@@ -1,10 +1,21 @@
 // @vitest-environment happy-dom
-import { act, createElement } from "react";
+import { act, createElement, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import * as taskOps from "./taskOps";
+import { deliveryKey } from "./delivery";
 import { BoardView } from "./BoardView";
-import { loadBoard } from "./boardStore";
+import { addTask, loadBoard, updateTask } from "./boardStore";
 import type { InboxItem } from "../inbox/model/githubTasks";
+
+let submitTask: ComponentProps<typeof import("./NewTaskDialog").NewTaskDialog>["onSubmit"];
+vi.mock("./NewTaskDialog", async (original) => {
+  const actual = await original<typeof import("./NewTaskDialog")>();
+  return { ...actual, NewTaskDialog: (props: ComponentProps<typeof actual.NewTaskDialog>) => {
+    submitTask = props.onSubmit;
+    return createElement(actual.NewTaskDialog, props);
+  } };
+});
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async () => null),
@@ -57,9 +68,10 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
-async function renderBoard() {
+async function renderBoard(overrides: Partial<ComponentProps<typeof BoardView>> = {}) {
   await act(async () =>
     root.render(
       createElement(BoardView, {
@@ -73,12 +85,33 @@ async function renderBoard() {
         onStartItem: vi.fn(),
         onSendToSession: vi.fn(),
         onSpawnSession: vi.fn(),
+        onPrepareWorktree: vi.fn(async (spec) => `${spec.projectPath}-task`),
         onBindSession: vi.fn(),
         onRemoveWorktree: vi.fn(),
+        ...overrides,
       }),
     ),
   );
 }
+
+it("creates a task-linked agent from the Board and opens it after the live session arrives", async () => {
+  const onOpenSession = vi.fn();
+  const onSpawnSession = vi.fn(async () => ({ sessionId: "new-agent", worktreePath: "/repo-task" }));
+  await renderBoard({ onOpenSession, onSpawnSession });
+  await act(async () => button("New task").click());
+  const input = document.querySelector<HTMLInputElement>('input[placeholder="e.g. Auth token refresh across services"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "Checkout task");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await act(async () => input.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  expect(onSpawnSession).toHaveBeenCalledWith(expect.objectContaining({ projectPath: "/repo", title: "Checkout task" }));
+  expect(loadBoard().tasks[0].primarySessionId).toBe("new-agent");
+  expect(loadBoard().tasks[0].workstreams[0].sessionIds).toBeUndefined();
+  expect(onOpenSession).not.toHaveBeenCalled();
+  await renderBoard({ onOpenSession, onSpawnSession, sessions: [{ id: "new-agent", title: "Checkout task", cwd: "/repo", worktreeCwd: "/repo-task", harness: "codex", model: "", modelSettings: {}, runtimeMode: "supervised", blocks: [] }] });
+  expect(onOpenSession).toHaveBeenCalledExactlyOnceWith("new-agent");
+});
 function button(label: string, scope: ParentNode = document) {
   const result = [...scope.querySelectorAll<HTMLButtonElement>("button")].find(
     (el) =>
@@ -186,4 +219,90 @@ it("keeps Board filters open when choosing an Updated dropdown option", async ()
     "Last 7 days",
   );
   expect(document.querySelector('[aria-label="Updated options"]')).toBeNull();
+});
+
+it("prepares multiple repositories but creates exactly one primary conversation", async () => {
+  const onPrepareWorktree = vi.fn(async (spec) => `${spec.projectPath}-task`);
+  const onSpawnSession = vi.fn(async (spec) => ({ sessionId: "lead", worktreePath: spec.worktreePath }));
+  await renderBoard({ onPrepareWorktree, onSpawnSession });
+  await act(async () => button("New task").click());
+  await act(async () => submitTask({ title: "Shared task", links: [], workstreams: [
+    { projectPath: "/web", branch: "feature", base: "main" },
+    { projectPath: "/api", branch: "feature", base: "main" },
+  ] }));
+  expect(onPrepareWorktree).toHaveBeenCalledTimes(2);
+  expect(onSpawnSession).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ projectPath: "/web", worktreePath: "/web-task" }));
+  expect(loadBoard().tasks[0]).toMatchObject({ primarySessionId: "lead", workstreams: [
+    { projectPath: "/web", worktreePath: "/web-task" },
+    { projectPath: "/api", worktreePath: "/api-task" },
+  ] });
+  expect(loadBoard().tasks[0].workstreams.every(ws => !ws.sessionIds)).toBe(true);
+});
+
+it("retains prepared worktrees when primary session creation fails so it can be retried", async () => {
+  const onSpawnSession = vi.fn(async () => { throw new Error("Agent unavailable"); });
+  await renderBoard({ onSpawnSession });
+  await act(async () => button("New task").click());
+  await act(async () => submitTask({ title: "Retry task", links: [], workstreams: [
+    { projectPath: "/repo", branch: "feature", base: "main" },
+  ] }));
+  expect(loadBoard().tasks[0]).toMatchObject({ title: "Retry task", workstreams: [{ worktreePath: "/repo-task" }] });
+  expect(loadBoard().tasks[0].primarySessionId).toBeUndefined();
+  expect(container.textContent).toContain("Agent unavailable");
+  expect(button("Create task session")).toBeDefined();
+});
+
+it("can adopt an existing repository conversation as primary without starting another agent", async () => {
+  const id = addTask({ title: "Existing task", links: [], workstreams: [{ id: "repo", projectPath: "/repo", worktreePath: "/repo-task", branch: "feature", base: "main", sessionIds: ["existing"] }] })!;
+  const onSpawnSession = vi.fn();
+  const onOpenSession = vi.fn();
+  await renderBoard({ taskRequest: { id }, onSpawnSession, onOpenSession, sessions: [{ id: "existing", title: "Existing conversation", cwd: "/repo", worktreeCwd: "/repo-task", harness: "codex", model: "", modelSettings: {}, runtimeMode: "supervised", blocks: [] }] });
+  const select = container.querySelector<HTMLSelectElement>('[aria-label="Use existing task session"]')!;
+  await act(async () => { select.value = "existing"; select.dispatchEvent(new Event("change", { bubbles: true })); });
+  expect(loadBoard().tasks[0].primarySessionId).toBe("existing");
+  expect(loadBoard().tasks[0].workstreams[0].sessionIds).toEqual(["existing"]);
+  expect(onSpawnSession).not.toHaveBeenCalled();
+  await act(async () => button("Open task session").click());
+  expect(onOpenSession).toHaveBeenCalledWith("existing");
+});
+
+it("opens an Inbox task draft with its ticket linked and no side effects until submission", async () => {
+  const onPrepareWorktree = vi.fn();
+  const onSpawnSession = vi.fn();
+  await renderBoard({ newTaskRequest: { item: items[0] }, onPrepareWorktree, onSpawnSession });
+  expect(document.querySelector<HTMLInputElement>('input[placeholder="e.g. Auth token refresh across services"]')?.value).toBe(items[0].title);
+  expect(loadBoard().tasks).toEqual([]);
+  expect(onPrepareWorktree).not.toHaveBeenCalled(); expect(onSpawnSession).not.toHaveBeenCalled();
+  const form = document.querySelector<HTMLInputElement>('input[placeholder="e.g. Auth token refresh across services"]')!.closest("form")!;
+  await act(async () => form.querySelector<HTMLButtonElement>('[aria-label="Remove repo"]')!.click());
+  await act(async () => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+  expect(loadBoard().tasks[0].links[0]).toMatchObject({ provider: items[0].provider, url: items[0].url });
+  expect(onPrepareWorktree).not.toHaveBeenCalled(); expect(onSpawnSession).not.toHaveBeenCalled();
+});
+
+it("rejects an Inbox task's already-owned branch before preparing worktrees or creating a session", async () => {
+  addTask({ title: "Existing owner", links: [], workstreams: [{ id: "owned", projectPath: "/repo", branch: "feature", base: "main", worktreePath: "/repo-task" }] });
+  const onPrepareWorktree = vi.fn(); const onSpawnSession = vi.fn();
+  await renderBoard({ newTaskRequest: { item: items[0] }, onPrepareWorktree, onSpawnSession });
+  await act(async () => submitTask({ title: "Another task", links: [], workstreams: [{ projectPath: "/repo", branch: "feature", base: "main" }] }));
+  expect(onPrepareWorktree).not.toHaveBeenCalled(); expect(onSpawnSession).not.toHaveBeenCalled();
+  expect(loadBoard().tasks).toHaveLength(1);
+  expect(document.body.textContent).toContain("already tracks feature");
+});
+
+it("retains task status across Board remounts while refreshing and rejects changed checkout snapshots", async () => {
+  const ws = { id: "cached-ws", projectPath: "/repo", worktreePath: "/repo-task", branch: "feature", base: "main" };
+  const id = addTask({ title: "Cached task", links: [], workstreams: [ws] })!;
+  const probe = vi.spyOn(taskOps, "probeWorkstream").mockResolvedValue({ pr: null, checks: [], requestKey: deliveryKey(ws), fetchedAt: Date.now() });
+  await renderBoard({ taskRequest: { id } });
+  expect(container.textContent).toContain("No pull request");
+  await act(async () => root.unmount());
+  root = createRoot(container);
+  probe.mockImplementation(() => new Promise(() => {}));
+  await renderBoard({ taskRequest: { id } });
+  expect(probe).toHaveBeenCalledTimes(2);
+  expect(container.textContent).toContain("No pull request");
+  expect(container.textContent).not.toContain("Looking for PR…");
+  await act(async () => updateTask(id, { workstreams: [{ ...ws, branch: "other" }] }));
+  expect(container.textContent).toContain("Looking for PR…");
 });

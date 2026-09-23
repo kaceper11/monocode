@@ -28,6 +28,8 @@ Agent adapters retain their actual provider semantics. Unsupported operations an
 
 ## Compatibility and maintenance
 
+The existing Board may group worktrees and ordinary sessions into tasks. Keep task membership in Board records, expose a compact task chip above the session transcript, and derive sidebar task groups without rewriting saved folders. New tasks use one primary conversation across their prepared working copies, with one starting directory. Task context accompanies user-dispatched turns and identifies each checkout and execution host; provider approvals still apply. Existing per-repository sessions remain available. Membership changes must not restart agents, send turns, or change working directories. This narrow task-awareness slice does not authorize restoring the previous custom task engine.
+
 Use focused branches and review fork differences file by file, including individual hunks in mixed files. Every remaining difference needs a retained-scope or safety reason. Recheck upstream before adding functionality. Minimize touched upstream files and divergence; future conflict-free merges cannot be guaranteed.
 
 Preserve the distinct fork application/data identity and release safeguards. Never overwrite another installation's sessions or credentials. Removing UI does not authorize deleting stored records, downloaded assets, repositories or worktrees. Any necessary migration must be recoverable and covered by old-data checks.

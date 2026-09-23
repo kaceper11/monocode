@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearInboxCache,
   listInboxItems,
+  peekInboxList,
   type GithubTaskKind,
   type GithubWorkItem,
 } from "./githubTasks";
@@ -284,6 +285,20 @@ describe.each([
       expect(invoke).toHaveBeenCalledWith("azure_devops_list_work_items", expect.objectContaining({ assignedToMe: false }));
     });
   }
+
+  it("retains separate Board and Inbox snapshots across navigation and clears them on reset", async () => {
+    const boardQuery = { ...query, state: "all" } as const;
+    const board = await listInboxItems(projects, boardQuery);
+    const inbox = await listInboxItems(projects, query);
+    expect(peekInboxList(projects, boardQuery)).toEqual(board);
+    expect(peekInboxList(projects, query)).toEqual(inbox);
+    list.mockClear();
+    await listInboxItems(projects, boardQuery);
+    expect(list).not.toHaveBeenCalled();
+    clearInboxCache();
+    expect(peekInboxList(projects, boardQuery)).toBeNull();
+    expect(peekInboxList(projects, query)).toBeNull();
+  });
 
   it("skips disconnected providers", async () => {
     connected = false;

@@ -6,6 +6,8 @@ import { formatSessionTitle } from "../../features/sessions/model/session";
 import { formatReminderTime } from "../../features/sessions/model/sessionReminders";
 import { Sidebar } from "./Sidebar";
 import { loadSessionFolders } from "../../features/sessions/model/sessionFolders";
+import { addTask } from "../../features/board/boardStore";
+import { detachTaskSession } from "../../features/board/taskSession";
 import { useProjectDiffStats } from "../../features/source-control/hooks/useProjectDiffStats";
 
 // Keep native services out of these menu/input interaction tests.
@@ -73,6 +75,28 @@ function startRename() {
   act(() => rename.click());
   return renameInput();
 }
+
+it("groups task sessions under their purpose and restores ordinary rows after detach", async () => {
+  await act(async () => {
+    addTask({ title: "Checkout across services", links: [], workstreams: [{
+      id: "web", projectPath: props.cwd, worktreePath: props.cwd,
+      branch: "main", base: "main", sessionIds: ["session-1"],
+    }] });
+    render();
+  });
+  const group = container.querySelector('[data-task-session-group]')!;
+  expect(group.textContent).toContain("Checkout across services");
+  expect(group.querySelector('[data-session-card="session-1"]')).toBeTruthy();
+  expect(loadSessionFolders(props.cwd)).toEqual([]);
+  const header = group.querySelector<HTMLButtonElement>('button[aria-expanded]')!;
+  await act(async () => header.click());
+  expect(group.querySelector('[data-session-card="session-1"]')).toBeNull();
+  await act(async () => header.click());
+  expect(group.querySelector('[data-session-card="session-1"]')).toBeTruthy();
+  await act(async () => detachTaskSession("session-1"));
+  expect(container.querySelector('[data-task-session-group]')).toBeNull();
+  expect(card()).toBeTruthy();
+});
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);

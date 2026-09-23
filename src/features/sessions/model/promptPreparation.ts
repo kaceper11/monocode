@@ -14,6 +14,7 @@ import {
 import { prepareAttachments } from "./attachments";
 import { beginSessionTurn } from "./checkpoint";
 import type { Attachment } from "./session";
+import { taskSessionPrompt } from "../../board/taskSession";
 
 /** Independent reads overlap, but the pre-edit snapshot still gates dispatch. */
 export async function prepareTurn(
@@ -41,7 +42,12 @@ export async function prepareTurn(
           .catch(() => undefined)
       : Promise.resolve(),
   ]);
-  return { text: prompt, attachments: prepared };
+  return {
+    text: isNativeCommandPrompt(text, context.harness)
+      ? prompt
+      : taskSessionPrompt(prompt, context.sessionId, context.cwd),
+    attachments: prepared,
+  };
 }
 
 export async function preparePrompt(

@@ -191,7 +191,8 @@ type InboxListCache = InboxListResult & {
   fetchedAt: number;
 };
 
-let inboxListCache: InboxListCache | null = null;
+// Keep Board and Inbox query snapshots independently during background refresh.
+const inboxListCache = new Map<string, InboxListCache>();
 let inboxGeneration = 0;
 const inboxListInflight = new Map<string, Promise<InboxListResult>>();
 const repoByPath = new Map<string, string>();
@@ -207,7 +208,7 @@ const prDiffInflight = new Map<string, Promise<GithubPrDiff>>();
 export function clearInboxCache() {
   inboxGeneration++;
   clearKnownInboxItems();
-  inboxListCache = null;
+  inboxListCache.clear();
   inboxListInflight.clear();
   repoByPath.clear();
   repositoriesByPath.clear();
@@ -239,8 +240,8 @@ export function peekInboxList(
   query: InboxQuery,
 ): InboxListResult | null {
   const key = inboxListCacheKey(projects, query);
-  if (inboxListCache?.key !== key) return null;
-  return { items: inboxListCache.items, errors: inboxListCache.errors };
+  const cached = inboxListCache.get(key);
+  return cached ? { items: cached.items, errors: cached.errors } : null;
 }
 
 export function peekInboxItems(
@@ -256,10 +257,8 @@ export function inboxListIsFresh(
   now = Date.now(),
 ): boolean {
   const key = inboxListCacheKey(projects, query);
-  return (
-    inboxListCache?.key === key &&
-    now - inboxListCache.fetchedAt < INBOX_CACHE_FRESH_MS
-  );
+  const cached = inboxListCache.get(key);
+  return !!cached && now - cached.fetchedAt < INBOX_CACHE_FRESH_MS;
 }
 
 export function githubStatus(): Promise<GithubStatus> {
@@ -535,10 +534,10 @@ export async function githubPrAction(
   });
   const key = workItemLookupKey(repo, "pr", number);
   workItemByKey.set(key, item);
-  if (inboxListCache) {
-    inboxListCache = {
-      ...inboxListCache,
-      items: inboxListCache.items.map((cached) =>
+  for (const [cacheKey, snapshot] of inboxListCache) {
+    inboxListCache.set(cacheKey, {
+      ...snapshot,
+      items: snapshot.items.map((cached) =>
         cached.provider === "github" &&
         cached.kind === "pr" &&
         cached.repo.toLowerCase() === repo.trim().toLowerCase() &&
@@ -546,7 +545,7 @@ export async function githubPrAction(
           ? { ...cached, ...item }
           : cached,
       ),
-    };
+    });
   }
   recordInboxSelfActivity({ provider: "github", kind: "pr", repo, number });
   return item;
@@ -672,7 +671,12 @@ export async function listInboxItems(
   const generation = inboxGeneration;
   const promise = fetchInboxItems(projects, query)
     .then((result) => {
-      if (generation === inboxGeneration) inboxListCache = { key, ...result, fetchedAt: Date.now() };
+      if (generation === inboxGeneration) {
+        inboxListCache.delete(key);
+        inboxListCache.set(key, { key, ...result, fetchedAt: Date.now() });
+        // Bound retained query results; evicted views load normally next time.
+        if (inboxListCache.size > 8) inboxListCache.delete(inboxListCache.keys().next().value!);
+      }
       return result;
     })
     .finally(() => {

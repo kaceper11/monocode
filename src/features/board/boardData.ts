@@ -909,6 +909,7 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     const card = newTaskCard(task, groupById);
     cards.set(card.id, card);
     taskCards.push(card);
+    if (task.primarySessionId) taskBySession.set(task.primarySessionId, { card });
     taskPatterns.set(
       card,
       task.links.flatMap(link => sessionWorkItems({ linkedWorkItem: link })).flatMap(ticketKeys).map(ticketKeyPattern),
@@ -1187,6 +1188,11 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
   }
 
   for (const card of cards.values()) {
+    // Task-owned conversations remain reachable even when the history query
+    // only returned sessions with ticket links.
+    if (card.task?.primarySessionId && !card.sessionIds.has(card.task.primarySessionId)) {
+      pushSession(card, { id: card.task.primarySessionId, title: card.task.title, live: false, busy: false, needsInput: false });
+    }
     // Resolve each lane's bound refs in binding order; the card's own
     // `sessions` list already collected exactly these via taskBySession.
     const refsById = new Map(card.sessions.map((ref) => [ref.id, ref]));
