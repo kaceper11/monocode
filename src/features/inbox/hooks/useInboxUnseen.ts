@@ -1,3 +1,4 @@
+import { loadJiraRelationship } from "../../sessions/model/jira";
 import {
   useCallback,
   useEffect,
@@ -209,15 +210,17 @@ export function useInboxActivity(
       const filters = pruneInboxFilters(loadInboxFilters(), projectPaths);
       const query: InboxQuery = {
         assignedToMe: filters.assignedToMe,
+        azureRelationship: filters.azureRelationship ?? "related",
+        jiraRelationship: loadJiraRelationship(),
         state: inboxFetchState(filters),
         search: "",
         linearHiddenTeamIds: loadHiddenLinearTeamIds(),
       };
       try {
         // Preserve upstream's no-project boundary; added services are project-independent.
-        const listed = projects.length
+        const listed = projects.length || query.azureRelationship !== "all"
           ? await listInboxItems(projects, query, { force })
-          : await listInboxIntegrations(query.state, query.assignedToMe);
+          : await listInboxIntegrations(query.state, query.assignedToMe, query.jiraRelationship);
         if (cancelled) return;
         const visible = applyInboxFilters(listed.items, filters, "");
         rememberNotificationProjects(

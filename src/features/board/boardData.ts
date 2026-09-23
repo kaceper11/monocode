@@ -14,6 +14,9 @@ import {
 import type { SessionSummary } from "../sessions/data/sessionStore";
 import {
   inboxItemMatchesLinkedWorkItem,
+  indexByWorkItem,
+  relatedFromIndex,
+  linkedWorkItemNeedsAccount,
   linkedWorkItemFromInboxItem,
   linkedWorkItemInboxKey,
   sessionWorkItems,
@@ -828,7 +831,7 @@ function newTaskCard(
     kind: "task",
     title: task.title,
     task,
-    tickets: task.links.map(ticketChipFromLink),
+    tickets: task.links.flatMap(link => sessionWorkItems({ linkedWorkItem: link })).map(ticketChipFromLink),
     ...(resolved.length ? { groups: resolved } : {}),
     prs: [],
     sessions: [],
@@ -878,7 +881,7 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
   const cards = new Map<string, MutableCard>();
 
   // --- task cards + lookup indexes -------------------------------------
-  const taskByLink = new Map<string, MutableCard>();
+  const taskCards: MutableCard[] = [];
   const taskBySession = new Map<string, { card: MutableCard; workstreamId?: string }>();
   /** Lowercase workstream branch → candidate lanes — Azure PRs join by
    * `sourceRefName`. Several lanes can share a branch name across repos, so
@@ -897,14 +900,11 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     if (task.archived) continue;
     const card = newTaskCard(task, groupById);
     cards.set(card.id, card);
+    taskCards.push(card);
     taskPatterns.set(
       card,
-      task.links.flatMap(ticketKeys).map(ticketKeyPattern),
+      task.links.flatMap(link => sessionWorkItems({ linkedWorkItem: link })).flatMap(ticketKeys).map(ticketKeyPattern),
     );
-    for (const link of task.links) {
-      taskByLink.set(linkedWorkItemInboxKey(link), card);
-      if (link.url) taskByLink.set(link.url, card);
-    }
     for (const ws of task.workstreams) {
       const row: BoardWorkstreamRow = {
         id: ws.id,
@@ -967,6 +967,9 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     }
   }
 
+  const taskLinks = (card: MutableCard) => card.task!.links.flatMap(link => sessionWorkItems({ linkedWorkItem: link }));
+  const tasksByItem = indexByWorkItem(taskCards, taskLinks);
+
   /** Fold a fetched item into its task card — refresh the ticket chip, put
    * a branch-matched PR on its lane, or add the PR to the discovered list.
    * `via` says which join matched. */
@@ -976,10 +979,13 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     via: "link" | "branch" | "key",
     workstreamId?: string,
   ): boolean => {
-    const key = inboxItemKey(item);
-    const index = (card.tickets ?? []).findIndex((t) => t.key === key);
-    if (index >= 0) {
-      card.tickets![index] = ticketChipFromItem(item);
+    if (via === "link") {
+      for (const link of taskLinks(card)) {
+        if (!inboxItemMatchesLinkedWorkItem(item, link)) continue;
+        const key = linkedWorkItemInboxKey(link);
+        const index = card.tickets!.findIndex(ticket => ticket.key === key);
+        if (index >= 0) card.tickets![index] = { ...ticketChipFromItem(item), key };
+      }
       return true;
     }
     if (item.kind === "pr") {
@@ -1015,13 +1021,6 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
   ):
     | { card: MutableCard; via: "link" | "branch" | "key"; workstreamId?: string }
     | undefined => {
-    // Links were built through `boardLinkFromInboxItem`, whose key is the
-    // item's own identity — this catches every provider, not just the
-    // three `linkedWorkItemFromInboxItem` covers.
-    const direct =
-      taskByLink.get(inboxItemKey(item)) ??
-      (item.url ? taskByLink.get(item.url) : undefined);
-    if (direct) return { card: direct, via: "link" };
     if (item.kind !== "pr") return undefined;
     // Azure/GitLab PRs carry `sourceRefName` — a match on a workstream's
     // branch is the lane's own pull request, more precise than a guess.
@@ -1059,6 +1058,11 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
   };
 
   for (const item of input.items) {
+    const direct = relatedFromIndex(item, tasksByItem);
+    if (direct.length) {
+      for (const card of direct) absorbItem(card, item, "link");
+      continue;
+    }
     const task = taskForItem(item);
     if (task && absorbItem(task.card, item, task.via, task.workstreamId))
       continue;
@@ -1081,15 +1085,10 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     ref: BoardCardSession,
     cwd?: string,
   ) => {
-    // A session linked to a task ticket belongs on the task card. The url
-    // fallback catches key drift between the link the task stored and the
-    // link a session carries (e.g. provider/account filled in later).
-    const task =
-      taskByLink.get(linkedWorkItemInboxKey(linked)) ??
-      (linked.url ? taskByLink.get(linked.url) : undefined);
-    if (task) {
-      pushSession(task, ref);
-      return task;
+    const tasks = linkedWorkItemNeedsAccount(linked) ? [] : relatedFromIndex(linked, tasksByItem);
+    if (tasks.length) {
+      for (const task of tasks) pushSession(task, ref);
+      return tasks[0];
     }
     let card: MutableCard | undefined;
     for (const candidate of cards.values()) {

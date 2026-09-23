@@ -5,6 +5,7 @@ import {
   DEFAULT_INBOX_FILTERS,
   hasActiveInboxFilters,
   type InboxFilters,
+  type InboxRelationship,
   type InboxSource,
   type InboxTimeFilter,
   type LinearProjectOption,
@@ -150,30 +151,26 @@ export function InboxFiltersMenu({
       onContextMenu={(event) => event.preventDefault()}
       className="overflow-y-auto overscroll-none p-1"
     >
-      <FilterItem
-        label={
-          source === "gitlab" || source === "azuredevops"
-            ? "Needs attention"
-            : "Assigned to me"
-        }
-        checked={
-          source === "jira"
-            ? jiraFilter.assigned || filters.assignedToMe
-            : filters.assignedToMe
-        }
-        // The shared flag already narrows the Jira fetch — the per-source
-        // toggle only takes over once the shared one is off.
-        disabled={source === "jira" && filters.assignedToMe}
-        onClick={
-          source === "jira"
-            ? () =>
-                onJiraFilterChange?.({
-                  ...jiraFilter,
-                  assigned: !jiraFilter.assigned,
-                })
-            : toggleAssigned
-        }
-      />
+      {source === "azuredevops" || source === "jira" ? (
+        <>
+          <SectionLabel>Relationship</SectionLabel>
+          {([
+            ["all", "All"], ["related", "Related to me"],
+            ["assigned", "Assigned to me"], ["created", "Created by me"],
+            ...(source === "azuredevops" ? [["reviewing", "Reviewing"]] : []),
+          ] as [InboxRelationship, string][]).map(([value, label]) => (
+            <FilterItem key={value} label={label} role="menuitemradio"
+              checked={(source === "jira" ? jiraFilter.relationship ?? "related" : filters.azureRelationship ?? "related") === value}
+              onClick={() => source === "jira"
+                ? onJiraFilterChange?.({ ...jiraFilter, relationship: value === "reviewing" ? "related" : value })
+                : onChange({ ...filters, azureRelationship: value })}
+            />
+          ))}
+        </>
+      ) : (
+        <FilterItem label={source === "gitlab" ? "Needs attention" : "Assigned to me"}
+          checked={filters.assignedToMe} onClick={toggleAssigned} />
+      )}
 
       <SectionLabel>Status</SectionLabel>
       <FilterItem
@@ -306,8 +303,8 @@ export function InboxFiltersMenu({
 
       {!ticket &&
       !(
-        (source === "gitlab" || source === "azuredevops") &&
-        filters.assignedToMe
+        (source === "gitlab" && filters.assignedToMe) ||
+        (source === "azuredevops" && filters.azureRelationship !== "all")
       ) &&
       projects.length > 0 ? (
         <>
@@ -334,7 +331,7 @@ export function InboxFiltersMenu({
 
       {hasActiveInboxFilters(filters, source, hiddenLinearTeamIds) ||
       (source === "jira" &&
-        (jiraFilter.project || jiraFilter.filter || !jiraFilter.assigned)) ? (
+        (jiraFilter.project || jiraFilter.filter || jiraFilter.relationship !== "all")) ? (
         <>
           <div role="separator" className="my-1 h-px bg-content/10" />
           <button
@@ -342,9 +339,12 @@ export function InboxFiltersMenu({
             role="menuitem"
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => {
-              onChange(DEFAULT_INBOX_FILTERS);
+              onChange({ ...DEFAULT_INBOX_FILTERS,
+                assignedToMe: source === "jira" || source === "azuredevops" ? filters.assignedToMe : false,
+                azureRelationship: source === "azuredevops" ? "all" : filters.azureRelationship,
+              });
               if (teamsActive) onLinearTeamsChange([]);
-              if (source === "jira") onJiraFilterChange?.(DEFAULT_JIRA_FILTER);
+              if (source === "jira") onJiraFilterChange?.({ ...DEFAULT_JIRA_FILTER, relationship: "all" });
             }}
             className="flex h-7 w-full items-center rounded-lg px-2 text-left text-[13px] leading-none text-content/70 hover:bg-content/5 hover:text-content"
           >
@@ -370,17 +370,19 @@ function FilterItem({
   icon,
   onClick,
   disabled = false,
+  role = "menuitemcheckbox",
 }: {
   label: string;
   checked: boolean;
   icon?: ReactNode;
   onClick: () => void;
   disabled?: boolean;
+  role?: "menuitemcheckbox" | "menuitemradio";
 }) {
   return (
     <button
       type="button"
-      role="menuitemcheckbox"
+      role={role}
       aria-checked={checked}
       disabled={disabled}
       onMouseDown={(event) => event.preventDefault()}

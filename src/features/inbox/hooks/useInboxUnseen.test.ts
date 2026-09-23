@@ -119,12 +119,12 @@ afterEach(() => {
 });
 
 describe("Inbox activity polling", () => {
-  it("does not poll upstream providers without a rail project", async () => {
+  it("polls personal Azure and Jira views without a rail project", async () => {
     cwd = "";
     listInboxItems.mockResolvedValue({ items: [], errors: {} });
     await mount();
-    expect(listInboxIntegrations).toHaveBeenCalledOnce();
-    expect(listInboxItems).not.toHaveBeenCalled();
+    expect(listInboxIntegrations).not.toHaveBeenCalled();
+    expect(listInboxItems).toHaveBeenCalledWith([], expect.objectContaining({ azureRelationship: "related", jiraRelationship: "related" }), { force: false });
     expect(refreshLinkedWorkItem).not.toHaveBeenCalled();
   });
 

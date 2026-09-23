@@ -102,18 +102,20 @@ it.each([
   expect(inboxItemStatus({ ...item, kind, state: "unknown", stateType })).toBe("Unknown");
 });
 
-it("remembers favorite filters only for their site and defaults to assigned", () => {
+it("remembers favorite filters only for their site and defaults to related", () => {
   expect(loadJiraFilter(item.site!).assigned).toBe(true);
   saveJiraFilter(item.site!, { project: "12", filter: "34", assigned: false });
   expect(loadJiraFilter(item.site!)).toEqual({
     project: "12",
     filter: "34",
     assigned: false,
+    relationship: "related",
   });
   expect(loadJiraFilter("https://other.atlassian.net")).toEqual({
     project: "",
     filter: "",
     assigned: true,
+    relationship: "related",
   });
 });
 
@@ -244,4 +246,16 @@ it("binds Jira filter options to the selected account", async () => {
   expect(call).toHaveBeenLastCalledWith("jira_options", {
     site: "https://team.atlassian.net", favorites: false, accountId: "email:ada@example.test",
   });
+});
+
+
+it.each(["all", "related", "assigned", "created"] as const)("passes the explicit %s relationship independently of the shared flag", async relationship => {
+  saveJiraFilter(item.site!, { project: "12", filter: "34", assigned: true, relationship: "related" });
+  call.mockImplementation(async cmd => {
+    if (cmd === "jira_status") return { connected: true, site: item.site, accountId: "ada" };
+    if (cmd === "jira_list_issues") return { site: item.site, issues: [] };
+    return { connected: false };
+  });
+  await listInboxItems([], { assignedToMe: true, state: "all", search: "", jiraRelationship: relationship }, { force: true });
+  expect(call).toHaveBeenCalledWith("jira_list_issues", expect.objectContaining({ project: "12", filter: "34", relationship, accountId: "ada" }));
 });

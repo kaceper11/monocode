@@ -13,6 +13,7 @@ import {
   atlassianCapable,
   jiraOptions,
   loadJiraFilter,
+  loadJiraRelationship,
   saveJiraFilter,
   DEFAULT_JIRA_FILTER,
   type JiraFilter,
@@ -246,6 +247,8 @@ function peekInboxForRail(recents: RecentProject[], cwd: string) {
   );
   return peekInboxList(projects, {
     assignedToMe: filters.assignedToMe,
+    azureRelationship: filters.azureRelationship ?? "related",
+    jiraRelationship: loadJiraRelationship(),
     state: inboxFetchState(filters),
     search: "",
     linearHiddenTeamIds: loadHiddenLinearTeamIds(),
@@ -421,7 +424,7 @@ export function InboxView({
       ),
     [filters, projects],
   );
-  const filtersActive = hasActiveInboxFilters(
+  const filtersActive = (source === "jira" && (jiraFilter.relationship !== "all" || !!jiraFilter.project || !!jiraFilter.filter)) || hasActiveInboxFilters(
     activeFilters,
     source,
     linearHiddenTeamIds,
@@ -430,11 +433,13 @@ export function InboxView({
   const fetchQuery = useMemo<InboxQuery>(
     () => ({
       assignedToMe: activeFilters.assignedToMe,
+      azureRelationship: activeFilters.azureRelationship ?? "related",
+      jiraRelationship: jiraFilter.relationship ?? "related",
       state: fetchState,
       search: "",
       linearHiddenTeamIds,
     }),
-    [activeFilters.assignedToMe, fetchState, linearHiddenTeamIds],
+    [activeFilters.assignedToMe, activeFilters.azureRelationship, jiraFilter.relationship, fetchState, linearHiddenTeamIds],
   );
 
   const resize = useDragResize({
@@ -979,7 +984,7 @@ export function InboxView({
                 : source === "linear"
                   ? "No Linear issues match these filters"
                   : source === "gitlab" || source === "azuredevops"
-                    ? activeFilters.assignedToMe
+                    ? source === "gitlab" && activeFilters.assignedToMe
                       ? "Nothing needs your attention"
                       : source === "gitlab"
                         ? "No GitLab items match these filters"

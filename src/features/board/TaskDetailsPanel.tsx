@@ -936,9 +936,9 @@ export function TaskDetailsPanel({
                 className="grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100"
                 onClick={() =>
                   updateTask(task.id, (current) => ({
-                    links: current.links.filter(
-                      (link) => linkedWorkItemInboxKey(link) !== ticket.key,
-                    ),
+                    links: current.links.flatMap(link => sessionWorkItems({ linkedWorkItem: link }))
+                      .filter(link => linkedWorkItemInboxKey(link) !== ticket.key)
+                      .map(({ additionalItems: _additionalItems, ...link }) => link),
                   }))
                 }
               >

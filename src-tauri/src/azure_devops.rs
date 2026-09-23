@@ -217,9 +217,20 @@ pub async fn azure_devops_list_todos(
     app: AppHandle,
     kind: String,
     limit: Option<u32>,
+    relationship: Option<String>,
+    state: Option<String>,
 ) -> Result<Vec<AzureDevOpsWorkItem>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app)?;
+        if let Some(relationship) = relationship.as_deref() {
+            return azure_personal_items(
+                &config,
+                &kind,
+                relationship,
+                state.as_deref().unwrap_or("open"),
+                limit.unwrap_or(DEFAULT_LIMIT),
+            );
+        }
         azure_devops_list_todos_for(&config, &kind, limit.unwrap_or(DEFAULT_LIMIT))
     })
     .await
@@ -319,7 +330,7 @@ fn azure_devops_list_todos_for(
     validate_kind(kind)?;
     let limit = limit.clamp(1, 100);
     if kind == "pr" {
-        return azure_list_pr_reviews_for(config, limit);
+        return azure_personal_items(config, "pr", "reviewing", "open", limit);
     }
     let mut items = azure_list_wit_for(config, None, true, "open", limit)?;
     for item in &mut items {
@@ -328,6 +339,87 @@ fn azure_devops_list_todos_for(
         }
     }
     Ok(items)
+}
+
+// Personal inbox queries retain organization scope even without local checkouts.
+fn azure_personal_items(
+    config: &AzureDevOpsConfig,
+    kind: &str,
+    relationship: &str,
+    state: &str,
+    limit: u32,
+) -> Result<Vec<AzureDevOpsWorkItem>, String> {
+    validate_kind(kind)?;
+    let limit = limit.clamp(1, 100);
+    if !matches!(
+        relationship,
+        "assigned" | "created" | "reviewing" | "related"
+    ) {
+        return Err("Choose a valid Azure DevOps relationship filter".into());
+    }
+    if kind == "issue" {
+        if relationship == "reviewing" {
+            return Ok(Vec::new());
+        }
+        let wiql = personal_wit_query(relationship, state);
+        let ids = azure_query_wit_ids(config, &wiql, limit)?;
+        return if ids.is_empty() {
+            Ok(Vec::new())
+        } else {
+            azure_fetch_wit_batch(config, &ids)
+        };
+    }
+    if relationship == "assigned" {
+        return Ok(Vec::new());
+    }
+    // The caller combines author and reviewer requests independently, retaining partial results.
+    let user_id = azure_current_user_id(config)?;
+    let path = personal_pr_path(relationship, state, &user_id, limit)?;
+    let response = azure_get(config, &path)?;
+    let rows = response
+        .value
+        .get("value")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Azure DevOps did not return pull requests".to_string())?;
+    let mut items = Vec::new();
+    for row in rows {
+        if let (Some(project), Some(repo_name)) = pr_repo_parts(row) {
+            if let Some(mut item) = parse_pr(row, &format!("{project}/{repo_name}"), &config.url) {
+                item.attention_reason = if relationship == "created" {
+                    "authored"
+                } else {
+                    "review_requested"
+                }
+                .into();
+                items.push(item);
+            }
+        }
+    }
+    Ok(items)
+}
+
+fn personal_wit_query(relationship: &str, state: &str) -> String {
+    let predicate = match relationship {
+        "created" => "[System.CreatedBy] = @me",
+        "related" => "([System.AssignedTo] = @me OR [System.CreatedBy] = @me)",
+        _ => "[System.AssignedTo] = @me",
+    };
+    wit_wiql(None, true, state).replace("[System.AssignedTo] = @me", predicate)
+}
+
+fn personal_pr_path(
+    relationship: &str,
+    state: &str,
+    user_id: &str,
+    limit: u32,
+) -> Result<String, String> {
+    let field = match relationship {
+        "created" => "creatorId",
+        "reviewing" => "reviewerId",
+        _ => return Err("Choose a PR author or reviewer filter".into()),
+    };
+    let status = if state == "all" { "all" } else { "active" };
+    Ok(format!("/_apis/git/pullrequests?searchCriteria.status={status}&searchCriteria.{field}={}&$top={}&api-version={API_VERSION}", encode_segment(user_id), limit.clamp(1, 100)))
 }
 
 fn azure_devops_work_item_details_for(
@@ -595,40 +687,6 @@ fn azure_fetch_prs(
     );
     let response = azure_get(config, &path)?;
     parse_pr_list(&response.value, repo, &config.url)
-}
-
-fn azure_list_pr_reviews_for(
-    config: &AzureDevOpsConfig,
-    limit: u32,
-) -> Result<Vec<AzureDevOpsWorkItem>, String> {
-    let user_id = azure_current_user_id(config)?;
-    let path = format!(
-        "/_apis/git/pullrequests?searchCriteria.status=active&searchCriteria.reviewerId={}&$top={}&api-version={}",
-        encode_segment(&user_id),
-        limit.clamp(1, 100),
-        API_VERSION
-    );
-    let response = azure_get(config, &path)?;
-    let rows = response
-        .value
-        .get("value")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Azure DevOps did not return pull requests".to_string())?;
-    let mut items = Vec::new();
-    for row in rows {
-        let (project, repo_name) = pr_repo_parts(row);
-        let repo = match (project, repo_name) {
-            (Some(project), Some(repo_name)) => format!("{project}/{repo_name}"),
-            _ => continue,
-        };
-        if let Some(mut item) = parse_pr(row, &repo, &config.url) {
-            if item.attention_reason.is_empty() {
-                item.attention_reason = "review_requested".into();
-            }
-            items.push(item);
-        }
-    }
-    Ok(items)
 }
 
 // ---- Work items (Boards) ----
@@ -2099,6 +2157,22 @@ fn write_secret_file(path: &Path, value: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn personal_queries_use_identity_roles_and_requested_status() {
+        let related = personal_wit_query("related", "open");
+        assert!(related.contains(
+            "([System.AssignedTo] = @me OR [System.CreatedBy] = @me) AND [System.State]"
+        ));
+        assert!(!related.contains("System.TeamProject"));
+        assert!(!personal_wit_query("created", "all").contains("System.AssignedTo"));
+        assert!(!personal_wit_query("assigned", "all").contains("System.State"));
+        let authored = personal_pr_path("created", "all", "user-id", 1000).unwrap();
+        assert!(authored.contains("status=all&searchCriteria.creatorId=user-id&$top=100"));
+        let reviewing = personal_pr_path("reviewing", "open", "user-id", 40).unwrap();
+        assert!(reviewing.contains("status=active&searchCriteria.reviewerId=user-id"));
+        assert!(personal_pr_path("invalid", "open", "user-id", 40).is_err());
+    }
 
     #[test]
     fn normalizes_organization_urls() {

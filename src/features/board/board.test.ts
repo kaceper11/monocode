@@ -1,3 +1,4 @@
+import { linkedWorkItemInboxKey } from "../sessions/model/sessionWorkItem";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   composePrBody,
@@ -15,6 +16,7 @@ import type { SessionSummary } from "../sessions/data/sessionStore";
 import {
   attentionScore,
   buildBoardCards,
+  boardLinkFromInboxItem,
   boardCardStatuses,
   boardStatusOptions,
   matchesBoardStatuses,
@@ -243,6 +245,7 @@ describe("buildBoardCards", () => {
   it("absorbs linked tickets and binds workstream sessions on task cards", () => {
     const link = linked({
       provider: "jira",
+      account: "ada",
       identifier: "PROJ-123",
       url: "https://jira.test/browse/PROJ-123",
       id: "j1",
@@ -251,6 +254,7 @@ describe("buildBoardCards", () => {
       items: [
         item({
           provider: "jira",
+          account: "ada",
           number: 0,
           id: "j1",
           identifier: "PROJ-123",
@@ -1845,7 +1849,7 @@ describe("provider status filters", () => {
 
   it("matches any task ticket, discovered PR or explicitly identified workstream PR", () => {
     const jira = item({
-      provider: "jira",
+      provider: "jira", account: "ada",
       kind: "jira",
       number: 7,
       identifier: "ACME-7",
@@ -1870,7 +1874,7 @@ describe("provider status filters", () => {
         task({
           links: [
             linked({
-              provider: "jira",
+              provider: "jira", account: "ada",
               identifier: "ACME-7",
               number: 7,
               url: jira.url,
@@ -2153,7 +2157,7 @@ describe("archive + local rename", () => {
 });
 
 describe("session link join", () => {
-  it("attaches a session to a task when the stored link's key drifts but the url matches", () => {
+  it("does not attach a session across providers merely because the URL matches", () => {
     // Task stores a Jira-flavoured link; the session carries the same url
     // without a provider — the identity keys differ, the url doesn't.
     const url = "https://jira.test/browse/ABC-1";
@@ -2187,9 +2191,9 @@ describe("session link join", () => {
         }),
       ],
     });
-    expect(cards).toHaveLength(1);
+    expect(cards).toHaveLength(2);
     expect(cards[0]!.kind).toBe("task");
-    expect(cards[0]!.sessions.map((s) => s.id)).toEqual(["s1"]);
+    expect(cards[0]!.sessions).toEqual([]);
   });
 
 });
@@ -2789,5 +2793,49 @@ describe("probeWorkstream", () => {
     expect(status?.pr).toBeNull();
     expect(status?.checks).toEqual([]);
     expect(status?.error).toContain("gone");
+  });
+});
+
+
+describe("existing task ownership", () => {
+  it.each(["azuredevops", "jira", "github", "gitlab", "linear"] as const)("folds nested %s issues and sessions into active tasks on every refresh", provider => {
+    const issue = item({ provider, account: "ada", number: 42, identifier: "ENG-42" });
+    const link = boardLinkFromInboxItem(issue)!;
+    const parent = linked({ number: 1, additionalItems: [link] });
+    const input = { items: [issue], tasks: [task({ links: [parent] })], summaries: [],
+      sessions: [liveSession({ linkedWorkItem: link })] };
+    for (let i = 0; i < 2; i++) {
+      const cards = buildBoardCards(input);
+      expect(cards).toHaveLength(1);
+      expect(cards[0]!.tickets).toHaveLength(2);
+      expect(cards[0]!.tickets![1]!.title).toBe(issue.title);
+      expect(cards[0]!.sessions).toHaveLength(1);
+    }
+    expect(buildBoardCards({ ...input, tasks: [task({ links: [parent], archived: true })] })[0]!.kind).toBe("item");
+  });
+
+  it("keeps the stored Azure chip key when repository metadata changes", () => {
+    const issue = item({ provider: "azuredevops", number: 42, repo: "New project" });
+    const link = boardLinkFromInboxItem({ ...issue, repo: "Old project" })!;
+    const cards = buildBoardCards({ items: [issue], tasks: [task({ links: [link] })], sessions: [], summaries: [] });
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.tickets![0]).toMatchObject({ key: linkedWorkItemInboxKey(link), title: issue.title, state: "open" });
+  });
+
+  it("does not suppress another account or site's issue with the same number", () => {
+    const issue = item({ provider: "jira", account: "ada", number: 42 });
+    const link = boardLinkFromInboxItem(issue)!;
+    for (const other of [{ ...issue, account: "bob" }, { ...issue, url: "https://other.test/42" }]) {
+      expect(buildBoardCards({ items: [other], tasks: [task({ links: [link] })], sessions: [], summaries: [] })).toHaveLength(2);
+    }
+    expect(buildBoardCards({ items: [issue], tasks: [task({ links: [{ ...link, account: undefined }] })], sessions: [], summaries: [] })).toHaveLength(2);
+  });
+
+  it("retains two explicitly linked tasks without an extra automatic card", () => {
+    const issue = item({ provider: "azuredevops", number: 42 });
+    const link = boardLinkFromInboxItem(issue)!;
+    const cards = buildBoardCards({ items: [issue], tasks: [task({ id: "task:a", links: [link] }), task({ id: "task:b", links: [link] })], sessions: [], summaries: [] });
+    expect(cards.map(card => card.id)).toEqual(["task:a", "task:b"]);
+    expect(cards.every(card => card.tickets![0]!.state === "open")).toBe(true);
   });
 });

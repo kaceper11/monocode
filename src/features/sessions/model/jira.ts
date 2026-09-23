@@ -1,3 +1,4 @@
+import { inboxRelationship, type InboxRelationship } from "../../inbox/model/inboxFilters";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
@@ -16,11 +17,12 @@ export type JiraStatus = {
   capabilities: string[];
 };
 export type JiraOption = { id: string; name: string };
-export type JiraFilter = { project: string; filter: string; assigned: boolean };
+export type JiraFilter = { project: string; filter: string; assigned: boolean; relationship?: Exclude<InboxRelationship, "reviewing"> };
 export const DEFAULT_JIRA_FILTER: JiraFilter = {
   project: "",
   filter: "",
   assigned: true,
+  relationship: "related",
 };
 export const JIRA_CHANGE_EVENT = "monocode:jira-change";
 const FILTER_KEY = "monocode.jiraFilter";
@@ -30,6 +32,12 @@ export function jiraFilterCacheKey(): string {
   } catch {
     return "";
   }
+}
+export function loadJiraRelationship(): Exclude<InboxRelationship, "reviewing"> {
+  try {
+    const value = inboxRelationship(JSON.parse(jiraFilterCacheKey() || "null")?.relationship);
+    return value === "reviewing" ? "related" : value;
+  } catch { return "related"; }
 }
 let generation = 0;
 const details = new Map<string, GithubWorkItemDetails>();
@@ -82,6 +90,7 @@ export function loadJiraFilter(site: string): JiraFilter {
   try {
     const saved = JSON.parse(localStorage.getItem(FILTER_KEY) ?? "null");
     if (saved?.site !== site) return DEFAULT_JIRA_FILTER;
+    const relationship = inboxRelationship(saved.relationship);
     return {
       project:
         typeof saved.project === "string" && /^\d*$/.test(saved.project)
@@ -92,6 +101,7 @@ export function loadJiraFilter(site: string): JiraFilter {
           ? saved.filter
           : "",
       assigned: saved.assigned !== false,
+      relationship: relationship === "reviewing" ? "related" : relationship,
     };
   } catch {
     return DEFAULT_JIRA_FILTER;

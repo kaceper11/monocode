@@ -1,3 +1,4 @@
+import type { InboxRelationship } from "./inboxFilters";
 import { invoke } from "@tauri-apps/api/core";
 import {
   inboxIntegrationCacheKey,
@@ -161,6 +162,8 @@ export type GithubWorkItemQuery = {
 
 export type InboxQuery = Omit<GithubWorkItemQuery, "kind"> & {
   linearHiddenTeamIds?: string[];
+  azureRelationship?: InboxRelationship;
+  jiraRelationship?: Exclude<InboxRelationship, "reviewing">;
 };
 
 export type InboxProviderErrors = Partial<Record<InboxProvider, string>>;
@@ -228,7 +231,7 @@ export function inboxListCacheKey(
     .sort()
     .join("|");
   const teams = [...(query.linearHiddenTeamIds ?? [])].sort().join(",");
-  return `${query.assignedToMe ? 1 : 0}:${query.state}:${paths}:${teams}:${inboxIntegrationCacheKey()}`;
+  return `${query.assignedToMe ? 1 : 0}:${query.state}:${paths}:${teams}:${query.azureRelationship ?? "legacy"}:${query.jiraRelationship ?? "legacy"}:${inboxIntegrationCacheKey()}`;
 }
 
 export function peekInboxList(
@@ -686,6 +689,7 @@ async function fetchInboxItems(
   const integrations = listInboxIntegrations(
     query.state,
     query.assignedToMe,
+    query.jiraRelationship,
   );
   const unique = uniqueInboxProjects(projects);
   const preferredPaths = unique.map((project) => project.path);
@@ -724,7 +728,7 @@ async function fetchInboxItems(
 
   let linearItems: InboxItem[] = [];
   try {
-    if ((await linearConnected()).connected) {
+    if ((unique.length > 0 || !query.azureRelationship) && (await linearConnected()).connected) {
       linearItems = await fetchLinearInboxItems(query);
     }
   } catch (error) {
@@ -733,7 +737,7 @@ async function fetchInboxItems(
 
   let gitlabItems: InboxItem[] = [];
   try {
-    if ((await gitlabConnected()).connected) {
+    if ((unique.length > 0 || !query.azureRelationship) && (await gitlabConnected()).connected) {
       const gitlab = await fetchRepositoryInboxItems(
         "gitlab",
         unique,
@@ -815,7 +819,25 @@ async function fetchRepositoryInboxItems(
     resolved.filter((project) => project.repo.length > 0),
   );
 
-  if (query.assignedToMe) {
+  if (provider === "azuredevops" && query.azureRelationship && query.azureRelationship !== "all") {
+    const localPathByRepo = new Map(grouped.map(project => [project.repo.toLowerCase(), project.path]));
+    const relationship = query.azureRelationship;
+    const jobs = (["issue", "pr"] as const).flatMap(kind => {
+      if ((kind === "pr" && relationship === "assigned") || (kind === "issue" && relationship === "reviewing")) return [];
+      const roles = kind === "pr" && relationship === "related" ? ["created", "reviewing"] as const : [relationship];
+      return roles.map(async role => {
+        const items = await listAzureDevOpsTodos({ kind, relationship: role, state: query.state,
+          limit: query.state === "all" ? INBOX_ALL_LIMIT : undefined });
+        return items.map(item => toInboxItem(item, localPathByRepo.get(item.repo.toLowerCase()) ?? "", item.repo));
+      });
+    });
+    const result = collectInboxResults(await Promise.allSettled(jobs), preferredPaths, true);
+    let prs = 0;
+    const limit = query.state === "all" ? INBOX_ALL_LIMIT : 40;
+    return { ...result, items: result.items.filter(item => item.kind !== "pr" || ++prs <= limit) };
+  }
+
+  if (query.assignedToMe && !(provider === "azuredevops" && query.azureRelationship)) {
     const localPathByRepo = new Map(
       grouped.map((project) => [project.repo.toLowerCase(), project.path]),
     );

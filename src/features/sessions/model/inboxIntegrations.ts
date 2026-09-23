@@ -1,3 +1,4 @@
+import type { InboxRelationship } from "../../inbox/model/inboxFilters";
 import {
   atlassianCapable,
   jiraConnected,
@@ -15,13 +16,15 @@ export function inboxIntegrationCacheKey(): string {
 export async function listInboxIntegrations(
   state: "open" | "all",
   assignedToMe: boolean,
+  relationship?: Exclude<InboxRelationship, "reviewing">,
 ): Promise<InboxListResult> {
-  return listJira(state, assignedToMe);
+  return listJira(state, assignedToMe, relationship);
 }
 
 async function listJira(
   state: "open" | "all",
   assignedToMe: boolean,
+  relationship?: Exclude<InboxRelationship, "reviewing">,
 ): Promise<InboxListResult> {
   try {
     const status = await jiraConnected();
@@ -32,13 +35,13 @@ async function listJira(
           jira: "Connect Jira Cloud in Settings to see assigned issues.",
         },
       };
-    // The shared "my work" flag narrows Jira too — a wider stored filter
-    // (e.g. a saved filter, which clears `assigned`) must not leak
-    // unassigned tickets into an assigned-only listing like the board's.
+    // Explicit Inbox choices are independent of the shared flag. Legacy
+    // callers such as Board retain their assigned-only behavior.
     const stored = loadJiraFilter(status.site);
     const items = atlassianCapable(status, "Jira")
       ? await listJiraIssues(status.site, state, status.accountId, {
           ...stored,
+          relationship,
           assigned: stored.assigned || assignedToMe,
         })
       : [];

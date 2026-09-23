@@ -264,7 +264,7 @@ export function indexByWorkItem<T>(
 
 /** Entities related to one item from a prebuilt {@link indexByWorkItem}. */
 export function relatedFromIndex<T>(
-  item: InboxItem,
+  item: InboxItem | LinkedWorkItem,
   index: WorkItemIndex<T>,
 ): T[] {
   const accounts = index.get(workItemIdentity(item));

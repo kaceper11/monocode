@@ -8,6 +8,12 @@ import {
 import { normalizeProjectPath } from "../../projects/model/recents";
 import { timeFilterStart, type SessionTimeFilter } from "../../sessions/model/sessionFilters";
 
+export type InboxRelationship = "all" | "related" | "assigned" | "created" | "reviewing";
+export function inboxRelationship(value: unknown): InboxRelationship {
+  return value === "all" || value === "assigned" || value === "created" || value === "reviewing"
+    ? value : "related";
+}
+
 export type InboxTimeFilter = SessionTimeFilter;
 
 export type InboxStatusFilter = {
@@ -19,6 +25,7 @@ export type InboxStatusFilter = {
 
 export type InboxFilters = {
   assignedToMe: boolean;
+  azureRelationship?: InboxRelationship;
   hiddenProjects: string[];
   /** Linear project ids to hide. `LINEAR_NO_PROJECT` stands for issues outside every project. */
   hiddenLinearProjects: string[];
@@ -47,6 +54,7 @@ export const DEFAULT_INBOX_STATUS_FILTER: InboxStatusFilter = {
 
 export const DEFAULT_INBOX_FILTERS: InboxFilters = {
   assignedToMe: false,
+  azureRelationship: "related",
   hiddenProjects: [],
   hiddenLinearProjects: [],
   hiddenKinds: [],
@@ -179,6 +187,7 @@ export function loadInboxFilters(): InboxFilters {
     const parsed = JSON.parse(raw) as Partial<InboxFilters>;
     return {
       assignedToMe: parsed.assignedToMe === true,
+      azureRelationship: inboxRelationship(parsed.azureRelationship),
       hiddenProjects: Array.isArray(parsed.hiddenProjects)
         ? parsed.hiddenProjects.filter(
             (path): path is string =>
@@ -248,7 +257,7 @@ export function hasActiveInboxFilters(
         filters.status.closed ||
         filters.status.merged;
   return (
-    filters.assignedToMe ||
+    (source === "azuredevops" ? filters.azureRelationship !== "all" : filters.assignedToMe) ||
     (source === "linear" && hiddenLinearTeamIds.length > 0) ||
     (source === "linear"
       ? filters.hiddenLinearProjects.length > 0
@@ -376,8 +385,8 @@ export function applyInboxFilters(
   const hiddenProjects =
     source === "linear" ||
     source === "jira" ||
-    ((source === "gitlab" || source === "azuredevops") &&
-      filters.assignedToMe)
+    (source === "gitlab" && filters.assignedToMe) ||
+    (source === "azuredevops" && filters.azureRelationship !== "all")
       ? []
       : filters.hiddenProjects;
   const hiddenKinds = source === "linear" || source === "jira" ? [] : filters.hiddenKinds;

@@ -1,3 +1,4 @@
+import type { InboxRelationship } from "./inboxFilters";
 import { invoke } from "@tauri-apps/api/core";
 import type { GitPr, GitPrCheck } from "../../../platform/tauri/fs";
 import { recordInboxSelfActivity } from "./inboxSelfActivity";
@@ -152,10 +153,13 @@ export function listAzureDevOpsWorkItems(
 
 export function listAzureDevOpsTodos(query: {
   kind: AzureDevOpsKind;
+  relationship?: InboxRelationship;
+  state?: "open" | "all";
   limit?: number;
 }): Promise<AzureDevOpsWorkItem[]> {
   return invoke<AzureDevOpsWorkItem[]>("azure_devops_list_todos", {
     kind: query.kind,
+    ...(query.relationship ? { relationship: query.relationship, state: query.state } : {}),
     limit: query.limit,
   });
 }

@@ -244,6 +244,47 @@ describe.each([
     expect(list).toHaveBeenCalledTimes(2);
   });
 
+  if (provider === "azuredevops") {
+    it.each([
+      ["assigned", ["issue:assigned"]],
+      ["created", ["issue:created", "pr:created"]],
+      ["reviewing", ["pr:reviewing"]],
+      ["related", ["issue:related", "pr:created", "pr:reviewing"]],
+    ] as const)("fetches %s across the organization without a checkout", async (relationship, expected) => {
+      list.mockImplementation(async ({ kind }) => [workItem("remote/repo", kind)]);
+      const result = await listInboxItems([], { ...query, azureRelationship: relationship, state: "all" });
+      expect(list.mock.calls.map(([args]) => {
+        const request = args as { kind: string; relationship: string; state: string };
+        expect(request.state).toBe("all");
+        return `${request.kind}:${request.relationship}`;
+      })).toEqual(expected);
+      expect(result.items).toHaveLength(relationship === "assigned" || relationship === "reviewing" ? 1 : 2);
+      expect(result.items.every(item => item.projectPath === "")).toBe(true);
+      expect(invoke).not.toHaveBeenCalledWith("linear_status");
+      expect(invoke).not.toHaveBeenCalledWith("gitlab_status");
+    });
+
+    it("keeps authored PRs when reviewer lookup fails and separates filter caches", async () => {
+      list.mockImplementation(async args => {
+        const request = args as { kind: GithubTaskKind; relationship?: string };
+        if (request.relationship === "reviewing") throw new Error("Review lookup failed");
+        return [workItem("remote/repo", request.kind)];
+      });
+      const result = await listInboxItems([], { ...query, azureRelationship: "related" });
+      expect(result.items.map(item => item.kind).sort()).toEqual(["issue", "pr"]);
+      expect(result.errors.azuredevops).toBe("Review lookup failed");
+      list.mockClear();
+      await listInboxItems([], { ...query, azureRelationship: "created" });
+      expect(list).toHaveBeenCalledTimes(2);
+    });
+
+    it("All ignores another provider's assignment flag and uses local repositories", async () => {
+      await listInboxItems(projects, { ...query, assignedToMe: true, azureRelationship: "all" });
+      expect(invoke).not.toHaveBeenCalledWith("azure_devops_list_todos", expect.anything());
+      expect(invoke).toHaveBeenCalledWith("azure_devops_list_work_items", expect.objectContaining({ assignedToMe: false }));
+    });
+  }
+
   it("skips disconnected providers", async () => {
     connected = false;
 

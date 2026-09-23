@@ -341,7 +341,13 @@ fn issue_ref(id: &str) -> bool {
         && numeric_id(number)
 }
 
-fn issue_query(project: &str, filter: &str, assigned: bool, state: &str) -> Result<String, String> {
+fn issue_query(
+    project: &str,
+    filter: &str,
+    assigned: bool,
+    state: &str,
+    relationship: Option<&str>,
+) -> Result<String, String> {
     if (!project.is_empty() && !numeric_id(project)) || (!filter.is_empty() && !numeric_id(filter))
     {
         return Err("Choose a valid Jira project or saved filter".into());
@@ -353,8 +359,12 @@ fn issue_query(project: &str, filter: &str, assigned: bool, state: &str) -> Resu
     if !project.is_empty() {
         parts.push(format!("project = {project}"));
     }
-    if assigned {
-        parts.push("assignee = currentUser()".into());
+    match relationship.unwrap_or(if assigned { "assigned" } else { "all" }) {
+        "all" => {}
+        "assigned" => parts.push("assignee = currentUser()".into()),
+        "created" => parts.push("creator = currentUser()".into()),
+        "related" => parts.push("(assignee = currentUser() OR creator = currentUser())".into()),
+        _ => return Err("Choose a valid Jira relationship filter".into()),
     }
     if state == "open" {
         parts.push("statusCategory != Done".into());
@@ -375,11 +385,12 @@ pub async fn jira_list_issues(
     filter: String,
     assigned: bool,
     state: String,
+    relationship: Option<String>,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let config = require_config(&app, &site)?;
         config.require_account(&account_id)?;
-        let jql = issue_query(&project, &filter, assigned, &state)?;
+        let jql = issue_query(&project, &filter, assigned, &state, relationship.as_deref())?;
         let issues = issue_pages(|limit, token| {
             let mut query = vec![
                 ("jql", jql.clone()),
@@ -609,6 +620,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn relationship_queries_keep_scope_and_override_legacy_assignment() {
+        assert_eq!(issue_query("12", "34", true, "open", Some("related")).unwrap(),
+            "filter = 34 AND project = 12 AND (assignee = currentUser() OR creator = currentUser()) AND statusCategory != Done ORDER BY updated DESC");
+        assert_eq!(
+            issue_query("", "", true, "all", Some("created")).unwrap(),
+            "creator = currentUser() ORDER BY updated DESC"
+        );
+        assert!(!issue_query("12", "", true, "all", Some("all"))
+            .unwrap()
+            .contains("assignee"));
+        assert!(issue_query("", "", false, "all", Some("assigned"))
+            .unwrap()
+            .contains("assignee = currentUser()"));
+        assert!(issue_query("", "", false, "all", Some("reviewing")).is_err());
+    }
+
+    #[test]
     fn content_identity_uses_the_credential_login_not_display_name() {
         let config: JiraConfig = serde_json::from_value(json!({
             "site": "https://team.atlassian.net", "email": "ada@example.test",
@@ -670,9 +698,9 @@ mod tests {
         ] {
             assert!(normalize_site(site).is_err());
         }
-        assert_eq!(issue_query("12", "34", true, "open").unwrap(), "filter = 34 AND project = 12 AND assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC");
-        assert!(issue_query("12 OR 1=1", "", true, "all").is_err());
-        assert!(issue_query("", "secret", true, "all").is_err());
+        assert_eq!(issue_query("12", "34", true, "open", None).unwrap(), "filter = 34 AND project = 12 AND assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC");
+        assert!(issue_query("12 OR 1=1", "", true, "all", None).is_err());
+        assert!(issue_query("", "secret", true, "all", None).is_err());
         assert!(!numeric_id("../myself"));
         for id in ["10042", "PROJ-123", "PROJ_2-1"] {
             assert!(issue_ref(id), "expected {id} to be accepted");
