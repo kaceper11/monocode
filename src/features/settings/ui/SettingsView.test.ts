@@ -8,7 +8,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
-import * as jira from "../../sessions/model/jira";
+import * as jira from "../../inbox/model/jira";
 import { SettingsView } from "./SettingsView";
 import { rememberNotificationProjects } from "../../notifications/model/notificationProjects";
 import {
@@ -103,6 +103,7 @@ describe("settings pages", () => {
   it("refreshes jira Settings after another window changes the connection", async () => {
     const first = { connected: true, site: "https://example.test", project: "Project", account: "Original account", accountId: "original", capabilities: [] };
     const next = { ...first, account: "Replacement account", accountId: "replacement" };
+    vi.spyOn(jira, "listJiraProjects").mockResolvedValue([]);
     const status = vi.spyOn(jira, "jiraConnected");
     status.mockResolvedValue(first);
     await render("inbox");
@@ -120,25 +121,17 @@ describe("settings pages", () => {
     expect(status).not.toHaveBeenCalled(); // Filter changes do not discard credential edits.
   });
 
-  it("ignores an old jira status response after connecting", async () => {
-    const next = { connected: true, site: "https://example.test", project: "Project", account: "Current account", accountId: "current", capabilities: [] };
-    let finish!: (status: typeof next) => void;
-    const pending = new Promise<typeof next>(resolve => { finish = resolve; });
-    vi.spyOn(jira, "jiraConnected").mockReturnValue(pending);
-    vi.spyOn(jira, "saveJiraConfig").mockResolvedValue(next);
+  it("ignores old Jira status responses after a newer connection notification", async () => {
+    let finish!: (status: unknown) => void;
+    const next = { connected: true, site: "https://example.test", email: "Current account", accountId: "current", capabilities: ["Confluence"] };
+    vi.spyOn(jira, "listJiraProjects").mockResolvedValue([]);
+    const status = vi.spyOn(jira, "jiraConnected");
+    status.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
     await render("inbox");
-    const labels = ["Atlassian Cloud site", "Atlassian email", "Atlassian API token"];
-    for (const [index, label] of labels.entries()) {
-      const input = container.querySelector<HTMLInputElement>(`[aria-label="${label}"]`)!;
-      await act(async () => {
-        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, ["https://example.test", "dev@example.test", "test-token"][index]);
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-      });
-    }
-    const input = container.querySelector(`[aria-label="${labels[0]}"]`)!;
-    await act(async () => input.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    status.mockResolvedValue(next);
+    await act(async () => window.dispatchEvent(new CustomEvent("monocode:jira-change", { detail: "connection" })));
     expect(container.textContent).toContain("Current account");
-    await act(async () => finish({ ...next, connected: false, account: "Old account" }));
+    await act(async () => finish({ ...next, connected: false, email: "Old account" }));
     expect(container.textContent).toContain("Current account");
   });
 

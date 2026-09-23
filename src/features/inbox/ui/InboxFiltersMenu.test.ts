@@ -15,7 +15,7 @@ it("keeps personal choices independent, persisted, and clearable despite the sha
   function Harness({ source }: { source: "azuredevops" | "jira" }) {
     const [filters, setFilters] = useState({ ...DEFAULT_INBOX_FILTERS, assignedToMe: true });
     const [jira, setJira] = useState(DEFAULT_JIRA_FILTER);
-    return createElement(InboxFiltersMenu, {
+    return createElement(InboxFiltersMenu, { jiraProjects: [], hiddenJiraProjectIds: [], onJiraProjectsChange: vi.fn(),
       x: 20, y: 20, source, projects: [], linearProjects: [], linearTeams: [],
       hiddenLinearTeamIds: [], onLinearTeamsChange: () => {}, filters, jiraFilter: jira, onClose: () => {},
       onChange: next => { setFilters(next); saveInboxFilters(next); },

@@ -13,9 +13,9 @@ afterEach(() => vi.restoreAllMocks());
 it("invalidates jira reads on remote connection events without duplicating the caller event", async () => {
   const jira = await import("./jira");
   const api = {
-    connected: jira.jiraConnected, save: () => jira.saveJiraConfig("", "", ""),
+    connected: jira.jiraConnected, save: async () => (await import("../../inbox/model/jira")).disconnectJira(),
     details: jira.jiraDetails, peek: jira.peekJiraDetails,
-    item: jira.jiraIssue("https://team.atlassian.net", { id: "1", key: "ENG-1", fields: { summary: "Plan" } }),
+    item: { provider: "jira", kind: "jira", site: "https://team.atlassian.net", account: "email:ada@example.test", id: "1", identifier: "ENG-1" } as Parameters<typeof jira.jiraDetails>[0],
   };
   const event = "monocode:jira-change";
   invoke.mockResolvedValue({ connected: false });
@@ -26,13 +26,14 @@ it("invalidates jira reads on remote connection events without duplicating the c
   try {
     let finish!: (value: unknown) => void;
     invoke.mockImplementation(async command => {
-      if (command.endsWith("_content")) return new Promise(resolve => { finish = resolve; });
+      if (command === "jira_issue_details") return new Promise(resolve => { finish = resolve; });
       if (command.endsWith("_set_config")) callbacks.get(event)!();
       return { connected: false };
     });
     const pending = api.details(api.item);
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
     callbacks.get(event)!(); // Native notification from another window.
-    finish({ fields: { description: "Old page" } });
+    finish({ body: "Old page", author: "" });
     await expect(pending).rejects.toThrow("connection changed");
     expect(api.peek(api.item)).toBeNull();
     expect(observed).toHaveBeenCalledOnce();

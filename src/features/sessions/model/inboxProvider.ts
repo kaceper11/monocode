@@ -1,3 +1,4 @@
+import { jiraIssueComment } from "../../inbox/model/jira";
 import {
   githubPrDiff,
   githubWorkItemComment,
@@ -106,8 +107,9 @@ export function inboxProvider(item: InboxItem): InboxProviderAdapter {
     return {
       details: () => jiraDetails(item),
       peekDetails: () => peekJiraDetails(item),
-      thread: () => jiraThread(item),
+      thread: (force) => jiraThread(item, force),
       peekThread: () => peekJiraThread(item),
+      comment: async (body) => { await jiraIssueComment({ ...item, id: item.id ?? "", key: item.identifier || item.id || "" }, body); },
     };
   if (item.provider === "linear") {
     const id = item.id ?? "";

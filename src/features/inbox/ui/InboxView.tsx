@@ -105,6 +105,7 @@ import {
   saveInboxSource,
   visibleInboxSources,
   INBOX_SOURCE_LABELS,
+  isTrackerSource,
   type ConnectableInboxSource,
   type InboxFilters,
   type InboxSource,
@@ -137,6 +138,12 @@ import {
   saveHiddenLinearTeamIds,
   type LinearTeam,
 } from "../model/linear";
+import {
+  listJiraProjects,
+  loadHiddenJiraProjectIds,
+  saveHiddenJiraProjectIds,
+  type JiraProject,
+} from "../model/jira";
 import {
   GITLAB_CHANGE_EVENT,
   gitlabConnected,
@@ -253,6 +260,7 @@ function peekInboxForRail(recents: RecentProject[], cwd: string) {
     state: inboxFetchState(filters),
     search: "",
     linearHiddenTeamIds: loadHiddenLinearTeamIds(),
+    jiraHiddenProjectIds: loadHiddenJiraProjectIds(),
   });
 }
 
@@ -403,7 +411,8 @@ export function InboxView({
   const [jiraSite, setJiraSite] = useState("");
   const [jiraAccountId, setJiraAccountId] = useState("");
   const [jiraFilter, setJiraFilter] = useState<JiraFilter>(DEFAULT_JIRA_FILTER);
-  const [jiraProjects, setJiraProjects] = useState<JiraOption[]>([]);
+  const [jiraProjects, setJiraProjects] = useState<JiraProject[]>([]);
+  const [jiraHiddenProjectIds, setJiraHiddenProjectIds] = useState(loadHiddenJiraProjectIds);
   const [jiraFavorites, setJiraFavorites] = useState<JiraOption[]>([]);
   const [jiraOptionsError, setJiraOptionsError] = useState("");
   const prevRefresh = useRef(refresh);
@@ -429,6 +438,7 @@ export function InboxView({
     activeFilters,
     source,
     linearHiddenTeamIds,
+    jiraHiddenProjectIds,
   );
   const fetchState = inboxFetchState(activeFilters);
   const fetchQuery = useMemo<InboxQuery>(
@@ -439,8 +449,9 @@ export function InboxView({
       state: fetchState,
       search: "",
       linearHiddenTeamIds,
+      jiraHiddenProjectIds,
     }),
-    [activeFilters.assignedToMe, activeFilters.azureRelationship, jiraFilter.relationship, fetchState, linearHiddenTeamIds],
+    [activeFilters.assignedToMe, activeFilters.azureRelationship, jiraFilter.relationship, fetchState, linearHiddenTeamIds, jiraHiddenProjectIds],
   );
 
   const resize = useDragResize({
@@ -481,6 +492,14 @@ export function InboxView({
     };
     window.addEventListener(LINEAR_CHANGE_EVENT, onChange);
     return () => window.removeEventListener(LINEAR_CHANGE_EVENT, onChange);
+  }, []);
+
+  useEffect(() => {
+    const onChange = () => {
+      setJiraHiddenProjectIds(loadHiddenJiraProjectIds());
+    };
+    window.addEventListener(JIRA_CHANGE_EVENT, onChange);
+    return () => window.removeEventListener(JIRA_CHANGE_EVENT, onChange);
   }, []);
 
   useEffect(() => {
@@ -530,13 +549,9 @@ export function InboxView({
     if (source !== "jira" || !jiraSite || !filterMenu) return;
     let cancelled = false;
     setJiraOptionsError("");
-    void Promise.all([
-      jiraOptions(jiraSite, false, jiraAccountId),
-      jiraOptions(jiraSite, true, jiraAccountId),
-    ])
-      .then(([projects, favorites]) => {
+    void jiraOptions(jiraSite, true, jiraAccountId)
+      .then((favorites) => {
         if (cancelled) return;
-        setJiraProjects(projects);
         setJiraFavorites(favorites);
       })
       .catch((error) => {
@@ -638,6 +653,22 @@ export function InboxView({
     };
   }, [source, linearHiddenTeamIds]);
 
+  // Same for Jira: hidden projects are excluded from the fetch itself.
+  useEffect(() => {
+    if (source !== "jira") return;
+    let cancelled = false;
+    void listJiraProjects()
+      .then((next) => {
+        if (!cancelled) setJiraProjects(next);
+      })
+      .catch(() => {
+        if (!cancelled) setJiraProjects([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [source, jiraSite, jiraAccountId, refresh]);
+
   useEffect(() => {
     const force = refresh !== prevRefresh.current;
     prevRefresh.current = refresh;
@@ -671,6 +702,7 @@ export function InboxView({
         setProviderErrors({
           github: message,
           linear: message,
+          jira: message,
           gitlab: message,
           azuredevops: message,
         });
@@ -796,7 +828,13 @@ export function InboxView({
     setListLimit(LIST_PAGE_SIZE);
     const scroller = listScrollRef.current;
     if (scroller) scroller.scrollTop = 0;
-  }, [activeFilters, linearHiddenTeamIds, searchInput, source]);
+  }, [
+    activeFilters,
+    jiraHiddenProjectIds,
+    linearHiddenTeamIds,
+    searchInput,
+    source,
+  ]);
 
   useEffect(() => {
     if (!hasMoreItems) return;
@@ -977,13 +1015,13 @@ export function InboxView({
           <p className="px-3 py-2 text-[12px] text-content/50">
             {narrowedByUser
               ? searchNarrowed
-                ? source === "linear"
-                  ? "No matching Linear issues"
+                ? isTrackerSource(source)
+                  ? `No matching ${INBOX_SOURCE_LABELS[source]} issues`
                   : source === "gitlab"
                     ? "No matching issues or merge requests"
                     : "No matching issues or pull requests"
-                : source === "linear"
-                  ? "No Linear issues match these filters"
+                : isTrackerSource(source)
+                  ? `No ${INBOX_SOURCE_LABELS[source]} issues match these filters`
                   : source === "gitlab" || source === "azuredevops"
                     ? source === "gitlab" && activeFilters.assignedToMe
                       ? "Nothing needs your attention"
@@ -991,8 +1029,8 @@ export function InboxView({
                         ? "No GitLab items match these filters"
                         : "No ADO items match these filters"
                     : "No issues or pull requests match these filters"
-              : source === "linear"
-                ? "No Linear issues"
+              : isTrackerSource(source)
+                ? `No ${INBOX_SOURCE_LABELS[source]} issues`
                 : source === "gitlab"
                   ? projects.length === 0
                     ? "Open a project to fill the inbox"
@@ -1062,12 +1100,14 @@ export function InboxView({
       linearProjects={linearProjects}
       linearTeams={linearTeams}
       hiddenLinearTeamIds={linearHiddenTeamIds}
+      jiraProjects={jiraProjects}
+      hiddenJiraProjectIds={jiraHiddenProjectIds}
+      onJiraProjectsChange={saveHiddenJiraProjectIds}
       source={source}
       filters={activeFilters}
       onChange={onFiltersChange}
       onLinearTeamsChange={saveHiddenLinearTeamIds}
       jiraFilter={jiraFilter}
-      jiraProjects={jiraProjects}
       jiraFavorites={jiraFavorites}
       jiraOptionsError={jiraOptionsError}
       onJiraFilterChange={(next) => {
@@ -1443,8 +1483,8 @@ function InboxCard({
       : "Issue";
   const time = formatRelativeTime(item.updatedAt);
   const name = projectName(item.projectPath);
-  const linear = item.provider === "linear";
-  const source = linear ? item.teamName || item.repo : item.repo || name;
+  const tracker = item.provider === "linear" || item.provider === "jira";
+  const source = tracker ? item.teamName || item.repo : item.repo || name;
   const attentionLabel =
     item.provider === "gitlab" || item.provider === "azuredevops"
       ? gitlabAttentionLabel(item.attentionReason ?? "")
@@ -1511,7 +1551,7 @@ function InboxCard({
       </span>
       <span className="mt-1 flex min-w-0 items-center gap-2">
         <span className="flex min-w-0 flex-1 items-center gap-1.5 text-[11px] text-content/45">
-          {linear || !item.projectPath ? null : logoPath ? (
+          {tracker || !item.projectPath ? null : logoPath ? (
             <ProjectLogoIcon
               path={logoPath}
               className="size-3.5 shrink-0 rounded-sm"
@@ -1936,9 +1976,11 @@ export function InboxDetail({
   const detailLock = useLockOverscroll<HTMLDivElement>();
   const panel = mode === "panel";
   const linear = item.provider === "linear";
+  const jira = item.provider === "jira";
+  const tracker = linear || jira;
   const gitlab = item.provider === "gitlab";
   const azuredevops = item.provider === "azuredevops";
-  const isPr = !linear && item.kind === "pr";
+  const isPr = !tracker && item.kind === "pr";
   const githubKind =
     item.provider === "github" && (item.kind === "issue" || item.kind === "pr")
       ? item.kind
@@ -1997,7 +2039,7 @@ export function InboxDetail({
   const statusMark = inboxStatusMark(item);
   const status = linear ? item.state || inboxItemStatus(item) : statusMark.label;
 
-  const source = linear
+  const source = tracker
     ? item.teamName || item.repo
     : item.provider === "jira"
       ? item.projectName || item.repo

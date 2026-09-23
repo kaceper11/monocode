@@ -14,7 +14,9 @@ export type InboxAskContext = {
 };
 
 export function inboxAskKey(item: InboxItem): string {
-  if (item.provider === "linear") return `linear:${item.id}`;
+  if (item.provider === "linear") {
+    return `${item.provider}:${item.id}`;
+  }
   // Items without a usable link (e.g. a provider that omitted the URL) must
   // still produce a stable key: this runs during render, so it cannot throw.
   try {

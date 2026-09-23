@@ -10,6 +10,7 @@ import {
   type InboxTimeFilter,
   type LinearProjectOption,
 } from "../model/inboxFilters";
+import { effectiveHiddenJiraProjects, type JiraProject } from "../model/jira";
 import type { LinearTeam } from "../model/linear";
 import {
   DEFAULT_JIRA_FILTER,
@@ -34,14 +35,17 @@ type Props = {
   linearProjects: LinearProjectOption[];
   linearTeams: LinearTeam[];
   hiddenLinearTeamIds: string[];
+  jiraProjects: JiraProject[];
+  hiddenJiraProjectIds: string[];
   source: InboxSource;
   filters: InboxFilters;
   onChange: (filters: InboxFilters) => void;
   /** Shared with Settings → Inbox → Linear; narrows the fetch, not just the list. */
   onLinearTeamsChange: (ids: string[]) => void;
+  /** Shared with Settings → Inbox → Jira; narrows the fetch, not just the list. */
+  onJiraProjectsChange: (ids: string[]) => void;
   onClose: () => void;
   jiraFilter?: JiraFilter;
-  jiraProjects?: JiraOption[];
   jiraFavorites?: JiraOption[];
   jiraOptionsError?: string;
   onJiraFilterChange?: (filter: JiraFilter) => void;
@@ -78,13 +82,15 @@ export function InboxFiltersMenu({
   linearProjects,
   linearTeams,
   hiddenLinearTeamIds,
+  jiraProjects,
+  hiddenJiraProjectIds,
   source,
   filters,
   onChange,
   onLinearTeamsChange,
+  onJiraProjectsChange,
   onClose,
   jiraFilter = DEFAULT_JIRA_FILTER,
-  jiraProjects = [],
   jiraFavorites = [],
   jiraOptionsError,
   onJiraFilterChange,
@@ -95,6 +101,7 @@ export function InboxFiltersMenu({
   const hiddenTeams = new Set(hiddenLinearTeamIds);
   const hiddenKinds = new Set(filters.hiddenKinds);
   const teamsActive = source === "linear" && hiddenLinearTeamIds.length > 0;
+  const hiddenJira = new Set(effectiveHiddenJiraProjects(jiraProjects, hiddenJiraProjectIds, jiraFilter.project));
 
   const toggleAssigned = () => {
     onChange({ ...filters, assignedToMe: !filters.assignedToMe });
@@ -119,6 +126,14 @@ export function InboxFiltersMenu({
     if (next.has(id)) next.delete(id);
     else next.add(id);
     onLinearTeamsChange([...next]);
+  };
+
+  const toggleJiraProject = (id: string) => {
+    const next = new Set(hiddenJira);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    onJiraFilterChange?.({ ...jiraFilter, project: "" });
+    onJiraProjectsChange([...next]);
   };
 
   const toggleLinearProject = (id: string) => {
@@ -260,16 +275,16 @@ export function InboxFiltersMenu({
           <SectionLabel>Projects</SectionLabel>
           <FilterItem
             label="All projects"
-            checked={!jiraFilter.project}
-            onClick={() => onJiraFilterChange?.({ ...jiraFilter, project: "" })}
+            checked={!jiraFilter.project && hiddenJiraProjectIds.length === 0}
+            onClick={() => { onJiraProjectsChange([]); onJiraFilterChange?.({ ...jiraFilter, project: "" }); }}
           />
           {jiraProjects.map((project) => (
             <FilterItem
               key={project.id}
               label={project.name}
-              checked={jiraFilter.project === project.id}
+              checked={!hiddenJira.has(project.id)}
               onClick={() =>
-                onJiraFilterChange?.({ ...jiraFilter, project: project.id })
+                toggleJiraProject(project.id)
               }
             />
           ))}
@@ -329,7 +344,7 @@ export function InboxFiltersMenu({
         </>
       ) : null}
 
-      {hasActiveInboxFilters(filters, source, hiddenLinearTeamIds) ||
+      {hasActiveInboxFilters(filters, source, hiddenLinearTeamIds, hiddenJiraProjectIds) ||
       (source === "jira" &&
         (jiraFilter.project || jiraFilter.filter || jiraFilter.relationship !== "all")) ? (
         <>
@@ -344,7 +359,10 @@ export function InboxFiltersMenu({
                 azureRelationship: source === "azuredevops" ? "all" : filters.azureRelationship,
               });
               if (teamsActive) onLinearTeamsChange([]);
-              if (source === "jira") onJiraFilterChange?.({ ...DEFAULT_JIRA_FILTER, relationship: "all" });
+              if (source === "jira") {
+                onJiraProjectsChange([]);
+                onJiraFilterChange?.({ ...DEFAULT_JIRA_FILTER, relationship: "all" });
+              }
             }}
             className="flex h-7 w-full items-center rounded-lg px-2 text-left text-[13px] leading-none text-content/70 hover:bg-content/5 hover:text-content"
           >

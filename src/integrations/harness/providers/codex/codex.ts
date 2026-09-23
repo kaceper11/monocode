@@ -30,7 +30,7 @@ import {
   codexMcpConfirmation,
   isCodexComputerUseAccessConfirmation,
 } from "./codexElicitation";
-import { joinStreamText, snapshotRemainder } from "../../core/streamText";
+import { snapshotRemainder } from "../../core/streamText";
 import type {
   ApprovalDecision,
   CompactContextInput,
@@ -86,8 +86,9 @@ type Live = {
   turnFailed: ((error: Error) => void) | null;
   /** turn/completed arrived before runTurn registered turnDone. */
   turnEndPending: boolean;
-  emittedAssistant: string;
-  emittedReasoning: string;
+  /** Completed snapshots describe one item, not all text in the turn. */
+  emittedAssistantByItem: Map<string, string>;
+  emittedReasoningByItem: Map<string, string>;
   /** Child thread id -> the agent tool row that spawned it. */
   subagentThreads: Map<string, string>;
   /** Child notifications that arrived before their row was known. */
@@ -557,8 +558,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       turnDone: null,
       turnFailed: null,
       turnEndPending: false,
-      emittedAssistant: "",
-      emittedReasoning: "",
+      emittedAssistantByItem: new Map(),
+      emittedReasoningByItem: new Map(),
       subagentThreads: new Map(),
       pendingSubagent: new Map(),
       openAgentRows: new Map(),
@@ -605,8 +606,8 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
     return;
   }
 
-  live.emittedAssistant = "";
-  live.emittedReasoning = "";
+  live.emittedAssistantByItem.clear();
+  live.emittedReasoningByItem.clear();
 
   const turnPromise = new Promise<void>((resolve, reject) => {
     live.turnDone = resolve;
@@ -644,8 +645,8 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
 }
 
 async function runCompaction(live: Live): Promise<void> {
-  live.emittedAssistant = "";
-  live.emittedReasoning = "";
+  live.emittedAssistantByItem.clear();
+  live.emittedReasoningByItem.clear();
   const turnPromise = new Promise<void>((resolve, reject) => {
     live.turnDone = resolve;
     live.turnFailed = reject;
@@ -711,15 +712,18 @@ function handleNotification(live: Live, method: string, params: unknown): void {
   // would otherwise stand up a second agent that never does anything.
   const duplicate = bindSubagentThreads(live, method, rec);
   const snapshot = method === "item/completed";
+  const itemId = snapshot
+    ? stringField(asRecord(rec?.item), "id")
+    : stringField(rec, "itemId");
   for (const event of mapped.events) {
     if (duplicate && duplicateAgentRow(event)) continue;
     trackAgentRow(live, event);
     if (event.type === "message.delta") {
-      publishCodexText(live, "assistant", event.text, snapshot);
+      publishCodexText(live, "assistant", event.text, snapshot, itemId);
       continue;
     }
     if (event.type === "reasoning.delta") {
-      publishCodexText(live, "reasoning", event.text, snapshot);
+      publishCodexText(live, "reasoning", event.text, snapshot, itemId);
       continue;
     }
     live.onEvent(event);
@@ -902,17 +906,24 @@ function publishCodexText(
   role: "assistant" | "reasoning",
   text: string,
   snapshot: boolean,
+  itemId: string | undefined,
 ): void {
-  const already =
-    role === "assistant" ? live.emittedAssistant : live.emittedReasoning;
+  const emitted =
+    role === "assistant"
+      ? live.emittedAssistantByItem
+      : live.emittedReasoningByItem;
+  // Keep id-less notifications compatible without mixing them into known items.
+  const key = itemId ?? "";
+  const already = emitted.get(key) ?? "";
   const emit = snapshot ? snapshotRemainder(already, text) : text;
   if (!emit) return;
+  // These are deltas (or a snapshot's missing suffix), so repeated tokens count.
+  // Retain completed items until the turn ends to ignore repeated completions.
+  emitted.set(key, already + emit);
   if (role === "assistant") {
-    live.emittedAssistant = joinStreamText(already, emit);
     live.onEvent({ type: "message.delta", text: emit });
     return;
   }
-  live.emittedReasoning = joinStreamText(already, emit);
   live.onEvent({ type: "reasoning.delta", text: emit });
 }
 
@@ -921,8 +932,8 @@ function finishActiveTurn(live: Live, extraEvents: HarnessEvent[] = []): void {
   closeOpenAgentRows(live);
   live.turnEndPending = false;
   live.activeTurnId = null;
-  live.emittedAssistant = "";
-  live.emittedReasoning = "";
+  live.emittedAssistantByItem.clear();
+  live.emittedReasoningByItem.clear();
   for (const event of extraEvents) {
     live.onEvent(event);
   }

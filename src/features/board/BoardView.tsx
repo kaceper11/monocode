@@ -1,3 +1,4 @@
+import { JIRA_CHANGE_EVENT } from "../inbox/model/jira";
 import { inboxIntegrationCacheKey } from "../sessions/model/inboxIntegrations";
 import { AgentHandoffDialog, type HandoffKind } from "./AgentHandoffDialog";
 import { currentDeliveryStatuses, deliveryKey, type SendToSession } from "./delivery";
@@ -263,8 +264,7 @@ export function BoardView({
     [recents, cwd],
   );
   const connections = useInboxConnections();
-  // Fetch-level "my work" filter — every provider honors it (Jira via the
-  // merged filter in listInboxIntegrations); off shows the wider listing.
+  // Fetch-level "my work" filter — every provider honors it; off shows the wider listing.
   const [mineOnly, setMineOnly] = useState(true);
   const query = useMemo<InboxQuery>(
     () => ({ assignedToMe: mineOnly, state: "all", search: "" }),
@@ -279,6 +279,17 @@ export function BoardView({
   );
   const [fetching, setFetching] = useState(false);
   const [refresh, setRefresh] = useState(0);
+
+  useEffect(() => {
+    const changed = (event: Event) => {
+      if (event instanceof CustomEvent && event.detail === "connection") {
+        setItems(items => items.filter(item => item.provider !== "jira"));
+      }
+      setRefresh(value => value + 1);
+    };
+    window.addEventListener(JIRA_CHANGE_EVENT, changed);
+    return () => window.removeEventListener(JIRA_CHANGE_EVENT, changed);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;

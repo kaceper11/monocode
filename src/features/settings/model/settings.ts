@@ -89,7 +89,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     label: "Inbox",
     description:
       "Manage Inbox services and notification preferences for each project.",
-    keywords: "github gitlab linear azure devops connect token integration",
+    keywords: "github gitlab linear jira atlassian azure devops connect token integration",
   },
   {
     id: "archive",
@@ -346,16 +346,16 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     keywords: "azure devops boards repos pull request pat organization connect",
   },
   {
+    id: "jira",
+    section: "inbox",
+    label: "Jira",
+    keywords: "atlassian cloud confluence site email api token issues projects boards connect",
+  },
+  {
     id: "linear",
     section: "inbox",
     label: "Linear",
     keywords: "api key issues teams connect",
-  },
-  {
-    id: "jira",
-    section: "inbox",
-    label: "Atlassian Cloud",
-    keywords: "jira atlassian site issues boards connect",
   },
   {
     id: "show-archived",

@@ -1,15 +1,13 @@
+import { saveJiraConfig, jiraIssueToInboxItem } from "../../inbox/model/jira";
 // @vitest-environment happy-dom
 import { beforeEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  jiraIssue,
   jiraOptions,
-  jiraMarkdown,
   loadJiraFilter,
   saveJiraFilter,
   jiraDetails,
   peekJiraDetails,
-  saveJiraConfig,
 } from "./jira";
 import {
   clearInboxCache,
@@ -24,17 +22,12 @@ import { inboxAskKey } from "../../inbox/model/inboxAsk.ts";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const call = vi.mocked(invoke);
-const issue = {
-  id: "101",
-  key: "ENG-42",
-  fields: {
-    summary: "Fix checkout",
-    status: { name: "Ready for deployment", statusCategory: { key: "done" } },
-    project: { id: "12", name: "Engineering" },
-    updated: "2026-09-10T10:00:00Z",
-  },
-};
-const item = jiraIssue("https://team.atlassian.net", issue);
+const item = jiraIssueToInboxItem({
+  provider: "jira", kind: "jira", site: "https://team.atlassian.net", account: "email:ada@example.test",
+  id: "101", identifier: "ENG-42", number: 42, title: "Fix checkout",
+  url: "https://team.atlassian.net/browse/ENG-42", state: "Ready for deployment", stateType: "done",
+  teamId: "12", teamName: "Engineering", updatedAt: "2026-09-10T10:00:00Z", labels: [], assignees: [], repo: "", projectPath: "", draft: false,
+});
 beforeEach(() => {
   const stored = new Map<string, string>();
   vi.stubGlobal("localStorage", {
@@ -46,8 +39,8 @@ beforeEach(() => {
 });
 
 it("keeps site/project identity and actual statuses without inventing a code host", () => {
-  const otherSite = jiraIssue("https://other.atlassian.net", issue);
-  const otherProject = jiraIssue(item.site!, { ...issue, key: "OPS-42" });
+  const otherSite = { ...item, site: "https://other.atlassian.net", url: "https://other.atlassian.net/browse/ENG-42" };
+  const otherProject = { ...item, identifier: "OPS-42", url: `${item.site}/browse/OPS-42` };
   expect(dedupeInboxItems([item, otherSite, otherProject])).toHaveLength(3);
   const github = {
     ...item,
@@ -119,53 +112,6 @@ it("remembers favorite filters only for their site and defaults to related", () 
   });
 });
 
-it("renders bounded ADF with readable unknown content and safe links", () => {
-  const content = jiraMarkdown({
-    type: "doc",
-    content: [
-      {
-        type: "heading",
-        attrs: { level: 2 },
-        content: [{ type: "text", text: "Summary" }],
-      },
-      {
-        type: "paragraph",
-        content: [
-          { type: "text", text: "Important", marks: [{ type: "strong" }] },
-          {
-            type: "text",
-            text: "link",
-            marks: [{ type: "link", attrs: { href: "javascript:alert(1)" } }],
-          },
-        ],
-      },
-      {
-        type: "futureBlock",
-        content: [{ type: "text", text: "Still readable" }],
-      },
-      { type: "media", attrs: { id: "private-attachment" } },
-    ],
-  });
-  expect(content).toContain("## Summary");
-  expect(content).toContain("**Important**");
-  expect(content).toContain("Still readable");
-  expect(content).not.toContain("javascript:");
-  expect(content).not.toContain("private-attachment");
-  expect(jiraMarkdown("x".repeat(70_000))).toContain("Truncated");
-  expect(
-    jiraMarkdown({
-      type: "orderedList",
-      attrs: { order: 2 },
-      content: [
-        { type: "listItem", content: [{ type: "text", text: "Check" }] },
-      ],
-    }),
-  ).toBe("2. Check");
-  expect(jiraMarkdown({ type: "text", text: "x".repeat(70_000) })).toContain(
-    "Truncated",
-  );
-});
-
 it("does not request Jira when disconnected and isolates connection errors", async () => {
   call.mockImplementation(async (cmd) => {
     if (cmd === "linear_status") throw new Error("Linear unavailable");
@@ -204,11 +150,12 @@ it("passes the selected saved filter and preserves other providers on Jira failu
   // assigned-only query forces `assigned` — a wider saved filter must not
   // leak unassigned tickets into it (e.g. the board).
   expect(call).toHaveBeenCalledWith("jira_list_issues", {
-    site: item.site,
-    accountId: "email:ada@example.test",
     project: "12",
     filter: "34",
-    assigned: true,
+    assignedToMe: true,
+    projectIds: [],
+    limit: 100,
+    relationship: undefined,
     state: "all",
   });
   expect(result.errors.jira).toBe("Jira denied access");
@@ -217,24 +164,24 @@ it("passes the selected saved filter and preserves other providers on Jira failu
 it("drops old detail results after disconnect instead of refilling the cache", async () => {
   let finish!: (value: unknown) => void;
   call.mockImplementation(async (cmd) => {
-    if (cmd === "jira_issue_content")
+    if (cmd === "jira_issue_details")
       return new Promise((resolve) => {
         finish = resolve;
       });
     return { connected: false, site: "", account: "" };
   });
   const pending = jiraDetails(item);
-  await saveJiraConfig("", "", "");
-  finish({ fields: { description: "Old private description" } });
+  await saveJiraConfig({ site: "", email: "", token: "" });
+  finish({ body: "Old private description", author: "" });
   await expect(pending).rejects.toThrow("connection changed");
   expect(peekJiraDetails(item)).toBeNull();
 });
 
 it("separates detail caches and reads by the credential account", async () => {
-  call.mockResolvedValue({ fields: { description: "Private issue" } });
+  call.mockResolvedValue({ body: "Private issue", author: "" });
   const owned = { ...item, account: "email:ada@example.test" };
   await jiraDetails(owned);
-  expect(call).toHaveBeenLastCalledWith("jira_issue_content", { site: owned.site, id: owned.id, accountId: owned.account, comments: false });
+  expect(call).toHaveBeenLastCalledWith("jira_issue_details", { site: owned.site, key: owned.identifier, accountId: owned.account });
   expect(peekJiraDetails(owned)).not.toBeNull();
   expect(peekJiraDetails({ ...owned, account: "email:other@example.test" })).toBeNull();
 });
@@ -252,10 +199,10 @@ it("binds Jira filter options to the selected account", async () => {
 it.each(["all", "related", "assigned", "created"] as const)("passes the explicit %s relationship independently of the shared flag", async relationship => {
   saveJiraFilter(item.site!, { project: "12", filter: "34", assigned: true, relationship: "related" });
   call.mockImplementation(async cmd => {
-    if (cmd === "jira_status") return { connected: true, site: item.site, accountId: "ada" };
-    if (cmd === "jira_list_issues") return { site: item.site, issues: [] };
+    if (cmd === "jira_status") return { connected: true, site: item.site };
+    if (cmd === "jira_list_issues") return [];
     return { connected: false };
   });
   await listInboxItems([], { assignedToMe: true, state: "all", search: "", jiraRelationship: relationship }, { force: true });
-  expect(call).toHaveBeenCalledWith("jira_list_issues", expect.objectContaining({ project: "12", filter: "34", relationship, accountId: "ada" }));
+  expect(call).toHaveBeenCalledWith("jira_list_issues", expect.objectContaining({ project: "12", filter: "34", relationship }));
 });

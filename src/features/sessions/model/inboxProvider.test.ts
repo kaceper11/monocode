@@ -118,12 +118,9 @@ it("routes Azure DevOps details, discussion, diff and comments through the adapt
       .mock.calls.filter(([cmd]) => cmd === "azure_devops_work_item_details"),
   ).toHaveLength(1);
 });
-it("does not offer unsupported ticket writes or route a Jira read to GitHub", async () => {
+it("routes Jira reads and comments to upstream Jira with selected identity", async () => {
   vi.mocked(invoke).mockResolvedValue({
-    fields: {
-      description: "Jira description",
-      creator: { displayName: "Ada" },
-    },
+    body: "Jira description", author: "Ada",
   });
   const provider = inboxProvider({
     ...item,
@@ -132,14 +129,16 @@ it("does not offer unsupported ticket writes or route a Jira read to GitHub", as
     account: "account-a",
     site: "https://team.atlassian.net",
     id: "42",
+    identifier: "ENG-42",
     url: "https://team.atlassian.net/browse/ENG-42",
   });
-  expect(provider.comment).toBeUndefined();
+  expect(provider.comment).toBeTypeOf("function");
+  await provider.comment!("A Jira comment");
+  expect(invoke).toHaveBeenCalledWith("jira_issue_comment", { key: "ENG-42", site: "https://team.atlassian.net", accountId: "account-a", body: "A Jira comment" });
   expect((await provider.details()).body).toBe("Jira description");
-  expect(invoke).toHaveBeenCalledWith("jira_issue_content", {
+  expect(invoke).toHaveBeenCalledWith("jira_issue_details", {
     site: "https://team.atlassian.net",
-    id: "42",
+    key: "ENG-42",
     accountId: "account-a",
-    comments: false,
   });
 });

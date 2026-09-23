@@ -3,12 +3,14 @@ import { sameProjectPath } from "../../projects/model/recents";
 const MAX_PENDING_AGE_MS = 10 * 60_000;
 
 export type InboxSelfActivityTarget = {
-  provider: "github" | "gitlab" | "linear" | "azuredevops";
-  kind?: "issue" | "pr" | "linear";
+  provider: "github" | "gitlab" | "linear" | "jira" | "azuredevops";
+  kind?: "issue" | "pr" | "linear" | "jira";
   repo?: string;
   number?: number;
   id?: string;
   projectPath?: string;
+  site?: string;
+  account?: string;
 };
 
 export type InboxSelfActivityItem = Omit<
@@ -40,6 +42,8 @@ function prune(now: number) {
 
 function matches(activity: PendingActivity, item: InboxSelfActivityItem) {
   if (activity.provider !== item.provider) return false;
+  if (activity.site && activity.site !== item.site) return false;
+  if (activity.account && activity.account !== item.account) return false;
   if (activity.id && activity.id !== item.id) return false;
   if (activity.kind && activity.kind !== item.kind) return false;
   if (activity.number != null && activity.number !== item.number) return false;

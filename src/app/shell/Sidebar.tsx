@@ -1097,6 +1097,56 @@ function SidebarComponent({
     onSelectSession(sessionId);
   };
 
+  // Cards are memoized. Their handlers go through one stable set that calls
+  // the latest version, so a sidebar render no longer re-renders every card.
+  const cardHandlers = useRef({
+    onSessionCardSelect,
+    onOpenInboxItem,
+    onPrefetchSession,
+    onPlaceSessionOnPane,
+    onSessionListDrop,
+    onSessionContextMenu,
+    onArchiveSession,
+    setRenamingSessionId,
+    onDeleteSession,
+  });
+  cardHandlers.current = {
+    onSessionCardSelect,
+    onOpenInboxItem,
+    onPrefetchSession,
+    onPlaceSessionOnPane,
+    onSessionListDrop,
+    onSessionContextMenu,
+    onArchiveSession,
+    setRenamingSessionId,
+    onDeleteSession,
+  };
+  const cardActions = useMemo(
+    () => ({
+      select: (
+        sessionId: string,
+        event: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean },
+      ) => cardHandlers.current.onSessionCardSelect(sessionId, event),
+      openWorkItem: (item: LinkedWorkItem, sessionId: string) =>
+        cardHandlers.current.onOpenInboxItem?.(item, sessionId),
+      prefetch: (sessionId: string) =>
+        cardHandlers.current.onPrefetchSession?.(sessionId),
+      placeOnPane: (sessionId: string, targetId: string, edge: PaneEdge) =>
+        cardHandlers.current.onPlaceSessionOnPane?.(sessionId, targetId, edge),
+      listDrop: (draggedId: string, target: SessionListDropTarget) =>
+        cardHandlers.current.onSessionListDrop(draggedId, target),
+      contextMenu: (sessionId: string, e: ReactMouseEvent<HTMLDivElement>) =>
+        cardHandlers.current.onSessionContextMenu(sessionId, e),
+      archive: (sessionId: string, archived: boolean) =>
+        cardHandlers.current.onArchiveSession?.(sessionId, archived),
+      rename: (sessionId: string) =>
+        cardHandlers.current.setRenamingSessionId(sessionId),
+      delete: (sessionId: string) =>
+        cardHandlers.current.onDeleteSession?.(sessionId),
+    }),
+    [],
+  );
+
   const renderSessionCard = (session: SessionSummary, compact = false) =>
     renamingSessionId === session.id && onRenameSession ? (
       <SessionRenameRow
@@ -1121,24 +1171,20 @@ function SidebarComponent({
         dropTarget={isSessionDrop("session", session.id)}
         compact={compact}
         now={now}
-        onSelect={onSessionCardSelect}
-        onOpenWorkItem={onOpenInboxItem}
-        onPrefetch={onPrefetchSession}
-        onPlaceOnPane={onPlaceSessionOnPane}
-        onListDrop={reminderIds.has(session.id) || taskSessionIds.has(session.id) ? undefined : onSessionListDrop}
+        onSelect={cardActions.select}
+        onOpenWorkItem={onOpenInboxItem ? cardActions.openWorkItem : undefined}
+        onPrefetch={onPrefetchSession ? cardActions.prefetch : undefined}
+        onPlaceOnPane={
+          onPlaceSessionOnPane ? cardActions.placeOnPane : undefined
+        }
+        onListDrop={
+          (reminderIds.has(session.id) || taskSessionIds.has(session.id)) ? undefined : cardActions.listDrop
+        }
         onListDropTargetChange={setSessionDrop}
-        onContextMenu={(e) => onSessionContextMenu(session.id, e)}
-        onArchive={
-          onArchiveSession
-            ? () => onArchiveSession(session.id, !session.archived)
-            : undefined
-        }
-        onRename={
-          onRenameSession ? () => setRenamingSessionId(session.id) : undefined
-        }
-        onDelete={
-          onDeleteSession ? () => onDeleteSession(session.id) : undefined
-        }
+        onContextMenu={cardActions.contextMenu}
+        onArchive={onArchiveSession ? cardActions.archive : undefined}
+        onRename={onRenameSession ? cardActions.rename : undefined}
+        onDelete={onDeleteSession ? cardActions.delete : undefined}
       />
     );
 
@@ -2594,7 +2640,7 @@ function FolderRenameRow({
 
 const SESSION_PREFETCH_DELAY_MS = 120;
 
-function SessionCard({
+const SessionCard = memo(function SessionCard({
   session,
   isActive,
   isSelected,
@@ -2635,10 +2681,13 @@ function SessionCard({
   onPlaceOnPane?: (sessionId: string, targetId: string, edge: PaneEdge) => void;
   onListDrop?: (draggedId: string, target: SessionListDropTarget) => void;
   onListDropTargetChange?: (target: SessionListDropTarget | null) => void;
-  onContextMenu?: (e: ReactMouseEvent<HTMLDivElement>) => void;
-  onArchive?: () => void;
-  onRename?: () => void;
-  onDelete?: () => void;
+  onContextMenu?: (
+    sessionId: string,
+    e: ReactMouseEvent<HTMLDivElement>,
+  ) => void;
+  onArchive?: (sessionId: string, archived: boolean) => void;
+  onRename?: (sessionId: string) => void;
+  onDelete?: (sessionId: string) => void;
 }) {
   const skipClickUntil = useRef(0);
   const prefetchTimer = useRef<number | null>(null);
@@ -2754,12 +2803,12 @@ function SessionCard({
     }
     if (e.key === "F2" && onRename) {
       e.preventDefault();
-      onRename();
+      onRename(session.id);
       return;
     }
     if ((e.key === "Delete" || e.key === "Backspace") && onDelete) {
       e.preventDefault();
-      onDelete();
+      onDelete(session.id);
     }
   };
 
@@ -2921,7 +2970,11 @@ function SessionCard({
           if (performance.now() < skipClickUntil.current) return;
           onSelect(session.id, event);
         }}
-        onContextMenu={onContextMenu}
+        onContextMenu={
+          onContextMenu
+            ? (event) => onContextMenu(session.id, event)
+            : undefined
+        }
         className={`relative border flex w-full cursor-default select-none touch-none flex-col rounded-md px-2.5 text-left ${cardPaddingY} ${
           dragging ? "opacity-40" : ""
         } ${
@@ -3028,7 +3081,7 @@ function SessionCard({
                 onPointerDown={(event) => event.stopPropagation()}
                 onClick={(event) => {
                   event.stopPropagation();
-                  onArchive();
+                  onArchive(session.id, !session.archived);
                 }}
                 className="pointer-events-none grid size-5 place-items-center rounded-md text-content/50 opacity-0 hover:bg-content/10 hover:text-content group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100"
               >
@@ -3142,7 +3195,7 @@ function SessionCard({
       ) : null}
     </div>
   );
-}
+});
 
 function SessionRenameRow({
   session,

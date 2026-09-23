@@ -1,7 +1,6 @@
 import { useWslStatus } from "../../sessions/model/wslStatus";
 import { KeepAwakeControl } from "../../sessions/ui/KeepAwakeControl";
 import { wslLocation } from "../../../shared/lib/paths";
-import { JIRA_CHANGE_EVENT, jiraConnected, saveJiraConfig, type JiraStatus } from "../../sessions/model/jira";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ask } from "@tauri-apps/plugin-dialog";
 import {
@@ -39,6 +38,7 @@ import {
 } from "../../../shared/ui/ColorPickerPopover";
 import { Popover } from "../../../shared/ui/Popover";
 import { SecondaryButton } from "../../../shared/ui/SecondaryButton";
+import { JiraSettings } from "./JiraSettings";
 import { InboxProviderMark } from "../../inbox/ui/InboxProviderMark";
 import { RemoveProjectDialog } from "../../projects/ui/RemoveProjectDialog";
 import { WindowControls } from "../../../app/shell/WindowControls";
@@ -994,185 +994,6 @@ function ChatPage() {
   );
 }
 
-function JiraSettings() {
-  const [status, setStatus] = useState<JiraStatus>({
-    connected: false,
-    site: "",
-    account: "",
-    accountId: "",
-    capabilities: [],
-  });
-  const [site, setSite] = useState("");
-  const [email, setEmail] = useState("");
-  const [token, setToken] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const operation = useRef(0);
-  useEffect(() => {
-    const refresh = (changed = false) => {
-      const current = ++operation.current;
-      if (changed) { setBusy(true); setStatus(previous => ({ ...previous, connected: false })); setToken(""); }
-      void jiraConnected()
-        .then((next) => {
-          if (current === operation.current && next) {
-            setStatus(next);
-            setSite(next.site);
-            setError("");
-          }
-        })
-        .catch((error) => {
-          if (current === operation.current) setError(String(error));
-        })
-        .finally(() => { if (changed && current === operation.current) setBusy(false); });
-    };
-    const onChange = (event: Event) => { if (event instanceof CustomEvent && event.detail === "connection") refresh(true); };
-    window.addEventListener(JIRA_CHANGE_EVENT, onChange);
-    refresh();
-    return () => {
-      operation.current++;
-      window.removeEventListener(JIRA_CHANGE_EVENT, onChange);
-    };
-  }, []);
-  const save = async (disconnect = false) => {
-    if (busy) return;
-    const current = ++operation.current;
-    setBusy(true);
-    setError("");
-    try {
-      const next = await saveJiraConfig(site, email, disconnect ? "" : token);
-      clearInboxCache();
-      if (current !== operation.current) return;
-      setStatus(next);
-      setToken("");
-    } catch (error) {
-      if (current === operation.current) setError(String(error));
-    } finally {
-      if (current === operation.current) setBusy(false);
-    }
-  };
-  return (
-    <>
-      <Row
-        stacked={!status.connected}
-        label={
-          <span className="flex items-center gap-2">
-            <InboxProviderMark provider="jira" className="size-4 shrink-0" />
-            {status.connected ? "Connected account" : "Connect your account"}
-          </span>
-        }
-        description="One Atlassian Cloud account for Jira issues and Confluence pages. Your API token stays on this device."
-      >
-        {status.connected ? (
-          <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <span
-              className="max-w-56 truncate text-[12px] text-content/50"
-              title={`${status.site} · ${status.account}`}
-            >
-              {status.site} · {status.account}
-            </span>
-            {(status.capabilities.length
-              ? status.capabilities
-              : ["Jira"]
-            ).map((capability) => (
-              <span
-                key={capability}
-                className="rounded-full border border-content/15 px-2 py-0.5 text-[11px] text-content/60"
-              >
-                {capability}
-              </span>
-            ))}
-            <SecondaryButton onClick={() => void save(true)} disabled={busy}>
-              Disconnect
-            </SecondaryButton>
-          </div>
-        ) : (
-          <form
-            className="grid w-full grid-cols-1 gap-3 sm:grid-cols-2"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (site.trim() && email.trim() && token.trim()) void save();
-            }}
-          >
-            {(
-              [
-                {
-                  value: site,
-                  change: setSite,
-                  type: "url",
-                  label: "Atlassian Cloud site",
-                  placeholder: "https://team.atlassian.net",
-                },
-                {
-                  value: email,
-                  change: setEmail,
-                  type: "email",
-                  label: "Atlassian email",
-                  placeholder: "you@example.com",
-                },
-                {
-                  value: token,
-                  change: setToken,
-                  type: "password",
-                  label: "Atlassian API token",
-                  placeholder: "API token",
-                },
-              ] as const
-            ).map((field) => (
-              <label
-                key={field.label}
-                className={`flex min-w-0 flex-col gap-1.5 ${field.type === "url" ? "sm:col-span-2" : ""}`}
-              >
-                <span className="text-[12px] text-content/60">
-                  {field.label}
-                </span>
-                <input
-                  type={field.type}
-                  value={field.value}
-                  onChange={(event) => field.change(event.target.value)}
-                  placeholder={field.placeholder}
-                  aria-label={field.label}
-                  autoComplete="off"
-                  spellCheck={false}
-                  disabled={busy}
-                  required
-                  className="h-8 w-full min-w-0 rounded-md border border-content/10 bg-transparent px-2.5 text-[12px] text-content outline-none placeholder:text-content/35 focus:border-content/30 disabled:opacity-50"
-                />
-              </label>
-            ))}
-            <div className="flex items-start justify-between gap-4 sm:col-span-2">
-              <p className="max-w-sm text-[12px] leading-relaxed text-content/45">
-                Use an API token without scopes. Jira and Confluence are
-                enabled automatically per your account. Server and Data Center
-                aren't supported.
-              </p>
-              <SecondaryButton
-                type="submit"
-                disabled={
-                  busy || !site.trim() || !email.trim() || !token.trim()
-                }
-              >
-                {busy ? "Connecting…" : "Connect"}
-              </SecondaryButton>
-            </div>
-            {error ? (
-              <p
-                role="alert"
-                className="text-[12px] text-red-400/90 sm:col-span-2"
-              >
-                {error}
-              </p>
-            ) : null}
-          </form>
-        )}
-      </Row>
-      {error && status.connected ? (
-        <p role="alert" className="pb-2 text-[12px] text-red-400/90">
-          {error}
-        </p>
-      ) : null}
-    </>
-  );
-}
 
 function InboxPage({
   cwd,
@@ -1243,6 +1064,19 @@ function InboxPage({
       </Group>
 
       <Group
+        id="jira"
+        title={
+          <span className="flex items-center gap-2">
+            <InboxProviderMark provider="jira" className="size-4 shrink-0" />
+            Jira
+          </span>
+        }
+        description="Jira Cloud issues from the projects you pick."
+      >
+        <JiraSettings />
+      </Group>
+
+      <Group
         id="linear"
         title={
           <span className="flex items-center gap-2">
@@ -1254,7 +1088,6 @@ function InboxPage({
       >
         <LinearSettings />
       </Group>
-      <Group id="jira" title="Atlassian Cloud" description="Jira issues and Confluence pages."><JiraSettings /></Group>
     </>
   );
 }

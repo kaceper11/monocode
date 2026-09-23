@@ -48,6 +48,7 @@ import {
   subscribeLinkedSessionSeen,
 } from "../model/linkedSessionSeen";
 import { loadHiddenLinearTeamIds } from "../model/linear";
+import { JIRA_CHANGE_EVENT, loadHiddenJiraProjectIds } from "../model/jira";
 import type { RecentProject } from "../../projects/model/recents";
 import type { SessionSummary } from "../../sessions/data/sessionStore";
 import { playCue } from "../../settings/model/sounds";
@@ -69,8 +70,6 @@ import {
   consumeInboxSelfActivity,
   subscribeInboxSelfActivity,
 } from "../model/inboxSelfActivity";
-
-import { listInboxIntegrations } from "../../sessions/model/inboxIntegrations";
 
 const POLL_MS = 30_000;
 const FALLBACK_REFRESH_MS = 60_000;
@@ -215,12 +214,10 @@ export function useInboxActivity(
         state: inboxFetchState(filters),
         search: "",
         linearHiddenTeamIds: loadHiddenLinearTeamIds(),
+        jiraHiddenProjectIds: loadHiddenJiraProjectIds(),
       };
       try {
-        // Preserve upstream's no-project boundary; added services are project-independent.
-        const listed = projects.length || query.azureRelationship !== "all"
-          ? await listInboxItems(projects, query, { force })
-          : await listInboxIntegrations(query.state, query.assignedToMe, query.jiraRelationship);
+        const listed = await listInboxItems(projects, query, { force });
         if (cancelled) return;
         const visible = applyInboxFilters(listed.items, filters, "");
         rememberNotificationProjects(
@@ -353,10 +350,13 @@ export function useInboxActivity(
       if (!document.hidden) void pull(true);
     };
     document.addEventListener("visibilitychange", onVis);
+    const onJiraChange = () => void pull(true);
+    window.addEventListener(JIRA_CHANGE_EVENT, onJiraChange);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener(JIRA_CHANGE_EVENT, onJiraChange);
       stopSelfActivity();
     };
   }, [applyUnseen, cwd, recents, targetKey]);

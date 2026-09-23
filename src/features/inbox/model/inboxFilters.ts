@@ -104,6 +104,11 @@ export function connectableInboxSources(
   return sources;
 }
 
+/** Account-wide issue trackers: no local repos, no PRs, no draft/merged states. */
+export function isTrackerSource(source?: InboxSource): boolean {
+  return source === "linear" || source === "jira";
+}
+
 export function resolveInboxSource(
   source: InboxSource,
   connections: InboxSourceConnections,
@@ -242,11 +247,13 @@ export function hasActiveInboxFilters(
   source?: InboxSource,
   /** Teams live outside InboxFilters — they narrow the fetch and are shared with Settings. */
   hiddenLinearTeamIds: readonly string[] = [],
+  /** Same for Jira projects. */
+  hiddenJiraProjectIds: readonly string[] = [],
 ): boolean {
   if (source === "jira") {
     const status = statusFilterForSource(filters.status, source);
     return (
-      filters.time !== "all" || Object.values(status).some(Boolean)
+      hiddenJiraProjectIds.length > 0 || filters.time !== "all" || Object.values(status).some(Boolean)
     );
   }
   const statusActive =
@@ -262,7 +269,7 @@ export function hasActiveInboxFilters(
     (source === "linear"
       ? filters.hiddenLinearProjects.length > 0
       : filters.hiddenProjects.length > 0) ||
-    (source === "linear" ? false : filters.hiddenKinds.length > 0) ||
+    (isTrackerSource(source) ? false : filters.hiddenKinds.length > 0) ||
     filters.time !== "all" ||
     statusActive
   );

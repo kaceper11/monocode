@@ -23,8 +23,8 @@ it.each(["jira", "azuredevops"] as const)("uses upstream Ask and Send controls w
   const jira = provider === "jira";
   const item: InboxItem = { provider, kind: jira ? "jira" : "issue", ...(jira ? { account: "Ada" } : {}), site: jira ? "https://team.atlassian.net" : "https://dev.azure.com/team", id: "42", number: 42, identifier: "ENG-42", title: "Ticket 42", url: "https://example.test/42", projectPath: "", repo: "repo", projectName: "Engineering", state: "In review", updatedAt: "", labels: [], assignees: [], draft: false };
   vi.mocked(invoke).mockImplementation(async (cmd, args) =>
-    cmd === "azure_devops_work_item_details" ? { body: "Shared description", author: "Ada" }
-      : cmd === "azure_devops_work_item_thread" ? { comments: [], truncated: true, reviewDecision: "", baseRefName: "", headRefName: "" }
+    (cmd === "azure_devops_work_item_details" || cmd === "jira_issue_details") ? { body: "Shared description", author: "Ada" }
+      : (cmd === "azure_devops_work_item_thread" || cmd === "jira_issue_thread") ? { comments: [], truncated: true, reviewDecision: "", baseRefName: "", headRefName: "" }
         : args?.comments || args?.discussion ? { comments: [], total: 51, more: true }
           : { fields: { description: "Shared description", creator: { displayName: "Ada" } } });
   const host = document.createElement("div");document.body.append(host);const root = createRoot(host);

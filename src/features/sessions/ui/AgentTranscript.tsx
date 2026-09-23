@@ -18,6 +18,7 @@ import {
 } from "../../../shared/ui/icons";
 import {
   memo,
+  startTransition,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -139,6 +140,12 @@ const STEP_ENTRANCE_MIN_MS = 160;
 const STEP_QUEUE_CALM_MS = 960;
 const STEP_QUEUE_MS = 2000;
 const INITIAL_TURNS = 20;
+/**
+ * Turns built before a transcript first paints. Every turn in the initial
+ * window costs markdown work on open, so paint the latest few (more if they
+ * leave the viewport short) and build the rest of the window after.
+ */
+const FIRST_PAINT_TURNS = 3;
 const TURN_PAGE_SIZE = 20;
 
 type Props = {
@@ -239,7 +246,7 @@ function AgentTranscriptComponent({
   const prependHeight = useRef<number | null>(null);
   const wasVisible = useRef(false);
   const [scrollerEl, setScrollerEl] = useState<HTMLDivElement | null>(null);
-  const [visibleTurnCount, setVisibleTurnCount] = useState(INITIAL_TURNS);
+  const [visibleTurnCount, setVisibleTurnCount] = useState(FIRST_PAINT_TURNS);
   // Turns whose folded work the reader has opened, by turn id.
   const [openWork, setOpenWork] = useState<Record<string, boolean>>({});
   const [searchCurrent, setSearchCurrent] = useState<string | null>(null);
@@ -450,12 +457,45 @@ function AgentTranscriptComponent({
   useLayoutEffect(() => {
     const previousHeight = prependHeight.current;
     const el = scroller.current;
-    if (previousHeight == null || !el) return;
+    if (!el) return;
+    if (previousHeight == null) {
+      // The opening window grows above the screen. Settle the offset in this
+      // commit: a scroll event queued by an earlier pin would otherwise read
+      // the taller transcript first and unpin it partway up.
+      if (stickToBottom.current) {
+        syncTranscriptViewport(el);
+        pinToBottom(el);
+      } else {
+        el.scrollTop =
+          el.scrollHeight - el.clientHeight - distanceFromBottom.current;
+      }
+      return;
+    }
     prependHeight.current = null;
     el.scrollTop += el.scrollHeight - previousHeight;
     distanceFromBottom.current =
       el.scrollHeight - el.scrollTop - el.clientHeight;
   }, [visibleTurnCount]);
+
+  // Short turns can leave the first paint with empty space above them, and
+  // the rest of the window arriving later would then push everything down.
+  // Top up before painting until the viewport is covered.
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    if (!el || el.clientHeight === 0) return;
+    if (visibleTurnCount >= Math.min(INITIAL_TURNS, turns.length)) return;
+    if (el.scrollHeight > el.clientHeight) return;
+    setVisibleTurnCount((count) =>
+      Math.min(INITIAL_TURNS, count + FIRST_PAINT_TURNS),
+    );
+  }, [visibleTurnCount, turns.length]);
+
+  useEffect(() => {
+    // Interruptible, so switching away before it finishes costs nothing.
+    startTransition(() =>
+      setVisibleTurnCount((count) => Math.max(count, INITIAL_TURNS)),
+    );
+  }, []);
 
   const prepareToPrepend = useCallback(() => {
     const el = scroller.current;

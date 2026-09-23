@@ -289,11 +289,13 @@ function InboxComment({
                 title={
                   provider === "linear"
                     ? "Open in Linear"
-                    : provider === "gitlab"
-                      ? "Open on GitLab"
-                      : provider === "azuredevops"
-                        ? "Open on ADO"
-                        : "Open on GitHub"
+                    : provider === "jira"
+                      ? "Open in Jira"
+                      : provider === "gitlab"
+                        ? "Open on GitLab"
+                        : provider === "azuredevops"
+                          ? "Open on ADO"
+                          : "Open on GitHub"
                 }
                 onClick={() => void openUrl(comment.url)}
                 className="hover:text-content"

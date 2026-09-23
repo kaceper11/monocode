@@ -306,3 +306,14 @@ it("retains task status across Board remounts while refreshing and rejects chang
   await act(async () => updateTask(id, { workstreams: [{ ...ws, branch: "other" }] }));
   expect(container.textContent).toContain("Looking for PR…");
 });
+
+it("refreshes Board immediately when Jira connection or project filters change", async () => {
+  const { listInboxItems } = await import("../inbox/model/githubTasks");
+  await renderBoard();
+  vi.mocked(listInboxItems).mockClear();
+  await act(async () => window.dispatchEvent(new CustomEvent("monocode:jira-change", { detail: "connection" })));
+  expect(listInboxItems).toHaveBeenCalledWith(expect.anything(), expect.anything(), { force: true });
+  vi.mocked(listInboxItems).mockClear();
+  await act(async () => window.dispatchEvent(new Event("monocode:jira-change")));
+  expect(listInboxItems).toHaveBeenCalledWith(expect.anything(), expect.anything(), { force: true });
+});
