@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.11] - 2026-09-23
+
+### Changed
+
+- Merge upstream through ef17ac02, adopting its Jira Inbox, comment posting, project visibility, notifications and automation triggers while preserving Board ticket links, saved filters, attachment previews and the shared Confluence connection.
+- Refresh Board immediately when the Jira account or project filters change; keep Jira reads, comments and automation event identities scoped to the selected site and account.
+- Include upstream session-switching improvements, Claude streamed tool-input reconciliation and Codex text deduplication by item.
+- Improve task sessions, Inbox task links and Board navigation, and resolve session model selections against their working directory, including WSL.
+
+### Compatibility
+
+- Existing Jira credentials and Board/session links remain usable. Fork identity, WSL, Azure integrations and other retained local features are preserved.
+- Local checks and a fixture browser smoke passed; authenticated Jira/Confluence and Windows/WSL acceptance remain unverified.
+
 ## [0.1.55] - 2026-09-23
 
 ### Added
@@ -1099,7 +1113,8 @@ First public release. macOS (Apple Silicon) only.
 - Updater endpoint and minisign public key are injected at release time rather than committed, so forks do not inherit the maintainer's update channel.
 - macOS release builds sign with `APPLE_SIGNING_IDENTITY` via a config overlay; the committed default remains ad-hoc `-` for community builds.
 
-[Unreleased]: https://github.com/hardbeat920/monocode/compare/v0.1.55...HEAD
+[Unreleased]: https://github.com/kaceper11/monocode/compare/v0.3.11...HEAD
+[0.3.11]: https://github.com/kaceper11/monocode/compare/v0.3.10...v0.3.11
 [0.1.55]: https://github.com/hardbeat920/monocode/compare/v0.1.54...v0.1.55
 [0.1.54]: https://github.com/hardbeat920/monocode/compare/v0.1.53...v0.1.54
 [0.1.53]: https://github.com/hardbeat920/monocode/compare/v0.1.52...v0.1.53
