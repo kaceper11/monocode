@@ -104,6 +104,7 @@ export async function probeWorkstream(
       // lane's branch, not whatever is checked out.
       return {
         ...(await azureDevOpsPrProbe(cwd, prUrl, workstream.branch)),
+        provider: "azuredevops",
         merging: await merging,
         behind: await behind,
         ...(drift ? { error: drift } : {}),
@@ -114,6 +115,7 @@ export async function probeWorkstream(
     const pr = drifted && !prUrl ? null : await gitPrStatus(cwd, prUrl);
     const checks = pr ? await gitPrChecks(cwd, prUrl).catch(() => []) : [];
     return {
+      provider: "github",
       pr,
       checks,
       merging: await merging,

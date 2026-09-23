@@ -15,6 +15,9 @@ import type { SessionSummary } from "../sessions/data/sessionStore";
 import {
   attentionScore,
   buildBoardCards,
+  boardCardStatuses,
+  boardStatusOptions,
+  matchesBoardStatuses,
   cardAttentionLines,
   cardColumn,
   columnCards,
@@ -52,6 +55,7 @@ import {
   archiveTasks,
   createGroup,
   DEFAULT_BOARD_FILTER,
+  boardStatusKey,
   deleteBoardFilter,
   deleteGroup,
   hideCards,
@@ -535,6 +539,7 @@ describe("buildBoardCards", () => {
     expect(cards).toHaveLength(1);
     const row = cards[0]!.workstreams![0]!;
     expect(row.pr).toEqual({
+      provider: "azuredevops",
       number: 77,
       title: "Azure PR",
       url: "https://dev.azure.com/acme/p/_git/r/pullrequest/77",
@@ -1785,6 +1790,200 @@ describe("groups", () => {
   });
 });
 
+describe("provider status filters", () => {
+  it("matches native statuses independently of provider categories and columns", () => {
+    const cards = buildBoardCards({
+      items: [
+        item({
+          provider: "jira",
+          kind: "jira",
+          state: "In Review",
+          stateType: "indeterminate",
+          number: 1,
+        }),
+        item({
+          provider: "linear",
+          kind: "linear",
+          state: "In Review",
+          stateType: "started",
+          number: 2,
+        }),
+        item({ provider: "azuredevops", state: "Active", number: 3 }),
+        item({ provider: "github", state: "open", number: 4 }),
+        item({ provider: "gitlab", state: "opened", number: 5 }),
+      ],
+      sessions: [],
+      summaries: [],
+      locals: [
+        { id: "l", title: "Note", column: "review", order: 0, createdAt: 1 },
+      ],
+    });
+    const selected = new Set([
+      boardStatusKey({ provider: "jira", state: " in review " }),
+      boardStatusKey({ provider: "azuredevops", state: "Active" }),
+    ]);
+    expect(
+      cards
+        .filter((card) => matchesBoardStatuses(card, selected))
+        .map((card) => card.provider),
+    ).toEqual(["jira", "azuredevops"]);
+    expect(cards.every((card) => matchesBoardStatuses(card, new Set()))).toBe(
+      true,
+    );
+    const options = boardStatusOptions(cards, [
+      { provider: "jira", state: "Retired workflow" },
+    ]);
+    expect(options).toContainEqual({
+      provider: "jira",
+      state: "Retired workflow",
+    });
+    expect(
+      options.filter((status) => status.state === "In Review"),
+    ).toHaveLength(2);
+    expect(options).not.toContainEqual({ provider: "jira", state: "Open" });
+  });
+
+  it("matches any task ticket, discovered PR or explicitly identified workstream PR", () => {
+    const jira = item({
+      provider: "jira",
+      kind: "jira",
+      number: 7,
+      identifier: "ACME-7",
+      state: "QA",
+      url: "https://jira.test/browse/ACME-7",
+    });
+    const cards = buildBoardCards({
+      items: [
+        jira,
+        item({
+          provider: "gitlab",
+          kind: "pr",
+          number: 8,
+          state: "merged",
+          title: "Fix ACME-7",
+        }),
+      ],
+      sessions: [],
+      summaries: [],
+      locals: [],
+      tasks: [
+        task({
+          links: [
+            linked({
+              provider: "jira",
+              identifier: "ACME-7",
+              number: 7,
+              url: jira.url,
+            }),
+          ],
+          workstreams: [
+            { id: "w", projectPath: "/repo", branch: "fix", base: "main" },
+          ],
+        }),
+      ],
+      workstreamStatus: new Map([
+        [
+          "w",
+          {
+            provider: "azuredevops",
+            pr: {
+              number: 9,
+              title: "PR",
+              url: "https://ado.test/9",
+              state: "active",
+            },
+            checks: [],
+          },
+        ],
+      ]),
+    });
+    const card = cards.find((entry) => entry.kind === "task")!;
+    expect(boardCardStatuses(card)).toEqual(
+      expect.arrayContaining([
+        { provider: "jira", state: "QA" },
+        { provider: "gitlab", state: "merged" },
+        { provider: "azuredevops", state: "active" },
+      ]),
+    );
+    for (const status of boardCardStatuses(card)) {
+      expect(
+        matchesBoardStatuses(card, new Set([boardStatusKey(status)])),
+      ).toBe(true);
+    }
+    expect(
+      matchesBoardStatuses(
+        card,
+        new Set([boardStatusKey({ provider: "github", state: "active" })]),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps the provider on a branch-absorbed PR", () => {
+    const cards = buildBoardCards({
+      items: [
+        item({
+          provider: "azuredevops",
+          kind: "pr",
+          number: 9,
+          state: "active",
+          sourceRefName: "refs/heads/fix",
+          repo: "acme/repo",
+        }),
+      ],
+      sessions: [],
+      summaries: [],
+      locals: [],
+      tasks: [
+        task({
+          workstreams: [
+            { id: "w", projectPath: "/repo", branch: "fix", base: "main" },
+          ],
+        }),
+      ],
+    });
+    expect(boardCardStatuses(cards[0]!)).toEqual([
+      { provider: "azuredevops", state: "active" },
+    ]);
+  });
+
+  it("sanitizes saved selections and compares them as sets", () => {
+    storage.set(
+      "monocode.board.v1",
+      JSON.stringify({
+        filters: [
+          {
+            id: "f",
+            name: "QA",
+            spec: {
+              statuses: [
+                { provider: "jira", state: " QA " },
+                { provider: "jira", state: "qa" },
+                { provider: "linear", state: "QA" },
+                { provider: "invalid", state: "QA" },
+                { provider: "jira", state: "" },
+                null,
+                42,
+              ],
+            },
+          },
+        ],
+      }),
+    );
+    const spec = loadBoard().filters[0]!.spec;
+    expect(spec.statuses).toEqual([
+      { provider: "jira", state: "qa" },
+      { provider: "linear", state: "QA" },
+    ]);
+    expect(
+      sameBoardFilterSpec(spec, {
+        ...spec,
+        statuses: [...spec.statuses].reverse(),
+      }),
+    ).toBe(true);
+    expect(sameBoardFilterSpec(spec, { ...spec, statuses: [] })).toBe(false);
+  });
+});
+
 describe("saved filters", () => {
   const spec: BoardFilterSpec = {
     project: "/repo",
@@ -1792,6 +1991,7 @@ describe("saved filters", () => {
     mineOnly: false,
     time: "7d",
     hiddenKinds: ["pr"],
+    statuses: [{ provider: "jira", state: "In Review" }],
     actionOnly: true,
     attentionFirst: true,
   };
@@ -1852,6 +2052,7 @@ describe("saved filters", () => {
       mineOnly: false,
       time: "all",
       hiddenKinds: ["pr"],
+      statuses: [],
       actionOnly: true,
       attentionFirst: false,
     });
@@ -2576,7 +2777,7 @@ describe("probeWorkstream", () => {
     vi.mocked(gitPrStatus).mockResolvedValue(pr);
     vi.mocked(gitBehindBase).mockResolvedValue(3);
     const status = await probeWorkstream(lane);
-    expect(status).toMatchObject({ pr, behind: 3 });
+    expect(status).toMatchObject({ provider: "github", pr, behind: 3 });
     expect(status?.error).toBeUndefined();
   });
 

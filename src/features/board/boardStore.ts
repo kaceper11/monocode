@@ -1,3 +1,4 @@
+import type { InboxProvider } from "../inbox/model/githubTasks";
 import type { LinkedWorkItem } from "../sessions/model/session";
 import type { InboxTimeFilter } from "../inbox/model/inboxFilters";
 import { pathKey } from "../../shared/lib/paths";
@@ -109,6 +110,11 @@ export type BoardGroup = {
   color: number;
 };
 
+export type BoardProviderStatus = { provider: InboxProvider; state: string };
+
+export const boardStatusKey = ({ provider, state }: BoardProviderStatus) =>
+  JSON.stringify([provider, state.trim().toLowerCase()]);
+
 /** The board's whole filter-bar state — saved filters store and restore
  * this wholesale, so every criterion the toolbar controls lives here. */
 export type BoardFilterSpec = {
@@ -121,6 +127,8 @@ export type BoardFilterSpec = {
   time: InboxTimeFilter;
   /** Item kinds to hide; task/local/session cards always pass. */
   hiddenKinds: ("issue" | "pr")[];
+  /** Provider-native statuses; empty means unrestricted. */
+  statuses: BoardProviderStatus[];
   /** Only cards that need action. */
   actionOnly: boolean;
   /** Sort each column by attention score — a sort, but saved as part of
@@ -140,6 +148,7 @@ export const DEFAULT_BOARD_FILTER: BoardFilterSpec = {
   mineOnly: true,
   time: "all",
   hiddenKinds: [],
+  statuses: [],
   actionOnly: false,
   attentionFirst: false,
 };
@@ -352,7 +361,22 @@ function cleanFilterSpec(value: unknown): BoardFilterSpec {
         )
         .filter((entry, index, list) => list.indexOf(entry) === index)
     : [];
+  const statuses = new Map<string, BoardProviderStatus>();
+  for (const entry of Array.isArray(raw.statuses) ? raw.statuses : []) {
+    if (
+      !isRecord(entry) ||
+      typeof entry.provider !== "string" ||
+      !PROVIDER_IDS.has(entry.provider)
+    )
+      continue;
+    const state = cleanString(entry.state);
+    if (!state) continue;
+    const status = { provider: entry.provider as InboxProvider, state };
+    statuses.set(boardStatusKey(status), status);
+    if (statuses.size >= 200) break;
+  }
   return {
+    statuses: [...statuses.values()],
     project: cleanString(raw.project, 600) ?? "",
     groups,
     mineOnly: raw.mineOnly !== false,
@@ -1133,7 +1157,8 @@ export function sameBoardFilterSpec(
     a.actionOnly === b.actionOnly &&
     a.attentionFirst === b.attentionFirst &&
     ids(a.groups) === ids(b.groups) &&
-    ids(a.hiddenKinds) === ids(b.hiddenKinds)
+    ids(a.hiddenKinds) === ids(b.hiddenKinds) &&
+    ids(a.statuses.map(boardStatusKey)) === ids(b.statuses.map(boardStatusKey))
   );
 }
 

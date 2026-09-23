@@ -19,6 +19,7 @@ import {
   sessionWorkItems,
 } from "../sessions/model/sessionWorkItem";
 import type { LinkedSessionUpdate } from "../inbox/model/linkedSessionUpdates";
+import { boardStatusKey, type BoardProviderStatus } from "./boardStore";
 import type {
   BoardColumnId,
   BoardGroup,
@@ -162,6 +163,7 @@ export type BoardWorkstreamRow = {
   /** Primary display ref — first live session, else first bound. */
   session?: BoardCardSession;
   pr?: {
+    provider?: InboxProvider;
     number: number;
     title: string;
     url: string;
@@ -189,6 +191,7 @@ export type BoardWorkstreamRow = {
 };
 
 export type WorkstreamStatus = {
+  provider?: InboxProvider;
   pr: GitPr | null;
   checks: GitPrCheck[];
   merging?: boolean;
@@ -237,6 +240,37 @@ export type BoardCard = {
   /** Column without a manual placement — informational, view overrides. */
   derived: BoardColumnId;
 };
+
+/** Read the provider states, never the card's derived/manual column. */
+export function boardCardStatuses(card: BoardCard): BoardProviderStatus[] {
+  return [card, ...(card.tickets ?? []), ...(card.prs ?? []),
+    ...(card.workstreams ?? []).flatMap((row) => row.pr ? [row.pr] : []),
+  ].flatMap(({ provider, state }) =>
+    provider && state?.trim() ? [{ provider, state: state.trim() }] : [],
+  );
+}
+
+export function boardStatusOptions(
+  cards: readonly BoardCard[],
+  selected: readonly BoardProviderStatus[],
+): BoardProviderStatus[] {
+  const options = new Map<string, BoardProviderStatus>();
+  for (const status of [...selected, ...cards.flatMap(boardCardStatuses)]) {
+    options.set(boardStatusKey(status), status);
+  }
+  return [...options.values()].sort((a, b) =>
+    a.provider.localeCompare(b.provider) || a.state.localeCompare(b.state),
+  );
+}
+
+export function matchesBoardStatuses(
+  card: BoardCard,
+  selected: ReadonlySet<string>,
+): boolean {
+  return !selected.size || boardCardStatuses(card).some((status) =>
+    selected.has(boardStatusKey(status)),
+  );
+}
 
 type BoardInput = {
   items: readonly InboxItem[];
@@ -890,6 +924,7 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
       if (status?.behind) row.behind = status.behind;
       if (status?.pr) {
         row.pr = {
+          provider: status.provider,
           number: status.pr.number,
           title: status.pr.title,
           url: status.pr.url,
@@ -954,6 +989,7 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
         const row = card.workstreamRows.get(workstreamId);
         if (row && !row.pr) {
           row.pr = {
+            provider: item.provider,
             number: item.number,
             title: item.title,
             url: item.url ?? "",

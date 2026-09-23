@@ -32,6 +32,8 @@ import {
   Zap,
 } from "../../shared/ui/icons";
 import { Popover } from "../../shared/ui/Popover";
+import { SearchableSelect } from "../../shared/ui/SearchableSelect";
+import { SecondaryButton } from "../../shared/ui/SecondaryButton";
 import { ProjectLogoIcon } from "../projects/ui/ProjectLogoIcon";
 import { ProjectMascot } from "../projects/ui/ProjectMascot";
 import { useTabGroupLogos } from "../projects/hooks/useTabGroupLogos";
@@ -78,6 +80,8 @@ import type { GitPrCheck } from "../../platform/tauri/fs";
 import {
   attentionScore,
   buildBoardCards,
+  boardStatusOptions,
+  matchesBoardStatuses,
   cardColumn,
   columnCards,
   columnDot,
@@ -117,6 +121,7 @@ import {
   archiveTasks,
   boardFromSnapshot,
   boardSnapshot,
+  boardStatusKey,
   createGroup,
   DEFAULT_BOARD_FILTER,
   DEFAULT_COLUMN_IDS,
@@ -149,6 +154,7 @@ import {
   type BoardColumn,
   type BoardColumnId,
   type BoardFilterSpec,
+  type BoardProviderStatus,
   type BoardGroup,
   type SavedBoardFilter,
   type TaskWorkstream,
@@ -365,6 +371,7 @@ export function BoardView({
               ? {
                   ...status,
                   pr: status.pr ?? prior.pr ?? null,
+                  provider: status.pr ? status.provider : prior.provider,
                   checks: status.checks.length ? status.checks : prior.checks,
                 }
               : status,
@@ -485,6 +492,11 @@ export function BoardView({
   const [hiddenKinds, setHiddenKinds] = useState<
     ReadonlySet<"issue" | "pr">
   >(new Set());
+  const [statuses, setStatuses] = useState<BoardProviderStatus[]>([]);
+  const statusOptions = useMemo(
+    () => boardStatusOptions(cards, statuses),
+    [cards, statuses],
+  );
   const [timeFilter, setTimeFilter] = useState<InboxTimeFilter>("all");
   const [filterAnchor, setFilterAnchor] = useState<HTMLElement | null>(null);
   // Column editor popover — rename/delete the target column, or flip to
@@ -503,6 +515,7 @@ export function BoardView({
       mineOnly,
       time: timeFilter,
       hiddenKinds: [...hiddenKinds],
+      statuses,
       actionOnly,
       attentionFirst,
     }),
@@ -512,6 +525,7 @@ export function BoardView({
       mineOnly,
       timeFilter,
       hiddenKinds,
+      statuses,
       actionOnly,
       attentionFirst,
     ],
@@ -522,6 +536,7 @@ export function BoardView({
     setMineOnly(spec.mineOnly);
     setTimeFilter(spec.time);
     setHiddenKinds(new Set(spec.hiddenKinds));
+    setStatuses(spec.statuses);
     setActionOnly(spec.actionOnly);
     setAttentionFirst(spec.attentionFirst);
   }, []);
@@ -564,12 +579,14 @@ export function BoardView({
 
   const filtered = useMemo(() => {
     const tokens = search.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const selectedStatuses = new Set(statuses.map(boardStatusKey));
     const hidden = new Set(hiddenProviders);
     const hiddenCards = new Set(board.hidden);
     const timeStart =
       timeFilter === "all" ? 0 : timeFilterStart(timeFilter, Date.now());
     return cards.filter((card) => {
       if (hiddenCards.has(card.id)) return false;
+      if (!matchesBoardStatuses(card, selectedStatuses)) return false;
       // Snoozed — until the time passes or the wake fingerprint changes.
       if (isCardSnoozed(card, board.snoozed[card.id])) return false;
       if (card.provider && hidden.has(card.provider)) return false;
@@ -640,6 +657,7 @@ export function BoardView({
     cards,
     search,
     hiddenProviders,
+    statuses,
     hiddenKinds,
     timeFilter,
     projectFilter,
@@ -1854,6 +1872,7 @@ export function BoardView({
           recents={recents}
           groups={board.groups}
           saved={board.filters}
+          statusOptions={statusOptions}
           spec={currentSpec}
           appliedId={appliedFilterId}
           onSpec={applySpec}
@@ -1973,6 +1992,7 @@ function BoardFiltersPopover({
   recents,
   groups,
   saved,
+  statusOptions,
   spec,
   appliedId,
   onSpec,
@@ -1983,6 +2003,7 @@ function BoardFiltersPopover({
   recents: RecentProject[];
   groups: BoardGroup[];
   saved: SavedBoardFilter[];
+  statusOptions: BoardProviderStatus[];
   spec: BoardFilterSpec;
   appliedId: string | null;
   onSpec: (spec: BoardFilterSpec) => void;
@@ -1992,6 +2013,7 @@ function BoardFiltersPopover({
   const [projectSearch, setProjectSearch] = useState("");
   const [newGroup, setNewGroup] = useState("");
   const [saveName, setSaveName] = useState("");
+  const [saving, setSaving] = useState(false);
   // Inline rename — saved filters and groups share the one input slot.
   const [rename, setRename] = useState<{
     kind: "filter" | "group";
@@ -2033,9 +2055,7 @@ function BoardFiltersPopover({
     <input
       autoFocus
       value={rename?.value ?? ""}
-      aria-label={
-        rename?.kind === "filter" ? "Rename filter" : "Rename group"
-      }
+      aria-label={rename?.kind === "filter" ? "Rename filter" : "Rename group"}
       onChange={(event) =>
         setRename((current) =>
           current ? { ...current, value: event.target.value } : current,
@@ -2054,7 +2074,9 @@ function BoardFiltersPopover({
     <Popover
       anchor={anchor}
       onDismiss={onClose}
-      width={252}
+      ignore="[data-dialog-popover]"
+      width={320}
+      maxHeight={560}
       aria-label="Board filters"
       className="overflow-y-auto"
     >
@@ -2074,285 +2096,466 @@ function BoardFiltersPopover({
           ) : null}
         </div>
 
-        <p className={FILTER_SECTION}>Saved</p>
-        {saved.map((filter) => {
-          const exact = sameBoardFilterSpec(filter.spec, spec);
-          const applied = exact || filter.id === appliedId;
-          // Applied but criteria since changed — offer to write the current
-          // spec back instead of dropping the filter's active state.
-          const modified = filter.id === appliedId && !exact;
-          return (
-            <div
-              key={filter.id}
-              className="group flex items-center gap-0.5 rounded-md hover:bg-content/6"
-            >
-              {rename?.kind === "filter" && rename.id === filter.id ? (
-                renameInput
-              ) : (
-                <>
-                  <button
-                    type="button"
-                    aria-pressed={applied}
-                    title={
-                      exact
-                        ? `${filter.name} applied — click to clear`
-                        : modified
-                          ? `${filter.name} applied, modified — click to restore it`
-                          : `Apply filter ${filter.name}`
-                    }
-                    className={`flex h-7 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-[12px] ${
-                      applied ? "text-content" : "text-content/70 hover:text-content"
-                    }`}
-                    onClick={() => onApply(exact ? null : filter)}
-                  >
-                    <ListFilter
-                      className="size-3 shrink-0 text-content/40"
-                      strokeWidth={1.75}
-                    />
-                    <span className="min-w-0 flex-1 truncate">
-                      {filter.name}
-                    </span>
-                    {exact ? (
-                      <Check
-                        className="size-3.5 shrink-0 text-accent"
-                        strokeWidth={2.5}
-                      />
-                    ) : null}
-                  </button>
-                  {modified ? (
-                    <button
-                      type="button"
-                      title="Update this filter with the current settings"
-                      className="shrink-0 rounded px-1 text-[10px] font-medium text-accent hover:bg-accent/15"
-                      onClick={() => saveBoardFilter(filter.name, spec)}
-                    >
-                      Update
-                    </button>
-                  ) : null}
-                  <button
-                    type="button"
-                    aria-label={`Rename filter ${filter.name}`}
-                    className="grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
-                    onClick={() =>
-                      setRename({
-                        kind: "filter",
-                        id: filter.id,
-                        value: filter.name,
-                      })
-                    }
-                  >
-                    <Pencil className="size-3" strokeWidth={1.75} />
-                  </button>
-                  <button
-                    type="button"
-                    aria-label={`Delete filter ${filter.name}`}
-                    className="mr-1 grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
-                    onClick={() => deleteBoardFilter(filter.id)}
-                  >
-                    <X className="size-3" strokeWidth={1.75} />
-                  </button>
-                </>
-              )}
-            </div>
-          );
-        })}
-        <label
-          title="Save the current filters — reuse an existing name to overwrite it"
-          className="mt-0.5 flex h-7 items-center gap-1.5 rounded-md px-1.5 text-content/40 focus-within:bg-content/6 focus-within:text-content/60"
-        >
-          <Plus className="size-3 shrink-0" strokeWidth={2} />
-          <input
-            value={saveName}
-            onChange={(event) => setSaveName(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key !== "Enter") return;
-              if (saveBoardFilter(saveName, spec)) setSaveName("");
-            }}
-            placeholder="Save current filters…"
-            aria-label="Save current filters as"
-            className="min-w-0 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/40"
-          />
-        </label>
-
-        <p className={FILTER_SECTION}>Project</p>
-        {recents.length > 5 ? (
-          <input
-            value={projectSearch}
-            onChange={(event) => setProjectSearch(event.target.value)}
-            placeholder="Search projects…"
-            aria-label="Search projects"
-            className="mb-1 h-7 w-full rounded-md bg-content/6 px-2 text-[12px] text-content outline-none placeholder:text-content/40 focus:ring-1 focus:ring-accent/40"
-          />
-        ) : null}
-        <ProjectPickRow
-          label="All projects"
-          selected={!spec.project}
-          onPick={() => onSpec({ ...spec, project: "" })}
-        />
-        <div className="max-h-36 overflow-y-auto">
-          {projectRows.map((project) => (
-            <ProjectPickRow
-              key={project.path}
-              label={projectName(project.path)}
-              mark={<BoardProjectMark path={project.path} />}
-              selected={sameProjectPath(project.path, spec.project)}
-              onPick={() => onSpec({ ...spec, project: project.path })}
-            />
-          ))}
-        </div>
-
-        <p className={FILTER_SECTION}>Groups</p>
-        <div className="max-h-36 overflow-y-auto">
-          {groups.map((group) => {
-            const swatch = groupSwatch(group.color);
-            const selected = spec.groups.includes(group.id);
-            return (
-              <div
-                key={group.id}
-                className="group flex items-center gap-0.5 rounded-md hover:bg-content/6"
-              >
-                {rename?.kind === "group" && rename.id === group.id ? (
-                  renameInput
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      aria-pressed={selected}
-                      className={`flex h-7 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-[12px] ${
-                        selected ? "text-content" : "text-content/70 hover:text-content"
-                      }`}
-                      onClick={() => toggleGroup(group.id)}
-                    >
-                      <span
-                        aria-hidden
-                        className={`size-2 shrink-0 rounded-full ${swatch.dot}`}
-                      />
-                      <span className="min-w-0 flex-1 truncate">
-                        {group.name}
-                      </span>
-                      {selected ? (
-                        <Check
-                          className="size-3.5 shrink-0 text-accent"
-                          strokeWidth={2.5}
+        {saved.length > 0 ? (
+          <BoardFilterSection
+            label="Saved views"
+            summary={
+              saved.find(
+                (filter) =>
+                  filter.id === appliedId ||
+                  sameBoardFilterSpec(filter.spec, spec),
+              )?.name ?? `${saved.length} saved`
+            }
+          >
+            {saved.map((filter) => {
+              const exact = sameBoardFilterSpec(filter.spec, spec);
+              const applied = exact || filter.id === appliedId;
+              // Applied but criteria since changed — offer to write the current
+              // spec back instead of dropping the filter's active state.
+              const modified = filter.id === appliedId && !exact;
+              return (
+                <div
+                  key={filter.id}
+                  className="group flex items-center gap-0.5 rounded-md hover:bg-content/6"
+                >
+                  {rename?.kind === "filter" && rename.id === filter.id ? (
+                    renameInput
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        aria-pressed={applied}
+                        title={
+                          exact
+                            ? `${filter.name} applied — click to clear`
+                            : modified
+                              ? `${filter.name} applied, modified — click to restore it`
+                              : `Apply filter ${filter.name}`
+                        }
+                        className={`flex h-7 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-[12px] ${
+                          applied
+                            ? "text-content"
+                            : "text-content/70 hover:text-content"
+                        }`}
+                        onClick={() => onApply(exact ? null : filter)}
+                      >
+                        <ListFilter
+                          className="size-3 shrink-0 text-content/40"
+                          strokeWidth={1.75}
                         />
+                        <span className="min-w-0 flex-1 truncate">
+                          {filter.name}
+                        </span>
+                        {exact ? (
+                          <Check
+                            className="size-3.5 shrink-0 text-accent"
+                            strokeWidth={2.5}
+                          />
+                        ) : null}
+                      </button>
+                      {modified ? (
+                        <button
+                          type="button"
+                          title="Update this filter with the current settings"
+                          className="shrink-0 rounded px-1 text-[10px] font-medium text-accent hover:bg-accent/15"
+                          onClick={() => saveBoardFilter(filter.name, spec)}
+                        >
+                          Update
+                        </button>
                       ) : null}
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Rename ${group.name}`}
-                      className="grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
-                      onClick={() =>
-                        setRename({
-                          kind: "group",
-                          id: group.id,
-                          value: group.name,
-                        })
-                      }
-                    >
-                      <Pencil className="size-3" strokeWidth={1.75} />
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Delete group ${group.name}`}
-                      className="mr-1 grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
-                      onClick={() => deleteGroup(group.id)}
-                    >
-                      <X className="size-3" strokeWidth={1.75} />
-                    </button>
-                  </>
-                )}
-              </div>
-            );
-          })}
-        </div>
-        <button
-          type="button"
-          aria-pressed={spec.groups.includes(UNGROUPED)}
-          className={`flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] ${
-            spec.groups.includes(UNGROUPED)
-              ? "text-content"
-              : "text-content/70 hover:bg-content/6 hover:text-content"
-          }`}
-          onClick={() => toggleGroup(UNGROUPED)}
-        >
-          <span
-            aria-hidden
-            className="size-2 shrink-0 rounded-full border border-content/30"
-          />
-          <span className="min-w-0 flex-1 truncate text-content/60">
-            Ungrouped
-          </span>
-          {spec.groups.includes(UNGROUPED) ? (
-            <Check className="size-3.5 shrink-0 text-accent" strokeWidth={2.5} />
-          ) : null}
-        </button>
-        {!groups.length ? (
-          <p className="px-2 py-1.5 text-[11px] text-content/40">
-            No groups yet — create one to tag tasks.
-          </p>
+                      <button
+                        type="button"
+                        aria-label={`Rename filter ${filter.name}`}
+                        className="grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
+                        onClick={() =>
+                          setRename({
+                            kind: "filter",
+                            id: filter.id,
+                            value: filter.name,
+                          })
+                        }
+                      >
+                        <Pencil className="size-3" strokeWidth={1.75} />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Delete filter ${filter.name}`}
+                        className="mr-1 grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
+                        onClick={() => deleteBoardFilter(filter.id)}
+                      >
+                        <X className="size-3" strokeWidth={1.75} />
+                      </button>
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </BoardFilterSection>
         ) : null}
-        <label className="mt-0.5 flex h-7 items-center gap-1.5 rounded-md px-1.5 text-content/40 focus-within:bg-content/6 focus-within:text-content/60">
-          <Plus className="size-3 shrink-0" strokeWidth={2} />
-          <input
-            value={newGroup}
-            onChange={(event) => setNewGroup(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key !== "Enter") return;
-              if (createGroup(newGroup)) setNewGroup("");
-            }}
-            placeholder="New group…"
-            aria-label="New group name"
-            className="min-w-0 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/40"
-          />
-        </label>
-
-        <p className={FILTER_SECTION}>Show</p>
-        <BoardFilterRow
-          label="Assigned to me"
-          checked={spec.mineOnly}
-          onClick={() => onSpec({ ...spec, mineOnly: !spec.mineOnly })}
-        />
-        <BoardFilterRow
-          label="Needs action only"
-          checked={spec.actionOnly}
-          icon={<ListFilter className="size-3.5 shrink-0" strokeWidth={1.75} />}
-          onClick={() => onSpec({ ...spec, actionOnly: !spec.actionOnly })}
-        />
-        <p className={FILTER_SECTION}>Updated</p>
-        {BOARD_TIME_OPTIONS.map((option) => (
+        <div className="border-b border-content/8 py-1.5">
           <BoardFilterRow
-            key={option.id}
-            label={option.label}
-            checked={spec.time === option.id}
-            onClick={() => onSpec({ ...spec, time: option.id })}
+            label="Assigned to me"
+            checked={spec.mineOnly}
+            onClick={() => onSpec({ ...spec, mineOnly: !spec.mineOnly })}
           />
-        ))}
-        <p className={FILTER_SECTION}>Type</p>
-        <BoardFilterRow
-          label="Issues"
-          checked={!spec.hiddenKinds.includes("issue")}
-          icon={<CircleDot className="size-3.5 shrink-0" strokeWidth={1.75} />}
-          onClick={() => toggleKind("issue")}
-        />
-        <BoardFilterRow
-          label="Pull requests"
-          checked={!spec.hiddenKinds.includes("pr")}
-          icon={
-            <GitPullRequest className="size-3.5 shrink-0" strokeWidth={1.75} />
+          <BoardFilterRow
+            label="Needs action only"
+            checked={spec.actionOnly}
+            icon={
+              <ListFilter className="size-3.5 shrink-0" strokeWidth={1.75} />
+            }
+            onClick={() => onSpec({ ...spec, actionOnly: !spec.actionOnly })}
+          />
+        </div>
+        <BoardFilterSection
+          label="Provider status"
+          summary={
+            spec.statuses.length
+              ? spec.statuses
+                  .map(
+                    (status) =>
+                      `${INBOX_SOURCE_LABELS[status.provider]}: ${status.state}`,
+                  )
+                  .join(", ")
+              : "All statuses"
           }
-          onClick={() => toggleKind("pr")}
-        />
-        <p className={FILTER_SECTION}>Sort</p>
-        <BoardFilterRow
-          label="Attention first"
-          checked={spec.attentionFirst}
-          icon={<Zap className="size-3.5 shrink-0" strokeWidth={1.75} />}
-          onClick={() =>
-            onSpec({ ...spec, attentionFirst: !spec.attentionFirst })
+        >
+          <BoardFilterRow
+            label="All statuses"
+            checked={!spec.statuses.length}
+            onClick={() => onSpec({ ...spec, statuses: [] })}
+          />
+          <div className="max-h-48 overflow-y-auto">
+            {Object.entries(INBOX_SOURCE_LABELS).map(([provider, label]) => {
+              const options = statusOptions.filter(
+                (status) => status.provider === provider,
+              );
+              if (!options.length) return null;
+              return (
+                <div
+                  key={provider}
+                  role="group"
+                  aria-label={`${label} statuses`}
+                >
+                  <p className="px-2 py-1 text-[11px] text-content/40">
+                    {label}
+                  </p>
+                  {options.map((status) => {
+                    const key = boardStatusKey(status);
+                    const checked = spec.statuses.some(
+                      (entry) => boardStatusKey(entry) === key,
+                    );
+                    return (
+                      <BoardFilterRow
+                        key={key}
+                        label={status.state}
+                        checked={checked}
+                        onClick={() =>
+                          onSpec({
+                            ...spec,
+                            statuses: checked
+                              ? spec.statuses.filter(
+                                  (entry) => boardStatusKey(entry) !== key,
+                                )
+                              : [...spec.statuses, status],
+                          })
+                        }
+                      />
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+          {!statusOptions.length ? (
+            <p className="px-2 py-1 text-[11px] text-content/40">
+              No provider statuses loaded.
+            </p>
+          ) : null}
+        </BoardFilterSection>
+        <BoardFilterSection
+          label="Project"
+          summary={spec.project ? projectName(spec.project) : "All projects"}
+        >
+          {recents.length > 5 ? (
+            <input
+              value={projectSearch}
+              onChange={(event) => setProjectSearch(event.target.value)}
+              placeholder="Search projects…"
+              aria-label="Search projects"
+              className="mb-1 h-7 w-full rounded-md bg-content/6 px-2 text-[12px] text-content outline-none placeholder:text-content/40 focus:ring-1 focus:ring-accent/40"
+            />
+          ) : null}
+          <ProjectPickRow
+            label="All projects"
+            selected={!spec.project}
+            onPick={() => onSpec({ ...spec, project: "" })}
+          />
+          <div className="max-h-36 overflow-y-auto">
+            {projectRows.map((project) => (
+              <ProjectPickRow
+                key={project.path}
+                label={projectName(project.path)}
+                mark={<BoardProjectMark path={project.path} />}
+                selected={sameProjectPath(project.path, spec.project)}
+                onPick={() => onSpec({ ...spec, project: project.path })}
+              />
+            ))}
+          </div>
+        </BoardFilterSection>
+        <BoardFilterSection
+          label="Groups"
+          summary={
+            spec.groups.length
+              ? spec.groups
+                  .map((id) =>
+                    id === UNGROUPED
+                      ? "Ungrouped"
+                      : (groups.find((group) => group.id === id)?.name ?? id),
+                  )
+                  .join(", ")
+              : "All groups"
           }
-        />
+        >
+          <div className="max-h-36 overflow-y-auto">
+            {groups.map((group) => {
+              const swatch = groupSwatch(group.color);
+              const selected = spec.groups.includes(group.id);
+              return (
+                <div
+                  key={group.id}
+                  className="group flex items-center gap-0.5 rounded-md hover:bg-content/6"
+                >
+                  {rename?.kind === "group" && rename.id === group.id ? (
+                    renameInput
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        aria-pressed={selected}
+                        className={`flex h-7 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-left text-[12px] ${
+                          selected
+                            ? "text-content"
+                            : "text-content/70 hover:text-content"
+                        }`}
+                        onClick={() => toggleGroup(group.id)}
+                      >
+                        <span
+                          aria-hidden
+                          className={`size-2 shrink-0 rounded-full ${swatch.dot}`}
+                        />
+                        <span className="min-w-0 flex-1 truncate">
+                          {group.name}
+                        </span>
+                        {selected ? (
+                          <Check
+                            className="size-3.5 shrink-0 text-accent"
+                            strokeWidth={2.5}
+                          />
+                        ) : null}
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Rename ${group.name}`}
+                        className="grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
+                        onClick={() =>
+                          setRename({
+                            kind: "group",
+                            id: group.id,
+                            value: group.name,
+                          })
+                        }
+                      >
+                        <Pencil className="size-3" strokeWidth={1.75} />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Delete group ${group.name}`}
+                        className="mr-1 grid size-5 shrink-0 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover:opacity-100 focus-visible:opacity-100"
+                        onClick={() => deleteGroup(group.id)}
+                      >
+                        <X className="size-3" strokeWidth={1.75} />
+                      </button>
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <button
+            type="button"
+            aria-pressed={spec.groups.includes(UNGROUPED)}
+            className={`flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] ${
+              spec.groups.includes(UNGROUPED)
+                ? "text-content"
+                : "text-content/70 hover:bg-content/6 hover:text-content"
+            }`}
+            onClick={() => toggleGroup(UNGROUPED)}
+          >
+            <span
+              aria-hidden
+              className="size-2 shrink-0 rounded-full border border-content/30"
+            />
+            <span className="min-w-0 flex-1 truncate text-content/60">
+              Ungrouped
+            </span>
+            {spec.groups.includes(UNGROUPED) ? (
+              <Check
+                className="size-3.5 shrink-0 text-accent"
+                strokeWidth={2.5}
+              />
+            ) : null}
+          </button>
+          {!groups.length ? (
+            <p className="px-2 py-1.5 text-[11px] text-content/40">
+              No groups yet — create one to tag tasks.
+            </p>
+          ) : null}
+          <label className="mt-0.5 flex h-7 items-center gap-1.5 rounded-md px-1.5 text-content/40 focus-within:bg-content/6 focus-within:text-content/60">
+            <Plus className="size-3 shrink-0" strokeWidth={2} />
+            <input
+              value={newGroup}
+              onChange={(event) => setNewGroup(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter") return;
+                if (createGroup(newGroup)) setNewGroup("");
+              }}
+              placeholder="New group…"
+              aria-label="New group name"
+              className="min-w-0 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/40"
+            />
+          </label>
+        </BoardFilterSection>
+        <BoardFilterSection
+          label="Display"
+          summary={[
+            BOARD_TIME_OPTIONS.find((option) => option.id === spec.time)?.label,
+            spec.hiddenKinds.length === 2
+              ? "No items"
+              : spec.hiddenKinds.includes("pr")
+                ? "Issues"
+                : spec.hiddenKinds.includes("issue")
+                  ? "Pull requests"
+                  : "All types",
+            ...(spec.attentionFirst ? ["Attention first"] : []),
+          ].join(" · ")}
+        >
+          <div className="flex items-center justify-between gap-2 px-2 py-1 text-[12px] text-content/70">
+            <span>Updated</span>
+            <SearchableSelect
+              label="Updated"
+              value={spec.time}
+              options={BOARD_TIME_OPTIONS.map((option) => ({
+                value: option.id,
+                label: option.label,
+              }))}
+              onChange={(value) =>
+                onSpec({ ...spec, time: value as InboxTimeFilter })
+              }
+              variant="row"
+              searchable={false}
+              align="end"
+            />
+          </div>
+          <p className={FILTER_SECTION}>Type</p>
+          <BoardFilterRow
+            label="Issues"
+            checked={!spec.hiddenKinds.includes("issue")}
+            icon={
+              <CircleDot className="size-3.5 shrink-0" strokeWidth={1.75} />
+            }
+            onClick={() => toggleKind("issue")}
+          />
+          <BoardFilterRow
+            label="Pull requests"
+            checked={!spec.hiddenKinds.includes("pr")}
+            icon={
+              <GitPullRequest
+                className="size-3.5 shrink-0"
+                strokeWidth={1.75}
+              />
+            }
+            onClick={() => toggleKind("pr")}
+          />
+          <p className={FILTER_SECTION}>Sort</p>
+          <BoardFilterRow
+            label="Attention first"
+            checked={spec.attentionFirst}
+            icon={<Zap className="size-3.5 shrink-0" strokeWidth={1.75} />}
+            onClick={() =>
+              onSpec({ ...spec, attentionFirst: !spec.attentionFirst })
+            }
+          />
+        </BoardFilterSection>
+        <div className="mt-1 border-t border-content/8 pt-1.5">
+          {saving ? (
+            <form
+              className="flex items-center gap-1 px-1"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (saveBoardFilter(saveName, spec)) {
+                  setSaveName("");
+                  setSaving(false);
+                }
+              }}
+            >
+              <input
+                autoFocus
+                value={saveName}
+                onChange={(event) => setSaveName(event.target.value)}
+                placeholder="View name…"
+                aria-label="Save current filters as"
+                className="h-8 min-w-0 flex-1 rounded-md bg-content/6 px-2 text-[12px] text-content outline-none placeholder:text-content/40 focus:ring-1 focus:ring-accent/50"
+              />
+              <SecondaryButton type="submit" disabled={!saveName.trim()}>
+                Save
+              </SecondaryButton>
+              <IconButton
+                label="Cancel saving view"
+                onClick={() => setSaving(false)}
+              >
+                <X className="size-3.5" strokeWidth={1.75} />
+              </IconButton>
+            </form>
+          ) : (
+            <div className="flex justify-end px-1 pb-0.5">
+              <SecondaryButton onClick={() => setSaving(true)}>
+                <Plus className="size-3.5" strokeWidth={1.75} /> Save view…
+              </SecondaryButton>
+            </div>
+          )}
+        </div>
       </div>
     </Popover>
+  );
+}
+
+function BoardFilterSection({
+  label,
+  summary,
+  children,
+}: {
+  label: string;
+  summary: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <details className="group/section border-b border-content/8 last:border-0">
+      <summary className="flex min-h-9 cursor-pointer list-none items-center gap-2 rounded-md px-2 py-1.5 text-[12px] transition-colors hover:bg-content/5 group-open/section:bg-content/5 focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent [&::-webkit-details-marker]:hidden">
+        <span className="shrink-0 font-medium text-content/80">{label}</span>
+        <span
+          title={summary}
+          className="min-w-0 flex-1 truncate text-right text-[11px] text-content/45"
+        >
+          {summary}
+        </span>
+        <ChevronDown
+          aria-hidden
+          className="size-3 shrink-0 text-content/40 transition-transform group-open/section:rotate-180"
+        />
+      </summary>
+      <div className="pb-2">{children}</div>
+    </details>
   );
 }
 
@@ -2374,12 +2577,12 @@ function BoardFilterRow({
       aria-checked={checked}
       onMouseDown={(event) => event.preventDefault()}
       onClick={onClick}
-      className="flex h-7 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] leading-none text-content hover:bg-content/5 focus-visible:outline focus-visible:outline-1 focus-visible:outline-content/50"
+      className="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] leading-none text-content/75 transition-colors hover:bg-content/5 hover:text-content focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent"
     >
       {icon}
       <span className="min-w-0 flex-1 truncate">{label}</span>
       {checked ? (
-        <Check className="size-3.5 shrink-0" strokeWidth={2.25} />
+        <Check className="size-3 shrink-0 text-accent" strokeWidth={2} />
       ) : null}
     </button>
   );
