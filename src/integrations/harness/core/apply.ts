@@ -23,17 +23,34 @@ import { isReviewablePlan } from "../../../features/sessions/model/plan";
 import { resolveModel } from "../../../features/sessions/model/models";
 import type { HarnessEvent } from "./types";
 
+/** Apply a frame without copying the transcript for each consecutive text chunk. */
+export function applyHarnessEvents(session: Session, events: readonly HarnessEvent[]): Session {
+  for (let index = 0; index < events.length; index++) {
+    const event = events[index];
+    if (event.type !== "message.delta" && event.type !== "reasoning.delta") {
+      session = applyHarnessEvent(session, event);
+      continue;
+    }
+    const texts = [event.text];
+    while (events[index + 1]?.type === event.type) {
+      texts.push((events[++index] as typeof event).text);
+    }
+    session = patchStreaming(session, event.type === "message.delta" ? "assistant" : "reasoning", texts, true);
+  }
+  return session;
+}
+
 export function applyHarnessEvent(
   session: Session,
   event: HarnessEvent,
 ): Session {
   switch (event.type) {
     case "message.delta":
-      return patchStreaming(session, "assistant", event.text, true);
+      return patchStreaming(session, "assistant", [event.text], true);
     case "message.completed":
       return finishRole(session, "assistant");
     case "reasoning.delta":
-      return patchStreaming(session, "reasoning", event.text, true);
+      return patchStreaming(session, "reasoning", [event.text], true);
     case "reasoning.completed":
       return finishRole(session, "reasoning");
     case "tool.started":
@@ -667,10 +684,10 @@ function appendBlock(session: Session, block: Block): Session {
 function patchStreaming(
   session: Session,
   role: "assistant" | "reasoning",
-  text: string,
+  texts: readonly string[],
   streaming: boolean,
 ): Session {
-  if (!text && role === "reasoning") return session;
+  if (role === "reasoning" && !texts.some(Boolean)) return session;
   let index = session.blocks.length - 1;
   while (
     index >= 0 &&
@@ -683,7 +700,9 @@ function patchStreaming(
     last?.role === role &&
     (index === session.blocks.length - 1 || last.streaming)
   ) {
-    const nextText = joinStreamText(last.text, text);
+    // Fold against the existing body, not an empty string: snapshot merging
+    // is order-sensitive and cannot be replaced by concatenating deltas.
+    const nextText = texts.reduce(joinStreamText, last.text);
     if (nextText === last.text && last.streaming === streaming) return session;
     const blocks = session.blocks.slice();
     blocks[index] = {
@@ -697,7 +716,7 @@ function patchStreaming(
   blocks.push({
     id: crypto.randomUUID(),
     role,
-    text,
+    text: texts.reduce(joinStreamText, ""),
     streaming,
   });
   return { ...session, blocks };

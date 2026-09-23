@@ -62,6 +62,40 @@ describe("isCurrentChildExit", () => {
   });
 });
 
+describe("concurrent binary discovery", () => {
+  it.each(["Codex", "Claude", "Devin", "Copilot", "Omp", "Muse"] as const)(
+    "shares pending %s discovery, then checks again on the next request",
+    async (name) => {
+      const child = await loadChild();
+      const pending = deferred<{ path: string }>();
+      mocks.invoke.mockReturnValue(pending.promise);
+      const resolve = child[`resolve${name}Binary`];
+      const first = resolve("C:/repo");
+      expect(resolve()).toBe(first);
+      expect(resolve("C:/another-repo")).toBe(first);
+      expect(mocks.invoke).toHaveBeenCalledTimes(1);
+      pending.resolve({ path: "cli.exe" });
+      await first;
+      await resolve();
+      expect(mocks.invoke).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("keeps guest workspaces and providers separate and retries failed lookups", async () => {
+    const child = await loadChild();
+    mocks.invoke.mockRejectedValue(new Error("missing"));
+    const workspaces = ["C:/repo", "//wsl.localhost/Ubuntu/home/me/repo", "//wsl.localhost/Debian/home/me/repo"];
+    const pending = workspaces.map(cwd => child.resolveCodexBinary(cwd));
+    pending.push(child.resolveClaudeBinary());
+    await Promise.all(pending.map(p => expect(p).rejects.toThrow("missing")));
+    expect(mocks.invoke).toHaveBeenCalledTimes(4);
+    expect(mocks.invoke).toHaveBeenCalledWith("wsl_resolve_harness", { cwd: workspaces[1], provider: "codex" });
+    mocks.invoke.mockResolvedValue({ path: "installed.exe" });
+    await expect(child.resolveCodexBinary()).resolves.toEqual({ path: "installed.exe" });
+    expect(mocks.invoke).toHaveBeenCalledTimes(5);
+  });
+});
+
 describe("child bridge", () => {
   it("waits until every listener is installed", async () => {
     const pending = deferred<UnlistenFn>();

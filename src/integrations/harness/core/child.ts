@@ -1,3 +1,4 @@
+import { currentHarnessTiming, markHarnessTiming, measureHarnessTiming, timingWriteKind } from "./timing";
 import { wslLocation } from "../../../shared/lib/paths.ts";
 import type { HarnessId } from "../../../features/sessions/model/session.ts";
 import { invoke } from "@tauri-apps/api/core";
@@ -110,6 +111,7 @@ function ensureBridge() {
         if (childGeneration.get(sessionId) !== generation) return;
         const handler = lineHandlers.get(sessionId);
         if (handler) {
+          markHarnessTiming(currentHarnessTiming(sessionId), "firstStdout");
           handler(line);
           return;
         }
@@ -293,14 +295,14 @@ export async function spawnChild(
     throw new Error("Harness startup cancelled");
   let pid: number;
   try {
-    pid = await invoke<number>("harness_spawn", {
+    pid = await measureHarnessTiming(currentHarnessTiming(sessionId), "spawn", () => invoke<number>("harness_spawn", {
       sessionId,
       generation,
       command,
       args,
       cwd,
       account,
-    });
+    }));
   } catch (error) {
     if (childGeneration.get(sessionId) === generation)
       childGeneration.delete(sessionId);
@@ -354,7 +356,9 @@ export function writeChild(
   queue.count += 1;
   queue.bytes += bytes;
   const owned = queue;
-  const write = owned.tail.then(async () => {
+  const timing = currentHarnessTiming(sessionId);
+  const kind = timing ? timingWriteKind(line) : "control";
+  const write = measureHarnessTiming(timing, `writeQueue:${kind}`, () => owned.tail).then(async () => {
     if (
       signal?.aborted ||
       owned.failed ||
@@ -364,8 +368,9 @@ export function writeChild(
     let timer: ReturnType<typeof setTimeout> | undefined;
     let onAbort: (() => void) | undefined;
     try {
+      markHarnessTiming(timing, `${kind}WriteStarted`);
       await Promise.race([
-        invoke<void>("harness_write", { sessionId, generation, line }),
+        measureHarnessTiming(timing, `write:${kind}`, () => invoke<void>("harness_write", { sessionId, generation, line })),
         new Promise<never>((_resolve, reject) => {
           onAbort = () =>
             reject(new Error("Harness write cancelled; delivery is unknown"));
@@ -377,6 +382,7 @@ export function writeChild(
           );
         }),
       ]);
+      markHarnessTiming(timing, `${kind}Written`);
     } catch (error) {
       owned.failed = true;
       if (childGeneration.get(sessionId) === generation) {
@@ -437,10 +443,25 @@ export function killAllChildren(): Promise<void> {
   return pending;
 }
 
+// Availability, model discovery and the first turn can resolve the same CLI
+// concurrently. Share only pending work; never retain stale paths or failures.
+const binaryResolutions = new Map<string, Promise<{ path: string }>>();
+
+function resolveBinary(provider: HarnessId, cwd?: string): Promise<{ path: string }> {
+  const guestCwd = cwd && wslLocation(cwd) ? cwd : undefined;
+  const key = JSON.stringify([provider, guestCwd]);
+  const existing = binaryResolutions.get(key);
+  if (existing) return existing;
+  const pending = (guestCwd
+    ? invoke<{ path: string }>("wsl_resolve_harness", { cwd: guestCwd, provider })
+    : invoke<{ path: string }>(`harness_resolve_${provider}`)
+  ).finally(() => binaryResolutions.delete(key));
+  binaryResolutions.set(key, pending);
+  return pending;
+}
+
 export function resolveCursorBinary(cwd?: string): Promise<{ path: string }> {
-  return cwd && wslLocation(cwd)
-    ? invoke("wsl_resolve_harness", { cwd, provider: "cursor" })
-    : invoke("harness_resolve_cursor");
+  return resolveBinary("cursor", cwd);
 }
 
 export type WslAgentResolution = {
@@ -457,69 +478,47 @@ export function resolveWslAgents(
 }
 
 export function resolveCodexBinary(cwd?: string): Promise<{ path: string }> {
-  return cwd && wslLocation(cwd)
-    ? invoke("wsl_resolve_harness", { cwd, provider: "codex" })
-    : invoke("harness_resolve_codex");
+  return resolveBinary("codex", cwd);
 }
 
 export function resolveOpenCodeBinary(cwd?: string): Promise<{ path: string }> {
-  return cwd && wslLocation(cwd)
-    ? invoke("wsl_resolve_harness", { cwd, provider: "opencode" })
-    : invoke("harness_resolve_opencode");
+  return resolveBinary("opencode", cwd);
 }
 
 export function resolveClaudeBinary(cwd?: string): Promise<{ path: string }> {
-  return cwd && wslLocation(cwd)
-    ? invoke("wsl_resolve_harness", { cwd, provider: "claude" })
-    : invoke("harness_resolve_claude");
+  return resolveBinary("claude", cwd);
 }
 
 export function resolvePiBinary(cwd?: string): Promise<{ path: string }> {
-  return cwd && wslLocation(cwd)
-    ? invoke("wsl_resolve_harness", { cwd, provider: "pi" })
-    : invoke("harness_resolve_pi");
+  return resolveBinary("pi", cwd);
 }
 
 export function resolveOmpBinary(cwd?: string): Promise<{ path: string }> {
-  return cwd && wslLocation(cwd)
-    ? invoke("wsl_resolve_harness", { cwd, provider: "omp" })
-    : invoke("harness_resolve_omp");
+  return resolveBinary("omp", cwd);
 }
 
 export function resolveFxBinary(cwd?: string): Promise<{ path: string }> {
-  return cwd && wslLocation(cwd)
-    ? invoke("wsl_resolve_harness", { cwd, provider: "fx" })
-    : invoke("harness_resolve_fx");
+  return resolveBinary("fx", cwd);
 }
 
 export function resolveHermesBinary(cwd?: string): Promise<{ path: string }> {
-  return cwd && wslLocation(cwd)
-    ? invoke("wsl_resolve_harness", { cwd, provider: "hermes" })
-    : invoke("harness_resolve_hermes");
+  return resolveBinary("hermes", cwd);
 }
 
 export function resolveGrokBinary(cwd?: string): Promise<{ path: string }> {
-  return cwd && wslLocation(cwd)
-    ? invoke("wsl_resolve_harness", { cwd, provider: "grok" })
-    : invoke("harness_resolve_grok");
+  return resolveBinary("grok", cwd);
 }
 
 export function resolveDevinBinary(cwd?: string): Promise<{ path: string }> {
-  return cwd && wslLocation(cwd)
-    ? invoke("wsl_resolve_harness", { cwd, provider: "devin" })
-    : invoke("harness_resolve_devin");
+  return resolveBinary("devin", cwd);
 }
 
 export function resolveCopilotBinary(cwd?: string): Promise<{ path: string }> {
-  return cwd && wslLocation(cwd)
-    ? invoke("wsl_resolve_harness", { cwd, provider: "copilot" })
-    : invoke("harness_resolve_copilot");
+  return resolveBinary("copilot", cwd);
 }
 
 export function resolveMuseBinary(cwd?: string): Promise<{ path: string }> {
-  return cwd && wslLocation(cwd)
-    ? invoke("wsl_resolve_harness", { cwd, provider: "muse" })
-    : invoke("harness_resolve_muse");
+  return resolveBinary("muse", cwd);
 }
 
 export function resolveAntigravityBinary(): Promise<{

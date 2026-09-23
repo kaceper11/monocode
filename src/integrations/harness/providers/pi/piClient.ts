@@ -1,3 +1,4 @@
+import { currentHarnessTiming, measureHarnessTiming, timingRequestName } from "../../core/timing";
 import { writeChild } from "../../core/child";
 import { parseJsonLine, parseRpcResponse, stringField } from "./piProtocol";
 
@@ -78,7 +79,7 @@ export class PiRpc {
       this.pending.delete(id);
       request?.reject(message);
     });
-    return pending;
+    return measureHarnessTiming(currentHarnessTiming(this.sessionId), timingRequestName(stringField(command, "type") ?? "command"), () => pending);
   }
 
   close(error?: Error) {

@@ -5,10 +5,62 @@ import { previewFromTool } from "../providers/claude/claudeProtocol";
 import {
   appendUser,
   applyHarnessEvent,
+  applyHarnessEvents,
   appendSteerUser,
   promoteLastAssistantToPlan,
   stopStreaming,
 } from "./apply";
+import type { HarnessEvent } from "./types";
+
+describe("streaming batches", () => {
+  it("matches individual events across snapshots, whitespace and lifecycle boundaries", () => {
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000000");
+    const session = appendUser(newSession("codex", "/repo"), "hello");
+    const events: HarnessEvent[] = [
+      { type: "reasoning.delta", text: "" },
+      { type: "reasoning.delta", text: "Think" },
+      { type: "reasoning.delta", text: "Think carefully" },
+      { type: "reasoning.completed" },
+      { type: "message.delta", text: "Hello" },
+      { type: "message.delta", text: "Hello world" },
+      { type: "message.delta", text: "Hello world" },
+      { type: "message.delta", text: "\n" },
+      { type: "message.delta", text: "\n" },
+      { type: "status", text: "Working" },
+      { type: "message.delta", text: "Next" },
+      { type: "message.delta", text: " paragraph" },
+      { type: "message.completed" },
+      { type: "tool.started", callId: "tool", title: "Read", kind: "read" },
+      { type: "message.delta", text: "" },
+      { type: "message.delta", text: "Done" },
+      { type: "message.completed" },
+    ];
+    const expected = events.reduce(applyHarnessEvent, session);
+    // Every split tests an existing streaming body as well as a new one.
+    for (let split = 0; split <= events.length; split++) {
+      const first = applyHarnessEvents(session, events.slice(0, split));
+      expect(applyHarnessEvents(first, events.slice(split))).toEqual(expected);
+    }
+    expect(session.blocks).toHaveLength(1);
+  });
+
+  it("copies a long transcript once per text run and preserves no-op identity", () => {
+    let session = newSession("codex", "/repo");
+    session = { ...session, blocks: Array.from({ length: 2_000 }, (_, index) => ({
+      id: String(index), role: "assistant", text: "earlier", streaming: index === 1_999,
+    })) };
+    const original = session.blocks;
+    const copies = vi.spyOn(original, "slice");
+    const events: HarnessEvent[] = Array.from({ length: 100 }, () => ({ type: "message.delta", text: "x" }));
+    const result = applyHarnessEvents(session, events);
+    expect(copies).toHaveBeenCalledTimes(1);
+    expect(result.blocks.at(-1)?.text).toBe("earlier" + "x".repeat(100));
+    expect(result.blocks[0]).toBe(original[0]);
+    expect(original.at(-1)?.text).toBe("earlier");
+    expect(applyHarnessEvents(result, [{ type: "message.delta", text: result.blocks.at(-1)!.text }])).toBe(result);
+    expect(applyHarnessEvents(result, [])).toBe(result);
+  });
+});
 
 let now = 0;
 

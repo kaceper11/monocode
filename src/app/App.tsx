@@ -1,3 +1,7 @@
+import {
+  startHarnessTiming, markHarnessTiming, finishHarnessTiming, measureHarnessTiming,
+  queueHarnessTimingCommit, commitHarnessTiming, type HarnessTiming,
+} from "../integrations/harness/core/timing";
 import { useWslStatus } from "../features/sessions/model/wslStatus";
 import { SavedCommandsControl } from "../features/sessions/ui/SavedCommandsControl";
 import { prepareSavedCommandLaunch, type SavedCommandLaunch } from "../features/sessions/model/savedCommandLaunch";
@@ -110,7 +114,7 @@ import {
   zoomOutUiScale,
 } from "../features/settings/model/uiScale";
 import { runUpdateFlow } from "./model/updater";
-import { displayAttachments, prepareAttachments } from "../features/sessions/model/attachments";
+import { displayAttachments } from "../features/sessions/model/attachments";
 import {
   basename,
   notifyGitChanged,
@@ -205,6 +209,7 @@ import {
 } from "../features/terminal/model/terminalTab";
 import {
   applyHarnessEvent,
+  applyHarnessEvents,
   appendUser,
   appendSteerUser,
   bindHarnessSession,
@@ -263,7 +268,6 @@ import {
   createEditedResendCoordinator,
 } from "../features/sessions/model/editLastTurn";
 import {
-  beginSessionTurn,
   applySessionCheckpoint,
   captureSessionCheckpoint,
   forgetSessionCheckpoint,
@@ -427,7 +431,7 @@ import {
   tabVisitForward,
   type TabVisitHistory,
 } from "../features/workspace/model/tabVisitHistory";
-import { preparePrompt } from "../features/sessions/model/promptPreparation";
+import { prepareTurn } from "../features/sessions/model/promptPreparation";
 import { warmNativeSkills, isNativeCommandPrompt } from "../features/skills/model/skills";
 import { nativeSkillContextForSession } from "../features/sessions/model/sessionSkills";
 import {
@@ -581,6 +585,8 @@ type SubmitOptions = ComposerTurnOptions & {
   refreshTitle?: boolean;
   /** Internal guard for the retry after resolving a renamed project. */
   projectLocationReady?: boolean;
+  /** Carries opt-in timings across project-location resubmission. */
+  timing?: HarnessTiming;
 };
 
 type Submit = (
@@ -1086,7 +1092,10 @@ export default function App({
     const prev = sessionsRef.current;
     const next = prev.map((session) => {
       const events = batches.get(session.id);
-      return events ? events.reduce(applyHarnessEvent, session) : session;
+      if (!events) return session;
+      const next = applyHarnessEvents(session, events);
+      queueHarnessTimingCommit(session.id, events);
+      return next;
     });
     if (!next.some((session, index) => session !== prev[index])) return;
     sessionsRef.current = next;
@@ -1123,10 +1132,11 @@ export default function App({
       const prev = sessionsRef.current;
       const next = prev.map((session) =>
         session.id === sessionId
-          ? events.reduce(applyHarnessEvent, session)
+          ? applyHarnessEvents(session, events)
           : session,
       );
       if (!next.some((session, index) => session !== prev[index])) return;
+      queueHarnessTimingCommit(sessionId, events);
       sessionsRef.current = next;
       syncDockBadge(next);
       setSessions(next);
@@ -1482,6 +1492,7 @@ export default function App({
   const activeSessionId = inboxViewOpen
     ? inboxAskPortal?.sessionId
     : active?.id;
+  useLayoutEffect(() => { commitHarnessTiming(activeSessionId); }, [sessions, activeSessionId]);
   const activeSessionIdRef = useRef(activeSessionId);
   activeSessionIdRef.current = activeSessionId;
 
@@ -5751,15 +5762,14 @@ export default function App({
         });
         sessionsRef.current = nextSessions;
         setSessions(nextSessions);
+        const timing = startHarnessTiming(current, "steer");
         void (async () => {
           try {
-            const prepared = await prepareAttachments(attachments, initialWorkCwd);
-            const prompt = await preparePrompt(harnessText, {
-              harness: current.harness,
-              sessionId,
-              cwd: initialWorkCwd,
-            });
+            const { attachments: prepared, text: prompt } = await prepareTurn(harnessText, attachments, {
+              harness: current.harness, sessionId, cwd: initialWorkCwd,
+            }, { timing });
             await steerHarnessTurn({
+              timing,
               harness: current.harness,
               sessionId,
               cwd: initialWorkCwd,
@@ -5772,6 +5782,7 @@ export default function App({
               attachments: prepared,
             });
           } catch (error: unknown) {
+            finishHarnessTiming(timing, "failed");
             const message =
               error instanceof Error
                 ? error.message
@@ -5786,6 +5797,7 @@ export default function App({
         return true;
       }
 
+      const timing = options?.timing ?? startHarnessTiming(current);
       if (
         !options?.projectLocationReady &&
         looksLikeProject(current.cwd) &&
@@ -5801,7 +5813,7 @@ export default function App({
             () => projectLocationSyncs.current.delete(key),
           );
         }
-        void sync
+        void measureHarnessTiming(timing, "projectLocation", () => sync!)
           .then(async (location) => {
             if (!location) {
               throw new Error(
@@ -5811,12 +5823,15 @@ export default function App({
             if (location.moved) {
               await applyProjectLocationChange(current.cwd, location.path);
             }
-            submitAfterProjectSyncRef.current(sessionId, text, attachments, {
+            const submitted = submitAfterProjectSyncRef.current(sessionId, text, attachments, {
               ...options,
               projectLocationReady: true,
+              timing,
             });
+            if (!submitted) finishHarnessTiming(timing, "cancelled");
           })
           .catch((error: unknown) => {
+            finishHarnessTiming(timing, "failed");
             const message =
               error instanceof Error
                 ? error.message
@@ -6054,6 +6069,7 @@ export default function App({
       };
 
       if (!live) {
+        finishHarnessTiming(timing, "failed");
         if (pendingSwitch) {
           void forgetHarnessSession(pendingSwitch.from, sessionId);
         }
@@ -6152,7 +6168,6 @@ export default function App({
             })
             .catch(() => undefined);
         }
-        launchTitleGeneration(workCwd);
         if (turnGen.current.get(sessionId) !== gen) return;
         if (proposalDraft && proposalId) {
           const settings = await discoverOrchestrationSettings(workCwd);
@@ -6297,21 +6312,18 @@ export default function App({
           });
         };
 
-        if (!current.inboxAsk && !orchestrator.forSession(sessionId)) {
-          await beginSessionTurn(sessionId, workCwd).catch(() => undefined);
-        }
         if (turnGen.current.get(sessionId) !== gen) return;
         let buildSucceeded = false;
         try {
-          const prepared = await prepareAttachments(attachments, workCwd);
-          const prompt =
-            intent === "build" && approvedPlan
-              ? buildPlanPrompt(approvedPlan.text)
-              : await preparePrompt(harnessText, {
-                  harness: current.harness,
-                  sessionId,
-                  cwd: workCwd,
-                });
+          const literal = intent === "build" && !!approvedPlan;
+          const { attachments: prepared, text: prompt } = await prepareTurn(
+            literal ? buildPlanPrompt(approvedPlan!.text) : harnessText,
+            attachments,
+            { harness: current.harness, sessionId, cwd: workCwd },
+            { checkpoint: !current.inboxAsk && !orchestrator.forSession(sessionId), literal, timing },
+          );
+          if (turnGen.current.get(sessionId) !== gen) return;
+          markHarnessTiming(timing, "prepared");
           const turnPrompt = proposalDraft
             ? options?.orchestrationRetry?.response
               ? orchestrationRepairPrompt({
@@ -6384,6 +6396,7 @@ export default function App({
           }
           const sendTurn = (text: string, turnAttachments = prepared) =>
             sendHarnessTurn({
+              timing: timing?.outcome ? undefined : timing,
               harness: current.harness,
               sessionId,
               cwd: workCwd,
@@ -6451,6 +6464,7 @@ export default function App({
             );
           }
           buildSucceeded = true;
+          launchTitleGeneration(workCwd);
         } catch (error: unknown) {
           recoverEditedResend();
           if (turnGen.current.get(sessionId) !== gen) return;
@@ -6575,6 +6589,7 @@ export default function App({
           }
         })
         .finally(() => {
+          finishHarnessTiming(timing, turnGen.current.get(sessionId) !== gen ? "cancelled" : controlOutcome.status === "completed" ? "completed" : "failed");
           editedResend?.reject();
           if (editedResend) editedResends.finish(sessionId);
           options?.onSettled?.(

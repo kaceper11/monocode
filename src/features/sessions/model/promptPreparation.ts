@@ -7,6 +7,42 @@ import {
   type SkillCatalogContext,
 } from "../../skills/model/skills";
 import { nativeCommandPrompt } from "../../../integrations/harness/core/nativeCommands";
+import {
+  measureHarnessTiming,
+  type HarnessTiming,
+} from "../../../integrations/harness/core/timing";
+import { prepareAttachments } from "./attachments";
+import { beginSessionTurn } from "./checkpoint";
+import type { Attachment } from "./session";
+
+/** Independent reads overlap, but the pre-edit snapshot still gates dispatch. */
+export async function prepareTurn(
+  text: string,
+  attachments: Attachment[],
+  context: SkillCatalogContext & { sessionId: string },
+  options: {
+    checkpoint?: boolean;
+    literal?: boolean;
+    timing?: HarnessTiming;
+  } = {},
+): Promise<{ text: string; attachments: Attachment[] }> {
+  const [prepared, prompt] = await Promise.all([
+    measureHarnessTiming(options.timing, "attachments", () =>
+      prepareAttachments(attachments, context.cwd),
+    ),
+    measureHarnessTiming(options.timing, "prompt", () =>
+      options.literal ? Promise.resolve(text) : preparePrompt(text, context),
+    ),
+    options.checkpoint
+      ? measureHarnessTiming(options.timing, "checkpoint", () =>
+          beginSessionTurn(context.sessionId, context.cwd),
+        )
+          // Preserve the existing behavior when checkpoints are unavailable.
+          .catch(() => undefined)
+      : Promise.resolve(),
+  ]);
+  return { text: prompt, attachments: prepared };
+}
 
 export async function preparePrompt(
   text: string,

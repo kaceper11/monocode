@@ -1,3 +1,8 @@
+import {
+  startHarnessTiming, markHarnessTiming, finishHarnessTiming,
+  bindHarnessTiming, currentHarnessTiming, measureHarnessTiming,
+  observeHarnessTiming, type HarnessTiming,
+} from "./timing";
 import { wslLocation } from "../../../shared/lib/paths";
 import { wslStatusFor } from "../../../features/sessions/model/wslStatus";
 import type { HarnessId } from "../../../features/sessions/model/session";
@@ -214,28 +219,40 @@ export function listHarnesses(): HarnessAdapter[] {
   return [...adapters.values()];
 }
 
-export function sendHarnessTurn(input: SendTurnInput & { harness: HarnessId }) {
+export function sendHarnessTurn(input: SendTurnInput & { harness: HarnessId; timing?: HarnessTiming }) {
+  const timing = input.timing ?? startHarnessTiming(input);
+  markHarnessTiming(timing, "queued");
   return queueSessionOperation(input.sessionId, async () => {
-    const adapter = requireHarness(input.harness);
-    if (!adapter.live) {
-      throw new Error(`${input.harness} is not connected yet`);
-    }
-    cancelIdlePark(input.sessionId);
-    const controlled = typeof isTauri === "function" && isTauri();
-    if (controlled)
-      await invoke("control_authorize_turn", {
-        sessionId: input.sessionId,
-        cwd: input.cwd,
-      });
-    activeTurnSessions.add(input.sessionId);
+    markHarnessTiming(timing, "dequeued");
+    const unbind = bindHarnessTiming(input.sessionId, timing);
     try {
-      await adapter.sendTurn(input);
-    } finally {
-      activeTurnSessions.delete(input.sessionId);
+      const adapter = requireHarness(input.harness);
+      if (!adapter.live) throw new Error(`${input.harness} is not connected yet`);
+      cancelIdlePark(input.sessionId);
+      const controlled = typeof isTauri === "function" && isTauri();
       if (controlled)
-        await invoke("control_turn_finished", { sessionId: input.sessionId });
-      scheduleIdlePark(input.harness, input.sessionId);
-    }
+        await measureHarnessTiming(timing, "authorize", () => invoke("control_authorize_turn", {
+          sessionId: input.sessionId,
+          cwd: input.cwd,
+        }));
+      activeTurnSessions.add(input.sessionId);
+      markHarnessTiming(timing, "adapterStart");
+      try {
+        await adapter.sendTurn({ ...input, onEvent: (event) => {
+          observeHarnessTiming(input.sessionId, timing, event);
+          input.onEvent(event);
+        } });
+      } finally {
+        activeTurnSessions.delete(input.sessionId);
+        if (controlled)
+          await invoke("control_turn_finished", { sessionId: input.sessionId });
+        scheduleIdlePark(input.harness, input.sessionId);
+      }
+      finishHarnessTiming(timing, timing?.marks.providerError != null ? "failed" : "completed");
+    } catch (error) {
+      finishHarnessTiming(timing, "failed");
+      throw error;
+    } finally { unbind(); }
   });
 }
 
@@ -295,19 +312,23 @@ export function rewindHarnessLastTurn(
 }
 
 export function steerHarnessTurn(
-  input: SteerTurnInput & { harness: HarnessId },
+  input: SteerTurnInput & { harness: HarnessId; timing?: HarnessTiming },
 ): Promise<void> {
+  const timing = input.timing ?? startHarnessTiming(input, "steer");
+  markHarnessTiming(timing, "queued");
   return queueSteerOperation(input.sessionId, async () => {
+    markHarnessTiming(timing, "dequeued");
     const adapter = requireHarness(input.harness);
-    if (!adapter.live) {
-      throw new Error(`${input.harness} is not connected yet`);
-    }
+    if (!adapter.live) throw new Error(`${input.harness} is not connected yet`);
     cancelIdlePark(input.sessionId);
     try {
+      markHarnessTiming(timing, "adapterStart");
       await adapter.steerTurn(input);
-    } finally {
-      scheduleIdlePark(input.harness, input.sessionId);
-    }
+      finishHarnessTiming(timing, "completed");
+    } finally { scheduleIdlePark(input.harness, input.sessionId); }
+  }).catch((error: unknown) => {
+    finishHarnessTiming(timing, "failed");
+    throw error;
   });
 }
 
@@ -317,9 +338,17 @@ export async function cancelHarnessTurn(
 ): Promise<void> {
   const adapter = getHarness(harness);
   if (!adapter?.live) return;
+  const timing = startHarnessTiming({ harness }, "cancel");
+  markHarnessTiming(currentHarnessTiming(sessionId), "cancelRequested");
   cancelIdlePark(sessionId);
-  await adapter.cancelTurn(sessionId);
-  scheduleIdlePark(harness, sessionId);
+  try {
+    markHarnessTiming(timing, "adapterStart");
+    await adapter.cancelTurn(sessionId);
+    finishHarnessTiming(timing, "completed");
+  } catch (error) {
+    finishHarnessTiming(timing, "failed");
+    throw error;
+  } finally { scheduleIdlePark(harness, sessionId); }
 }
 
 export function respondHarnessApproval(

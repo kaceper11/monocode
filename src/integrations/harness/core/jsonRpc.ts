@@ -1,3 +1,4 @@
+import { currentHarnessTiming, markHarnessTiming, measureHarnessTiming, timingRequestName } from "./timing";
 import { writeChild } from "./child";
 
 type Pending = {
@@ -142,7 +143,7 @@ export class JsonRpcClient {
       this.pending.delete(key);
       pending.reject(error instanceof Error ? error : new Error(String(error)));
     });
-    return response;
+    return measureHarnessTiming(currentHarnessTiming(this.sessionId), timingRequestName(method), () => response);
   }
 
   async notify(method: string, params?: unknown): Promise<void> {
@@ -223,6 +224,8 @@ export class JsonRpcClient {
     }
 
     if (msg.method) {
+      if (msg.method === "turn/completed")
+        markHarnessTiming(currentHarnessTiming(this.sessionId), "providerTurnCompleted");
       this.handlers.onNotification?.(msg.method, msg.params);
     }
   }
