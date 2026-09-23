@@ -943,6 +943,11 @@ export function InboxView({
         ref={setListScrollRef}
         className="min-h-0 flex-1 overflow-y-auto overscroll-none"
       >
+        {source === "azuredevops" && sourceError && visibleItems.length > 0 ? (
+          <p role="alert" className="px-3 py-2 text-[12px] text-content/50">
+            Some ADO items could not be loaded: {sourceError}
+          </p>
+        ) : null}
         {noSourcesConnected ? (
           <p className="px-3 py-3 text-[12px] text-content/50">
             <button

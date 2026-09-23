@@ -3,13 +3,20 @@ import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { InboxDetail } from "./InboxView";
+import { InboxDetail, InboxView } from "./InboxView";
+import { saveInboxConnections, saveInboxSource } from "../model/inboxFilters";
 import * as adapters from "../../sessions/model/inboxProvider";
 import * as github from "../model/githubTasks";
 import { LinkedWorkItemPanel } from "./InboxView";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { InboxItem } from "../model/githubTasks";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), convertFileSrc: (path: string) => path }));
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    isMaximized: async () => false,
+    onResized: async () => () => {},
+  }),
+}));
 vi.mock("../../sessions/ui/AgentMarkdown", () => ({ AgentMarkdown: ({ text }: { text: string }) => createElement("p", null, text) }));
 it.each(["jira", "azuredevops"] as const)("uses upstream Ask and Send controls with %s identity and the chosen project", async provider => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -62,4 +69,47 @@ it("shows cached GitHub linked items immediately", () => {
     const markup = renderToStaticMarkup(createElement(LinkedWorkItemPanel, { target: { kind: "issue", number: 42, repo: "org/repo", url: item.url }, cwd: "/repo", recents: [], onClose: vi.fn() }));
     expect(markup).toContain("Cached linked issue");
   } finally { spy.mockRestore(); }
+});
+
+it("keeps Azure PRs visible with a loading error and clears it after refresh", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  localStorage.clear();
+  github.clearInboxCache();
+  saveInboxConnections({ github: false, gitlab: false, linear: false, jira: false, azuredevops: true });
+  saveInboxSource("azuredevops");
+  vi.mocked(invoke).mockRejectedValue(new Error("No native bridge"));
+  const pr: InboxItem = {
+    provider: "azuredevops", kind: "pr", repo: "Cash/app", number: 42,
+    title: "Visible Azure PR", url: "https://dev.azure.com/acme/Cash/_git/app/pullrequest/42",
+    state: "open", updatedAt: new Date().toISOString(),
+    labels: [], assignees: [], draft: false, projectPath: "/repo",
+  };
+  const list = vi.spyOn(github, "listInboxItems").mockResolvedValue({
+    items: [pr], errors: { azuredevops: "issues unavailable" },
+  });
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  try {
+    await act(async () => root.render(createElement(InboxView, {
+      cwd: "/repo", recents: [], onAsk: async () => "", onAskRestart: async () => "",
+      onAskMount: () => {}, onOpenIntegrations: () => {},
+    })));
+    expect(host.textContent).toContain("Visible Azure PR");
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain("issues unavailable");
+    list.mockResolvedValue({ items: [pr, {
+      ...pr, kind: "issue", repo: "Cash", number: 193, title: "Recovered Azure issue",
+      url: "https://dev.azure.com/acme/Cash/_workitems/edit/193",
+    }], errors: {} });
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Refresh"]')!.click());
+    expect(host.textContent).toContain("Visible Azure PR");
+    expect(host.textContent).toContain("Recovered Azure issue");
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    list.mockRestore();
+    localStorage.clear();
+    vi.unstubAllGlobals();
+  }
 });

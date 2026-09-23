@@ -185,8 +185,18 @@ describe.each([
             projectPath: "/tmp/first",
           },
         ],
-        errors: { jira: "Connect Jira Cloud in Settings to see assigned issues." },
+        errors: {
+          jira: "Connect Jira Cloud in Settings to see assigned issues.",
+          ...(provider === "azuredevops" ? { azuredevops: "issues unavailable" } : {}),
+        },
       });
+
+      list.mockImplementation(async ({ kind }) => [workItem("acme/web", kind)]);
+      const recovered = await listInboxItems(
+        projects, { ...query, assignedToMe }, { force: true },
+      );
+      expect(recovered.items.map((item) => item.kind).sort()).toEqual(["issue", "pr"]);
+      expect(recovered.errors[provider]).toBeUndefined();
     },
   );
 

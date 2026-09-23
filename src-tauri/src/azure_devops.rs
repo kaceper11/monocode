@@ -701,20 +701,9 @@ fn azure_fetch_wit_batch(
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let fields = [
-        "System.Id",
-        "System.Title",
-        "System.State",
-        "System.ChangedDate",
-        "System.CreatedDate",
-        "System.AssignedTo",
-        "System.Tags",
-        "System.TeamProject",
-    ]
-    .join(",");
-    let path = format!(
-        "/_apis/wit/workitems?ids={joined}&fields={fields}&$expand=relations&api-version={API_VERSION}"
-    );
+    // Azure rejects fields combined with $expand. Links supplies the browser
+    // URL used by Inbox without fetching work-item relations.
+    let path = format!("/_apis/wit/workitems?ids={joined}&$expand=Links&api-version={API_VERSION}");
     let response = azure_get(config, &path)?;
     let rows = response
         .value
@@ -2249,6 +2238,59 @@ mod tests {
         assert!(assigned.contains("[System.AssignedTo] = @me"));
         let all = wit_wiql(Some("platform"), false, "all");
         assert!(!all.contains("NOT IN"));
+    }
+
+    #[test]
+    fn fetches_work_items_with_links_without_conflicting_fields() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = AzureDevOpsConfig {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "test-token".into(),
+        };
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let body = json!({ "value": [{
+                "id": 193,
+                "fields": {
+                    "System.Title": "Visible work item",
+                    "System.State": "Active",
+                    "System.TeamProject": "Cash",
+                    "System.ChangedDate": "2026-09-23T10:00:00Z"
+                },
+                "_links": { "html": { "href": "https://dev.azure.com/acme/Cash/_workitems/edit/193" } }
+            }] }).to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            request
+        });
+        let result = azure_fetch_wit_batch(&config, &[193]);
+        let request = server.join().unwrap();
+        assert!(request.contains("ids=193&$expand=Links&api-version=7.1"));
+        assert!(!request.contains("fields="));
+        let items = result.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Visible work item");
+        assert_eq!(items[0].repo, "Cash");
+        assert_eq!(items[0].kind, "issue");
+        assert_eq!(items[0].state, "open");
+        assert_eq!(
+            items[0].url,
+            "https://dev.azure.com/acme/Cash/_workitems/edit/193"
+        );
     }
 
     #[test]

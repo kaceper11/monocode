@@ -832,7 +832,11 @@ async function fetchRepositoryInboxItems(
         ),
       );
     });
-    return collectInboxResults(await Promise.allSettled(jobs), preferredPaths);
+    return collectInboxResults(
+      await Promise.allSettled(jobs),
+      preferredPaths,
+      provider === "azuredevops",
+    );
   }
 
   const jobs = grouped.flatMap((project) =>
@@ -848,7 +852,11 @@ async function fetchRepositoryInboxItems(
       );
     }),
   );
-  return collectInboxResults(await Promise.allSettled(jobs), preferredPaths);
+  return collectInboxResults(
+    await Promise.allSettled(jobs),
+    preferredPaths,
+    provider === "azuredevops",
+  );
 }
 
 async function fetchLinearInboxItems(query: InboxQuery): Promise<InboxItem[]> {
@@ -967,6 +975,7 @@ export function groupProjectsByRepo(
 export function collectInboxResults(
   settled: PromiseSettledResult<InboxItem[]>[],
   preferredPaths: readonly string[] = [],
+  reportPartialErrors = false,
 ): { items: InboxItem[]; error?: string } {
   const batches: InboxItem[][] = [];
   const errors: unknown[] = [];
@@ -974,10 +983,12 @@ export function collectInboxResults(
     if (result.status === "fulfilled") batches.push(result.value);
     else errors.push(result.reason);
   }
-  if (batches.length === 0 && errors.length > 0) {
-    return { items: [], error: inboxErrorMessage(errors[0]) };
-  }
-  return { items: dedupeInboxItems(batches.flat(), preferredPaths) };
+  return {
+    items: dedupeInboxItems(batches.flat(), preferredPaths),
+    ...((reportPartialErrors || batches.length === 0) && errors.length > 0
+      ? { error: inboxErrorMessage(errors[0]) }
+      : {}),
+  };
 }
 
 function inboxErrorMessage(error: unknown): string {
