@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.13] - 2026-09-24
+
+### Fixed
+
+- Follow Azure build pagination in task details and retain matching builds when a later page fails or reaches the lookup limit. Incomplete CI evidence remains visible and cannot trigger repair handoffs.
+- Offer explicit actions to switch the current worktree or create a separate worktree from a selected branch. Creating separately preserves uncommitted changes and existing session locations.
+- Resolve existing local branches before worktree creation and offer to attach an existing working copy while retaining task ownership checks.
+
+### Compatibility
+
+- No persistence schema changes or new dependencies.
+- Local web and Rust checks and browser interaction validation passed; authenticated Azure and native Windows/WSL acceptance remain unverified.
+
 ## [0.3.12] - 2026-09-24
 
 ### Fixed
