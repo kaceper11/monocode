@@ -2164,9 +2164,9 @@ export function WorkstreamEditor({
     }
     return "";
   };
-  const applyBranch = async (action: "switch" | "create", existingPath?: string) => {
-    if (!targetBranch || inFlight.current || blocked) return;
-    const choice = taskBranchChoice(targetBranch);
+  const applyBranch = async (action: "switch" | "create", existingPath?: string, selectedBranch = targetBranch) => {
+    if (!selectedBranch || inFlight.current || blocked) return;
+    const choice = taskBranchChoice(selectedBranch);
     let preparedPath: string | undefined;
     const validate = (path?: string) => {
       const current = loadBoard().tasks.flatMap(task => task.workstreams).find(ws => ws.id === row.id);
@@ -2183,7 +2183,7 @@ export function WorkstreamEditor({
       validate(existingPath);
       if (action === "switch") {
         if (!row.worktreePath) throw new Error("Select a working copy first.");
-        const branch = await gitTaskBranch(row.worktreePath, row.branch, targetBranch, row.base, "switch");
+        const branch = await gitTaskBranch(row.worktreePath, row.branch, selectedBranch, row.base, "switch");
         validate(row.worktreePath);
         onPatch({ branch, prUrl: undefined });
       } else {
@@ -2262,23 +2262,20 @@ export function WorkstreamEditor({
             ...worktreeOptions,
           ]}
           onChange={(path) => {
-            const tree = bindableWorktrees(worktrees?.worktrees ?? []).find(
-              (entry) => entry.path === path,
-            );
-            const patch = {
-              worktreePath: path || undefined,
-              ...(tree?.branch ? { branch: tree.branch } : {}),
-              // Unbinding keeps the lane's probed PR alive — a lane without
-              // a worktree only tracks a PR when one's pinned.
-              ...(!path && row.pr?.url ? { prUrl: row.pr.url } : {}),
-            };
-            const claim = storeClaim(patch);
-            if (claim) {
-              setError(claim);
+            if (path) {
+              const tree = bindableWorktrees(worktrees?.worktrees ?? []).find(entry => entry.path === path);
+              if (!tree?.branch) {
+                setError("Working copy is unavailable. Refresh copies before retrying.");
+                return;
+              }
+              // Attachment needs the same live branch/path and ownership checks
+              // as the existing-copy offer after creation.
+              void applyBranch("create", path, tree.branch);
               return;
             }
             setError("");
-            onPatch(patch);
+            // Keep the probed PR when detaching its working copy.
+            onPatch({ worktreePath: undefined, ...(row.pr?.url ? { prUrl: row.pr.url } : {}) });
           }}
           placeholder="No worktree attached"
           searchPlaceholder="Search worktrees…"

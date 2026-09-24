@@ -23,7 +23,7 @@ vi.mock("../source-control/hooks/useProjectBranches", async original => ({
 }));
 const refresh = vi.fn();
 vi.mock("../source-control/hooks/useProjectWorktrees", () => ({
-  useProjectWorktrees: () => ({ data: { worktrees: [] }, refresh }),
+  useProjectWorktrees: () => ({ data: { worktrees: [{ path: "/existing-copy", branch: "existing", missing: false }] }, refresh }),
 }));
 let root: Root;
 let host: HTMLDivElement;
@@ -123,5 +123,22 @@ it("creates a named worktree from a chosen starting branch without changing the 
   await act(async () => button("Create separate worktree").click());
   expect(prepare).toHaveBeenCalledWith({ projectPath: "/repo", branch: "new-feature", base: "existing" });
   expect(patch).toHaveBeenCalledWith({ branch: "new-feature", worktreePath: "/new-worktree", prUrl: undefined });
+  expect(gitTaskBranch).not.toHaveBeenCalled();
+});
+
+it("validates a directly selected working copy before attaching and clears the previous PR", async () => {
+  prepare.mockRejectedValueOnce(new Error("Worktree is on changed, expected existing"));
+  await render();
+  const selectCopy = async () => {
+    await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Worktree:"]')!.click());
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find(b => b.textContent?.startsWith("existing —"))!.click());
+  };
+  await selectCopy();
+  expect(prepare).toHaveBeenCalledWith({ projectPath: "/repo", branch: "existing", base: "main", worktreePath: "/existing-copy" });
+  expect(patch).not.toHaveBeenCalled();
+  expect(document.querySelector('[role="alert"]')?.textContent).toContain("Worktree is on changed");
+  prepare.mockResolvedValueOnce("/existing-copy");
+  await selectCopy();
+  expect(patch).toHaveBeenCalledWith({ branch: "existing", worktreePath: "/existing-copy", prUrl: undefined });
   expect(gitTaskBranch).not.toHaveBeenCalled();
 });

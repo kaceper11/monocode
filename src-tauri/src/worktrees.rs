@@ -1005,6 +1005,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn creates_from_selected_local_and_remote_refs_without_changing_dirty_source() {
+        let repo = repo();
+        let root = repo.0.join("repo");
+        git_checked(&root, &["checkout", "-b", "source"]).unwrap();
+        git_checked(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "source commit",
+            ],
+        )
+        .unwrap();
+        let source = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        git_checked(&root, &["checkout", "main"]).unwrap();
+        std::fs::write(root.join("untracked.txt"), "keep").unwrap();
+        let before = git(&root, &["status", "--porcelain"]).unwrap();
+        let local = create(&root, "new-topic", "source", false).unwrap();
+        assert_eq!(
+            git(Path::new(&local.path), &["rev-parse", "HEAD"]).unwrap(),
+            source
+        );
+        git_checked(&root, &["remote", "add", "review", "."]).unwrap();
+        git_checked(
+            &root,
+            &["update-ref", "refs/remotes/review/topic", source.trim()],
+        )
+        .unwrap();
+        let remote = create(&root, "topic", "refs/remotes/review/topic", false).unwrap();
+        let path = Path::new(&remote.path);
+        assert_eq!(git(path, &["rev-parse", "HEAD"]).unwrap(), source);
+        assert_eq!(
+            git(path, &["rev-parse", "--symbolic-full-name", "@{upstream}"])
+                .unwrap()
+                .trim(),
+            "refs/remotes/review/topic"
+        );
+        assert_eq!(
+            git(&root, &["branch", "--show-current"]).unwrap().trim(),
+            "main"
+        );
+        assert_eq!(git(&root, &["status", "--porcelain"]).unwrap(), before);
+        assert_eq!(
+            std::fs::read_to_string(root.join("untracked.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
     fn parses_literal_paths_and_worktree_flags() {
         let trees = parse_worktrees("worktree /repo\0HEAD abc\0branch refs/heads/main\0\0worktree /a\nquoted\"path\0HEAD def\0detached\0locked reason\0prunable missing\0\0");
         assert!(trees[0].is_main);

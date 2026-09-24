@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.16] - 2026-09-24
+
+### Fixed
+
+- Validate the live working-copy path and branch before attaching it to a task, recheck task ownership, and clear the previous pull-request binding after a successful attachment.
+- Add regression coverage for stale attachment choices and native worktree creation from exact local and remote refs while preserving dirty source files.
+
+### Changed
+
+- Includes the worktree creation and Git-feedback improvements prepared for 0.3.15, whose release build was cancelled before publication.
+
 ## [0.3.15] - 2026-09-24
 
 ### Changed
