@@ -244,7 +244,7 @@ export function ExplorerMenu({
         }`}
       >
         <span className="min-w-0 flex-1">
-          <span className="block truncate">{item.label}</span>
+          <span className="block truncate leading-label">{item.label}</span>
           {item.description ? (
             <span className="mt-1 block text-[11px] leading-snug text-content/50">
               {item.description}

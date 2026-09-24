@@ -2725,7 +2725,7 @@ function BoardFilterRow({
       className="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] leading-none text-content/75 transition-colors hover:bg-content/5 hover:text-content focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent"
     >
       {icon}
-      <span className="min-w-0 flex-1 truncate">{label}</span>
+      <span className="min-w-0 flex-1 truncate leading-label">{label}</span>
       {checked ? (
         <Check className="size-3 shrink-0 text-accent" strokeWidth={2} />
       ) : null}

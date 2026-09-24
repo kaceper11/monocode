@@ -339,7 +339,7 @@ function ActionList({
               className="size-4 shrink-0 text-content/50"
               strokeWidth={1.75}
             />
-            <span className="min-w-0 flex-1 truncate">
+            <span className="min-w-0 flex-1 truncate leading-label">
               <MatchText
                 text={action.label}
                 positions={action.positions}
@@ -431,7 +431,7 @@ function FileList({
             <span className="shrink-0">
               <FileTypeIcon name={file.name} isDir={false} />
             </span>
-            <span className="min-w-0 flex-1 truncate">
+            <span className="min-w-0 flex-1 truncate leading-label">
               <MatchText
                 text={file.name}
                 positions={file.positions
@@ -441,7 +441,7 @@ function FileList({
               />
             </span>
             {dir ? (
-              <span className="min-w-0 max-w-[45%] truncate font-mono text-[11px] text-content/40">
+              <span className="min-w-0 max-w-[45%] truncate font-mono text-[11px] leading-label text-content/40">
                 <MatchText
                   text={dir}
                   positions={file.positions.filter((pos) => pos < slash)}

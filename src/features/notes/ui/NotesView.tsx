@@ -480,7 +480,7 @@ function NoteCard({
           {note.tags.slice(0, 3).map((tag) => (
             <span
               key={tag}
-              className="max-w-24 truncate rounded bg-content/8 px-1.5 py-0.5 text-[10px] leading-none text-content/55"
+              className="max-w-24 truncate rounded bg-content/8 px-1.5 py-0.5 text-[10px] leading-label text-content/55"
             >
               #{tag}
             </span>

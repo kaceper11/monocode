@@ -1445,7 +1445,7 @@ function BrowserBookmarksBar({
               title={fav.url}
             >
               <Globe className="size-3 shrink-0 text-content/40" strokeWidth={1.75} />
-              <span className="max-w-40 truncate">
+              <span className="max-w-40 truncate leading-label">
                 {fav.title || browserTabLabel(fav.url)}
               </span>
             </button>
