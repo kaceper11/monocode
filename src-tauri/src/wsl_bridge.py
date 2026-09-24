@@ -788,6 +788,33 @@ def handle(request):
         if not result.is_relative_to(root):
             raise ValueError("Write scope points outside the project")
         return str(result)
+    if op == "project_location":
+        def location_info(candidate):
+            meta = candidate.stat()
+            return {"path": str(candidate), "identity": f"unix:{meta.st_dev}:{meta.st_ino}"}
+
+        if path.is_dir():
+            return location_info(path)
+        identity = request.get("identity")
+        if not identity:
+            return None
+        try:
+            with os.scandir(path.parent) as entries:
+                for count, entry in enumerate(entries):
+                    if count >= MAX_FILES:
+                        raise ValueError("Project location search exceeds 20,000 entries")
+                    if not portable(entry.name):
+                        continue
+                    try:
+                        if entry.is_dir():
+                            candidate = location_info(Path(entry.path))
+                            if candidate["identity"] == identity:
+                                return candidate
+                    except OSError:
+                        continue
+        except FileNotFoundError:
+            pass
+        return None
     if op == "canonical_directory":
         result = path.resolve(strict=True)
         if not result.is_dir():

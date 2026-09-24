@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { invalidateHarnessAvailability } from "../../../integrations/harness/core/availability.ts";
 import { invalidateModelCatalogs } from "./models";
 import { pathKey, wslLocation, wslPath } from "../../../shared/lib/paths.ts";
-import { setWslStatus } from "./wslStatus";
+import { setWslStatus, wslStatusFor } from "./wslStatus";
 
 /** Long enough to keep the project dialog warm, short enough to notice a distro installed mid-session. */
 const DISTRIBUTIONS_TTL_MS = 30_000;
@@ -93,19 +93,27 @@ async function connectWslProjectRequest(path: string, refresh: boolean): Promise
   const host = location.distribution.toLowerCase();
   const request = Symbol();
   connectionRequests.set(host, request);
-  setWslStatus(location.distribution, { state: "connecting" });
   let connected: { distribution: string; path: string; generation?: number };
   try {
+    // Validating another folder on a live bridge is not a reconnect.
+    const alive = wslStatusFor(host).state === "connected" &&
+      await invoke<boolean>("wsl_connected", { distribution: location.distribution });
+    if (connectionRequests.get(host) === request && (!alive || refresh))
+      setWslStatus(location.distribution, { state: "connecting" });
     connected = await invoke<{
       distribution: string;
       path: string;
       generation?: number;
     }>("wsl_connect", refresh ? { ...location, refresh: true } : location);
   } catch (error) {
-    if (connectionRequests.get(host) === request) setWslStatus(
-      location.distribution,
-      { state: "error", error: String(error) },
-    );
+    // A missing folder must not take other projects on this distro offline.
+    const alive = await invoke<boolean>("wsl_connected", {
+      distribution: location.distribution,
+    }).catch(() => false);
+    if (connectionRequests.get(host) === request)
+      setWslStatus(location.distribution, alive === true
+        ? { state: "connected" }
+        : { state: "error", error: String(error) });
     if (connectionRequests.get(host) === request) connectionRequests.delete(host);
     throw error;
   }

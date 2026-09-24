@@ -7,6 +7,20 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn().mockResolvedValue(true)
 vi.mock("../model/wsl", () => ({ connectWslProject: connect }));
 vi.mock("../../../shared/ui/Popover.tsx", () => ({ Popover: ({ children }: { children: ReactNode }) => createElement("div", null, children) }));
 import { WslBadge } from "./WslBadge";
+import { invoke } from "@tauri-apps/api/core";
+import { setWslStatus, wslStatusFor } from "../model/wslStatus";
+
+it("does not overwrite a connection in progress with an offline badge probe", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  setWslStatus("ConnectingBadge", { state: "connecting" });
+  vi.mocked(invoke).mockClear();
+  const root = createRoot(document.createElement("div"));
+  try {
+    await act(async () => root.render(createElement(WslBadge, { cwd: "//wsl.localhost/ConnectingBadge/repo" })));
+    expect(invoke).not.toHaveBeenCalled();
+    expect(wslStatusFor("ConnectingBadge").state).toBe("connecting");
+  } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
+});
 
 it("shows canonical-path errors and abandons old checks when the project changes", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);

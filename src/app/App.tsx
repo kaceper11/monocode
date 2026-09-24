@@ -454,6 +454,8 @@ import {
 } from "../features/notes";
 import {
   claimDueAutomations,
+  automationWorkCwd,
+  connectAutomationWorkspace,
   recoverAutomationRuns,
   updateAutomationRun,
   type Automation,
@@ -6681,6 +6683,8 @@ export default function App({
       };
       try {
         const eventRun = run.trigger === "event";
+        // Background runs cannot depend on the visible session opening WSL.
+        await connectAutomationWorkspace(automationWorkCwd(automation));
         const linkedWorkItem =
           sourceWorkItem ?? linkedWorkItemFromAutomationEvent(run);
         let session =
@@ -6712,6 +6716,12 @@ export default function App({
               automation.runtimeMode,
               automation.modelSettings,
             ),
+            // Saved selections belong to the execution target, which may be
+            // an existing worktree with a different (or not yet loaded) catalog.
+            ...(wslLocation(automationWorkCwd(automation)) ? {
+              model: automation.model,
+              modelSettings: automation.modelSettings ?? {},
+            } : {}),
             title: eventRun
               ? HARNESS_LABEL[automation.harness]
               : formatSessionTitle(automation.harness, automation.name),

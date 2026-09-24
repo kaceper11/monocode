@@ -8,6 +8,7 @@ import { setWslStatus } from "../../features/sessions/model/wslStatus";
 import { useWslProjects } from "./useWslProjects";
 import { connectWslProject, invalidateWslDiscovery, wslDistributions, wslDistributionsPeek } from "../../features/sessions/model/wsl";
 import { pickFolder } from "../../platform/tauri/fs";
+import { WslConnectionStatus } from "../../features/sessions/ui/WslProjectDialog";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn().mockResolvedValue(false) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 vi.mock("../../platform/tauri/platform", () => ({
@@ -243,5 +244,52 @@ it("keeps recovered catalogs when a stale disconnect event arrives", async () =>
     const onDisconnect = vi.mocked(listen).mock.calls.find(([event]) => event === "wsl:disconnected")![1];
     await act(async () => onDisconnect({ event: "wsl:disconnected", id: 1, payload: "Recovered" }));
     expect(invalidateWslDiscovery).not.toHaveBeenCalled();
+  } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
+});
+
+it("keeps the content stable during warm project and session switches, but shows failures and reconnects", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  setWslStatus("Warm", { state: "connected" });
+  const select = vi.fn();
+  let hook!: ReturnType<typeof useWslProjects>;
+  let finish!: (path: string) => void;
+  let fail!: (error: Error) => void;
+  const banners: boolean[] = [];
+  vi.mocked(connectWslProject).mockReset().mockImplementation(() => new Promise((resolve, reject) => {
+    finish = resolve; fail = reject;
+  }));
+  function Fixture({ cwd, id }: { cwd: string; id: string }) {
+    hook = useWslProjects(cwd, select, id);
+    banners.push(Boolean(hook.wslOpening));
+    return createElement("div", null,
+      hook.wslOpening && createElement(WslConnectionStatus, {
+        opening: hook.wslOpening, onRetry: hook.retryOpening, onDismiss: hook.dismissOpening,
+      }),
+      createElement("div", { "data-board": "" }, "Board"));
+  }
+  const host = document.createElement("div");
+  const root = createRoot(host);
+  try {
+    const cwd = "//wsl.localhost/Warm/a";
+    await act(async () => root.render(createElement(Fixture, { cwd, id: "one" })));
+    const board = host.querySelector("[data-board]");
+    await act(async () => finish(cwd));
+    await act(async () => hook.onSelectProject("//wsl.localhost/Warm/b"));
+    await act(async () => finish("//wsl.localhost/Warm/b"));
+    await act(async () => root.render(createElement(Fixture, { cwd: "//wsl.localhost/Warm/b", id: "two" })));
+    expect(banners.every(value => !value)).toBe(true);
+    expect(host.querySelector("[data-board]")).toBe(board);
+    await act(async () => fail(new Error("folder missing")));
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain("folder missing");
+    await act(async () => hook.retryOpening());
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+    await act(async () => setWslStatus("Warm", { state: "connecting" }));
+    expect(host.querySelector('[role="status"]')?.textContent).toContain("Connecting to WSL");
+    await act(async () => {
+      setWslStatus("Warm", { state: "connected" });
+      finish("//wsl.localhost/Warm/b");
+    });
+    expect(host.querySelector('[role="status"]')).toBeNull();
+    expect(host.querySelector("[data-board]")).toBe(board);
   } finally { await act(async () => root.unmount()); vi.unstubAllGlobals(); }
 });

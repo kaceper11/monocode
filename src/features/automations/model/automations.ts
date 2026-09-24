@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { HarnessId, RuntimeMode } from "../../sessions/model/session";
+import { pathKey, wslLocation } from "../../../shared/lib/paths";
+import { connectWslProject } from "../../sessions/model/wsl";
 
 export const AUTOMATIONS_CHANGED = "monocode:automations-changed";
 const LOCAL_CHANGED = "monocode:automations-local-changed";
@@ -69,6 +71,20 @@ export type AutomationUpsert = Omit<
   | "createdAt"
   | "updatedAt"
 >;
+
+/** Fresh worktrees do not exist yet; discover against their source project. */
+export function automationWorkCwd(automation: Pick<Automation, "cwd" | "workspaceMode" | "worktreeCwd">): string {
+  return automation.workspaceMode === "existing" && automation.worktreeCwd
+    ? automation.worktreeCwd : automation.cwd;
+}
+
+/** Validate without moving the active conversation or retargeting saved work. */
+export async function connectAutomationWorkspace(cwd: string, signal?: AbortSignal): Promise<void> {
+  if (!wslLocation(cwd)) return;
+  const canonical = await connectWslProject(cwd, signal);
+  if (pathKey(canonical) !== pathKey(cwd))
+    throw new Error("This folder resolves to a different path. Select its canonical location before running the automation.");
+}
 
 export type AutomationRunTrigger = "scheduled" | "manual" | "event";
 

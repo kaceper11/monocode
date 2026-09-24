@@ -50,6 +50,8 @@ import {
   applyTriggers,
   automationScheduleLabel,
   automationTriggers,
+  automationWorkCwd,
+  connectAutomationWorkspace,
   createAutomationTrigger,
   createManualAutomationRun,
   deleteAutomation,
@@ -89,8 +91,12 @@ import { GITLAB_CHANGE_EVENT, gitlabConnected } from "../../inbox/model/gitlab";
 import { LAYER } from "../../../shared/lib/layers";
 import { LINEAR_CHANGE_EVENT, linearConnected } from "../../inbox/model/linear";
 import { JIRA_CHANGE_EVENT, jiraConnected, atlassianCapable } from "../../inbox/model/jira";
-import { defaultSessionChoice, modelsFor, resolveModel } from "../../sessions/model/models";
-import { projectKey, projectName } from "../../../shared/lib/paths";
+import { defaultSessionChoice, modelsFor, resolveModel, subscribeModels, getModelSnapshot, hasLiveCatalog } from "../../sessions/model/models";
+import { refreshHarnessCatalogs } from "../../../integrations/harness/core/registry";
+import { probeHarnessAvailability } from "../../../integrations/harness/core/availability";
+import { WslBadge } from "../../sessions/ui/WslBadge";
+import { useWslStatus } from "../../sessions/model/wslStatus";
+import { pathKey, projectKey, projectName, wslLocation } from "../../../shared/lib/paths";
 import { IS_MAC } from "../../../platform/tauri/platform";
 import { looksLikeProject, type RecentProject } from "../../projects/model/recents";
 import {
@@ -258,14 +264,16 @@ function AutomationsContent({
   const selected = automations.find((entry) => entry.id === selectedId) ?? null;
 
   const defaultDraftTarget = () => {
-    const preferred = defaultSessionChoice();
-    const harness = selected?.harness ?? preferred.harness;
-    const model =
-      (selected?.harness === harness ? selected.model : undefined) ??
-      modelsFor(harness)[0]?.id ??
-      preferred.model;
     const project =
       cwd && looksLikeProject(cwd) ? cwd : (recents[0]?.path ?? "~");
+    const preferred = defaultSessionChoice(project);
+    const harness = selected?.harness ?? preferred.harness;
+    const model =
+      (selected?.harness === harness && pathKey(automationWorkCwd(selected)) === pathKey(project)
+        ? selected.model : undefined) ??
+      (preferred.harness === harness ? preferred.model : undefined) ??
+      modelsFor(harness, project)[0]?.id ??
+      preferred.model;
     return { project, harness, model };
   };
 
@@ -494,7 +502,8 @@ function AutomationCard({
   const lastRun = automation.lastRunAt
     ? formatRelativeTime(new Date(automation.lastRunAt).toISOString())
     : null;
-  const model = resolveModel(automation.harness, automation.model);
+  useSyncExternalStore(subscribeModels, getModelSnapshot, getModelSnapshot);
+  const model = resolveModel(automation.harness, automation.model, automationWorkCwd(automation));
   return (
     <div
       className={`group rounded-md border px-2.5 py-2 ${
@@ -815,6 +824,34 @@ function AutomationEditor({
   onOpenSession: (sessionId: string) => void | Promise<void>;
 }) {
   const [tab, setTab] = useState<"settings" | "history">("settings");
+  const modelCwd = automationWorkCwd(draft);
+  useSyncExternalStore(subscribeModels, getModelSnapshot, getModelSnapshot);
+  const modelUnavailable = Boolean(wslLocation(modelCwd)) && hasLiveCatalog(draft.harness, modelCwd) &&
+    draft.model !== `${draft.harness}:default` &&
+    resolveModel(draft.harness, draft.model, modelCwd).id !== draft.model;
+  const wslStatus = useWslStatus(wslLocation(modelCwd)?.distribution);
+  const [connectionError, setConnectionError] = useState("");
+  const [validatedCwd, setValidatedCwd] = useState<string | null>(null);
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    setConnectionError("");
+    setValidatedCwd(null);
+    void connectAutomationWorkspace(modelCwd, controller.signal)
+      .then(() => {
+        if (controller.signal.aborted) return;
+        setValidatedCwd(modelCwd);
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) setConnectionError(String(error));
+      });
+    return () => controller.abort();
+  }, [modelCwd, connectionAttempt]);
+  useEffect(() => {
+    if (validatedCwd !== modelCwd || (wslLocation(modelCwd) && wslStatus.state !== "connected")) return;
+    void probeHarnessAvailability({ cwd: modelCwd });
+    void refreshHarnessCatalogs([draft.harness], modelCwd);
+  }, [modelCwd, draft.harness, wslStatus, validatedCwd]);
   const settingsTabId = useId();
   const historyTabId = useId();
   const tabPanelId = useId();
@@ -885,7 +922,7 @@ function AutomationEditor({
     draft.name.trim().length > 0 &&
     draft.prompt.trim().length > 0 &&
     looksLikeProject(draft.cwd) &&
-    draft.model.length > 0;
+    draft.model.length > 0 && !modelUnavailable;
   const [sessionFolders, setSessionFolders] = useState(() =>
     loadSessionFolders(draft.cwd),
   );
@@ -990,7 +1027,7 @@ function AutomationEditor({
                   <button
                     type="button"
                     onClick={onRun}
-                    disabled={running}
+                    disabled={running || modelUnavailable || Boolean(connectionError)}
                     className={ACTION_OUTLINE}
                   >
                     {running ? (
@@ -1031,9 +1068,11 @@ function AutomationEditor({
                 cwd={draft.cwd}
                 recents={recents}
                 onSelectProject={(cwd) =>
-                  onChange({ ...draft, cwd, sessionFolderId: "" })
+                  onChange({ ...draft, cwd, sessionFolderId: "", worktreeCwd: "",
+                    workspaceMode: draft.workspaceMode === "existing" ? "current" : draft.workspaceMode })
                 }
               />
+              <WslBadge cwd={modelCwd} compact />
               {onDelete ? (
                 <>
                   <span
@@ -1311,6 +1350,18 @@ function AutomationEditor({
 
             <section>
               <SectionTitle>Instructions</SectionTitle>
+              {modelUnavailable && (
+                <p role="alert" className="mt-2 text-[12px] text-content/75">
+                  The saved model ({draft.model}) is unavailable in this working copy. Choose a model before saving or running.
+                </p>
+              )}
+              {connectionError && (
+                <div role="alert" className="mt-2 flex items-center gap-2 text-[12px] text-content/75">
+                  <span>{connectionError}</span>
+                  <button type="button" className="shrink-0 rounded px-2 py-1 hover:bg-content/8"
+                    onClick={() => setConnectionAttempt(value => value + 1)}>Retry</button>
+                </div>
+              )}
               <div className="relative mt-3 rounded-md border border-content/10 bg-content/3 backdrop-blur-sm has-focus:border-content/20">
                 <PromptField
                   value={draft.prompt}
@@ -1322,6 +1373,7 @@ function AutomationEditor({
                   <div className="flex min-w-0 flex-1 items-center overflow-x-auto">
                     <div className="flex shrink-0 items-center gap-1">
                       <ModelPicker
+                        cwd={modelCwd}
                         harness={draft.harness}
                         model={draft.model}
                         values={draft.modelSettings}
@@ -1335,6 +1387,7 @@ function AutomationEditor({
                       />
                       {controlsBeside ? (
                         <ModelControlPills
+                          cwd={modelCwd}
                           harness={draft.harness}
                           model={draft.model}
                           values={draft.modelSettings}

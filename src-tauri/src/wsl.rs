@@ -713,6 +713,7 @@ impl Bridge {
                         | "files"
                         | "canonical"
                         | "canonical_directory"
+                        | "project_location"
                         | "home"
                         | "skill_entries"
                         | "terminal_resources"
@@ -1633,6 +1634,28 @@ def run(argv, cwd, input_bytes=None, timeout=25):
             .unwrap()
             .insert(unique.clone(), bridge);
         let root = Location::new(&unique, &directory.to_string_lossy()).unwrap();
+        let original = fs::create_path(root.identity(), "project before ż".into(), true).unwrap();
+        let first =
+            serde_json::to_value(fs::resolve_project_location(original.clone(), None).unwrap())
+                .unwrap();
+        let identity = first["identity"].as_str().unwrap().to_string();
+        assert!(identity.starts_with(&format!("wsl:{unique}:unix:")));
+        let moved = block_on(fs::rename_path(original.clone(), "project after ż".into())).unwrap();
+        let resolved = serde_json::to_value(
+            fs::resolve_project_location(original.clone(), Some(identity.clone())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved["path"], moved);
+        assert_eq!(resolved["identity"], identity);
+        assert!(fs::resolve_project_location(original.clone(), None)
+            .unwrap()
+            .is_none());
+        assert!(fs::resolve_project_location(
+            original,
+            Some(identity.replace(&unique, "other-distribution"))
+        )
+        .unwrap()
+        .is_none());
         let file = fs::create_path(root.identity(), "Zażółć file.txt".into(), false).unwrap();
         assert!(file.starts_with(&root.identity()));
         block_on(fs::write_text_file(file.clone(), "hello\r\n".into())).unwrap();

@@ -5,7 +5,7 @@ import { pickFolder } from "../../platform/tauri/fs";
 import { pathKey, wslLocation } from "../lib/paths";
 import { IS_WIN } from "../../platform/tauri/platform";
 import { connectWslProject, invalidateWslDiscovery, wslDistributions, wslDistributionsPeek } from "../../features/sessions/model/wsl";
-import { setWslStatus, wslStatusFor } from "../../features/sessions/model/wslStatus";
+import { setWslStatus, useWslStatus, wslStatusFor } from "../../features/sessions/model/wslStatus";
 
 /** Connect the selected execution host before entering upstream's project flow. */
 export function useWslProjects(
@@ -24,6 +24,7 @@ export function useWslProjects(
     /** Reconnect an attached session without opening or retargeting it. */
     attached?: boolean;
   } | null>(null);
+  const openingStatus = useWslStatus(wslLocation(wslOpening?.path ?? "")?.distribution);
   const wslOpenRequest = useRef<AbortController | null>(null);
   useEffect(() => () => wslOpenRequest.current?.abort(), []);
   const reconnectAttached = useCallback((path: string) => {
@@ -180,7 +181,9 @@ export function useWslProjects(
 
   return { onSelectProject, onSelectProjects, pickProject, wslPickerOpen,
     closePicker: () => setWslPickerOpen(false),
-    wslOpening,
+    // Keep warm path validation out of the layout; genuine connects and errors
+    // still expose progress, cancellation and recovery through the same banner.
+    wslOpening: wslOpening?.busy && openingStatus.state === "connected" ? null : wslOpening,
     retryOpening: () => {
       if (!wslOpening) return;
       if (wslOpening.attached) reconnectAttached(wslOpening.path);

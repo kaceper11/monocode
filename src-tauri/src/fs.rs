@@ -24,7 +24,7 @@ pub(crate) const MAX_TEXT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_ATTACHMENT_EMBED_BYTES: u64 = 20 * 1024 * 1024;
 pub(crate) const MAX_PREVIEW_BYTES: u64 = 25 * 1024 * 1024;
 
-#[derive(Serialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectLocation {
     path: String,
@@ -48,6 +48,18 @@ fn resolve_project_location_sync(
     path: &str,
     identity: Option<&str>,
 ) -> Result<Option<ProjectLocation>, String> {
+    if let Some(location) = wsl::location(path)? {
+        let prefix = format!("wsl:{}:", location.distribution.to_lowercase());
+        let mut result: Option<ProjectLocation> = wsl::files_request(
+            &location,
+            "project_location",
+            json!({"identity": identity.and_then(|value| value.strip_prefix(&prefix))}),
+        )?;
+        if let Some(result) = &mut result {
+            result.identity = format!("{prefix}{}", result.identity);
+        }
+        return Ok(result);
+    }
     let path = expand_home(path);
     if path.is_dir() {
         let identity = directory_identity(&path)?;

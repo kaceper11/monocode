@@ -34,6 +34,7 @@ export function WslBadge({
     // Probes take time; only publish when nothing fresher landed meanwhile
     // (a connect in flight or a finished one outranks an older probe).
     const before = wslStatusFor(location.distribution);
+    if (before.state === "connecting") return;
     void invoke<boolean>("wsl_connected", {
       distribution: location.distribution,
     })

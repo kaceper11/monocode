@@ -16,6 +16,8 @@ From Projects → Open project (or the existing File menu), Windows users choose
 
 The WSL badge beside project/composer identity opens connection details and Reconnect. Branch/worktree creation uses the existing branch controls and displays Linux destination paths. Files, Changes, search, terminals and agent chat keep their existing surfaces.
 
+Healthy project/session switches validate the folder without showing a reconnect banner. Automation model discovery uses the selected project or existing worktree's WSL catalog; background runs validate that target independently of the visible session. See the [2026-09-24 local audit](validation/wsl-audit-2026-09-24.md) for fixes, regression evidence and remaining live acceptance.
+
 Internal saved paths carry distribution identity. Linux filename case is retained. There is no session-schema migration, credential copying or Windows fallback. Existing native sessions stay native. Selecting a different distribution is an explicit project selection.
 
 ## Runtime and limits
@@ -33,7 +35,7 @@ Internal saved paths carry distribution identity. Linux filename case is retaine
 
 - **No live Windows/WSL result is claimed.** Distribution shutdown, Windows/ConPTY hangup/job control, concurrent native/WSL agents, credentials, approval recovery and Windows networking still need the scenarios below.
 - OpenCode's HTTP/SSE transport is explicitly unavailable for WSL. Use a stdio provider such as Claude or Codex. Native OpenCode remains available. WSL model discovery is scoped to the selected distribution; Windows-discovered catalogs are not evidence of Linux account/model availability. Linux CLI installation/authentication and provider-specific resume must be accepted live.
-- Claude installed-plugin registry skill discovery is not implemented for WSL; fixed project/user skill directories are supported.
+- Claude installed-plugin registry skill discovery uses Linux registry/config paths qualified into the selected distribution, alongside project/user skill directories. Live installed-plugin acceptance remains unverified.
 - Browsers open on Windows. MonoCode does not forward ports; localhost access depends on Windows/WSL networking configuration. Run Linux editors from the terminal. Reveal in Explorer uses an explicit WSL path, after Linux validation.
 - This is an app-open runtime. Normal cancellation attempts Linux cleanup; abrupt Windows termination, app crashes or descendants surviving a provider's ordinary exit may leave work requiring inspection inside Linux. Durable supervision is not supplied by this integration. Reconnect restores access, not a promise that an interrupted agent turn completed.
 
