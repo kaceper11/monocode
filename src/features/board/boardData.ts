@@ -21,6 +21,7 @@ import {
   linkedWorkItemFromInboxItem,
   linkedWorkItemInboxKey,
   sessionWorkItems,
+  workItemIdentity,
 } from "../sessions/model/sessionWorkItem";
 import type { LinkedSessionUpdate } from "../inbox/model/linkedSessionUpdates";
 import { boardStatusKey, type BoardProviderStatus } from "./boardStore";
@@ -211,6 +212,9 @@ export type WorkstreamStatus = {
 };
 
 export type BoardCard = {
+  /** Presentation-only hierarchy; underlying task records retain their owners. */
+  members?: BoardCard[];
+  relatedItems?: InboxItem[];
   /** Stable identity — provider work-item key, `session:<id>`, `local:<id>`,
    * `task:<id>`. */
   id: string;
@@ -806,6 +810,7 @@ function newItemCard(item: InboxItem): MutableCard {
       ? { attentionReason: item.attentionReason }
       : {}),
     item,
+    relatedItems: [item],
     sessions: [],
     hasUpdate: false,
     ciTotal: 0,
@@ -978,7 +983,13 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     }
   }
 
-  const taskLinks = (card: MutableCard) => card.task!.links.flatMap(link => sessionWorkItems({ linkedWorkItem: link }));
+  const sessionsById = new Map([...input.summaries.filter(s => !s.archived), ...input.sessions].map(s => [s.id, s]));
+  const taskLinks = (card: MutableCard) => {
+    const task = card.task!;
+    const ids = new Set([task.primarySessionId, ...task.workstreams.flatMap(ws => ws.sessionIds ?? [])]);
+    return [...task.links.flatMap(link => sessionWorkItems({ linkedWorkItem: link })),
+      ...[...ids].flatMap(id => id && sessionsById.has(id) ? sessionWorkItems(sessionsById.get(id)!) : [])];
+  };
   const tasksByItem = indexByWorkItem(taskCards, taskLinks);
 
   /** Fold a fetched item into its task card — refresh the ticket chip, put
@@ -991,11 +1002,14 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     workstreamId?: string,
   ): boolean => {
     if (via === "link") {
+      card.relatedItems ??= [];
+      if (!card.relatedItems.some(row => inboxItemKey(row) === inboxItemKey(item))) card.relatedItems.push(item);
       for (const link of taskLinks(card)) {
         if (!inboxItemMatchesLinkedWorkItem(item, link)) continue;
         const key = linkedWorkItemInboxKey(link);
         const index = card.tickets!.findIndex(ticket => ticket.key === key);
         if (index >= 0) card.tickets![index] = { ...ticketChipFromItem(item), key };
+        else card.tickets!.push({ ...ticketChipFromItem(item), key });
       }
       return true;
     }
@@ -1235,7 +1249,7 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     cards.set(card.id, card);
   }
 
-  return [...cards.values()].map((mutable) => {
+  const result = [...cards.values()].map((mutable) => {
     const card = toCard(mutable);
     // Non-task cards carry membership in the store's cardGroups map — tasks
     // already resolved theirs from `groupIds` in newTaskCard.
@@ -1245,6 +1259,91 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     }
     return card;
   });
+  return groupRelatedCards(result, input.items);
+}
+
+/** Stable parent identity includes connection scope, never a ticket number alone. */
+function hierarchyKey(item: InboxItem): string {
+  return JSON.stringify([item.account ?? "", workItemIdentity(item)]);
+}
+
+export function boardCardMembers(cards: readonly BoardCard[]): BoardCard[] {
+  return cards.flatMap(card => [card, ...(card.members ?? [])]);
+}
+
+function groupRelatedCards(cards: BoardCard[], items: readonly InboxItem[]): BoardCard[] {
+  const families = new Map<string, { parent: InboxItem; items: InboxItem[] }>();
+  const loaded = new Map(items.map(item => [hierarchyKey(item), item]));
+  const parentOf = (child: InboxItem): InboxItem | undefined => child.parent ? {
+    ...child.parent, parent: undefined, provider: child.provider, account: child.account,
+    site: child.site, projectPath: child.projectPath,
+  } : undefined;
+  const cyclic = (child: InboxItem) => {
+    const seen = new Set<string>();
+    let current: InboxItem | undefined = child;
+    while (current) {
+      const key = hierarchyKey(current);
+      if (seen.has(key)) return true;
+      seen.add(key);
+      const parent = parentOf(current);
+      current = parent ? loaded.get(hierarchyKey(parent)) : undefined;
+    }
+    return false;
+  };
+  for (const child of items) {
+    if (!child.parent || child.kind === "pr" || cyclic(child)) continue;
+    if ((child.parent.provider && child.parent.provider !== child.provider) ||
+        (child.parent.account && child.parent.account !== child.account) ||
+        (child.parent.site && child.parent.site !== child.site)) continue;
+    const parent: InboxItem = { ...child.parent, parent: undefined, provider: child.provider,
+      account: child.account, site: child.site, projectPath: child.projectPath };
+    if (!parent.url || parent.kind === "pr" || hierarchyKey(parent) === hierarchyKey(child)) continue;
+    const key = hierarchyKey(parent);
+    const family = families.get(key) ?? { parent, items: [parent] };
+    family.items.push(child); families.set(key, family);
+  }
+  // Two explicit local tasks for the same provider item also share one wrapper.
+  for (const item of items) {
+    const owners = cards.filter(card => card.task && card.relatedItems?.some(row => hierarchyKey(row) === hierarchyKey(item)));
+    if (owners.length > 1 && !item.parent && !families.has(hierarchyKey(item)))
+      families.set(hierarchyKey(item), { parent: item, items: [item] });
+  }
+  const consumed = new Set<string>();
+  const grouped: BoardCard[] = [];
+  for (const [key, family] of [...families].sort(([a], [b]) => a.localeCompare(b))) {
+    const keys = new Set(family.items.map(hierarchyKey));
+    const members = cards.filter(card => !consumed.has(card.id) && (
+      (card.relatedItems ?? (card.item ? [card.item] : [])).some(item => keys.has(hierarchyKey(item))) ||
+      card.task?.links.flatMap(link => sessionWorkItems({ linkedWorkItem: link })).some(link =>
+        family.items.some(item => inboxItemMatchesLinkedWorkItem(item, link)))
+    ));
+    if (!members.length) continue;
+    members.forEach(card => consumed.add(card.id));
+    // Keep missing parent context accessible, without pretending it matched the query.
+    if (!members.some(card => card.item && hierarchyKey(card.item) === key)) {
+      members.push(toCard(newItemCard({ ...family.parent, planningContextOnly: true })));
+    }
+    const tasks = members.filter(card => card.kind === "task");
+    const representative = tasks.length === 1 ? tasks[0] : toCard(newItemCard(family.parent));
+    const unique = <T,>(rows: T[], id: (row: T) => string) => [...new Map(rows.map(row => [id(row), row])).values()];
+    const workstreams = unique(members.flatMap(card => card.workstreams ?? []), row => row.id);
+    const states = members.map(card => card.derived);
+    grouped.push({ ...representative,
+      id: tasks.length === 1 ? representative.id : `hierarchy:${key}`,
+      members, relatedItems: unique(family.items, hierarchyKey),
+      tickets: unique([...members.flatMap(card => card.tickets ?? []), ...family.items.map(ticketChipFromItem)], row => row.key),
+      sessions: unique(members.flatMap(card => card.sessions), row => row.id), workstreams,
+      prs: unique(members.flatMap(card => card.prs ?? []), row => row.id),
+      groups: unique(members.flatMap(card => card.groups ?? []), row => row.id),
+      hasUpdate: members.some(card => card.hasUpdate),
+      ciTotal: workstreams.reduce((n, row) => n + row.ciTotal, 0),
+      ciFailing: workstreams.reduce((n, row) => n + row.ciFailing, 0),
+      ciRunning: workstreams.reduce((n, row) => n + row.ciRunning, 0),
+      updatedAt: Math.max(...members.map(card => card.updatedAt)),
+      derived: states.includes("review") ? "review" : states.includes("progress") ? "progress" : states.every(state => state === "done") ? "done" : "todo",
+    });
+  }
+  return [...cards.filter(card => !consumed.has(card.id)), ...grouped];
 }
 
 /** Column contents: pinned cards first (their placement order decides among

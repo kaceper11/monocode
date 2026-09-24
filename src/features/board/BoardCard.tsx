@@ -172,21 +172,21 @@ function CardMenu({
           onClick={run({ kind: "review-locally" })}
         />
       ) : null}
-      {card.kind === "item" && !anySession ? (
+      {card.kind === "item" && !anySession && !card.members ? (
         <MenuRow
           icon={Play}
           label={card.itemKind === "pr" ? "Create review" : "Create task"}
           onClick={run({ kind: "start" })}
         />
       ) : null}
-      {card.ciFailing > 0 && (anySession || card.task?.workstreams.length) ? (
+      {(!card.members || card.kind === "task") && card.ciFailing > 0 && (anySession || card.task?.workstreams.length) ? (
         <MenuRow
           icon={RefreshCw}
           label="Fix CI"
           onClick={run({ kind: "fix-ci" })}
         />
       ) : null}
-      {card.hasUpdate && (anySession || card.task?.workstreams.length) ? (
+      {(!card.members || card.kind === "task") && card.hasUpdate && (anySession || card.task?.workstreams.length) ? (
         <MenuRow
           icon={MessageSquare}
           label="Address updates"
@@ -301,9 +301,9 @@ export function BoardCardView({
   const chipGroups = (card.groups ?? []).filter(
     (group) => group.id !== inGroup,
   );
-  const showStart = card.kind === "item" && !anySession;
-  const showFixCi = card.ciFailing > 0 && !!(anySession || card.task?.workstreams.length);
-  const showUpdates = card.hasUpdate && !!(anySession || card.task?.workstreams.length);
+  const showStart = card.kind === "item" && !anySession && !card.members;
+  const showFixCi = (!card.members || card.kind === "task") && card.ciFailing > 0 && !!(anySession || card.task?.workstreams.length);
+  const showUpdates = (!card.members || card.kind === "task") && card.hasUpdate && !!(anySession || card.task?.workstreams.length);
   const hasActions =
     showStart || showFixCi || showUpdates || card.kind === "local";
   // Column age — surfaced at a glance; the card dims once it's idled past
@@ -343,7 +343,8 @@ export function BoardCardView({
           )
         )
           return;
-        onAction(card, { kind: "open-task" });
+        if (card.members && card.kind !== "task") setExpanded(value => !value);
+        else onAction(card, { kind: "open-task" });
       }}
       onKeyDown={(event) => {
         if (
@@ -351,7 +352,8 @@ export function BoardCardView({
           event.target === event.currentTarget
         ) {
           event.preventDefault();
-          onAction(card, { kind: "open-task" });
+          if (card.members && card.kind !== "task") setExpanded(value => !value);
+        else onAction(card, { kind: "open-task" });
         }
       }}
       className={`group relative min-w-0 cursor-grab rounded-xl border px-2.5 py-2 outline-none transition-opacity focus-visible:ring-1 focus-visible:ring-accent/60 ${groupWash} ${
@@ -442,7 +444,10 @@ export function BoardCardView({
                 manual={manual}
                 pinned={pinned}
                 anchor={menuAnchor}
-                onAction={onAction}
+                onAction={(target, action) => {
+                  if (action.kind === "open-task" && card.members && card.kind !== "task") setExpanded(true);
+                  else onAction(target, action);
+                }}
                 onClose={() => setMenuAnchor(null)}
               />
             ) : null}
@@ -450,7 +455,7 @@ export function BoardCardView({
         </span>
       </div>
 
-      <p className="mt-1 line-clamp-2 break-words text-[12px] leading-snug text-content/90">
+      <p className="mt-1.5 line-clamp-2 break-words text-[12px] font-medium leading-relaxed text-content/90">
         {card.title}
       </p>
       {(card.repo || card.projectPath) && card.kind !== "task" ? (
@@ -463,7 +468,7 @@ export function BoardCardView({
           <GroupChips card={card} groups={chipGroups} onAction={onAction} />
         </div>
       ) : null}
-      {card.kind === "task" ? (
+      {(card.kind === "task" || card.members) ? (
         <button
           type="button"
           aria-label={`Details for ${card.title}`}
@@ -472,7 +477,7 @@ export function BoardCardView({
           className="mt-1.5 flex w-full min-w-0 items-center gap-1 rounded py-1 text-left text-[11px] text-content/55 hover:bg-content/5 hover:text-content focus-visible:outline-accent"
         >
           <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
-            {card.workstreams?.length ?? 0} {card.workstreams?.length === 1 ? "repo" : "repos"} · {card.sessions.length} {card.sessions.length === 1 ? "agent" : "agents"}
+            {card.workstreams?.length ?? 0} {card.workstreams?.length === 1 ? "repo" : "repos"} · {card.sessions.length} {card.sessions.length === 1 ? "conversation" : "conversations"}
             {card.tickets?.length ? ` · ${card.tickets.length} ${card.tickets.length === 1 ? "ticket" : "tickets"}` : ""}
           </span>
           <ChevronRight className={`size-3 shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`} />
@@ -481,7 +486,7 @@ export function BoardCardView({
       {card.kind === "task" && card.workstreams?.some((row) => row.probeError) ? (
         <p className="mt-1 text-[10px] text-amber-700 dark:text-amber-300">Worktree needs attention</p>
       ) : null}
-      {card.kind === "task" && expanded ? (
+      {(card.kind === "task" || card.members) && expanded ? (
         <TaskMeta
           card={card}
           onOpenSession={(sessionId) =>
@@ -490,6 +495,11 @@ export function BoardCardView({
         />
       ) : null}
 
+      {card.members && expanded ? <div className="mt-2 flex min-w-0 flex-col gap-1 border-t border-content/10 pt-2">
+        {card.members.filter(member => member.id !== card.id).map(member => <button key={member.id} type="button" className="flex min-w-0 items-center gap-1 rounded px-1 py-1 text-left text-[11px] text-content/70 hover:bg-content/8" onClick={() => onAction(member, { kind: "open-task" })}>
+          <span className="shrink-0 text-content/40">{member.kind === "task" ? "Task" : member.identifier}</span><span className="min-w-0 truncate">{member.title}</span>
+        </button>)}
+      </div> : null}
       {lines.length ? (
         <div className="mt-1.5 flex flex-wrap items-center gap-1">
           {lines.slice(0, 3).map((line) => (
@@ -516,7 +526,7 @@ export function BoardCardView({
         </div>
       ) : null}
 
-      {card.sessions.length && card.kind !== "task" ? (
+      {card.sessions.length && card.kind !== "task" && !card.members ? (
         <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
           {card.sessions.slice(0, 3).map((session) => (
             <button
@@ -652,7 +662,7 @@ function TaskMeta({
   const workstreams = card.workstreams ?? [];
   const prs = card.prs ?? [];
   return (
-    <div className="mt-1 flex flex-col gap-1">
+    <div className="mt-2 flex flex-col gap-2 border-t border-content/8 pt-2">
       {tickets.length ? (
         <div className="flex min-w-0 flex-wrap items-center gap-1">
           {tickets.slice(0, 4).map((ticket) => (
@@ -684,7 +694,7 @@ function TaskMeta({
       {workstreams.map((row) => (
         <div
           key={row.id}
-          className="flex min-w-0 items-center gap-1.5 text-[11px] text-content/55"
+          className="grid min-w-0 grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-2 py-0.5 text-[11px] text-content/55"
         >
           {row.session ? (
             <button
@@ -702,24 +712,14 @@ function TaskMeta({
           ) : (
             <span
               aria-hidden
-              className="size-1.5 shrink-0 rounded-full bg-transparent ring-1 ring-content/15"
+              className="m-1 size-1.5 rounded-full bg-transparent ring-1 ring-content/15"
             />
           )}
-          <span className="shrink-0 max-w-24 truncate font-medium text-content/70">
-            {row.projectPath.split("/").filter(Boolean).pop() ??
-              row.projectPath}
+          <span className="min-w-0" title={`${row.projectPath} · ${row.branch}`}>
+            <span className="block truncate font-medium text-content/75">{row.projectPath.split(/[\\/]/).filter(Boolean).pop() ?? row.projectPath}</span>
+            <span className="block truncate font-mono text-[10px] text-content/40">{row.branch}</span>
           </span>
-          {row.sessionIds.length > 1 ? (
-            <span
-              className="shrink-0 text-[9px] text-content/40"
-              title={`${row.sessionIds.length} conversations`}
-            >
-              ×{row.sessionIds.length}
-            </span>
-          ) : null}
-          <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-content/40">
-            {row.branch}
-          </span>
+          <span className="flex items-center gap-1">
           {row.pr ? (
             <button
               type="button"
@@ -756,8 +756,17 @@ function TaskMeta({
               !
             </span>
           ) : null}
+          </span>
         </div>
       ))}
+      {card.sessions.length ? <div className="flex min-w-0 flex-col gap-0.5 border-t border-content/6 pt-1.5">
+        {card.sessions.slice(0, 3).map(session => <button key={session.id} type="button" onClick={() => onOpenSession(session.id)} className="flex min-w-0 items-center gap-2 rounded px-1 py-1 text-left text-[11px] text-content/60 hover:bg-content/5 hover:text-content">
+          <MessageSquare className="size-3 shrink-0 text-content/35" />
+          <span className="min-w-0 flex-1 truncate">{session.title}</span>
+          <span className="shrink-0 text-[10px] text-content/40">{session.needsInput ? "Needs input" : session.busy ? "Working" : session.live ? "Idle" : "Saved"}</span>
+        </button>)}
+        {card.sessions.length > 3 && <span className="px-1 text-[10px] text-content/40">+{card.sessions.length - 3} conversations in details</span>}
+      </div> : null}
       {prs.length ? (
         <div className="flex min-w-0 flex-wrap items-center gap-1">
           {prs.slice(0, 3).map((pr) => (

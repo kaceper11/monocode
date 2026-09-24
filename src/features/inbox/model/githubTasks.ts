@@ -63,6 +63,7 @@ export type GithubAssignee = {
 };
 
 export type GithubWorkItem = {
+  parent?: GithubWorkItem;
   kind: GithubTaskKind;
   number: number;
   title: string;
@@ -83,7 +84,8 @@ export type InboxProvider =
   | "jira"
   | "azuredevops";
 
-export type InboxItem = Omit<GithubWorkItem, "kind"> & {
+export type InboxItem = Omit<GithubWorkItem, "kind" | "parent"> & {
+  parent?: Omit<InboxItem, "parent" | "provider" | "projectPath"> & { provider?: InboxProvider; projectPath?: string };
   planningPeriods?: PlanningPeriod[];
   /** Period membership used to hydrate tasks, not a standalone relationship match. */
   planningContextOnly?: boolean;
@@ -965,6 +967,7 @@ async function fetchLinearInboxItems(query: InboxQuery): Promise<InboxItem[]> {
 
 function linearIssueToInboxItem(issue: LinearIssue): InboxItem {
   return {
+    ...(issue.parent ? { parent: linearIssueToInboxItem(issue.parent) } : {}),
     provider: "linear",
     kind: "linear",
     id: issue.id,
@@ -1014,6 +1017,7 @@ function gitlabWorkItemToInboxItem(
 ): InboxItem {
   return {
     ...item,
+    parent: item.parent ? gitlabWorkItemToInboxItem(item.parent, projectPath, item.parent.repo) : undefined,
     provider: "gitlab",
     repo: item.repo || repo,
     projectPath,
@@ -1027,6 +1031,7 @@ function azureDevOpsWorkItemToInboxItem(
 ): InboxItem {
   return {
     ...item,
+    parent: item.parent ? azureDevOpsWorkItemToInboxItem(item.parent, projectPath, item.parent.repo) : undefined,
     provider: "azuredevops",
     repo: item.repo || repo,
     projectPath,

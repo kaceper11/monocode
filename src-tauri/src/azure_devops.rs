@@ -52,6 +52,8 @@ pub struct AzureDevOpsAssignee {
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AzureDevOpsWorkItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Box<AzureDevOpsWorkItem>>,
     pub kind: String,
     pub number: i64,
     pub title: String,
@@ -769,6 +771,51 @@ pub(crate) fn azure_fetch_wit_batch(
         .and_then(Value::as_array)
         .ok_or_else(|| "Azure DevOps did not return work items".to_string())?;
     let mut items: Vec<AzureDevOpsWorkItem> = rows.iter().filter_map(parse_wit).collect();
+    // Fetch only direct execution parents; never climb PBI -> Feature -> Epic.
+    let parents: std::collections::HashMap<i64, i64> = rows
+        .iter()
+        .filter_map(|row| {
+            let fields = row.get("fields")?;
+            if fields.get("System.WorkItemType")?.as_str()? != "Task" {
+                return None;
+            }
+            Some((
+                row.get("id")?.as_i64()?,
+                fields.get("System.Parent")?.as_i64()?,
+            ))
+        })
+        .filter(|(child, parent)| *parent > 0 && child != parent)
+        .collect();
+    let mut by_id: std::collections::HashMap<_, _> = items
+        .iter()
+        .map(|item| (item.number, item.clone()))
+        .collect();
+    let missing: std::collections::HashSet<_> = parents
+        .values()
+        .filter(|id| !by_id.contains_key(id))
+        .copied()
+        .collect();
+    let missing: Vec<_> = missing.into_iter().collect();
+    for chunk in missing.chunks(100) {
+        let ids = chunk
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        // Missing permissions or deleted parents must not erase the child list.
+        if let Ok(response) = azure_get(config, &format!("/_apis/wit/workitems?ids={ids}&$expand=Links&errorPolicy=Omit&api-version={API_VERSION}")) {
+            if let Some(rows) = response.value["value"].as_array() {
+                for parent in rows.iter().filter_map(parse_wit) { by_id.insert(parent.number, parent); }
+            }
+        }
+    }
+    for item in &mut items {
+        item.parent = parents
+            .get(&item.number)
+            .and_then(|id| by_id.get(id))
+            .cloned()
+            .map(Box::new);
+    }
     items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(items)
 }
@@ -797,6 +844,7 @@ pub(crate) fn parse_pr(row: &Value, repo: &str, base_url: &str) -> Option<AzureD
     }
     let status = string_field(row, "status").unwrap_or_default();
     Some(AzureDevOpsWorkItem {
+        parent: None,
         kind: "pr".into(),
         number,
         title: string_field(row, "title").unwrap_or_default(),
@@ -933,6 +981,7 @@ fn parse_wit(row: &Value) -> Option<AzureDevOpsWorkItem> {
     let fields = row.get("fields")?;
     let project = string_field(fields, "System.TeamProject").unwrap_or_default();
     Some(AzureDevOpsWorkItem {
+        parent: None,
         kind: "issue".into(),
         number,
         title: string_field(fields, "System.Title").unwrap_or_default(),
@@ -2391,6 +2440,47 @@ mod tests {
             items[0].url,
             "https://dev.azure.com/acme/Cash/_workitems/edit/193"
         );
+    }
+
+    #[test]
+    fn fetches_missing_task_parent_without_climbing_the_feature_hierarchy() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = AzureDevOpsConfig {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "test".into(),
+        };
+        let server = std::thread::spawn(move || {
+            let mut requests = vec![];
+            for (id, kind, parent) in [(2, "Task", 1), (1, "Product Backlog Item", 100)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                requests.push(request);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let body=json!({"value":[{"id":id,"fields":{"System.Title":kind,"System.WorkItemType":kind,"System.Parent":parent},"_links":{"html":{"href":format!("https://dev.azure.com/acme/_workitems/edit/{id}")}}}]}).to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+            requests
+        });
+        let items = azure_fetch_wit_batch(&config, &[2]).unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(items.len(), 1);
+        let parent = items[0].parent.as_ref().unwrap();
+        assert_eq!(parent.number, 1);
+        assert!(parent.parent.is_none());
+        assert!(requests[1].contains("ids=1&"));
+        assert_eq!(requests.len(), 2);
     }
 
     #[test]

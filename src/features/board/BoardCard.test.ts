@@ -33,7 +33,7 @@ it("summarizes tasks and expands details without opening or dragging the card", 
     card, column: "todo", columns: [], manual: false, pinned: false,
     dragging: false, dropTarget: false, onAction, onDragStart,
   })));
-  expect(container.textContent).toContain("1 repo · 0 agents · 1 ticket");
+  expect(container.textContent).toContain("1 repo · 0 conversations · 1 ticket");
   expect(container.textContent).toContain("Worktree needs attention");
   expect(container.textContent).not.toContain("feature/checkout");
   expect(container.textContent).not.toContain("TASK-1");
@@ -62,4 +62,21 @@ it("keeps validation errors in the CI details with wrapping and the complete mes
   expect(alert.textContent).toBe(error);
   expect(alert.className).toContain("[overflow-wrap:anywhere]");
   expect(alert.className).toContain("whitespace-pre-wrap");
+});
+
+it("expands a family and opens the selected original task", async () => {
+  const onAction = vi.fn();
+  const first: BoardCard = { id: "task:first", kind: "task", title: "Frontend task", sessions: [], hasUpdate: false, ciTotal: 0, ciFailing: 0, ciRunning: 0, updatedAt: 0, derived: "todo" };
+  const second: BoardCard = { ...first, id: "task:second", title: "Backend task" };
+  const card: BoardCard = { ...first, id: "hierarchy:parent", kind: "item", title: "Parent story", members: [first, second] };
+  await act(async () => root.render(createElement(BoardCardView, {
+    card, column: "todo", columns: [], manual: false, pinned: false,
+    dragging: false, dropTarget: false, onAction,
+  })));
+  expect(container.textContent).not.toContain("Backend task");
+  await act(async () => container.querySelector<HTMLElement>('[data-board-card]')!.click());
+  expect(onAction).not.toHaveBeenCalled();
+  const child = [...container.querySelectorAll("button")].find(button => button.textContent?.includes("Backend task"))!;
+  await act(async () => child.click());
+  expect(onAction).toHaveBeenCalledExactlyOnceWith(second, { kind: "open-task" });
 });

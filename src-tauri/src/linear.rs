@@ -42,6 +42,8 @@ pub struct LinearAssignee {
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LinearIssue {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Box<LinearIssue>>,
     pub provider: String,
     pub kind: String,
     pub id: String,
@@ -245,6 +247,7 @@ pub(crate) const ISSUES_QUERY: &str = r#"
 query InboxIssues($first: Int!, $filter: IssueFilter) {
   issues(first: $first, filter: $filter, orderBy: updatedAt) {
     nodes {
+      parent { id identifier number title url updatedAt state { name type } team { id key name } project { id name } }
       id
       identifier
       number
@@ -455,6 +458,10 @@ fn parse_linear_issue(node: &Value) -> Option<LinearIssue> {
         .unwrap_or_default();
     let state = node.get("state");
     Some(LinearIssue {
+        parent: node
+            .get("parent")
+            .and_then(parse_linear_issue)
+            .map(Box::new),
         provider: "linear".into(),
         kind: "linear".into(),
         id,
@@ -948,5 +955,12 @@ mod tests {
             graphql_error_message(body).as_deref(),
             Some("Invalid token")
         );
+    }
+    #[test]
+    fn issue_list_carries_direct_parent_context() {
+        let data = json!({"issues":{"nodes":[{"id":"child","identifier":"ENG-2","number":2,"parent":{"id":"parent","identifier":"ENG-1","number":1,"title":"Story","url":"https://linear.app/team/issue/ENG-1"}}]}});
+        let issues = parse_linear_issues(&data).unwrap();
+        assert_eq!(issues[0].parent.as_ref().unwrap().id, "parent");
+        assert!(ISSUES_QUERY.contains("parent { id identifier"));
     }
 }

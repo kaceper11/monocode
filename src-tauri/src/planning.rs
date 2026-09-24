@@ -478,6 +478,10 @@ fn planning_items_for(
             for issue in &mut issues {
                 issue.account = c.account_id();
                 issue.site = c.site.clone();
+                if let Some(parent) = &mut issue.parent {
+                    parent.account = c.account_id();
+                    parent.site = c.site.clone();
+                }
             }
             issues
                 .into_iter()
@@ -590,8 +594,10 @@ fn planning_items_for(
                 if value.has_next_page {
                     next = Some((page + 1).to_string());
                 }
+                let mut items = gitlab::parse_work_items(&value.value, "issue", &repo)?;
+                gitlab::enrich_gitlab_parents(&c, &mut items);
                 entries.extend(
-                    gitlab::parse_work_items(&value.value, "issue", &repo)?
+                    items
                         .into_iter()
                         .map(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
                         .collect::<Result<Vec<_>, _>>()?,
@@ -626,7 +632,7 @@ fn github_period_items(
     cursor: &str,
     next: &mut Option<String>,
 ) -> Result<Vec<Value>, String> {
-    let query = r#"query($id:ID!,$after:String) { viewer { login } node(id:$id) { ... on ProjectV2 { items(first:100,after:$after) { pageInfo { hasNextPage endCursor } nodes { fieldValues(first:100) { pageInfo { hasNextPage } nodes { ... on ProjectV2ItemFieldIterationValue { iterationId field { ... on ProjectV2IterationField { id } } } } } content { __typename ... on Issue { number title url state updatedAt repository { nameWithOwner } author { login } assignees(first:100) { nodes { login } } } ... on PullRequest { number title url state updatedAt isDraft repository { nameWithOwner } author { login } assignees(first:100) { nodes { login } } reviewRequests(first:100) { nodes { requestedReviewer { ... on User { login } } } } } } } } } } }"#;
+    let query = r#"query($id:ID!,$after:String) { viewer { login } node(id:$id) { ... on ProjectV2 { items(first:100,after:$after) { pageInfo { hasNextPage endCursor } nodes { fieldValues(first:100) { pageInfo { hasNextPage } nodes { ... on ProjectV2ItemFieldIterationValue { iterationId field { ... on ProjectV2IterationField { id } } } } } content { __typename ... on Issue { parent { number title url state updatedAt repository { nameWithOwner } } number title url state updatedAt repository { nameWithOwner } author { login } assignees(first:100) { nodes { login } } } ... on PullRequest { number title url state updatedAt isDraft repository { nameWithOwner } author { login } assignees(first:100) { nodes { login } } reviewRequests(first:100) { nodes { requestedReviewer { ... on User { login } } } } } } } } } } }"#;
     let data = gh(
         &period.scope.cwd,
         query,
@@ -672,7 +678,15 @@ fn github_period_items(
         {
             continue;
         }
-        result.push(json!({"kind":kind,"number":item["number"],"title":item["title"],"url":item["url"],"state":text(item,"state").to_lowercase(),"updatedAt":item["updatedAt"],"repo":item["repository"]["nameWithOwner"],"assignees":rows(&item["assignees"]["nodes"]),"labels":[],"draft":item["isDraft"].as_bool().unwrap_or(false)}));
+        let parent = &item["parent"];
+        let parent = if parent["number"].as_i64().is_some() {
+            Some(
+                json!({"kind":"issue","number":parent["number"],"title":parent["title"],"url":parent["url"],"state":text(parent,"state").to_lowercase(),"updatedAt":parent["updatedAt"],"repo":parent["repository"]["nameWithOwner"],"labels":[],"assignees":[],"draft":false}),
+            )
+        } else {
+            None
+        };
+        result.push(json!({"parent":parent,"kind":kind,"number":item["number"],"title":item["title"],"url":item["url"],"state":text(item,"state").to_lowercase(),"updatedAt":item["updatedAt"],"repo":item["repository"]["nameWithOwner"],"assignees":rows(&item["assignees"]["nodes"]),"labels":[],"draft":item["isDraft"].as_bool().unwrap_or(false)}));
     }
     Ok(result)
 }

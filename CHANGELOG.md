@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.14] - 2026-09-24
+
+### Changed
+
+- Group related parent/child provider tickets and linked local tasks on the Board while preserving each task and its conversations.
+- Simplify task cards, repository details, worktree attachment and conversation selection. Keep unattached conversations in a collapsed Board tray.
+- Move per-repository and bulk Fetch/Pull actions into menus. Pull uses the tracked upstream with fast-forward-only and working-copy safeguards.
+- Include the WSL usage-routing fixes and Copilot/Muse quota support already merged into main.
+
+### Fixed
+
+- Scope Azure Pipelines history lookups to source and PR validation refs, newest first, while retaining partial results and explicit incomplete-evidence errors.
+- Align multi-repository card details and refresh branch lists after in-flight fetches.
+
+### Compatibility
+
+- No persistence schema changes or new dependencies. Existing task and session records are retained.
+- Authenticated provider and native Windows/WSL acceptance remain unverified.
+
 ## [0.3.13] - 2026-09-24
 
 ### Fixed

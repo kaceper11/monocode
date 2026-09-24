@@ -266,7 +266,7 @@ fn build_rows_for_ref(
         ""
     };
     let path = format!(
-        "/{}/_apis/build/builds?branchName={}&repositoryId={}&repositoryType=TfsGit{}&queryOrder=finishTimeDescending&$top=15&api-version={}",
+        "/{}/_apis/build/builds?branchName={}&repositoryId={}&repositoryType=TfsGit{}&queryOrder=queueTimeDescending&$top=15&api-version={}",
         encode_segment(project),
         encode_segment(branch_ref),
         encode_segment(repo_id),
@@ -282,12 +282,11 @@ fn build_rows_for_ref(
         .unwrap_or_default())
 }
 
-/// Builds in-flight have no `finishTime` — fall back so they still sort
-/// ahead of older finished runs.
+/// Queue order makes a new pending run supersede an older completed run.
 fn build_time(row: &Value) -> String {
-    string_field(row, "finishTime")
+    string_field(row, "queueTime")
         .or_else(|| string_field(row, "startTime"))
-        .or_else(|| string_field(row, "queueTime"))
+        .or_else(|| string_field(row, "finishTime"))
         .unwrap_or_default()
 }
 

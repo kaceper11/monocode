@@ -8,6 +8,7 @@ export type LinearTeam = {
 };
 
 export type LinearIssue = {
+  parent?: LinearIssue;
   provider: "linear";
   kind: "linear";
   id: string;

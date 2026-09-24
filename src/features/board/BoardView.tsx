@@ -87,6 +87,7 @@ import type { GitPrCheck } from "../../platform/tauri/fs";
 import {
   attentionScore,
   buildBoardCards,
+  boardCardMembers,
   boardLinkFromInboxItem,
   boardStatusOptions,
   matchesBoardStatuses,
@@ -663,7 +664,7 @@ export function BoardView({
       timeFilter === "all" ? 0 : timeFilterStart(timeFilter, Date.now());
     const selectedPeriods = new Set(periods.map(periodKey));
     const inPeriod = (item: InboxItem) => item.planningPeriods?.some(p => selectedPeriods.has(periodKey(p)));
-    return cards.filter((card) => {
+    const matches = (card: BoardCard) => {
       if (hiddenCards.has(card.id) || card.item?.planningContextOnly) return false;
       if (periods.length && !(card.item && inPeriod(card.item)) && !items.some(item => inPeriod(item) && (
         card.task?.links.some(link => [link, ...(link.additionalItems ?? [])].some(ref => inboxItemMatchesLinkedWorkItem(item, ref))) ||
@@ -735,7 +736,9 @@ export function BoardView({
       return tokens.every((token) =>
         fields.some((field) => field?.toLowerCase().includes(token)),
       );
-    });
+    };
+    return cards.filter(card => !hiddenCards.has(card.id) && !isCardSnoozed(card, board.snoozed[card.id]) &&
+      (card.members ? card.members.some(matches) : matches(card)));
   }, [
     cards, items, periods,
     search,
@@ -1109,7 +1112,7 @@ export function BoardView({
   const selectedCard = useMemo(
     () =>
       selectedCardId
-        ? (cards.find((card) => card.id === selectedCardId) ?? null)
+        ? (boardCardMembers(cards).find((card) => card.id === selectedCardId) ?? null)
         : null,
     [cards, selectedCardId],
   );
@@ -1909,6 +1912,7 @@ export function BoardView({
             onUpdateWorkstream={taskOpsHandlers.onUpdateWorkstream}
             onSubmitPrs={taskOpsHandlers.onSubmitPrs}
             onCleanupWorkstream={taskOpsHandlers.onCleanupWorkstream}
+            onGitDone={refreshNow}
           />
           ) : (
             <CardDetailsPanel
@@ -1971,13 +1975,12 @@ export function BoardView({
       {sessionCards.length ? (
         // Running agents not bound to any task — compact tray instead of
         // column cards, so the board stays about work items.
-        <div
-          aria-label="Unbound sessions"
-          className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-t border-stroke px-3 py-1.5"
+        <details
+          aria-label="Unattached conversations"
+          className="shrink-0 border-t border-stroke px-3 py-1.5"
         >
-          <span className="shrink-0 text-[10px] font-semibold uppercase tracking-[0.08em] text-content/40">
-            Sessions
-          </span>
+          <summary className="cursor-pointer text-[11px] text-content/45 hover:text-content">Unattached conversations · {sessionCards.reduce((count, card) => count + card.sessions.length, 0)}</summary>
+          <div className="mt-2 grid max-h-40 grid-cols-2 gap-1 overflow-y-auto sm:grid-cols-3 lg:grid-cols-4">
           {sessionCards.map((card) =>
             card.sessions.map((session) => (
               <button
@@ -2001,7 +2004,8 @@ export function BoardView({
               </button>
             )),
           )}
-        </div>
+          </div>
+        </details>
       ) : null}
       {filterAnchor ? (
         <BoardFiltersPopover
@@ -2035,6 +2039,7 @@ export function BoardView({
       ) : null}
       {taskDialogOpen ? (
         <NewTaskDialog
+          sessions={sessions}
           items={taskFromInbox ? [taskFromInbox, ...items.filter(item => inboxItemKey(item) !== inboxItemKey(taskFromInbox))] : items}
           recents={recents}
           lanes={boardLanes}

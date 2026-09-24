@@ -25,6 +25,8 @@ import { inboxItemRef, type InboxItem } from "../inbox/model/githubTasks";
 import { LAYER } from "../../shared/lib/layers";
 import { pathKey, prettyCwd, projectName } from "../../shared/lib/paths";
 import { sameProjectPath, type RecentProject } from "../projects/model/recents";
+import { TaskGitActions, useTaskGitBusy } from "./TaskGitActions";
+import type { Session } from "../sessions/model/session";
 import type { LinkedWorkItem } from "../sessions/model/session";
 import { linkedWorkItemInboxKey } from "../sessions/model/sessionWorkItem";
 import {
@@ -38,7 +40,7 @@ import {
   useProjectBranchesState,
 } from "../source-control/hooks/useProjectBranches";
 import { useProjectWorktrees } from "../source-control/hooks/useProjectWorktrees";
-import { gitBranches, gitRefreshBranches, type GitBranches } from "../../platform/tauri/fs";
+import { gitBranches, type GitBranches } from "../../platform/tauri/fs";
 import { boardTicketOptions, groupSwatch } from "./boardData";
 import {
   createGroup,
@@ -170,6 +172,7 @@ export function WorkstreamFields({
   onChange,
   tail,
   compact,
+  blocked = false,
   layer,
   excludeWorktreePaths,
   excludeBranches,
@@ -192,6 +195,7 @@ export function WorkstreamFields({
   ) => void;
   tail: ReactNode;
   compact?: boolean;
+  blocked?: boolean;
   defaultBranch?: string;
   /** Popover layer — pass `LAYER.dialogPopover` when inside a modal. */
   layer?: number;
@@ -203,18 +207,12 @@ export function WorkstreamFields({
   excludeBranches?: ReadonlySet<string>;
 }) {
   const branchListId = useId();
-  const [fetchingBranches, setFetchingBranches] = useState(false);
-  const [fetchError, setFetchError] = useState("");
-  const fetchBranches = async () => {
-    setFetchingBranches(true); setFetchError("");
-    try { await gitRefreshBranches(draft.projectPath); } catch (error) { setFetchError(String(error)); }
-    finally { setFetchingBranches(false); }
-  };
+  const gitBusy = useTaskGitBusy([draft.projectPath]);
   const { branches } = useProjectBranchesState(
     draft.projectPath,
     !!draft.projectPath,
   );
-  const { data: worktrees } = useProjectWorktrees(
+  const { data: worktrees, error: worktreeError, refresh: refreshWorktrees } = useProjectWorktrees(
     draft.projectPath,
     !!draft.projectPath,
   );
@@ -249,6 +247,7 @@ export function WorkstreamFields({
   const repoSelect = (
     <SearchableSelect
       variant={compact ? "row" : "field"}
+      disabled={gitBusy}
       label="Repository"
       value={draft.projectPath}
       options={projects}
@@ -271,7 +270,7 @@ export function WorkstreamFields({
       variant={compact ? "row" : "field"}
       label="Worktree"
       value={draft.worktreePath ?? ""}
-      options={[{ value: "", label: "New worktree" }, ...worktreeOptions]}
+      options={[{ value: "", label: "Create new worktree" }, ...worktreeOptions]}
       onChange={(path) => {
         const tree = worktrees?.worktrees.find((entry) => entry.path === path);
         onChange({
@@ -284,10 +283,10 @@ export function WorkstreamFields({
           branch: path ? (tree?.branch ?? draft.branch) : "",
         });
       }}
-      placeholder="New worktree"
+      placeholder="Create new worktree"
       searchPlaceholder="Search worktrees…"
       emptyLabel="No working copies"
-      disabled={!draft.projectPath}
+      disabled={!draft.projectPath || gitBusy}
       layer={layer}
       minMenuWidth={280}
     />
@@ -301,7 +300,7 @@ export function WorkstreamFields({
       onChange={(base) => onChange({ base })}
       placeholder="HEAD (current checkout)"
       searchPlaceholder="Branches…"
-      disabled={!draft.projectPath}
+      disabled={!draft.projectPath || gitBusy}
       layer={layer}
       minMenuWidth={260}
     />
@@ -317,7 +316,7 @@ export function WorkstreamFields({
       searchPlaceholder="Pick or type a branch…"
       creatable="New branch"
       exclude={excludeBranches}
-      disabled={!draft.projectPath || !!draft.worktreePath}
+      disabled={!draft.projectPath || gitBusy || !!draft.worktreePath}
       layer={layer}
       minMenuWidth={240}
     />
@@ -331,19 +330,17 @@ export function WorkstreamFields({
           <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">Repository{repoSelect}</div>
           <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">Working copy{worktreeSelect}</div>
           <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">Branch{branchSelect}</div>
-          <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">Start from{baseSelect}</div>
+          <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">{draft.worktreePath ? "PR base" : "Start from"}{baseSelect}</div>
         </div>
-        <button type="button" disabled={!draft.projectPath || fetchingBranches} onClick={() => void fetchBranches()}
-          className="mt-2 rounded px-1 py-1 text-[11px] text-content/45 hover:bg-content/5 hover:text-content disabled:opacity-40">{fetchingBranches ? "Fetching…" : "Fetch branches"}</button>
-        {fetchError && <p role="alert" className="text-[11px] text-red-400">{fetchError}</p>}
+        <TaskGitActions layer={layer} targets={[{ ...draft, blocked }]} />
+        <button type="button" className="text-[11px] text-content/50" disabled={!draft.projectPath || gitBusy} onClick={() => void refreshWorktrees()}>Refresh copies</button>
+        {worktreeError && <p role="alert" className="text-[11px] text-red-400">{worktreeError}</p>}
         {tail}
       </div>
     );
   }
   return (
     <div className="min-w-0 rounded-lg border border-content/10 p-3">
-      <button type="button" disabled={!draft.projectPath || fetchingBranches} onClick={() => void fetchBranches()} className="mb-2 text-[11px] text-accent">{fetchingBranches ? "Fetching…" : "Fetch branches"}</button>
-      {fetchError && <p role="alert" className="text-[11px] text-red-400">{fetchError}</p>}
       <div className="mb-3 flex min-w-0 items-center gap-2">
         <GitBranch className="size-4 shrink-0 text-content/45" />
         <div className="min-w-0 flex-1">
@@ -359,7 +356,10 @@ export function WorkstreamFields({
         </div>
         {tail}
       </div>
-      <div className="mb-2 min-w-0">{worktreeSelect}</div>
+      <div className="mb-2 min-w-0"><div className="mb-1 flex items-center justify-between text-[10px] text-content/50"><span>Working copy · attach existing or create new</span><button type="button" disabled={gitBusy} onClick={() => void refreshWorktrees()}>Refresh copies</button></div>{worktreeSelect}</div>
+      {draft.worktreePath && <p title={draft.worktreePath} className="mb-2 break-all text-[11px] text-content/55">{draft.branch} · {prettyCwd(draft.worktreePath)}</p>}
+      {draft.projectPath && !worktrees && !worktreeError && <p role="status" className="text-[11px] text-content/50">Loading working copies…</p>}
+      {worktreeError && <p role="alert" className="text-[11px] text-red-400">{worktreeError}</p>}
       <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2">
         {!draft.worktreePath && (
           <label className="min-w-0 text-[10px] text-content/50">
@@ -388,11 +388,13 @@ export function WorkstreamFields({
           {baseSelect}
         </div>
       </div>
+      <div className="mt-3 border-t border-content/6 pt-2"><TaskGitActions layer={layer} targets={[{ ...draft, blocked }]} /></div>
     </div>
   );
 }
 
 export function NewTaskDialog({
+  sessions = [],
   items,
   recents,
   lanes,
@@ -405,6 +407,7 @@ export function NewTaskDialog({
   onSubmit,
   onCancel,
 }: {
+  sessions?: readonly Session[];
   items: InboxItem[];
   recents: RecentProject[];
   /** All board lanes — claimed worktree paths and branches are excluded
@@ -444,6 +447,7 @@ export function NewTaskDialog({
   );
   // Group ids the task starts in; the list is read fresh on open and grows
   // when a new group is created inline.
+  const gitBusy = useTaskGitBusy(streams.map(stream => stream.projectPath));
   const [groups, setGroups] = useState(() => loadBoard().groups);
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
   const [newGroupName, setNewGroupName] = useState("");
@@ -491,7 +495,7 @@ export function NewTaskDialog({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (busy || submitting || !title.trim()) return;
+    if (busy || gitBusy || submitting || !title.trim()) return;
     setSubmitting(true);
     try {
       const links = [...selected.values()];
@@ -553,7 +557,7 @@ export function NewTaskDialog({
           <button
             type="button"
             onClick={onCancel}
-            disabled={busy || submitting}
+            disabled={busy || gitBusy || submitting}
             className="rounded-md px-3 py-1.5 text-[12px] text-content/70 outline-none hover:bg-content/8 focus-visible:ring-2 focus-visible:ring-accent/60 active:scale-[0.97] disabled:opacity-50"
           >
             Cancel
@@ -561,7 +565,7 @@ export function NewTaskDialog({
           <button
             type="submit"
             form={formId}
-            disabled={busy || submitting || !title.trim()}
+            disabled={busy || gitBusy || submitting || !title.trim()}
             className="inline-flex items-center gap-1.5 rounded-md bg-content px-3 py-1.5 text-[12px] font-medium text-background-base outline-none transition-transform focus-visible:ring-2 focus-visible:ring-accent active:scale-[0.97] disabled:opacity-40"
           >
             {busy || submitting ? (
@@ -607,9 +611,9 @@ export function NewTaskDialog({
           </p>
         ) : (
           <section className="min-w-0">
-            <h3 className="mb-2 text-[12px] font-medium text-content/75">
-              Repositories
-            </h3>
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h3 className="text-[12px] font-medium text-content/75">Repositories</h3>
+              <TaskGitActions all layer={LAYER.dialogPopover} disabled={busy} targets={streams.map(stream => ({ ...stream, blocked: sessions.some(session => session.busy && pathKey(session.worktreeCwd || session.cwd) === pathKey(stream.worktreePath ?? "")) }))} />
+            </div>
             <div className="flex min-w-0 flex-col gap-2">
               {streams.map((stream) => {
                 // Claims against this row's repo: board lanes own their
@@ -639,6 +643,7 @@ export function NewTaskDialog({
                   <WorkstreamFields
                     key={stream.key}
                     draft={stream}
+                    blocked={sessions.some(session => session.busy && pathKey(session.worktreeCwd || session.cwd) === pathKey(stream.worktreePath ?? ""))}
                     defaultBranch={suggestedBranch(title, [
                       ...selected.values(),
                     ])}

@@ -1549,6 +1549,8 @@ pub struct GitHubAssignee {
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHubWorkItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Box<GitHubWorkItem>>,
     pub kind: String,
     pub number: i64,
     pub title: String,
@@ -3127,7 +3129,9 @@ fn git_github_work_items_for(
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let json = gh_checked(root, &refs)?;
-    parse_github_work_items(&json, kind, &repo)
+    let mut items = parse_github_work_items(&json, kind, &repo)?;
+    enrich_github_parents(root, &mut items);
+    Ok(items)
 }
 
 fn git_github_work_item_for(
@@ -3155,7 +3159,46 @@ fn git_github_work_item_for(
         root,
         &[kind, "view", &number, "--repo", &repo, "--json", fields],
     )?;
-    parse_github_work_item(&json, kind, &repo)
+    let mut items = vec![parse_github_work_item(&json, kind, &repo)?];
+    enrich_github_parents(root, &mut items);
+    Ok(items.remove(0))
+}
+
+// Parent context is optional and bounded by the already selected issue list.
+fn enrich_github_parents(root: &Path, items: &mut [GitHubWorkItem]) {
+    for chunk in items.chunks_mut(25) {
+        let Some(first) = chunk.first() else {
+            continue;
+        };
+        if first.kind != "issue" {
+            continue;
+        }
+        let Ok((owner, name)) = split_github_repo(&first.repo) else {
+            continue;
+        };
+        let fields = chunk.iter().map(|item| format!("i{}: issue(number:{}) {{ parent {{ number title url state createdAt updatedAt repository {{ nameWithOwner }} }} }}", item.number, item.number)).collect::<Vec<_>>().join(" ");
+        let query = format!(
+            "query {{ repository(owner:{}, name:{}) {{ {fields} }} }}",
+            serde_json::to_string(&owner).unwrap_or_default(),
+            serde_json::to_string(&name).unwrap_or_default()
+        );
+        let Ok(json) = gh_checked(root, &["api", "graphql", "-f", &format!("query={query}")])
+        else {
+            continue;
+        };
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&json) else {
+            continue;
+        };
+        for item in chunk {
+            let parent = &data["data"]["repository"][format!("i{}", item.number)]["parent"];
+            let Some(repo) = parent["repository"]["nameWithOwner"].as_str() else {
+                continue;
+            };
+            item.parent = parse_github_work_item(&parent.to_string(), "issue", repo)
+                .ok()
+                .map(Box::new);
+        }
+    }
 }
 
 fn github_pr_action_args(repo: &str, number: i64, action: &str) -> Result<Vec<String>, String> {
@@ -4201,6 +4244,7 @@ fn parse_github_work_items(
     Ok(rows
         .into_iter()
         .map(|row| GitHubWorkItem {
+            parent: None,
             kind: kind.to_string(),
             number: row.number,
             title: row.title,

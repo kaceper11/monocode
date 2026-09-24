@@ -13,6 +13,7 @@ export type AzureDevOpsStatus = {
 };
 
 export type AzureDevOpsWorkItem = {
+  parent?: AzureDevOpsWorkItem;
   kind: AzureDevOpsKind;
   number: number;
   title: string;

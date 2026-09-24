@@ -250,7 +250,7 @@ it("retains prepared worktrees when primary session creation fails so it can be 
   expect(loadBoard().tasks[0]).toMatchObject({ title: "Retry task", workstreams: [{ worktreePath: "/repo-task" }] });
   expect(loadBoard().tasks[0].primarySessionId).toBeUndefined();
   expect(container.textContent).toContain("Agent unavailable");
-  expect(button("Create task session")).toBeDefined();
+  expect(button("New conversation")).toBeDefined();
 });
 
 it("can adopt an existing repository conversation as primary without starting another agent", async () => {
@@ -258,12 +258,11 @@ it("can adopt an existing repository conversation as primary without starting an
   const onSpawnSession = vi.fn();
   const onOpenSession = vi.fn();
   await renderBoard({ taskRequest: { id }, onSpawnSession, onOpenSession, sessions: [{ id: "existing", title: "Existing conversation", cwd: "/repo", worktreeCwd: "/repo-task", harness: "codex", model: "", modelSettings: {}, runtimeMode: "supervised", blocks: [] }] });
-  const select = container.querySelector<HTMLSelectElement>('[aria-label="Use existing task session"]')!;
-  await act(async () => { select.value = "existing"; select.dispatchEvent(new Event("change", { bubbles: true })); });
+  await click("Use for task");
   expect(loadBoard().tasks[0].primarySessionId).toBe("existing");
   expect(loadBoard().tasks[0].workstreams[0].sessionIds).toEqual(["existing"]);
   expect(onSpawnSession).not.toHaveBeenCalled();
-  await act(async () => button("Open task session").click());
+  await click("Open");
   expect(onOpenSession).toHaveBeenCalledWith("existing");
 });
 
@@ -383,4 +382,36 @@ it("waits for standalone Azure PR checks discovered after tickets finish", async
   await act(async () => finish());
   expect(container.textContent).not.toContain("Loading board…");
   expect(container.textContent).toContain(pr.title);
+});
+
+
+it("selects and opens a conversation without changing the primary task conversation", async () => {
+  const sessions = Array.from({ length: 12 }, (_, index) => ({ id: `session-${index}`, title: `Conversation ${index}`, cwd: "/repo", worktreeCwd: "/repo-task", harness: "codex" as const, model: "", modelSettings: {}, runtimeMode: "supervised" as const, blocks: [] }));
+  const id = addTask({ title: "Many conversations", links: [], primarySessionId: sessions[0].id, workstreams: [0, 1].map(index => ({ id: `repo-${index}`, projectPath: `/repo-${index}`, worktreePath: `/repo-task-${index}`, branch: "feature", base: "main", sessionIds: sessions.slice(index * 6, index * 6 + 6).map(session => session.id) })) })!;
+  const onOpenSession = vi.fn();
+  await renderBoard({ taskRequest: { id }, sessions, onOpenSession });
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label^="Conversation:"]')!.click());
+  const input = document.querySelector<HTMLInputElement>('[aria-label="Search conversations…"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "Conversation 11");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(document.querySelectorAll('[role="option"]')).toHaveLength(1);
+  await act(async () => document.querySelector<HTMLButtonElement>('[role="option"]')!.click());
+  await click("Open");
+  expect(onOpenSession).toHaveBeenCalledWith("session-11");
+  expect(loadBoard().tasks[0].primarySessionId).toBe("session-0");
+});
+
+
+it("keeps unattached conversations in a collapsed, clearly named Board tray", async () => {
+  const onOpenSession = vi.fn();
+  await renderBoard({ sessions: [{ id: "loose", title: "Unattached chat", cwd: "/repo", harness: "codex", model: "", modelSettings: {}, runtimeMode: "supervised", blocks: [] }], onOpenSession });
+  const tray = container.querySelector<HTMLDetailsElement>('details[aria-label="Unattached conversations"]')!;
+  expect(tray).not.toBeNull();
+  expect(tray.open).toBe(false);
+  expect(tray.querySelector("summary")?.textContent).toContain("Unattached conversations · 1");
+  await act(async () => tray.querySelector("summary")!.click());
+  await act(async () => tray.querySelector<HTMLButtonElement>("button")!.click());
+  expect(onOpenSession).toHaveBeenCalledWith("loose");
 });

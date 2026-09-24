@@ -14,6 +14,7 @@ type Entry = {
   state: ProjectBranchesState;
   listeners: Set<() => void>;
   inFlight: boolean;
+  invalidated: boolean;
   unsubscribeGit: (() => void) | null;
   onResume: (() => void) | null;
 };
@@ -49,6 +50,7 @@ function entryFor(cwd: string): Entry {
     state: PENDING,
     listeners: new Set(),
     inFlight: false,
+    invalidated: false,
     unsubscribeGit: null,
     onResume: null,
   };
@@ -67,7 +69,8 @@ function publish(entry: Entry, branches: GitBranches | null) {
 }
 
 async function load(entry: Entry, force = false) {
-  if (entry.inFlight || (!force && document.hidden)) return;
+  if (entry.inFlight) { entry.invalidated ||= force; return; }
+  if (!force && document.hidden) return;
   entry.inFlight = true;
   try {
     publish(entry, await gitBranches(entry.cwd));
@@ -75,6 +78,7 @@ async function load(entry: Entry, force = false) {
     publish(entry, null);
   } finally {
     entry.inFlight = false;
+    if (entry.invalidated) { entry.invalidated = false; void load(entry, true); }
   }
 }
 

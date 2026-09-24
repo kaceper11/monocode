@@ -312,8 +312,15 @@ fn request_bytes(
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_LIMIT: u32 = 40;
 const COMMENT_LIMIT: u32 = 50;
-pub(crate) const ISSUE_FIELDS: [&str; 6] = [
-    "summary", "status", "updated", "labels", "assignee", "project",
+pub(crate) const ISSUE_FIELDS: [&str; 8] = [
+    "summary",
+    "status",
+    "updated",
+    "labels",
+    "assignee",
+    "project",
+    "parent",
+    "issuetype",
 ];
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -341,6 +348,8 @@ pub struct JiraAssignee {
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct JiraIssue {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Box<JiraIssue>>,
     pub site: String,
     pub account: String,
     pub provider: String,
@@ -453,7 +462,10 @@ pub async fn jira_list_issues(
         let data = json!({ "issues": rows.into_iter().take(limit as usize).collect::<Vec<_>>() });
         require_config(&app, &config.site)?.require_account(&config.account_id())?;
         let mut issues = parse_jira_issues(&data, &config.site)?;
-        for issue in &mut issues { issue.site = config.site.clone(); issue.account = config.account_id(); }
+        for issue in &mut issues {
+            issue.site = config.site.clone(); issue.account = config.account_id();
+            if let Some(parent) = &mut issue.parent { parent.site = config.site.clone(); parent.account = config.account_id(); }
+        }
         Ok(issues)
     })
     .await
@@ -764,6 +776,18 @@ fn parse_jira_issue(node: &Value, site: &str) -> Option<JiraIssue> {
         .unwrap_or_default();
     let (assignee, avatar_url) = person_fields(fields.get("assignee"));
     Some(JiraIssue {
+        parent: if fields
+            .pointer("/issuetype/subtask")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            fields
+                .get("parent")
+                .and_then(|parent| parse_jira_issue(parent, site))
+                .map(Box::new)
+        } else {
+            None
+        },
         site: site.to_string(),
         account: String::new(),
         provider: "jira".into(),
@@ -1376,13 +1400,16 @@ pub async fn jira_issue_snapshot(
             &format!("issue/{id}"),
             &[(
                 "fields",
-                "summary,status,updated,project,labels,assignee".into(),
+                "summary,status,updated,project,labels,assignee,parent,issuetype".into(),
             )],
         )
         .map_err(String::from)?;
         require_config(&app, &site)?.require_account(&account_id)?;
         let mut issue = parse_jira_issue(&result, &config.site).ok_or("Invalid Jira issue")?;
         issue.account = config.account_id();
+        if let Some(parent) = &mut issue.parent {
+            parent.account = config.account_id();
+        }
         Ok(issue)
     })
     .await
@@ -1869,5 +1896,17 @@ mod compatibility_tests {
         }
         assert!(http_error(401).contains("Reconnect"));
         assert!(http_error(403).contains("permissions"));
+    }
+    #[test]
+    fn subtask_parent_context_stops_before_epics() {
+        let parent = json!({"id":"1","key":"APP-1","fields":{"summary":"Story","issuetype":{"subtask":false}}});
+        let child = json!({"id":"2","key":"APP-2","fields":{"summary":"Task","issuetype":{"subtask":true},"parent":parent}});
+        let parsed = parse_jira_issue(&child, "https://team.atlassian.net").unwrap();
+        assert_eq!(parsed.parent.unwrap().identifier, "APP-1");
+        let story = json!({"id":"3","key":"APP-3","fields":{"summary":"Story","issuetype":{"subtask":false},"parent":parent}});
+        assert!(parse_jira_issue(&story, "https://team.atlassian.net")
+            .unwrap()
+            .parent
+            .is_none());
     }
 }

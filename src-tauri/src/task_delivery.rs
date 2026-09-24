@@ -276,13 +276,13 @@ fn pr_snapshot(
     source: &Source,
     branch: &str,
     pin: Option<&str>,
-) -> Result<(Option<GitPr>, String, Vec<String>), String> {
+) -> Result<(Option<GitPr>, String, Vec<String>, String), String> {
     let number = pinned_number(pin, source)?;
     match source.provider {
         Provider::Github => {
             let pr = git_pr_status_for(root, pin)?;
             let Some(pr) = pr else {
-                return Ok((None, String::new(), vec![]));
+                return Ok((None, String::new(), vec![], branch.to_string()));
             };
             let value = github(
                 root,
@@ -290,7 +290,12 @@ fn pr_snapshot(
                 &format!("repos/{}/pulls/{}", source.repo, pr.number),
             )?;
             let head = pointer(&value, "/head/sha");
-            Ok((Some(pr), head, vec![field(&value, "merge_commit_sha")]))
+            Ok((
+                Some(pr),
+                head,
+                vec![field(&value, "merge_commit_sha")],
+                pointer(&value, "/head/ref"),
+            ))
         }
         Provider::Gitlab => {
             let config = gl::require_config(app)?;
@@ -320,7 +325,7 @@ fn pr_snapshot(
                     .find(|v| field(v, "state") == "opened")
                     .or_else(|| list.first())
                 else {
-                    return Ok((None, String::new(), vec![]));
+                    return Ok((None, String::new(), vec![], branch.to_string()));
                 };
                 gl::gitlab_get(&config, &format!("{endpoint}/{}", row["iid"]))?.value
             };
@@ -362,7 +367,7 @@ fn pr_snapshot(
                     validation.push(pipeline_sha);
                 }
             }
-            Ok((Some(pr), head, validation))
+            Ok((Some(pr), head, validation, field(&value, "source_branch")))
         }
         Provider::Azuredevops => {
             let config = az::require_config(app)?;
@@ -372,7 +377,7 @@ fn pr_snapshot(
                 None => az_board::pr_for_branch(&config, &project, &repo, branch)?,
             };
             let Some(value) = value else {
-                return Ok((None, String::new(), vec![]));
+                return Ok((None, String::new(), vec![], branch.to_string()));
             };
             let mut pr = az_board::pr_to_git_pr(&value, &project, &repo, &config)
                 .ok_or("Invalid Azure PR")?;
@@ -382,6 +387,7 @@ fn pr_snapshot(
                 Some(pr),
                 pointer(&value, "/lastMergeSourceCommit/commitId"),
                 vec![pointer(&value, "/lastMergeCommit/commitId")],
+                field(&value, "sourceRefName"),
             ))
         }
     }
@@ -496,6 +502,7 @@ fn azure_checks(
     binding: Option<&CiBinding>,
     sha: &str,
     validation: &[String],
+    refs: &[String],
 ) -> Result<(Vec<Check>, Option<String>), String> {
     let project = match binding.filter(|b| !b.project.is_empty()) {
         Some(b) => b.project.clone(),
@@ -524,66 +531,105 @@ fn azure_checks(
         String::new()
     };
     let endpoint = format!("/{}/_apis/build/builds?queryOrder=queueTimeDescending&$top=100{definition_filter}{repo_filter}&api-version=7.1",az::encode_segment(&project));
-    let mut seen = HashSet::new();
     let mut checks = vec![];
-    let result = (|| -> Result<(), String> {
-        let mut continuation = String::new();
-        let mut tokens = HashSet::new();
-        // ponytail: cap history at 1,000 builds; narrow the query if larger histories matter.
-        for _ in 0..10 {
-            let response = az::azure_get(config, &format!("{endpoint}{continuation}"))?;
-            for run in response.value["value"]
-                .as_array()
-                .ok_or("Invalid Azure build response")?
-            {
-                let revision = field(run, "sourceVersion");
-                let pr_source = pointer(run, "/triggerInfo/pr.sourceSha");
-                if !revision_matches(&revision, &pr_source, sha, validation) {
-                    continue;
+    let mut newest: std::collections::HashMap<i64, (String, i64, usize)> =
+        std::collections::HashMap::new();
+    let mut errors = vec![];
+    let queries = if refs.is_empty() {
+        vec![String::new()]
+    } else {
+        refs.to_vec()
+    };
+    for branch in queries {
+        let endpoint = if branch.is_empty() {
+            endpoint.clone()
+        } else {
+            format!("{endpoint}&branchName={}", az::encode_segment(&branch))
+        };
+        let mut seen = HashSet::new();
+        let result = (|| -> Result<(), String> {
+            let mut continuation = String::new();
+            let mut tokens = HashSet::new();
+            // ponytail: cap each scoped ref at 1,000 builds; preserve incomplete evidence beyond this bound.
+            for _ in 0..10 {
+                let response = az::azure_get(config, &format!("{endpoint}{continuation}"))?;
+                for run in response.value["value"]
+                    .as_array()
+                    .ok_or("Invalid Azure build response")?
+                {
+                    let revision = field(run, "sourceVersion");
+                    let pr_source = pointer(run, "/triggerInfo/pr.sourceSha");
+                    if !revision_matches(&revision, &pr_source, sha, validation) {
+                        continue;
+                    }
+                    let definition = run["definition"]["id"]
+                        .as_i64()
+                        .ok_or("Missing pipeline definition")?;
+                    if !seen.insert(definition) {
+                        continue;
+                    }
+                    let id = run["id"].as_i64().ok_or("Missing build ID")?;
+                    let state = if field(run, "result").is_empty() {
+                        field(run, "status")
+                    } else {
+                        field(run, "result")
+                    };
+                    let time = field(run, "queueTime");
+                    if newest
+                        .get(&definition)
+                        .is_some_and(|(old_time, old_id, _)| (old_time, *old_id) >= (&time, id))
+                    {
+                        continue;
+                    }
+                    let check = Check {
+                        id: format!("azure:{id}"),
+                        name: pointer(run, "/definition/name"),
+                        bucket: bucket(&state).into(),
+                        state,
+                        url: pointer(run, "/_links/web/href"),
+                        sha: revision,
+                        source: Source {
+                            repo: project.clone(),
+                            ..source.clone()
+                        },
+                        run_id: Some(id),
+                        job_id: None,
+                    };
+                    if let Some((_, _, index)) = newest.get(&definition) {
+                        checks[*index] = check;
+                        newest.insert(definition, (time, id, *index));
+                    } else {
+                        newest.insert(definition, (time, id, checks.len()));
+                        checks.push(check);
+                    }
                 }
-                let definition = run["definition"]["id"]
-                    .as_i64()
-                    .ok_or("Missing pipeline definition")?;
-                if !seen.insert(definition) {
-                    continue;
+                if (!ids.is_empty() && ids.iter().all(|id| seen.contains(id)))
+                    || response.continuation_token.is_none()
+                {
+                    return Ok(());
                 }
-                let id = run["id"].as_i64().ok_or("Missing build ID")?;
-                let state = if field(run, "result").is_empty() {
-                    field(run, "status")
-                } else {
-                    field(run, "result")
-                };
-                checks.push(Check {
-                    id: format!("azure:{id}"),
-                    name: pointer(run, "/definition/name"),
-                    bucket: bucket(&state).into(),
-                    state,
-                    url: pointer(run, "/_links/web/href"),
-                    sha: revision,
-                    source: Source {
-                        repo: project.clone(),
-                        ..source.clone()
-                    },
-                    run_id: Some(id),
-                    job_id: None,
-                });
+                let token = response.continuation_token.unwrap();
+                if !tokens.insert(token.clone()) {
+                    return Err(
+                        "Azure repeated a build continuation token — refresh or open Azure".into(),
+                    );
+                }
+                continuation = format!("&continuationToken={}", az::encode_segment(&token));
             }
-            if (!ids.is_empty() && ids.iter().all(|id| seen.contains(id)))
-                || response.continuation_token.is_none()
-            {
-                return Ok(());
-            }
-            let token = response.continuation_token.unwrap();
-            if !tokens.insert(token.clone()) {
-                return Err(
-                    "Azure repeated a build continuation token — refresh or open Azure".into(),
-                );
-            }
-            continuation = format!("&continuationToken={}", az::encode_segment(&token));
+            Err("Azure build history exceeds the lookup limit — narrow the selected pipelines or open Azure".into())
+        })();
+        if let Err(error) = result {
+            errors.push(error);
         }
-        Err("Azure build history exceeds the lookup limit — narrow the selected pipelines or open Azure".into())
-    })();
-    Ok((checks, result.err()))
+    }
+    Ok((
+        checks,
+        if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        },
+    ))
 }
 fn revision_matches(revision: &str, pr_source: &str, head: &str, validation: &[String]) -> bool {
     !head.is_empty()
@@ -696,7 +742,8 @@ pub async fn task_delivery_probe(
             .ok_or("Could not read checkout HEAD")?
             .trim()
             .to_string();
-        let (pr, head, validation) = pr_snapshot(&app, &root, &source, &branch, pr_url.as_deref())?;
+        let (pr, head, validation, source_branch) =
+            pr_snapshot(&app, &root, &source, &branch, pr_url.as_deref())?;
         if pr.is_some() && head.is_empty() {
             return Err("Provider did not return the PR head revision".into());
         }
@@ -735,12 +782,36 @@ pub async fn task_delivery_probe(
                     )
                     .map(|checks| (checks, None)),
                     Provider::Azuredevops => az::require_config(&app).and_then(|config| {
+                        let source_branch = if source_branch.is_empty() {
+                            &branch
+                        } else {
+                            &source_branch
+                        };
+                        let mut refs = vec![if source_branch.starts_with("refs/") {
+                            source_branch.clone()
+                        } else {
+                            format!("refs/heads/{source_branch}")
+                        }];
+                        // Native PR providers expose these validation refs to Azure Pipelines.
+                        if let Some(pr) = &pr {
+                            refs.push(match source.provider {
+                                Provider::Github | Provider::Azuredevops => {
+                                    format!("refs/pull/{}/merge", pr.number)
+                                }
+                                Provider::Gitlab => {
+                                    format!("refs/merge-requests/{}/merge", pr.number)
+                                }
+                            });
+                        }
+                        refs.sort();
+                        refs.dedup();
                         azure_checks(
                             &config,
                             &cs,
                             ci.as_ref(),
                             &head_sha,
                             if cs == source { &validation } else { &[] },
+                            &refs,
                         )
                     }),
                 };
@@ -944,6 +1015,13 @@ mod tests {
         pages: Vec<(u16, Option<String>, Value)>,
         ids: Vec<i64>,
     ) -> (Vec<Check>, Option<String>, Vec<String>) {
+        azure_ref_pages(pages, ids, &[])
+    }
+    fn azure_ref_pages(
+        pages: Vec<(u16, Option<String>, Value)>,
+        ids: Vec<i64>,
+        refs: &[String],
+    ) -> (Vec<Check>, Option<String>, Vec<String>) {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
         use std::time::{Duration, Instant};
@@ -1004,9 +1082,52 @@ mod tests {
             }
             requests
         });
-        let (checks, error) =
-            azure_checks(&config, &source, Some(&binding), "head", &["merge".into()]).unwrap();
+        let (checks, error) = azure_checks(
+            &config,
+            &source,
+            Some(&binding),
+            "head",
+            &["merge".into()],
+            refs,
+        )
+        .unwrap();
         (checks, error, server.join().unwrap())
+    }
+
+    #[test]
+    fn azure_ci_scopes_source_and_validation_refs_and_keeps_newest_run() {
+        let mut running = build(11, 7, "merge");
+        running["queueTime"] = json!("2026-09-24T12:00:00Z");
+        running["result"] = json!("");
+        running["status"] = json!("inProgress");
+        let mut old = build(10, 7, "head");
+        old["queueTime"] = json!("2026-09-24T11:00:00Z");
+        let (checks, error, requests) = azure_ref_pages(
+            vec![
+                (
+                    200,
+                    Some("thousands-of-older-builds".into()),
+                    json!({"value":[old]}),
+                ),
+                (
+                    200,
+                    Some("more-unrelated-history".into()),
+                    json!({"value":[running]}),
+                ),
+            ],
+            vec![7],
+            &["refs/heads/feature/a".into(), "refs/pull/42/merge".into()],
+        );
+        assert!(error.is_none());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].id, "azure:11");
+        assert_eq!(checks[0].bucket, "pending");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("branchName=refs%2Fheads%2Ffeature%2Fa"));
+        assert!(requests[1].contains("branchName=refs%2Fpull%2F42%2Fmerge"));
+        assert!(requests
+            .iter()
+            .all(|r| r.contains("queryOrder=queueTimeDescending") && r.contains("definitions=7")));
     }
 
     #[test]
@@ -1143,7 +1264,7 @@ mod tests {
                 }
                 requests
             });
-            let result = azure_checks(&config, &source, None, "head", &[]);
+            let result = azure_checks(&config, &source, None, "head", &[], &[]);
             let requests = server.join().unwrap();
             assert!(requests[0].contains("/My%20Project/_apis/git/repositories/web%20app?"));
             if valid {

@@ -241,7 +241,7 @@ function azureWorkItemIdentity(item: InboxItem | LinkedWorkItem): string {
   return item.url;
 }
 
-const workItemIdentity = (item: InboxItem | LinkedWorkItem) => JSON.stringify([
+export const workItemIdentity = (item: InboxItem | LinkedWorkItem) => JSON.stringify([
   providerOf(item),
   providerOf(item) === "github" ? [item.repo.trim().toLowerCase(), item.kind, item.number] : providerOf(item) === "azuredevops" ? azureWorkItemIdentity(item) : item.url,
 ]);

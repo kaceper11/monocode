@@ -2836,11 +2836,12 @@ describe("existing task ownership", () => {
     expect(buildBoardCards({ items: [issue], tasks: [task({ links: [{ ...link, account: undefined }] })], sessions: [], summaries: [] })).toHaveLength(2);
   });
 
-  it("retains two explicitly linked tasks without an extra automatic card", () => {
+  it("groups two explicitly linked tasks without merging their records", () => {
     const issue = item({ provider: "azuredevops", number: 42 });
     const link = boardLinkFromInboxItem(issue)!;
     const cards = buildBoardCards({ items: [issue], tasks: [task({ id: "task:a", links: [link] }), task({ id: "task:b", links: [link] })], sessions: [], summaries: [] });
-    expect(cards.map(card => card.id)).toEqual(["task:a", "task:b"]);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].members?.filter(card => card.task).map(card => card.id)).toEqual(["task:a", "task:b"]);
     expect(cards.every(card => card.tickets![0]!.state === "open")).toBe(true);
   });
 });
@@ -2863,4 +2864,48 @@ it("keeps the primary task conversation reachable without lane bindings or a loa
   expect(cards).toHaveLength(1);
   expect(cards[0].sessions).toHaveLength(1);
   expect(cards[0].sessions[0]).toMatchObject({ id: "lead", live: true, busy: true });
+});
+
+
+describe("provider parent groups", () => {
+  it.each(["azuredevops", "jira", "github", "gitlab", "linear"] as const)("groups %s siblings with missing parent context and preserves local task ownership", provider => {
+    const parent = item({ provider, number: 1, account: "one", title: "Story" });
+    const child = item({ provider, number: 2, account: "one", parent });
+    const sibling = item({ provider, number: 3, account: "one", parent });
+    const first = task({ id: "task:first", links: [boardLinkFromInboxItem(child)!] });
+    const second = task({ id: "task:second", links: [boardLinkFromInboxItem(sibling)!] });
+    const input = { items: [child, sibling], tasks: [first, second], sessions: [], summaries: [] };
+    const cards = buildBoardCards(input);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].title).toBe("Story");
+    expect(cards[0].members?.filter(card => card.task).map(card => card.task)).toEqual([first, second]);
+    expect(cards[0].members?.some(card => card.item?.number === 1)).toBe(true);
+    expect(buildBoardCards({ ...input, items: [sibling, child] })[0].id).toBe(cards[0].id);
+    expect(first.links).toHaveLength(1);
+  });
+  it("absorbs an issue linked only through the task's primary session", () => {
+    const issue = item({ provider: "azuredevops", number: 42 });
+    const cards = buildBoardCards({ items: [issue], tasks: [task({ links: [], primarySessionId: "lead" })],
+      sessions: [liveSession({ id: "lead", linkedWorkItem: boardLinkFromInboxItem(issue)! })], summaries: [] });
+    expect(cards).toHaveLength(1);
+    expect(cards[0].kind).toBe("task");
+    expect(cards[0].tickets?.[0].title).toBe(issue.title);
+  });
+  it("keeps one local task as representative and exposes matching child statuses", () => {
+    const parent = item({ provider: "azuredevops", number: 1, state: "New" });
+    const child = item({ provider: "azuredevops", number: 2, state: "Active", parent });
+    const cards = buildBoardCards({ items: [parent, child], tasks: [task({ links: [boardLinkFromInboxItem(parent)!] })], sessions: [], summaries: [] });
+    expect(cards).toHaveLength(1);
+    expect(cards[0].kind).toBe("task");
+    expect(cards[0].derived).toBe("progress");
+    expect(boardCardStatuses(cards[0])).toContainEqual({ provider: "azuredevops", state: "Active" });
+  });
+  it("does not collapse cycles, unrelated items or mismatched accounts", () => {
+    const a = item({ provider: "jira", number: 1, account: "one" });
+    const b = item({ provider: "jira", number: 2, account: "one" });
+    const input = { tasks: [], sessions: [], summaries: [] };
+    expect(buildBoardCards({ ...input, items: [{ ...a, parent: b }, { ...b, parent: a }] })).toHaveLength(2);
+    expect(buildBoardCards({ ...input, items: [{ ...a, parent: { ...b, account: "two" } }, b] })).toHaveLength(2);
+    expect(buildBoardCards({ ...input, items: [a, b] })).toHaveLength(2);
+  });
 });

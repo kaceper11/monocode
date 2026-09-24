@@ -43,6 +43,8 @@ pub struct GitlabAssignee {
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitlabWorkItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Box<GitlabWorkItem>>,
     pub kind: String,
     pub number: i64,
     pub title: String,
@@ -299,7 +301,9 @@ fn gitlab_list_work_items_for(
         encode_path_component(repo)
     );
     let response = gitlab_get(config, &path)?;
-    parse_work_items(&response.value, kind, repo)
+    let mut items = parse_work_items(&response.value, kind, repo)?;
+    enrich_gitlab_parents(config, &mut items);
+    Ok(items)
 }
 
 fn gitlab_list_todos_for(
@@ -316,7 +320,77 @@ fn gitlab_list_todos_for(
     let limit = limit.clamp(1, 100);
     let path = format!("/todos?state=pending&type={target_type}&per_page={limit}");
     let response = gitlab_get(config, &path)?;
-    parse_todos(&response.value, kind)
+    let mut items = parse_todos(&response.value, kind)?;
+    enrich_gitlab_parents(config, &mut items);
+    Ok(items)
+}
+
+pub(crate) fn enrich_gitlab_parents(config: &GitlabConfig, items: &mut [GitlabWorkItem]) {
+    let repos: std::collections::HashSet<_> = items
+        .iter()
+        .filter(|i| i.kind == "issue")
+        .map(|i| i.repo.clone())
+        .collect();
+    for repo in repos {
+        let ids: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == "issue" && i.repo == repo)
+            .map(|i| i.number)
+            .collect();
+        for chunk in ids.chunks(25) {
+            let fields = chunk.iter().map(|id| format!("i{id}: workItem(iid: \"{id}\") {{ widgets {{ ... on WorkItemWidgetHierarchy {{ parent {{ iid title webUrl state updatedAt workItemType {{ name }} }} }} }} }}")).collect::<Vec<_>>().join(" ");
+            let query =
+                format!("query($project: ID!) {{ project(fullPath: $project) {{ {fields} }} }}");
+            let url = format!("{}/api/graphql", config.url.trim_end_matches('/'));
+            let response = gitlab_agent()
+                .post(&url)
+                .set("PRIVATE-TOKEN", &config.token)
+                .set("User-Agent", USER_AGENT)
+                .set("Content-Type", "application/json")
+                .send_string(
+                    &serde_json::json!({"query": query, "variables": {"project": repo}})
+                        .to_string(),
+                );
+            let Ok(response) = read_gitlab_response(response) else {
+                continue;
+            };
+            for item in items
+                .iter_mut()
+                .filter(|i| i.kind == "issue" && i.repo == repo && chunk.contains(&i.number))
+            {
+                let Some(widgets) = response.value["data"]["project"][format!("i{}", item.number)]
+                    ["widgets"]
+                    .as_array()
+                else {
+                    continue;
+                };
+                let Some(parent) = widgets
+                    .iter()
+                    .map(|w| &w["parent"])
+                    .find(|p| p["workItemType"]["name"] == "Issue")
+                else {
+                    continue;
+                };
+                let Some(url) = parent["webUrl"].as_str() else {
+                    continue;
+                };
+                let Some(path) =
+                    url.strip_prefix(&format!("{}/", config.url.trim_end_matches('/')))
+                else {
+                    continue;
+                };
+                let Some((parent_repo, _)) = path.split_once("/-/") else {
+                    continue;
+                };
+                let number = parent["iid"]
+                    .as_str()
+                    .and_then(|id| id.parse::<i64>().ok())
+                    .or_else(|| parent["iid"].as_i64());
+                let row = serde_json::json!({"iid":number,"title":parent["title"],"web_url":url,"state":parent["state"],"updated_at":parent["updatedAt"]});
+                item.parent = parse_work_item(&row, "issue", parent_repo).map(Box::new);
+            }
+        }
+    }
 }
 
 fn gitlab_work_item_details_for(
@@ -555,6 +629,7 @@ fn parse_work_item(row: &Value, kind: &str, repo: &str) -> Option<GitlabWorkItem
             || title_lower.starts_with("draft:")
             || title_lower.starts_with("wip:"));
     Some(GitlabWorkItem {
+        parent: None,
         kind: kind.into(),
         number,
         title,
@@ -1466,6 +1541,7 @@ pub async fn gitlab_relationship_items(
                 items.push(item);
             }
         }
+        enrich_gitlab_parents(&config, &mut items);
         Ok(items)
     })
     .await

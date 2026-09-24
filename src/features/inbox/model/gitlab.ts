@@ -10,6 +10,7 @@ export type GitlabStatus = {
 };
 
 export type GitlabWorkItem = {
+  parent?: GitlabWorkItem;
   kind: GitlabKind;
   number: number;
   title: string;

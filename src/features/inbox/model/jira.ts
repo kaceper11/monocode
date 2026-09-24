@@ -11,6 +11,7 @@ export type JiraProject = {
 };
 
 export type JiraIssue = {
+  parent?: JiraIssue;
   site?: string;
   account?: string;
   provider: "jira";
