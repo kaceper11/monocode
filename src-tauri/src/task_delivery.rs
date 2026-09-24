@@ -491,13 +491,12 @@ fn gitlab_checks(
     Ok(checks)
 }
 fn azure_checks(
-    app: &AppHandle,
+    config: &az::AzureDevOpsConfig,
     source: &Source,
     binding: Option<&CiBinding>,
     sha: &str,
     validation: &[String],
 ) -> Result<Vec<Check>, String> {
-    let config = az::require_config(app)?;
     let project = match binding.filter(|b| !b.project.is_empty()) {
         Some(b) => b.project.clone(),
         None => az::split_repo(&source.repo)?.0,
@@ -519,12 +518,12 @@ fn azure_checks(
     let repo_filter = if binding.is_none_or(|b| b.project.is_empty()) {
         format!(
             "&repositoryId={}&repositoryType=TfsGit",
-            az::encode_segment(&az::split_repo(&source.repo)?.1)
+            az::repository_id(config, &project, &az::split_repo(&source.repo)?.1)?
         )
     } else {
         String::new()
     };
-    let response = az::azure_get(&config, &format!("/{}/_apis/build/builds?queryOrder=queueTimeDescending&$top=100{definition_filter}{repo_filter}&api-version=7.1",az::encode_segment(&project)))?;
+    let response = az::azure_get(config, &format!("/{}/_apis/build/builds?queryOrder=queueTimeDescending&$top=100{definition_filter}{repo_filter}&api-version=7.1",az::encode_segment(&project)))?;
     let mut seen = HashSet::new();
     let mut checks = vec![];
     for run in response.value["value"]
@@ -718,13 +717,15 @@ pub async fn task_delivery_probe(
                         &head_sha,
                         if cs == source { &validation } else { &[] },
                     ),
-                    Provider::Azuredevops => azure_checks(
-                        &app,
-                        &cs,
-                        ci.as_ref(),
-                        &head_sha,
-                        if cs == source { &validation } else { &[] },
-                    ),
+                    Provider::Azuredevops => az::require_config(&app).and_then(|config| {
+                        azure_checks(
+                            &config,
+                            &cs,
+                            ci.as_ref(),
+                            &head_sha,
+                            if cs == source { &validation } else { &[] },
+                        )
+                    }),
                 };
                 match result {
                     Ok(checks) => (checks, None, Some(cs)),
@@ -917,6 +918,73 @@ pub async fn task_delivery_log(app: AppHandle, cwd: String, check: Check) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn azure_ci_resolves_repository_names_before_querying_builds() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let guid = "12345678-1234-1234-1234-123456789abc";
+        for repository in [json!({ "id": guid }), json!({}), json!({ "id": "web app" })] {
+            let valid = repository["id"] == guid;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let config = az::AzureDevOpsConfig {
+                url: format!("http://{}", listener.local_addr().unwrap()),
+                token: "test-token".into(),
+            };
+            let source = Source {
+                provider: Provider::Azuredevops,
+                repo: "My Project/web app".into(),
+                host: config.url.clone(),
+                account: "test".into(),
+            };
+            let server = std::thread::spawn(move || {
+                let mut requests = vec![];
+                let mut responses = vec![repository];
+                if valid {
+                    responses.push(json!({ "value": [{
+                        "id": 42, "sourceVersion": "head", "result": "succeeded",
+                        "definition": { "id": 7, "name": "Build" }
+                    }] }));
+                }
+                for body in responses {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request = String::new();
+                    reader.read_line(&mut request).unwrap();
+                    requests.push(request);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let body = body.to_string();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                }
+                requests
+            });
+            let result = azure_checks(&config, &source, None, "head", &[]);
+            let requests = server.join().unwrap();
+            assert!(requests[0].contains("/My%20Project/_apis/git/repositories/web%20app?"));
+            if valid {
+                assert!(requests[1].contains(&format!("repositoryId={guid}&repositoryType=TfsGit")));
+                let checks = result.unwrap();
+                assert_eq!(checks.len(), 1);
+                assert_eq!(checks[0].bucket, "pass");
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "Azure DevOps did not return a valid repository GUID"
+                );
+            }
+        }
+    }
+
     #[test]
     fn log_excerpts_are_bounded_and_action_links_are_scoped() {
         let log = excerpt("é".repeat(40_000));

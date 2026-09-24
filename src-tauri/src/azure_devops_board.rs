@@ -14,7 +14,8 @@ use tauri::AppHandle;
 use crate::azure_devops::{
     azure_devops_repo_for, azure_get, azure_request_json, encode_segment, match_remote,
     parse_azure_remote, parse_pr, percent_decode, pr_web_url, read_config, remote_urls,
-    require_config, short_ref, split_repo, string_field, AzureDevOpsConfig, API_VERSION,
+    repository_id, require_config, short_ref, split_repo, string_field, AzureDevOpsConfig,
+    API_VERSION,
 };
 use crate::fs::{expand_home, git_branch, GitPr, GitPrCheck};
 
@@ -255,7 +256,7 @@ fn bucket_for_build(status: &str, result: &str) -> &'static str {
 fn build_rows_for_ref(
     config: &AzureDevOpsConfig,
     project: &str,
-    repo: &str,
+    repo_id: &str,
     branch_ref: &str,
     pr_validation: bool,
 ) -> Result<Vec<Value>, String> {
@@ -268,7 +269,7 @@ fn build_rows_for_ref(
         "/{}/_apis/build/builds?branchName={}&repositoryId={}&repositoryType=TfsGit{}&queryOrder=finishTimeDescending&$top=15&api-version={}",
         encode_segment(project),
         encode_segment(branch_ref),
-        encode_segment(repo),
+        encode_segment(repo_id),
         reason,
         API_VERSION
     );
@@ -321,14 +322,17 @@ fn checks_for_branch(
     branch: &str,
     pr: Option<i64>,
 ) -> Vec<GitPrCheck> {
+    let Ok(repo_id) = repository_id(config, project, repo) else {
+        return vec![];
+    };
     let mut rows =
-        build_rows_for_ref(config, project, repo, &ref_name(branch), false).unwrap_or_default();
+        build_rows_for_ref(config, project, &repo_id, &ref_name(branch), false).unwrap_or_default();
     if let Some(id) = pr {
         rows.extend(
             build_rows_for_ref(
                 config,
                 project,
-                repo,
+                &repo_id,
                 &format!("refs/pull/{id}/merge"),
                 true,
             )

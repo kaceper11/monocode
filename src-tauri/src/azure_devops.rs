@@ -1606,6 +1606,26 @@ pub(crate) fn split_repo(repo: &str) -> Result<(String, String), String> {
     Ok((project.to_string(), name.to_string()))
 }
 
+/// Git endpoints accept names, but TfsGit build filters require the repository GUID.
+pub(crate) fn repository_id(
+    config: &AzureDevOpsConfig,
+    project: &str,
+    repo: &str,
+) -> Result<String, String> {
+    let response = azure_get(
+        config,
+        &format!(
+            "/{}/_apis/git/repositories/{}?api-version={API_VERSION}",
+            encode_segment(project),
+            encode_segment(repo),
+        ),
+    )?;
+    string_field(&response.value, "id")
+        .and_then(|id| uuid::Uuid::parse_str(&id).ok())
+        .map(|id| id.to_string())
+        .ok_or_else(|| "Azure DevOps did not return a valid repository GUID".into())
+}
+
 fn validate_repo(repo: &str) -> Result<String, String> {
     let repo = repo.trim();
     let parts: Vec<&str> = repo.split('/').collect();
