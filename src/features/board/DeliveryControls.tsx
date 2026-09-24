@@ -100,7 +100,9 @@ export function CiBadge({
         ? CircleDashed
         : appearance.icon;
   const tone = error || !states.length ? "text-content/45" : appearance.tone;
-  const summaryLabel = status ? ciLabel(checks, error) : "CI loading…";
+  const summaryLabel = status?.ciError && checks.length
+    ? "CI incomplete"
+    : status ? ciLabel(checks, error) : "CI loading…";
   return (
     <>
       <button

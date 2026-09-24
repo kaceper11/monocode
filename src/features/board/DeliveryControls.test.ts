@@ -5,7 +5,7 @@ import { expect, it, vi } from "vitest";
 import { CiBadge } from "./DeliveryControls";
 import type { WorkstreamStatus } from "./boardData";
 
-it("shows failed checks above running ones and opens their details", async () => {
+it.each(["stale", "partial"])("shows check details but blocks repair for %s evidence", async (reason) => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const host = document.createElement("div");
   document.body.append(host);
@@ -41,14 +41,17 @@ it("shows failed checks above running ones and opens their details", async () =>
     await act(async () =>
       root.render(
         createElement(CiBadge, {
-          status: { ...status, fetchedAt: Date.now() - 90_000 },
+          status: reason === "stale"
+            ? { ...status, fetchedAt: Date.now() - 90_000 }
+            : { ...status, ciError: "Azure build history exceeds the lookup limit" },
           onFix,
         }),
       ),
     );
-    expect(trigger.textContent).toContain("CI unavailable");
+    expect(trigger.textContent).toContain(reason === "stale" ? "CI unavailable" : "CI incomplete");
     await act(async () => trigger.click());
     expect(document.body.textContent).not.toContain("Fix CI with an agent");
+    expect(document.querySelector('[aria-label="Open Tests"]')).not.toBeNull();
   } finally {
     act(() => root.unmount());
     host.remove();

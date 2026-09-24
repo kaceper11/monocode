@@ -1,7 +1,7 @@
 import { CiBadge, DeliverySettings } from "./DeliveryControls";
 import type { HandoffKind } from "./AgentHandoffDialog";
 import { PROVIDER_NAMES, type SendToSession } from "./delivery";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { InboxProviderMark } from "../inbox/ui/InboxProviderMark";
 import { Popover } from "../../shared/ui/Popover";
@@ -1403,6 +1403,7 @@ export function TaskDetailsPanel({
                 anchor={editAt.anchor}
                 row={editRow}
                 lanes={lanes}
+                onPrepareWorktree={onPrepareWorktree}
                 busy={busyAction === `cleanup:${editRow.id}` || card.sessions.some(session => session.busy)}
                 onPatch={(patch) =>
                   updateTask(task.id, (current) => ({
@@ -2169,14 +2170,15 @@ function WorkstreamCard({
 }
 
 /** Lane editor — rebind an existing worktree, retarget branch/base, or drop
- * the lane's worktree. Picks apply immediately; no save step. */
-function WorkstreamEditor({
+ * the lane's worktree. Branch picks wait for an explicit checkout action. */
+export function WorkstreamEditor({
   anchor,
   row,
   lanes,
   busy,
   onPatch,
   onRemoveWorktree,
+  onPrepareWorktree,
   onClose,
 }: {
   anchor: HTMLElement;
@@ -2190,6 +2192,7 @@ function WorkstreamEditor({
       Pick<TaskWorkstream, "branch" | "base" | "worktreePath" | "prUrl">
     >,
   ) => void;
+  onPrepareWorktree: (spec: NewTaskSpec["workstreams"][number]) => Promise<string>;
   onRemoveWorktree: () => Promise<unknown>;
   onClose: () => void;
 }) {
@@ -2199,6 +2202,16 @@ function WorkstreamEditor({
     true,
   );
   const [branchBusy, setBranchBusy] = useState(false);
+  const [targetBranch, setTargetBranch] = useState<string>();
+  const [bindPath, setBindPath] = useState<string>();
+  const inFlight = useRef(false);
+  const blocked = busy || branchBusy || row.sessions.some(session => session.busy);
+  const blockedRef = useRef(busy);
+  blockedRef.current = busy || row.sessions.some(session => session.busy);
+  useEffect(() => {
+    setTargetBranch(undefined);
+    setBindPath(undefined);
+  }, [row.branch, row.worktreePath]);
   const [armed, setArmed] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [error, setError] = useState("");
@@ -2279,6 +2292,66 @@ function WorkstreamEditor({
     }
     return "";
   };
+  const applyBranch = async (action: "switch" | "create", existingPath?: string) => {
+    if (!targetBranch || inFlight.current || blocked) return;
+    const choice = taskBranchChoice(targetBranch);
+    let preparedPath: string | undefined;
+    const validate = (path?: string) => {
+      const current = loadBoard().tasks.flatMap(task => task.workstreams).find(ws => ws.id === row.id);
+      if (!current || current.branch !== row.branch || current.base !== row.base ||
+          current.worktreePath !== row.worktreePath || !sameProjectPath(current.projectPath, row.projectPath))
+        throw new Error("Working copy settings changed. Reopen the editor before retrying.");
+      const claim = storeClaim({ branch: choice.branch, worktreePath: path });
+      if (claim) throw new Error(claim);
+    };
+    inFlight.current = true;
+    setBranchBusy(true);
+    setError("");
+    try {
+      validate(existingPath);
+      if (action === "switch") {
+        if (!row.worktreePath) throw new Error("Select a working copy first.");
+        const branch = await gitTaskBranch(row.worktreePath, row.branch, targetBranch, row.base, "switch");
+        validate(row.worktreePath);
+        onPatch({ branch, prUrl: undefined });
+      } else {
+        if (!existingPath) {
+          const tree = await worktreeOnBranch(row.projectPath, choice.branch);
+          validate(tree?.path);
+          if (tree) { setBindPath(tree.path); return; }
+        }
+        // Reuse the app's normal preparation path; the old checkout is untouched.
+        try {
+          preparedPath = await onPrepareWorktree({
+            projectPath: row.projectPath,
+            branch: choice.branch,
+            base: choice.base ?? row.base,
+            ...(existingPath ? { worktreePath: existingPath } : {}),
+          });
+        } catch (cause) {
+          if (!existingPath && /already has a working copy/i.test(String(cause))) {
+            const tree = await worktreeOnBranch(row.projectPath, choice.branch);
+            validate(tree?.path);
+            if (tree) { setBindPath(tree.path); return; }
+          }
+          throw cause;
+        }
+        validate(preparedPath);
+        // A running agent may have started while preparation was awaiting IO.
+        if (blockedRef.current)
+          throw new Error("An agent is working. Reopen the editor after it finishes.");
+        onPatch({ branch: choice.branch, worktreePath: preparedPath, prUrl: undefined });
+      }
+      setTargetBranch(undefined);
+      setBindPath(undefined);
+      void refresh();
+    } catch (cause) {
+      setError(`${String(cause)}${preparedPath ? ` Working copy kept at ${preparedPath}.` : ""}`);
+    } finally {
+      inFlight.current = false;
+      setBranchBusy(false);
+    }
+  };
   const boundTree = row.worktreePath
     ? worktrees?.worktrees.find(
         (tree) => pathKey(tree.path) === pathKey(row.worktreePath!),
@@ -2288,7 +2361,7 @@ function WorkstreamEditor({
     <Popover
       anchor={anchor}
       width={360}
-      onDismiss={onClose}
+      onDismiss={() => { if (!inFlight.current) onClose(); }}
       // SearchableSelect menus portal out of this popover — they aren't
       // "outside" clicks.
       ignore="[data-dialog-popover]"
@@ -2299,6 +2372,7 @@ function WorkstreamEditor({
         <span>Worktree</span>
         <SearchableSelect
           label="Worktree"
+          disabled={blocked}
           value={row.worktreePath ?? ""}
           options={[
             { value: "", label: "Detach — create with next agent" },
@@ -2335,17 +2409,12 @@ function WorkstreamEditor({
           <span>Branch</span>
           <SearchableSelect
             label="Branch"
-            value={row.branch}
+            value={targetBranch ?? row.branch}
             options={branchOptions}
             onChange={(value) => {
-              const choice = taskBranchChoice(value);
-              const claim = storeClaim({ branch: choice.branch });
-              if (claim) { setError(claim); return; }
-              if (!row.worktreePath) { onPatch({ branch: choice.branch, ...(choice.base ? { base: choice.base } : {}) }); return; }
-              setBranchBusy(true); setError("");
-              void gitTaskBranch(row.worktreePath, row.branch, value, row.base, "switch")
-                .then(branch => { onPatch({ branch, prUrl: undefined }); void refresh(); })
-                .catch(error => setError(String(error))).finally(() => setBranchBusy(false));
+              setTargetBranch(value);
+              setBindPath(undefined);
+              setError("");
             }}
             searchPlaceholder="Pick or type a branch…"
             creatable="New branch"
@@ -2359,6 +2428,7 @@ function WorkstreamEditor({
           <span>Base</span>
           <SearchableSelect
             label="Base branch"
+            disabled={blocked}
             value={row.base}
             options={baseOptions}
             onChange={(base) => onPatch({ base })}
@@ -2368,6 +2438,16 @@ function WorkstreamEditor({
           />
         </div>
       </div>
+      {targetBranch && (
+        <div className="flex flex-col gap-2 text-[11px]">
+          <div className="flex flex-wrap gap-2 text-accent">
+            <button type="button" disabled={blocked || !row.worktreePath} onClick={() => void applyBranch("switch")}>Switch current worktree</button>
+            <button type="button" disabled={blocked} onClick={() => void applyBranch("create")}>Create separate worktree</button>
+          </div>
+          <p className="text-content/50">A separate worktree keeps your current files and sessions in place.</p>
+          {bindPath && <BindOfferBar path={bindPath} busy={blocked} onAccept={() => void applyBranch("create", bindPath)} onDismiss={() => setBindPath(undefined)} />}
+        </div>
+      )}
       <div className="flex flex-wrap gap-2 text-[11px] text-accent">
         <button type="button" disabled={branchBusy || busy} onClick={() => {
           setBranchBusy(true); setError("");
@@ -2383,7 +2463,7 @@ function WorkstreamEditor({
       {row.worktreePath && !boundTree?.isMain ? (
         <button
           type="button"
-          disabled={busy || removing}
+          disabled={blocked || removing}
           aria-pressed={armed}
           title={
             armed

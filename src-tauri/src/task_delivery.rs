@@ -496,7 +496,7 @@ fn azure_checks(
     binding: Option<&CiBinding>,
     sha: &str,
     validation: &[String],
-) -> Result<Vec<Check>, String> {
+) -> Result<(Vec<Check>, Option<String>), String> {
     let project = match binding.filter(|b| !b.project.is_empty()) {
         Some(b) => b.project.clone(),
         None => az::split_repo(&source.repo)?.0,
@@ -523,52 +523,67 @@ fn azure_checks(
     } else {
         String::new()
     };
-    let response = az::azure_get(config, &format!("/{}/_apis/build/builds?queryOrder=queueTimeDescending&$top=100{definition_filter}{repo_filter}&api-version=7.1",az::encode_segment(&project)))?;
+    let endpoint = format!("/{}/_apis/build/builds?queryOrder=queueTimeDescending&$top=100{definition_filter}{repo_filter}&api-version=7.1",az::encode_segment(&project));
     let mut seen = HashSet::new();
     let mut checks = vec![];
-    for run in response.value["value"]
-        .as_array()
-        .ok_or("Invalid Azure build response")?
-    {
-        let revision = field(run, "sourceVersion");
-        let pr_source = pointer(run, "/triggerInfo/pr.sourceSha");
-        if !revision_matches(&revision, &pr_source, sha, validation) {
-            continue;
+    let result = (|| -> Result<(), String> {
+        let mut continuation = String::new();
+        let mut tokens = HashSet::new();
+        // ponytail: cap history at 1,000 builds; narrow the query if larger histories matter.
+        for _ in 0..10 {
+            let response = az::azure_get(config, &format!("{endpoint}{continuation}"))?;
+            for run in response.value["value"]
+                .as_array()
+                .ok_or("Invalid Azure build response")?
+            {
+                let revision = field(run, "sourceVersion");
+                let pr_source = pointer(run, "/triggerInfo/pr.sourceSha");
+                if !revision_matches(&revision, &pr_source, sha, validation) {
+                    continue;
+                }
+                let definition = run["definition"]["id"]
+                    .as_i64()
+                    .ok_or("Missing pipeline definition")?;
+                if !seen.insert(definition) {
+                    continue;
+                }
+                let id = run["id"].as_i64().ok_or("Missing build ID")?;
+                let state = if field(run, "result").is_empty() {
+                    field(run, "status")
+                } else {
+                    field(run, "result")
+                };
+                checks.push(Check {
+                    id: format!("azure:{id}"),
+                    name: pointer(run, "/definition/name"),
+                    bucket: bucket(&state).into(),
+                    state,
+                    url: pointer(run, "/_links/web/href"),
+                    sha: revision,
+                    source: Source {
+                        repo: project.clone(),
+                        ..source.clone()
+                    },
+                    run_id: Some(id),
+                    job_id: None,
+                });
+            }
+            if (!ids.is_empty() && ids.iter().all(|id| seen.contains(id)))
+                || response.continuation_token.is_none()
+            {
+                return Ok(());
+            }
+            let token = response.continuation_token.unwrap();
+            if !tokens.insert(token.clone()) {
+                return Err(
+                    "Azure repeated a build continuation token — refresh or open Azure".into(),
+                );
+            }
+            continuation = format!("&continuationToken={}", az::encode_segment(&token));
         }
-        let definition = run["definition"]["id"]
-            .as_i64()
-            .ok_or("Missing pipeline definition")?;
-        if !seen.insert(definition) {
-            continue;
-        }
-        let id = run["id"].as_i64().ok_or("Missing build ID")?;
-        let state = if field(run, "result").is_empty() {
-            field(run, "status")
-        } else {
-            field(run, "result")
-        };
-        checks.push(Check {
-            id: format!("azure:{id}"),
-            name: pointer(run, "/definition/name"),
-            bucket: bucket(&state).into(),
-            state,
-            url: pointer(run, "/_links/web/href"),
-            sha: revision,
-            source: Source {
-                repo: project.clone(),
-                ..source.clone()
-            },
-            run_id: Some(id),
-            job_id: None,
-        });
-    }
-    if response.truncated {
-        return Err(
-            "Azure build results are incomplete — narrow the selected pipelines or open Azure"
-                .into(),
-        );
-    }
-    Ok(checks)
+        Err("Azure build history exceeds the lookup limit — narrow the selected pipelines or open Azure".into())
+    })();
+    Ok((checks, result.err()))
 }
 fn revision_matches(revision: &str, pr_source: &str, head: &str, validation: &[String]) -> bool {
     !head.is_empty()
@@ -710,13 +725,15 @@ pub async fn task_delivery_probe(
                         let mut seen = HashSet::new();
                         checks.retain(|c| seen.insert(c.id.clone()));
                         Ok(checks)
-                    })(),
+                    })()
+                    .map(|checks| (checks, None)),
                     Provider::Gitlab => gitlab_checks(
                         &app,
                         &cs,
                         &head_sha,
                         if cs == source { &validation } else { &[] },
-                    ),
+                    )
+                    .map(|checks| (checks, None)),
                     Provider::Azuredevops => az::require_config(&app).and_then(|config| {
                         azure_checks(
                             &config,
@@ -728,7 +745,7 @@ pub async fn task_delivery_probe(
                     }),
                 };
                 match result {
-                    Ok(checks) => (checks, None, Some(cs)),
+                    Ok((checks, error)) => (checks, error, Some(cs)),
                     Err(e) => (vec![], Some(e), Some(cs)),
                 }
             }
@@ -919,6 +936,164 @@ pub async fn task_delivery_log(app: AppHandle, cwd: String, check: Check) -> Res
 mod tests {
     use super::*;
 
+    fn build(id: i64, definition: i64, sha: &str) -> Value {
+        json!({"id": id, "definition": {"id": definition, "name": "Build"}, "sourceVersion": sha, "result": "succeeded"})
+    }
+
+    fn azure_pages(
+        pages: Vec<(u16, Option<String>, Value)>,
+        ids: Vec<i64>,
+    ) -> (Vec<Check>, Option<String>, Vec<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let config = az::AzureDevOpsConfig {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "test".into(),
+        };
+        let source = Source {
+            provider: Provider::Azuredevops,
+            repo: "Project".into(),
+            host: config.url.clone(),
+            account: "test".into(),
+        };
+        let binding = CiBinding {
+            provider: Provider::Azuredevops,
+            project: "Project".into(),
+            repo: String::new(),
+            host: config.url.clone(),
+            definition_ids: ids,
+        };
+        let server = std::thread::spawn(move || {
+            let mut requests = vec![];
+            for (status, token, body) in pages {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => panic!("Missing Azure request: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                requests.push(request);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let header = token
+                    .map(|token| format!("x-ms-continuationtoken: {token}\r\n"))
+                    .unwrap_or_default();
+                let body = body.to_string();
+                write!(stream, "HTTP/1.1 {status} Test\r\n{header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let (checks, error) =
+            azure_checks(&config, &source, Some(&binding), "head", &["merge".into()]).unwrap();
+        (checks, error, server.join().unwrap())
+    }
+
+    #[test]
+    fn azure_ci_pages_and_keeps_latest_revision_matches() {
+        let mut triggered = build(5, 8, "trigger-merge");
+        triggered["triggerInfo"] = json!({"pr.sourceSha": "head"});
+        let (checks, error, requests) = azure_pages(
+            vec![
+                (
+                    200,
+                    Some("next+/=".into()),
+                    json!({"value": [build(9, 7, "old"), build(8, 7, "head")]}),
+                ),
+                (
+                    200,
+                    Some("more-history".into()),
+                    json!({"value": [build(7, 7, "head"), triggered, build(4, 8, "merge")]}),
+                ),
+            ],
+            vec![7, 8],
+        );
+        assert!(error.is_none());
+        assert_eq!(
+            checks.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["azure:8", "azure:5"]
+        );
+        assert!(requests[1].contains("continuationToken=next%2B%2F%3D"));
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.contains("definitions=7,8")
+                    && r.contains("queryOrder=queueTimeDescending"))
+        );
+    }
+
+    #[test]
+    fn azure_ci_retains_checks_on_errors_repeated_tokens_and_page_limit() {
+        for (status, token, body, expected) in [
+            (500, None, json!({"message":"offline"}), "offline"),
+            (200, Some("next".into()), json!({"value": []}), "repeated"),
+            (200, None, json!({"invalid": true}), "Invalid Azure"),
+        ] {
+            let (checks, error, _) = azure_pages(
+                vec![
+                    (
+                        200,
+                        Some("next".into()),
+                        json!({"value": [build(8, 7, "head")]}),
+                    ),
+                    (status, token, body),
+                ],
+                vec![7, 8],
+            );
+            assert_eq!(checks.len(), 1);
+            assert!(error.unwrap().contains(expected));
+        }
+        let pages = (0..10)
+            .map(|page| {
+                (
+                    200,
+                    Some(format!("page-{page}")),
+                    json!({"value": [build(8, 7, "head")]}),
+                )
+            })
+            .collect();
+        let (checks, error, requests) = azure_pages(pages, vec![7, 8]);
+        assert_eq!(checks.len(), 1);
+        assert!(error.unwrap().contains("lookup limit"));
+        assert_eq!(requests.len(), 10);
+    }
+
+    #[test]
+    fn azure_ci_empty_final_page_is_complete_and_selected_pipeline_stops_early() {
+        let (checks, error, _) = azure_pages(vec![(200, None, json!({"value": []}))], vec![7]);
+        assert!(checks.is_empty() && error.is_none());
+        let (checks, error, _) = azure_pages(
+            vec![(
+                200,
+                Some("old-history".into()),
+                json!({"value": [build(8, 7, "head")]}),
+            )],
+            vec![7],
+        );
+        assert_eq!(checks.len(), 1);
+        assert!(error.is_none());
+    }
+
     #[test]
     fn azure_ci_resolves_repository_names_before_querying_builds() {
         use std::io::{BufRead, BufReader, Write};
@@ -973,7 +1148,8 @@ mod tests {
             assert!(requests[0].contains("/My%20Project/_apis/git/repositories/web%20app?"));
             if valid {
                 assert!(requests[1].contains(&format!("repositoryId={guid}&repositoryType=TfsGit")));
-                let checks = result.unwrap();
+                let (checks, error) = result.unwrap();
+                assert!(error.is_none());
                 assert_eq!(checks.len(), 1);
                 assert_eq!(checks[0].bucket, "pass");
             } else {

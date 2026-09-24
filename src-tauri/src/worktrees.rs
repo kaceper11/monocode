@@ -979,6 +979,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn existing_branch_worktree_preserves_dirty_source() {
+        let repo = repo();
+        let root = repo.0.join("repo");
+        git_checked(&root, &["branch", "existing"]).unwrap();
+        std::fs::write(root.join("staged.txt"), "staged").unwrap();
+        git_checked(&root, &["add", "staged.txt"]).unwrap();
+        std::fs::write(root.join("untracked.txt"), "keep").unwrap();
+        let before = git(&root, &["status", "--porcelain"]).unwrap();
+        let tree = create(&root, "existing", "missing-base", true).unwrap();
+        assert_eq!(tree.branch.as_deref(), Some("existing"));
+        assert_eq!(git(&root, &["status", "--porcelain"]).unwrap(), before);
+        assert_eq!(
+            git(&root, &["branch", "--show-current"]).unwrap().trim(),
+            "main"
+        );
+        assert!(!Path::new(&tree.path).join("staged.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("untracked.txt")).unwrap(),
+            "keep"
+        );
+        assert!(create(&root, "existing", "main", true)
+            .unwrap_err()
+            .contains("already has a working copy"));
+    }
+
+    #[test]
     fn parses_literal_paths_and_worktree_flags() {
         let trees = parse_worktrees("worktree /repo\0HEAD abc\0branch refs/heads/main\0\0worktree /a\nquoted\"path\0HEAD def\0detached\0locked reason\0prunable missing\0\0");
         assert!(trees[0].is_main);

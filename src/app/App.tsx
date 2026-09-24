@@ -121,6 +121,7 @@ import {
   notifyGitChanged,
   type GitFileDiffKind,
   type GitHistoryCommit,
+  gitBranches,
 } from "../platform/tauri/fs";
 import {
   invalidateProjectFiles,
@@ -8368,15 +8369,15 @@ export default function App({
     async (spec: TaskWorkstreamSpec) => {
       let worktreePath = spec.worktreePath;
       if (!worktreePath) {
-        // A partial earlier attempt can leave the branch behind — adopt it
-        // rather than failing the lane.
+        const branches = await gitBranches(spec.projectPath);
+        const existing = branches.branches.some(branch => !branch.remote && branch.name === spec.branch);
         const created = await createWorktree(
           spec.projectPath,
           spec.branch,
           spec.base,
-          false,
+          existing,
         ).catch((error) =>
-          /already exists/i.test(String(error))
+          !existing && /already exists/i.test(String(error))
             ? createWorktree(spec.projectPath, spec.branch, spec.base, true)
             : Promise.reject(error),
         );

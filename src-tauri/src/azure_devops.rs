@@ -1648,6 +1648,7 @@ fn validate_repo(repo: &str) -> Result<String, String> {
 pub(crate) struct AzureResponse {
     pub value: Value,
     pub truncated: bool,
+    pub continuation_token: Option<String>,
 }
 
 pub(crate) fn basic_auth(token: &str) -> String {
@@ -1730,7 +1731,7 @@ pub(crate) fn azure_agent() -> ureq::Agent {
 pub(crate) fn read_azure_response(
     result: Result<ureq::Response, ureq::Error>,
 ) -> Result<AzureResponse, String> {
-    let (bytes, status, truncated) = read_azure_bytes(result, None)?;
+    let (bytes, status, continuation_token) = read_azure_bytes(result, None)?;
     let body = String::from_utf8(bytes)
         .map_err(|_| "Azure DevOps returned an unreadable response".to_string())?;
     if !(200..300).contains(&status) {
@@ -1738,7 +1739,11 @@ pub(crate) fn read_azure_response(
     }
     let value: Value = serde_json::from_str(&body)
         .map_err(|_| "Azure DevOps returned invalid JSON".to_string())?;
-    Ok(AzureResponse { value, truncated })
+    Ok(AzureResponse {
+        value,
+        truncated: continuation_token.is_some(),
+        continuation_token,
+    })
 }
 
 /// Raw-bytes variant for file content, which is not necessarily UTF-8 JSON.
@@ -1760,13 +1765,13 @@ fn azure_get_bytes(config: &AzureDevOpsConfig, path: &str) -> Result<(Vec<u8>, b
         let body = String::from_utf8_lossy(&bytes);
         return Err(azure_http_error(status, &body));
     }
-    Ok((bytes, truncated))
+    Ok((bytes, truncated.is_some()))
 }
 
 fn read_azure_bytes(
     result: Result<ureq::Response, ureq::Error>,
     max_bytes: Option<usize>,
-) -> Result<(Vec<u8>, u16, bool), String> {
+) -> Result<(Vec<u8>, u16, Option<String>), String> {
     let response = match result {
         Ok(response) => response,
         Err(ureq::Error::Status(401, _) | ureq::Error::Status(403, _)) => {
@@ -1785,7 +1790,8 @@ fn read_azure_bytes(
     let truncated = response
         .header("x-ms-continuationtoken")
         .map(str::trim)
-        .is_some_and(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let mut bytes = Vec::new();
     let read_result = if let Some(max_bytes) = max_bytes {
         response
