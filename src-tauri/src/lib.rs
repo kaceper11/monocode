@@ -2,6 +2,7 @@ mod bounded_process;
 mod browser;
 mod browser_preview;
 pub mod dictation;
+mod planning;
 mod power;
 mod saved_commands;
 mod wsl;
@@ -383,6 +384,7 @@ pub fn run() {
             gitlab::gitlab_repo,
             gitlab::gitlab_list_work_items,
             gitlab::gitlab_list_todos,
+            gitlab::gitlab_relationship_items,
             gitlab::gitlab_work_item_details,
             gitlab::gitlab_work_item_thread,
             gitlab::gitlab_work_item_comment,
@@ -422,7 +424,13 @@ pub fn run() {
             jira::jira_issue_thread,
             jira::jira_issue_comment,
             link_preview::fetch_link_preview,
+            task_delivery::task_review_remote,
+            planning::planning_scopes,
+            planning::planning_periods,
+            planning::planning_items,
             fs::git_branches,
+            fs::git_refresh_branches,
+            fs::git_task_branch,
             fs::git_current_branch,
             fs::git_checkout,
             fs::git_create_branch,

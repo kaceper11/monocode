@@ -33,12 +33,12 @@ import {
   type Worktree,
 } from "../source-control/model/worktrees";
 import {
-  localBranchOptions,
-  peekProjectBranches,
+  taskBranchOptions,
+  taskBranchChoice,
   useProjectBranchesState,
 } from "../source-control/hooks/useProjectBranches";
 import { useProjectWorktrees } from "../source-control/hooks/useProjectWorktrees";
-import { gitBranches, type GitBranches } from "../../platform/tauri/fs";
+import { gitBranches, gitRefreshBranches, type GitBranches } from "../../platform/tauri/fs";
 import { boardTicketOptions, groupSwatch } from "./boardData";
 import {
   createGroup,
@@ -85,29 +85,15 @@ export function suggestedBranch(
   return namedWorktreeBranch(fragment) ?? "mc/task";
 }
 
-/** Resolve a typed/picked lane branch. A name matching an existing LOCAL
- * branch stays verbatim — spawn adopts it via the `existing: true` retry
- * (`mc/` wrapping would create a different branch instead). Anything else
- * is a new branch and gets the `mc/` convention. Callers on a submit path
- * should pass a fresh `branches` — the cache can lag branches created
- * outside the app, and wrapping a real branch in `mc/` silently forks it. */
+/** Preserve explicit branch names; only the task's automatic suggestion uses mc/. */
 export function resolveLaneBranch(
   projectPath: string,
   typed: string,
   branches?: GitBranches | null,
 ): string | null {
-  const clean = typed.trim();
-  if (!clean) return null;
-  const known =
-    branches !== undefined ? branches : peekProjectBranches(projectPath);
-  // Cache still loading — pass the name through verbatim. The spawn path
-  // adopts an existing branch or creates it under the user's literal name;
-  // wrapping in `mc/` here could fork an existing branch into `mc/<name>`.
-  if (!known) return clean;
-  const isLocal = known.branches.some(
-    (branch) => !branch.remote && branch.name === clean,
-  );
-  return isLocal ? clean : namedWorktreeBranch(clean);
+  void projectPath;
+  void branches;
+  return taskBranchChoice(typed.trim()).branch || null;
 }
 
 /** Repo select options from recents — shared by this dialog and the
@@ -123,11 +109,13 @@ export function workstreamProjectOptions(recents: readonly RecentProject[]) {
  * it isn't listed. Shared by WorkstreamFields and the lane editor. */
 export function baseBranchOptions(
   branches: GitBranches | null,
+  selected?: string,
 ): SearchableSelectOption[] {
   const list = (branches?.branches ?? []).map((branch) => ({
     value: branch.remote ? `${branch.remote}/${branch.name}` : branch.name,
     label: branch.remote ? `${branch.remote}/${branch.name}` : branch.name,
   }));
+  if (selected && !list.some(option => option.value === selected)) list.unshift({ value: selected, label: selected.replace(/^refs\/remotes\//, "") });
   const current = branches?.current;
   return current && !list.some((option) => option.value === current)
     ? [{ value: current, label: current }, ...list]
@@ -215,6 +203,13 @@ export function WorkstreamFields({
   excludeBranches?: ReadonlySet<string>;
 }) {
   const branchListId = useId();
+  const [fetchingBranches, setFetchingBranches] = useState(false);
+  const [fetchError, setFetchError] = useState("");
+  const fetchBranches = async () => {
+    setFetchingBranches(true); setFetchError("");
+    try { await gitRefreshBranches(draft.projectPath); } catch (error) { setFetchError(String(error)); }
+    finally { setFetchingBranches(false); }
+  };
   const { branches } = useProjectBranchesState(
     draft.projectPath,
     !!draft.projectPath,
@@ -223,16 +218,14 @@ export function WorkstreamFields({
     draft.projectPath,
     !!draft.projectPath,
   );
-  const baseOptions = useMemo(() => baseBranchOptions(branches), [branches]);
+  const baseOptions = useMemo(() => baseBranchOptions(branches, draft.base), [branches, draft.base]);
   // Adoptable branches are local-only, matching CreateWorktreeDialog — the
   // spawn path creates a new branch from base for anything else it can't
   // adopt. "" keeps the auto-generated name.
   const branchOptions = useMemo(
     () => [
       { value: "", label: "Auto from task" },
-      ...localBranchOptions(branches).filter(
-        (option) => !excludeBranches?.has(option.value),
-      ),
+      ...taskBranchOptions(branches, excludeBranches),
     ],
     [branches, excludeBranches],
   );
@@ -255,6 +248,7 @@ export function WorkstreamFields({
   );
   const repoSelect = (
     <SearchableSelect
+      variant={compact ? "row" : "field"}
       label="Repository"
       value={draft.projectPath}
       options={projects}
@@ -274,6 +268,7 @@ export function WorkstreamFields({
   );
   const worktreeSelect = (
     <SearchableSelect
+      variant={compact ? "row" : "field"}
       label="Worktree"
       value={draft.worktreePath ?? ""}
       options={[{ value: "", label: "New worktree" }, ...worktreeOptions]}
@@ -299,6 +294,7 @@ export function WorkstreamFields({
   );
   const baseSelect = (
     <SearchableSelect
+      variant={compact ? "row" : "field"}
       label="Base branch"
       value={draft.base}
       options={baseOptions}
@@ -312,11 +308,12 @@ export function WorkstreamFields({
   );
   const branchSelect = (
     <SearchableSelect
+      variant={compact ? "row" : "field"}
       label="Branch"
       value={draft.branch}
       options={branchOptions}
-      onChange={(branch) => onChange({ branch })}
-      placeholder={branches ? "mc/branch…" : "…"}
+      onChange={(value) => { const choice = taskBranchChoice(value); onChange({ branch: choice.branch, ...(choice.base ? { base: choice.base } : {}) }); }}
+      placeholder={branches ? "Choose or create branch…" : "Loading branches…"}
       searchPlaceholder="Pick or type a branch…"
       creatable="New branch"
       exclude={excludeBranches}
@@ -329,19 +326,24 @@ export function WorkstreamFields({
   // branch+base so every field stays readable.
   if (compact) {
     return (
-      <div className="flex flex-col gap-1.5">
-        {repoSelect}
-        {worktreeSelect}
-        <div className="flex items-center gap-1.5">
-          <div className="min-w-0 flex-1">{branchSelect}</div>
-          <div className="w-28 shrink-0">{baseSelect}</div>
-          {tail}
+      <div className="min-w-0 rounded-lg bg-content/[0.025] p-2">
+        <div className="flex flex-col gap-1.5">
+          <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">Repository{repoSelect}</div>
+          <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">Working copy{worktreeSelect}</div>
+          <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">Branch{branchSelect}</div>
+          <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">Start from{baseSelect}</div>
         </div>
+        <button type="button" disabled={!draft.projectPath || fetchingBranches} onClick={() => void fetchBranches()}
+          className="mt-2 rounded px-1 py-1 text-[11px] text-content/45 hover:bg-content/5 hover:text-content disabled:opacity-40">{fetchingBranches ? "Fetching…" : "Fetch branches"}</button>
+        {fetchError && <p role="alert" className="text-[11px] text-red-400">{fetchError}</p>}
+        {tail}
       </div>
     );
   }
   return (
     <div className="min-w-0 rounded-lg border border-content/10 p-3">
+      <button type="button" disabled={!draft.projectPath || fetchingBranches} onClick={() => void fetchBranches()} className="mb-2 text-[11px] text-accent">{fetchingBranches ? "Fetching…" : "Fetch branches"}</button>
+      {fetchError && <p role="alert" className="text-[11px] text-red-400">{fetchError}</p>}
       <div className="mb-3 flex min-w-0 items-center gap-2">
         <GitBranch className="size-4 shrink-0 text-content/45" />
         <div className="min-w-0 flex-1">
@@ -366,7 +368,7 @@ export function WorkstreamFields({
               aria-label="Branch"
               list={branchListId}
               value={draft.branch}
-              onChange={(event) => onChange({ branch: event.target.value })}
+              onChange={(event) => { const choice = taskBranchChoice(event.target.value); onChange({ branch: choice.branch, ...(choice.base ? { base: choice.base } : {}) }); }}
               placeholder={defaultBranch}
               className="mt-1 h-8 w-full min-w-0 rounded-md border border-content/10 bg-background-base px-2 text-[12px] text-content outline-none placeholder:text-content/40 focus:border-content/30"
             />

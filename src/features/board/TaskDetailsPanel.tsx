@@ -37,9 +37,10 @@ import {
   type InboxItem,
 } from "../inbox/model/githubTasks";
 import { pathKey, prettyCwd, projectName } from "../../shared/lib/paths";
-import { gitBranches } from "../../platform/tauri/fs";
+import { gitBranches, gitRefreshBranches, gitTaskBranch } from "../../platform/tauri/fs";
 import {
-  localBranchOptions,
+  taskBranchOptions,
+  taskBranchChoice,
   useProjectBranchesState,
 } from "../source-control/hooks/useProjectBranches";
 import { useProjectWorktrees } from "../source-control/hooks/useProjectWorktrees";
@@ -353,12 +354,14 @@ function AddWorkstreamRow({
   lanes,
   busy,
   onAdd,
+  onCancel,
 }: {
   recents: RecentProject[];
   /** All board lanes — claimed worktree paths are hidden from the picker
    * (a pick that can only fail at submit is worse than no option). */
   lanes: TaskWorkstream[];
   busy: boolean;
+  onCancel: () => void;
   onAdd: (spec: {
     projectPath: string;
     branch: string;
@@ -409,22 +412,15 @@ function AddWorkstreamRow({
         excludeBranches={claimedBranches}
         onChange={(patch) => setDraft((current) => ({ ...current, ...patch }))}
         tail={
-          <button
-            type="button"
-            disabled={busy || !draft.projectPath}
-            onClick={() => {
-              onAdd({ ...draft, base: draft.base || "HEAD" });
-              setDraft((current) => ({
-                ...current,
-                branch: "",
-                worktreePath: undefined,
-              }));
-            }}
-            className="grid size-7 shrink-0 place-items-center rounded-md bg-accent/15 text-accent hover:bg-accent/25 disabled:opacity-40"
-            aria-label="Add workstream"
-          >
-            <Plus className="size-3.5" strokeWidth={2} />
-          </button>
+          <div className="flex justify-end gap-2 pt-2">
+            <button type="button" disabled={busy} onClick={onCancel}
+              className="rounded-md px-3 py-1.5 text-[12px] hover:bg-content/8 disabled:opacity-40">Cancel</button>
+            <button type="button" disabled={busy || !draft.projectPath}
+              onClick={() => onAdd({ ...draft, base: draft.base || "HEAD" })}
+              className="rounded-md bg-accent/15 px-3 py-1.5 text-[12px] text-accent hover:bg-accent/25 disabled:opacity-40">
+              {busy ? "Preparing…" : "Add repository"}
+            </button>
+          </div>
         }
       />
     </div>
@@ -1121,6 +1117,7 @@ export function TaskDetailsPanel({
             lanes={lanes}
             busy={addingStream}
             onAdd={addWorkstream}
+            onCancel={() => { setShowAddStream(false); setStreamError(""); setBindOffer(null); }}
           />
         ) : null}
         {bindOffer && !bindOffer.workstreamId ? (
@@ -1406,7 +1403,7 @@ export function TaskDetailsPanel({
                 anchor={editAt.anchor}
                 row={editRow}
                 lanes={lanes}
-                busy={busyAction === `cleanup:${editRow.id}`}
+                busy={busyAction === `cleanup:${editRow.id}` || card.sessions.some(session => session.busy)}
                 onPatch={(patch) =>
                   updateTask(task.id, (current) => ({
                     workstreams: current.workstreams.map((ws) =>
@@ -1563,7 +1560,7 @@ export function CardDetailsPanel({
             onClick={onStartItem}
           >
             <Play className="size-3" strokeWidth={2} />
-            Start work
+            {card.itemKind === "pr" ? "Create review" : "Create task"}
           </button>
         ) : null}
         {card.kind === "local" && onPromote ? (
@@ -2201,6 +2198,7 @@ function WorkstreamEditor({
     row.projectPath,
     true,
   );
+  const [branchBusy, setBranchBusy] = useState(false);
   const [armed, setArmed] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [error, setError] = useState("");
@@ -2252,12 +2250,10 @@ function WorkstreamEditor({
       ),
     [worktrees, row.worktreePath, claimedPaths, claimedBranches],
   );
-  const baseOptions = useMemo(() => baseBranchOptions(branches), [branches]);
+  const baseOptions = useMemo(() => baseBranchOptions(branches, row.base), [branches, row.base]);
   const branchOptions = useMemo(
     () =>
-      localBranchOptions(branches).filter(
-        (option) => !claimedBranches.has(option.value),
-      ),
+      taskBranchOptions(branches, claimedBranches),
     [branches, claimedBranches],
   );
   // Siblings are render-time — a claim can land between render and pick.
@@ -2291,7 +2287,7 @@ function WorkstreamEditor({
   return (
     <Popover
       anchor={anchor}
-      width={280}
+      width={360}
       onDismiss={onClose}
       // SearchableSelect menus portal out of this popover — they aren't
       // "outside" clicks.
@@ -2341,32 +2337,20 @@ function WorkstreamEditor({
             label="Branch"
             value={row.branch}
             options={branchOptions}
-            onChange={(branch) => {
-              // Fresh list — the cache can lag a branch created outside the
-              // app; wrapping a real branch in `mc/` would silently fork it.
-              void gitBranches(row.projectPath)
-                .catch(() => null)
-                .then((fresh) => {
-                  const next =
-                    resolveLaneBranch(row.projectPath, branch, fresh) ??
-                    row.branch;
-                  // A typed name can still resolve onto a sibling lane's
-                  // branch — render-time claims are only a hint.
-                  const claim = claimedBranches.has(next)
-                    ? `A lane already tracks ${next}`
-                    : storeClaim({ branch: next });
-                  if (claim) {
-                    setError(claim);
-                    return;
-                  }
-                  setError("");
-                  onPatch({ branch: next });
-                });
+            onChange={(value) => {
+              const choice = taskBranchChoice(value);
+              const claim = storeClaim({ branch: choice.branch });
+              if (claim) { setError(claim); return; }
+              if (!row.worktreePath) { onPatch({ branch: choice.branch, ...(choice.base ? { base: choice.base } : {}) }); return; }
+              setBranchBusy(true); setError("");
+              void gitTaskBranch(row.worktreePath, row.branch, value, row.base, "switch")
+                .then(branch => { onPatch({ branch, prUrl: undefined }); void refresh(); })
+                .catch(error => setError(String(error))).finally(() => setBranchBusy(false));
             }}
             searchPlaceholder="Pick or type a branch…"
             creatable="New branch"
             exclude={claimedBranches}
-            disabled={!!row.worktreePath}
+            disabled={busy || branchBusy || row.sessions.some(session => session.busy)}
             layer={LAYER.submenu}
             minMenuWidth={220}
           />
@@ -2383,6 +2367,18 @@ function WorkstreamEditor({
             minMenuWidth={220}
           />
         </div>
+      </div>
+      <div className="flex flex-wrap gap-2 text-[11px] text-accent">
+        <button type="button" disabled={branchBusy || busy} onClick={() => {
+          setBranchBusy(true); setError("");
+          void gitRefreshBranches(row.projectPath).catch(error => setError(String(error))).finally(() => setBranchBusy(false));
+        }}>Fetch branches</button>
+        {row.worktreePath && <button type="button" disabled={branchBusy || busy || row.sessions.some(session => session.busy)} onClick={() => {
+          setBranchBusy(true); setError("");
+          void gitTaskBranch(row.worktreePath!, row.branch, row.branch, row.base, "update")
+            .catch(error => setError(String(error))).finally(() => setBranchBusy(false));
+        }}>Update from upstream</button>}
+        {branchBusy && <span role="status">Working…</span>}
       </div>
       {row.worktreePath && !boundTree?.isMain ? (
         <button

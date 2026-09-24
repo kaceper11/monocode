@@ -41,7 +41,7 @@ pub struct JiraStatus {
 
 impl JiraConfig {
     // Bind reads to the credential login, never the non-unique display name.
-    fn account_id(&self) -> String {
+    pub(crate) fn account_id(&self) -> String {
         format!("email:{}", self.email.trim())
     }
 
@@ -312,7 +312,7 @@ fn request_bytes(
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_LIMIT: u32 = 40;
 const COMMENT_LIMIT: u32 = 50;
-const ISSUE_FIELDS: [&str; 6] = [
+pub(crate) const ISSUE_FIELDS: [&str; 6] = [
     "summary", "status", "updated", "labels", "assignee", "project",
 ];
 
@@ -571,7 +571,7 @@ fn jira_authorization(config: &JiraConfig) -> String {
     format!("Basic {encoded}")
 }
 
-fn jira_get(config: &JiraConfig, path: &str) -> Result<Value, String> {
+pub(crate) fn jira_get(config: &JiraConfig, path: &str) -> Result<Value, String> {
     check_backoff(config)?;
     let agent = ureq::AgentBuilder::new()
         .timeout(HTTP_TIMEOUT)
@@ -585,7 +585,7 @@ fn jira_get(config: &JiraConfig, path: &str) -> Result<Value, String> {
     read_jira_response(result, config)
 }
 
-fn jira_post(config: &JiraConfig, path: &str, body: &Value) -> Result<Value, String> {
+pub(crate) fn jira_post(config: &JiraConfig, path: &str, body: &Value) -> Result<Value, String> {
     check_backoff(config)?;
     let agent = ureq::AgentBuilder::new()
         .timeout(HTTP_TIMEOUT)
@@ -731,7 +731,7 @@ fn fetch_jira_projects(
     Ok(projects)
 }
 
-fn parse_jira_issues(data: &Value, site: &str) -> Result<Vec<JiraIssue>, String> {
+pub(crate) fn parse_jira_issues(data: &Value, site: &str) -> Result<Vec<JiraIssue>, String> {
     let issues = data
         .get("issues")
         .and_then(Value::as_array)
@@ -1446,7 +1446,7 @@ pub async fn jira_image(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
-fn current_config(app: &AppHandle) -> Result<JiraConfig, String> {
+pub(crate) fn current_config(app: &AppHandle) -> Result<JiraConfig, String> {
     read_config(app)?.ok_or_else(|| "Connect Jira in Settings".into())
 }
 

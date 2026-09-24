@@ -1992,6 +1992,7 @@ describe("provider status filters", () => {
 
 describe("saved filters", () => {
   const spec: BoardFilterSpec = {
+    search: "", hiddenProviders: [], periods: [], relationships: [],
     project: "/repo",
     groups: [],
     mineOnly: false,
@@ -2053,6 +2054,7 @@ describe("saved filters", () => {
     const store = loadBoard();
     expect(store.filters).toHaveLength(1);
     expect(store.filters[0]!.spec).toEqual({
+      search: "", hiddenProviders: [], periods: [], relationships: [],
       project: "/r",
       groups: ["g1", UNGROUPED],
       mineOnly: false,

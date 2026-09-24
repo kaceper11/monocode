@@ -101,6 +101,7 @@ export function linearTeamIdsForFetch(
 }
 
 export function listLinearIssues(query: {
+  relationship?: string;
   assignedToMe: boolean;
   state: "open" | "all";
   teamIds: string[];
@@ -108,6 +109,7 @@ export function listLinearIssues(query: {
 }): Promise<LinearIssue[]> {
   return invoke<LinearIssue[]>("linear_list_issues", {
     assignedToMe: query.assignedToMe,
+    ...(query.relationship ? { relationship: query.relationship } : {}),
     state: query.state,
     teamIds: query.teamIds,
     limit: query.limit,

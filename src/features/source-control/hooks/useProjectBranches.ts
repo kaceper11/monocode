@@ -148,3 +148,17 @@ export function localBranchOptions(
     .filter((branch) => !branch.remote)
     .map((branch) => ({ value: branch.name, label: branch.name }));
 }
+
+/** Remote choices retain their fully qualified ref so remotes never collide. */
+export function taskBranchOptions(branches: GitBranches | null, claimed: ReadonlySet<string> = new Set()) {
+  const locals = new Set((branches?.branches ?? []).filter(b => !b.remote).map(b => b.name));
+  return (branches?.branches ?? []).map(branch => ({
+    value: branch.remote ? `refs/remotes/${branch.remote}/${branch.name}` : branch.name,
+    label: `${branch.remote ? `${branch.remote}/` : ""}${branch.name}${claimed.has(branch.name) ? " — used by another task" : branch.remote && locals.has(branch.name) ? " — local branch exists; select it to update" : ""}`,
+    disabled: claimed.has(branch.name) || !!branch.remote && locals.has(branch.name),
+  }));
+}
+export function taskBranchChoice(value: string): { branch: string; base?: string } {
+  if (value.startsWith("refs/remotes/")) return { branch: value.split("/").slice(3).join("/"), base: value };
+  return { branch: value };
+}

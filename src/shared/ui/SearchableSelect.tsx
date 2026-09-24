@@ -16,6 +16,7 @@ export type SearchableSelectOption = {
   value: string;
   label: string;
   keywords?: string;
+  disabled?: boolean;
 };
 
 export function SearchableSelect({
@@ -158,6 +159,7 @@ export function SearchableSelect({
   }, [disabled]);
 
   const pick = (next: string) => {
+    if (options.find(option => option.value === next)?.disabled) return;
     onChange(next);
     close(true);
   };
@@ -307,6 +309,8 @@ export function SearchableSelect({
                     id={`${listId}-option-${index}`}
                     type="button"
                     role="option"
+                    disabled={option.disabled}
+                    aria-disabled={option.disabled}
                     tabIndex={-1}
                     aria-selected={isSelected}
                     onMouseDown={(event) => event.preventDefault()}

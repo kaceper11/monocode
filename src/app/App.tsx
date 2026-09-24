@@ -1009,7 +1009,12 @@ export default function App({
   boardViewOpenRef.current = boardViewOpen;
   /** Set when a session was opened from the board — the next visit-back
    * returns there instead of popping tab history. Consumed once. */
+  const [boardReturn, setBoardReturn] = useState(false);
   const boardReturnRef = useRef(false);
+  const rememberBoardReturn = useCallback((value: boolean) => {
+    boardReturnRef.current = value;
+    setBoardReturn(value);
+  }, []);
   const notesViewOpenRef = useRef(notesViewOpen);
   notesViewOpenRef.current = notesViewOpen;
   const automationsViewOpenRef = useRef(automationsViewOpen);
@@ -3236,7 +3241,7 @@ export default function App({
 
   const onVisitBack = useCallback(() => {
     if (boardReturnRef.current) {
-      boardReturnRef.current = false;
+      rememberBoardReturn(false);
       // Same exclusivity as onOpenBoard — a sibling surface left open would
       // paint over the board we're returning to.
       setFilePickerOpen(false);
@@ -8284,12 +8289,12 @@ export default function App({
     setNotesViewOpen(false);
     setInboxViewOpen(false);
     setAutomationsViewOpen(false);
-    boardReturnRef.current = false;
+    rememberBoardReturn(false);
     setBoardViewOpen(true);
   }, []);
 
   const onLeaveBoard = useCallback(() => {
-    boardReturnRef.current = false;
+    rememberBoardReturn(false);
     setBoardViewOpen(false);
   }, []);
 
@@ -8317,7 +8322,7 @@ export default function App({
   const onOpenBoardSession = useCallback(
     (sessionId: string) => {
       // Remember the board was the origin — one visit-back returns to it.
-      boardReturnRef.current = true;
+      rememberBoardReturn(true);
       setBoardViewOpen(false);
       setSidebarTab("sessions");
       void onSelectHistorySession(sessionId);
@@ -8339,7 +8344,7 @@ export default function App({
       }
       const accepted = onSubmit(sessionId, text, []);
       if (accepted) {
-        boardReturnRef.current = true;
+        rememberBoardReturn(true);
         setBoardViewOpen(false);
         setSidebarTab("sessions");
       }
@@ -9254,7 +9259,7 @@ export default function App({
       projectRailOpen={projectRailOpen}
       sessionSidebarOpen={sessionSidebarOpen}
       compactRail={compactTitleBar}
-      canGoBack={tabVisitNav.canBack}
+      canGoBack={tabVisitNav.canBack || boardReturn}
       canGoForward={tabVisitNav.canForward}
       onGoBack={onRailBack}
       onGoForward={onRailForward}
@@ -9324,7 +9329,7 @@ export default function App({
               onFileMoved={onFileMoved}
               onFileDeleted={onFileDeleted}
               canGoBack={
-                tabVisitNav.canBack ||
+                tabVisitNav.canBack || boardReturn ||
                 searchViewOpen ||
                 settingsOpen ||
                 inboxViewOpen ||

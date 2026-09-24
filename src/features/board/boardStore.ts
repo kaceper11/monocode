@@ -1,7 +1,8 @@
+import { cleanPlanningPeriods, periodKey, type PlanningPeriod } from "../inbox/model/planning";
 import type { CiBinding, DeliveryProvider } from "./delivery";
 import type { InboxProvider } from "../inbox/model/githubTasks";
 import type { LinkedWorkItem } from "../sessions/model/session";
-import type { InboxTimeFilter } from "../inbox/model/inboxFilters";
+import { type InboxRelationship, type InboxTimeFilter } from "../inbox/model/inboxFilters";
 import { pathKey } from "../../shared/lib/paths";
 
 /** Group-filter sentinel for cards with no group assigned. */
@@ -123,6 +124,10 @@ export const boardStatusKey = ({ provider, state }: BoardProviderStatus) =>
 /** The board's whole filter-bar state — saved filters store and restore
  * this wholesale, so every criterion the toolbar controls lives here. */
 export type BoardFilterSpec = {
+  search?: string;
+  periods?: PlanningPeriod[];
+  hiddenProviders?: InboxProvider[];
+  relationships?: InboxRelationship[];
   /** Project path, "" = all projects. */
   project: string;
   /** Group ids, plus UNGROUPED for cards with no group. */
@@ -148,6 +153,7 @@ export type SavedBoardFilter = {
 };
 
 export const DEFAULT_BOARD_FILTER: BoardFilterSpec = {
+  periods: [], search: "", hiddenProviders: [], relationships: ["assigned"],
   project: "",
   groups: [],
   mineOnly: true,
@@ -384,6 +390,10 @@ function cleanFilterSpec(value: unknown): BoardFilterSpec {
     if (statuses.size >= 200) break;
   }
   return {
+    periods: cleanPlanningPeriods(raw.periods),
+    search: typeof raw.search === "string" ? raw.search.slice(0, 2000) : "",
+    hiddenProviders: Array.isArray(raw.hiddenProviders) ? [...new Set(raw.hiddenProviders.filter((p): p is InboxProvider => typeof p === "string" && PROVIDER_IDS.has(p)))] : [],
+    relationships: Array.isArray(raw.relationships) ? [...new Set(raw.relationships.filter((r): r is InboxRelationship => ["related", "assigned", "created", "reviewing"].includes(String(r))))] : raw.mineOnly === false ? [] : ["assigned"],
     statuses: [...statuses.values()],
     project: cleanString(raw.project, 600) ?? "",
     groups,
@@ -1172,6 +1182,10 @@ export function sameBoardFilterSpec(
 ): boolean {
   const ids = (list: readonly string[]) => [...list].sort().join("\n");
   return (
+    ids((a.periods ?? []).map(periodKey)) === ids((b.periods ?? []).map(periodKey)) &&
+    (a.search ?? "") === (b.search ?? "") &&
+    ids(a.hiddenProviders ?? []) === ids(b.hiddenProviders ?? []) &&
+    ids(a.relationships ?? (a.mineOnly ? ["assigned"] : [])) === ids(b.relationships ?? (b.mineOnly ? ["assigned"] : [])) &&
     pathKey(a.project) === pathKey(b.project) &&
     a.mineOnly === b.mineOnly &&
     a.time === b.time &&
@@ -1241,4 +1255,13 @@ export function deleteBoardFilter(id: string) {
     ...store,
     filters: store.filters.filter((filter) => filter.id !== id),
   });
+}
+
+const VIEW_KEY = "monocode.board.view.v1";
+export function loadBoardView(): BoardFilterSpec {
+  try { return cleanFilterSpec(JSON.parse(localStorage.getItem(VIEW_KEY) ?? "null")); }
+  catch { return cleanFilterSpec(null); }
+}
+export function saveBoardView(spec: BoardFilterSpec) {
+  try { localStorage.setItem(VIEW_KEY, JSON.stringify(cleanFilterSpec(spec))); } catch { /* storage unavailable */ }
 }

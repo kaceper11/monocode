@@ -1,3 +1,5 @@
+import { periodKey } from "../inbox/model/planning";
+import { PlanningFilter } from "./PlanningFilter";
 import { JIRA_CHANGE_EVENT } from "../inbox/model/jira";
 import { inboxIntegrationCacheKey } from "../sessions/model/inboxIntegrations";
 import { AgentHandoffDialog, type HandoffKind } from "./AgentHandoffDialog";
@@ -135,6 +137,8 @@ import {
   deleteGroup,
   hideCards,
   loadBoard,
+  loadBoardView,
+  saveBoardView,
   MAX_TASK_GROUPS,
   MAX_TASKS,
   MAX_WORKSTREAMS,
@@ -197,10 +201,12 @@ type DragState = {
 
 // Presentation snapshots survive navigation. Mutations still probe live delivery state.
 let boardStatusSnapshot: {
+  key: string;
   scope: string;
   statuses: ReadonlyMap<string, WorkstreamStatus>;
 } | undefined;
 let boardChecksSnapshot: {
+  key: string;
   scope: string;
   checks: ReadonlyMap<string, GitPrCheck[]>;
 } | undefined;
@@ -265,10 +271,13 @@ export function BoardView({
   );
   const connections = useInboxConnections();
   // Fetch-level "my work" filter — every provider honors it; off shows the wider listing.
-  const [mineOnly, setMineOnly] = useState(true);
+  const [initialView] = useState(loadBoardView);
+  const [mineOnly, setMineOnly] = useState(initialView.mineOnly);
+  const [relationships, setRelationships] = useState(initialView.relationships ?? []);
+  const [periods, setPeriods] = useState(initialView.periods ?? []);
   const query = useMemo<InboxQuery>(
-    () => ({ assignedToMe: mineOnly, state: "all", search: "" }),
-    [mineOnly],
+    () => ({ assignedToMe: mineOnly, relationships, periods, state: "all", search: "" }),
+    [mineOnly, relationships, periods],
   );
 
   const [items, setItems] = useState<InboxItem[]>(
@@ -278,6 +287,8 @@ export function BoardView({
     () => peekInboxList(projects, query)?.errors ?? {},
   );
   const [fetching, setFetching] = useState(false);
+  const [loaded, setLoaded] = useState(() => !!peekInboxList(projects, query));
+  const [loadError, setLoadError] = useState("");
   const [refresh, setRefresh] = useState(0);
 
   useEffect(() => {
@@ -297,8 +308,10 @@ export function BoardView({
     if (cached) {
       setItems(cached.items);
       setErrors(cached.errors);
+      setLoaded(true);
     }
     setFetching(true);
+    setLoadError("");
     void listInboxItems(projects, query, { force: refresh > 0 })
       .then(
         (result) => {
@@ -306,10 +319,10 @@ export function BoardView({
           setItems(result.items);
           setErrors(result.errors);
         },
-        () => {},
+        (error) => { if (!cancelled) setLoadError(String(error)); },
       )
       .finally(() => {
-        if (!cancelled) setFetching(false);
+        if (!cancelled) { setFetching(false); setLoaded(true); }
       });
     return () => {
       cancelled = true;
@@ -375,6 +388,8 @@ export function BoardView({
     probeRef.current = probeStreams;
   });
   const statusScope = inboxIntegrationCacheKey();
+  const probeScope = JSON.stringify([statusScope, probeKey]);
+  const [settledProbes, setSettledProbes] = useState(boardStatusSnapshot?.key ?? "");
   const [probedStatus, setWsStatus] = useState<
     ReadonlyMap<string, WorkstreamStatus>
   >(() =>
@@ -411,7 +426,8 @@ export function BoardView({
         // another checkout's or an older revision's green checks forward.
         next.set(result.value[0], status);
       }
-      boardStatusSnapshot = { scope: statusScope, statuses: next };
+      boardStatusSnapshot = { key: probeScope, scope: statusScope, statuses: next };
+      setSettledProbes(probeScope);
       setWsStatus(next);
     });
     return () => {
@@ -484,6 +500,12 @@ export function BoardView({
         `${card.id}:${card.item!.repo}:${card.item!.sourceRefName}:${card.item!.number}`,
     )
     .join("\n");
+  const cardCheckScope = JSON.stringify([checksScope, azureCheckKey]);
+  const [settledChecks, setSettledChecks] = useState(boardChecksSnapshot?.key ?? "");
+  const [revealed, setRevealed] = useState(false);
+  const firstLoadComplete = loaded && (!probeStreams.length || settledProbes === probeScope) && (!azureCheckTargets.length || settledChecks === cardCheckScope);
+  const boardLoading = !revealed && !firstLoadComplete;
+  useEffect(() => { if (firstLoadComplete) setRevealed(true); }, [firstLoadComplete]);
   const azureCheckRef = useRef(azureCheckTargets);
   useEffect(() => {
     azureCheckRef.current = azureCheckTargets;
@@ -514,7 +536,8 @@ export function BoardView({
       for (const result of results)
         if (result.status === "fulfilled")
           next.set(result.value[0], result.value[1]);
-      boardChecksSnapshot = { scope: checksScope, checks: next };
+      boardChecksSnapshot = { key: cardCheckScope, scope: checksScope, checks: next };
+      setSettledChecks(cardCheckScope);
       setCardChecks(next);
     });
     return () => {
@@ -523,28 +546,28 @@ export function BoardView({
   }, [azureCheckKey, refresh, checksScope]);
 
   // --- filters -----------------------------------------------------------
-  const [search, setSearch] = useState("");
-  const [hiddenProviders, setHiddenProviders] = useState<InboxProvider[]>([]);
-  const [projectFilter, setProjectFilter] = useState("");
+  const [search, setSearch] = useState(initialView.search ?? "");
+  const [hiddenProviders, setHiddenProviders] = useState<InboxProvider[]>(initialView.hiddenProviders ?? []);
+  const [projectFilter, setProjectFilter] = useState(initialView.project);
   // Group filter — group ids, plus `UNGROUPED` for cards with no group.
   const [groupFilter, setGroupFilter] = useState<ReadonlySet<string>>(
-    new Set(),
+    new Set(initialView.groups),
   );
-  const [actionOnly, setActionOnly] = useState(false);
+  const [actionOnly, setActionOnly] = useState(initialView.actionOnly);
   // Attention-first is a per-column sort, but it lives in the same spec so a
   // saved filter restores the ordering too.
-  const [attentionFirst, setAttentionFirst] = useState(false);
+  const [attentionFirst, setAttentionFirst] = useState(initialView.attentionFirst);
   // Item kinds to hide (issues vs pull requests) — task/local cards always
   // pass; the filter trims standalone provider cards.
   const [hiddenKinds, setHiddenKinds] = useState<
     ReadonlySet<"issue" | "pr">
-  >(new Set());
-  const [statuses, setStatuses] = useState<BoardProviderStatus[]>([]);
+  >(new Set(initialView.hiddenKinds));
+  const [statuses, setStatuses] = useState<BoardProviderStatus[]>(initialView.statuses);
   const statusOptions = useMemo(
     () => boardStatusOptions(cards, statuses),
     [cards, statuses],
   );
-  const [timeFilter, setTimeFilter] = useState<InboxTimeFilter>("all");
+  const [timeFilter, setTimeFilter] = useState<InboxTimeFilter>(initialView.time);
   const [filterAnchor, setFilterAnchor] = useState<HTMLElement | null>(null);
   // Column editor popover — rename/delete the target column, or flip to
   // add mode for a new one.
@@ -557,6 +580,7 @@ export function BoardView({
   // what applying one writes back.
   const currentSpec = useMemo<BoardFilterSpec>(
     () => ({
+      search, hiddenProviders, relationships, periods,
       project: projectFilter,
       groups: [...groupFilter],
       mineOnly,
@@ -567,6 +591,7 @@ export function BoardView({
       attentionFirst,
     }),
     [
+      search, hiddenProviders, relationships, periods,
       projectFilter,
       groupFilter,
       mineOnly,
@@ -578,6 +603,10 @@ export function BoardView({
     ],
   );
   const applySpec = useCallback((spec: BoardFilterSpec) => {
+    setPeriods(spec.periods ?? []);
+    setSearch(spec.search ?? "");
+    setHiddenProviders(spec.hiddenProviders ?? []);
+    setRelationships(spec.relationships ?? (spec.mineOnly ? ["assigned"] : []));
     setProjectFilter(spec.project);
     setGroupFilter(new Set(spec.groups));
     setMineOnly(spec.mineOnly);
@@ -587,13 +616,14 @@ export function BoardView({
     setActionOnly(spec.actionOnly);
     setAttentionFirst(spec.attentionFirst);
   }, []);
+  useEffect(() => saveBoardView(currentSpec), [currentSpec]);
   const filtersActive = !sameBoardFilterSpec(
-    currentSpec,
+    { ...currentSpec, actionOnly: false },
     DEFAULT_BOARD_FILTER,
   );
   // The last explicitly applied saved filter — kept while the user tweaks
   // criteria (the panel marks it modified rather than dropping it).
-  const [appliedFilterId, setAppliedFilterId] = useState<string | null>(null);
+  const [appliedFilterId, setAppliedFilterId] = useState<string | null>(() => board.filters.find(filter => sameBoardFilterSpec(filter.spec, initialView))?.id ?? null);
   // An exact spec match always wins — if the state matches another saved
   // filter, that is the view being shown. Otherwise the applied id holds.
   const activeFilter =
@@ -631,8 +661,14 @@ export function BoardView({
     const hiddenCards = new Set(board.hidden);
     const timeStart =
       timeFilter === "all" ? 0 : timeFilterStart(timeFilter, Date.now());
+    const selectedPeriods = new Set(periods.map(periodKey));
+    const inPeriod = (item: InboxItem) => item.planningPeriods?.some(p => selectedPeriods.has(periodKey(p)));
     return cards.filter((card) => {
-      if (hiddenCards.has(card.id)) return false;
+      if (hiddenCards.has(card.id) || card.item?.planningContextOnly) return false;
+      if (periods.length && !(card.item && inPeriod(card.item)) && !items.some(item => inPeriod(item) && (
+        card.task?.links.some(link => [link, ...(link.additionalItems ?? [])].some(ref => inboxItemMatchesLinkedWorkItem(item, ref))) ||
+        (!card.task && card.url === item.url)
+      ))) return false;
       if (!matchesBoardStatuses(card, selectedStatuses)) return false;
       // Snoozed — until the time passes or the wake fingerprint changes.
       if (isCardSnoozed(card, board.snoozed[card.id])) return false;
@@ -701,7 +737,7 @@ export function BoardView({
       );
     });
   }, [
-    cards,
+    cards, items, periods,
     search,
     hiddenProviders,
     statuses,
@@ -1062,7 +1098,8 @@ export function BoardView({
     setHandoff({workstreams:[...rows.values()],kind,title:card.title,links:[]});
   }, [sessions, linkedSessions]);
 
-  const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+  const [selectedCardId, setSelectedCardId] = useState<string | null>(boardPosition.selected);
+  useEffect(() => { boardPosition.selected = selectedCardId; }, [selectedCardId]);
   useEffect(() => {
     if (taskRequest) setSelectedCardId(taskRequest.id);
   }, [taskRequest]);
@@ -1090,7 +1127,17 @@ export function BoardView({
           setSelectedCardId(card.id);
           return;
         case "start":
-          if (card.item) onStartItem(card.item);
+          if (!card.item) return;
+          if (card.item.kind === "pr") { setReviewItem(card.item); return; }
+          {
+            const existing = loadBoard().tasks.find(task => !task.archived && task.links.some(link =>
+              [link, ...(link.additionalItems ?? [])].some(ref => inboxItemMatchesLinkedWorkItem(card.item!, ref))));
+            if (existing) { setSelectedCardId(existing.id); return; }
+          }
+          setTaskFromInbox(card.item);
+          setPromoteFrom(null);
+          setTaskError("");
+          setTaskDialogOpen(true);
           return;
         case "open-url":
           if (card.url) void openUrl(card.url);
@@ -1199,6 +1246,7 @@ export function BoardView({
   const [taskFromInbox, setTaskFromInbox] = useState<InboxItem | null>(null);
   useEffect(() => {
     if (!newTaskRequest) return;
+    if (newTaskRequest.item.kind === "pr") { setReviewItem(newTaskRequest.item); return; }
     setTaskFromInbox(newTaskRequest.item);
     setPromoteFrom(null);
     setTaskError("");
@@ -1217,6 +1265,10 @@ export function BoardView({
 
   const onCreateTask = useCallback(
     async (spec: NewTaskSpec) => {
+      if (taskFromInbox) {
+        const existing = loadBoard().tasks.find(task => !task.archived && task.links.some(link => [link, ...(link.additionalItems ?? [])].some(ref => inboxItemMatchesLinkedWorkItem(taskFromInbox, ref))));
+        if (existing) { setTaskDialogOpen(false); setSelectedCardId(existing.id); return; }
+      }
       // Reject a full board before preparing any working copies.
       // Archived tasks don't render — they shouldn't count toward the cap.
       if (loadBoard().tasks.filter((task) => !task.archived).length >= MAX_TASKS) {
@@ -1361,7 +1413,7 @@ export function BoardView({
       onSpawnSession,
       onPrepareWorktree,
       onRemoveWorktree,
-      promoteFrom,
+      promoteFrom, taskFromInbox,
       cards,
       board.placements,
       board.locals,
@@ -1553,6 +1605,17 @@ export function BoardView({
           })}
           <button
             type="button"
+            aria-label="Needs action"
+            aria-pressed={actionOnly}
+            title="Show only cards that need action"
+            onClick={() => setActionOnly(current => !current)}
+            className={`flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent ${actionOnly ? "bg-accent/15 text-accent" : "text-content/50 hover:bg-content/8 hover:text-content"}`}
+          >
+            <Zap className="size-3.5" strokeWidth={1.75} />
+            Needs action
+          </button>
+          <button
+            type="button"
             aria-label="Board filters"
             aria-pressed={filtersActive}
             title={
@@ -1623,9 +1686,12 @@ export function BoardView({
         {IS_MAC ? null : <WindowControls />}
       </div>
 
-      <div className="flex min-h-0 min-w-0 flex-1">
+      {boardLoading && <p role="status" className="flex shrink-0 items-center gap-1.5 px-4 pt-2 text-[11px] text-content/40"><LoaderCircle className="size-3 animate-spin" />Loading board…</p>}
+      {loadError && <p role="alert" className="px-4 pt-2 text-[11px] text-red-400">Couldn’t refresh board: {loadError}</p>}
+      <div className="flex min-h-0 min-w-0 flex-1" aria-busy={fetching || boardLoading}>
         <div
-          ref={boardRef}
+          ref={node => { boardRef.current = node; if (node) node.scrollLeft = boardPosition.left; }}
+          onScroll={event => { if (event.target === event.currentTarget) boardPosition.left = event.currentTarget.scrollLeft; }}
           className="flex min-h-0 min-w-0 flex-1 items-stretch gap-3 overflow-auto p-3"
         >
         {board.columns.map((column) => {
@@ -1686,7 +1752,7 @@ export function BoardView({
                   {column.label}
                 </h2>
                 <span className="text-[11px] text-content/40">
-                  {columnList.length}
+                  {boardLoading ? "—" : columnList.length}
                 </span>
                 <span className="ml-auto flex items-center gap-0.5">
                 {column.id === "done" && columnList.length ? (
@@ -1728,8 +1794,9 @@ export function BoardView({
                 </button>
                 </span>
               </header>
-              <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
-                {units.map((unit) =>
+              <div ref={node => { if (node) node.scrollTop = boardPosition.columns.get(column.id) ?? 0; }} onScroll={event => { boardPosition.columns.set(column.id, event.currentTarget.scrollTop); }} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
+                {boardLoading && <div aria-hidden="true" className="space-y-2">{[0, 1].map(index => <div key={index} className="rounded-lg border border-content/5 bg-content/[0.025] p-3"><div className={`h-2 rounded bg-content/6 ${index ? "w-3/5" : "w-4/5"}`} /><div className="mt-2 h-2 w-2/5 rounded bg-content/4" /><div className="mt-5 h-1.5 w-1/3 rounded bg-content/4" /></div>)}</div>}
+                {!boardLoading && units.map((unit) =>
                   unit.type === "group" ? (
                     <div
                       key={unit.group.id}
@@ -1799,7 +1866,7 @@ export function BoardView({
                     </label>
                   </form>
                 ) : null}
-                {!columnList.length && column.id !== "todo" ? (
+                {!boardLoading && !columnList.length && column.id !== "todo" ? (
                   <p className="px-2 pb-3 text-[11px] text-content/30">
                     Nothing here
                   </p>
@@ -1818,7 +1885,7 @@ export function BoardView({
           );
         })}
         </div>
-        {selectedCard ? (
+        {!boardLoading && selectedCard ? (
           selectedCard.kind === "task" && taskOpsHandlers ? (
             <TaskDetailsPanel
               onHandoff={(id, kind) => openHandoff(selectedCard!, kind, id)}
@@ -1850,7 +1917,7 @@ export function BoardView({
               onOpenSession={onOpenSession}
               onStartItem={
                 selectedCard.item
-                  ? () => onStartItem(selectedCard.item!)
+                  ? () => onCardAction(selectedCard, { kind: "start" })
                   : undefined
               }
               onPromote={
@@ -2271,20 +2338,20 @@ function BoardFiltersPopover({
           </BoardFilterSection>
         ) : null}
         <div className="border-b border-content/8 py-1.5">
-          <BoardFilterRow
-            label="Assigned to me"
-            checked={spec.mineOnly}
-            onClick={() => onSpec({ ...spec, mineOnly: !spec.mineOnly })}
-          />
-          <BoardFilterRow
-            label="Needs action only"
-            checked={spec.actionOnly}
-            icon={
-              <ListFilter className="size-3.5 shrink-0" strokeWidth={1.75} />
-            }
-            onClick={() => onSpec({ ...spec, actionOnly: !spec.actionOnly })}
-          />
+          <BoardFilterSection label="Relationship" summary="Match any selected">
+            {([['all', 'All'], ['related', 'Related to me'], ['assigned', 'Assigned to me'], ['created', 'Created by me'], ['reviewing', 'Reviewing']] as const).map(([id, label]) => (
+              <BoardFilterRow key={id} label={label}
+                checked={id === "all" ? !spec.relationships?.length : !!spec.relationships?.includes(id)}
+                onClick={() => {
+                  const next = id === "all" ? [] : spec.relationships?.includes(id)
+                    ? spec.relationships.filter(r => r !== id) : [...(spec.relationships ?? []), id];
+                  onSpec({ ...spec, relationships: next, mineOnly: next.length > 0 });
+                }} />
+            ))}
+            <p className="px-2 pb-1 text-[10px] text-content/40">Reviewing matches PRs; Jira and Linear have no review relationship.</p>
+          </BoardFilterSection>
         </div>
+        <PlanningFilter selected={spec.periods ?? []} recents={recents} onChange={periods => onSpec({ ...spec, periods })} />
         <BoardFilterSection
           label="Provider status"
           summary={
@@ -2828,3 +2895,5 @@ function ProjectPickRow({
     </button>
   );
 }
+
+const boardPosition = { selected: null as string | null, left: 0, columns: new Map<string, number>() };

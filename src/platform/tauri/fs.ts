@@ -643,3 +643,13 @@ export function basename(path: string): string {
   const parts = trimmed.split("/").filter(Boolean);
   return parts[parts.length - 1] ?? trimmed;
 }
+
+export async function gitRefreshBranches(cwd: string): Promise<void> {
+  await invoke("git_refresh_branches", { cwd });
+  notifyGitChanged();
+}
+export async function gitTaskBranch(cwd: string, expectedBranch: string, name: string, base: string, action: "switch" | "update"): Promise<string> {
+  const branch = await invoke<string>("git_task_branch", { cwd, expectedBranch, name, base, action });
+  notifyGitChanged();
+  return branch;
+}

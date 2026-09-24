@@ -277,6 +277,16 @@ fn create(root: &Path, branch: &str, base: &str, existing: bool) -> Result<Workt
             ],
         )?;
     }
+    if !existing {
+        if let Some(remote_ref) = base.strip_prefix("refs/remotes/") {
+            if remote_ref
+                .split_once('/')
+                .is_some_and(|(_, name)| name == branch)
+            {
+                git_checked(root, &["branch", "--set-upstream-to", remote_ref, branch])?;
+            }
+        }
+    }
     list(root)?
         .into_iter()
         .find(|tree| same_path(Path::new(&tree.path), &path))

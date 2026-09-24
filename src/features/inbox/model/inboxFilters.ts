@@ -232,14 +232,10 @@ export function pruneInboxFilters(
   filters: InboxFilters,
   projectPaths: Iterable<string>,
 ): InboxFilters {
-  const known = new Set(
-    [...projectPaths].map((path) => normalizeProjectPath(path)),
-  );
-  const hiddenProjects = filters.hiddenProjects.filter((path) =>
-    known.has(normalizeProjectPath(path)),
-  );
-  if (hiddenProjects.length === filters.hiddenProjects.length) return filters;
-  return { ...filters, hiddenProjects };
+  // Missing projects can be temporary (connection, host, or discovery failure).
+  // Keep the user's choices until they explicitly change them.
+  void projectPaths;
+  return filters;
 }
 
 export function hasActiveInboxFilters(
@@ -437,4 +433,11 @@ function isTimeFilter(value: unknown): value is InboxTimeFilter {
   return (
     value === "all" || value === "today" || value === "7d" || value === "30d"
   );
+}
+
+export function loadInboxSearch(): string {
+  try { return localStorage.getItem("monocode.inboxSearch") ?? ""; } catch { return ""; }
+}
+export function saveInboxSearch(value: string) {
+  try { localStorage.setItem("monocode.inboxSearch", value); } catch { /* storage unavailable */ }
 }

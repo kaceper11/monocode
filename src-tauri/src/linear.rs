@@ -140,13 +140,17 @@ pub async fn linear_list_issues(
     state: String,
     team_ids: Vec<String>,
     limit: Option<u32>,
+    relationship: Option<String>,
 ) -> Result<Vec<LinearIssue>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let Some(token) = read_token(&app)? else {
             return Ok(Vec::new());
         };
         let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, 100);
-        let filter = issue_filter(assigned_to_me, &state, &team_ids);
+        let mut filter = issue_filter(assigned_to_me, &state, &team_ids);
+        if relationship.as_deref() == Some("created") {
+            filter["creator"] = json!({ "isMe": { "eq": true } });
+        }
         let data = graphql_with_token(
             &token,
             ISSUES_QUERY,
@@ -237,7 +241,7 @@ query {
   }
 }
 "#;
-const ISSUES_QUERY: &str = r#"
+pub(crate) const ISSUES_QUERY: &str = r#"
 query InboxIssues($first: Int!, $filter: IssueFilter) {
   issues(first: $first, filter: $filter, orderBy: updatedAt) {
     nodes {
@@ -323,7 +327,11 @@ fn linear_authorization(token: &str) -> String {
         .to_string()
 }
 
-fn graphql_with_token(token: &str, query: &str, variables: Value) -> Result<Value, String> {
+pub(crate) fn graphql_with_token(
+    token: &str,
+    query: &str,
+    variables: Value,
+) -> Result<Value, String> {
     let authorization = linear_authorization(token);
     let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
     let payload = serde_json::to_string(&json!({ "query": query, "variables": variables }))
@@ -413,7 +421,7 @@ fn parse_linear_teams(data: &Value) -> Result<Vec<LinearTeam>, String> {
         .collect())
 }
 
-fn parse_linear_issues(data: &Value) -> Result<Vec<LinearIssue>, String> {
+pub(crate) fn parse_linear_issues(data: &Value) -> Result<Vec<LinearIssue>, String> {
     let nodes = data
         .pointer("/issues/nodes")
         .and_then(Value::as_array)
@@ -689,7 +697,7 @@ fn read_token(app: &AppHandle) -> Result<Option<String>, String> {
     }
 }
 
-fn require_token(app: &AppHandle) -> Result<String, String> {
+pub(crate) fn require_token(app: &AppHandle) -> Result<String, String> {
     read_token(app)?.ok_or_else(|| "Connect Linear in Settings".to_string())
 }
 

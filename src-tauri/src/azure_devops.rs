@@ -750,7 +750,7 @@ fn azure_query_wit_ids(
         .collect())
 }
 
-fn azure_fetch_wit_batch(
+pub(crate) fn azure_fetch_wit_batch(
     config: &AzureDevOpsConfig,
     ids: &[i64],
 ) -> Result<Vec<AzureDevOpsWorkItem>, String> {
@@ -1697,7 +1697,7 @@ pub(crate) fn azure_post_json(
     azure_request_json(config, "POST", path, body)
 }
 
-fn azure_current_user_id(config: &AzureDevOpsConfig) -> Result<String, String> {
+pub(crate) fn azure_current_user_id(config: &AzureDevOpsConfig) -> Result<String, String> {
     // connectionData is still under preview and rejects stable api-versions.
     let response = azure_get(
         config,
@@ -1960,7 +1960,7 @@ pub(crate) fn azure_devops_repo_for(root: &Path, organization_url: &str) -> Resu
         .ok_or_else(|| "No Azure DevOps remote matches the configured organization".to_string())
 }
 
-fn project_repo_from_remote(remote: &str, organization_url: &str) -> Option<String> {
+pub(crate) fn project_repo_from_remote(remote: &str, organization_url: &str) -> Option<String> {
     let expected = canonical_org_key(organization_url)?;
     let (org_key, project, repo) = parse_azure_remote(remote)?;
     if org_key.to_ascii_lowercase() != expected {

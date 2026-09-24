@@ -162,17 +162,9 @@ export function inboxItemMatchesLinkedWorkItem(
   item: InboxItem,
   linked: LinkedWorkItem,
 ): boolean {
-  return (
-    !linkedWorkItemNeedsAccount(linked) &&
-    item.provider === providerOf(linked) &&
-    (providerOf(linked) !== "github"
-      ? item.url === linked.url &&
-        (!linked.account || item.account === linked.account)
-      : (!linked.account || item.account === linked.account) &&
-        item.kind === linked.kind &&
-        item.number === linked.number &&
-        item.repo.trim().toLowerCase() === linked.repo.trim().toLowerCase())
-  );
+  return !linkedWorkItemNeedsAccount(linked) &&
+    workItemIdentity(item) === workItemIdentity(linked) &&
+    (!linked.account || item.account === linked.account);
 }
 
 /** Same key used by Inbox selection, without synthesizing a full Inbox item. */
@@ -231,9 +223,27 @@ export function boundLinkedContexts(links: LinkedWorkItem[]): LinkedWorkItem[] {
     : link);
 }
 
+/** Azure work-item ids are organization-wide; HTML links may include a project or omit it. */
+function azureWorkItemIdentity(item: InboxItem | LinkedWorkItem): string {
+  try {
+    const url = new URL(item.url);
+    if (url.protocol !== "https:" || url.username || url.password) return item.url;
+    const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    const host = url.hostname.toLowerCase();
+    const organization = host === "dev.azure.com" ? parts.shift()?.toLowerCase()
+      : host.endsWith(".visualstudio.com") ? host.slice(0, -".visualstudio.com".length) : undefined;
+    const marker = parts.findIndex(part => part.toLowerCase() === "_workitems");
+    const id = parts[marker + 2];
+    if (organization && item.kind === "issue" && marker >= 0 &&
+        parts[marker + 1]?.toLowerCase() === "edit" && /^\d+$/.test(id ?? "") && Number(id) === item.number)
+      return JSON.stringify([organization, "issue", item.number]);
+  } catch { /* Unrecognized links retain exact identity; never join by number alone. */ }
+  return item.url;
+}
+
 const workItemIdentity = (item: InboxItem | LinkedWorkItem) => JSON.stringify([
   providerOf(item),
-  providerOf(item) === "github" ? [item.repo.trim().toLowerCase(), item.kind, item.number] : item.url,
+  providerOf(item) === "github" ? [item.repo.trim().toLowerCase(), item.kind, item.number] : providerOf(item) === "azuredevops" ? azureWorkItemIdentity(item) : item.url,
 ]);
 
 export type WorkItemIndex<T> = Map<string, Map<string, Set<T>>>;

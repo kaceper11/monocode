@@ -100,7 +100,8 @@ import {
   loadInboxSource,
   pruneInboxFilters,
   saveInboxFilters,
-  resolveInboxSource,
+  loadInboxSearch,
+  saveInboxSearch,
   saveInboxConnections,
   saveInboxSource,
   visibleInboxSources,
@@ -378,7 +379,7 @@ export function InboxView({
   const [groupColors] = useState(loadTabGroupColors);
   const [groupCustomColors] = useState(loadTabGroupCustomColors);
 
-  const [searchInput, setSearchInput] = useState("");
+  const [searchInput, setSearchInput] = useState(loadInboxSearch);
   const [items, setItems] = useState<InboxItem[]>(
     () => peekInboxForRail(recents, cwd)?.items ?? [],
   );
@@ -399,7 +400,7 @@ export function InboxView({
   const [filters, setFilters] = useState(loadInboxFilters);
   const [connections, setConnections] = useState(loadInboxConnections);
   const [source, setSource] = useState(() =>
-    resolveInboxSource(loadInboxSource(), connections),
+    loadInboxSource(),
   );
   const [filterMenu, setFilterMenu] = useState<{ x: number; y: number } | null>(
     null,
@@ -613,23 +614,6 @@ export function InboxView({
   useEffect(() => {
     saveInboxConnections(connections);
   }, [connections]);
-
-  // The initial source is resolved against cached status, so storage can still
-  // name a provider this view has already fallen back from.
-  useEffect(() => {
-    saveInboxSource(source);
-    // Mount only: the temporary switch to GitHub for a linked target must not
-    // be persisted.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Disconnecting can pull the tab out from under the current selection.
-  useEffect(() => {
-    const next = resolveInboxSource(source, connections);
-    if (next === source) return;
-    setSource(next);
-    saveInboxSource(next);
-  }, [connections, source]);
 
   const visibleSources = visibleInboxSources(connections);
   const connectableSources = connectableInboxSources(connections);
@@ -926,7 +910,7 @@ export function InboxView({
             <Search className="pointer-events-none absolute left-2 size-3 shrink-0 opacity-50" />
             <input
               value={searchInput}
-              onChange={(event) => setSearchInput(event.target.value)}
+              onChange={(event) => { setSearchInput(event.target.value); saveInboxSearch(event.target.value); }}
               placeholder="Filter inbox"
               aria-label="Filter inbox"
               spellCheck={false}

@@ -1,3 +1,4 @@
+import { planningItems, type PlanningPeriod } from "./planning";
 import type { InboxRelationship } from "./inboxFilters";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -83,6 +84,9 @@ export type InboxProvider =
   | "azuredevops";
 
 export type InboxItem = Omit<GithubWorkItem, "kind"> & {
+  planningPeriods?: PlanningPeriod[];
+  /** Period membership used to hydrate tasks, not a standalone relationship match. */
+  planningContextOnly?: boolean;
   account?: string;
   kind: InboxKind;
   projectPath: string;
@@ -170,6 +174,9 @@ export type GithubWorkItemQuery = {
 };
 
 export type InboxQuery = Omit<GithubWorkItemQuery, "kind"> & {
+  relationships?: InboxRelationship[];
+  periods?: PlanningPeriod[];
+  relationship?: InboxRelationship;
   linearHiddenTeamIds?: string[];
   azureRelationship?: InboxRelationship;
   jiraRelationship?: Exclude<InboxRelationship, "reviewing">;
@@ -244,7 +251,7 @@ export function inboxListCacheKey(
     .join("|");
   const teams = [...(query.linearHiddenTeamIds ?? [])].sort().join(",");
   const jiraProjects = [...(query.jiraHiddenProjectIds ?? loadHiddenJiraProjectIds())].sort().join(",");
-  return `${query.assignedToMe ? 1 : 0}:${query.state}:${paths}:${teams}:${query.azureRelationship ?? "legacy"}:${query.jiraRelationship ?? "legacy"}:${jiraProjects}:${inboxIntegrationCacheKey()}`;
+  return `${query.assignedToMe ? 1 : 0}:${query.state}:${paths}:${teams}:${query.azureRelationship ?? "legacy"}:${query.jiraRelationship ?? "legacy"}:${jiraProjects}:${JSON.stringify(query.relationships ?? null)}:${query.relationship ?? ""}:${JSON.stringify(query.periods ?? [])}:${query.search}:${inboxIntegrationCacheKey()}`;
 }
 
 export function peekInboxList(
@@ -702,6 +709,30 @@ async function fetchInboxItems(
   projects: readonly { path: string }[],
   query: InboxQuery,
 ): Promise<InboxListResult> {
+  if (query.periods?.length) {
+    const roles = query.relationships ?? [];
+    const [result, membership] = await Promise.all([
+      planningItems(query.periods, roles),
+      roles.length ? planningItems(query.periods, []) : Promise.resolve(null),
+    ]);
+    return {
+      errors: { ...membership?.errors, ...result.errors },
+      items: dedupeInboxItems([
+        ...result.items,
+        ...(membership?.items ?? []).map(item => ({ ...item, planningContextOnly: true })),
+      ], projects.map(p => p.path)),
+    };
+  }
+  if (query.relationships) {
+    const roles = query.relationships.includes("related")
+      ? ["assigned", "created", "reviewing"] as const : query.relationships;
+    const results = await Promise.all((roles.length ? roles : ["all" as const]).map(relationship =>
+      fetchInboxItems(projects, { ...query, relationships: undefined, relationship,
+        assignedToMe: relationship === "assigned", azureRelationship: relationship,
+        jiraRelationship: relationship === "reviewing" ? "all" : relationship })));
+    return { items: dedupeInboxItems(results.flatMap(r => r.items), projects.map(p => p.path)),
+      errors: Object.assign({}, ...results.map(r => r.errors)) };
+  }
   const unique = uniqueInboxProjects(projects);
   const preferredPaths = unique.map((project) => project.path);
   const discovery = await Promise.allSettled(
@@ -714,9 +745,10 @@ async function fetchInboxItems(
   );
   const grouped = groupProjectsByRepo(resolved);
   const githubJobs = grouped.flatMap((project) =>
-    (["issue", "pr"] as const).map(async (kind) => {
+    (["issue", "pr"] as const).filter(kind => query.relationship !== "reviewing" || kind === "pr").map(async (kind) => {
       const items = await listGithubWorkItems(project.path, project.repo, {
         ...query,
+        search: [query.search, query.relationship === "created" ? "author:@me" : query.relationship === "reviewing" ? "review-requested:@me" : ""].filter(Boolean).join(" "),
         kind,
       });
       return items.map((item) => ({
@@ -739,7 +771,7 @@ async function fetchInboxItems(
 
   let linearItems: InboxItem[] = [];
   try {
-    if ((unique.length > 0 || !query.azureRelationship) && (await linearConnected()).connected) {
+    if (query.relationship !== "reviewing" && (query.relationship || unique.length > 0 || !query.azureRelationship) && (await linearConnected()).connected) {
       linearItems = await fetchLinearInboxItems(query);
     }
   } catch (error) {
@@ -750,7 +782,7 @@ async function fetchInboxItems(
   try {
     const status = await jiraConnected();
     if (status.connected) {
-      if (atlassianCapable(status, "Jira")) jiraItems = await fetchJiraInboxItems(query);
+      if (query.relationship !== "reviewing" && atlassianCapable(status, "Jira")) jiraItems = await fetchJiraInboxItems(query);
     } else {
       errors.jira = "Connect Jira Cloud in Settings to see assigned issues.";
     }
@@ -760,7 +792,7 @@ async function fetchInboxItems(
 
   let gitlabItems: InboxItem[] = [];
   try {
-    if ((unique.length > 0 || !query.azureRelationship) && (await gitlabConnected()).connected) {
+    if ((query.relationship || unique.length > 0 || !query.azureRelationship) && (await gitlabConnected()).connected) {
       const gitlab = await fetchRepositoryInboxItems(
         "gitlab",
         unique,
@@ -841,6 +873,14 @@ async function fetchRepositoryInboxItems(
     resolved.filter((project) => project.repo.length > 0),
   );
 
+  if (provider === "gitlab" && query.relationship && query.relationship !== "all") {
+    const kinds = query.relationship === "reviewing" ? ["pr"] as const : ["issue", "pr"] as const;
+    const jobs = kinds.map(async kind => {
+      const rows = await invoke<GitlabWorkItem[]>("gitlab_relationship_items", { kind, relationship: query.relationship });
+      return rows.map(row => gitlabWorkItemToInboxItem(row, grouped.find(p => p.repo === row.repo)?.path ?? "", row.repo));
+    });
+    return collectInboxResults(await Promise.allSettled(jobs), preferredPaths, true);
+  }
   if (provider === "azuredevops" && query.azureRelationship && query.azureRelationship !== "all") {
     const localPathByRepo = new Map(grouped.map(project => [project.repo.toLowerCase(), project.path]));
     const relationship = query.azureRelationship;
@@ -912,6 +952,7 @@ async function fetchLinearInboxItems(query: InboxQuery): Promise<InboxItem[]> {
   }
   const issues = await listLinearIssues({
     assignedToMe: query.assignedToMe,
+    relationship: query.relationship,
     state: query.state,
     teamIds: teamIds ?? [],
     limit: query.state === "all" ? INBOX_ALL_LIMIT : undefined,

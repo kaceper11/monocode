@@ -487,12 +487,12 @@ describe("inboxFetchState", () => {
 });
 
 describe("pruneInboxFilters", () => {
-  it("drops hidden projects that are no longer in the rail", () => {
+  it("retains hidden projects that are temporarily absent from the rail", () => {
     const pruned = pruneInboxFilters(
       { ...DEFAULT_INBOX_FILTERS, hiddenProjects: ["/tmp/web", "/tmp/gone"] },
       ["/tmp/web"],
     );
-    expect(pruned.hiddenProjects).toEqual(["/tmp/web"]);
+    expect(pruned.hiddenProjects).toEqual(["/tmp/web", "/tmp/gone"]);
   });
 });
 

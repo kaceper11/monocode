@@ -498,7 +498,11 @@ fn item_path(repo: &str, kind: &str, number: i64) -> String {
     )
 }
 
-fn parse_work_items(value: &Value, kind: &str, repo: &str) -> Result<Vec<GitlabWorkItem>, String> {
+pub(crate) fn parse_work_items(
+    value: &Value,
+    kind: &str,
+    repo: &str,
+) -> Result<Vec<GitlabWorkItem>, String> {
     let rows = value
         .as_array()
         .ok_or_else(|| "GitLab did not return work items".to_string())?;
@@ -1054,7 +1058,7 @@ pub(crate) fn gitlab_repo_for(root: &Path, gitlab_url: &str) -> Result<String, S
         .ok_or_else(|| "No GitLab remote matches the configured host".to_string())
 }
 
-fn project_from_remote(remote: &str, gitlab_url: &str) -> Option<String> {
+pub(crate) fn project_from_remote(remote: &str, gitlab_url: &str) -> Option<String> {
     let configured = configured_remote(gitlab_url)?;
     let (authority, mut path) = remote_authority_path(remote)?;
     if host_without_port(&authority) != host_without_port(&configured.authority) {
@@ -1421,5 +1425,69 @@ mod tests {
         assert_eq!(diff.files[0].path, "src/new.ts");
         assert!(diff.patch.contains("rename from src/old.ts"));
         assert!(diff.patch.contains("@@ -1 +1 @@"));
+    }
+}
+
+#[tauri::command]
+pub async fn gitlab_relationship_items(
+    app: AppHandle,
+    kind: String,
+    relationship: String,
+) -> Result<Vec<GitlabWorkItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = require_config(&app)?;
+        validate_kind(&kind)?;
+        let suffix = relationship_suffix(&config, &kind, &relationship)?;
+        let resource = resource_for_kind(&kind);
+        let response = gitlab_get(
+            &config,
+            &format!("/{resource}?per_page=100&order_by=updated_at&sort=desc{suffix}"),
+        )?;
+        let mut repos = std::collections::HashMap::new();
+        let mut items = Vec::new();
+        for row in response
+            .value
+            .as_array()
+            .ok_or("GitLab did not return items")?
+        {
+            let project = row["project_id"]
+                .as_i64()
+                .ok_or("GitLab item has no project")?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = repos.entry(project) {
+                let result = gitlab_get(&config, &format!("/projects/{project}"))?;
+                entry.insert(
+                    result.value["path_with_namespace"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            }
+            if let Some(item) = parse_work_item(row, &kind, &repos[&project]) {
+                items.push(item);
+            }
+        }
+        Ok(items)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub(crate) fn relationship_suffix(
+    config: &GitlabConfig,
+    kind: &str,
+    relationship: &str,
+) -> Result<String, String> {
+    match relationship {
+        "all" => Ok("&scope=all".into()),
+        "created" => Ok("&scope=created_by_me".into()),
+        "assigned" => Ok("&scope=assigned_to_me".into()),
+        "reviewing" if kind == "pr" => {
+            let user = gitlab_get(config, "/user")?;
+            let id = user.value["id"]
+                .as_i64()
+                .ok_or("GitLab did not identify the current user")?;
+            Ok(format!("&scope=all&reviewer_id={id}"))
+        }
+        _ => Err("This relationship is unavailable for this item kind".into()),
     }
 }

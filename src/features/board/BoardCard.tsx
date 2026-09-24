@@ -175,7 +175,7 @@ function CardMenu({
       {card.kind === "item" && !anySession ? (
         <MenuRow
           icon={Play}
-          label="Start work"
+          label={card.itemKind === "pr" ? "Create review" : "Create task"}
           onClick={run({ kind: "start" })}
         />
       ) : null}
@@ -554,7 +554,7 @@ export function BoardCardView({
               onClick={() => onAction(card, { kind: "start" })}
             >
               <Play className="size-3" strokeWidth={2} />
-              Start work
+              {card.itemKind === "pr" ? "Create review" : "Create task"}
             </button>
           ) : null}
           {showFixCi ? (

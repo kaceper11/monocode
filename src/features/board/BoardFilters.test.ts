@@ -3,10 +3,11 @@ import { act, createElement, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import * as taskOps from "./taskOps";
+import * as azureDevOps from "../inbox/model/azureDevOps";
 import { deliveryKey } from "./delivery";
 import { BoardView } from "./BoardView";
 import { addTask, loadBoard, updateTask } from "./boardStore";
-import type { InboxItem } from "../inbox/model/githubTasks";
+import { listInboxItems, peekInboxList, type InboxItem } from "../inbox/model/githubTasks";
 
 let submitTask: ComponentProps<typeof import("./NewTaskDialog").NewTaskDialog>["onSubmit"];
 vi.mock("./NewTaskDialog", async (original) => {
@@ -36,7 +37,7 @@ vi.mock("./useInboxConnections", () => ({
 vi.mock("../inbox/model/githubTasks", async (original) => ({
   ...(await original<typeof import("../inbox/model/githubTasks")>()),
   listInboxItems: vi.fn(async () => ({ items, errors: {} })),
-  peekInboxList: () => ({ items, errors: {} }),
+  peekInboxList: vi.fn(() => ({ items, errors: {} })),
 }));
 
 const items: InboxItem[] = ["jira", "linear"].map((provider, index) => ({
@@ -137,10 +138,10 @@ it("filters provider cards and restores saved statuses after reopening Board", a
     sections.map(
       (section) => section.querySelector("summary span")?.textContent,
     ),
-  ).toEqual(["Provider status", "Project", "Groups", "Display"]);
+  ).toEqual(["Relationship", "Provider status", "Project", "Groups", "Display"]);
   expect(sections.every((section) => !section.open)).toBe(true);
-  await act(async () => sections[0]!.querySelector("summary")!.click());
-  expect(sections[0]!.open).toBe(true);
+  await act(async () => sections[1]!.querySelector("summary")!.click());
+  expect(sections[1]!.open).toBe(true);
   const jiraGroup = document.querySelector('[aria-label="Jira statuses"]')!;
   await click("In Review", jiraGroup);
   expect(container.textContent).toContain("jira review ticket");
@@ -173,7 +174,7 @@ it("filters provider cards and restores saved statuses after reopening Board", a
       .querySelector("details summary")!
       .dispatchEvent(new MouseEvent("click", { bubbles: true })),
   );
-  await click("Jira review");
+  // The active selection is restored automatically; no preset click is needed.
   expect(container.textContent).not.toContain("linear review ticket");
   const statusSection = [
     ...document.querySelectorAll<HTMLDetailsElement>("details"),
@@ -316,4 +317,70 @@ it("refreshes Board immediately when Jira connection or project filters change",
   vi.mocked(listInboxItems).mockClear();
   await act(async () => window.dispatchEvent(new Event("monocode:jira-change")));
   expect(listInboxItems).toHaveBeenCalledWith(expect.anything(), expect.anything(), { force: true });
+});
+
+
+it("shows one initial loading state and retains cards during background refresh", async () => {
+  vi.mocked(peekInboxList).mockReturnValue(undefined);
+  let resolve!: (value: { items: InboxItem[]; errors: {} }) => void;
+  vi.mocked(listInboxItems).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  await renderBoard();
+  expect(container.textContent).toContain("Loading board…");
+  expect(container.textContent).not.toContain("Nothing here");
+  expect(container.textContent).not.toContain("jira review ticket");
+  await act(async () => resolve({ items, errors: {} }));
+  expect(container.textContent).not.toContain("Loading board…");
+  expect(container.textContent).toContain("jira review ticket");
+  vi.mocked(listInboxItems).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  await act(async () => button("Refresh").click());
+  expect(container.textContent).toContain("jira review ticket");
+  expect(container.textContent).not.toContain("Loading board…");
+  await act(async () => resolve({ items, errors: {} }));
+});
+
+
+it("waits for initial PR and CI probes before revealing cards", async () => {
+  const ws = { id: "delayed-ws", projectPath: "/delayed", worktreePath: "/delayed-wt", branch: "feature", base: "main" };
+  addTask({ title: "Waiting for checks", links: [], workstreams: [ws] });
+  let finish!: () => void;
+  vi.spyOn(taskOps, "probeWorkstream").mockImplementation(() => new Promise(resolve => {
+    finish = () => resolve({ pr: null, checks: [], requestKey: deliveryKey(ws), fetchedAt: Date.now() });
+  }));
+  await renderBoard();
+  expect(container.textContent).toContain("Loading board…");
+  expect(container.textContent).not.toContain("Waiting for checks");
+  await act(async () => finish());
+  expect(container.textContent).not.toContain("Loading board…");
+  expect(container.textContent).toContain("Waiting for checks");
+});
+
+it("keeps Needs action as a persistent top-bar toggle", async () => {
+  await renderBoard();
+  expect(button("Needs action").getAttribute("aria-pressed")).toBe("false");
+  await click("Needs action");
+  expect(button("Needs action").getAttribute("aria-pressed")).toBe("true");
+  expect(button("Board filters").getAttribute("aria-pressed")).toBe("false");
+  await act(async () => root.render(null));
+  await renderBoard();
+  expect(button("Needs action").getAttribute("aria-pressed")).toBe("true");
+  await click("Board filters");
+  expect(document.querySelector('[role="menuitemcheckbox"][aria-label="Needs action only"]')).toBeNull();
+});
+
+
+it("waits for standalone Azure PR checks discovered after tickets finish", async () => {
+  const pr: InboxItem = { ...items[0], provider: "azuredevops", kind: "pr", number: 84,
+    title: "Delayed Azure pull request", url: "https://dev.azure.com/org/project/_git/repo/pullrequest/84",
+    repo: "org/project/repo", sourceRefName: "refs/heads/feature", state: "open" };
+  vi.mocked(peekInboxList).mockReturnValue(undefined);
+  vi.mocked(listInboxItems).mockResolvedValueOnce({ items: [pr], errors: {} });
+  let finish!: () => void;
+  vi.spyOn(azureDevOps, "azureDevOpsBranchChecks").mockImplementation(() => new Promise(resolve => { finish = () => resolve([]); }));
+  await renderBoard();
+  expect(azureDevOps.azureDevOpsBranchChecks).toHaveBeenCalled();
+  expect(container.textContent).toContain("Loading board…");
+  expect(container.textContent).not.toContain(pr.title);
+  await act(async () => finish());
+  expect(container.textContent).not.toContain("Loading board…");
+  expect(container.textContent).toContain(pr.title);
 });

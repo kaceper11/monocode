@@ -1035,3 +1035,57 @@ mod tests {
         }
     }
 }
+
+/// Resolve the PR's exact repository before the review workflow fetches its head.
+#[tauri::command]
+pub async fn task_review_remote(
+    app: AppHandle,
+    cwd: String,
+    provider: Provider,
+    repo: String,
+    pr_url: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        let (project, name) = if provider == Provider::Azuredevops {
+            let (project, name) = az::split_repo(&repo)?;
+            (project, name)
+        } else {
+            (String::new(), repo)
+        };
+        let binding = CiBinding {
+            provider: provider.clone(),
+            repo: name,
+            project,
+            definition_ids: vec![],
+            host: String::new(),
+        };
+        let expected = source(&app, &root, &provider, Some(&binding))?;
+        pinned_number(Some(&pr_url), &expected)?.ok_or("A review needs a PR URL")?;
+        if provider == Provider::Github {
+            return crate::fs::remote_matching_github_url(
+                &root,
+                &format!("https://{}/{}", expected.host, expected.repo),
+            )
+            .ok_or_else(|| "No local remote matches this PR repository".into());
+        }
+        let remotes = git_run(&root, &["remote", "-v"]).ok_or("Cannot list repository remotes")?;
+        for line in remotes.lines() {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            if parts.len() < 3 || parts[2] != "(fetch)" {
+                continue;
+            }
+            let matched = if provider == Provider::Gitlab {
+                gl::project_from_remote(parts[1], &expected.host)
+            } else {
+                az::project_repo_from_remote(parts[1], &expected.host)
+            };
+            if matched.as_deref() == Some(expected.repo.as_str()) {
+                return Ok(parts[0].to_string());
+            }
+        }
+        Err("No local remote matches this PR repository".into())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}

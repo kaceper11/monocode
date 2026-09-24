@@ -116,7 +116,7 @@ it("adds a chosen repository directly and accepts an editable branch", async () 
   await submit();
   expect(props.onSubmit).toHaveBeenCalledWith(
     expect.objectContaining({
-      workstreams: [{ projectPath: "/api", branch: "mc/custom", base: "HEAD" }],
+      workstreams: [{ projectPath: "/api", branch: "custom", base: "HEAD" }],
     }),
   );
 });

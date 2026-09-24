@@ -275,3 +275,16 @@ it("rebinds only the chosen legacy link and retains saved context and other link
   expect(root.additionalItems[0]).toBe(linked);
   expect(bindLinkedWorkItemAccount(root, { ...linked, url: "https://example.test/items/8" }, "chosen", "https://example.test")).toBe(root);
 });
+
+it("matches Azure project and organization work-item URLs without crossing organizations or accounts", () => {
+  const item = { provider: "azuredevops", kind: "issue", number: 193, repo: "Cash", account: "ada", url: "https://dev.azure.com/acme/Cash/_workitems/edit/193" } as InboxItem;
+  const linked = linkedWorkItemFromInboxItem(item)!;
+  for (const url of ["https://dev.azure.com/acme/_workitems/edit/193", "https://acme.visualstudio.com/Cash/_workitems/edit/193?view=edit"]) {
+    const changed = { ...item, url };
+    expect(inboxItemMatchesLinkedWorkItem(changed, linked)).toBe(true);
+    expect(relatedFromIndex(changed, indexByWorkItem([linked], link => [link]))).toEqual([linked]);
+  }
+  expect(inboxItemMatchesLinkedWorkItem({ ...item, account: "bob" }, linked)).toBe(false);
+  expect(inboxItemMatchesLinkedWorkItem({ ...item, url: "https://dev.azure.com/other/Cash/_workitems/edit/193" }, linked)).toBe(false);
+  expect(inboxItemMatchesLinkedWorkItem({ ...item, url: "https://attacker.test/acme/_workitems/edit/193" }, linked)).toBe(false);
+});

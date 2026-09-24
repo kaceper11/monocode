@@ -4085,7 +4085,7 @@ fn gh_repo_view_url(root: &Path) -> Option<String> {
         .filter(|url| !url.trim().is_empty())
 }
 
-fn remote_matching_github_url(root: &Path, url: &str) -> Option<String> {
+pub(crate) fn remote_matching_github_url(root: &Path, url: &str) -> Option<String> {
     let remotes = git_stdout(root, &["remote", "-v"])?;
     let wanted = normalize_github_remote_url(url);
     for line in remotes.lines() {
@@ -4615,9 +4615,6 @@ fn git_branches_for(root: &Path) -> GitBranches {
                 continue;
             };
             if remote.is_empty() || name.is_empty() || name == "HEAD" || name.ends_with("/HEAD") {
-                continue;
-            }
-            if local_names.contains(name) {
                 continue;
             }
             branches.push(GitBranchEntry {
@@ -8625,7 +8622,7 @@ mod tests {
             .find(|branch| branch.name == "feature")
             .unwrap();
         assert_eq!(remote.remote.as_deref(), Some("origin"));
-        assert!(!listed
+        assert!(listed
             .branches
             .iter()
             .any(|branch| branch.name == "main" && branch.remote.is_some()));
@@ -8635,4 +8632,108 @@ mod tests {
         );
         assert_eq!(git_head_branch(&repo.0).as_deref(), Some("feature"));
     }
+
+    #[test]
+    fn task_branch_uses_explicit_base_and_rejects_dirty_or_changed_checkout() {
+        let dir = tmp("task-branch");
+        assert!(init_git_commit(&dir.0, &[("a.txt", "main\n")]));
+        let main = git_head_branch(&dir.0).unwrap();
+        git_checked(&dir.0, &["checkout", "-b", "base"]).unwrap();
+        std::fs::write(dir.0.join("base.txt"), "base").unwrap();
+        git_checked(&dir.0, &["add", "."]).unwrap();
+        git_checked(&dir.0, &["commit", "-m", "base"]).unwrap();
+        let base = git_run(&dir.0, &["rev-parse", "HEAD"]).unwrap();
+        git_checkout_for(&dir.0, &main, None).unwrap();
+        assert_eq!(
+            task_branch_for(&dir.0, &main, "topic", "base", "switch").unwrap(),
+            "topic"
+        );
+        assert_eq!(git_run(&dir.0, &["rev-parse", "HEAD"]).unwrap(), base);
+        assert!(task_branch_for(&dir.0, &main, "another", "HEAD", "switch")
+            .unwrap_err()
+            .contains("changed"));
+        std::fs::write(dir.0.join("dirty.txt"), "keep me").unwrap();
+        assert!(task_branch_for(&dir.0, "topic", &main, "HEAD", "switch")
+            .unwrap_err()
+            .contains("Commit or stash"));
+        assert!(task_branch_for(&dir.0, "topic", "topic", "HEAD", "update").is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("dirty.txt")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(git_head_branch(&dir.0).as_deref(), Some("topic"));
+    }
+}
+
+#[tauri::command]
+pub async fn git_refresh_branches(cwd: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_checked(&expand_home(&cwd), &["fetch", "--all"])
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn git_task_branch(
+    cwd: String,
+    expected_branch: String,
+    name: String,
+    base: String,
+    action: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        task_branch_for(&expand_home(&cwd), &expected_branch, &name, &base, &action)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn task_branch_for(
+    root: &Path,
+    expected: &str,
+    name: &str,
+    base: &str,
+    action: &str,
+) -> Result<String, String> {
+    if git_head_branch(root).as_deref() != Some(expected) {
+        return Err("The working copy branch changed. Refresh before retrying.".into());
+    }
+    let status =
+        git_run(root, &["status", "--porcelain"]).ok_or("Cannot read working copy status")?;
+    if !status.trim().is_empty() {
+        return Err(
+            "Commit or stash working copy changes before changing or updating its branch.".into(),
+        );
+    }
+    if action == "update" {
+        git_checked(root, &["pull", "--ff-only"])?;
+        return Ok(expected.to_string());
+    }
+    if action != "switch" {
+        return Err("Unknown branch action".into());
+    }
+    if let Some(remote_ref) = name.strip_prefix("refs/remotes/") {
+        let (remote, branch) = remote_ref.split_once('/').ok_or("Invalid remote branch")?;
+        if !git_remote_names(root).iter().any(|r| r == remote) {
+            return Err("Remote no longer exists".into());
+        }
+        return git_checkout_for(root, branch, Some(remote));
+    }
+    let name = git_branch_name(root, name)?;
+    if git_ref_exists(root, &format!("refs/heads/{name}")) {
+        return git_checkout_for(root, &name, None);
+    }
+    let commit = git_run(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{base}^{{commit}}"),
+        ],
+    )
+    .ok_or("Base branch could not be resolved")?;
+    git_switch(root, &["checkout", "-b", &name, commit.trim()])?;
+    Ok(name)
 }

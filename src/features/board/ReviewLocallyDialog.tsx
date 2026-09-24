@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { useId, useMemo, useState } from "react";
 import { Modal } from "../../shared/ui/Modal";
 import { Checkbox } from "../../shared/ui/Checkbox";
@@ -6,7 +7,8 @@ import { GitPullRequest, LoaderCircle } from "../../shared/ui/icons";
 import { projectName } from "../../shared/lib/paths";
 import { sameProjectPath, type RecentProject } from "../projects/model/recents";
 import type { InboxItem } from "../inbox/model/githubTasks";
-import { linkedWorkItemFromInboxItem } from "../sessions/model/sessionWorkItem";
+import { inboxItemMatchesLinkedWorkItem } from "../sessions/model/sessionWorkItem";
+import { boardLinkFromInboxItem } from "./boardData";
 import type { LinkedWorkItem } from "../sessions/model/session";
 import type { TaskWorkstreamSpec } from "./NewTaskDialog";
 import { workstreamProjectOptions } from "./NewTaskDialog";
@@ -19,7 +21,7 @@ import {
 } from "./boardStore";
 import { prHeadRemoteRef } from "./taskOps";
 import { createWorktree } from "../source-control/model/worktrees";
-import { gitFetchBranch, gitRemotes } from "../../platform/tauri/fs";
+import { gitFetchBranch } from "../../platform/tauri/fs";
 import { LAYER } from "../../shared/lib/layers";
 
 /** Providers that expose a fetchable PR head ref. */
@@ -98,12 +100,12 @@ export function ReviewLocallyDialog({
     try {
       if (loadBoard().tasks.filter((task) => !task.archived).length >= MAX_TASKS)
         throw new Error("Board is full — archive some tasks first.");
-      const remotes = await gitRemotes(projectPath);
-      const remote = remotes.includes("origin") ? "origin" : remotes[0];
-      if (!remote)
-        throw new Error(
-          `${projectName(projectPath)} has no git remote to fetch the PR from.`,
-        );
+      const existing = loadBoard().tasks.find(task => !task.archived && task.links.some(link =>
+        [link, ...(link.additionalItems ?? [])].some(ref => inboxItemMatchesLinkedWorkItem(item, ref))));
+      if (existing) { onCreated(existing.id); onClose(); return; }
+      const remote = await invoke<string>("task_review_remote", {
+        cwd: projectPath, provider: item.provider, repo: item.repo, prUrl: item.url,
+      });
       const branch = `pr/${item.number}`;
       // A branch serves one lane board-wide — an archived review task's
       // lane still owns its worktree, so claims include archived tasks.
@@ -137,7 +139,7 @@ export function ReviewLocallyDialog({
         `Review: ${item.title}`.trim() === "Review:"
           ? `Review PR #${item.number}`
           : `Review: ${item.title}`;
-      const linked = linkedWorkItemFromInboxItem(item);
+      const linked = boardLinkFromInboxItem(item);
       const links = linked ? [linked] : [];
       let worktreePath: string;
       let sessionIds: string[] = [];
@@ -171,6 +173,7 @@ export function ReviewLocallyDialog({
             // Probes resolve the PR by url — `pr/<N>` never matches the
             // PR's real head branch name.
             prUrl: item.url,
+            prProvider: item.provider as "github" | "gitlab" | "azuredevops",
           },
         ],
       });
