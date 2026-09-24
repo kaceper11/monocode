@@ -24,8 +24,9 @@ it("pulls each exact checkout, continues after failure and reports each result",
   await act(async () => button("Pull all").click());
   expect(gitTaskBranch).toHaveBeenNthCalledWith(1, "/repo-wt", "feature", "feature", "main", "update");
   expect(gitTaskBranch).toHaveBeenNthCalledWith(2, "/second-wt", "topic", "topic", "main", "update");
-  expect(host.textContent).toContain("repo: Error: Branch diverged");
-  expect(host.textContent).toContain("second: Pulled");
+  expect(host.textContent).toContain("repo: Pull failed");
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain("Branch diverged");
+  expect(host.textContent).toContain("second: Pull completed");
 });
 
 it("deduplicates fetches and does not pull new or busy working copies", async () => {
@@ -55,4 +56,15 @@ it("shares in-flight exclusion with per-row controls", async () => {
   await act(async () => finish());
   expect(trigger().disabled).toBe(false);
   expect(gitRefreshBranches).toHaveBeenCalledOnce();
+});
+
+it("preserves multiline errors and lets the user dismiss feedback", async () => {
+  const message = "Commit or stash working copy changes before updating.\nFiles: src/example.ts";
+  vi.mocked(gitTaskBranch).mockRejectedValueOnce(new Error(message));
+  await act(async () => root.render(createElement(TaskGitActions, { targets: [target] })));
+  await open();
+  await act(async () => button("Pull").click());
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain(message);
+  await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Dismiss message"]')!.click());
+  expect(host.querySelector('[role="alert"]')).toBeNull();
 });

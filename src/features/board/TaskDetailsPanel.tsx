@@ -1,3 +1,4 @@
+import { TaskActionFeedback } from "./TaskActionFeedback";
 import { TaskGitActions, useTaskGitBusy } from "./TaskGitActions";
 import { CiBadge, DeliverySettings } from "./DeliveryControls";
 import type { HandoffKind } from "./AgentHandoffDialog";
@@ -91,7 +92,6 @@ import {
 import {
   prIsOpen,
   resolveConflictPrompt,
-  shortError,
   worktreeOnBranch,
   type WorkstreamResult,
 } from "./taskOps";
@@ -687,7 +687,7 @@ export function TaskDetailsPanel({
       updateTask(task.id, { primarySessionId: spawned.sessionId });
       onSessionCreated(spawned.sessionId);
     } catch (error) {
-      setStreamError(shortError(error));
+      setStreamError(String(error));
     } finally {
       setCreatingSession(false);
     }
@@ -842,7 +842,7 @@ export function TaskDetailsPanel({
         })
       )
         return;
-      setStreamError(shortError(error));
+      setStreamError(String(error));
     } finally {
       setAddingStream(false);
     }
@@ -1090,9 +1090,9 @@ export function TaskDetailsPanel({
         })()}
 
         {/* Workstreams ---------------------------------------------- */}
-        <div className="mb-2 mt-5 flex items-center gap-1">
+        <div className="mb-2 mt-5">
+          <TaskGitActions all disabled={!!busyAction} targets={task.workstreams.map(ws => ({ ...ws, blocked: card.sessions.some(session => session.busy) }))}>
           <div className="min-w-0 flex-1"><SectionLabel>Repositories</SectionLabel></div>
-          <TaskGitActions all disabled={!!busyAction} targets={task.workstreams.map(ws => ({ ...ws, blocked: card.sessions.some(session => session.busy) }))} />
           <button
             type="button"
             aria-label="Add repository"
@@ -1108,6 +1108,7 @@ export function TaskDetailsPanel({
           >
             <Plus className="size-3" strokeWidth={2} />
           </button>
+          </TaskGitActions>
         </div>
         {showAddStream ? (
           <AddWorkstreamRow
@@ -1130,11 +1131,7 @@ export function TaskDetailsPanel({
             onDismiss={() => setBindOffer(null)}
           />
         ) : null}
-        {streamError ? (
-          <p role="alert" className="mt-1 whitespace-pre-wrap [overflow-wrap:anywhere] text-[11px] text-red-300">
-            {streamError}
-          </p>
-        ) : null}
+        {streamError && <TaskActionFeedback title="Could not prepare repository" message={streamError} error onDismiss={() => setStreamError("")} />}
         <div className="mt-1 flex flex-col gap-1.5">
           {(card.workstreams ?? []).map((row) => (
             <WorkstreamCard
@@ -1654,7 +1651,7 @@ function WorkstreamCard({
     try {
       await fn();
     } catch (error) {
-      setActionError(shortError(error));
+      setActionError(String(error));
     } finally {
       setPending(null);
       setArmed(false);
@@ -1821,8 +1818,8 @@ function WorkstreamCard({
         ) : null}
         <CiBadge status={status} onFix={() => onHandoff("ci")} />
       </div>
-      <div className="mt-2.5 flex min-w-0 flex-row-reverse items-start justify-between gap-2 border-t border-content/6 pt-2">
-        <TaskGitActions disabled={laneBusy} targets={[{ ...row, blocked: gitBlocked || row.sessions.some(session => session.busy) }]} />
+      <div className="mt-2.5 min-w-0 border-t border-content/6 pt-2">
+        <TaskGitActions disabled={laneBusy} targets={[{ ...row, blocked: gitBlocked || row.sessions.some(session => session.busy) }]}>
         {row.worktreePath ? (
           <button type="button" disabled={laneBusy} onClick={(event) => onEdit(event.currentTarget)} title={prettyCwd(row.worktreePath)} className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-[11px] text-content/55 hover:bg-content/6 hover:text-content disabled:opacity-40">
             <FolderTree className="size-3" /> Worktree <ChevronRight className="size-3 text-content/30" />
@@ -1833,6 +1830,7 @@ function WorkstreamCard({
             Prepare worktree
           </button>
         )}
+        </TaskGitActions>
       </div>
       {row.merging && !expanded && (
         <button
@@ -2034,23 +2032,8 @@ function WorkstreamCard({
           </p>
         </details>
       ) : null}
-      {actionError ? (
-        <p
-          role="alert"
-          className="mt-1 whitespace-pre-wrap [overflow-wrap:anywhere] text-[10px] text-red-700 dark:text-red-300"
-        >
-          {actionError}
-        </p>
-      ) : null}
-      {result ? (
-        <p
-          className={`mt-1 whitespace-pre-wrap [overflow-wrap:anywhere] text-[10px] ${
-            result.ok ? "text-content/40" : "text-red-700 dark:text-red-300"
-          }`}
-        >
-          {result.message}
-        </p>
-      ) : null}
+      {actionError && <TaskActionFeedback title="Worktree action failed" message={actionError} error onDismiss={() => setActionError("")} />}
+      {result && <TaskActionFeedback title={result.ok ? "Update completed" : "Update failed"} message={result.message} error={!result.ok} />}
     </div>
   );
 }
@@ -2089,6 +2072,7 @@ export function WorkstreamEditor({
   );
   const [branchBusy, setBranchBusy] = useState(false);
   const [targetBranch, setTargetBranch] = useState<string>();
+  const [createBase, setCreateBase] = useState<string>();
   const [bindPath, setBindPath] = useState<string>();
   const inFlight = useRef(false);
   const gitBusy = useTaskGitBusy([row.projectPath]);
@@ -2097,6 +2081,7 @@ export function WorkstreamEditor({
   blockedRef.current = busy || gitBusy || row.sessions.some(session => session.busy);
   useEffect(() => {
     setTargetBranch(undefined);
+    setCreateBase(undefined);
     setBindPath(undefined);
   }, [row.branch, row.worktreePath]);
   const [armed, setArmed] = useState(false);
@@ -2212,7 +2197,7 @@ export function WorkstreamEditor({
           preparedPath = await onPrepareWorktree({
             projectPath: row.projectPath,
             branch: choice.branch,
-            base: choice.base ?? row.base,
+            base: choice.base ?? createBase ?? row.base,
             ...(existingPath ? { worktreePath: existingPath } : {}),
           });
         } catch (cause) {
@@ -2230,6 +2215,7 @@ export function WorkstreamEditor({
         onPatch({ branch: choice.branch, worktreePath: preparedPath, prUrl: undefined });
       }
       setTargetBranch(undefined);
+      setCreateBase(undefined);
       setBindPath(undefined);
       void refresh();
     } catch (cause) {
@@ -2239,6 +2225,8 @@ export function WorkstreamEditor({
       setBranchBusy(false);
     }
   };
+  const usesExistingBranch = !!targetBranch && (targetBranch.startsWith("refs/remotes/") ||
+    branches?.branches.some(branch => !branch.remote && branch.name === targetBranch));
   const boundTree = row.worktreePath
     ? worktrees?.worktrees.find(
         (tree) => pathKey(tree.path) === pathKey(row.worktreePath!),
@@ -2252,10 +2240,16 @@ export function WorkstreamEditor({
       // SearchableSelect menus portal out of this popover — they aren't
       // "outside" clicks.
       ignore="[data-dialog-popover]"
-      className="flex flex-col gap-2 p-2"
+      className="flex flex-col gap-3 p-3"
       aria-label="Manage worktree"
     >
-      <div className="flex flex-col gap-1 text-[11px] font-medium text-content/45">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[12px] font-medium">{createBase !== undefined ? "Create new worktree" : "Manage worktree"}</span>
+        {createBase === undefined && <button type="button" disabled={blocked} onClick={() => {
+          setCreateBase(row.branch); setTargetBranch(""); setBindPath(undefined); setError("");
+        }} className="rounded-md bg-accent/10 px-2 py-1.5 text-[11px] text-accent hover:bg-accent/20 disabled:opacity-40">Create new worktree</button>}
+      </div>
+      {createBase === undefined && <div className="flex flex-col gap-1 text-[11px] font-medium text-content/45">
         <div className="flex items-center justify-between"><span>Attach existing working copy</span><button type="button" disabled={blocked} onClick={() => void refresh()}>Refresh copies</button></div>
         {worktreeError && <p role="alert" className="text-red-400">{worktreeError}</p>}
         {!worktrees && !worktreeError && <p role="status">Loading working copies…</p>}
@@ -2292,13 +2286,14 @@ export function WorkstreamEditor({
           layer={LAYER.submenu}
           minMenuWidth={280}
         />
-      </div>
-      <div className="flex items-start gap-1.5">
+      </div>}
+      <div className="flex flex-col gap-2">
         <div className="flex min-w-0 flex-1 flex-col gap-1 text-[11px] font-medium text-content/45">
-          <span>Branch</span>
+          <span>{createBase !== undefined ? "Worktree branch" : "Branch"}</span>
           <SearchableSelect
             label="Branch"
             value={targetBranch ?? row.branch}
+            placeholder="Choose or name a branch…"
             options={branchOptions}
             onChange={(value) => {
               setTargetBranch(value);
@@ -2313,31 +2308,32 @@ export function WorkstreamEditor({
             minMenuWidth={220}
           />
         </div>
-        <div className="flex w-28 shrink-0 flex-col gap-1 text-[11px] font-medium text-content/45">
-          <span>Base</span>
+        {!(createBase !== undefined && usesExistingBranch) && <div className="flex min-w-0 flex-col gap-1 text-[11px] font-medium text-content/45">
+          <span>{createBase !== undefined ? "Start from branch" : "PR base branch"}</span>
           <SearchableSelect
-            label="Base branch"
+            label={createBase !== undefined ? "Start from branch" : "Base branch"}
             disabled={blocked}
-            value={row.base}
+            value={createBase ?? row.base}
             options={baseOptions}
-            onChange={(base) => onPatch({ base })}
+            onChange={(base) => createBase !== undefined ? setCreateBase(base) : onPatch({ base })}
             searchPlaceholder="Branches…"
             layer={LAYER.submenu}
             minMenuWidth={220}
           />
-        </div>
+        </div>}
       </div>
-      {targetBranch && (
+      {(targetBranch || createBase !== undefined) && (
         <div className="flex flex-col gap-2 text-[11px]">
           <div className="flex flex-wrap gap-2 text-accent">
-            <button type="button" disabled={blocked || !row.worktreePath} onClick={() => void applyBranch("switch")}>Switch current worktree</button>
-            <button type="button" disabled={blocked} onClick={() => void applyBranch("create")}>Create separate worktree</button>
+            {createBase === undefined && <button type="button" disabled={blocked || !row.worktreePath} onClick={() => void applyBranch("switch")} className="rounded-md border border-content/10 px-2 py-1.5 hover:bg-content/5 disabled:opacity-40">Switch current worktree</button>}
+            <button type="button" disabled={blocked || !targetBranch?.trim()} onClick={() => void applyBranch("create")} className="rounded-md bg-accent/10 px-2 py-1.5 hover:bg-accent/20 disabled:opacity-40">{branchBusy ? "Preparing…" : "Create separate worktree"}</button>
+            {createBase !== undefined && <button type="button" disabled={blocked} onClick={() => { setCreateBase(undefined); setTargetBranch(undefined); setBindPath(undefined); setError(""); }}>Cancel</button>}
           </div>
-          <p className="text-content/50">A separate worktree keeps your current files and sessions in place.</p>
+          <p className="text-content/50">{usesExistingBranch ? "The worktree will use the selected branch as-is." : "Type a new branch name to create it from the starting branch."} Your current files and sessions stay in place.</p>
           {bindPath && <BindOfferBar path={bindPath} busy={blocked} onAccept={() => void applyBranch("create", bindPath)} onDismiss={() => setBindPath(undefined)} />}
         </div>
       )}
-      {row.worktreePath && !boundTree?.isMain ? (
+      {createBase === undefined && row.worktreePath && !boundTree?.isMain ? (
         <button
           type="button"
           disabled={blocked || removing}
@@ -2355,7 +2351,7 @@ export function WorkstreamEditor({
             setRemoving(true);
             setError("");
             void onRemoveWorktree()
-              .catch((cause) => setError(shortError(cause, 120)))
+              .catch((cause) => setError(String(cause)))
               .finally(() => {
                 setRemoving(false);
                 setArmed(false);
@@ -2379,11 +2375,7 @@ export function WorkstreamEditor({
             : "Delete worktree…"}
         </button>
       ) : null}
-      {error ? (
-        <p role="alert" className="whitespace-pre-wrap [overflow-wrap:anywhere] text-[10px] text-red-700 dark:text-red-300">
-          {error}
-        </p>
-      ) : null}
+      {error && <TaskActionFeedback title="Worktree action failed" message={error} error onDismiss={() => setError("")} />}
     </Popover>
   );
 }

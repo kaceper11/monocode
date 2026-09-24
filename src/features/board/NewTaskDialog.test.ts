@@ -102,17 +102,14 @@ it("adds a chosen repository directly and accepts an editable branch", async () 
   await act(async () =>
     document.querySelector<HTMLButtonElement>('[role="option"]')!.click(),
   );
-  const input = document.querySelector<HTMLInputElement>(
-    '[aria-label="Branch"]',
-  )!;
-  expect(input.placeholder).toBe("mc/checkout");
+  expect(document.querySelector('[aria-label^="Git actions"]')).toBeNull();
+  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Branch:"]')!.click());
+  const input = document.querySelector<HTMLInputElement>('[aria-label="Pick or type a branch…"]')!;
   await act(async () => {
-    Object.getOwnPropertyDescriptor(
-      HTMLInputElement.prototype,
-      "value",
-    )!.set!.call(input, "custom");
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "custom");
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
+  await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find(button => button.textContent === 'New branch "custom"')!.click());
   await submit();
   expect(props.onSubmit).toHaveBeenCalledWith(
     expect.objectContaining({

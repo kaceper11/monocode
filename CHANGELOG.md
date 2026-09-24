@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.15] - 2026-09-24
+
+### Changed
+
+- Make worktree creation explicit in task details, with a starting-branch picker for new branches and support for existing branches.
+- Show readable, dismissible Git errors and successful pull/fetch confirmations across the full repository row.
+- Simplify new-task and add-repository forms by removing Fetch/Pull controls and using the shared searchable branch picker.
+
+### Compatibility
+
+- No persistence schema changes or new dependencies. Existing worktree ownership and dirty-checkout safeguards remain in place.
+- Browser interactions were checked with mocked Git responses; native Windows/WSL execution remains unverified.
+
 ## [0.3.14] - 2026-09-24
 
 ### Changed

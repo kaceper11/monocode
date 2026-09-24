@@ -25,7 +25,7 @@ import { inboxItemRef, type InboxItem } from "../inbox/model/githubTasks";
 import { LAYER } from "../../shared/lib/layers";
 import { pathKey, prettyCwd, projectName } from "../../shared/lib/paths";
 import { sameProjectPath, type RecentProject } from "../projects/model/recents";
-import { TaskGitActions, useTaskGitBusy } from "./TaskGitActions";
+import { useTaskGitBusy } from "./TaskGitActions";
 import type { Session } from "../sessions/model/session";
 import type { LinkedWorkItem } from "../sessions/model/session";
 import { linkedWorkItemInboxKey } from "../sessions/model/sessionWorkItem";
@@ -172,7 +172,6 @@ export function WorkstreamFields({
   onChange,
   tail,
   compact,
-  blocked = false,
   layer,
   excludeWorktreePaths,
   excludeBranches,
@@ -195,7 +194,6 @@ export function WorkstreamFields({
   ) => void;
   tail: ReactNode;
   compact?: boolean;
-  blocked?: boolean;
   defaultBranch?: string;
   /** Popover layer — pass `LAYER.dialogPopover` when inside a modal. */
   layer?: number;
@@ -206,7 +204,6 @@ export function WorkstreamFields({
    * worktrees checked out on them are equally unpickable. */
   excludeBranches?: ReadonlySet<string>;
 }) {
-  const branchListId = useId();
   const gitBusy = useTaskGitBusy([draft.projectPath]);
   const { branches } = useProjectBranchesState(
     draft.projectPath,
@@ -312,7 +309,7 @@ export function WorkstreamFields({
       value={draft.branch}
       options={branchOptions}
       onChange={(value) => { const choice = taskBranchChoice(value); onChange({ branch: choice.branch, ...(choice.base ? { base: choice.base } : {}) }); }}
-      placeholder={branches ? "Choose or create branch…" : "Loading branches…"}
+      placeholder={defaultBranch}
       searchPlaceholder="Pick or type a branch…"
       creatable="New branch"
       exclude={excludeBranches}
@@ -332,7 +329,6 @@ export function WorkstreamFields({
           <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">Branch{branchSelect}</div>
           <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">{draft.worktreePath ? "PR base" : "Start from"}{baseSelect}</div>
         </div>
-        <TaskGitActions layer={layer} targets={[{ ...draft, blocked }]} />
         <button type="button" className="text-[11px] text-content/50" disabled={!draft.projectPath || gitBusy} onClick={() => void refreshWorktrees()}>Refresh copies</button>
         {worktreeError && <p role="alert" className="text-[11px] text-red-400">{worktreeError}</p>}
         {tail}
@@ -362,24 +358,10 @@ export function WorkstreamFields({
       {worktreeError && <p role="alert" className="text-[11px] text-red-400">{worktreeError}</p>}
       <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2">
         {!draft.worktreePath && (
-          <label className="min-w-0 text-[10px] text-content/50">
-            Branch
-            <input
-              aria-label="Branch"
-              list={branchListId}
-              value={draft.branch}
-              onChange={(event) => { const choice = taskBranchChoice(event.target.value); onChange({ branch: choice.branch, ...(choice.base ? { base: choice.base } : {}) }); }}
-              placeholder={defaultBranch}
-              className="mt-1 h-8 w-full min-w-0 rounded-md border border-content/10 bg-background-base px-2 text-[12px] text-content outline-none placeholder:text-content/40 focus:border-content/30"
-            />
-            <datalist id={branchListId}>
-              {branchOptions
-                .filter((option) => option.value)
-                .map((option) => (
-                  <option key={option.value} value={option.value} />
-                ))}
-            </datalist>
-          </label>
+          <div className="min-w-0">
+            <p className="mb-1 text-[10px] text-content/50">Worktree branch</p>
+            {branchSelect}
+          </div>
         )}
         <div className="min-w-0">
           <p className="mb-1 text-[10px] text-content/50">
@@ -388,13 +370,11 @@ export function WorkstreamFields({
           {baseSelect}
         </div>
       </div>
-      <div className="mt-3 border-t border-content/6 pt-2"><TaskGitActions layer={layer} targets={[{ ...draft, blocked }]} /></div>
     </div>
   );
 }
 
 export function NewTaskDialog({
-  sessions = [],
   items,
   recents,
   lanes,
@@ -612,7 +592,6 @@ export function NewTaskDialog({
         ) : (
           <section className="min-w-0">
             <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h3 className="text-[12px] font-medium text-content/75">Repositories</h3>
-              <TaskGitActions all layer={LAYER.dialogPopover} disabled={busy} targets={streams.map(stream => ({ ...stream, blocked: sessions.some(session => session.busy && pathKey(session.worktreeCwd || session.cwd) === pathKey(stream.worktreePath ?? "")) }))} />
             </div>
             <div className="flex min-w-0 flex-col gap-2">
               {streams.map((stream) => {
@@ -643,7 +622,6 @@ export function NewTaskDialog({
                   <WorkstreamFields
                     key={stream.key}
                     draft={stream}
-                    blocked={sessions.some(session => session.busy && pathKey(session.worktreeCwd || session.cwd) === pathKey(stream.worktreePath ?? ""))}
                     defaultBranch={suggestedBranch(title, [
                       ...selected.values(),
                     ])}

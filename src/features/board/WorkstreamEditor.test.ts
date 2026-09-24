@@ -105,3 +105,23 @@ it("leaves the lane unchanged when preparation fails or another edit wins the ra
   expect(patch).not.toHaveBeenCalled();
   expect(document.querySelector('[role="alert"]')?.textContent).toContain("Working copy kept at /kept-worktree");
 });
+
+it("creates a named worktree from a chosen starting branch without changing the PR base", async () => {
+  await render();
+  await act(async () => button("Create new worktree").click());
+  expect(button("Create separate worktree").disabled).toBe(true);
+  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Branch:"]')!.click());
+  const input = document.querySelector<HTMLInputElement>('[aria-label="Pick or type a branch…"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "new-feature");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await act(async () => button('New branch "new-feature"').click());
+  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label="Start from branch: main"]')!.click());
+  await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find(b => b.textContent === "existing")!.click());
+  expect(patch).not.toHaveBeenCalled();
+  await act(async () => button("Create separate worktree").click());
+  expect(prepare).toHaveBeenCalledWith({ projectPath: "/repo", branch: "new-feature", base: "existing" });
+  expect(patch).toHaveBeenCalledWith({ branch: "new-feature", worktreePath: "/new-worktree", prUrl: undefined });
+  expect(gitTaskBranch).not.toHaveBeenCalled();
+});
