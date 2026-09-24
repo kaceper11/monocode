@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.12] - 2026-09-24
+
+### Fixed
+
+- Keep the Board stable when switching between projects on an already connected WSL distribution, while retaining genuine connection progress and recovery errors.
+- Discover Automation models in the selected WSL project or worktree, preserve saved model settings, and connect background runs to their execution workspace.
+- Resolve WSL project identities and renamed folders inside Linux instead of using native Windows filesystem identities.
+- Include Board filter and task workflow improvements, Azure CI repository GUID resolution, and fixes for clipped menu and list labels.
+
+### Compatibility
+
+- No persistence schema changes. Existing WSL folders refresh their identity when opened; already renamed folders with an older native identity may need to be reopened.
+- Local regression checks and browser fixtures cover the WSL changes; live Windows/WSL acceptance remains unverified. See [the WSL audit](docs/validation/wsl-audit-2026-09-24.md).
+
 ## [0.3.11] - 2026-09-23
 
 ### Changed
