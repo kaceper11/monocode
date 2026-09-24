@@ -131,7 +131,7 @@ describe("UsageFooter provider authentication", () => {
     expect(dialog?.querySelector(".size-9")).not.toBeNull();
 
     act(() => button("Sign in to Grok Build").click());
-    expect(auth.loginHarness).toHaveBeenCalledWith("grok");
+    expect(auth.loginHarness).toHaveBeenCalledWith("grok", undefined, undefined);
     expect(dialog?.textContent).toContain("Waiting for browser…");
 
     await act(async () => finishLogin?.());
@@ -167,16 +167,51 @@ describe("UsageFooter provider authentication", () => {
     act(() => button("Claude Code usage details").click());
     act(() => button("Sign in to Claude Code").click());
     await vi.waitFor(() =>
-      expect(auth.loginHarness).toHaveBeenCalledWith("claude"),
+      expect(auth.loginHarness).toHaveBeenCalledWith("claude", "default", undefined),
     );
 
     act(() => button("Codex usage details").click());
     act(() => button("Sign in to Codex").click());
-    expect(auth.loginHarness).not.toHaveBeenCalledWith("codex");
+    expect(auth.loginHarness).not.toHaveBeenCalledWith("codex", "default", undefined);
 
     await act(async () => rejectClaude?.(new Error("Claude login failed")));
     await vi.waitFor(() =>
-      expect(auth.loginHarness).toHaveBeenCalledWith("codex"),
+      expect(auth.loginHarness).toHaveBeenCalledWith("codex", "default", undefined),
     );
   });
+});
+
+it("discards native usage after switching to a WSL worktree and keeps account actions guest-scoped", async () => {
+  let finishNative!: (value: ProviderRateLimits) => void;
+  rateLimitsFetch.fetchCodexRateLimits.mockImplementationOnce(() => new Promise(resolve => { finishNative = resolve; }));
+  const usage = (usedPercent: number): ProviderRateLimits => ({ ...connectedLimits("codex"), session: { usedPercent, windowMinutes: 300, resetsAt: Date.now() + 60_000 } });
+  const render = (cwd: string) => root.render(createElement(UsageFooter, { providers: ["codex"], project: cwd, session: { id: "same-session", harness: "codex", cwd } }));
+  await act(async () => render("C:/repo"));
+  rateLimitsFetch.fetchCodexRateLimits.mockResolvedValue(usage(20));
+  const cwd = "//wsl.localhost/Ubuntu/home/me/worktree";
+  await act(async () => render(cwd));
+  expect(rateLimitsFetch.fetchCodexRateLimits).toHaveBeenLastCalledWith("default", cwd);
+  await act(async () => finishNative(usage(99)));
+  expect(container.textContent).toContain("20%");
+  expect(container.textContent).not.toContain("99%");
+  act(() => button("Codex usage details").click());
+  act(() => button("Switch Codex account").click());
+  expect(document.body.textContent).toContain("Ubuntu account");
+  expect(document.body.textContent).not.toContain("Add account");
+});
+
+it("does not consume a queued reset after its host changes", async () => {
+  const limits: ProviderRateLimits = { ...connectedLimits("codex"), resetCredits: { availableCount: 1, credits: [{ id: "credit-1", resetType: "codexRateLimits", status: "available", grantedAt: null, expiresAt: Date.now() + 86_400_000, title: "Reset", description: null }] } };
+  rateLimitsFetch.fetchCodexRateLimits.mockResolvedValue(limits);
+  const render = (cwd: string) => root.render(createElement(UsageFooter, { providers: ["codex"], project: cwd, session: { id: "session", harness: "codex", cwd } }));
+  await act(async () => render("C:/repo"));
+  let completeRefresh!: (value: ProviderRateLimits) => void;
+  rateLimitsFetch.fetchCodexRateLimits.mockImplementationOnce(() => new Promise(resolve => { completeRefresh = resolve; }));
+  act(() => button("Refresh usage").click());
+  act(() => button("Codex usage details").click());
+  act(() => button("Use reset").click());
+  act(() => button("Confirm").click());
+  await act(async () => render("//wsl.localhost/Debian/home/me/repo"));
+  await act(async () => completeRefresh(limits));
+  expect(rateLimitsFetch.consumeCodexRateLimitResetCredit).not.toHaveBeenCalled();
 });

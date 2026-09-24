@@ -60,7 +60,7 @@ describe("ProviderSignInDialog", () => {
     expect(dialog?.querySelector(".size-9")).not.toBeNull();
 
     await act(async () => button("Sign in to Grok Build").click());
-    expect(auth.loginHarness).toHaveBeenCalledWith("grok");
+    expect(auth.loginHarness).toHaveBeenCalledWith("grok", undefined, undefined);
     expect(dialog?.textContent).toContain("Signed in to Grok Build");
 
     act(() => button("Continue").click());

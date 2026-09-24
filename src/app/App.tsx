@@ -925,6 +925,8 @@ export default function App({
     key: string;
     sessionId: string;
     harness: HarnessId;
+    cwd: string;
+    accountId?: string;
   } | null>(null);
   const seenProviderSignInRequestsRef = useRef<Set<string> | null>(null);
   const seenProviderSignInRequests =
@@ -1423,7 +1425,10 @@ export default function App({
     if (
       active?.harness === "claude" ||
       active?.harness === "codex" ||
-      active?.harness === "opencode"
+      active?.harness === "opencode" ||
+      active?.harness === "copilot" ||
+      active?.harness === "muse" ||
+      active?.harness === "devin"
     ) {
       return [active.harness];
     }
@@ -1434,6 +1439,7 @@ export default function App({
     return {
       id: active.id,
       harness: active.harness,
+      cwd: sessionWorkCwd(active),
       authRequired: latestTurnNeedsHarnessLogin(active.blocks),
       providerAccountId:
         active.providerAccountId ??
@@ -1441,7 +1447,7 @@ export default function App({
           ? DEFAULT_PROVIDER_ACCOUNT_ID
           : undefined),
     };
-  }, [active?.id, active?.harness, active?.blocks, active?.providerAccountId]);
+  }, [active?.id, active?.harness, active?.blocks, active?.providerAccountId, active?.cwd, active?.worktreeCwd]);
   const activeProviderSignInRequest = useMemo(() => {
     if (
       !active ||
@@ -1451,6 +1457,8 @@ export default function App({
       return null;
     }
     return {
+      cwd: sessionWorkCwd(active),
+      accountId: active.providerAccountId,
       key: providerSignInRequestKey(active),
       sessionId: active.id,
       harness: active.harness,
@@ -9759,6 +9767,7 @@ export default function App({
               automationsViewOpen ||
               settingsOpen ? null : (
                 <UsageFooter
+                  key={JSON.stringify([activeModelCwd, activeWslStatus.state, usageSession?.providerAccountId, active?.harness, active?.id])}
                   providers={usageProviders}
                   session={usageSession}
                   project={active?.cwd ?? projectCwd}
@@ -9842,6 +9851,8 @@ export default function App({
             <ProviderSignInDialog
               key={providerSignInRequest.key}
               harness={providerSignInRequest.harness}
+              cwd={providerSignInRequest.cwd}
+              accountId={providerSignInRequest.accountId}
               onClose={() => setProviderSignInRequest(null)}
             />
           ) : null}

@@ -4,6 +4,7 @@ import {
   useEffect,
   useRef,
   useState,
+  type ComponentProps,
   type Dispatch,
   type ReactNode,
   type SetStateAction,
@@ -15,6 +16,7 @@ import {
   fetchClaudeRateLimits,
   fetchCodexRateLimits,
   fetchOpencodeGoRateLimits,
+  fetchAdditionalRateLimits,
 } from "../../features/providers/model/rateLimitsFetch";
 import {
   errorRateLimits,
@@ -26,8 +28,15 @@ import {
   type ProviderRateLimits,
   type RateLimitProvider,
 } from "../../features/providers/model/rateLimits";
-import { HARNESS_LABEL, HARNESS_TITLE, type HarnessId } from "../../features/sessions/model/session";
-import { loginHarness, supportsHarnessLogin } from "../../integrations/harness/core/auth";
+import {
+  HARNESS_LABEL,
+  HARNESS_TITLE,
+  type HarnessId,
+} from "../../features/sessions/model/session";
+import {
+  loginHarness,
+  supportsHarnessLogin,
+} from "../../integrations/harness/core/auth";
 import {
   runningTerminalChipLabel,
   type RunningTerminal,
@@ -49,6 +58,8 @@ import {
   type ProviderAccountProvider,
 } from "../../features/providers/model/providerAccounts";
 
+import { wslLocation } from "../../shared/lib/paths";
+
 const CLOCK_MS = 30_000;
 
 export type UsageFooterSession = {
@@ -56,9 +67,21 @@ export type UsageFooterSession = {
   harness: HarnessId;
   authRequired?: boolean;
   providerAccountId?: string;
+  cwd?: string;
 };
 
-export function UsageFooter({
+export function UsageFooter(props: ComponentProps<typeof UsageFooterContent>) {
+  const destination = [
+    props.session?.cwd ?? props.project,
+    props.session?.id,
+    props.session?.harness,
+    props.session?.providerAccountId,
+    props.providers,
+  ];
+  return <UsageFooterContent key={JSON.stringify(destination)} {...props} />;
+}
+
+function UsageFooterContent({
   providers,
   session,
   project,
@@ -92,9 +115,27 @@ export function UsageFooter({
   ) => void;
   onManageAccounts?: (provider: ProviderAccountProvider) => void;
 }) {
+  const cwd = session?.cwd ?? project;
+  const wsl = cwd ? wslLocation(cwd) : undefined;
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const wantClaude = providers.includes("claude");
   const wantCodex = providers.includes("codex");
   const wantOpencode = providers.includes("opencode");
+  const additional = providers.find(
+    (provider): provider is "copilot" | "muse" | "devin" =>
+      provider === "copilot" || provider === "muse" || provider === "devin",
+  );
+  const [extra, setExtra] = useState<ProviderRateLimits>(() =>
+    idleRateLimits(additional ?? "devin"),
+  );
+  const extraRef = useRef(extra);
+  extraRef.current = extra;
   const [claude, setClaude] = useState<ProviderRateLimits>(() =>
     idleRateLimits("claude"),
   );
@@ -155,15 +196,18 @@ export function UsageFooter({
       const fetchOpencode =
         wantOpencode &&
         shouldFetchProvider(opencodeRef.current, { force, visible });
-      if (!fetchClaude && !fetchCodex && !fetchOpencode) return;
+      const fetchExtra =
+        additional && shouldFetchProvider(extraRef.current, { force, visible });
+      if (!fetchClaude && !fetchCodex && !fetchOpencode && !fetchExtra) return;
       if (force) setRefreshing(true);
       const jobs: Promise<void>[] = [];
       if (fetchClaude) {
         const accountId = claudeAccountId;
         setClaude((current) => fetchingRateLimits("claude", current));
         jobs.push(
-          fetchClaudeRateLimits(accountId).then((value) => {
-            if (accountId === claudeAccountRef.current) setClaude(value);
+          fetchClaudeRateLimits(accountId, cwd).then((value) => {
+            if (mounted.current && accountId === claudeAccountRef.current)
+              setClaude(value);
           }),
         );
       }
@@ -171,17 +215,28 @@ export function UsageFooter({
         const accountId = codexAccountId;
         setCodex((current) => fetchingRateLimits("codex", current));
         jobs.push(
-          fetchCodexRateLimits(accountId).then((value) => {
-            if (accountId === codexAccountRef.current) setCodex(value);
+          fetchCodexRateLimits(accountId, cwd).then((value) => {
+            if (mounted.current && accountId === codexAccountRef.current)
+              setCodex(value);
           }),
         );
       }
       if (fetchOpencode) {
         setOpencode((current) => fetchingRateLimits("opencode", current));
         jobs.push(
-          fetchOpencodeGoRateLimits().then((value) => {
+          fetchOpencodeGoRateLimits(cwd).then((value) => {
             setOpencode(value);
           }),
+        );
+      }
+      if (fetchExtra && additional) {
+        setExtra((current) => fetchingRateLimits(additional, current));
+        jobs.push(
+          fetchAdditionalRateLimits(additional, cwd, session?.id).then(
+            (value) => {
+              if (mounted.current) setExtra(value);
+            },
+          ),
         );
       }
       const run = Promise.allSettled(jobs)
@@ -194,6 +249,7 @@ export function UsageFooter({
       return run;
     },
     [
+      cwd,
       claudeAccountAvailable,
       claudeAccountId,
       codexAccountAvailable,
@@ -201,6 +257,8 @@ export function UsageFooter({
       wantClaude,
       wantCodex,
       wantOpencode,
+      additional,
+      session?.id,
     ],
   );
 
@@ -236,12 +294,27 @@ export function UsageFooter({
     const onVisible = () => {
       if (document.visibilityState === "visible") void refresh();
     };
+    const onUsage = (event: Event) => {
+      if (
+        (event as CustomEvent<{ sessionId: string }>).detail.sessionId !==
+        session?.id
+      )
+        return;
+      const pending = inflight.current;
+      if (pending)
+        void pending.finally(() => {
+          if (mounted.current) void refresh(true);
+        });
+      else void refresh(true);
+    };
+    window.addEventListener("monocode-provider-usage-changed", onUsage);
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       window.clearInterval(poll);
       document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("monocode-provider-usage-changed", onUsage);
     };
-  }, [refresh]);
+  }, [refresh, session?.id]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), CLOCK_MS);
@@ -251,6 +324,10 @@ export function UsageFooter({
   const consumeCodexReset = useCallback(
     async (creditId?: string) => {
       while (inflight.current) await inflight.current;
+      if (!mounted.current || codexAccountRef.current !== codexAccountId)
+        throw new Error(
+          "The usage destination changed. Reopen usage and retry.",
+        );
       setRefreshing(true);
       setCodex((current) => fetchingRateLimits("codex", current));
       let outcome: Awaited<ReturnType<typeof consumeCodexRateLimitResetCredit>>;
@@ -259,8 +336,9 @@ export function UsageFooter({
           outcome = await consumeCodexRateLimitResetCredit(
             creditId,
             codexAccountId,
+            cwd,
           );
-          setCodex(await fetchCodexRateLimits(codexAccountId));
+          setCodex(await fetchCodexRateLimits(codexAccountId, cwd));
         } catch (error) {
           const message =
             error instanceof Error
@@ -278,7 +356,7 @@ export function UsageFooter({
       await tracked;
       return outcome!;
     },
-    [codexAccountId],
+    [codexAccountId, cwd],
   );
 
   const reconnectProvider = useCallback(
@@ -289,13 +367,15 @@ export function UsageFooter({
       setLimits: Dispatch<SetStateAction<ProviderRateLimits>>,
     ) => {
       while (inflight.current) await inflight.current;
+      if (!mounted.current)
+        throw new Error(
+          "The usage destination changed. Reopen usage and retry.",
+        );
       setRefreshing(true);
       setLimits((current) => fetchingRateLimits(provider, current));
       const operation = (async () => {
         try {
-          await (accountId === "default"
-            ? loginHarness(provider)
-            : loginHarness(provider, accountId));
+          await loginHarness(provider, accountId, cwd);
           const value = await fetchLimits();
           setLimits(value);
           if (value.status !== "ok") {
@@ -320,7 +400,7 @@ export function UsageFooter({
       inflight.current = tracked.catch(() => undefined);
       await tracked;
     },
-    [],
+    [cwd],
   );
 
   const reconnectClaude = useCallback(
@@ -328,10 +408,10 @@ export function UsageFooter({
       reconnectProvider(
         "claude",
         claudeAccountId,
-        () => fetchClaudeRateLimits(claudeAccountId),
+        () => fetchClaudeRateLimits(claudeAccountId, cwd),
         setClaude,
       ),
-    [claudeAccountId, reconnectProvider],
+    [claudeAccountId, cwd, reconnectProvider],
   );
 
   const reconnectCodex = useCallback(
@@ -339,10 +419,10 @@ export function UsageFooter({
       reconnectProvider(
         "codex",
         codexAccountId,
-        () => fetchCodexRateLimits(codexAccountId),
+        () => fetchCodexRateLimits(codexAccountId, cwd),
         setCodex,
       ),
-    [codexAccountId, reconnectProvider],
+    [codexAccountId, cwd, reconnectProvider],
   );
 
   const selectAccount = useCallback(
@@ -365,7 +445,8 @@ export function UsageFooter({
   );
 
   const showOpencodeChip = wantOpencode && opencode.status !== "unavailable";
-  const showUsage = wantClaude || wantCodex || showOpencodeChip;
+  const showUsage =
+    wantClaude || wantCodex || showOpencodeChip || Boolean(additional);
   const showTerminals = terminals.length > 0;
   const showTerminalButton = Boolean(onNewTerminal || onShowTerminal);
   const terminalLabel = projectTerminalActive
@@ -387,20 +468,46 @@ export function UsageFooter({
       aria-label={ariaLabel}
       className="flex h-7 shrink-0 items-center gap-1.5 overflow-x-auto border-t border-stroke px-3 text-[11px] text-content/55"
     >
+      {wsl ? (
+        <span
+          className="shrink-0 text-content/40"
+          title={`Usage and sign-in inside WSL: ${wsl.distribution}`}
+        >
+          {wsl.distribution}
+        </span>
+      ) : null}
       {showUsage ? (
         <>
           {wantClaude ? (
             <UsageProviderChip
               limits={claude}
               now={now}
-              accounts={claudeAccounts}
+              accounts={
+                wsl
+                  ? claudeAccounts
+                      .filter((account) => account.id === "default")
+                      .map((account) => ({
+                        ...account,
+                        label: `${wsl.distribution} account`,
+                      }))
+                  : claudeAccounts
+              }
               accountId={claudeAccountId}
+              accountLabel={
+                wsl && claudeAccountId !== "default"
+                  ? "Native account (unavailable in WSL)"
+                  : undefined
+              }
               onSelectAccount={(accountId) =>
                 selectAccount("claude", accountId)
               }
-              onAddAccount={(label) => addAccount("claude", label)}
+              onAddAccount={
+                wsl ? undefined : (label) => addAccount("claude", label)
+              }
               onManageAccounts={
-                onManageAccounts ? () => onManageAccounts("claude") : undefined
+                !wsl && onManageAccounts
+                  ? () => onManageAccounts("claude")
+                  : undefined
               }
               onReconnect={reconnectClaude}
             />
@@ -410,16 +517,37 @@ export function UsageFooter({
               limits={codex}
               now={now}
               project={project}
-              accounts={codexAccounts}
+              accounts={
+                wsl
+                  ? codexAccounts
+                      .filter((account) => account.id === "default")
+                      .map((account) => ({
+                        ...account,
+                        label: `${wsl.distribution} account`,
+                      }))
+                  : codexAccounts
+              }
               accountId={codexAccountId}
+              accountLabel={
+                wsl && codexAccountId !== "default"
+                  ? "Native account (unavailable in WSL)"
+                  : undefined
+              }
               onSelectAccount={(accountId) => selectAccount("codex", accountId)}
-              onAddAccount={(label) => addAccount("codex", label)}
+              onAddAccount={
+                wsl ? undefined : (label) => addAccount("codex", label)
+              }
               onManageAccounts={
-                onManageAccounts ? () => onManageAccounts("codex") : undefined
+                !wsl && onManageAccounts
+                  ? () => onManageAccounts("codex")
+                  : undefined
               }
               onConsumeReset={consumeCodexReset}
               onReconnect={reconnectCodex}
             />
+          ) : null}
+          {additional ? (
+            <UsageProviderChip limits={extra} now={now} project={project} />
           ) : null}
           {showOpencodeChip ? (
             <UsageProviderChip limits={opencode} now={now} project={project} />
@@ -467,9 +595,18 @@ export function UsageFooter({
               <span>Terminal</span>
             </button>
           ) : null}
-          {onToggleBrowser ? <button type="button" aria-label="Toggle browser panel" title="Toggle browser panel" onClick={onToggleBrowser} className="inline-flex h-5 shrink-0 items-center gap-1.5 whitespace-nowrap rounded px-1.5 text-content/60 hover:bg-content/10 hover:text-content focus-visible:outline-2 focus-visible:outline-content">
-            <Globe className="size-3.5" strokeWidth={1.75} aria-hidden /><span>Browser</span>
-          </button> : null}
+          {onToggleBrowser ? (
+            <button
+              type="button"
+              aria-label="Toggle browser panel"
+              title="Toggle browser panel"
+              onClick={onToggleBrowser}
+              className="inline-flex h-5 shrink-0 items-center gap-1.5 whitespace-nowrap rounded px-1.5 text-content/60 hover:bg-content/10 hover:text-content focus-visible:outline-2 focus-visible:outline-content"
+            >
+              <Globe className="size-3.5" strokeWidth={1.75} aria-hidden />
+              <span>Browser</span>
+            </button>
+          ) : null}
           {commandsControl}
           {resourcesControl}
         </div>
@@ -515,7 +652,11 @@ function SessionChip({ session }: { session: UsageFooterSession }) {
     setLoginState("running");
     setLoginError(null);
     try {
-      await loginHarness(session.harness);
+      await loginHarness(
+        session.harness,
+        session.providerAccountId,
+        session.cwd,
+      );
       setOpen(false);
       setLoginState("complete");
     } catch (error) {

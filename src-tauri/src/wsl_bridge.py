@@ -412,6 +412,136 @@ def checkpoint_has_symlink(root, relative):
     return False
 
 
+def cursor_stores(request):
+    # Read SQLite beside the Linux CLI so live WAL data stays coherent.
+    import sqlite3
+    session = request["sessionId"]
+    wanted = request["toolCallIds"]
+    if not isinstance(session, str) or not session or len(session) > 240 or any(c in session for c in "/\\\0"):
+        raise ValueError("Invalid Cursor session id")
+    if not isinstance(wanted, list) or len(wanted) > 256 or any(not isinstance(v, str) or len(v) > 240 for v in wanted):
+        raise ValueError("Invalid Cursor tool call ids")
+    if not wanted:
+        return []
+    root = Path.home() / ".cursor"
+    import itertools
+    chats = root / "chats"
+    roots = itertools.chain([root / "acp-sessions"], chats.iterdir() if chats.is_dir() else [])
+    subagents = request.get("subagents", False)
+    known = request.get("knownRevisions") or {}
+    deadline = time.monotonic() + 5
+    result, total, inspected = [], 0, 0
+    for parent in roots:
+        if not parent.is_dir():
+            continue
+        for folder in (parent.iterdir() if subagents else [parent / session]):
+            inspected += 1
+            if inspected > 20000 or time.monotonic() > deadline:
+                raise ValueError("Cursor store lookup exceeded its read budget")
+            db = folder / "store.db"
+            if not db.is_file():
+                continue
+            try:
+                suffix = "?mode=ro" if Path(str(db) + "-wal").exists() else "?mode=ro&immutable=1"
+                connection = sqlite3.connect(db.as_uri() + suffix, uri=True, timeout=0.1)
+            except sqlite3.Error:
+                continue
+            try:
+                connection.execute("PRAGMA query_only=ON")
+                connection.execute("BEGIN")
+                connection.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
+                metadata = {}
+                revision = str(connection.execute("SELECT COALESCE(MAX(rowid), 0) FROM blobs").fetchone()[0])
+                if subagents:
+                    row = connection.execute("SELECT value FROM meta WHERE key='0'").fetchone()
+                    if not row or len(row[0]) > 65536:
+                        continue
+                    raw = row[0]
+                    metadata = json.loads(raw if raw.startswith("{") else bytes.fromhex(raw))
+                    info = metadata.get("subagentInfo") or {}
+                    if info.get("parentAgentId") != session or not any(cursor_ids_match(info.get("toolCallId", ""), v) for v in wanted):
+                        continue
+                    if known.get(metadata.get("agentId")) == revision:
+                        continue
+                query = "SELECT id, data FROM blobs WHERE length(data) <= 262144 AND substr(data, 1, 1) = x'7b' ORDER BY rowid DESC"
+                if subagents:
+                    query += " LIMIT 600"
+                blobs, found = [], set()
+                for blob_id, data in connection.execute(query):
+                    try:
+                        payload = json.loads(data)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(payload, dict) or not isinstance(payload.get("content", []), list):
+                        continue
+                    if not subagents:
+                        matches = {v for part in payload.get("content", []) if isinstance(part, dict) and part.get("type") == "tool-call" and isinstance(part.get("toolName"), str) and "args" in part for v in wanted if cursor_ids_match(part.get("toolCallId", ""), v)}
+                        if not matches - found:
+                            continue
+                        found.update(matches)
+                    text = data.decode("utf-8") if isinstance(data, bytes) else data
+                    total += len(text.encode("utf-8"))
+                    if total > 8 * 1024 * 1024:
+                        raise ValueError("Cursor store snapshot exceeds 8 MiB")
+                    blobs.append([str(blob_id), text])
+                    if not subagents and len(found) == len(wanted):
+                        break
+                # Rust reuses the existing parsers, preserving chronological row order.
+                result.append({"metadata": metadata, "revision": revision, "blobs": list(reversed(blobs))})
+                if not subagents:
+                    return result
+            except (sqlite3.Error, ValueError, TypeError, AttributeError):
+                if time.monotonic() > deadline or total > 8 * 1024 * 1024:
+                    raise ValueError("Cursor store snapshot exceeded its read budget")
+                continue
+            finally:
+                connection.close()
+    return result
+
+
+def cursor_ids_match(stored, wanted):
+    if not isinstance(stored, str):
+        return False
+    a, b = {v for v in stored.split() if len(v) >= 8}, {v for v in wanted.split() if len(v) >= 8}
+    return stored == wanted or wanted in a or stored in b or bool(a & b)
+
+
+def claude_usage():
+    # Credentials stay in the selected distribution; only usage crosses IPC.
+    import urllib.request
+    import urllib.error
+    prepare_environment()
+    try:
+        config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude"))
+        raw = json.loads((config / ".credentials.json").read_text())
+        oauth = raw.get("claudeAiOauth", raw)
+        token = oauth.get("accessToken")
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError("missing token")
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {"status": "unavailable", "error": "Claude not signed in inside this WSL distribution"}
+    expires = oauth.get("expiresAt")
+    if isinstance(expires, (int, float)) and expires <= time.time() * 1000:
+        return {"status": "error", "error": "Claude sign-in expired inside this WSL distribution"}
+    request = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
+        "Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0"})
+    try:
+        # Do not forward bearer credentials to redirects.
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=10) as response:
+            body = response.read(1024 * 1024 + 1)
+            if len(body) > 1024 * 1024:
+                raise ValueError("Usage response too large")
+            return {"status": "ok", "httpStatus": response.status, "body": body.decode("utf-8")}
+    except urllib.error.HTTPError as error:
+        return {"status": "error", "httpStatus": error.code,
+                "error": "Claude sign-in expired" if error.code == 401 else "Claude usage request failed (%s)" % error.code}
+    except Exception:
+        return {"status": "error", "error": "Claude usage request failed inside this WSL distribution"}
+
+
 def handle(request):
     op = request["op"]
     path = absolute(request["path"])
@@ -450,6 +580,10 @@ def handle(request):
             if request.get("includeFiles") and not stat.S_ISDIR(meta.st_mode) and len(files) < 100:
                 files.append(str(current.relative_to(path)))
         return {"token": digest.hexdigest(), "fileCount": count - 1, "files": files}
+    if op == "cursor_stores":
+        return cursor_stores(request)
+    if op == "claude_usage":
+        return claude_usage()
     if op == "refresh_environment":
         global ENVIRONMENT_READY
         ENVIRONMENT_READY = False

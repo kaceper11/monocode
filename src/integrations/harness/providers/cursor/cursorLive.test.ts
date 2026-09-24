@@ -192,6 +192,7 @@ describe("cursor background subagents", () => {
       "cursor_1",
       ["call_agent"],
       expect.any(Object),
+      "/repo",
     );
     notify("session/update", {
       sessionId: "cursor_1",

@@ -70,6 +70,7 @@ it("reopens a saved Cursor placeholder as a named, expandable subagent with a st
       sessionId: "parent",
       toolCallIds: ["call-1"],
       knownRevisions: {},
+      cwd: "/repo",
     });
     act(() =>
       root.render(

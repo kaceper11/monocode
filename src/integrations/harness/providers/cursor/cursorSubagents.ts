@@ -107,6 +107,8 @@ export async function recoverCursorSubagents(
   const runs = await readStoredCursorSubagentRuns(
     session.providerSessionId,
     rows.map((row) => row.tool!.callId!).slice(-256),
+    {},
+    session.worktreeCwd || session.cwd,
   ).catch(() => []);
   const titles = new Map(
     rows.map((row) => [row.tool!.callId, row.tool!.title ?? row.text]),

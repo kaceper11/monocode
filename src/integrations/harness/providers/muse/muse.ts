@@ -155,6 +155,13 @@ const startupByThread = new Map<string, { cancelled: boolean; rpc?: JsonRpcClien
 /** In-flight cold starts: a prewarm and a send share one spawn. */
 const startingByThread = new Map<string, Promise<Live>>();
 
+/** Read only the active session's host; never borrow another distribution's usage. */
+export function readLiveMuseUsage(sessionId?: string, cwd?: string): Promise<unknown> | undefined {
+  const live = sessionId ? liveByThread.get(sessionId) : undefined;
+  if (!live || live.cwd !== cwd || live.stopping) return undefined;
+  return live.rpc.request("usage/read", {}, CONTROL_TIMEOUT_MS);
+}
+
 export async function sendMuseTurn(input: SendTurnInput): Promise<void> {
   const previous = liveByThread.get(input.sessionId);
   const previousGeneration = previous?.cancelGeneration;
@@ -639,6 +646,9 @@ async function startLive(
     input.sessionId,
     {
       onNotification: (method, params) => {
+        if (method === "usage/changed") {
+          window.dispatchEvent(new CustomEvent("monocode-provider-usage-changed", { detail: { sessionId: input.sessionId } }));
+        }
         const live = liveRef.current;
         if (!live) return;
         handleNotification(live, method, params);

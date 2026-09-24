@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
@@ -23,7 +23,7 @@ const LEGACY_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 #[cfg(target_os = "macos")]
 const KEYCHAIN_FALLBACK_USER: &str = "claude-code-user";
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeUsageFetch {
     pub status: String,
@@ -32,7 +32,7 @@ pub struct ClaudeUsageFetch {
     pub error: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpencodeGoUsageFetch {
     pub status: String,
@@ -402,7 +402,23 @@ fn usage_result(
 pub async fn fetch_claude_usage(
     app: AppHandle,
     account_id: Option<String>,
+    cwd: Option<String>,
 ) -> Result<ClaudeUsageFetch, String> {
+    if let Some(location) = cwd
+        .as_deref()
+        .map(crate::wsl::location)
+        .transpose()?
+        .flatten()
+    {
+        if account_id.as_deref().is_some_and(|id| id != "default") {
+            return Err("Native account profiles cannot be used in WSL".into());
+        }
+        return tauri::async_runtime::spawn_blocking(move || {
+            crate::wsl::request(&location, "claude_usage", serde_json::json!({}))
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     let config_dir = crate::harness::provider_account_dir(&app, "claude", account_id.as_deref())?;
     tauri::async_runtime::spawn_blocking(move || fetch_claude_usage_sync(config_dir))
         .await

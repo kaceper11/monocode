@@ -9,22 +9,24 @@ import {
 
 type Props = {
   harness: HarnessId;
+  cwd?: string;
+  accountId?: string;
   onClose: () => void;
 };
 
-export function ProviderSignInDialog({ harness, onClose }: Props) {
+export function ProviderSignInDialog({ harness, cwd, accountId, onClose }: Props) {
   const [state, setState] = useState<ProviderSignInState>("idle");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     setState("idle");
     setError(null);
-  }, [harness]);
+  }, [harness, cwd, accountId]);
 
   const signIn = useCallback(() => {
     setState("running");
     setError(null);
-    void loginHarness(harness).then(
+    void loginHarness(harness, accountId, cwd).then(
       () => setState("complete"),
       (reason: unknown) => {
         setState("error");
@@ -35,7 +37,7 @@ export function ProviderSignInDialog({ harness, onClose }: Props) {
         );
       },
     );
-  }, [harness]);
+  }, [harness, cwd, accountId]);
 
   return (
     <Modal

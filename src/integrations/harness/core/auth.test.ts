@@ -123,3 +123,17 @@ describe("harness login", () => {
     expect(child.spawnChild).not.toHaveBeenCalled();
   });
 });
+
+
+it("isolates native and WSL login and rejects native profiles before starting a guest", async () => {
+  const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
+  const native = loginHarness("codex");
+  const guest = loginHarness("codex", "default", cwd);
+  await vi.waitFor(() => expect(child.spawnChild).toHaveBeenCalledTimes(2));
+  expect(child.resolveCodexBinary).toHaveBeenCalledWith(cwd);
+  expect(child.spawnChild).toHaveBeenCalledWith("monocode-provider-login-test-window-codex-wsl-ubuntu", "/bin/codex", ["login"], cwd);
+  for (const call of child.watchChild.mock.calls) (call[2] as (code: number) => void)(0);
+  await Promise.all([native, guest]);
+  await expect(loginHarness("codex", "work", cwd)).rejects.toThrow("Native account profiles");
+  expect(child.spawnChild).toHaveBeenCalledTimes(2);
+});

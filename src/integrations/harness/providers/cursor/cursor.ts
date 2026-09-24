@@ -983,6 +983,7 @@ function refreshCursorSubagents(live: Live): Promise<void> {
       live.acpSessionId,
       [...live.agentTools.keys()].slice(-256),
       live.subagentRevisions,
+      live.cwd,
     ).catch(() => []);
     if (live.muteUpdates || live.subagentGeneration !== generation) return;
     for (const run of runs) {
@@ -1133,6 +1134,7 @@ async function refreshCursorToolEnrichments(live: Live): Promise<void> {
     const storedCalls = await readStoredCursorToolCalls(
       live.acpSessionId,
       callIds,
+      live.cwd,
     ).catch(() => []);
     if (live.muteUpdates) return;
 

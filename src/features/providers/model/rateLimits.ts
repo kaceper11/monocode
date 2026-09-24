@@ -1,12 +1,13 @@
 import { asRecord } from "../../../integrations/harness/providers/codex/codexProtocol";
 
-export type RateLimitProvider = "claude" | "codex" | "opencode";
+export type RateLimitProvider =
+  "claude" | "codex" | "opencode" | "copilot" | "muse" | "devin";
 
 export type RateLimitStatus =
-  "idle" | "fetching" | "ok" | "error" | "unavailable";
+  "idle" | "fetching" | "ok" | "error" | "unavailable" | "unsupported";
 
 export type RateLimitWindow = {
-  /** Percentage of the window consumed (0–100). */
+  /** Percentage consumed; providers may report overage above 100. */
   usedPercent: number;
   /** Window duration in minutes: 300 (5h) or 10080 (7d). */
   windowMinutes: number;
@@ -32,6 +33,7 @@ export type RateLimitResetCredits = {
 
 export type ProviderRateLimits = {
   provider: RateLimitProvider;
+  summary?: string;
   session: RateLimitWindow | null;
   weekly: RateLimitWindow | null;
   monthly: RateLimitWindow | null;
@@ -57,7 +59,8 @@ export function isRateLimitSnapshotStale(
   minAgeMs = RATE_LIMIT_MIN_REFETCH_MS,
 ): boolean {
   if (!limits || limits.status === "idle") return true;
-  if (limits.status === "unavailable") return false;
+  if (limits.status === "unavailable" || limits.status === "unsupported")
+    return false;
   if (limits.updatedAt <= 0) return true;
   return now - limits.updatedAt >= minAgeMs;
 }
@@ -68,7 +71,8 @@ export function shouldFetchProvider(
 ): boolean {
   if (input.force) return true;
   if (!input.visible) return false;
-  if (limits.status === "unavailable") return false;
+  if (limits.status === "unavailable" || limits.status === "unsupported")
+    return false;
   return isRateLimitSnapshotStale(limits, input.now ?? Date.now());
 }
 
@@ -110,7 +114,10 @@ export function fetchingRateLimits(
 ): ProviderRateLimits {
   if (
     previous &&
-    (previous.session || previous.weekly || previous.monthly || previous.resetCredits)
+    (previous.session ||
+      previous.weekly ||
+      previous.monthly ||
+      previous.resetCredits)
   ) {
     return { ...previous, status: "fetching" };
   }
@@ -149,7 +156,10 @@ export function errorRateLimits(
 ): ProviderRateLimits {
   if (
     previous &&
-    (previous.session || previous.weekly || previous.monthly || previous.resetCredits)
+    (previous.session ||
+      previous.weekly ||
+      previous.monthly ||
+      previous.resetCredits)
   ) {
     return {
       ...previous,
@@ -176,7 +186,7 @@ export function clampUsedPercent(value: number): number {
 }
 
 export function formatUsagePercent(usedPercent: number): string {
-  return `${Math.round(clampUsedPercent(usedPercent))}%`;
+  return `${Math.round(Number.isFinite(usedPercent) ? Math.max(0, usedPercent) : 0)}%`;
 }
 
 /**
@@ -522,4 +532,107 @@ function numberField(rec: Record<string, unknown>, key: string): number | null {
 function stringField(rec: Record<string, unknown>, key: string): string | null {
   const value = rec[key];
   return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+/** Provider observations only: never derive account quota from session tokens. */
+export function parseMuseUsage(raw: unknown): ProviderRateLimits {
+  const usage = asRecord(asRecord(raw)?.usage);
+  if (!usage)
+    return {
+      ...idleRateLimits("muse"),
+      status: "ok",
+      summary: "Not reported",
+      updatedAt: Date.now(),
+      error:
+        "Muse has not reported subscription usage yet. Run a turn or check your subscription in Muse.",
+    };
+  const window = asRecord(usage.window);
+  const weekly = asRecord(usage.weekly);
+  const observed = numberField(usage, "observedAtMs");
+  const duration = window && numberField(window, "windowDurationMins");
+  if (!observed || observed <= 0 || !duration || duration <= 0)
+    return errorRateLimits("muse", "Muse usage response was unexpected");
+  const session = mapUsageWindow(
+    { ...window, resetsAt: window?.resetsAtMs },
+    duration,
+  );
+  const week = mapUsageWindow(
+    { ...weekly, resetsAt: weekly?.resetsAtMs },
+    WEEKLY_WINDOW_MINUTES,
+  );
+  const used = window && numberField(window, "usedPercent");
+  const weeklyUsed = weekly && numberField(weekly, "usedPercent");
+  if (
+    !session ||
+    !week ||
+    used == null ||
+    weeklyUsed == null ||
+    used < 0 ||
+    weeklyUsed < 0 ||
+    !session.resetsAt ||
+    !week.resetsAt
+  )
+    return errorRateLimits("muse", "Muse usage response was unexpected");
+  return {
+    ...idleRateLimits("muse"),
+    status: "ok",
+    updatedAt: observed,
+    session: { ...session, usedPercent: used },
+    weekly: { ...week, usedPercent: weeklyUsed },
+  };
+}
+
+export function parseCopilotQuota(raw: unknown): ProviderRateLimits {
+  const snapshots = asRecord(asRecord(raw)?.quotaSnapshots);
+  const quota = asRecord(snapshots?.premium_interactions);
+  const entitlement =
+    typeof quota?.entitlementRequests === "number" &&
+    Number.isFinite(quota.entitlementRequests)
+      ? quota.entitlementRequests
+      : null;
+  if (quota?.isUnlimitedEntitlement === true || entitlement === -1)
+    return {
+      ...idleRateLimits("copilot"),
+      status: "ok",
+      summary: "Unlimited",
+      updatedAt: Date.now(),
+      error: "Copilot reports an unlimited entitlement.",
+    };
+  if (quota?.hasQuota === false)
+    return {
+      ...idleRateLimits("copilot"),
+      status: "ok",
+      summary: "Not reported",
+      updatedAt: Date.now(),
+      error: "Copilot has not reported an account allowance.",
+    };
+  const remaining =
+    typeof quota?.remainingPercentage === "number" &&
+    Number.isFinite(quota.remainingPercentage)
+      ? quota.remainingPercentage
+      : null;
+  if (
+    !quota ||
+    remaining == null ||
+    remaining < 0 ||
+    remaining > 100 ||
+    entitlement == null ||
+    entitlement < 0
+  )
+    return errorRateLimits(
+      "copilot",
+      "Copilot did not report a usable account quota. Check usage in the Copilot CLI.",
+    );
+  const reset = parseResetTimestamp(quota.resetDate);
+  return {
+    ...idleRateLimits("copilot"),
+    status: "ok",
+    updatedAt: Date.now(),
+    monthly: {
+      usedPercent: 100 - remaining,
+      windowMinutes: MONTHLY_WINDOW_MINUTES,
+      // Some runtimes report their fetch time here; never show that as a reset.
+      resetsAt: reset && reset > Date.now() + 60_000 ? reset : null,
+    },
+  };
 }

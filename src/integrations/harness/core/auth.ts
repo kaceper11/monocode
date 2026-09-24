@@ -1,7 +1,11 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { wslLocation } from "../../../shared/lib/paths";
 import { homeDir } from "../../../platform/tauri/fs";
 import { supportsProviderAccounts } from "../../../features/providers/model/providerAccounts";
-import { HARNESS_TITLE, type HarnessId } from "../../../features/sessions/model/session";
+import {
+  HARNESS_TITLE,
+  type HarnessId,
+} from "../../../features/sessions/model/session";
 import * as child from "./child";
 import { harnessLoginArgs } from "./authSupport";
 
@@ -15,7 +19,11 @@ export {
 const LOGIN_TIMEOUT_MS = 10 * 60_000;
 const LOGIN_CHILD_PREFIX = "monocode-provider-login-";
 
-function loginChildId(harness: HarnessId, accountId?: string): string {
+function loginChildId(
+  harness: HarnessId,
+  accountId?: string,
+  cwd?: string,
+): string {
   let windowLabel = "main";
   try {
     windowLabel = getCurrentWindow().label || windowLabel;
@@ -23,23 +31,24 @@ function loginChildId(harness: HarnessId, accountId?: string): string {
     // Keep the login helper usable in browser previews and isolated tests.
   }
   const safeWindowLabel = windowLabel.replace(/[^a-zA-Z0-9_-]/g, "-");
-  const legacyId = `${LOGIN_CHILD_PREFIX}${safeWindowLabel}-${harness}`;
+  const host = cwd && wslLocation(cwd)?.distribution.toLowerCase();
+  const legacyId = `${LOGIN_CHILD_PREFIX}${safeWindowLabel}-${harness}${host ? `-wsl-${encodeURIComponent(host)}` : ""}`;
   if (!accountId || accountId === "default") return legacyId;
   const safeAccount = accountId.replace(/[^a-zA-Z0-9_-]/g, "-");
   return `${legacyId}-${safeAccount}`;
 }
 
 const LOGIN_RESOLVERS: Partial<
-  Record<HarnessId, () => Promise<{ path: string }>>
+  Record<HarnessId, (cwd?: string) => Promise<{ path: string }>>
 > = {
   // Resolve through the module at click time. Some isolated harness tests mock
   // only their own binary resolver, and merely rendering a transcript must not
   // require every other CLI resolver to exist in that mock.
-  claude: () => child.resolveClaudeBinary(),
-  codex: () => child.resolveCodexBinary(),
-  cursor: () => child.resolveCursorBinary(),
-  grok: () => child.resolveGrokBinary(),
-  fx: () => child.resolveFxBinary(),
+  claude: (cwd) => child.resolveClaudeBinary(cwd),
+  codex: (cwd) => child.resolveCodexBinary(cwd),
+  cursor: (cwd) => child.resolveCursorBinary(cwd),
+  grok: (cwd) => child.resolveGrokBinary(cwd),
+  fx: (cwd) => child.resolveFxBinary(cwd),
 };
 
 const inflight = new Map<string, Promise<void>>();
@@ -52,12 +61,20 @@ const inflight = new Map<string, Promise<void>>();
 export function loginHarness(
   harness: HarnessId,
   accountId?: string,
+  projectCwd?: string,
 ): Promise<void> {
-  const key = `${harness}:${accountId ?? "default"}`;
+  const host = projectCwd ? wslLocation(projectCwd) : undefined;
+  if (host && accountId && accountId !== "default")
+    return Promise.reject(
+      new Error(
+        "Native account profiles cannot be used in WSL. Sign in to the default account inside this distribution.",
+      ),
+    );
+  const key = `${harness}:${accountId ?? "default"}:${host?.distribution.toLowerCase() ?? "native"}`;
   const current = inflight.get(key);
   if (current) return current;
 
-  const run = runHarnessLogin(harness, accountId).finally(() => {
+  const run = runHarnessLogin(harness, accountId, projectCwd).finally(() => {
     if (inflight.get(key) === run) inflight.delete(key);
   });
   inflight.set(key, run);
@@ -67,6 +84,7 @@ export function loginHarness(
 async function runHarnessLogin(
   harness: HarnessId,
   accountId?: string,
+  projectCwd?: string,
 ): Promise<void> {
   const args = harnessLoginArgs(harness);
   const resolve = LOGIN_RESOLVERS[harness];
@@ -76,8 +94,11 @@ async function runHarnessLogin(
     );
   }
 
-  const [{ path }, cwd] = await Promise.all([resolve(), homeDir()]);
-  const childId = loginChildId(harness, accountId);
+  const [{ path }, cwd] = await Promise.all([
+    resolve(projectCwd),
+    projectCwd ?? homeDir(),
+  ]);
+  const childId = loginChildId(harness, accountId, projectCwd);
   await child.killChild(childId).catch(() => undefined);
 
   return new Promise<void>((resolve, reject) => {

@@ -28,20 +28,24 @@ export function readStoredCursorSubagentRuns(
   sessionId: string,
   toolCallIds: string[],
   knownRevisions: Record<string, string> = {},
+  cwd?: string,
 ): Promise<StoredCursorSubagentRun[]> {
   return invoke("cursor_subagent_runs", {
     sessionId,
     toolCallIds,
     knownRevisions,
+    cwd,
   });
 }
 
 export function readStoredCursorToolCalls(
   sessionId: string,
   toolCallIds: string[],
+  cwd?: string,
 ): Promise<StoredCursorToolCall[]> {
   return invoke<StoredCursorToolCall[]>("cursor_tool_calls", {
     sessionId,
     toolCallIds,
+    cwd,
   });
 }

@@ -92,6 +92,7 @@ fn antigravity_args() -> Vec<String> {
 }
 
 struct LiveChild {
+    content_length: bool,
     cwd: PathBuf,
     stdin: Mutex<ChildStdin>,
     pid: u32,
@@ -432,6 +433,7 @@ impl HarnessHost {
         self.lock_inner().children.insert(
             session_id.into(),
             Arc::new(LiveChild {
+                content_length: false,
                 account: None,
                 generation: 0,
                 stdin: Mutex::new(stdin),
@@ -706,6 +708,8 @@ pub fn harness_spawn(
     };
 
     let live = Arc::new(LiveChild {
+        content_length: args.iter().any(|arg| arg == "--headless")
+            && args.iter().any(|arg| arg == "--stdio"),
         account,
         generation,
         stdin: Mutex::new(stdin),
@@ -1006,9 +1010,13 @@ pub async fn harness_write(
     };
     tauri::async_runtime::spawn_blocking(move || {
         let mut stdin = live.stdin.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = if live.content_length {
+            format!("Content-Length: {}\r\n\r\n{}", line.len(), line)
+        } else {
+            format!("{line}\n")
+        };
         stdin
-            .write_all(line.as_bytes())
-            .and_then(|_| stdin.write_all(b"\n"))
+            .write_all(frame.as_bytes())
             .and_then(|_| stdin.flush())
             .map_err(|e| format!("Failed to write to harness: {e}"))
     })
@@ -1052,6 +1060,36 @@ fn bounded_line(reader: &mut impl BufRead, limit: u64) -> Result<Option<String>,
     Ok(Some(line))
 }
 
+// Copilot's SDK transport uses Content-Length frames, while ACP uses JSONL.
+fn bounded_rpc_frame(reader: &mut impl BufRead) -> Result<Option<String>, String> {
+    let Some(header) = bounded_line(reader, 1024)? else {
+        return Ok(None);
+    };
+    let length: usize = header
+        .strip_prefix("Content-Length: ")
+        .ok_or("Invalid RPC frame header")?
+        .parse()
+        .map_err(|_| "Invalid RPC frame length")?;
+    if length == 0 || length > MAX_HARNESS_LINE_BYTES as usize {
+        return Err("RPC frame exceeds output limit".into());
+    }
+    // vscode-jsonrpc may include Content-Type; headers remain bounded.
+    for index in 0..16 {
+        let line = bounded_line(reader, 1024)?.ok_or("Incomplete RPC headers")?;
+        if line.is_empty() {
+            break;
+        }
+        if index == 15 {
+            return Err("Too many RPC headers".into());
+        }
+    }
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
 fn stream_lines(
     mut reader: impl BufRead,
     app: &AppHandle,
@@ -1061,7 +1099,11 @@ fn stream_lines(
     output_open: &Mutex<bool>,
 ) {
     loop {
-        match bounded_line(&mut reader, MAX_HARNESS_LINE_BYTES) {
+        match if live.content_length && event == STDOUT_EVENT {
+            bounded_rpc_frame(&mut reader)
+        } else {
+            bounded_line(&mut reader, MAX_HARNESS_LINE_BYTES)
+        } {
             Ok(Some(line)) => {
                 let open = output_open.lock().unwrap_or_else(|e| e.into_inner());
                 if !*open {
@@ -3157,6 +3199,36 @@ fn command_basename(command: &str) -> &str {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn copilot_frames_are_bounded_and_keep_utf8_and_adjacent_messages() {
+        let body = "{\"text\":\"żółć\"}";
+        let framed = format!(
+            "Content-Length: {}\r\n\r\n{}Content-Length: 2\r\n\r\n{{}}",
+            body.len(),
+            body
+        );
+        let mut reader = std::io::Cursor::new(framed.into_bytes());
+        assert_eq!(
+            super::bounded_rpc_frame(&mut reader).unwrap(),
+            Some(body.into())
+        );
+        assert_eq!(
+            super::bounded_rpc_frame(&mut reader).unwrap(),
+            Some("{}".into())
+        );
+        assert_eq!(super::bounded_rpc_frame(&mut reader).unwrap(), None);
+        for invalid in [
+            "Content-Length: 999999999\r\n\r\n",
+            "Content-Length: 5\r\n\r\n{}",
+            "Content-Length: nope\r\n\r\n",
+            "Content-Length: 0\r\n\r\n",
+        ] {
+            assert!(
+                super::bounded_rpc_frame(&mut std::io::Cursor::new(invalid.as_bytes())).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn wsl_accounts_never_silently_fall_back_to_the_linux_default() {
         let location = crate::wsl::Location::new("Ubuntu", "/home/me/repo").unwrap();
         for provider in ["codex", "claude"] {
@@ -3215,6 +3287,7 @@ mod tests {
         let stdin = child.stdin.take().expect("test child stdin");
         (
             Arc::new(LiveChild {
+                content_length: false,
                 account: None,
                 generation: 0,
                 linux: None,
@@ -3778,6 +3851,7 @@ mod tests {
         let stdin = child.stdin.take().expect("grouped child stdin");
         (
             Arc::new(LiveChild {
+                content_length: false,
                 account: None,
                 generation: 0,
                 linux: None,

@@ -98,3 +98,11 @@ describe("Cursor stored subagents", () => {
     expect(read).not.toHaveBeenCalled();
   });
 });
+
+
+it("recovers Cursor details from the effective WSL worktree", async () => {
+  const session = savedSession();
+  session.worktreeCwd = "//wsl.localhost/Ubuntu/home/me/worktree";
+  await recoverCursorSubagents(session);
+  expect(read).toHaveBeenCalledWith("parent", ["spawn"], {}, session.worktreeCwd);
+});

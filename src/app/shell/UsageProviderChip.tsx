@@ -12,7 +12,10 @@ import {
   type RateLimitWindow,
 } from "../../features/providers/model/rateLimits";
 import type { CodexRateLimitResetOutcome } from "../../features/providers/model/rateLimitsFetch";
-import { mascotPath, projectMascot } from "../../features/projects/model/projectMascots";
+import {
+  mascotPath,
+  projectMascot,
+} from "../../features/projects/model/projectMascots";
 import { projectKey, projectName } from "../../shared/lib/paths";
 import { HARNESS_TITLE } from "../../features/sessions/model/session";
 import {
@@ -23,7 +26,13 @@ import {
   resolveTabGroupMascot,
 } from "../../features/workspace/model/tabGroups";
 import { HarnessIcon } from "../../features/sessions/ui/HarnessIcon";
-import { ArrowLeft, Check, ChevronRight, Plus, RefreshCw } from "../../shared/ui/icons";
+import {
+  ArrowLeft,
+  Check,
+  ChevronRight,
+  Plus,
+  RefreshCw,
+} from "../../shared/ui/icons";
 import { Popover, type PopoverDismissReason } from "../../shared/ui/Popover";
 import {
   ProviderSignInPanel,
@@ -45,6 +54,7 @@ export function UsageProviderChip({
   project,
   accounts = [],
   accountId,
+  accountLabel,
   onSelectAccount,
   onAddAccount,
   onManageAccounts,
@@ -56,6 +66,7 @@ export function UsageProviderChip({
   project?: string;
   accounts?: ProviderAccount[];
   accountId?: string;
+  accountLabel?: string;
   onSelectAccount?: (accountId: string) => void;
   onAddAccount?: (label: string) => Promise<ProviderAccount>;
   onManageAccounts?: () => void;
@@ -97,8 +108,9 @@ export function UsageProviderChip({
     .join(" · ");
   const providerLabel = HARNESS_TITLE[limits.provider];
   const activeAccount = accounts.find((account) => account.id === accountId);
-  const canManageAccounts = Boolean(onSelectAccount && onAddAccount);
-  const activeAccountLabel = activeAccount?.label ?? "Removed account";
+  const canManageAccounts = Boolean(onSelectAccount && accounts.length);
+  const activeAccountLabel =
+    accountLabel ?? activeAccount?.label ?? "Removed account";
   const mascotProject = project ? projectName(project) : providerLabel;
   const appearanceKey = project ? projectKey(project) : mascotProject;
   const mascotName = resolveTabGroupMascot(
@@ -237,7 +249,7 @@ export function UsageProviderChip({
               accounts={accounts}
               accountId={accountId ?? ""}
               onBack={() => setAccountView("usage")}
-              onAdd={() => setAccountView("add")}
+              onAdd={onAddAccount ? () => setAccountView("add") : undefined}
               onManage={
                 onManageAccounts
                   ? () => {
@@ -405,7 +417,7 @@ function ProviderAccountPicker({
   accounts: ProviderAccount[];
   accountId: string;
   onBack: () => void;
-  onAdd: () => void;
+  onAdd?: () => void;
   onManage?: () => void;
   onSelect: (accountId: string) => void;
 }) {
@@ -453,14 +465,16 @@ function ProviderAccountPicker({
           );
         })}
       </div>
-      <button
-        type="button"
-        className="mt-2 flex h-8 w-full items-center gap-2 rounded-lg px-2.5 text-left text-[11px] text-content/55 hover:bg-content/[0.07] hover:text-content"
-        onClick={onAdd}
-      >
-        <Plus className="size-3.5" strokeWidth={1.75} aria-hidden />
-        Add account
-      </button>
+      {onAdd ? (
+        <button
+          type="button"
+          className="mt-2 flex h-8 w-full items-center gap-2 rounded-lg px-2.5 text-left text-[11px] text-content/55 hover:bg-content/[0.07] hover:text-content"
+          onClick={onAdd}
+        >
+          <Plus className="size-3.5" strokeWidth={1.75} aria-hidden />
+          Add account
+        </button>
+      ) : null}
       {onManage ? (
         <button
           type="button"
@@ -581,7 +595,9 @@ function UsageWindowCard({
   const remaining = Math.max(0, Math.round(100 - pct));
   const title =
     kind === "session"
-      ? "5-hour limit"
+      ? window.windowMinutes === 300
+        ? "5-hour limit"
+        : `${formatWindowLabel(window.windowMinutes)} limit`
       : kind === "weekly"
         ? "Weekly limit"
         : kind === "monthly"
@@ -592,7 +608,7 @@ function UsageWindowCard({
       <div className="flex items-baseline justify-between gap-3">
         <h3 className="text-[11px] font-medium text-content/65">{title}</h3>
         <span className="shrink-0 text-[11px] font-medium tabular-nums">
-          {formatUsagePercent(pct)} used
+          {formatUsagePercent(window.usedPercent)} used
         </span>
       </div>
       <div
@@ -903,7 +919,7 @@ function EmptyUsageState({
           ? "Loading usage…"
           : limits.status === "unavailable"
             ? "Not connected"
-            : "Usage unavailable"}
+            : (limits.summary ?? "Usage unavailable")}
       </p>
       {limits.error ? (
         <p className="mx-auto mt-1 max-w-[15rem] text-[10px] leading-4 text-content/40">
@@ -957,6 +973,8 @@ function isResetOutcome(
 }
 
 function emptyUsageLabel(limits: ProviderRateLimits): string {
+  if (limits.summary) return limits.summary;
+  if (limits.status === "unsupported") return "unavailable";
   if (limits.status !== "error") return "—";
   const text = limits.error?.toLowerCase() ?? "";
   if (text.includes("expired") || text.includes("sign-in")) return "expired";

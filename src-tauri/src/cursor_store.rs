@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::dirs_home;
@@ -58,6 +58,7 @@ pub async fn cursor_subagent_runs(
     session_id: String,
     tool_call_ids: Vec<String>,
     known_revisions: Option<HashMap<String, String>>,
+    cwd: Option<String>,
 ) -> Result<Vec<CursorSubagentRun>, String> {
     validate_id(&session_id, "session")?;
     if tool_call_ids.len() > 256 {
@@ -69,17 +70,64 @@ pub async fn cursor_subagent_runs(
     if tool_call_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let home = dirs_home().ok_or("Home directory is unavailable")?;
+    let location = cwd
+        .as_deref()
+        .map(crate::wsl::location)
+        .transpose()?
+        .flatten();
     tauri::async_runtime::spawn_blocking(move || {
-        lookup_subagent_runs(
+        if let Some(location) = location {
+            let snapshots = guest_stores(
+                &location,
+                &session_id,
+                &tool_call_ids,
+                true,
+                known_revisions.as_ref(),
+            )?;
+            let mut runs = Vec::new();
+            for snapshot in snapshots {
+                let metadata = &snapshot.metadata;
+                let Some(info) = metadata.get("subagentInfo") else {
+                    continue;
+                };
+                if info.get("parentAgentId").and_then(Value::as_str) != Some(&session_id) {
+                    continue;
+                }
+                let Some(agent_id) = metadata.get("agentId").and_then(Value::as_str) else {
+                    continue;
+                };
+                let stored = info.get("toolCallId").and_then(Value::as_str).unwrap_or("");
+                let Some(call_id) = tool_call_ids.iter().find(|id| ids_match(stored, id)) else {
+                    continue;
+                };
+                let connection = snapshot_connection(&snapshot)?;
+                let (prompt, steps, model) =
+                    read_subagent_steps(&connection, agent_id).map_err(|e| e.to_string())?;
+                runs.push(CursorSubagentRun {
+                    tool_call_id: call_id.clone(),
+                    agent_id: agent_id.into(),
+                    revision: snapshot.revision,
+                    agent_type: info
+                        .get("typeName")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    prompt,
+                    steps,
+                    model,
+                });
+            }
+            return Ok(runs);
+        }
+        let home = dirs_home().ok_or("Home directory is unavailable")?;
+        Ok(lookup_subagent_runs(
             &PathBuf::from(home).join(".cursor"),
             &session_id,
             &tool_call_ids,
             &known_revisions.unwrap_or_default(),
-        )
+        ))
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?
 }
 
 fn lookup_subagent_runs(
@@ -326,6 +374,7 @@ fn cap_text(value: &str, limit: usize) -> String {
 pub async fn cursor_tool_calls(
     session_id: String,
     tool_call_ids: Vec<String>,
+    cwd: Option<String>,
 ) -> Result<Vec<CursorToolCall>, String> {
     validate_id(&session_id, "session")?;
     if tool_call_ids.len() > 256 {
@@ -335,12 +384,64 @@ pub async fn cursor_tool_calls(
         validate_id(tool_call_id, "tool call")?;
     }
 
+    let location = cwd
+        .as_deref()
+        .map(crate::wsl::location)
+        .transpose()?
+        .flatten();
     tauri::async_runtime::spawn_blocking(move || {
+        if let Some(location) = location {
+            let snapshots = guest_stores(&location, &session_id, &tool_call_ids, false, None)?;
+            let Some(snapshot) = snapshots.first() else {
+                return Ok(Vec::new());
+            };
+            return lookup_tool_calls(&snapshot_connection(snapshot)?, &tool_call_ids)
+                .map_err(|e| e.to_string());
+        }
         let store = find_session_store(&session_id)?;
         read_tool_calls(&store, &tool_call_ids)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[derive(Deserialize)]
+struct GuestStore {
+    metadata: Value,
+    revision: String,
+    blobs: Vec<(String, String)>,
+}
+
+fn guest_stores(
+    location: &crate::wsl::Location,
+    session_id: &str,
+    ids: &[String],
+    subagents: bool,
+    known: Option<&HashMap<String, String>>,
+) -> Result<Vec<GuestStore>, String> {
+    crate::wsl::request(
+        location,
+        "cursor_stores",
+        serde_json::json!({
+            "sessionId": session_id, "toolCallIds": ids, "subagents": subagents, "knownRevisions": known
+        }),
+    )
+}
+
+fn snapshot_connection(snapshot: &GuestStore) -> Result<Connection, String> {
+    let connection = Connection::open_in_memory().map_err(|e| e.to_string())?;
+    connection
+        .execute_batch("CREATE TABLE blobs (id TEXT, data BLOB)")
+        .map_err(|e| e.to_string())?;
+    for (id, data) in &snapshot.blobs {
+        connection
+            .execute(
+                "INSERT INTO blobs VALUES (?1, ?2)",
+                rusqlite::params![id, data.as_bytes()],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(connection)
 }
 
 fn validate_id(value: &str, label: &str) -> Result<(), String> {
@@ -524,6 +625,40 @@ fn id_parts(value: &str) -> Vec<&str> {
 mod tests {
     use super::*;
     use rusqlite::params;
+
+    #[test]
+    fn guest_snapshot_reuses_native_tool_parser() {
+        let snapshot = GuestStore {
+            metadata: serde_json::json!({}), revision: "1".into(),
+            blobs: vec![("tool".into(), serde_json::json!({"content": [{"type":"tool-call", "toolCallId":"call-12345678\nfc_12345678", "toolName":"Shell", "args":{"command":"pwd"}}]}).to_string())],
+        };
+        let calls = lookup_tool_calls(
+            &snapshot_connection(&snapshot).unwrap(),
+            &["fc_12345678".into()],
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args["command"], "pwd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wsl_usage_and_cursor_stores_use_guest_credentials_and_live_wal() {
+        let script = format!(
+            "__name__ = 'fixture'\n{}\n{}",
+            include_str!("wsl_bridge.py"),
+            include_str!("wsl_usage_test.py")
+        );
+        let output = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     struct TestStore(PathBuf);
     impl TestStore {

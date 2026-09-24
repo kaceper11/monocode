@@ -11,6 +11,8 @@ import {
   mapUsageWindow,
   parseClaudeOAuthUsage,
   parseCodexRateLimits,
+  parseMuseUsage,
+  parseCopilotQuota,
   parseOpencodeGoUsage,
   parseResetTimestamp,
   RATE_LIMIT_MIN_REFETCH_MS,
@@ -89,6 +91,7 @@ describe("formatUsagePercent", () => {
   it("rounds to a whole percent", () => {
     expect(formatUsagePercent(58.4)).toBe("58%");
     expect(formatUsagePercent(58.6)).toBe("59%");
+    expect(formatUsagePercent(140)).toBe("140%");
     expect(clampUsedPercent(140)).toBe(100);
   });
 });
@@ -401,4 +404,24 @@ describe("shouldFetchRateLimits", () => {
       shouldFetchProvider(disconnected, { force: true, visible: true, now }),
     ).toBe(true);
   });
+});
+
+
+it("preserves Muse observation time and real window duration, without inventing absent usage", () => {
+  const observedAtMs = 1_800_000_000_000;
+  const parsed = parseMuseUsage({ usage: { observedAtMs, window: { usedPercent: 22, windowDurationMins: 60, resetsAtMs: observedAtMs + 60_000 }, weekly: { usedPercent: 40, resetsAtMs: observedAtMs + 120_000 } } });
+  expect(parsed).toMatchObject({ updatedAt: observedAtMs, session: { usedPercent: 22, windowMinutes: 60, resetsAt: observedAtMs + 60_000 }, weekly: { usedPercent: 40 } });
+  expect(parseMuseUsage({})).toMatchObject({ session: null, weekly: null });
+  expect(parseMuseUsage({ usage: { observedAtMs, window: { windowDurationMins: -1 } } }).status).toBe("error");
+});
+
+it("parses Copilot entitlement without inventing a reset or treating unlimited as zero used", () => {
+  const quota = (value: object) => parseCopilotQuota({ quotaSnapshots: { premium_interactions: value } });
+  expect(quota({ entitlementRequests: 300, remainingPercentage: 75, resetDate: new Date().toISOString() })).toMatchObject({ monthly: { usedPercent: 25, resetsAt: null } });
+  expect(quota({ entitlementRequests: -1 })).toMatchObject({ status: "ok", monthly: null });
+  expect(quota({ entitlementRequests: 0, isUnlimitedEntitlement: true })).toMatchObject({ summary: "Unlimited", monthly: null });
+  expect(quota({ entitlementRequests: 0, remainingPercentage: 0, hasQuota: false })).toMatchObject({ summary: "Not reported", monthly: null });
+  expect(quota({ entitlementRequests: 300, remainingPercentage: "75" }).status).toBe("error");
+  expect(quota({ entitlementRequests: 300, remainingPercentage: NaN }).status).toBe("error");
+  expect(quota({ entitlementRequests: 300, remainingPercentage: 120 }).status).toBe("error");
 });
