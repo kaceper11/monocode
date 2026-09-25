@@ -1,3 +1,5 @@
+import { useContext } from "react";
+import { NativePopupHost } from "../../../shared/ui/NativePopupHost";
 import type { ComponentPropsWithoutRef } from "react";
 import { FolderTree, GitBranch } from "../../../shared/ui/icons";
 
@@ -17,6 +19,8 @@ export function GitPickerTrigger({
   worktree = false,
   ...props
 }: Props) {
+  const host = useContext(NativePopupHost);
+  if (host) return null;
   const Icon = worktree ? FolderTree : GitBranch;
   return (
     <button

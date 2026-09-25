@@ -91,7 +91,7 @@ import { GITLAB_CHANGE_EVENT, gitlabConnected } from "../../inbox/model/gitlab";
 import { LAYER } from "../../../shared/lib/layers";
 import { LINEAR_CHANGE_EVENT, linearConnected } from "../../inbox/model/linear";
 import { JIRA_CHANGE_EVENT, jiraConnected, atlassianCapable } from "../../inbox/model/jira";
-import { defaultSessionChoice, modelsFor, resolveModel, subscribeModels, getModelSnapshot, hasLiveCatalog } from "../../sessions/model/models";
+import { defaultSessionChoice, firstEnabledHarness, modelsFor, preferredModelId, resolveModel, subscribeModels, getModelSnapshot, hasLiveCatalog } from "../../sessions/model/models";
 import { refreshHarnessCatalogs } from "../../../integrations/harness/core/registry";
 import { probeHarnessAvailability } from "../../../integrations/harness/core/availability";
 import { WslBadge } from "../../sessions/ui/WslBadge";
@@ -267,13 +267,16 @@ function AutomationsContent({
     const project =
       cwd && looksLikeProject(cwd) ? cwd : (recents[0]?.path ?? "~");
     const preferred = defaultSessionChoice(project);
-    const harness = selected?.harness ?? preferred.harness;
+    const harness = firstEnabledHarness(
+      project,
+      selected?.harness ?? preferred.harness,
+    );
     const model =
       (selected?.harness === harness && pathKey(automationWorkCwd(selected)) === pathKey(project)
         ? selected.model : undefined) ??
       (preferred.harness === harness ? preferred.model : undefined) ??
       modelsFor(harness, project)[0]?.id ??
-      preferred.model;
+      preferredModelId(harness, project);
     return { project, harness, model };
   };
 
@@ -1377,6 +1380,7 @@ function AutomationEditor({
                         harness={draft.harness}
                         model={draft.model}
                         values={draft.modelSettings}
+                        project={draft.cwd}
                         hideSettings={controlsBeside}
                         onChange={(harness, model) =>
                           onChange({ ...draft, harness, model })

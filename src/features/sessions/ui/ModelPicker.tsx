@@ -44,6 +44,11 @@ import {
   type ModelSetting,
 } from "../model/models";
 import {
+  isProviderHidden,
+  projectProvidersRevision,
+  subscribeProjectProviders,
+} from "../model/projectProviders";
+import {
   harnessAuthHint,
   harnessUnavailableHint,
   hasProbedHarnessAvailability,
@@ -64,6 +69,8 @@ type Props = {
   harness: HarnessId;
   model: string;
   values: Record<string, string>;
+  /** Project whose disabled providers are hidden from the picker. */
+  project?: string;
   /** Hide option rows from the menu when they render as pills beside the picker. */
   hideSettings?: boolean;
   hotkeys?: boolean;
@@ -221,6 +228,7 @@ export function ModelPicker({
   harness,
   model,
   values,
+  project,
   hideSettings = false,
   hotkeys = false,
   cwd,
@@ -243,6 +251,11 @@ export function ModelPicker({
     subscribePickerVisibility,
     getPickerVisibilitySnapshot,
     getPickerVisibilitySnapshot,
+  );
+  const projectVersion = useSyncExternalStore(
+    subscribeProjectProviders,
+    projectProvidersRevision,
+    projectProvidersRevision,
   );
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<ModelPickerTab>(harness);
@@ -304,14 +317,17 @@ export function ModelPicker({
   const pickerHarnesses = useMemo(() => {
     void availabilityVersion;
     void visibilityVersion;
-    return HARNESSES.filter((id) =>
-      showProviderInModelPicker(
-        id,
-        isHarnessAvailable(id, cwd),
-        hasProbedHarnessAvailability(cwd),
-      ),
+    void projectVersion;
+    return HARNESSES.filter(
+      (id) =>
+        !isProviderHidden(project, id) &&
+        showProviderInModelPicker(
+          id,
+          isHarnessAvailable(id, cwd),
+          hasProbedHarnessAvailability(cwd),
+        ),
     );
-  }, [availabilityVersion, visibilityVersion, cwd]);
+  }, [availabilityVersion, visibilityVersion, projectVersion, project, cwd]);
   const providerKey = pickerHarnesses.join(",");
   const visibleTab = coerceModelPickerTab(tab, (id) =>
     pickerHarnesses.includes(id),

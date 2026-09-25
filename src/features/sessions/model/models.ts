@@ -2,6 +2,11 @@ import { copilotEffortSetting } from "../../../integrations/harness/providers/co
 import { pathKey, wslLocation } from "../../../shared/lib/paths";
 import type { HarnessId } from "./session";
 import { HARNESSES } from "./session";
+import { loadProjectProviderSettings } from "./projectProviders";
+import {
+  hasProbedHarnessAvailability,
+  isHarnessAvailable,
+} from "../../../integrations/harness/core/availabilityState";
 
 export type ModelSettingChoice = {
   value: string;
@@ -874,11 +879,40 @@ export function preferredModelId(harness: HarnessId, cwd?: string): string {
   return defaultModelId(harness, cwd);
 }
 
+/**
+ * `preferred` unless the project hides it, in which case the first provider the
+ * project still allows. Falls back to `preferred` when a project has hidden
+ * everything, so a conversation always has a provider.
+ */
+export function firstEnabledHarness(
+  cwd: string | undefined,
+  preferred: HarnessId,
+): HarnessId {
+  const hidden = new Set(loadProjectProviderSettings(cwd).hidden ?? []);
+  const enabled = (id: HarnessId) =>
+    !hidden.has(id) &&
+    showProviderInModelPicker(
+      id,
+      isHarnessAvailable(id),
+      hasProbedHarnessAvailability(),
+    );
+  if (enabled(preferred)) return preferred;
+  return HARNESSES.find(enabled) ?? preferred;
+}
+
 /** Provider + model new conversations should start with. */
 export function defaultSessionChoice(cwd?: string): LastModelChoice {
+  const project = loadProjectProviderSettings(cwd);
   const last = loadLastModelChoice(cwd);
-  const harness = last?.harness ?? "cursor";
-  return { harness, model: preferredModelId(harness, cwd) };
+  const harness = firstEnabledHarness(
+    cwd,
+    project.defaultHarness ?? last?.harness ?? "cursor",
+  );
+  const model =
+    project.models?.[harness] ??
+    (project.defaultHarness === harness ? project.defaultModel : undefined) ??
+    preferredModelId(harness, cwd);
+  return { harness, model };
 }
 
 export function loadLastModelChoice(cwd?: string): LastModelChoice | null {

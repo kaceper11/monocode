@@ -17,6 +17,18 @@ import { useWslProjects } from "../shared/hooks/useWslProjects";
 import { WslProjectDialog, WslConnectionStatus } from "../features/sessions/ui/WslProjectDialog";
 import { modelCatalogKey, nativeIdFrom } from "../features/sessions/model/models";
 import { wslLocation } from "../shared/lib/paths";
+import { acceptQuickLaunch } from "./model/quickLaunchSession";
+import { submitWithSettlement } from "./model/managedSubmission";
+import {
+  submitAfterProjectSync,
+  type SubmissionAcceptance,
+} from "./model/submissionAcceptance";
+import type { CiRepairRequest } from "../features/inbox/model/ciRepair";
+import { ciRepairSessions } from "../features/inbox/model/ciRepairSessions";
+import {
+  rebaseCiRepairs,
+  trackCiRepair,
+} from "../features/inbox/model/ciRepairTracking";
 import { invoke } from "@tauri-apps/api/core";
 import {
   orchestrationCheckoutCwd,
@@ -133,7 +145,6 @@ import {
 import {
   closeLeaf,
   closeSurfacePanes,
-  editorTabKey,
   findSurfacePane,
   firstLeafId,
   focusedFileTab,
@@ -157,6 +168,9 @@ import {
   newAgentTab,
   openEditorTab,
   openSessionChangesTab,
+  pinEditorFile,
+  openWorkspaceFile,
+  previewWorkspaceFile,
   openTerminalTab,
   removePane,
   resetTabToSession,
@@ -358,6 +372,8 @@ import {
   sessionNeedsInput,
   newDefaultSession,
   newSession,
+  newSessionForProject,
+  retargetSessionToProject,
   removeSessionDraft,
   sessionDisplayTitle,
   sessionDraftBlock,
@@ -462,14 +478,14 @@ import {
   type Automation,
   type AutomationRun,
 } from "../features/automations/model/automations";
+import { useQuickComposerLaunches } from "../features/quick-composer/hooks/useQuickComposerLaunches";
+import type { QuickLaunch } from "../features/quick-composer/model/quickComposer";
 import { claimInboxAutomationRuns } from "../features/automations/model/automationEvents";
 import {
   SECOND_OPINION_TITLE,
-  buildSecondOpinionCard,
-  buildSecondOpinionPrompt,
+  buildSecondOpinionRequest,
   harnessForTurn,
   turnEditedFiles,
-  turnReport,
   turnUserRequest,
 } from "../features/sessions/model/secondOpinion";
 import { PaneTree } from "../features/workspace/ui/PaneTree";
@@ -586,6 +602,9 @@ type LinkedWorkItemPanelState = {
 };
 
 type SubmitOptions = ComposerTurnOptions & {
+  ciRepair?: CiRepairRequest;
+  /** Saved alongside the user turn; does not replace the submitted prompt. */
+  ciContext?: string;
   secondOpinion?: SecondOpinionMeta;
   followUpBehavior?: FollowUpBehavior;
   noteCard?: NoteComposerCard;
@@ -609,7 +628,7 @@ type Submit = (
   text: string,
   attachments?: Attachment[],
   options?: SubmitOptions,
-) => boolean;
+) => SubmissionAcceptance;
 
 function withPlanStatus(
   session: Session,
@@ -776,6 +795,7 @@ function titleTabsEqual(a: TitleTab[], b: TitleTab[]): boolean {
       tab.blank === other.blank &&
       tab.terminal === other.terminal &&
       tab.browser === other.browser &&
+      tab.previewFileId === other.previewFileId &&
       tab.groupId === other.groupId
     );
   });
@@ -832,6 +852,12 @@ export default function App({
   const [projectTerminals, setProjectTerminals] = useState<ProjectTerminal[]>(
     () => windowTransfer?.projectTerminals ?? resumed?.projectTerminals ?? [],
   );
+  /** Dock side a brand-new project's terminal starts with, persisted in the workspace snapshot. */
+  const [lastDockSide, setLastDockSide] = useState<DockSide | null>(
+    () => resumed?.lastDockSide ?? null,
+  );
+  const lastDockSideRef = useRef(lastDockSide);
+  lastDockSideRef.current = lastDockSide;
   const [projectTerminalFocused, setProjectTerminalFocused] = useState(false);
   const [activeTabId, setActiveTabId] = useState(
     () => windowTransfer?.activeTabId ?? resumed?.activeTabId ?? seed.tab.id,
@@ -1204,6 +1230,7 @@ export default function App({
         readProjectReturnMemory(),
         "unload",
         projectTerminalsRef.current,
+        lastDockSideRef.current ?? undefined,
       ).finally(() => {
         void reapWindowRuntime(
           sessionsRef.current,
@@ -1618,6 +1645,7 @@ export default function App({
       () => projectTerminalsRef.current,
       readProjectReturnMemory,
       flushHarnessEvents,
+      () => lastDockSideRef.current,
     );
     void getCurrentWindow()
       .onCloseRequested((event) => {
@@ -1644,6 +1672,7 @@ export default function App({
           readProjectReturnMemory(),
           "unload",
           projectTerminalsRef.current,
+          lastDockSideRef.current ?? undefined,
         ).finally(() => {
           void (toTray ? hideCurrentWindow() : closeCurrentWindow());
         });
@@ -1832,6 +1861,7 @@ export default function App({
         activeTabId,
       }),
       projectTerminals,
+      lastDockSide ?? undefined,
     );
     const key = workspaceSnapshotKey(snapshot);
     if (workspaceSyncKey.current === key) return;
@@ -1846,6 +1876,7 @@ export default function App({
     activeTabId,
     projectCwd,
     projectTerminals,
+    lastDockSide,
     windowTransfer,
   ]);
 
@@ -2027,19 +2058,19 @@ export default function App({
   }, [activeTabId, commitTabVisit, tabs]);
 
   /** `cwd` scopes group inheritance: a tab from another project starts alone. */
+  const insertBesideActive = useCallback(
+    (prev: WorkspaceTab[], tab: WorkspaceTab, cwd?: string) =>
+      insertTabBesideActive(prev, tab, activeTabIdRef.current, (id) =>
+        id === tab.id ? (cwd ? projectName(cwd) : undefined) : projectOfTab(id),
+      ),
+    [projectOfTab],
+  );
+
   const appendTab = useCallback(
     (tab: WorkspaceTab, cwd?: string) => {
-      setTabs((prev) =>
-        insertTabBesideActive(prev, tab, activeTabIdRef.current, (id) =>
-          id === tab.id
-            ? cwd
-              ? projectName(cwd)
-              : undefined
-            : projectOfTab(id),
-        ),
-      );
+      setTabs((prev) => insertBesideActive(prev, tab, cwd));
     },
-    [projectOfTab],
+    [insertBesideActive],
   );
 
   const onSelectProviderAccount = useCallback(
@@ -2320,7 +2351,14 @@ export default function App({
           projectPath,
         );
         if (!existing) {
-          return [...prev, createProjectTerminal(projectPath, file)];
+          return [
+            ...prev,
+            createProjectTerminal(
+              projectPath,
+              file,
+              lastDockSideRef.current ?? "bottom",
+            ),
+          ];
         }
         return mapProjectTerminal(prev, projectPath, (dock) =>
           addTerminalToDock(dock, file),
@@ -2438,6 +2476,7 @@ export default function App({
   }, []);
 
   const onProjectTerminalSide = useCallback((side: DockSide) => {
+    setLastDockSide(side);
     setProjectTerminals((prev) =>
       mapProjectTerminal(prev, projectCwdRef.current, (dock) =>
         withDockSide(dock, side, {
@@ -3327,6 +3366,7 @@ export default function App({
       path?: string,
       session?: { sessionId: string; cwd: string },
       changeKind?: GitFileDiffKind,
+      pin = false,
     ) => {
       void (async () => {
         const diffCwd = session?.cwd ?? gitCwdRef.current;
@@ -3348,6 +3388,7 @@ export default function App({
                 session.sessionId,
                 resolved,
                 diffProjectCwd,
+                pin,
               );
             }
             if (loadDiffViewer() === "unified") {
@@ -3363,6 +3404,7 @@ export default function App({
             return openEditorTab(
               tab,
               newFileTab(resolved, diffCwd, true, changeKind, diffProjectCwd),
+              { pin },
             );
           }),
         );
@@ -3374,7 +3416,8 @@ export default function App({
   );
 
   const onOpenWorkingTreeDiff = useCallback(
-    (path: string, kind?: GitFileDiffKind) => onOpenDiff(path, undefined, kind),
+    (path: string, kind?: GitFileDiffKind, pin?: boolean) =>
+      onOpenDiff(path, undefined, kind, pin),
     [onOpenDiff],
   );
 
@@ -3397,7 +3440,7 @@ export default function App({
   }, [activeTabId]);
 
   const onOpenCommit = useCallback(
-    (commit: GitHistoryCommit) => {
+    (commit: GitHistoryCommit, pin?: boolean) => {
       setTabs((prev) =>
         prev.map((tab) =>
           tab.id === activeTabId
@@ -3410,6 +3453,7 @@ export default function App({
                   subject: commit.subject,
                 },
                 sidebarCwdRef.current,
+                pin,
               )
             : tab,
         ),
@@ -4702,19 +4746,23 @@ export default function App({
       setProjectCwd(normalized);
       setRecents(rememberProject(normalized));
       setSessions((prev) =>
-        prev.map((s) =>
-          s.id === sessionId
-            ? {
-                ...s,
-                cwd: normalized,
-                branch: undefined,
-                worktreeCwd: undefined,
-                worktreeRemoved: undefined,
-                workspaceMode: undefined,
-                worktreeBase: undefined,
-              }
-            : s,
-        ),
+        prev.map((s) => {
+          if (s.id !== sessionId) return s;
+          // A blank session moving into a project adopts its provider defaults;
+          // a conversation keeps its own provider.
+          const base = isBlankSession(s)
+            ? retargetSessionToProject(s, normalized)
+            : s;
+          return {
+            ...base,
+            cwd: normalized,
+            branch: undefined,
+            worktreeCwd: undefined,
+            worktreeRemoved: undefined,
+            workspaceMode: undefined,
+            worktreeBase: undefined,
+          };
+        }),
       );
       // The session's project just moved in place; a group only holds tabs that
       // share one project, so drop this tab out if it no longer matches.
@@ -4975,13 +5023,7 @@ export default function App({
       }
 
       const seed = current ?? sessionsRef.current[0];
-      const session = newSession(
-        seed?.harness ?? "claude",
-        normalized,
-        seed?.model,
-        seed?.runtimeMode,
-        seed?.modelSettings,
-      );
+      const session = newSessionForProject(seed, normalized);
       const tab = newTab(session.id);
       setProjectCwd(normalized);
       setRecents(rememberProject(normalized));
@@ -5173,6 +5215,7 @@ export default function App({
   const applyProjectLocationChange = useCallback(
     async (from: string, to: string) => {
       await rebaseProjectSessions(from, to);
+      rebaseCiRepairs(from, to);
 
       const nextSessions = sessionsRef.current.map((session) =>
         sameProjectPath(session.cwd, from) ? { ...session, cwd: to } : session,
@@ -5272,29 +5315,31 @@ export default function App({
           undefined,
           fileProjectCwd,
         );
+        const pin = !!options?.pin;
         if (loadFileTabMode() === "workspace") {
-          const key = editorTabKey(file);
-          const existing = tabsRef.current
-            .flatMap((entry) =>
-              entry.editorPanes.map((pane) => ({ entry, pane })),
-            )
-            .find(({ pane }) =>
-              pane.files.some((open) => editorTabKey(open) === key),
-            );
-          if (existing) {
-            setTabs((prev) =>
-              prev.map((entry) =>
-                entry.id === existing.entry.id
-                  ? openEditorTab(entry, file)
-                  : entry,
-              ),
-            );
-            activateTab(existing.entry.id, existing.pane.id);
-          } else {
-            const next = newEditorWorkspaceTab(file);
-            appendTab(next, fileProjectCwd);
-            setActiveTabId(next.id);
-          }
+          // Built once: the updater may run twice in StrictMode.
+          const created = newEditorWorkspaceTab(
+            pin ? file : { ...file, preview: true },
+          );
+          let target: { tabId: string; paneId?: string } | undefined;
+          // Select inside the updater, not from `tabsRef`: two opens resuming
+          // before a render would otherwise both miss the preview and append
+          // twice. flushSync runs the updater now so `target` is set below.
+          flushSync(() => {
+            setTabs((prev) => {
+              const result = openWorkspaceFile(
+                prev,
+                file,
+                created,
+                (tabs, tab) => insertBesideActive(tabs, tab, fileProjectCwd),
+                pin,
+              );
+              target = result;
+              return result.tabs;
+            });
+          });
+          if (target?.paneId) activateTab(target.tabId, target.paneId);
+          else if (target) setActiveTabId(target.tabId);
           setProjectTerminalFocused(false);
           setComposerFocused(false);
           if (navigation) {
@@ -5315,6 +5360,7 @@ export default function App({
             );
             return openEditorTab(entry, file, {
               split: focusedSession?.blocks.length === 0 ? "left" : "right",
+              pin,
             });
           }),
         );
@@ -5329,7 +5375,7 @@ export default function App({
         setComposerFocused(false);
       })();
     },
-    [activateTab, appendTab],
+    [activateTab, insertBesideActive],
   );
 
   const onBrowserMetaChange = useCallback((fileId: string, patch: BrowserMetaPatch) => {
@@ -5406,15 +5452,27 @@ export default function App({
     [activeTabId],
   );
 
-  const onFileDirtyChange = useCallback((fileId: string, dirty: boolean) => {
-    setDirtyFiles((prev) => {
-      if (prev.has(fileId) === dirty) return prev;
-      const next = new Set(prev);
-      if (dirty) next.add(fileId);
-      else next.delete(fileId);
-      return next;
+  const onPinFile = useCallback((fileId: string) => {
+    setTabs((prev) => {
+      const next = prev.map((tab) => pinEditorFile(tab, fileId));
+      return next.some((tab, index) => tab !== prev[index]) ? next : prev;
     });
   }, []);
+
+  const onFileDirtyChange = useCallback(
+    (fileId: string, dirty: boolean) => {
+      // An edited preview must not be replaced by the next click.
+      if (dirty) onPinFile(fileId);
+      setDirtyFiles((prev) => {
+        if (prev.has(fileId) === dirty) return prev;
+        const next = new Set(prev);
+        if (dirty) next.add(fileId);
+        else next.delete(fileId);
+        return next;
+      });
+    },
+    [onPinFile],
+  );
 
   /** The editor reports 0 as it unmounts, so closed tabs drop out on their own. */
   const onFileErrorCountChange = useCallback(
@@ -5601,13 +5659,13 @@ export default function App({
     [invalidateLoadedSession],
   );
 
-  const onSubmit = useCallback(
+  const submitSession = useCallback(
     (
       sessionId: string,
       text: string,
       attachments: Attachment[] = [],
       options?: SubmitOptions,
-    ) => {
+    ): SubmissionAcceptance => {
       if (editedResends.isActive(sessionId)) return false;
       const controlError = orchestrator.submissionError(
         sessionId,
@@ -5641,6 +5699,14 @@ export default function App({
       )
         return false;
       const storedCurrent = sessionsRef.current.find((s) => s.id === sessionId);
+      if (
+        options?.ciRepair &&
+        storedCurrent &&
+        (storedCurrent.busy ||
+          storedCurrent.pendingSwitch ||
+          isPreparingHandoff(storedCurrent))
+      )
+        return false;
       if (
         !storedCurrent ||
         storedCurrent.worktreeRemoved ||
@@ -5749,9 +5815,12 @@ export default function App({
       }
       const submittedText = intent === "build" ? "Build approved plan" : text;
       const rawCommand = isNativeCommandPrompt(submittedText, current.harness);
-      const harnessText = rawCommand
-        ? submittedText
-        : composeNoteMessage(noteCard, submittedText);
+      const ciContext = options?.ciRepair?.prompt ?? options?.ciContext;
+      const harnessText =
+        options?.ciRepair?.prompt ??
+        (rawCommand
+          ? submittedText
+          : composeNoteMessage(noteCard, submittedText));
 
       const pendingSwitch =
         current.pendingSwitch && current.pendingSwitch.from !== current.harness
@@ -5764,7 +5833,12 @@ export default function App({
           intent === "plan" ||
           intent === "orchestrate"
             ? "queue"
-            : (options?.followUpBehavior ?? loadFollowUpBehavior());
+            : // The agent has yielded and only background work is left, which
+              // may never end (a dev server). Queuing would park the message
+              // behind it, so hand it to the agent now.
+              current.backgroundTasks?.length
+              ? "steer"
+              : (options?.followUpBehavior ?? loadFollowUpBehavior());
         if (followUpBehavior === "queue") {
           setSessions((prev) =>
             prev.map((s) =>
@@ -5876,24 +5950,30 @@ export default function App({
             () => projectLocationSyncs.current.delete(key),
           );
         }
-        void measureHarnessTiming(timing, "projectLocation", () => sync!)
-          .then(async (location) => {
-            if (!location) {
-              throw new Error(
-                `Project folder not found: ${displayPath(current.cwd)}. Reopen the folder to reconnect it.`,
-              );
+        return submitAfterProjectSync({
+          cwd: current.cwd,
+          sync: measureHarnessTiming(timing, "projectLocation", () => sync!),
+          applyLocationChange: applyProjectLocationChange,
+          submit: async () => {
+            const accepted = await submitAfterProjectSyncRef.current(
+              sessionId,
+              text,
+              attachments,
+              { ...options, projectLocationReady: true, timing },
+            );
+            if (!accepted) {
+              finishHarnessTiming(timing, "cancelled");
+              editedResend?.reject();
+              options?.onSettled?.({
+                status: "failed",
+                text: "",
+                error:
+                  "The chat became unavailable before the request could start. Try again when it is ready.",
+              });
             }
-            if (location.moved) {
-              await applyProjectLocationChange(current.cwd, location.path);
-            }
-            const submitted = submitAfterProjectSyncRef.current(sessionId, text, attachments, {
-              ...options,
-              projectLocationReady: true,
-              timing,
-            });
-            if (!submitted) finishHarnessTiming(timing, "cancelled");
-          })
-          .catch((error: unknown) => {
+            return accepted;
+          },
+          onError: (error: unknown) => {
             finishHarnessTiming(timing, "failed");
             const message =
               error instanceof Error
@@ -5910,8 +5990,8 @@ export default function App({
               text: "",
               error: message,
             });
-          });
-        return true;
+          },
+        });
       }
 
       const gen = (turnGen.current.get(sessionId) ?? 0) + 1;
@@ -5963,6 +6043,7 @@ export default function App({
             : submittedText;
       const cards = {
         ...(rawCommand ? undefined : userTurnCards(noteCard, card)),
+        ...(ciContext ? { ciContext } : {}),
         // The orchestrator writes these turns, not the user; hide them.
         ...(options?.managed ? { internal: true } : {}),
       };
@@ -5995,9 +6076,12 @@ export default function App({
               worktreePreparing: createDraftWorktree
                 ? true
                 : selected.worktreePreparing,
-              inboxCard: rawCommand ? s.inboxCard : undefined,
-              noteCard: rawCommand ? s.noteCard : undefined,
-              handoffCard: rawCommand ? s.handoffCard : undefined,
+              inboxCard:
+                rawCommand || options?.ciRepair ? s.inboxCard : undefined,
+              noteCard:
+                rawCommand || options?.ciRepair ? s.noteCard : undefined,
+              handoffCard:
+                rawCommand || options?.ciRepair ? s.handoffCard : undefined,
             };
             if (editedResend) {
               next = editedResend.replace(next);
@@ -6276,7 +6360,8 @@ export default function App({
           const latest = sessionsRef.current.find((s) => s.id === sessionId);
           const brief = chooseHandoffBrief(
             agentText,
-            buildDeterministicHandoff(latest ?? current, text),
+            latest ?? current,
+            text,
           );
           await forgetHarnessSession(pendingSwitch.from, sessionId);
           if (turnGen.current.get(sessionId) !== gen) return;
@@ -6670,7 +6755,19 @@ export default function App({
       flushHarnessEvents,
     ],
   );
-  submitAfterProjectSyncRef.current = onSubmit;
+  submitAfterProjectSyncRef.current = submitSession;
+  // Interactive callers use the immediate result to clear their composer. The
+  // queued-launch receiver uses submitSession to await the actual acceptance.
+  const onSubmit = useCallback(
+    (...args: Parameters<Submit>): boolean => {
+      const result = submitSession(...args);
+      if (typeof result === "boolean") return result;
+      // Deferred errors have already been displayed by submitAfterProjectSync.
+      void result.catch(() => undefined);
+      return true;
+    },
+    [submitSession],
+  );
 
   const automationSessionReservations = useRef(new Set<string>());
   const automationRecoveryRef = useRef<Promise<void> | null>(null);
@@ -6689,6 +6786,7 @@ export default function App({
       const releaseReservation = () => {
         if (!reservationId) return;
         automationSessionReservations.current.delete(reservationId);
+        reservationId = undefined;
       };
       try {
         const eventRun = run.trigger === "event";
@@ -6797,8 +6895,17 @@ export default function App({
         await updateAutomationRun(run.id, "running", {
           sessionId: session.id,
         });
-        const accepted = onSubmit(session.id, prompt, [], {
-          refreshTitle: eventRun,
+        // From here the settlement callback owns reservation cleanup, including
+        // a rejected submission that never starts an agent turn.
+        releaseAfterSettle = true;
+        await submitWithSettlement({
+          submit: (onSettled) =>
+            submitSession(session.id, prompt, [], {
+              refreshTitle: eventRun,
+              onSettled,
+            }),
+          rejectionMessage:
+            "The selected agent session could not start this run.",
           onSettled: (outcome) => {
             const status =
               outcome.status === "completed"
@@ -6814,14 +6921,6 @@ export default function App({
               .finally(releaseReservation);
           },
         });
-        if (!accepted) {
-          await updateAutomationRun(run.id, "failed", {
-            sessionId: session.id,
-            error: "The selected agent session could not start this run.",
-          });
-        } else {
-          releaseAfterSettle = true;
-        }
       } catch (reason: unknown) {
         await updateAutomationRun(run.id, "failed", {
           error: reason instanceof Error ? reason.message : String(reason),
@@ -6831,8 +6930,35 @@ export default function App({
         if (!releaseAfterSettle) releaseReservation();
       }
     },
-    [appendTab, focusOpenSession, onSubmit],
+    [appendTab, focusOpenSession, submitSession],
   );
+
+  const launchQuickSession = useCallback(
+    (launch: QuickLaunch, deliveryId: string) =>
+      acceptQuickLaunch(launch, deliveryId, {
+        getSessions: () => sessionsRef.current,
+        updateSessions: (update) => {
+          sessionsRef.current = update(sessionsRef.current);
+          // Compose with submission's queued transcript updates.
+          setSessions(update);
+        },
+        appendTab,
+        setProjectCwd,
+        setRecents,
+        revealTab: (id) => {
+          setActiveTabId(id);
+          setComposerFocused(false);
+          setSearchViewOpen(false);
+          setInboxViewOpen(false);
+          setNotesViewOpen(false);
+          setAutomationsViewOpen(false);
+          setSidebarTab("sessions");
+        },
+        submit: submitSession,
+      }),
+    [appendTab, submitSession],
+  );
+  useQuickComposerLaunches(launchQuickSession);
 
   const ensureAutomationRecovery = useCallback(() => {
     if (!automationRecoveryRef.current) {
@@ -7185,13 +7311,11 @@ export default function App({
       const { harness, model, modelSettings } = target;
       const cwd = sessionWorkCwd(source);
       const from = harnessForTurn(source.blocks, turn, source.harness);
-      const userRequest = turnUserRequest(turn);
-      const files = turnEditedFiles(turn, cwd);
-      const prompt = buildSecondOpinionPrompt({
+      const request = buildSecondOpinionRequest({
         from,
-        userRequest,
-        report: turnReport(turn),
-        files,
+        to: harness,
+        turn,
+        cwd,
       });
       const session = {
         ...newSession(harness, source.cwd, model, source.runtimeMode),
@@ -7204,14 +7328,7 @@ export default function App({
         title: formatSessionTitle(harness, SECOND_OPINION_TITLE),
       };
       openSessionBeside(sourceId, session, source.cwd);
-      onSubmit(session.id, prompt, [], {
-        secondOpinion: buildSecondOpinionCard({
-          from,
-          to: harness,
-          userRequest,
-          files,
-        }),
-      });
+      onSubmit(session.id, request.prompt, [], request.options);
     },
     [onSubmit, openSessionBeside],
   );
@@ -7795,11 +7912,23 @@ export default function App({
         return true;
       },
       submit: (id, text, done) => {
-        // Commit the new turn before the scheduler or confirmation updates
-        // another session snapshot in the same event loop.
-        flushSync(() =>
-          onSubmit(id, text, [], { managed: true, onSettled: done }),
-        );
+        void submitWithSettlement({
+          submit: (onSettled) => {
+            let acceptance: SubmissionAcceptance = false;
+            // Commit an immediate turn before another scheduler update. A
+            // deferred submission flushes its own turn after synchronization.
+            flushSync(() => {
+              acceptance = submitSession(id, text, [], {
+                managed: true,
+                onSettled,
+              });
+            });
+            return acceptance;
+          },
+          onSettled: done,
+          rejectionMessage:
+            "The selected agent session could not accept this turn.",
+        }).catch(console.error);
       },
       steer: async (id, text) => {
         const session = sessionsRef.current.find((entry) => entry.id === id);
@@ -7859,7 +7988,7 @@ export default function App({
         }
       },
     });
-  }, [checkOpenWorktreeFiles, onSubmit, onStop]);
+  }, [checkOpenWorktreeFiles, submitSession, onStop]);
 
   useEffect(() => {
     orchestrator.sync();
@@ -8190,6 +8319,10 @@ export default function App({
       (a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id),
     );
   }, [history, sessions, storedLinkedSessions, boardVersion]);
+  const repairSessions = useMemo(
+    () => ciRepairSessions(history, sessions),
+    [history, sessions],
+  );
   const openProjectSessions = useMemo(
     () =>
       sessions
@@ -8528,6 +8661,65 @@ export default function App({
       void onSelectHistorySession(sessionId);
     },
     [onSelectHistorySession],
+  );
+
+  const onRepairChecks = useCallback(
+    async (
+      item: InboxItem,
+      request: CiRepairRequest,
+      sessionId?: string,
+    ) => {
+      const cwd = item.projectPath;
+      if (!cwd) throw new Error("Choose a local project for this PR first.");
+      let session = sessionId ? await ensureOpenSession(sessionId) : undefined;
+      if (
+        sessionId &&
+        (!session ||
+          session.inboxAsk ||
+          session.orchestrationLeadId ||
+          !sameProjectPath(session.cwd, cwd))
+      ) {
+        throw new Error("Choose a chat from this project.");
+      }
+      if (
+        session &&
+        (session.busy || session.pendingSwitch || isPreparingHandoff(session))
+      ) {
+        throw new Error(
+          "This chat is busy. Choose another chat or start a new one.",
+        );
+      }
+      if (!session) {
+        session = {
+          ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
+          title: `Fix CI #${item.number}: ${item.title}`,
+          linkedWorkItem: linkedWorkItemFromInboxItem(item) ?? undefined,
+        };
+        const next = [...sessionsRef.current, session];
+        sessionsRef.current = next;
+        setSessions(next);
+      }
+      const repairSessionId = session.id;
+      trackCiRepair(cwd, request, repairSessionId, (settle) =>
+        onSubmit(repairSessionId, request.text, [], {
+          ciRepair: request,
+          noteCard: undefined,
+          handoffCard: undefined,
+          onSettled: (outcome) => settle(outcome.status),
+        }),
+      );
+      setInboxViewOpen(false);
+      setNotesViewOpen(false);
+      setSearchViewOpen(false);
+      setSidebarTab("sessions");
+      await onSelectHistorySession(session.id);
+    },
+    [
+      ensureOpenSession,
+      onSubmit,
+      onSelectHistorySession,
+      sessionDefaults?.runtimeMode,
+    ],
   );
 
   const onOpenNotes = useCallback(() => {
@@ -9296,6 +9488,7 @@ export default function App({
       onReorder={onReorderTabs}
       onPlaceOnPane={onPlaceTabOnPane}
       onGoToFile={onGoToFile}
+      onPinFile={onPinFile}
       recents={recents}
       onSelectProject={onSelectProject}
     />
@@ -9573,6 +9766,7 @@ export default function App({
                                 onSelectFile={onSelectFileSurface}
                                 onCloseFile={onCloseFile}
                                 onCloseOtherFiles={onCloseOtherFiles}
+                                onPinFile={onPinFile}
                                 onReorderFiles={onReorderFiles}
                                 onFileDirtyChange={onFileDirtyChange}
                                 onFileErrorCountChange={onFileErrorCountChange}
@@ -9595,6 +9789,12 @@ export default function App({
                   </div>
                   {[...linkedWorkItemPanels.values()].map((panel) => (
                     <LinkedWorkItemPanel
+                      repairSessions={repairSessions}
+                      onRepairChecks={onRepairChecks}
+                      onOpenSession={(sessionId) => {
+                        closeLinkedWorkItemPanel(panel.sessionId);
+                        onOpenInboxSession(sessionId);
+                      }}
                       key={panel.sessionId}
                       target={panel.item}
                       cwd={panel.cwd}
@@ -9684,6 +9884,8 @@ export default function App({
                   onAskRestart={onRestartInboxAsk}
                   onAskMount={setInboxAskPortal}
                   sessions={inboxRelatedSessions}
+                  repairSessions={repairSessions}
+                  onRepairChecks={onRepairChecks}
                   onOpenSession={onOpenInboxSession}
                   onOpenIntegrations={onOpenInboxIntegrations}
                 />
@@ -10034,6 +10236,7 @@ function toTitleTab(
     ),
     terminal: hasTerminal && harnesses.length === 0,
     browser: firstIsBrowser,
+    previewFileId: previewWorkspaceFile(tab)?.id,
     groupId: tab.groupId,
   };
 }

@@ -12,7 +12,15 @@ export default defineConfig(async ({ mode }) => {
     plugins: [react(), tailwindcss()],
     clearScreen: false,
     build: {
-      rollupOptions: { input: ["index.html", "browser-preview.html"] },
+      rollupOptions: {
+        // The quick composer panel loads its own page so it does not boot the
+        // whole workspace.
+        input: {
+          main: "index.html",
+          browserPreview: "browser-preview.html",
+          quickComposer: "quick-composer.html",
+        },
+      },
     },
     server: {
       port: 1420,

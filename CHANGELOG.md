@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.17] - 2026-09-25
+
+### Changed
+
+- Merge upstream through v0.1.56: floating quick composer (Cmd+Shift+Space on macOS), reusable preview tabs, GitHub PR checks with job details and AI repair tracking, project-scoped provider defaults, format-on-save, terminal dock persistence, compact sidebar rail, and Haze background effect.
+- Preserve fork integrations: WSL routing, Azure Boards/Repos/Pipelines, Jira, Confluence, Devin, Muse, Copilot quotas, task worktrees, and the browser side panel. Provider availability stays probed per host; native results feed the shared model-layer snapshot.
+
+### Compatibility
+
+- No persistence schema changes. Existing sessions, worktrees, and provider settings are retained.
+- Native Windows/WSL execution of the merged upstream paths remains unverified.
+
 ## [0.3.16] - 2026-09-24
 
 ### Fixed
@@ -90,6 +102,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Existing Jira credentials and Board/session links remain usable. Fork identity, WSL, Azure integrations and other retained local features are preserved.
 - Local checks and a fixture browser smoke passed; authenticated Jira/Confluence and Windows/WSL acceptance remain unverified.
+
+## [0.1.56] - 2026-09-24
+
+### Added
+
+- On macOS, Quick composer opens a floating prompt over any app with Command+Shift+Space. Choose a project, provider, model, permissions, and working copy; attach files or capture a screenshot; then press Return to start a session in the background or Command+Return to open it. Enable it in Settings → General. In #398.
+- GitHub pull requests in the Inbox show check results, expandable GitHub Actions jobs and steps, and failure details. Failed checks can be sent individually or together to an agent for repair, with progress and the linked conversation tracked in the pull request. In #364.
+- Single-clicking a file, diff, or search result opens a reusable preview tab. Double-clicking its tab or source item, or editing the file, makes it permanent. Preview state survives workspace restoration. In #385.
+- Settings → Providers can set default providers, models, and picker visibility globally or for a selected project. Project defaults apply when opening or moving a blank session into that project. In #395.
+- Settings → Editor has a **Format on save** toggle for Prettier-supported files; it is enabled by default. Turn it off to save the text as typed, including quote style. In #396.
+- Background effects include **Haze**, available globally and per project with a live preview. In #390.
+- When the project rail is compact, its sidebar opens temporarily as a drawer and closes on Escape, an outside click, or session selection. Project menus are available from the project picker even while the rail is hidden, including by right-click or keyboard. In #389.
+
+### Changed
+
+- The collapsed project rail defaults to icon mode for new settings; the hidden rail remains available.
+- Compact-rail live-agent cards have more bottom spacing, and empty sidebar action groups no longer take up space.
+
+### Fixed
+
+- Non-plan Full Access Codex turns now accept supported MCP elicitation confirmations without an additional approval prompt.
+- Claude tool rows reconcile complete streamed input, keep consecutive assistant messages separate, and show background tasks while Claude yields and later resumes.
+- Codex streamed assistant and reasoning text is deduplicated per item instead of repeating completed content.
+- Pi and omp ignore late tool-progress updates after a tool finishes, so completed cards do not return to a running state. In #391.
+- The terminal dock keeps its last chosen side across projects, restarts, and reloads. In #400.
+- Clicking a file in the activity log opens the path shown in its label; mismatched preview paths no longer show an unrelated diff, and home-relative paths resolve correctly. In #330.
 
 ## [0.1.55] - 2026-09-23
 
@@ -1183,8 +1221,10 @@ First public release. macOS (Apple Silicon) only.
 - Updater endpoint and minisign public key are injected at release time rather than committed, so forks do not inherit the maintainer's update channel.
 - macOS release builds sign with `APPLE_SIGNING_IDENTITY` via a config overlay; the committed default remains ad-hoc `-` for community builds.
 
-[Unreleased]: https://github.com/kaceper11/monocode/compare/v0.3.11...HEAD
+[Unreleased]: https://github.com/kaceper11/monocode/compare/v0.3.16...HEAD
+[0.3.16]: https://github.com/kaceper11/monocode/compare/v0.3.15...v0.3.16
 [0.3.11]: https://github.com/kaceper11/monocode/compare/v0.3.10...v0.3.11
+[0.1.56]: https://github.com/hardbeat920/monocode/compare/v0.1.55...v0.1.56
 [0.1.55]: https://github.com/hardbeat920/monocode/compare/v0.1.54...v0.1.55
 [0.1.54]: https://github.com/hardbeat920/monocode/compare/v0.1.53...v0.1.54
 [0.1.53]: https://github.com/hardbeat920/monocode/compare/v0.1.52...v0.1.53

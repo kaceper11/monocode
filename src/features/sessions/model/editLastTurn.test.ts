@@ -18,6 +18,21 @@ function chat(blocks: Block[]) {
 }
 
 describe("editLastTurn", () => {
+  it("blocks editing CI repair requests whose context is absent from the composer", () => {
+    const session = chat([
+      {
+        id: "repair",
+        role: "user",
+        text: "Fix 1 failed CI check for acme/web PR #42.",
+        ciContext: "Checked commit: abc123\nRun tests: expected 200, received 500",
+      },
+      { id: "reply", role: "assistant", text: "Fixed the failing check." },
+    ]);
+
+    expect(canEditLastTurn(session)).toBe(false);
+    expect(prepareEditedResend(session)).toBeNull();
+  });
+
   it("finds the latest user turn", () => {
     const blocks: Block[] = [
       { id: "u1", role: "user", text: "first" },

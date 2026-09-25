@@ -18,6 +18,7 @@ import type { ReleaseNotesTabSource } from "../../../app/model/releaseNotes";
 import {
   clampDockSize,
   isDockSide,
+  type DockSide,
   type ProjectTerminalDock,
 } from "../../projects/model/projectTerminal";
 import { normalizeProjectPath } from "../../projects/model/recents";
@@ -56,6 +57,7 @@ export type WorkspaceSnapshot = {
   projectCwd: string;
   projectTerminals: ProjectTerminalDock[];
   projectReturnTargets?: { projectPath: string; tabId?: string; paneId?: string }[];
+  lastDockSide?: DockSide;
 };
 
 export function collectWorkspaceSnapshot(
@@ -65,6 +67,7 @@ export function collectWorkspaceSnapshot(
   projectCwd: string,
   memory: ProjectReturnMemory,
   projectTerminals: ProjectTerminalDock[] = [],
+  lastDockSide?: DockSide,
 ): WorkspaceSnapshot {
   const snapshot = withoutInboxSessions({
     tabs: withoutAgentTabs(tabs).map(sanitizeTab).filter((tab): tab is WorkspaceTab => tab != null),
@@ -74,6 +77,7 @@ export function collectWorkspaceSnapshot(
     projectTerminals: projectTerminals
       .map(sanitizeProjectTerminal)
       .filter((dock): dock is ProjectTerminalDock => dock != null),
+    ...(isDockSide(lastDockSide) ? { lastDockSide } : {}),
   });
   return withProjectReturnTargets(snapshot, memory);
 }
@@ -176,6 +180,7 @@ export function parseWorkspaceSnapshot(raw: unknown): WorkspaceSnapshot | null {
     projectCwd?: unknown;
     projectTerminals?: unknown;
     projectReturnTargets?: unknown;
+    lastDockSide?: unknown;
   };
   if (!Array.isArray(value.tabs) || typeof value.activeTabId !== "string") {
     return null;
@@ -201,7 +206,10 @@ export function parseWorkspaceSnapshot(raw: unknown): WorkspaceSnapshot | null {
         .map(sanitizeProjectTerminal)
         .filter((dock): dock is ProjectTerminalDock => dock != null)
     : [];
-  const snapshot = withoutInboxSessions({ tabs, sessions, activeTabId, projectCwd, projectTerminals });
+  const lastDockSide = isDockSide(value.lastDockSide)
+    ? value.lastDockSide
+    : undefined;
+  const snapshot = withoutInboxSessions({ tabs, sessions, activeTabId, projectCwd, projectTerminals, lastDockSide });
   return snapshot.tabs.length > 0
     ? withProjectReturnTargets(
         snapshot,
@@ -298,6 +306,7 @@ export function hydrateWorkspaceSnapshot(
       sessions: [...sessions.values()],
       activeTabId,
     }),
+    lastDockSide: parsed.lastDockSide,
   };
 }
 
@@ -592,6 +601,7 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       ? { changeKind: value.changeKind }
       : {}),
     ...(value.terminal === true ? { terminal: true } : {}),
+    ...(value.preview === true ? { preview: true } : {}),
   };
 }
 

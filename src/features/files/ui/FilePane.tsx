@@ -54,6 +54,7 @@ type Props = {
   onSelectFile: (paneId: string, fileId: string) => void;
   onCloseFile: (paneId: string, fileId: string) => void;
   onCloseOtherFiles: (paneId: string, fileId: string) => void;
+  onPinFile?: (fileId: string) => void;
   onDirtyChange: (fileId: string, dirty: boolean) => void;
   onErrorCountChange: (fileId: string, count: number) => void;
   onReorderFiles: (paneId: string, ids: string[]) => void;
@@ -83,6 +84,7 @@ function FilePaneComponent({
   onSelectFile,
   onCloseFile,
   onCloseOtherFiles,
+  onPinFile,
   onDirtyChange,
   onErrorCountChange,
   onReorderFiles,
@@ -122,6 +124,7 @@ function FilePaneComponent({
           onSelectFile={(fileId) => onSelectFile(pane.id, fileId)}
           onCloseFile={(fileId) => onCloseFile(pane.id, fileId)}
           onCloseOtherFiles={(fileId) => onCloseOtherFiles(pane.id, fileId)}
+          onPinFile={onPinFile}
           onReorder={(ids) => onReorderFiles(pane.id, ids)}
           onPaneDragStart={onPaneDragStart}
           trailing={pane.files.some(isBrowserTab) ? <button type="button" title="New browser tab" aria-label="New browser tab" className="mr-1 grid size-5.5 shrink-0 place-items-center self-center rounded text-content/55 hover:bg-content/10 focus-visible:ring-1 focus-visible:ring-content/30" onClick={event => {
@@ -253,6 +256,7 @@ export const FilePane = memo(FilePaneComponent, (previous, next) => {
     previous.onSelectFile !== next.onSelectFile ||
     previous.onCloseFile !== next.onCloseFile ||
     previous.onCloseOtherFiles !== next.onCloseOtherFiles ||
+    previous.onPinFile !== next.onPinFile ||
     previous.onDirtyChange !== next.onDirtyChange ||
     previous.onErrorCountChange !== next.onErrorCountChange ||
     previous.onReorderFiles !== next.onReorderFiles ||

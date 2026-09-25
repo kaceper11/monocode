@@ -19,8 +19,18 @@ import {
   resolveWslAgents,
 } from "./child";
 import { isLiveHarness } from "./registry";
+import {
+  emitHarnessAvailability,
+  markHarnessAvailabilityProbed,
+  setHarnessAvailability,
+  type HarnessAvailability,
+} from "./availabilityState";
 
-export type HarnessAvailability = Record<HarnessId, boolean>;
+export type { HarnessAvailability } from "./availabilityState";
+export {
+  getHarnessAvailabilitySnapshot,
+  subscribeHarnessAvailability,
+} from "./availabilityState";
 
 /**
  * Availability only means the binary exists; authentication is reported
@@ -93,8 +103,6 @@ function hostKey(cwd?: string): string {
     ? `wsl:${wslLocation(cwd)!.distribution.toLowerCase()}`
     : "native";
 }
-let version = 0;
-const listeners = new Set<() => void>();
 
 /**
  * A probe stats ~100 paths across the per-provider resolvers. The model picker and the
@@ -103,24 +111,6 @@ const listeners = new Set<() => void>();
  * and `force` covers it.
  */
 const PROBE_TTL_MS = 30_000;
-
-function emit() {
-  version += 1;
-  for (const listener of listeners) listener();
-}
-
-export function subscribeHarnessAvailability(
-  onStoreChange: () => void,
-): () => void {
-  listeners.add(onStoreChange);
-  return () => {
-    listeners.delete(onStoreChange);
-  };
-}
-
-export function getHarnessAvailabilitySnapshot(): number {
-  return version;
-}
 
 export function hasProbedHarnessAvailability(cwd?: string): boolean {
   return (probes.get(hostKey(cwd))?.probedAt ?? 0) > 0;
@@ -132,7 +122,7 @@ export function isHarnessAvailable(id: HarnessId, cwd?: string): boolean {
 
 export function invalidateHarnessAvailability(cwd: string) {
   probes.delete(hostKey(cwd));
-  emit();
+  emitHarnessAvailability();
 }
 
 export function harnessProbeError(cwd?: string): string | undefined {
@@ -203,7 +193,12 @@ export function probeHarnessAvailability(options?: {
   const finish = () => {
     current.probedAt = Date.now();
     current.inflight = null;
-    emit();
+    if (key === "native") {
+      // The extracted store backs model-layer reads that are not host-scoped.
+      setHarnessAvailability(current.availability);
+      markHarnessAvailabilityProbed();
+    }
+    emitHarnessAvailability();
   };
   const location = options?.cwd ? wslLocation(options.cwd) : undefined;
   if (options?.cwd && location) {

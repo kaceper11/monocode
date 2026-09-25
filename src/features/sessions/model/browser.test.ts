@@ -705,7 +705,7 @@ describe("browser workspace isolation", () => {
     expect(closed.editorPanes).toEqual([]);
 
     const file = newFileTab("/repo/a.ts", "/repo");
-    const withFile = openEditorTab(original, file);
+    const withFile = openEditorTab(original, file, { pin: true });
     const mixed = openBrowserTab(withFile, browser);
     const result = closeBrowserTabs(mixed)!;
     expect(result.editorPanes[0].files).toEqual([file]);
