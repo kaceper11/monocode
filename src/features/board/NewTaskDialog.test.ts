@@ -171,6 +171,7 @@ it("clears checkout-specific choices when changing repositories", async () => {
   expect(onChange).toHaveBeenCalledWith({
     projectPath: "/api",
     worktreePath: undefined,
+    noWorktree: false,
     branch: "",
     base: "",
   });

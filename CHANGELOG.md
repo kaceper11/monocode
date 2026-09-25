@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.18] - 2026-09-25
+
+### Changed
+
+- Rework worktree management in task details and task creation: staged selections replace immediate Git operations, explicit actions (attach, create, switch, detach, save branch) apply once and close the editor, and a one-line hint previews each change.
+- Keep worktree fields mounted in both surfaces — labelled rows and a stable status line replace swapping sections, removing popover flicker.
+- Support branch-only task lanes: "No working copy" in task creation and a detach action in task details let a lane track a branch and its pull request without a local checkout; a copy can be attached or created later.
+
+### Fixed
+
+- Revalidate the lane's persisted branch, base, and bound path plus board-wide branch/worktree claims before every worktree edit, so a stale editor cannot overwrite a fresher update.
+- Offer to bind an existing worktree that already occupies a selected branch instead of failing, and keep a probed pull request when detaching without retargeting.
+
+### Compatibility
+
+- No persistence schema changes or new dependencies. Branch-tracking lanes reuse the existing pathless workstream shape.
+- UI flows were verified with mocked Git responses; native Windows/WSL execution remains unverified.
+
 ## [0.3.17] - 2026-09-25
 
 ### Changed

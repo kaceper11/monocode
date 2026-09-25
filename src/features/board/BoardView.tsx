@@ -1332,6 +1332,17 @@ export function BoardView({
           failLane(ws, `a lane already tracks ${ws.branch}`);
           continue;
         }
+        // Branch-tracking lane — no copy to prepare; details can bind or
+        // create one later.
+        if (ws.noWorktree) {
+          workstreams.push({
+            id: newEntityId("ws"),
+            projectPath: ws.projectPath,
+            branch: ws.branch,
+            base: ws.base,
+          });
+          continue;
+        }
         try {
           const worktreePath = await onPrepareWorktree(ws);
           workstreams.push({

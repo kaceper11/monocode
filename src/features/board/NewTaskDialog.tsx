@@ -18,6 +18,7 @@ import {
   GitBranch,
   LoaderCircle,
   Plus,
+  RefreshCw,
   Search,
   X,
 } from "../../shared/ui/icons";
@@ -40,7 +41,7 @@ import {
   useProjectBranchesState,
 } from "../source-control/hooks/useProjectBranches";
 import { useProjectWorktrees } from "../source-control/hooks/useProjectWorktrees";
-import { gitBranches, type GitBranches } from "../../platform/tauri/fs";
+import { type GitBranches } from "../../platform/tauri/fs";
 import { boardTicketOptions, groupSwatch } from "./boardData";
 import {
   createGroup,
@@ -55,6 +56,8 @@ export type TaskWorkstreamSpec = {
   base: string;
   /** Bind this existing worktree instead of creating a new one. */
   worktreePath?: string;
+  /** Track the branch only — no working copy is prepared on submit. */
+  noWorktree?: boolean;
 };
 
 export type NewTaskSpec = {
@@ -88,13 +91,7 @@ export function suggestedBranch(
 }
 
 /** Preserve explicit branch names; only the task's automatic suggestion uses mc/. */
-export function resolveLaneBranch(
-  projectPath: string,
-  typed: string,
-  branches?: GitBranches | null,
-): string | null {
-  void projectPath;
-  void branches;
+export function resolveLaneBranch(typed: string): string | null {
   return taskBranchChoice(typed.trim()).branch || null;
 }
 
@@ -162,10 +159,18 @@ type DraftWorkstream = {
   base: string;
   /** Bind this existing worktree instead of creating a new one. */
   worktreePath?: string;
+  /** Track the branch only — the lane prepares a copy on demand. */
+  noWorktree?: boolean;
 };
 
-/** Repo + branch + base inputs — shared by this dialog and the details
- * panel's add-workstream row. `tail` is the trailing button (remove/add). */
+/** Working-copy pick that binds nothing — real values are absolute paths. */
+export const NO_COPY = "none";
+
+/** Repo + working-copy + branch/base inputs — shared by this dialog and the
+ * details panel's add-workstream row. `tail` is the trailing button
+ * (remove/add). Every row stays mounted across mode changes — a pick only
+ * ever disables or re-labels a field, so choosing a copy never reflows the
+ * form. */
 export function WorkstreamFields({
   draft,
   projects,
@@ -182,6 +187,7 @@ export function WorkstreamFields({
     branch: string;
     base: string;
     worktreePath?: string;
+    noWorktree?: boolean;
   };
   projects: { value: string; label: string }[];
   onChange: (
@@ -190,6 +196,7 @@ export function WorkstreamFields({
       branch: string;
       base: string;
       worktreePath?: string;
+      noWorktree?: boolean;
     }>,
   ) => void;
   tail: ReactNode;
@@ -241,6 +248,12 @@ export function WorkstreamFields({
       ),
     [worktrees, draft.worktreePath, excludeWorktreePaths, excludeBranches],
   );
+  const field = (label: string, control: ReactNode) => (
+    <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">
+      <span className="truncate">{label}</span>
+      {control}
+    </div>
+  );
   const repoSelect = (
     <SearchableSelect
       variant={compact ? "row" : "field"}
@@ -253,6 +266,7 @@ export function WorkstreamFields({
         onChange({
           projectPath,
           worktreePath: undefined,
+          noWorktree: false,
           branch: "",
           base: "",
         });
@@ -265,19 +279,34 @@ export function WorkstreamFields({
   const worktreeSelect = (
     <SearchableSelect
       variant={compact ? "row" : "field"}
-      label="Worktree"
-      value={draft.worktreePath ?? ""}
-      options={[{ value: "", label: "Create new worktree" }, ...worktreeOptions]}
+      label="Working copy"
+      value={draft.noWorktree ? NO_COPY : (draft.worktreePath ?? "")}
+      options={[
+        { value: "", label: "Create new worktree" },
+        ...worktreeOptions,
+        { value: NO_COPY, label: "No working copy" },
+      ]}
       onChange={(path) => {
+        if (path === NO_COPY) {
+          // Track the branch only — task details can prepare a copy later.
+          onChange({ noWorktree: true, worktreePath: undefined });
+          return;
+        }
         const tree = worktrees?.worktrees.find((entry) => entry.path === path);
         onChange({
+          noWorktree: false,
           // `path` may be the stale-bound synthetic option — keep it so the
-          // pick stays visible instead of silently unbinding. Reverting to
-          // "New worktree" drops the copied branch too — leaving it would
-          // collide with the worktree it came from. A stale pick has no
-          // live tree to read from — keep the branch it synced.
+          // pick stays visible instead of silently unbinding. Leaving a
+          // bound pick for "new" drops the synced branch (it would collide
+          // with the copy it came from); "none" keeps it — a tracked branch
+          // survives detaching the copy. A stale pick has no live tree to
+          // read from — keep the branch it synced.
           worktreePath: path || undefined,
-          branch: path ? (tree?.branch ?? draft.branch) : "",
+          branch: path
+            ? (tree?.branch ?? draft.branch)
+            : draft.worktreePath
+              ? ""
+              : draft.branch,
         });
       }}
       placeholder="Create new worktree"
@@ -318,26 +347,65 @@ export function WorkstreamFields({
       minMenuWidth={240}
     />
   );
-  // Compact rows live in the narrow details panel — stack the repo over
-  // branch+base so every field stays readable.
+  // One status line under the fields: what the current picks mean, or the
+  // loading/error state. Always rendered so the card never grows on load.
+  const hint = worktreeError
+    ? worktreeError
+    : draft.projectPath && !worktrees
+      ? "Loading working copies…"
+      : draft.worktreePath
+        ? `${draft.branch || "Bound branch"} · ${prettyCwd(draft.worktreePath)}`
+        : draft.noWorktree
+          ? "Tracks the branch only — attach or create a copy later"
+          : `New worktree branches from ${draft.base || "the current checkout"}`;
+  const footer = (
+    <div className="mt-1.5 flex items-center gap-2">
+      <p
+        role={
+          worktreeError
+            ? "alert"
+            : draft.projectPath && !worktrees
+              ? "status"
+              : undefined
+        }
+        title={hint}
+        className={`min-w-0 flex-1 truncate text-[11px] ${worktreeError ? "text-red-400" : "text-content/40"}`}
+      >
+        {hint}
+      </p>
+      <button
+        type="button"
+        title="Refresh working copies"
+        aria-label="Refresh working copies"
+        disabled={!draft.projectPath || gitBusy}
+        onClick={() => void refreshWorktrees()}
+        className="grid size-5 shrink-0 place-items-center rounded text-content/40 hover:bg-content/8 hover:text-content disabled:opacity-40"
+      >
+        <RefreshCw
+          className={`size-3 ${draft.projectPath && !worktrees && !worktreeError ? "animate-spin" : ""}`}
+          strokeWidth={1.75}
+        />
+      </button>
+    </div>
+  );
+  // Compact rows live in the narrow details panel — same fields, lighter box.
   if (compact) {
     return (
       <div className="min-w-0 rounded-lg bg-content/[0.025] p-2">
         <div className="flex flex-col gap-1.5">
-          <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">Repository{repoSelect}</div>
-          <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">Working copy{worktreeSelect}</div>
-          <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">Branch{branchSelect}</div>
-          <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">{draft.worktreePath ? "PR base" : "Start from"}{baseSelect}</div>
+          {field("Repository", repoSelect)}
+          {field("Working copy", worktreeSelect)}
+          {field("Branch", branchSelect)}
+          {field("Base branch", baseSelect)}
         </div>
-        <button type="button" className="text-[11px] text-content/50" disabled={!draft.projectPath || gitBusy} onClick={() => void refreshWorktrees()}>Refresh copies</button>
-        {worktreeError && <p role="alert" className="text-[11px] text-red-400">{worktreeError}</p>}
+        {footer}
         {tail}
       </div>
     );
   }
   return (
     <div className="min-w-0 rounded-lg border border-content/10 p-3">
-      <div className="mb-3 flex min-w-0 items-center gap-2">
+      <div className="mb-2.5 flex min-w-0 items-center gap-2">
         <GitBranch className="size-4 shrink-0 text-content/45" />
         <div className="min-w-0 flex-1">
           <p className="truncate text-[12px] font-medium text-content">
@@ -352,24 +420,12 @@ export function WorkstreamFields({
         </div>
         {tail}
       </div>
-      <div className="mb-2 min-w-0"><div className="mb-1 flex items-center justify-between text-[10px] text-content/50"><span>Working copy · attach existing or create new</span><button type="button" disabled={gitBusy} onClick={() => void refreshWorktrees()}>Refresh copies</button></div>{worktreeSelect}</div>
-      {draft.worktreePath && <p title={draft.worktreePath} className="mb-2 break-all text-[11px] text-content/55">{draft.branch} · {prettyCwd(draft.worktreePath)}</p>}
-      {draft.projectPath && !worktrees && !worktreeError && <p role="status" className="text-[11px] text-content/50">Loading working copies…</p>}
-      {worktreeError && <p role="alert" className="text-[11px] text-red-400">{worktreeError}</p>}
-      <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2">
-        {!draft.worktreePath && (
-          <div className="min-w-0">
-            <p className="mb-1 text-[10px] text-content/50">Worktree branch</p>
-            {branchSelect}
-          </div>
-        )}
-        <div className="min-w-0">
-          <p className="mb-1 text-[10px] text-content/50">
-            {draft.worktreePath ? "PR base branch" : "Create from"}
-          </p>
-          {baseSelect}
-        </div>
+      <div className="flex flex-col gap-1.5">
+        {field("Working copy", worktreeSelect)}
+        {field("Branch", branchSelect)}
+        {field("Base branch", baseSelect)}
       </div>
+      {footer}
     </div>
   );
 }
@@ -463,6 +519,37 @@ export function NewTaskDialog({
     [items, query],
   );
 
+  // Claims per stream row: board lanes own their paths+branches; sibling rows
+  // claim each picked worktree and the branch it synced. Keyed by row key so
+  // the sets stay stable across unrelated re-renders.
+  const claims = useMemo(() => {
+    const map = new Map<
+      number,
+      { paths: Set<string>; branches: Set<string> }
+    >();
+    for (const stream of streams) {
+      const paths = new Set<string>();
+      const branches = new Set<string>();
+      for (const ws of lanes) {
+        if (!sameProjectPath(ws.projectPath, stream.projectPath)) continue;
+        branches.add(ws.branch);
+        if (ws.worktreePath) paths.add(pathKey(ws.worktreePath));
+      }
+      for (const other of streams) {
+        if (
+          other === stream ||
+          !sameProjectPath(other.projectPath, stream.projectPath)
+        )
+          continue;
+        // "" is the auto-name sentinel, never a real claim.
+        if (other.branch) branches.add(other.branch);
+        if (other.worktreePath) paths.add(pathKey(other.worktreePath));
+      }
+      map.set(stream.key, { paths, branches });
+    }
+    return map;
+  }, [lanes, streams]);
+
   const toggleTicket = (linked: LinkedWorkItem) => {
     const key = linkedWorkItemInboxKey(linked);
     setSelected((current) => {
@@ -480,21 +567,6 @@ export function NewTaskDialog({
     try {
       const links = [...selected.values()];
       const fallback = suggestedBranch(title, links);
-      // Fresh branch lists — a stale cache would wrap a branch created
-      // outside the app in `mc/` instead of adopting it.
-      const fresh = new Map<string, GitBranches | null>();
-      for (const stream of streams) {
-        if (
-          !stream.worktreePath &&
-          stream.projectPath &&
-          !fresh.has(stream.projectPath)
-        ) {
-          fresh.set(
-            stream.projectPath,
-            await gitBranches(stream.projectPath).catch(() => null),
-          );
-        }
-      }
       onSubmit({
         title: title.trim(),
         links,
@@ -506,15 +578,12 @@ export function NewTaskDialog({
             // would only be needed for fresh creations.
             branch: stream.worktreePath
               ? stream.branch
-              : resolveLaneBranch(
-                  stream.projectPath,
-                  stream.branch,
-                  fresh.get(stream.projectPath),
-                ) || fallback,
+              : resolveLaneBranch(stream.branch) || fallback,
             base: stream.base.trim() || "HEAD",
             ...(stream.worktreePath
               ? { worktreePath: stream.worktreePath }
               : {}),
+            ...(stream.noWorktree ? { noWorktree: true } : {}),
           })),
         groupIds: [...selectedGroups],
       });
@@ -551,7 +620,8 @@ export function NewTaskDialog({
             {busy || submitting ? (
               <LoaderCircle className="size-3.5 animate-spin" strokeWidth={2} />
             ) : null}
-            {!fixedWorkstream && streams.length > 0
+            {!fixedWorkstream &&
+            streams.some((stream) => stream.projectPath && !stream.noWorktree)
               ? "Create & open agent"
               : "Create task"}
           </button>
@@ -595,29 +665,7 @@ export function NewTaskDialog({
             </div>
             <div className="flex min-w-0 flex-col gap-2">
               {streams.map((stream) => {
-                // Claims against this row's repo: board lanes own their
-                // paths+branches; sibling rows claim each picked worktree
-                // and the branch it synced.
-                const excludePaths = new Set<string>();
-                const excludeBranches = new Set<string>();
-                for (const ws of lanes) {
-                  if (!sameProjectPath(ws.projectPath, stream.projectPath))
-                    continue;
-                  excludeBranches.add(ws.branch);
-                  if (ws.worktreePath)
-                    excludePaths.add(pathKey(ws.worktreePath));
-                }
-                for (const other of streams) {
-                  if (
-                    other === stream ||
-                    !sameProjectPath(other.projectPath, stream.projectPath)
-                  )
-                    continue;
-                  // "" is the auto-name sentinel, never a real claim.
-                  if (other.branch) excludeBranches.add(other.branch);
-                  if (other.worktreePath)
-                    excludePaths.add(pathKey(other.worktreePath));
-                }
+                const claim = claims.get(stream.key)!;
                 return (
                   <WorkstreamFields
                     key={stream.key}
@@ -627,8 +675,8 @@ export function NewTaskDialog({
                     ])}
                     projects={projects}
                     layer={LAYER.dialogPopover}
-                    excludeWorktreePaths={excludePaths}
-                    excludeBranches={excludeBranches}
+                    excludeWorktreePaths={claim.paths}
+                    excludeBranches={claim.branches}
                     onChange={(patch) =>
                       setStreams((current) =>
                         current.map((entry) =>

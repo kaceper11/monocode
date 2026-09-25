@@ -26,6 +26,7 @@ import {
   MessageSquare,
   Play,
   Plus,
+  RefreshCw,
   Search,
   Trash2,
   WandSparkles,
@@ -39,7 +40,7 @@ import {
   type InboxItem,
 } from "../inbox/model/githubTasks";
 import { pathKey, prettyCwd, projectName } from "../../shared/lib/paths";
-import { gitBranches, gitTaskBranch, subscribeGitChanged } from "../../platform/tauri/fs";
+import { gitTaskBranch, subscribeGitChanged } from "../../platform/tauri/fs";
 import {
   taskBranchOptions,
   taskBranchChoice,
@@ -82,6 +83,7 @@ import {
 } from "./boardStore";
 import {
   baseBranchOptions,
+  NO_COPY,
   resolveLaneBranch,
   suggestedBranch,
   WorkstreamFields,
@@ -368,6 +370,7 @@ function AddWorkstreamRow({
     branch: string;
     base: string;
     worktreePath?: string;
+    noWorktree?: boolean;
   }) => void;
 }) {
   const [draft, setDraft] = useState<{
@@ -375,6 +378,7 @@ function AddWorkstreamRow({
     branch: string;
     base: string;
     worktreePath?: string;
+    noWorktree?: boolean;
   }>({
     projectPath: "",
     branch: "",
@@ -764,18 +768,14 @@ export function TaskDetailsPanel({
     branch: string;
     base: string;
     worktreePath?: string;
+    noWorktree?: boolean;
   }) => {
     setAddingStream(true);
     setStreamError("");
     const resolved = spec.worktreePath
       ? spec.branch
-      : resolveLaneBranch(
-          spec.projectPath,
-          spec.branch,
-          // Fresh list — the cache can lag a branch created outside the
-          // app; wrapping a real branch in `mc/` would silently fork it.
-          await gitBranches(spec.projectPath).catch(() => null),
-        ) || suggestedBranch(task.title, task.links);
+      : resolveLaneBranch(spec.branch) ||
+        suggestedBranch(task.title, task.links);
     try {
       // Cap check before spawn — `updateTask` failing after the worktree +
       // session exist would orphan both.
@@ -798,7 +798,7 @@ export function TaskDetailsPanel({
       ) {
         throw new Error(`A lane already tracks ${resolved}`);
       }
-      if (!spec.worktreePath) {
+      if (!spec.worktreePath && !spec.noWorktree) {
         // "New" can collide with a worktree already on this branch — offer
         // to bind that copy instead of erroring out. Unless another lane
         // already owns it — then there's nothing to offer.
@@ -813,12 +813,15 @@ export function TaskDetailsPanel({
           return;
         }
       }
-      const worktreePath = await onPrepareWorktree({
-        projectPath: spec.projectPath,
-        branch: resolved,
-        base: spec.base,
-        ...(spec.worktreePath ? { worktreePath: spec.worktreePath } : {}),
-      });
+      // `noWorktree` adds a branch-tracking lane — no copy to prepare.
+      const worktreePath = spec.noWorktree
+        ? undefined
+        : await onPrepareWorktree({
+            projectPath: spec.projectPath,
+            branch: resolved,
+            base: spec.base,
+            ...(spec.worktreePath ? { worktreePath: spec.worktreePath } : {}),
+          });
       updateTask(task.id, (current) => ({
         workstreams: [
           ...current.workstreams,
@@ -827,7 +830,7 @@ export function TaskDetailsPanel({
             projectPath: spec.projectPath,
             branch: resolved,
             base: spec.base,
-            worktreePath,
+            ...(worktreePath ? { worktreePath } : {}),
           },
         ],
       }));
@@ -2038,8 +2041,11 @@ function WorkstreamCard({
   );
 }
 
-/** Lane editor — rebind an existing worktree, retarget branch/base, or drop
- * the lane's worktree. Branch picks wait for an explicit checkout action. */
+/** Lane editor — stage a working-copy pick (attach an existing tree, create
+ * a new one, or none) plus a branch/base retarget, then apply once. Picks
+ * never fire IO on their own, and every field stays mounted so the popover
+ * never reflows mid-edit; a successful apply closes it rather than
+ * resetting the form in place. */
 export function WorkstreamEditor({
   anchor,
   row,
@@ -2066,11 +2072,12 @@ export function WorkstreamEditor({
   onClose: () => void;
 }) {
   const { branches } = useProjectBranchesState(row.projectPath, true);
-  const { data: worktrees, refresh, error: worktreeError } = useProjectWorktrees(
-    row.projectPath,
-    true,
-  );
+  const { data: worktrees, refresh, error: worktreeError } =
+    useProjectWorktrees(row.projectPath);
   const [branchBusy, setBranchBusy] = useState(false);
+  /** Staged working-copy pick: undefined = keep current, "new" = create a
+   * fresh worktree, NO_COPY = detach, anything else = a worktree path. */
+  const [copy, setCopy] = useState<string>();
   const [targetBranch, setTargetBranch] = useState<string>();
   const [createBase, setCreateBase] = useState<string>();
   const [bindPath, setBindPath] = useState<string>();
@@ -2080,6 +2087,7 @@ export function WorkstreamEditor({
   const blockedRef = useRef(busy);
   blockedRef.current = busy || gitBusy || row.sessions.some(session => session.busy);
   useEffect(() => {
+    setCopy(undefined);
     setTargetBranch(undefined);
     setCreateBase(undefined);
     setBindPath(undefined);
@@ -2087,11 +2095,6 @@ export function WorkstreamEditor({
   const [armed, setArmed] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [error, setError] = useState("");
-  // The shared cache can lag a worktree created/removed elsewhere — the
-  // editor's whole job is correctness, so ask git again on open.
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
   // An armed confirm must not survive a rebind — it would remove the new
   // pick's worktree instead of the one the user armed against.
   useEffect(() => setArmed(false), [row.worktreePath]);
@@ -2164,15 +2167,29 @@ export function WorkstreamEditor({
     }
     return "";
   };
+  /** The lane must still look like the row this editor opened with —
+   * otherwise the patch would clobber a fresher update. */
+  const rowDrift = (): string => {
+    const current = loadBoard().tasks
+      .flatMap((task) => task.workstreams)
+      .find((ws) => ws.id === row.id);
+    return !current ||
+      current.branch !== row.branch ||
+      current.base !== row.base ||
+      current.worktreePath !== row.worktreePath ||
+      !sameProjectPath(current.projectPath, row.projectPath)
+      ? "Working copy settings changed. Reopen the editor before retrying."
+      : "";
+  };
+  /** Switch the bound copy's branch in place, or prepare another worktree.
+   * A successful patch closes the popover. */
   const applyBranch = async (action: "switch" | "create", existingPath?: string, selectedBranch = targetBranch) => {
     if (!selectedBranch || inFlight.current || blocked) return;
     const choice = taskBranchChoice(selectedBranch);
     let preparedPath: string | undefined;
     const validate = (path?: string) => {
-      const current = loadBoard().tasks.flatMap(task => task.workstreams).find(ws => ws.id === row.id);
-      if (!current || current.branch !== row.branch || current.base !== row.base ||
-          current.worktreePath !== row.worktreePath || !sameProjectPath(current.projectPath, row.projectPath))
-        throw new Error("Working copy settings changed. Reopen the editor before retrying.");
+      const drift = rowDrift();
+      if (drift) throw new Error(drift);
       const claim = storeClaim({ branch: choice.branch, worktreePath: path });
       if (claim) throw new Error(claim);
     };
@@ -2190,7 +2207,14 @@ export function WorkstreamEditor({
         if (!existingPath) {
           const tree = await worktreeOnBranch(row.projectPath, choice.branch);
           validate(tree?.path);
-          if (tree) { setBindPath(tree.path); return; }
+          // A hit on the lane's own bound copy is no clash — the branch is
+          // already where the user wants it.
+          if (tree) {
+            if (row.worktreePath && pathKey(tree.path) === pathKey(row.worktreePath))
+              throw new Error("This working copy is already on that branch.");
+            setBindPath(tree.path);
+            return;
+          }
         }
         // Reuse the app's normal preparation path; the old checkout is untouched.
         try {
@@ -2214,10 +2238,8 @@ export function WorkstreamEditor({
           throw new Error("An agent is working. Reopen the editor after it finishes.");
         onPatch({ branch: choice.branch, worktreePath: preparedPath, prUrl: undefined });
       }
-      setTargetBranch(undefined);
-      setCreateBase(undefined);
-      setBindPath(undefined);
       void refresh();
+      onClose();
     } catch (cause) {
       setError(`${String(cause)}${preparedPath ? ` Working copy kept at ${preparedPath}.` : ""}`);
     } finally {
@@ -2225,13 +2247,159 @@ export function WorkstreamEditor({
       setBranchBusy(false);
     }
   };
-  const usesExistingBranch = !!targetBranch && (targetBranch.startsWith("refs/remotes/") ||
-    branches?.branches.some(branch => !branch.remote && branch.name === targetBranch));
+  const currentCopy = row.worktreePath ?? NO_COPY;
+  const pick = copy ?? currentCopy;
+  const creating = pick === "new";
+  const attaching = copy !== undefined && copy !== "new" && copy !== NO_COPY;
+  // The staged copy — only while the user actually picked a different one;
+  // resolving the current binding here would freeze the branch field.
+  const stagedTree = attaching
+    ? bindableWorktrees(worktrees?.worktrees ?? []).find(
+        (tree) => pathKey(tree.path) === pathKey(pick),
+      )
+    : undefined;
+  // "" is the create-mode sentinel for "not picked yet" — anywhere else it
+  // means the staged branch was cleared, so fall back to the lane's branch.
+  const stagedBranch =
+    stagedTree?.branch ?? (targetBranch || (creating ? "" : row.branch));
+  const stagedChoice = taskBranchChoice(stagedBranch);
+  const stagedName = stagedChoice.branch;
+  const branchStaged = !stagedTree && stagedName !== row.branch;
+  const effectiveBase = stagedChoice.base ?? createBase ?? row.base;
+  // The staged picture as one line — the action row's context.
+  const usesExistingBranch = branches?.branches.some(
+    (branch) => !branch.remote && branch.name === stagedName,
+  );
+  const hint =
+    copy === NO_COPY
+      ? `The lane keeps tracking ${stagedName} without a local copy.`
+      : attaching
+        ? stagedTree
+          ? `Attaches ${stagedTree.branch} — the lane follows the copy's checkout.`
+          : "That working copy can't be attached — it may be gone or detached."
+        : creating
+          ? usesExistingBranch
+            ? `A new copy adopts ${stagedName || "the branch"} as-is.`
+            : `A new copy creates ${stagedName || "the branch"} from ${effectiveBase}.`
+          : branchStaged
+            ? row.worktreePath
+              ? `Switch this copy to ${stagedName}, or leave it and create a second copy.`
+              : `Create a worktree on ${stagedName}, or just retarget the lane.`
+            : "";
+  const attach = () => {
+    if (!stagedTree?.branch) {
+      setError("Working copy is unavailable. Refresh copies before retrying.");
+      return;
+    }
+    // Attachment needs the same live branch/path and ownership checks as
+    // the existing-copy offer after creation.
+    void applyBranch("create", stagedTree.path, stagedTree.branch);
+  };
+  const detach = () => {
+    // Keep the probed PR when detaching its working copy; a branch staged
+    // alongside the detach retargets the lane in the same patch.
+    const drift = rowDrift();
+    const claim = branchStaged && !drift ? storeClaim({ branch: stagedName }) : "";
+    if (drift || claim) {
+      setError(drift || claim);
+      return;
+    }
+    onPatch({
+      worktreePath: undefined,
+      ...(branchStaged
+        ? {
+            branch: stagedName,
+            ...(stagedChoice.base ? { base: stagedChoice.base } : {}),
+            prUrl: undefined,
+          }
+        : { ...(row.pr?.url ? { prUrl: row.pr.url } : {}) }),
+    });
+    onClose();
+  };
+  /** Branch-only retarget for a lane with no copy — a plain field patch. */
+  const retarget = () => {
+    const drift = rowDrift();
+    const claim = drift ? "" : storeClaim({ branch: stagedName });
+    if (drift || claim) {
+      setError(drift || claim);
+      return;
+    }
+    onPatch({
+      branch: stagedName,
+      ...(stagedChoice.base ? { base: stagedChoice.base } : {}),
+      prUrl: undefined,
+    });
+    onClose();
+  };
+  type LaneAction = {
+    key: string;
+    label: string;
+    run: () => void;
+    primary?: boolean;
+    disabled?: boolean;
+  };
+  const actions: LaneAction[] = [];
+  if (copy === NO_COPY) {
+    actions.push({
+      key: "detach",
+      label: "Detach working copy",
+      primary: true,
+      run: detach,
+    });
+  } else if (attaching) {
+    actions.push({
+      key: "attach",
+      label: "Attach working copy",
+      primary: true,
+      run: attach,
+      disabled: !stagedTree,
+    });
+  } else if (creating) {
+    actions.push({
+      key: "create",
+      label: branchBusy ? "Preparing…" : "Create worktree",
+      primary: true,
+      run: () => void applyBranch("create"),
+      disabled: !targetBranch?.trim(),
+    });
+  } else if (branchStaged) {
+    if (row.worktreePath) {
+      actions.push({
+        key: "switch",
+        label: "Switch in place",
+        run: () => void applyBranch("switch"),
+      });
+      actions.push({
+        key: "create",
+        label: branchBusy ? "Preparing…" : "New worktree",
+        primary: true,
+        run: () => void applyBranch("create"),
+      });
+    } else {
+      actions.push({
+        key: "retarget",
+        label: "Save branch",
+        run: retarget,
+      });
+      actions.push({
+        key: "create",
+        label: branchBusy ? "Preparing…" : "Create worktree",
+        primary: true,
+        run: () => void applyBranch("create"),
+      });
+    }
+  }
   const boundTree = row.worktreePath
     ? worktrees?.worktrees.find(
         (tree) => pathKey(tree.path) === pathKey(row.worktreePath!),
       )
     : undefined;
+  const field = (label: string, control: React.ReactNode) => (
+    <div className="grid min-w-0 grid-cols-[88px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/45">
+      <span className="truncate">{label}</span>
+      {control}
+    </div>
+  );
   return (
     <Popover
       anchor={anchor}
@@ -2240,97 +2408,134 @@ export function WorkstreamEditor({
       // SearchableSelect menus portal out of this popover — they aren't
       // "outside" clicks.
       ignore="[data-dialog-popover]"
-      className="flex flex-col gap-3 p-3"
+      className="flex flex-col gap-2 p-3"
       aria-label="Manage worktree"
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="text-[12px] font-medium">{createBase !== undefined ? "Create new worktree" : "Manage worktree"}</span>
-        {createBase === undefined && <button type="button" disabled={blocked} onClick={() => {
-          setCreateBase(row.branch); setTargetBranch(""); setBindPath(undefined); setError("");
-        }} className="rounded-md bg-accent/10 px-2 py-1.5 text-[11px] text-accent hover:bg-accent/20 disabled:opacity-40">Create new worktree</button>}
+        <span className="text-[12px] font-medium">Worktree</span>
+        <button
+          type="button"
+          title="Refresh working copies"
+          aria-label="Refresh working copies"
+          disabled={blocked}
+          onClick={() => void refresh()}
+          className="grid size-5 shrink-0 place-items-center rounded text-content/40 hover:bg-content/8 hover:text-content disabled:opacity-40"
+        >
+          <RefreshCw
+            className={`size-3 ${!worktrees && !worktreeError ? "animate-spin" : ""}`}
+            strokeWidth={1.75}
+          />
+        </button>
       </div>
-      {createBase === undefined && <div className="flex flex-col gap-1 text-[11px] font-medium text-content/45">
-        <div className="flex items-center justify-between"><span>Attach existing working copy</span><button type="button" disabled={blocked} onClick={() => void refresh()}>Refresh copies</button></div>
-        {worktreeError && <p role="alert" className="text-red-400">{worktreeError}</p>}
-        {!worktrees && !worktreeError && <p role="status">Loading working copies…</p>}
+      {field(
+        "Working copy",
         <SearchableSelect
           label="Worktree"
           disabled={blocked}
-          value={row.worktreePath ?? ""}
+          value={pick}
           options={[
-            { value: "", label: "No working copy attached" },
+            { value: "new", label: "Create new worktree" },
             ...worktreeOptions,
+            { value: NO_COPY, label: "No working copy" },
           ]}
-          onChange={(path) => {
-            if (path) {
-              const tree = bindableWorktrees(worktrees?.worktrees ?? []).find(entry => entry.path === path);
-              if (!tree?.branch) {
-                setError("Working copy is unavailable. Refresh copies before retrying.");
-                return;
-              }
-              // Attachment needs the same live branch/path and ownership checks
-              // as the existing-copy offer after creation.
-              void applyBranch("create", path, tree.branch);
-              return;
-            }
+          onChange={(value) => {
+            setBindPath(undefined);
             setError("");
-            // Keep the probed PR when detaching its working copy.
-            onPatch({ worktreePath: undefined, ...(row.pr?.url ? { prUrl: row.pr.url } : {}) });
+            setCopy(pathKey(value) === pathKey(currentCopy) ? undefined : value);
+            // A fresh worktree must name its own branch — the current copy
+            // already holds this one, so force an explicit pick. Other
+            // picks keep a staged branch (detach+retarget, attach revert).
+            if (value === "new") setTargetBranch("");
+            // Leaving create mode drops a picked base — a later "New
+            // worktree" for a staged branch must not inherit it.
+            setCreateBase(value === "new" ? row.base : undefined);
           }}
-          placeholder="No worktree attached"
+          placeholder="No working copy"
           searchPlaceholder="Search worktrees…"
           emptyLabel="No working copies"
           layer={LAYER.submenu}
           minMenuWidth={280}
-        />
-      </div>}
-      <div className="flex flex-col gap-2">
-        <div className="flex min-w-0 flex-1 flex-col gap-1 text-[11px] font-medium text-content/45">
-          <span>{createBase !== undefined ? "Worktree branch" : "Branch"}</span>
-          <SearchableSelect
-            label="Branch"
-            value={targetBranch ?? row.branch}
-            placeholder="Choose or name a branch…"
-            options={branchOptions}
-            onChange={(value) => {
-              setTargetBranch(value);
-              setBindPath(undefined);
-              setError("");
-            }}
-            searchPlaceholder="Pick or type a branch…"
-            creatable="New branch"
-            exclude={claimedBranches}
-            disabled={blocked}
-            layer={LAYER.submenu}
-            minMenuWidth={220}
-          />
-        </div>
-        {!(createBase !== undefined && usesExistingBranch) && <div className="flex min-w-0 flex-col gap-1 text-[11px] font-medium text-content/45">
-          <span>{createBase !== undefined ? "Start from branch" : "PR base branch"}</span>
-          <SearchableSelect
-            label={createBase !== undefined ? "Start from branch" : "Base branch"}
-            disabled={blocked}
-            value={createBase ?? row.base}
-            options={baseOptions}
-            onChange={(base) => createBase !== undefined ? setCreateBase(base) : onPatch({ base })}
-            searchPlaceholder="Branches…"
-            layer={LAYER.submenu}
-            minMenuWidth={220}
-          />
-        </div>}
-      </div>
-      {(targetBranch || createBase !== undefined) && (
-        <div className="flex flex-col gap-2 text-[11px]">
-          <div className="flex flex-wrap gap-2 text-accent">
-            {createBase === undefined && <button type="button" disabled={blocked || !row.worktreePath} onClick={() => void applyBranch("switch")} className="rounded-md border border-content/10 px-2 py-1.5 hover:bg-content/5 disabled:opacity-40">Switch current worktree</button>}
-            <button type="button" disabled={blocked || !targetBranch?.trim()} onClick={() => void applyBranch("create")} className="rounded-md bg-accent/10 px-2 py-1.5 hover:bg-accent/20 disabled:opacity-40">{branchBusy ? "Preparing…" : "Create separate worktree"}</button>
-            {createBase !== undefined && <button type="button" disabled={blocked} onClick={() => { setCreateBase(undefined); setTargetBranch(undefined); setBindPath(undefined); setError(""); }}>Cancel</button>}
-          </div>
-          <p className="text-content/50">{usesExistingBranch ? "The worktree will use the selected branch as-is." : "Type a new branch name to create it from the starting branch."} Your current files and sessions stay in place.</p>
-          {bindPath && <BindOfferBar path={bindPath} busy={blocked} onAccept={() => void applyBranch("create", bindPath)} onDismiss={() => setBindPath(undefined)} />}
-        </div>
+        />,
       )}
-      {createBase === undefined && row.worktreePath && !boundTree?.isMain ? (
+      {field(
+        "Branch",
+        <SearchableSelect
+          label="Branch"
+          value={creating ? (targetBranch ?? "") : stagedBranch}
+          placeholder="Choose or name a branch…"
+          options={branchOptions}
+          onChange={(value) => {
+            setTargetBranch(value);
+            setBindPath(undefined);
+            setError("");
+          }}
+          searchPlaceholder="Pick or type a branch…"
+          creatable="New branch"
+          exclude={claimedBranches}
+          disabled={blocked || attaching}
+          layer={LAYER.submenu}
+          minMenuWidth={220}
+        />,
+      )}
+      {field(
+        "Base branch",
+        <SearchableSelect
+          label="Base branch"
+          // A remote pick pins the creation base to that ref.
+          disabled={blocked || (creating && !!stagedChoice.base)}
+          value={creating ? effectiveBase : row.base}
+          options={baseOptions}
+          onChange={(base) =>
+            creating ? setCreateBase(base) : onPatch({ base })
+          }
+          searchPlaceholder="Branches…"
+          layer={LAYER.submenu}
+          minMenuWidth={220}
+        />,
+      )}
+      {worktreeError ? (
+        <p role="alert" className="text-[11px] text-red-400">
+          {worktreeError}
+        </p>
+      ) : null}
+      {!worktrees && !worktreeError ? (
+        <p role="status" className="text-[11px] text-content/40">
+          Loading working copies…
+        </p>
+      ) : null}
+      {actions.length || bindPath ? (
+        <div className="flex flex-col gap-2 border-t border-content/8 pt-2.5 text-[11px]">
+          {hint ? (
+            <p className="text-content/50">{hint}</p>
+          ) : null}
+          <div className="flex flex-wrap gap-2 text-accent">
+            {actions.map((action) => (
+              <button
+                key={action.key}
+                type="button"
+                disabled={blocked || action.disabled}
+                onClick={action.run}
+                className={
+                  action.primary
+                    ? "rounded-md bg-accent/10 px-2 py-1.5 hover:bg-accent/20 disabled:opacity-40"
+                    : "rounded-md border border-content/10 px-2 py-1.5 text-content/70 hover:bg-content/5 disabled:opacity-40"
+                }
+              >
+                {action.label}
+              </button>
+            ))}
+          </div>
+          {bindPath ? (
+            <BindOfferBar
+              path={bindPath}
+              busy={blocked}
+              onAccept={() => void applyBranch("create", bindPath)}
+              onDismiss={() => setBindPath(undefined)}
+            />
+          ) : null}
+        </div>
+      ) : null}
+      {row.worktreePath && !boundTree?.isMain ? (
         <button
           type="button"
           disabled={blocked || removing}
@@ -2354,7 +2559,7 @@ export function WorkstreamEditor({
                 setArmed(false);
               });
           }}
-          className={`flex h-7 items-center justify-center gap-1.5 rounded-md text-[11px] font-medium disabled:opacity-40 ${
+          className={`flex h-7 w-full items-center justify-center gap-1.5 rounded-md text-[11px] font-medium disabled:opacity-40 ${
             armed
               ? "bg-red-400/15 text-red-300 hover:bg-red-400/25"
               : "text-content/55 hover:bg-content/8 hover:text-content"
