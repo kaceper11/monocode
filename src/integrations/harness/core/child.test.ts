@@ -497,3 +497,13 @@ describe("child bridge", () => {
     release();
   });
 });
+
+it("inspects and updates the selected guest CLI without native binary overrides", async () => {
+  const child = await loadChild();
+  const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
+  mocks.invoke.mockImplementation(async (command: string) => command === "wsl_resolve_harness" ? { path: "/usr/bin/claude" } : "2.1.285");
+  expect(await child.inspectHarnessBinary("claude", "C:/native/claude.exe", cwd)).toMatchObject({ path: "/usr/bin/claude", version: "2.1.285" });
+  expect(mocks.invoke).toHaveBeenCalledWith("harness_exec", { command: "/usr/bin/claude", args: ["--version"], cwd, binaryProvider: "claude", binaryPath: undefined });
+  await child.updateHarnessCli("claude", cwd);
+  expect(mocks.invoke).toHaveBeenLastCalledWith("harness_update", { command: "/usr/bin/claude", binaryProvider: "claude", binaryPath: undefined, cwd });
+});

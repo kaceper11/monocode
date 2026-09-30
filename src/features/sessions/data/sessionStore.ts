@@ -393,6 +393,7 @@ export async function getSession(sessionId: string): Promise<Session | null> {
           session.providerSessionId,
           session.providerAccountId,
           toolIds,
+          session.worktreeCwd ?? session.cwd,
         );
         const blocks = backfillClaudeShellCommands(session.blocks, commands);
         if (blocks !== session.blocks) {

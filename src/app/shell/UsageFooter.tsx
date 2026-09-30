@@ -386,7 +386,7 @@ function UsageFooterContent({
         </span>
       ) : null}
       {session?.harness === "pi" ? (
-        <PiUsage key={`${session.id}:${session.model}`} model={session.model} now={now} />
+        <PiUsage key={`${session.id}:${session.model}`} model={session.model} now={now} cwd={cwd} />
       ) : showUsage ? (
         <>
           {wantClaude ? (

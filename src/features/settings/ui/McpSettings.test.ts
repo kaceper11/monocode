@@ -459,3 +459,15 @@ it("uses the shared project picker and caches each project's list", async () => 
   expect(invoke).toHaveBeenCalledTimes(6);
   expect(invoke).toHaveBeenLastCalledWith("claude_mcp_list", { cwd: "/other" });
 });
+
+it("keeps guest MCP discovery and choices scoped to the selected distribution", async () => {
+  const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
+  await act(async () => root.render(createElement(McpSettings, { cwd })));
+  expect(invoke).toHaveBeenCalledWith("mcp_discover", { cwd });
+  expect(invoke).toHaveBeenCalledWith("claude_mcp_list", { cwd });
+  await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Add MCP server"]')!.click());
+  await act(async () => document.body.querySelector<HTMLButtonElement>('[aria-label="Provider: Claude Code"]')!.click());
+  const choices = document.body.querySelector('[role="listbox"][aria-label="Provider"]')!;
+  expect(choices.textContent).toContain("Codex");
+  expect(choices.textContent).not.toContain("Claude Desktop");
+});

@@ -56,10 +56,21 @@ impl PiUsageProvider {
 }
 
 #[tauri::command]
-pub async fn fetch_pi_usage(provider: PiUsageProvider) -> PiUsageResult {
+pub async fn fetch_pi_usage(provider: PiUsageProvider, cwd: Option<String>) -> PiUsageResult {
     tauri::async_runtime::spawn_blocking(move || {
-        let Some(dir) = agent_dir(std::env::var_os("PI_CODING_AGENT_DIR"), crate::dirs_home())
-        else {
+        let location = match cwd.as_deref().map(crate::wsl::location).transpose() {
+            Ok(location) => location.flatten(),
+            Err(message) => return error(&message),
+        };
+        let dir = if let Some(location) = location {
+            match crate::wsl::config_path(&location, Some("PI_CODING_AGENT_DIR"), ".pi/agent") {
+                Ok(path) => Some(path),
+                Err(message) => return error(&message),
+            }
+        } else {
+            agent_dir(std::env::var_os("PI_CODING_AGENT_DIR"), crate::dirs_home())
+        };
+        let Some(dir) = dir else {
             return unavailable(
                 "Pi usage needs an absolute configuration directory. Check PI_CODING_AGENT_DIR.",
             );

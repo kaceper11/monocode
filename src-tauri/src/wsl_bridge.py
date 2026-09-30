@@ -56,7 +56,7 @@ def control_write_path(path):
     return path.resolve(strict=True).joinpath(*reversed(missing))
 
 
-def run(argv, cwd, input_bytes=None, timeout=25):
+def run(argv, cwd, input_bytes=None, timeout=25, max_output=MAX_GIT_OUTPUT, truncate=False):
     """Bound both streams and kill the owned group before reaping on failure."""
     # Temporary input avoids blocking the bridge while a child ignores its stdin.
     with tempfile.TemporaryFile() as source:
@@ -85,8 +85,15 @@ def run(argv, cwd, input_bytes=None, timeout=25):
                             selected.unregister(key.fileobj)
                             continue
                         output[key.data].extend(chunk)
-                        if len(output[key.data]) > MAX_GIT_OUTPUT:
-                            raise ValueError("Linux command output exceeds 8 MiB")
+                        if len(output[key.data]) > max_output:
+                            if truncate and key.data == 0:
+                                try:
+                                    os.killpg(child.pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                                child.wait()
+                                return 0, bytes(output[0][:max_output + 1]), bytes(output[1])
+                            raise ValueError("Linux command output exceeds its limit")
             code = child.wait(timeout=max(0.001, deadline - time.monotonic()))
             return code, bytes(output[0]), bytes(output[1])
         except BaseException:
@@ -344,8 +351,8 @@ def verify_agent(provider, name, candidate, resolved, home):
     return True
 
 
-def find_agent(provider):
-    if provider == "opencode":
+def find_agent(provider, cli_only=False):
+    if provider == "opencode" and not cli_only:
         raise ValueError("OpenCode's HTTP transport is not supported in WSL yet. Choose a stdio agent such as Claude or Codex.")
     names = list(AGENT_NAMES.get(provider) or [])
     if not names:
@@ -608,13 +615,22 @@ def handle(request):
             except Exception as error:
                 resolved[provider] = {"error": str(error)}
         return resolved
-    if op == "agent_exec":
-        command = request["command"]
+    if op in ("agent_exec", "agent_run"):
+        # CLI mutations stay on the serialized channel and resolve their binary
+        # here. OpenCode configuration does not enable its unsupported transport.
+        if op == "agent_run":
+            prepare_environment()
+            command = find_agent(request["provider"], cli_only=True)
+            if request.get("command") is not None and request["command"] != command:
+                raise ValueError("The selected guest CLI changed; inspect it again before updating")
+        else:
+            command = request["command"]
         if command not in AGENT_BINARIES.values():
             raise ValueError("Resolve the agent in this WSL distribution before probing it")
-        code, out, err = run([command, *request["args"]], str(path), timeout=15)
-        if code and not out.strip():
-            raise ValueError(err.decode("utf-8", errors="replace").strip())
+        code, out, err = run([command, *request["args"]], str(path), timeout=max(1, min(int(request.get("timeout", 15)), 300)))
+        if code and (op == "agent_run" or not out.strip()):
+            message = (err or out).decode("utf-8", errors="replace").strip()
+            raise ValueError(message.splitlines()[-1][:1000] if message else "Guest CLI exited with code %d" % code)
         return out.decode("utf-8", errors="replace")
     if op == "home":
         return str(Path.home())
@@ -671,9 +687,11 @@ def handle(request):
         timeout = request.get("timeout")
         timeout = max(5, min(int(timeout), 600)) if isinstance(timeout, (int, float)) else 25
         code, out, err = run(["git", "--no-pager", "-c", "core.quotepath=false", "-C", str(path), *args], str(path),
-                             base64.b64decode(source, validate=True) if source else None, timeout)
+                             base64.b64decode(source, validate=True) if source else None, timeout,
+                             max_output=max(1, min(int(request.get("maxOutput", MAX_GIT_OUTPUT)), MAX_GIT_OUTPUT)),
+                             truncate="maxOutput" in request)
         return {"code": code, "stdout": base64.b64encode(out).decode(),
-                "stderr": base64.b64encode(err).decode()}
+                "stderr": base64.b64encode(err).decode(), "capped": "maxOutput" in request and len(out) > request["maxOutput"]}
     if op == "attachment":
         global ATTACHMENTS, ATTACHMENT_BYTES, ATTACHMENT_COUNT
         encoded = request["data"]

@@ -214,3 +214,18 @@ describe("session persistence concurrency", () => {
     });
   });
 });
+
+it("recovers Claude shell rows from the persisted session's guest worktree", async () => {
+  const { getSession } = await loadStore();
+  const worktreeCwd = "//wsl.localhost/Ubuntu/home/me/worktree";
+  mocks.invoke.mockImplementation(async (command: string) => command === "session_get" ? {
+    ...session("claude-guest"), harness: "claude", cwd: "//wsl.localhost/Debian/home/me/project", worktreeCwd,
+    providerSessionId: "session-1", providerAccountId: "default", createdAt: 1, updatedAt: 1,
+    blocks: [{ id: "shell", role: "tool", text: "Shell", tool: { kind: "execute", callId: "call-1", title: "Shell" } }],
+  } : command === "claude_shell_commands" ? { "call-1": "pwd" } : undefined);
+  const recovered = await getSession("claude-guest");
+  expect(mocks.invoke).toHaveBeenCalledWith("claude_shell_commands", {
+    providerSessionId: "session-1", providerAccountId: "default", toolIds: ["call-1"], cwd: worktreeCwd,
+  });
+  expect(recovered?.blocks[0].text).toBe("pwd");
+});

@@ -81,11 +81,13 @@ export function claudeShellCommands(
   providerSessionId: string,
   providerAccountId: string | undefined,
   toolIds: string[],
+  cwd?: string,
 ): Promise<Record<string, string>> {
   return invoke<Record<string, string>>("claude_shell_commands", {
     providerSessionId,
     providerAccountId,
     toolIds,
+    ...(cwd ? { cwd } : {}),
   });
 }
 

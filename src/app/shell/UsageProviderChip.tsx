@@ -139,8 +139,9 @@ export function UsageProviderChip({
   const canManageAccounts = Boolean(onSelectAccount && (onAddAccount || accounts.length));
   const activeAccountLabel = accountLabel ?? activeAccount?.label ?? "Removed account";
   const identities = useProviderAccountIdentities(
-    wslLocation(cwd ?? "") ? [] : accounts,
+    wslLocation(cwd ?? "") ? accounts.filter(account => account.id === "default") : accounts,
     `${open}:${limits.updatedAt}:${reconnectState}`,
+    cwd,
   );
   const activeIdentity = activeAccount
     ? identities[identityKey(activeAccount)]

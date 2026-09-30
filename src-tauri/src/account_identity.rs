@@ -23,12 +23,38 @@ pub async fn provider_account_identity(
     app: AppHandle,
     provider: String,
     account_id: Option<String>,
+    cwd: Option<String>,
 ) -> Result<Option<ProviderAccountIdentity>, String> {
-    let dir = crate::harness::provider_account_dir(&app, &provider, account_id.as_deref())?;
-    tauri::async_runtime::spawn_blocking(move || match provider.as_str() {
-        "claude" => Ok(claude_identity(dir)),
-        "codex" => Ok(codex_identity(dir)),
-        _ => Err("Account identity is not supported for this provider".into()),
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(location) = cwd
+            .as_deref()
+            .map(crate::wsl::location)
+            .transpose()?
+            .flatten()
+        {
+            if account_id.as_deref().is_some_and(|id| id != "default") {
+                return Err("Named native accounts are unavailable inside WSL".into());
+            }
+            return match provider.as_str() {
+                "claude" => {
+                    let path = crate::wsl::config_path(&location, Some("CLAUDE_CONFIG_DIR"), "")?
+                        .join(".claude.json");
+                    Ok(read_json(&path).and_then(|config| parse_claude_identity(&config)))
+                }
+                "codex" => Ok(codex_identity(Some(crate::wsl::config_path(
+                    &location,
+                    Some("CODEX_HOME"),
+                    ".codex",
+                )?))),
+                _ => Err("Account identity is not supported for this provider".into()),
+            };
+        }
+        let dir = crate::harness::provider_account_dir(&app, &provider, account_id.as_deref())?;
+        match provider.as_str() {
+            "claude" => Ok(claude_identity(dir)),
+            "codex" => Ok(codex_identity(dir)),
+            _ => Err("Account identity is not supported for this provider".into()),
+        }
     })
     .await
     .map_err(|e| e.to_string())?

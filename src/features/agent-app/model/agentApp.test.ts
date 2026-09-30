@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+import { isHarnessAvailable } from "../../../integrations/harness/core/availability";
 import { newSession } from "../../sessions/model/session";
 import {
   resetHarnessModelOverlays,
@@ -14,7 +15,7 @@ import type { Worktree } from "../../source-control/model/worktrees";
 import { handleAgentApp, notePreview, type AgentAppHost } from "./agentApp";
 
 vi.mock("../../../integrations/harness/core/availability", () => ({
-  isHarnessAvailable: (id: string) => id === "codex",
+  isHarnessAvailable: vi.fn((id: string) => id === "codex"),
 }));
 
 const note: Note = {
@@ -739,4 +740,16 @@ describe("agent app commands", () => {
       ),
     ).rejects.toThrow("body is required");
   });
+});
+
+it("uses the source worktree's guest availability and model catalog for Operator", async () => {
+  const { source, host } = fixture();
+  source.worktreeCwd = "//wsl.localhost/Ubuntu/home/me/repo";
+  setHarnessModels("codex", [{ id: "codex:guest", harness: "codex", name: "Guest model" }], source.worktreeCwd);
+  const result = await handleAgentApp(source, "list-guest", "models.list", {}, host) as { harnesses: { id: string; models: { id: string }[] }[] };
+  expect(result.harnesses.find((entry) => entry.id === "codex")?.models.map((entry) => entry.id)).toEqual(["codex:guest"]);
+  expect(isHarnessAvailable).toHaveBeenCalledWith("codex", source.worktreeCwd);
+  await expect(handleAgentApp(source, "native-model", "sessions.start", { prompt: "Review", model: "codex:test" }, host)).rejects.toThrow("Unknown model");
+  await handleAgentApp(source, "guest-model", "sessions.start", { prompt: "Review", model: "codex:guest" }, host);
+  expect(host.start).toHaveBeenCalledWith(expect.objectContaining({ model: "codex:guest", worktreeCwd: source.worktreeCwd }), expect.any(String));
 });

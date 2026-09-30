@@ -557,11 +557,18 @@ pub fn configure_child(app: &AppHandle, session_id: &str, cmd: &mut Command) {
     };
 }
 
-#[tauri::command]
-pub fn app_cli_path() -> Result<String, String> {
-    std::env::current_exe()
-        .map(|path| path.to_string_lossy().into_owned())
-        .map_err(|error| error.to_string())
+#[tauri::command(async)]
+pub fn app_cli_path(cwd: Option<String>) -> Result<String, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    if let Some(location) = cwd
+        .as_deref()
+        .map(crate::wsl::location)
+        .transpose()?
+        .flatten()
+    {
+        return crate::wsl::request(&location, "control_cli", json!({"executable":executable}));
+    }
+    Ok(executable.to_string_lossy().into_owned())
 }
 
 #[tauri::command]

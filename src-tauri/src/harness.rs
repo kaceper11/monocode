@@ -569,6 +569,9 @@ fn claude_mcp_command(
     timeout: Duration,
     binary_path: Option<&str>,
 ) -> Result<String, String> {
+    if let Some(location) = crate::wsl::location(&cwd)? {
+        return crate::wsl::agent_exec(&location, "claude", &args, timeout);
+    }
     let binary = resolve_mcp_binary("claude", binary_path)?;
     mcp_command(binary, args, cwd, timeout)
 }
@@ -635,13 +638,29 @@ fn configured_ws_mcp_servers(cwd: &Path) -> Vec<String> {
             }
         }
     };
-    if let Some(home) = dirs_home() {
-        if let Some(settings) = read(&Path::new(&home).join(".claude.json")) {
+    let profile = if let Ok(Some(location)) = crate::wsl::location(&cwd.to_string_lossy()) {
+        crate::wsl::config_path(&location, Some("CLAUDE_CONFIG_DIR"), "")
+            .ok()
+            .map(|path| path.join(".claude.json"))
+    } else {
+        dirs_home().map(|home| Path::new(&home).join(".claude.json"))
+    };
+    if let Some(profile) = profile {
+        if let Some(settings) = read(&profile) {
             collect(settings.get("mcpServers"), &mut names);
             collect(
                 settings
                     .get("projects")
-                    .and_then(|projects| projects.get(cwd.to_string_lossy().as_ref()))
+                    .and_then(|projects| {
+                        projects.get(
+                            crate::wsl::location(&cwd.to_string_lossy())
+                                .ok()
+                                .flatten()
+                                .map(|location| location.path)
+                                .as_deref()
+                                .unwrap_or(cwd.to_string_lossy().as_ref()),
+                        )
+                    })
                     .and_then(|project| project.get("mcpServers")),
                 &mut names,
             );
@@ -705,19 +724,34 @@ pub(crate) fn add_mcp_via_cli(
     config: &serde_json::Value,
     binary_path: Option<&str>,
 ) -> Result<(), String> {
+    if let Some(location) = crate::wsl::location(cwd)? {
+        // Build provider-native arguments without resolving any Windows CLI.
+        let (_, args) = mcp_add_args_with_binary(provider, scope, name, config, PathBuf::new())?;
+        crate::wsl::agent_exec(&location, provider, &args, Duration::from_secs(30))?;
+        return Ok(());
+    }
     let (binary, args) = mcp_add_args(provider, scope, name, config, binary_path)?;
     mcp_command(binary, args, cwd.to_owned(), Duration::from_secs(30))?;
     Ok(())
 }
 
 pub(crate) fn opencode_major_version(cwd: &str, binary_path: Option<&str>) -> Result<u32, String> {
-    let binary = resolve_mcp_binary("opencode", binary_path)?;
-    let version = mcp_command(
-        binary,
-        vec!["--version".into()],
-        cwd.to_owned(),
-        Duration::from_secs(10),
-    )?;
+    let version = if let Some(location) = crate::wsl::location(cwd)? {
+        crate::wsl::agent_exec(
+            &location,
+            "opencode",
+            &["--version".into()],
+            Duration::from_secs(10),
+        )?
+    } else {
+        let binary = resolve_mcp_binary("opencode", binary_path)?;
+        mcp_command(
+            binary,
+            vec!["--version".into()],
+            cwd.to_owned(),
+            Duration::from_secs(10),
+        )?
+    };
     version
         .split_whitespace()
         .find_map(|part| {
@@ -738,11 +772,26 @@ fn mcp_add_args(
     config: &serde_json::Value,
     binary_path: Option<&str>,
 ) -> Result<(PathBuf, Vec<String>), String> {
+    mcp_add_args_with_binary(
+        provider,
+        scope,
+        name,
+        config,
+        resolve_mcp_binary(provider, binary_path)?,
+    )
+}
+
+fn mcp_add_args_with_binary(
+    provider: &str,
+    scope: &str,
+    name: &str,
+    config: &serde_json::Value,
+    binary: PathBuf,
+) -> Result<(PathBuf, Vec<String>), String> {
     if provider == "claude" {
         if !matches!(scope, "local" | "project" | "user") {
             return Err("Invalid Claude MCP scope".into());
         }
-        let binary = resolve_mcp_binary("claude", binary_path)?;
         let config = serde_json::to_string(config).map_err(|e| e.to_string())?;
         return Ok((
             binary,
@@ -759,10 +808,9 @@ fn mcp_add_args(
     if provider == "codex" && scope != "user" {
         return Err("Codex CLI adds user-scoped servers only".into());
     }
-    let binary = match provider {
-        "codex" => resolve_mcp_binary("codex", binary_path)?,
-        _ => return Err("Unsupported MCP provider".into()),
-    };
+    if provider != "codex" {
+        return Err("Unsupported MCP provider".into());
+    }
     let object = config
         .as_object()
         .ok_or("Server configuration must be an object")?;

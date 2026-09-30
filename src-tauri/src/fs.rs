@@ -16,6 +16,7 @@ use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
@@ -215,6 +216,7 @@ pub fn claude_shell_commands(
     provider_session_id: String,
     provider_account_id: Option<String>,
     tool_ids: Vec<String>,
+    cwd: Option<String>,
 ) -> Result<HashMap<String, String>, String> {
     if provider_session_id.is_empty()
         || !provider_session_id
@@ -226,14 +228,27 @@ pub fn claude_shell_commands(
     if tool_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let config_dir = match provider_account_id.as_deref() {
-        Some(id) if id != "default" => crate::harness::provider_account_path(&app, "claude", id)?,
-        _ => match std::env::var_os("CLAUDE_CONFIG_DIR") {
-            Some(path) => PathBuf::from(path),
-            None => {
-                PathBuf::from(dirs_home().ok_or("Home directory is unavailable")?).join(".claude")
+    let guest = cwd.as_deref().map(wsl::location).transpose()?.flatten();
+    if guest.is_some()
+        && provider_account_id
+            .as_deref()
+            .is_some_and(|id| id != "default")
+    {
+        return Err("Named native accounts are unavailable inside WSL".into());
+    }
+    let config_dir = if let Some(location) = guest {
+        wsl::config_path(&location, Some("CLAUDE_CONFIG_DIR"), ".claude")?
+    } else {
+        match provider_account_id.as_deref() {
+            Some(id) if id != "default" => {
+                crate::harness::provider_account_path(&app, "claude", id)?
             }
-        },
+            _ => match std::env::var_os("CLAUDE_CONFIG_DIR") {
+                Some(path) => PathBuf::from(path),
+                None => PathBuf::from(dirs_home().ok_or("Home directory is unavailable")?)
+                    .join(".claude"),
+            },
+        }
     };
     let transcript_name = format!("{provider_session_id}.jsonl");
     let root = config_dir.join("projects");
@@ -685,7 +700,7 @@ pub(crate) fn list_project_files_sync_cancellable(
         return Ok(Vec::new());
     }
     if let Some(location) = wsl::location(cwd)? {
-        return wsl::files_request(&location, "files", json!({}));
+        return wsl::files_request_cancellable(&location, "files", json!({}), cancel);
     }
     let root = expand_home(cwd);
     if !root.is_dir() {
@@ -5097,9 +5112,20 @@ pub(crate) fn git_output_capped(
     if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
         return None;
     }
-    if wsl::path_location(root).ok().flatten().is_some() {
-        let mut bytes = git_output(root, args)?;
-        let capped = bytes.len() > max_bytes;
+    if let Some(location) = wsl::path_location(root).ok().flatten() {
+        let arguments = json!({"args":args,"maxOutput":max_bytes});
+        let result: Value = if let Some(cancel) = cancel {
+            wsl::request_cancellable(&location, "git", arguments, cancel).ok()?
+        } else {
+            wsl::request(&location, "git", arguments).ok()?
+        };
+        if !matches!(result["code"].as_i64(), Some(0 | 1)) {
+            return None;
+        }
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(result["stdout"].as_str()?)
+            .ok()?;
+        let capped = result["capped"].as_bool().unwrap_or(false);
         bytes.truncate(max_bytes);
         return Some((bytes, capped));
     }

@@ -658,8 +658,9 @@ export type HarnessBinaryInspection = {
 export function inspectHarnessBinary(
   provider: ConfigurableBinaryProvider,
   binaryPath?: string | null,
+  cwd?: string,
 ): Promise<HarnessBinaryInspection> {
-  return resolveHarnessBinary(provider, binaryPath).then(async (resolved) => {
+  return resolveBinary(provider, cwd, binaryPath).then(async (resolved) => {
     if (provider === "antigravity") {
       return { path: resolved.path, version: "ACP server" };
     }
@@ -668,7 +669,7 @@ export function inspectHarnessBinary(
         await execChild(
           resolved.path,
           ["--version"],
-          undefined,
+          cwd,
           provider,
           binaryPath,
         )
@@ -688,12 +689,14 @@ export function inspectHarnessBinary(
 /** Runs the CLI's own self-update against the binary MonoCode uses. */
 export async function updateHarnessCli(
   provider: ConfigurableBinaryProvider,
+  cwd?: string,
 ): Promise<void> {
-  const resolved = await resolveHarnessBinary(provider);
+  const resolved = await resolveBinary(provider, cwd);
   await invoke("harness_update", {
     command: resolved.path,
     binaryProvider: provider,
-    binaryPath: runtimeProviderBinaryPath(provider),
+    binaryPath: wslLocation(cwd ?? "") ? undefined : runtimeProviderBinaryPath(provider),
+    ...(cwd ? { cwd } : {}),
   });
 }
 
@@ -705,9 +708,10 @@ export function execChild(
   binaryPathOverride?: string | null,
 ): Promise<string> {
   const binaryPath =
-    binaryPathOverride === undefined && binaryProvider
-      ? runtimeProviderBinaryPath(binaryProvider)
-      : binaryPathOverride;
+    wslLocation(cwd ?? "") ? undefined
+      : binaryPathOverride === undefined && binaryProvider
+        ? runtimeProviderBinaryPath(binaryProvider)
+        : binaryPathOverride;
   return invoke("harness_exec", {
     command,
     args,

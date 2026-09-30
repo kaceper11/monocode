@@ -16,6 +16,9 @@ import {
 import { refreshHarnessCatalogs } from "../../../integrations/harness/core/registry";
 import { LAYER } from "../../../shared/lib/layers";
 import { Check, Loader, X } from "../../../shared/ui/icons";
+import { wslLocation } from "../../../shared/lib/paths";
+import { modelCatalogKey } from "../../sessions/model/models";
+import { useWslStatus } from "../../sessions/model/wslStatus";
 import { isPickerProviderVisible } from "../../sessions/model/models";
 import {
   HARNESS_TITLE,
@@ -37,24 +40,26 @@ import {
  * Shared by every mount in this window: a StrictMode remount must reuse the
  * first run, since the launch claim it made cannot be taken twice.
  */
-let launchCheck: Promise<HarnessUpdate[]> | null = null;
+const launchChecks = new Map<string, Promise<HarnessUpdate[]>>();
 
-function checkForHarnessUpdates(): Promise<HarnessUpdate[]> {
-  launchCheck ??= runLaunchCheck().catch(() => []);
-  return launchCheck;
+function checkForHarnessUpdates(cwd?: string): Promise<HarnessUpdate[]> {
+  const key = modelCatalogKey(cwd);
+  let check = launchChecks.get(key);
+  if (!check) { check = runLaunchCheck(cwd).catch(() => []); launchChecks.set(key, check); }
+  return check;
 }
 
-async function runLaunchCheck(): Promise<HarnessUpdate[]> {
-  if (!(await claimLaunchHarnessUpdateCheck())) return [];
-  await probeHarnessAvailability();
+async function runLaunchCheck(cwd?: string): Promise<HarnessUpdate[]> {
+  if (!(await claimLaunchHarnessUpdateCheck(cwd))) return [];
+  await probeHarnessAvailability(cwd ? { cwd } : undefined);
   return findHarnessUpdates({
     harnesses: HARNESSES.filter(
       (id) =>
         UPDATABLE_HARNESSES.has(id) &&
-        isHarnessAvailable(id) &&
+        isHarnessAvailable(id, cwd) &&
         isPickerProviderVisible(id),
     ),
-    installedVersion: async (id) => (await inspectHarnessBinary(id)).version,
+    installedVersion: async (id) => (await inspectHarnessBinary(id, undefined, cwd)).version,
     latestVersion: fetchLatestHarnessVersion,
   });
 }
@@ -70,14 +75,14 @@ type RowState =
  * version the CLI reports afterwards, not the exit code. Its models are
  * reloaded before the row says so, so the picker is current by then.
  */
-async function runUpdate(update: HarnessUpdate): Promise<RowState> {
+async function runUpdate(update: HarnessUpdate, cwd?: string): Promise<RowState> {
   try {
-    await updateHarnessCli(update.harness);
-    const after = await inspectHarnessBinary(update.harness);
+    await updateHarnessCli(update.harness, cwd);
+    const after = await inspectHarnessBinary(update.harness, undefined, cwd);
     const version = parseOpenCodeVersion(after.version ?? "");
     if (version && compareSemver(version, update.latest) >= 0) {
-      await refreshHarnessCatalogs([update.harness], { force: true });
-      void announceHarnessUpdated(update.harness).catch(() => undefined);
+      await refreshHarnessCatalogs([update.harness], cwd, true);
+      void announceHarnessUpdated(update.harness, cwd).catch(() => undefined);
       return { status: "updated", version };
     }
     return {
@@ -96,10 +101,17 @@ async function runUpdate(update: HarnessUpdate): Promise<RowState> {
 export function HarnessUpdateNotice({
   topOffset = 12,
   onHeightChange,
+  cwd,
 }: {
   topOffset?: number;
+  cwd?: string;
   onHeightChange?: (height: number) => void;
 }) {
+  const distribution = wslLocation(cwd ?? "")?.distribution;
+  const wslStatus = useWslStatus(distribution);
+  const scope = modelCatalogKey(cwd);
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
   const panelRef = useRef<HTMLElement>(null);
   const [updates, setUpdates] = useState<HarnessUpdate[]>([]);
   const [rows, setRows] = useState<Partial<Record<HarnessId, RowState>>>({});
@@ -107,8 +119,8 @@ export function HarnessUpdateNotice({
   // Mounted in every window, so the window that ran the update tells the
   // others to pick up the new CLI's models too.
   useEffect(() => {
-    const unlisten = onHarnessUpdated((harness) => {
-      void refreshHarnessCatalogs([harness], { force: true });
+    const unlisten = onHarnessUpdated((harness, updatedCwd) => {
+      void refreshHarnessCatalogs([harness], updatedCwd, true);
     }).catch(() => undefined);
     return () => {
       void unlisten.then((stop) => stop?.());
@@ -117,13 +129,16 @@ export function HarnessUpdateNotice({
 
   useEffect(() => {
     let cancelled = false;
-    void checkForHarnessUpdates().then((next) => {
+    setUpdates([]);
+    setRows({});
+    if (distribution && wslStatus.state !== "connected") return;
+    void checkForHarnessUpdates(cwd).then((next) => {
       if (!cancelled) setUpdates(next);
     });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [scope, wslStatus.state]);
 
   const visible = updates.length > 0;
   useLayoutEffect(() => {
@@ -159,14 +174,14 @@ export function HarnessUpdateNotice({
         ...current,
         [update.harness]: { status: "updating" },
       }));
-      void runUpdate(update).then((result) =>
-        setRows((current) => ({ ...current, [update.harness]: result })),
-      );
+      void runUpdate(update, cwd).then((result) => {
+        if (scopeRef.current === scope) setRows((current) => ({ ...current, [update.harness]: result }));
+      });
     }
   };
   const dismiss = () => {
     // Only for this run: the next launch checks and offers again.
-    launchCheck = Promise.resolve([]);
+    launchChecks.set(scope, Promise.resolve([]));
     setUpdates([]);
   };
 
@@ -174,6 +189,7 @@ export function HarnessUpdateNotice({
     <section
       ref={panelRef}
       aria-label="Harness updates"
+      aria-description={distribution ? `Updates agents inside WSL: ${distribution}` : "Updates agents on this computer"}
       role="status"
       style={{ zIndex: LAYER.toast, top: topOffset }}
       className="fixed right-3 isolate w-[min(340px,calc(100vw-24px))] overflow-hidden rounded-xl border border-content/10 text-content shadow-xl"
@@ -185,6 +201,7 @@ export function HarnessUpdateNotice({
             {updates.length === 1
               ? "Harness update available"
               : "Harness updates available"}
+            {distribution ? ` · WSL: ${distribution}` : " · This computer"}
           </span>
           {pending.length > 1 ? (
             <button

@@ -354,12 +354,19 @@ pub fn agent_acknowledgement(acknowledgement: &str, cmd: &Command) -> Result<Str
     let environment = message["environment"]
         .as_object_mut()
         .ok_or("Invalid Linux startup environment")?;
-    for key in ["MONOCODE_CONTROL_ENDPOINT", "MONOCODE_CONTROL_TOKEN"] {
+    for key in [
+        "MONOCODE_CONTROL_ENDPOINT",
+        "MONOCODE_CONTROL_TOKEN",
+        "MONOCODE_APP_ENDPOINT",
+        "MONOCODE_APP_TOKEN",
+    ] {
         environment.remove(key);
     }
     for key in [
         "MONOCODE_CONTROL_ENDPOINT",
         "MONOCODE_CONTROL_TOKEN",
+        "MONOCODE_APP_ENDPOINT",
+        "MONOCODE_APP_TOKEN",
         "TMPDIR",
         "TMP",
         "TEMP",
@@ -380,15 +387,17 @@ pub fn agent_acknowledgement(acknowledgement: &str, cmd: &Command) -> Result<Str
     }
     // /w exports only to Win32 children. The CLI remains the same native app
     // executable and connects to its Windows loopback listener, including on NAT.
-    environment.insert(
-        "WSLENV".into(),
-        if environment.contains_key("MONOCODE_CONTROL_TOKEN") {
-            "MONOCODE_CONTROL_ENDPOINT/w:MONOCODE_CONTROL_TOKEN/w"
-        } else {
-            ""
-        }
-        .into(),
-    );
+    let exported: Vec<_> = [
+        "MONOCODE_CONTROL_ENDPOINT",
+        "MONOCODE_CONTROL_TOKEN",
+        "MONOCODE_APP_ENDPOINT",
+        "MONOCODE_APP_TOKEN",
+    ]
+    .into_iter()
+    .filter(|key| environment.contains_key(*key))
+    .map(|key| format!("{key}/w"))
+    .collect();
+    environment.insert("WSLENV".into(), exported.join(":").into());
     Ok(message.to_string())
 }
 
@@ -421,6 +430,68 @@ fn agent_environment(location: &Location) -> Result<Arc<Value>, String> {
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some((generation, environment.clone()));
     Ok(environment)
+}
+
+/// Read a guest configuration directory using the guest's login environment.
+/// The UNC identity lets the existing Rust parsers read it without duplicating schemas.
+pub(crate) fn config_path(
+    location: &Location,
+    key: Option<&str>,
+    suffix: &str,
+) -> Result<std::path::PathBuf, String> {
+    config_path_from_environment(location, agent_environment(location)?.as_ref(), key, suffix)
+}
+
+fn config_path_from_environment(
+    location: &Location,
+    environment: &Value,
+    key: Option<&str>,
+    suffix: &str,
+) -> Result<std::path::PathBuf, String> {
+    let home = environment
+        .get("HOME")
+        .and_then(Value::as_str)
+        .ok_or("Linux HOME is unavailable")?;
+    let configured = key
+        .and_then(|key| environment.get(key))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let path = match configured {
+        Some("~") => home.to_string(),
+        Some(value) if value.starts_with("~/") => format!("{home}/{}", &value[2..]),
+        Some(value) => value.to_string(),
+        None => format!("{}/{}", home.trim_end_matches('/'), suffix),
+    };
+    Ok(location.with_path(&path)?.identity().into())
+}
+
+pub(crate) fn config_override(
+    location: &Location,
+    key: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let environment = agent_environment(location)?;
+    if environment
+        .get(key)
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.is_empty())
+    {
+        return Ok(None);
+    }
+    config_path(location, Some(key), "").map(Some)
+}
+
+pub(crate) fn agent_exec(
+    location: &Location,
+    provider: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<String, String> {
+    request_bounded(
+        location,
+        "agent_run",
+        json!({"provider":provider,"args":args,"timeout":timeout.as_secs()}),
+        timeout + Duration::from_secs(15),
+    )
 }
 
 pub fn agent_handshake(
@@ -723,7 +794,7 @@ impl Bridge {
                         | "agent_environment"
                 )
             ) {
-                let result = reads.request(request);
+                let result = reads.request_bounded(request, timeout);
                 if !self.alive.load(Ordering::SeqCst) {
                     self.available.notify_all();
                 }
@@ -916,6 +987,139 @@ pub fn request<T: DeserializeOwned>(
         .map_err(|e| format!("Invalid WSL result: {e}"))
 }
 
+/// Searches use the existing owned-process supervisor so cancellation never kills
+/// a shared bridge or an agent. The guest handles one read-only request and exits.
+pub(crate) fn request_cancellable<T: DeserializeOwned>(
+    location: &Location,
+    op: &str,
+    mut args: Value,
+    cancel: &AtomicBool,
+) -> Result<T, String> {
+    if !matches!(op, "git" | "files" | "search_read") {
+        return Err("Unsupported cancellable WSL read".into());
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err("Search cancelled".into());
+    }
+    // Unix integration fixtures supply an in-process bridge, without wsl.exe.
+    // Their filesystem checks use that bridge; owned worker cleanup is exercised
+    // separately with real Python subprocesses.
+    #[cfg(all(test, not(windows)))]
+    if bridge_for(location)?.owner.is_none() {
+        return request(location, op, args);
+    }
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    struct Slot;
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    if ACTIVE.fetch_add(1, Ordering::SeqCst) >= 4 {
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        return Err("WSL search workers are busy".into());
+    }
+    let _slot = Slot;
+    let program = format!("__name__='search_worker'\n{}\nENVIRONMENT_READY=True\ndef cancel_search(signum, frame):\n    raise RuntimeError('Search cancelled')\nsignal.signal(signal.SIGTERM, cancel_search)\nsignal.pthread_sigmask(signal.SIG_UNBLOCK, {{signal.SIGTERM}})\ntry:\n    result = {{'ok': handle(json.loads(sys.stdin.buffer.readline({})))}}\nexcept Exception as error:\n    result = {{'error': str(error)}}\nprint(json.dumps(result), flush=True)\n", SCRIPT, MAX_MESSAGE);
+    args["op"] = op.into();
+    args["path"] = location.path.clone().into();
+    let mut request = serde_json::to_vec(&args).map_err(|e| e.to_string())?;
+    if request.len() >= MAX_MESSAGE {
+        return Err("WSL search request exceeds its limit".into());
+    }
+    request.push(b'\n');
+    let (mut command, nonce, acknowledgement) = agent_command(
+        location,
+        "/usr/bin/python3",
+        &["-u".into(), "-c".into(), stdin_bootstrap(&program)],
+    )?;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let acknowledgement = agent_acknowledgement(&acknowledgement, &command)?;
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let mut stdin = child.stdin.take().ok_or("WSL search input unavailable")?;
+    let handshake = agent_handshake(
+        child.stdout.take().ok_or("WSL search output unavailable")?,
+        location.clone(),
+        &nonce,
+    );
+    let (mut reader, owned) = match handshake {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let (send, receive) = mpsc::sync_channel(1);
+    // Read concurrently with the bounded script delivery, including startup failures.
+    let worker = std::thread::spawn(move || {
+        let mut response = Vec::new();
+        let result = (&mut reader)
+            .take((MAX_MESSAGE + 1) as u64)
+            .read_until(b'\n', &mut response)
+            .map_err(|e| e.to_string())
+            .and_then(|_| {
+                if response.len() > MAX_MESSAGE || !response.ends_with(b"\n") {
+                    return Err("Invalid WSL search response".into());
+                }
+                let value: Value = serde_json::from_slice(&response).map_err(|e| e.to_string())?;
+                if let Some(error) = value["error"].as_str() {
+                    return Err(error.to_string());
+                }
+                Ok(value["ok"].clone())
+            });
+        let _ = send.send(result);
+    });
+    let delivery = (|| {
+        stdin.write_all(acknowledgement.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.write_all(program.as_bytes())?;
+        stdin.write_all(&request)?;
+        stdin.flush()
+    })();
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    let result = loop {
+        if let Err(error) = &delivery {
+            break Err(error.to_string());
+        }
+        if cancel.load(Ordering::Acquire) {
+            break Err("Search cancelled".into());
+        }
+        if Instant::now() >= deadline {
+            break Err("WSL search timed out".into());
+        }
+        match receive.recv_timeout(Duration::from_millis(25)) {
+            Ok(result) => break result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Err("WSL search stopped".into()),
+            Err(_) => {}
+        }
+    };
+    if result.is_err() {
+        let _ = owned.stop();
+        let _ = child.kill();
+    }
+    drop(stdin);
+    let _ = child.wait();
+    let _ = worker.join();
+    serde_json::from_value(result?).map_err(|e| format!("Invalid WSL search result: {e}"))
+}
+
+pub(crate) fn refresh_agent_environment(location: &Location) -> Result<(), String> {
+    let bridge = bridge_for(location)?;
+    bridge.request(json!({"op":"refresh_environment", "path":location.path}))?;
+    if let Some(reads) = &bridge.reads {
+        reads.request(json!({"op":"refresh_environment", "path":location.path}))?;
+    }
+    bridge.generation.store(
+        NEXT_BRIDGE_GENERATION.fetch_add(1, Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    Ok(())
+}
+
 /// `request` with a caller-chosen deadline — for ops whose own timeout
 /// exceeds `REQUEST_TIMEOUT` (a fetch/merge on a slow link).
 pub fn request_bounded<T: DeserializeOwned>(
@@ -1083,6 +1287,15 @@ pub fn files_request<T: DeserializeOwned>(
     op: &str,
     args: Value,
 ) -> Result<T, String> {
+    files_request_cancellable(location, op, args, None)
+}
+
+pub(crate) fn files_request_cancellable<T: DeserializeOwned>(
+    location: &Location,
+    op: &str,
+    args: Value,
+    cancel: Option<&AtomicBool>,
+) -> Result<T, String> {
     fn qualify(value: &mut Value, location: &Location) -> Result<(), String> {
         match value {
             Value::Array(items) => {
@@ -1107,13 +1320,25 @@ pub fn files_request<T: DeserializeOwned>(
         }
         Ok(())
     }
-    let mut result: Value = request(location, op, args)?;
+    let mut result: Value = if let Some(cancel) = cancel {
+        request_cancellable(location, op, args, cancel)?
+    } else {
+        request(location, op, args)?
+    };
     qualify(&mut result, location)?;
     serde_json::from_value(result).map_err(|e| format!("Invalid WSL filesystem result: {e}"))
 }
 
 /// One Linux metadata request per distribution, never a UNC stat per file.
 pub fn file_batches<T: DeserializeOwned>(paths: &[String], op: &str) -> Result<Vec<T>, String> {
+    file_batches_cancellable(paths, op, None)
+}
+
+pub(crate) fn file_batches_cancellable<T: DeserializeOwned>(
+    paths: &[String],
+    op: &str,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<T>, String> {
     let mut groups: HashMap<String, Vec<(&String, Location)>> = HashMap::new();
     for path in paths {
         if let Some(location) = location(path)? {
@@ -1126,11 +1351,12 @@ pub fn file_batches<T: DeserializeOwned>(paths: &[String], op: &str) -> Result<V
     let mut result = Vec::new();
     for paths in groups.values() {
         for batch in paths.chunks(64) {
-            let values: Vec<Value> = request(
-                &batch[0].1,
-                op,
-                json!({"paths":batch.iter().map(|(_, location)| &location.path).collect::<Vec<_>>()}),
-            )?;
+            let args = json!({"paths":batch.iter().map(|(_, location)| &location.path).collect::<Vec<_>>()});
+            let values: Vec<Value> = if let Some(cancel) = cancel {
+                request_cancellable(&batch[0].1, op, args, cancel)?
+            } else {
+                request(&batch[0].1, op, args)?
+            };
             let mut remaining = batch.iter();
             for mut value in values {
                 let (original, _) = remaining
@@ -1224,17 +1450,166 @@ pub fn git_bounded(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn guest_config_paths_use_only_the_selected_login_environment() {
+        use super::*;
+        let location = location("//wsl.localhost/Ubuntu/home/me/repo")
+            .unwrap()
+            .unwrap();
+        let environment = json!({"HOME":"/home/guest", "CODEX_HOME":"~/custom-codex", "CLAUDE_CONFIG_DIR":"/data/claude", "PI_CODING_AGENT_DIR":"/data/pi"});
+        for (key, suffix, expected) in [
+            (None, "", "/home/guest/"),
+            (Some("CODEX_HOME"), ".codex", "/home/guest/custom-codex"),
+            (Some("CLAUDE_CONFIG_DIR"), ".claude", "/data/claude"),
+            (Some("PI_CODING_AGENT_DIR"), ".pi/agent", "/data/pi"),
+            (Some("MISSING"), ".pi/agent", "/home/guest/.pi/agent"),
+        ] {
+            assert_eq!(
+                config_path_from_environment(&location, &environment, key, suffix).unwrap(),
+                std::path::PathBuf::from(location.with_path(expected).unwrap().identity())
+            );
+        }
+        for configured in ["relative/path", "C:/Windows/secret", "/home/../other"] {
+            assert!(config_path_from_environment(
+                &location,
+                &json!({"HOME":"/home/guest", "CODEX_HOME":configured}),
+                Some("CODEX_HOME"),
+                ".codex"
+            )
+            .is_err());
+        }
+        assert!(config_path_from_environment(&location, &json!({}), None, "").is_err());
+        assert!(
+            request_cancellable::<Value>(&location, "git", json!({}), &AtomicBool::new(true))
+                .unwrap_err()
+                .contains("cancelled")
+        );
+        assert!(request_cancellable::<Value>(
+            &location,
+            "write",
+            json!({}),
+            &AtomicBool::new(false)
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guest_cli_mutations_resolve_on_their_own_channel_and_reject_changed_binaries() {
+        use super::*;
+        let fixture = r#"
+with tempfile.TemporaryDirectory() as directory:
+    cli = Path(directory) / 'claude'
+    source = '#!' + sys.executable + '\nimport sys\nprint("guest-version")\nsys.exit(2 if "fail" in sys.argv else 0)\n'
+    cli.write_text(source)
+    cli.chmod(0o700)
+    opencode = Path(directory) / 'opencode'
+    opencode.write_text(source)
+    opencode.chmod(0o700)
+    os.environ['PATH'] = directory
+    ENVIRONMENT_READY = True
+    request = {'op':'agent_run', 'path':directory, 'provider':'claude', 'args':['--version'], 'timeout':300}
+    assert handle(request).strip() == 'guest-version'
+    for changed in [{'command':'/other/claude'}, {'args':['fail']}]:
+        try:
+            handle({**request, **changed})
+            raise AssertionError('wrong binary or failed update accepted')
+        except ValueError:
+            pass
+    assert handle({**request, 'provider':'opencode'}).strip() == 'guest-version'
+    try:
+        find_agent('opencode')
+        raise AssertionError('unsupported agent transport became available')
+    except ValueError:
+        pass
+"#;
+        let script = format!(
+            "__name__='fixture'\nexec({})\n{}",
+            serde_json::to_string(SCRIPT).unwrap(),
+            fixture
+        );
+        let output = Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guest_search_caps_and_interrupts_owned_command_groups() {
+        use super::*;
+        let fixture = r#"
+import threading
+with tempfile.TemporaryDirectory() as directory:
+    code, out, err = run([sys.executable, '-c', "import sys; sys.stdout.write('x'*1000000); sys.stdout.flush()"], directory, max_output=100, truncate=True)
+    assert code == 0 and out == b'x'*101
+    try:
+        run([sys.executable, '-c', "import sys; sys.stdout.write('x'*1000000)"], directory, max_output=100)
+        raise AssertionError('unbounded output accepted')
+    except ValueError:
+        pass
+    def interrupt(signum, frame):
+        raise RuntimeError('Search cancelled')
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+    ready = Path(directory) / 'ready'
+    escaped = Path(directory) / 'escaped'
+    descendant = "import time; from pathlib import Path; time.sleep(0.5); Path(%r).touch()" % str(escaped)
+    command = "import subprocess, sys, time; from pathlib import Path; subprocess.Popen([sys.executable, '-c', %r]); Path(%r).touch(); time.sleep(30)" % (descendant, str(ready))
+    def cancel():
+        deadline = time.monotonic() + 3
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        os.kill(os.getpid(), signal.SIGTERM)
+    thread = threading.Thread(target=cancel)
+    thread.start()
+    start = time.monotonic()
+    try:
+        run([sys.executable, '-c', command], directory)
+        raise AssertionError('cancellation ignored')
+    except RuntimeError as error:
+        assert str(error) == 'Search cancelled'
+    thread.join()
+    assert time.monotonic() - start < 3
+    time.sleep(0.6)
+    assert not escaped.exists(), 'search descendant survived cancellation'
+"#;
+        let script = format!(
+            "__name__='fixture'\nexec({})\n{}",
+            serde_json::to_string(SCRIPT).unwrap(),
+            fixture
+        );
+        let output = Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn launch_control_environment_is_private_and_never_cached_or_inherited() {
         use super::*;
         let original = json!({"nonce":"one", "environment": {
             "PATH":"/linux/bin", "MONOCODE_CONTROL_TOKEN":"stale", "MONOCODE_CONTROL_ENDPOINT":"stale",
+            "MONOCODE_APP_TOKEN":"stale-app", "MONOCODE_APP_ENDPOINT":"stale-app-endpoint",
             "WSLENV":"UNRELATED/p", "TMPDIR":"/tmp"
         }}).to_string();
         let mut command = Command::new("wsl.exe");
         command
             .env("MONOCODE_CONTROL_TOKEN", "session-only")
             .env("MONOCODE_CONTROL_ENDPOINT", "127.0.0.1:4321")
+            .env("MONOCODE_APP_TOKEN", "app-session-only")
+            .env("MONOCODE_APP_ENDPOINT", "127.0.0.1:8765")
             .env("TMPDIR", "/tmp/worker")
             .env("PATH", "C:/Windows")
             .env("UNRELATED_SECRET", "never-transfer");
@@ -1249,9 +1624,17 @@ mod tests {
         );
         assert_eq!(
             message["environment"]["WSLENV"],
-            "MONOCODE_CONTROL_ENDPOINT/w:MONOCODE_CONTROL_TOKEN/w"
+            "MONOCODE_CONTROL_ENDPOINT/w:MONOCODE_CONTROL_TOKEN/w:MONOCODE_APP_ENDPOINT/w:MONOCODE_APP_TOKEN/w"
         );
         assert!(message["environment"].get("UNRELATED_SECRET").is_none());
+        assert_eq!(
+            message["environment"]["MONOCODE_APP_TOKEN"],
+            "app-session-only"
+        );
+        assert_eq!(
+            message["environment"]["MONOCODE_APP_ENDPOINT"],
+            "127.0.0.1:8765"
+        );
         assert_eq!(command.get_args().count(), 0);
         let ordinary: Value = serde_json::from_str(
             &agent_acknowledgement(&original, &Command::new("wsl.exe")).unwrap(),
@@ -1262,6 +1645,10 @@ mod tests {
             .is_none());
         assert!(ordinary["environment"]
             .get("MONOCODE_CONTROL_ENDPOINT")
+            .is_none());
+        assert!(ordinary["environment"].get("MONOCODE_APP_TOKEN").is_none());
+        assert!(ordinary["environment"]
+            .get("MONOCODE_APP_ENDPOINT")
             .is_none());
         assert_eq!(ordinary["environment"]["WSLENV"], "");
         assert_eq!(
@@ -1597,7 +1984,7 @@ with tempfile.TemporaryDirectory(prefix='monocode-env-') as directory:
             serde_json::to_string(SCRIPT).unwrap(),
             r#"
 real_run = run
-def run(argv, cwd, input_bytes=None, timeout=25):
+def run(argv, cwd, input_bytes=None, timeout=25, **kwargs):
     if argv[0] == 'git' and 'clone' in argv:
         assert argv[-4:-1] == ['clone', '--', 'https://example.invalid/clonefixture.git']
         argv = [*argv[:-2], cwd, argv[-1]]
@@ -1618,7 +2005,7 @@ def run(argv, cwd, input_bytes=None, timeout=25):
         if not os.path.lexists(argv[5]):
             os.rename(argv[4], argv[5])
         return 0, b'', b''
-    return real_run(argv, cwd, input_bytes, timeout)
+    return real_run(argv, cwd, input_bytes, timeout, **kwargs)
 "#
         );
         let bridge = Arc::new(

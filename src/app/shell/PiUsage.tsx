@@ -1,3 +1,4 @@
+import { wslLocation } from "../../shared/lib/paths";
 import { useEffect, useRef, useState } from "react";
 import { RefreshCw } from "../../shared/ui/icons";
 import { HarnessIcon } from "../../features/sessions/ui/HarnessIcon";
@@ -14,7 +15,7 @@ import {
 } from "../../features/providers/model/rateLimits";
 import { UsageProviderChip } from "./UsageProviderChip";
 
-export function PiUsage({ model, now }: { model?: string; now: number }) {
+export function PiUsage({ model, now, cwd }: { model?: string; now: number; cwd?: string }) {
   const provider = piUsageProvider(model);
   if (!provider) {
     return (
@@ -31,15 +32,17 @@ export function PiUsage({ model, now }: { model?: string; now: number }) {
       </span>
     );
   }
-  return <PiProviderUsage key={provider} provider={provider} now={now} />;
+  return <PiProviderUsage key={`${provider}:${cwd ?? "native"}`} provider={provider} now={now} cwd={cwd} />;
 }
 
 function PiProviderUsage({
   provider,
   now,
+  cwd,
 }: {
   provider: PiUsageProvider;
   now: number;
+  cwd?: string;
 }) {
   const [limits, setLimits] = useState(() =>
     idleRateLimits(piBillingProvider(provider)),
@@ -62,7 +65,7 @@ function PiProviderUsage({
         ...idleRateLimits(piBillingProvider(provider)),
         status: "fetching",
       });
-      void fetchPiUsage(provider)
+      void fetchPiUsage(provider, cwd)
         .then((result) => {
           if (!disposed) setLimits(result);
         })
@@ -83,7 +86,7 @@ function PiProviderUsage({
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onVisible);
     };
-  }, [provider]);
+  }, [provider, cwd]);
   const fetching = limits.status === "fetching";
   return (
     <>
@@ -91,7 +94,7 @@ function PiProviderUsage({
         limits={limits}
         now={now}
         presentation={{
-          sourceLabel: "Pi's saved OAuth account",
+          sourceLabel: wslLocation(cwd ?? "") ? `Pi's saved OAuth account · WSL: ${wslLocation(cwd ?? "")!.distribution}` : "Pi's saved OAuth account",
           harness: "pi",
           label:
             provider === "anthropic" ? "Pi · Anthropic" : "Pi · OpenAI Codex",

@@ -99,9 +99,26 @@ pub async fn mcp_add(
     config: String,
 ) -> Result<(), String> {
     let (name, server) = server_from_json(&provider, &name, &config)?;
-    let binary_path = host.runtime_binary_path(&provider);
+    let guest = crate::wsl::location(&cwd)?;
+    if guest.is_some() && provider == "claude_desktop" {
+        return Err(
+            "Claude Desktop configuration belongs to the native host; choose a native project"
+                .into(),
+        );
+    }
+    let binary_path = if guest.is_some() {
+        None
+    } else {
+        host.runtime_binary_path(&provider)
+    };
     tauri::async_runtime::spawn_blocking(move || {
-        let home = dirs_home().ok_or("Home directory not found")?;
+        let home = if let Some(location) = &guest {
+            crate::wsl::config_path(location, None, "")?
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            dirs_home().ok_or("Home directory not found")?
+        };
         let project = expand_home(&cwd);
         if !project.is_dir() {
             return Err("Project directory does not exist".into());
@@ -124,7 +141,11 @@ pub async fn mcp_add(
                     return Err("Invalid OpenCode MCP scope".into());
                 }
                 let major = crate::harness::opencode_major_version(&cwd, binary_path.as_deref())?;
-                let override_path = std::env::var_os("OPENCODE_CONFIG").map(PathBuf::from);
+                let override_path = if let Some(location) = &guest {
+                    crate::wsl::config_override(location, "OPENCODE_CONFIG")?
+                } else {
+                    std::env::var_os("OPENCODE_CONFIG").map(PathBuf::from)
+                };
                 let path = opencode_config_path(
                     Path::new(&home),
                     &project,
@@ -433,18 +454,49 @@ pub struct McpConnection {
 
 #[tauri::command]
 pub async fn mcp_discover(cwd: String) -> Result<Vec<McpConnection>, String> {
+    let guest = crate::wsl::location(&cwd)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let home = dirs_home().ok_or("Home directory not found")?;
+        let home = if let Some(location) = &guest {
+            crate::wsl::config_path(location, None, "")?
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            dirs_home().ok_or("Home directory not found")?
+        };
         let project = expand_home(&cwd);
-        let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
-        let desktop_config = claude_desktop_config(Path::new(&home));
-        let opencode_config = std::env::var_os("OPENCODE_CONFIG").map(PathBuf::from);
+        let codex_home = if let Some(location) = &guest {
+            Some(crate::wsl::config_path(
+                location,
+                Some("CODEX_HOME"),
+                ".codex",
+            )?)
+        } else {
+            std::env::var_os("CODEX_HOME").map(PathBuf::from)
+        };
+        let desktop_config = if guest.is_some() {
+            PathBuf::new()
+        } else {
+            claude_desktop_config(Path::new(&home))
+        };
+        let opencode_config = if let Some(location) = &guest {
+            crate::wsl::config_override(location, "OPENCODE_CONFIG")?
+        } else {
+            std::env::var_os("OPENCODE_CONFIG").map(PathBuf::from)
+        };
+        let claude_profile = guest
+            .as_ref()
+            .map(|location| {
+                crate::wsl::config_path(location, Some("CLAUDE_CONFIG_DIR"), "")
+                    .map(|directory| directory.join(".claude.json"))
+            })
+            .transpose()?;
         Ok(discover(
             Path::new(&home),
             &project,
             codex_home.as_deref(),
             &desktop_config,
             opencode_config.as_deref(),
+            claude_profile.as_deref(),
         ))
     })
     .await
@@ -457,9 +509,12 @@ fn discover(
     codex_home_override: Option<&Path>,
     desktop_config: &Path,
     opencode_config: Option<&Path>,
+    claude_profile: Option<&Path>,
 ) -> Vec<McpConnection> {
     let mut connections = Vec::new();
-    let claude = home.join(".claude.json");
+    let claude = claude_profile
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home.join(".claude.json"));
     if let Some(config) = read_json(&claude) {
         add_json_servers(
             &mut connections,
@@ -475,7 +530,16 @@ fn discover(
             &claude,
             config
                 .get("projects")
-                .and_then(|projects| projects.get(project.to_string_lossy().as_ref()))
+                .and_then(|projects| {
+                    projects.get(
+                        crate::wsl::location(&project.to_string_lossy())
+                            .ok()
+                            .flatten()
+                            .map(|location| location.path)
+                            .as_deref()
+                            .unwrap_or(project.to_string_lossy().as_ref()),
+                    )
+                })
                 .and_then(|entry| entry.get("mcpServers")),
         );
     }
@@ -1059,6 +1123,27 @@ mod tests {
     }
 
     #[test]
+    fn discovery_honors_selected_claude_profile_without_native_fallback() {
+        let root = std::env::temp_dir().join(format!("monocode-mcp-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let profile = root.join("guest/.claude.json");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"mcpServers":{"native":{"command":"native"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(&profile, r#"{"mcpServers":{"guest":{"command":"guest"}}}"#).unwrap();
+        let found = discover(&home, &root, None, Path::new(""), None, Some(&profile));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "guest");
+        std::fs::remove_file(&profile).unwrap();
+        assert!(discover(&home, &root, None, Path::new(""), None, Some(&profile)).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn discovers_provider_configs_without_exposing_credentials() {
         let root = std::env::temp_dir().join(format!("monocode-mcp-{}", uuid::Uuid::new_v4()));
         let home = root.join("home");
@@ -1085,7 +1170,7 @@ mod tests {
         let codex_config: toml::Value = toml::from_str(&codex_raw).unwrap();
         assert!(codex_config.get("mcp_servers").is_some());
         std::fs::write(home.join(".config/opencode/opencode.jsonc"), "{\"mcp\": {\"servers\": {\"four\": {\"type\": \"remote\", \"url\": \"https://example.com\",},},}}").unwrap();
-        let found = discover(&home, &project, None, &desktop, None);
+        let found = discover(&home, &project, None, &desktop, None, None);
         let names: Vec<_> = found
             .iter()
             .map(|entry| (entry.provider.as_str(), entry.name.as_str()))
@@ -1212,7 +1297,14 @@ mod tests {
             r#"{"mcpServers":{"servers":{"command":"npx"},"docs":{"command":"node"}}}"#,
         )
         .unwrap();
-        let found = discover(&root, &project, None, &root.join("desktop.json"), None);
+        let found = discover(
+            &root,
+            &project,
+            None,
+            &root.join("desktop.json"),
+            None,
+            None,
+        );
         assert_eq!(found.len(), 2);
         assert!(found.iter().all(|server| server.scope == "user"));
         assert!(found.iter().any(|server| server.name == "servers"));

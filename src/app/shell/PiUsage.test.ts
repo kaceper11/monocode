@@ -40,12 +40,12 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-async function show(model: string, id = "pi-session") {
+async function show(model: string, id = "pi-session", cwd?: string) {
   await act(async () =>
     root.render(
       createElement(UsageFooter, {
         providers: [],
-        session: { id, harness: "pi", model },
+        session: { id, harness: "pi", model, cwd },
       }),
     ),
   );
@@ -199,4 +199,17 @@ it("polls only while visible and retries unavailable credentials", async () => {
   vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
   await act(async () => vi.advanceTimersByTimeAsync(RATE_LIMIT_POLL_MS));
   expect(invoke).toHaveBeenCalledTimes(2);
+});
+
+it("scopes Pi usage to WSL and ignores replies after changing execution hosts", async () => {
+  let finishOld!: (value: unknown) => void;
+  vi.mocked(invoke).mockImplementationOnce(() => new Promise((resolve) => { finishOld = resolve; }));
+  const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
+  await show("pi:anthropic/claude-sonnet-4-6", "same-session", cwd);
+  expect(invoke).toHaveBeenLastCalledWith("fetch_pi_usage", { provider: "anthropic", cwd });
+  vi.mocked(invoke).mockResolvedValueOnce(quota(32));
+  await show("pi:anthropic/claude-sonnet-4-6", "same-session", "/native/repo");
+  await act(async () => finishOld(quota(99)));
+  expect(container.textContent).toContain("32%");
+  expect(container.textContent).not.toContain("99%");
 });

@@ -300,7 +300,8 @@ fn scan_files(
                 .iter()
                 .map(|file| file.path.clone())
                 .collect::<Vec<_>>();
-            let results: Vec<serde_json::Value> = crate::wsl::file_batches(&paths, "search_read")?;
+            let results: Vec<serde_json::Value> =
+                crate::wsl::file_batches_cancellable(&paths, "search_read", Some(cancel))?;
             for result in results {
                 if let (Some(path), Some(data)) = (result["path"].as_str(), result["data"].as_str())
                 {
