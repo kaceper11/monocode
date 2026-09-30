@@ -8,7 +8,7 @@ import { submitWithSettlement } from "./model/managedSubmission";
 import { wslLocation } from "../shared/lib/paths";
 
 // Exercise the production callback, without mounting the app's background services.
-const callback = source.slice(source.indexOf("  const launchAutomation = useCallback("), source.indexOf("  const ensureAutomationRecovery = useCallback("));
+const callback = source.slice(source.indexOf("  const launchAutomation = useCallback("), source.indexOf("  const launchQuickSession = useCallback("));
 function fixture(connectAutomationWorkspace = vi.fn().mockResolvedValue(undefined)) {
   const sessionsRef: { current: Session[] } = { current: [] };
   const submitSession = vi.fn().mockReturnValue(true);
@@ -19,6 +19,7 @@ function fixture(connectAutomationWorkspace = vi.fn().mockResolvedValue(undefine
     automationSessionReservations: { current: new Set<string>() },
     linkedWorkItemFromAutomationEvent: () => undefined,
     formatSessionTitle: (_harness: string, name: string) => name,
+    onSaveDraft: vi.fn(),
     setSessions: vi.fn(), appendTab: vi.fn(), focusOpenSession: vi.fn(),
     newTab: (id: string) => ({ id }),
     useQuickComposerLaunches: () => undefined,

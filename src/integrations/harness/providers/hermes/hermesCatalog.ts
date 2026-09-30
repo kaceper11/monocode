@@ -17,11 +17,13 @@ export function refreshHermesCatalog(cwd?: string): Promise<void> {
   return refreshModelCatalog("hermes", cwd, discoverHermesModels);
 }
 
-async function discoverHermesModels(projectCwd?: string): Promise<AgentModel[]> {
+export async function discoverHermesModels(
+  projectCwd?: string,
+): Promise<AgentModel[]> {
   const { path } = await resolveHermesBinary(projectCwd);
-  const cwd = projectCwd ?? await homeDir();
-  const PROBE_ID = `monocode-hermes-probe-${crypto.randomUUID()}`;
-  const acp = new AcpClient(PROBE_ID, {
+  const cwd = projectCwd ?? (await homeDir());
+  const probeId = `monocode-hermes-probe-${crypto.randomUUID()}`;
+  const acp = new AcpClient(probeId, {
     onRequest: (id, method) => {
       void acp
         .respondError(id, {
@@ -34,18 +36,18 @@ async function discoverHermesModels(projectCwd?: string): Promise<AgentModel[]> 
 
   const stop = async () => {
     acp.close();
-    unwatchChild(PROBE_ID);
-    await killChild(PROBE_ID).catch(() => undefined);
+    unwatchChild(probeId);
+    await killChild(probeId).catch(() => undefined);
   };
 
   watchChild(
-    PROBE_ID,
+    probeId,
     (line) => acp.pushLine(line),
     () => acp.close(new Error("Hermes catalog probe exited")),
   );
 
   try {
-    await spawnChild(PROBE_ID, path, ["acp"], cwd);
+    await spawnChild(probeId, path, ["acp"], cwd, undefined, "hermes");
     return await withTimeout(
       DISCOVERY_TIMEOUT_MS,
       async () => {

@@ -11,12 +11,12 @@ export function refreshFxCatalog(cwd?: string): Promise<void> {
   return refreshModelCatalog("fx", cwd, discoverFxModels);
 }
 
-async function discoverFxModels(projectCwd?: string) {
+export async function discoverFxModels(projectCwd?: string) {
   const { path } = await resolveFxBinary(projectCwd);
-  const cwd = projectCwd ?? await homeDir();
+  const cwd = projectCwd ?? (await homeDir());
   const [modelsOutput, statusOutput] = await Promise.all([
-    execChild(path, ["models", "--json"], cwd),
-    execChild(path, ["status", "--json"], cwd).catch(() => ""),
+    execChild(path, ["models", "--json"], cwd, "fx"),
+    execChild(path, ["status", "--json"], cwd, "fx").catch(() => ""),
   ]);
   return mergeFxCatalogModels(
     modelsFromFxOutput(modelsOutput),

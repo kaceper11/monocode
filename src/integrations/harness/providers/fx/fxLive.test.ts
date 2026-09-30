@@ -114,7 +114,7 @@ describe("fx live turn sequence", () => {
     });
     await turn1;
     expect(spawn).toHaveBeenCalledWith("t1", "/fake/fx",
-      model ? ["acp", "--model", "zai/glm-5.2"] : ["acp"], cwd);
+      model ? ["acp", "--model", "zai/glm-5.2"] : ["acp"], cwd, undefined, "fx");
     console.log(
       "TURN 1 OK, messages:",
       parse().map((m) => m.method ?? `reply:${m.id}`),

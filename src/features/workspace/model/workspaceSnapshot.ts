@@ -23,7 +23,11 @@ import {
 } from "../../projects/model/projectTerminal";
 import { normalizeProjectPath } from "../../projects/model/recents";
 import { pathKey } from "../../../shared/lib/paths";
-import { reconcileProjectReturn, type ProjectReturnMemory } from "../../projects/model/projectReturn";
+import { parseRemotePath, remotePath } from "../../connections/model/remoteProjects";
+import {
+  reconcileProjectReturn,
+  type ProjectReturnMemory,
+} from "../../projects/model/projectReturn";
 import type { InboxAskContext } from "../../inbox/model/inboxAsk";
 import {
   HARNESSES,
@@ -56,7 +60,11 @@ export type WorkspaceSnapshot = {
   activeTabId: string;
   projectCwd: string;
   projectTerminals: ProjectTerminalDock[];
-  projectReturnTargets?: { projectPath: string; tabId?: string; paneId?: string }[];
+  projectReturnTargets?: {
+    projectPath: string;
+    tabId?: string;
+    paneId?: string;
+  }[];
   lastDockSide?: DockSide;
 };
 
@@ -70,8 +78,12 @@ export function collectWorkspaceSnapshot(
   lastDockSide?: DockSide,
 ): WorkspaceSnapshot {
   const snapshot = withoutInboxSessions({
-    tabs: withoutAgentTabs(tabs).map(sanitizeTab).filter((tab): tab is WorkspaceTab => tab != null),
-    sessions: sessions.map(sessionStub).filter((stub): stub is WorkspaceSessionStub => stub != null),
+    tabs: withoutAgentTabs(tabs)
+      .map(sanitizeTab)
+      .filter((tab): tab is WorkspaceTab => tab != null),
+    sessions: sessions
+      .map(sessionStub)
+      .filter((stub): stub is WorkspaceSessionStub => stub != null),
     activeTabId,
     projectCwd: projectCwd.trim() || "~",
     projectTerminals: projectTerminals
@@ -125,12 +137,13 @@ function parseProjectReturnTargets(raw: unknown): ProjectReturnMemory {
  * cost the whole workspace tab on restore, so the pane is closed here instead.
  */
 function withoutAgentTabs(tabs: WorkspaceTab[]): WorkspaceTab[] {
-  return tabs.flatMap(tab => {
-    if (!tab.editorPanes.some(pane => pane.files.some(isAgentTab))) return [tab];
+  return tabs.flatMap((tab) => {
+    if (!tab.editorPanes.some((pane) => pane.files.some(isAgentTab)))
+      return [tab];
     let remaining: WorkspaceTab | null = tab;
     const panes: EditorPane[] = [];
     for (const pane of tab.editorPanes) {
-      const files = pane.files.filter(file => !isAgentTab(file));
+      const files = pane.files.filter((file) => !isAgentTab(file));
       if (files.length === pane.files.length) {
         panes.push(pane);
       } else if (files.length === 0) {
@@ -139,7 +152,7 @@ function withoutAgentTabs(tabs: WorkspaceTab[]): WorkspaceTab[] {
         panes.push({
           ...pane,
           files,
-          activeFileId: files.some(file => file.id === pane.activeFileId)
+          activeFileId: files.some((file) => file.id === pane.activeFileId)
             ? pane.activeFileId
             : files[0].id,
         });
@@ -151,11 +164,13 @@ function withoutAgentTabs(tabs: WorkspaceTab[]): WorkspaceTab[] {
 
 /** Also removes tabs saved by the earlier, persistent Inbox implementation. */
 function withoutInboxSessions(snapshot: WorkspaceSnapshot): WorkspaceSnapshot {
-  const inboxIds = snapshot.sessions.filter(session => session.inboxAsk).map(session => session.id);
+  const inboxIds = snapshot.sessions
+    .filter((session) => session.inboxAsk)
+    .map((session) => session.id);
   if (inboxIds.length === 0) return snapshot;
   let tabs = snapshot.tabs;
   for (const id of inboxIds) {
-    tabs = tabs.flatMap(tab => {
+    tabs = tabs.flatMap((tab) => {
       if (!leafIds(tab.layout).includes(id)) return [tab];
       const next = closeLeaf(tab, id);
       return next ? [next] : [];
@@ -164,10 +179,10 @@ function withoutInboxSessions(snapshot: WorkspaceSnapshot): WorkspaceSnapshot {
   return {
     ...snapshot,
     tabs,
-    sessions: snapshot.sessions.filter(session => !session.inboxAsk),
-    activeTabId: tabs.some(tab => tab.id === snapshot.activeTabId)
+    sessions: snapshot.sessions.filter((session) => !session.inboxAsk),
+    activeTabId: tabs.some((tab) => tab.id === snapshot.activeTabId)
       ? snapshot.activeTabId
-      : tabs[0]?.id ?? "",
+      : (tabs[0]?.id ?? ""),
   };
 }
 
@@ -209,7 +224,14 @@ export function parseWorkspaceSnapshot(raw: unknown): WorkspaceSnapshot | null {
   const lastDockSide = isDockSide(value.lastDockSide)
     ? value.lastDockSide
     : undefined;
-  const snapshot = withoutInboxSessions({ tabs, sessions, activeTabId, projectCwd, projectTerminals, lastDockSide });
+  const snapshot = withoutInboxSessions({
+    tabs,
+    sessions,
+    activeTabId,
+    projectCwd,
+    projectTerminals,
+    lastDockSide,
+  });
   return snapshot.tabs.length > 0
     ? withProjectReturnTargets(
         snapshot,
@@ -251,7 +273,9 @@ export function hydrateWorkspaceSnapshot(
     const stub = stubs.get(id);
     const base = record ?? (stub ? sessionFromStub(stub) : null);
     if (!base || base.inboxAsk) return null;
-    const next = interruptedIds.has(id) ? markTurnInterrupted(base) : { ...base, busy: false };
+    const next = interruptedIds.has(id)
+      ? markTurnInterrupted(base)
+      : { ...base, busy: false };
     sessions.set(id, next);
     return next;
   };
@@ -292,7 +316,7 @@ export function hydrateWorkspaceSnapshot(
   const projectCwd =
     parsed.projectCwd !== "~"
       ? parsed.projectCwd
-      : sessions.values().next().value?.cwd ?? "~";
+      : (sessions.values().next().value?.cwd ?? "~");
 
   return {
     tabs,
@@ -344,6 +368,10 @@ function sessionFromStub(stub: WorkspaceSessionStub): Session {
   return {
     ...session,
     id: stub.id,
+    // A snapshot is a saved choice, not a new conversation. Catalog discovery
+    // and the current picker preferences must not replace its model.
+    model: stub.model || session.model,
+    modelSettings: { ...stub.modelSettings },
     title: stub.title,
     ...(stub.inboxAsk ? { inboxAsk: stub.inboxAsk } : {}),
     ...(stub.providerSessionId
@@ -457,7 +485,8 @@ function sanitizeLayout(raw: unknown): LayoutNode | null {
   if (value.type !== "split" || typeof value.id !== "string" || !value.id) {
     return null;
   }
-  const dir = value.dir === "down" ? "down" : value.dir === "right" ? "right" : null;
+  const dir =
+    value.dir === "down" ? "down" : value.dir === "right" ? "right" : null;
   if (!dir || !Array.isArray(value.children) || value.children.length < 2) {
     return null;
   }
@@ -466,7 +495,10 @@ function sanitizeLayout(raw: unknown): LayoutNode | null {
     .filter((node): node is LayoutNode => node != null);
   if (children.length < 2) return null;
   const sizes = Array.isArray(value.sizes)
-    ? value.sizes.filter((size): size is number => typeof size === "number" && Number.isFinite(size))
+    ? value.sizes.filter(
+        (size): size is number =>
+          typeof size === "number" && Number.isFinite(size),
+      )
     : [];
   const normalized =
     sizes.length === children.length
@@ -550,9 +582,26 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
   const commit = sanitizeCommit(value.commit);
   const hasSessionChanges = "sessionChanges" in value;
   const sessionChanges = sanitizeSessionChanges(value.sessionChanges);
+  const hasRemoteFile = "remoteFile" in value;
+  const remoteFile = sanitizeRemoteFile(value.remoteFile);
   if (hasReleaseNotes && !releaseNotes) return null;
   if (hasCommit && !commit) return null;
   if (hasSessionChanges && !sessionChanges) return null;
+  if (hasRemoteFile && !remoteFile) return null;
+  const remoteOwner =
+    remoteFile && typeof value.projectCwd === "string"
+      ? parseRemotePath(value.projectCwd)
+      : undefined;
+  if (remoteFile && !remoteOwner) return null;
+  if (
+    remoteFile &&
+    (value.plan != null ||
+      releaseNotes ||
+      commit ||
+      sessionChanges ||
+      value.terminal === true)
+  )
+    return null;
   if (
     sessionChanges &&
     (value.plan != null ||
@@ -586,8 +635,8 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
   }
   return {
     id: value.id,
-    path: value.path,
-    cwd: value.cwd,
+    path: remoteOwner ? remotePath(remoteOwner.environmentId, value.path) : value.path,
+    cwd: remoteOwner ? remotePath(remoteOwner.environmentId, value.cwd) : value.cwd,
     ...(typeof value.projectCwd === "string" && value.projectCwd
       ? { projectCwd: value.projectCwd }
       : {}),
@@ -602,6 +651,25 @@ function sanitizeFile(raw: unknown): FilePaneTab | null {
       : {}),
     ...(value.terminal === true ? { terminal: true } : {}),
     ...(value.preview === true ? { preview: true } : {}),
+  };
+}
+
+function sanitizeRemoteFile(raw: unknown): { machineId: string; projectId: string; relativePath: string } | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  if (
+    typeof value.machineId !== "string" ||
+    !value.machineId ||
+    typeof value.projectId !== "string" ||
+    !value.projectId ||
+    typeof value.relativePath !== "string" ||
+    !value.relativePath
+  )
+    return null;
+  return {
+    machineId: value.machineId,
+    projectId: value.projectId,
+    relativePath: value.relativePath,
   };
 }
 
@@ -630,9 +698,7 @@ function sanitizeCommit(raw: unknown): CommitTabSource | undefined {
   };
 }
 
-function sanitizeReleaseNotes(
-  raw: unknown,
-): ReleaseNotesTabSource | undefined {
+function sanitizeReleaseNotes(raw: unknown): ReleaseNotesTabSource | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const version = (raw as Record<string, unknown>).version;
   if (typeof version !== "string" || !version.trim()) return undefined;
@@ -682,7 +748,8 @@ function asHarness(value: unknown): HarnessId | null {
 }
 
 function asRuntimeMode(value: unknown): RuntimeMode | null {
-  return typeof value === "string" && (RUNTIME_MODES as string[]).includes(value)
+  return typeof value === "string" &&
+    (RUNTIME_MODES as string[]).includes(value)
     ? (value as RuntimeMode)
     : null;
 }

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { hasHeadlessChildBackend } from "../../core/child";
 
 export type StoredCursorToolCall = {
   toolCallId: string;
@@ -30,6 +31,7 @@ export function readStoredCursorSubagentRuns(
   knownRevisions: Record<string, string> = {},
   cwd?: string,
 ): Promise<StoredCursorSubagentRun[]> {
+  if (hasHeadlessChildBackend()) return Promise.resolve([]);
   return invoke("cursor_subagent_runs", {
     sessionId,
     toolCallIds,
@@ -43,6 +45,7 @@ export function readStoredCursorToolCalls(
   toolCallIds: string[],
   cwd?: string,
 ): Promise<StoredCursorToolCall[]> {
+  if (hasHeadlessChildBackend()) return Promise.resolve([]);
   return invoke<StoredCursorToolCall[]>("cursor_tool_calls", {
     sessionId,
     toolCallIds,

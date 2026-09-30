@@ -300,6 +300,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       plan: wantPlanning,
     }),
     input.cwd,
+    undefined,
+    "grok",
   );
 
   try {

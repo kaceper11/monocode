@@ -20,6 +20,14 @@ import {
   providerAccounts,
   saveProviderAccount,
 } from "../../providers/model/providerAccounts";
+import {
+  clearCachedRateLimits,
+  setCachedRateLimits,
+} from "../../providers/model/rateLimitsCache";
+import {
+  HARNESSES,
+  HARNESS_TITLE,
+} from "../../sessions/model/session";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async () => undefined),
@@ -96,11 +104,13 @@ beforeEach(() => {
   document.body.append(container);
   root = createRoot(container);
   onSelectSection = vi.fn();
+  vi.mocked(invoke).mockReset().mockResolvedValue(undefined);
 });
 
 afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
+  clearCachedRateLimits();
   localStorage.clear();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -156,6 +166,68 @@ describe("settings pages", () => {
     await render("providers");
     expect(container.querySelector('button[aria-label^="Provider execution location:"]')).toBeNull();
     expect(container.querySelector('[aria-label="Rename Default account"]')).not.toBeNull();
+  });
+
+  it("keeps account emails blurred until clicked and hides them when settings reopen", async () => {
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "provider_account_identity") {
+        const { provider } = args as { provider: string };
+        return { email: `${provider}@example.com`, plan: "Pro" };
+      }
+      return undefined;
+    });
+    await render("providers");
+
+    const emails = container.querySelectorAll<HTMLButtonElement>(
+      '[aria-label="Reveal email"]',
+    );
+    expect(emails).toHaveLength(2);
+    expect(
+      [...emails].every((email) =>
+        email.querySelector("span")?.className.includes("blur-[5px]"),
+      ),
+    ).toBe(true);
+    expect(container.textContent).toContain("Pro");
+    await act(async () => emails[0].click());
+    expect(emails[0].getAttribute("aria-label")).toBe("Hide email");
+    expect(emails[0].querySelector("span")?.className).not.toContain("blur");
+    expect(emails[1].getAttribute("aria-label")).toBe("Reveal email");
+    await act(async () => emails[0].click());
+    expect(emails[0].getAttribute("aria-label")).toBe("Reveal email");
+
+    await act(async () => emails[0].click());
+    await render("general");
+    await render("providers");
+    expect(container.querySelector('[aria-label="Hide email"]')).toBeNull();
+    expect(
+      container.querySelectorAll('[aria-label="Reveal email"]'),
+    ).toHaveLength(2);
+  });
+
+  it("shows account usage bars as remaining capacity", async () => {
+    setCachedRateLimits("claude", "default", {
+      provider: "claude",
+      session: {
+        usedPercent: 23,
+        windowMinutes: 300,
+        resetsAt: Date.now() + 3_600_000,
+      },
+      weekly: null,
+      monthly: null,
+      resetCredits: null,
+      updatedAt: Date.now(),
+      error: null,
+      status: "ok",
+    });
+
+    await render("providers");
+
+    const bar = container.querySelector('[aria-label="5h limit remaining"]');
+    expect(bar?.getAttribute("aria-valuenow")).toBe("77");
+    expect(bar?.querySelector("span")?.getAttribute("style")).toBe(
+      "width: 77%;",
+    );
+    expect(bar?.parentElement?.textContent).toContain("77% left");
   });
 
   it("shows background effect choices above scope when artwork is available", async () => {
@@ -290,6 +362,166 @@ describe("settings pages", () => {
       accountId: "account-work",
     });
     expect(providerAccounts("codex")).toHaveLength(1);
+  });
+
+  it("validates and stores Codex and OpenCode binary overrides", async () => {
+    let failAutoCodex = false;
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      const payload = args as { binaryPath?: string } | undefined;
+      if (command === "harness_resolve_configured") {
+        return { path: payload?.binaryPath };
+      }
+      if (command === "harness_resolve_codex") {
+        if (failAutoCodex && payload?.binaryPath == null) {
+          throw new Error("Codex auto-detection failed");
+        }
+        return { path: payload?.binaryPath ?? "/auto/codex" };
+      }
+      if (command === "harness_resolve_opencode") {
+        return { path: payload?.binaryPath ?? "/auto/opencode" };
+      }
+      if (command === "harness_exec") {
+        if (payload?.binaryPath === "/bad/codex") {
+          throw new Error("Codex failed to start");
+        }
+        return payload?.binaryPath?.includes("opencode")
+          ? "opencode 1.18.32"
+          : "codex-cli 0.156.1";
+      }
+      return undefined;
+    });
+    await render("providers");
+
+    const details = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Show Codex CLI details"]',
+    )!;
+    await act(async () => details.click());
+    await act(async () =>
+      document
+        .querySelector<HTMLButtonElement>(
+          '[aria-label="Open Codex CLI location"]',
+        )!
+        .click(),
+    );
+    expect(invoke).toHaveBeenCalledWith("reveal_path", {
+      path: "/auto/codex",
+    });
+
+    const save = async (provider: "Codex" | "OpenCode", path: string) => {
+      const id = `${provider.toLowerCase()}-binary-path`;
+      if (!document.querySelector(`#${id}`)) {
+        if (!document.querySelector(`[aria-label="Edit ${provider} CLI path"]`)) {
+          await act(async () =>
+            container
+              .querySelector<HTMLButtonElement>(
+                `[aria-label^="Show ${provider} CLI details"]`,
+              )!
+              .click(),
+          );
+        }
+        await act(async () =>
+          document
+            .querySelector<HTMLButtonElement>(
+              `[aria-label="Edit ${provider} CLI path"]`,
+            )!
+            .click(),
+        );
+      }
+      const input = document.querySelector<HTMLInputElement>(`#${id}`)!;
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype,
+          "value",
+        )!.set!.call(input, path);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await act(async () => input.closest("form")!.requestSubmit());
+    };
+
+    await save("Codex", "/opt/codex/bin/codex");
+    await save("OpenCode", "/opt/opencode/bin/opencode");
+    expect(
+      JSON.parse(
+        localStorage.getItem("monocode.providerBinaryPaths.v1") ?? "{}",
+      ),
+    ).toEqual({
+      codex: "/opt/codex/bin/codex",
+      opencode: "/opt/opencode/bin/opencode",
+    });
+    await act(async () => details.click());
+    expect(document.body.textContent).toContain("/opt/codex/bin/codex");
+    expect(document.body.textContent).toContain("codex-cli 0.156.1");
+    expect(document.body.textContent).toContain("Restart required");
+    await act(async () => details.click());
+    const openCodeDetails = container.querySelector<HTMLButtonElement>(
+      '[aria-label^="Show OpenCode CLI details"]',
+    )!;
+    await act(async () => openCodeDetails.click());
+    expect(document.body.textContent).toContain("/opt/opencode/bin/opencode");
+    expect(document.body.textContent).toContain("opencode 1.18.32");
+    await act(async () => openCodeDetails.click());
+
+    await save("Codex", "/bad/codex");
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(
+      "Codex failed to start",
+    );
+    expect(container.textContent).not.toContain("/opt/codex/bin/codex");
+    expect(
+      JSON.parse(
+        localStorage.getItem("monocode.providerBinaryPaths.v1") ?? "{}",
+      ).codex,
+    ).toBe("/opt/codex/bin/codex");
+    await act(async () =>
+      Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+        (button) => button.textContent === "Cancel",
+      )!.click(),
+    );
+    expect(document.querySelector('[aria-label="Retry Codex configured path"]')).not.toBeNull();
+
+    failAutoCodex = true;
+    await save("Codex", "");
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(
+      "Codex auto-detection failed",
+    );
+    expect(
+      JSON.parse(
+        localStorage.getItem("monocode.providerBinaryPaths.v1") ?? "{}",
+      ).codex,
+    ).toBe("/opt/codex/bin/codex");
+
+    failAutoCodex = false;
+    await save("Codex", "");
+    expect(
+      JSON.parse(
+        localStorage.getItem("monocode.providerBinaryPaths.v1") ?? "{}",
+      ).codex,
+    ).toBeUndefined();
+    await act(async () => details.click());
+    expect(document.body.textContent).toContain("/auto/codex");
+    expect(document.body.textContent).toContain("Auto-detected");
+  });
+
+  it("offers manual auto-detect retry when a CLI is missing", async () => {
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "harness_resolve_codex") {
+        throw new Error("Codex CLI not found");
+      }
+      return undefined;
+    });
+    await render("providers");
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>(
+          '[aria-label="Show Codex CLI details"]',
+        )!
+        .click(),
+    );
+    const retry = document.querySelector<HTMLButtonElement>(
+      '[aria-label="Retry Codex auto-detect"]',
+    )!;
+    expect(retry).not.toBeNull();
+    await act(async () => retry.click());
+    expect(invoke).toHaveBeenCalledWith("harness_resolve_codex", undefined);
   });
 
   it("reopens, scrolls to, focuses and highlights the same project on a repeated notification settings request", async () => {
@@ -452,6 +684,27 @@ describe("settings pages", () => {
     expect(hidden?.getAttribute("aria-checked")).toBe("true");
   });
 
+  it("sets interface scale from a menu instead of a live slider", async () => {
+    await render("appearance");
+    const row = container.querySelector('[data-setting-id="interface-scale"]')!;
+    expect(row.querySelector('input[type="range"]')).toBeNull();
+    const trigger = row.querySelector<HTMLButtonElement>(
+      '[aria-haspopup="listbox"]',
+    )!;
+    expect(trigger.getAttribute("aria-label")).toBe("Interface scale: 100%");
+
+    await act(async () => trigger.click());
+    const option = Array.from(
+      document.querySelectorAll<HTMLButtonElement>('[role="option"]'),
+    ).find((node) => node.textContent?.includes("150%"));
+    expect(option).toBeTruthy();
+    await act(async () => option!.click());
+
+    expect(localStorage.getItem("monocode.uiScale")).toBe("1.5");
+    expect(trigger.getAttribute("aria-label")).toBe("Interface scale: 150%");
+    document.documentElement.style.removeProperty("zoom");
+  });
+
   it("reports collapsed project rail changes to the app shell", async () => {
     const onCollapsedProjectRailModeChange = vi.fn();
     await render("appearance", {
@@ -484,6 +737,62 @@ describe("settings pages", () => {
       expect(renderedSettingIds().sort()).toEqual(expected.sort());
     },
   );
+
+  it("shows path details for every Agent CLI", async () => {
+    await render("providers");
+    expect(
+      vi.mocked(invoke).mock.calls.some(([command]) => command === "harness_exec"),
+    ).toBe(false);
+    for (const harness of HARNESSES) {
+      expect(
+        container.querySelector(
+          `[aria-label="Show ${HARNESS_TITLE[harness]} CLI details"]`,
+        ),
+      ).not.toBeNull();
+    }
+  });
+
+  it("returns focus to the CLI trigger when the details popover closes", async () => {
+    await render("providers");
+    const trigger = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Show Codex CLI details"]',
+    )!;
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    await act(async () => trigger.click());
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    });
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("keeps location failures separate from CLI check failures", async () => {
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "harness_resolve_codex") return { path: "/auto/codex" };
+      if (command === "harness_exec") return "codex-cli 0.156.1";
+      if (command === "reveal_path") throw new Error("File manager unavailable");
+      return undefined;
+    });
+    await render("providers");
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>(
+          '[aria-label="Show Codex CLI details"]',
+        )!
+        .click(),
+    );
+    await act(async () =>
+      document
+        .querySelector<HTMLButtonElement>(
+          '[aria-label="Open Codex CLI location"]',
+        )!
+        .click(),
+    );
+    expect(document.body.textContent).toContain(
+      "Could not open the CLI location: File manager unavailable",
+    );
+  });
 
   it("only tags rows that search can find", async () => {
     for (const section of SETTINGS_SECTIONS.map((item) => item.id)) {
@@ -587,6 +896,152 @@ describe("settings search", () => {
     expect(onSelectSection).not.toHaveBeenCalled();
   });
 
+  it("records a custom keybinding from the key cell", async () => {
+    await render("keybindings");
+    const input = container.querySelector<HTMLInputElement>(
+      '[aria-label="Change App: Search shortcut"]',
+    )!;
+    await act(async () => input.click());
+    await act(async () =>
+      document.body.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          code: "KeyY",
+          key: "y",
+          ctrlKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      ),
+    );
+
+    expect(localStorage.getItem("monocode.keybindingOverrides")).toBe(
+      '{"App: Search":{"shortcut":"Control+Shift+KeyY"}}',
+    );
+    expect(input.value).toBe("Ctrl+Shift+Y");
+  });
+
+  it("lets Tab leave the recorder and keeps Cmd+Delete recordable", async () => {
+    await render("keybindings");
+    const input = container.querySelector<HTMLInputElement>(
+      '[aria-label="Change App: Search shortcut"]',
+    )!;
+
+    await act(async () => input.click());
+    await act(async () =>
+      document.body.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          code: "Tab",
+          key: "Tab",
+          bubbles: true,
+          cancelable: true,
+        }),
+      ),
+    );
+    expect(container.textContent).not.toContain("Del disables");
+
+    await act(async () => input.click());
+    await act(async () =>
+      document.body.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          code: "Delete",
+          key: "Delete",
+          metaKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      ),
+    );
+    expect(localStorage.getItem("monocode.keybindingOverrides")).toBe(
+      '{"App: Search":{"shortcut":"Command+Delete"}}',
+    );
+  });
+
+  it("surfaces a storage failure instead of silently dropping the change", async () => {
+    await render("keybindings");
+    (
+      localStorage as unknown as {
+        setItem: (key: string, value: string) => void;
+      }
+    ).setItem = () => {
+      throw new Error("quota exceeded");
+    };
+    const input = container.querySelector<HTMLInputElement>(
+      '[aria-label="Change App: Search shortcut"]',
+    )!;
+    await act(async () => input.click());
+    await act(async () =>
+      document.body.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          code: "KeyY",
+          key: "y",
+          ctrlKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      ),
+    );
+
+    expect(container.textContent).toContain("Could not save shortcuts");
+  });
+
+  it("records an Alt shortcut on a keybinding row", async () => {
+    await render("keybindings");
+    const input = container.querySelector<HTMLInputElement>(
+      '[aria-label="Change App: Search shortcut"]',
+    )!;
+    await act(async () => input.click());
+    await act(async () =>
+      document.body.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          code: "KeyY",
+          key: "y",
+          altKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      ),
+    );
+
+    expect(localStorage.getItem("monocode.keybindingOverrides")).toBe(
+      '{"App: Search":{"shortcut":"Option+KeyY"}}',
+    );
+    expect(input.value).toBe("Alt+Y");
+  });
+
+  it("disables and restores an individual keybinding", async () => {
+    await render("keybindings");
+    const input = container.querySelector<HTMLInputElement>(
+      '[aria-label="Change App: Search shortcut"]',
+    )!;
+    await act(async () => input.click());
+    await act(async () =>
+      document.body.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          code: "Backspace",
+          key: "Backspace",
+          bubbles: true,
+          cancelable: true,
+        }),
+      ),
+    );
+
+    expect(localStorage.getItem("monocode.keybindingOverrides")).toBe(
+      '{"App: Search":{"disabled":true}}',
+    );
+    expect(input.value).toBe("Disabled");
+
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>(
+          '[aria-label="Reset App: Search shortcut"]',
+        )!
+        .click(),
+    );
+    expect(localStorage.getItem("monocode.keybindingOverrides")).toBeNull();
+  });
+
   it("reveals a setting on the current page", async () => {
     await render("general");
     await type("sounds");
@@ -677,8 +1132,8 @@ describe("providers scope inheritance", () => {
     // Global precedence: the project toggle cannot turn a globally hidden
     // provider back on, so it is locked and explained.
     expect(cursorToggle.hasAttribute("disabled")).toBe(true);
-    expect(
-      cursorToggle.closest(".settings-row")?.textContent,
-    ).toContain("Hidden globally");
+    expect(cursorToggle.closest(".settings-row")?.textContent).toContain(
+      "Hidden globally",
+    );
   });
 });

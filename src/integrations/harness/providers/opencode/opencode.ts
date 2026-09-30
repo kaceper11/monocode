@@ -410,6 +410,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     path,
     ["serve", `--hostname=127.0.0.1`, `--port=${port}`],
     input.cwd,
+    undefined,
+    "opencode",
   );
 
   try {
@@ -1115,6 +1117,7 @@ function emitSubagentStep(
     }) ||
     (typeof state.title === "string" && state.title) ||
     tool;
+  const failed = status === "error";
   live.onEvent({
     type: "agent.step",
     callId,
@@ -1122,12 +1125,13 @@ function emitSubagentStep(
     kind: "tool",
     text: title,
     toolKind: kind,
-    status:
-      status === "error"
-        ? "failed"
-        : status === "completed"
-          ? "completed"
-          : "in_progress",
+    status: failed
+      ? "failed"
+      : status === "completed"
+        ? "completed"
+        : "in_progress",
+    // Only a failure earns detail; a preview's output is never shown here.
+    ...(failed ? { detail: detailFromToolPart(part) } : {}),
     ...(preview ? { preview } : {}),
   });
   if (kind === "agent") trackSubagentRow(live, callId, part);
@@ -1318,7 +1322,7 @@ function unsupportedFileMediaType(error: unknown): string | undefined {
 }
 
 async function assertOpenCodeVersion(path: string, cwd: string): Promise<void> {
-  const output = await execChild(path, ["--version"], cwd).catch(() => "");
+  const output = await execChild(path, ["--version"], cwd, "opencode").catch(() => "");
   const version = parseOpenCodeVersion(output);
   if (!version) {
     throw new Error(

@@ -1719,6 +1719,7 @@ def run(argv, cwd, input_bytes=None, timeout=25):
                     regex: false,
                     include,
                     exclude: None,
+                    search_id: String::new(),
                 },
             ))
             .unwrap()

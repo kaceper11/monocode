@@ -146,7 +146,7 @@ describe("grok live turn sequence", () => {
     expect(parse().some((m) => m.method === "authenticate")).toBe(true);
     await stopGrokSession("t1");
     expect(spawn).toHaveBeenCalledWith("t1", "/fake/grok",
-      expect.arrayContaining(["--model", "grok-4.6"]), cwd);
+      expect.arrayContaining(["--model", "grok-4.6"]), cwd, undefined, "grok");
   });
 
   it.each(["allow-once", "opaque-allow"])("surfaces a supervised permission request instead of auto-approving (%s)", async (allowId) => {

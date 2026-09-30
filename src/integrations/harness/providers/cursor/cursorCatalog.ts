@@ -28,7 +28,7 @@ export function refreshCursorCatalog(cwd?: string): Promise<void> {
   return refreshModelCatalog("cursor", cwd, discoverCursorModels);
 }
 
-async function discoverCursorModels(projectCwd?: string): Promise<AgentModel[]> {
+export async function discoverCursorModels(projectCwd?: string): Promise<AgentModel[]> {
   const fromAcp = await discoverViaAcp(projectCwd).catch((error: unknown) => {
     console.debug("[monocode] cursor ACP catalog failed", error);
     return [];
@@ -42,9 +42,9 @@ async function discoverCursorModels(projectCwd?: string): Promise<AgentModel[]> 
 
 async function discoverViaAcp(projectCwd?: string): Promise<AgentModel[]> {
   const { path } = await resolveCursorBinary(projectCwd);
-  const cwd = projectCwd ?? await homeDir();
-  const PROBE_ID = `monocode-cursor-probe-${crypto.randomUUID()}`;
-  const acp = new AcpClient(PROBE_ID, {
+  const cwd = projectCwd ?? (await homeDir());
+  const probeId = `monocode-cursor-probe-${crypto.randomUUID()}`;
+  const acp = new AcpClient(probeId, {
     onRequest: (id) => {
       void acp.respond(id, {}).catch(() => undefined);
     },
@@ -52,18 +52,18 @@ async function discoverViaAcp(projectCwd?: string): Promise<AgentModel[]> {
 
   const stop = async () => {
     acp.close();
-    unwatchChild(PROBE_ID);
-    await killChild(PROBE_ID).catch(() => undefined);
+    unwatchChild(probeId);
+    await killChild(probeId).catch(() => undefined);
   };
 
   watchChild(
-    PROBE_ID,
+    probeId,
     (line) => acp.pushLine(line),
     () => acp.close(new Error("Cursor probe exited")),
   );
 
   try {
-    await spawnChild(PROBE_ID, path, ["acp"], cwd);
+    await spawnChild(probeId, path, ["acp"], cwd, undefined, "cursor");
     return await withTimeout(DISCOVERY_TIMEOUT_MS, async () => {
       await acp.request(
         "initialize",
@@ -101,8 +101,8 @@ async function discoverViaAcp(projectCwd?: string): Promise<AgentModel[]> {
 
 async function discoverViaCli(projectCwd?: string): Promise<AgentModel[]> {
   const { path } = await resolveCursorBinary(projectCwd);
-  const cwd = projectCwd ?? await homeDir();
-  const stdout = await execChild(path, ["--list-models"], cwd);
+  const cwd = projectCwd ?? (await homeDir());
+  const stdout = await execChild(path, ["--list-models"], cwd, "cursor");
   return modelsFromListModelsOutput(stdout);
 }
 

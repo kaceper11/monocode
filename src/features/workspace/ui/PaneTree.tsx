@@ -16,7 +16,10 @@ import {
   useExternalPaneDrop,
   type TitleTabDropPosition,
 } from "../model/paneDrop";
-import type { ApprovalDecision, UserQuestionReply } from "../../../integrations/harness";
+import type {
+  ApprovalDecision,
+  UserQuestionReply,
+} from "../../../integrations/harness";
 import type { EditorNavigationTarget } from "../../search/model/search";
 import {
   layoutLeaves,
@@ -28,7 +31,10 @@ import {
   type LayoutSash,
   type PaneEdge,
 } from "../model/layout";
-import { sameProjectPath, type RecentProject } from "../../projects/model/recents";
+import {
+  sameProjectPath,
+  type RecentProject,
+} from "../../projects/model/recents";
 import type { TerminalMetaPatch } from "../../terminal/model/terminalTab";
 import {
   sessionWorkCwd,
@@ -114,6 +120,9 @@ type Shared = {
   onQueuedMessageEditingChange: (sessionId: string, messageId?: string) => void;
   onSteerQueuedMessage: (sessionId: string, messageId: string) => void;
   onResumeQueue: (sessionId: string) => void;
+  onUsageLimitResume: (sessionId: string) => void;
+  onUsageLimitResumeAtReset: (sessionId: string, enabled: boolean) => void;
+  onUsageLimitDismiss: (sessionId: string) => void;
   onInboxCardDismiss?: (sessionId: string) => void;
   onLinkedWorkItemUpdateCardDismiss?: (sessionId: string) => void;
   onNoteCardDismiss?: (sessionId: string) => void;
@@ -151,6 +160,25 @@ type Shared = {
     turn: Block[],
   ) => void;
   onHandoff?: (sessionId: string, target: ModelTarget, turn: Block[]) => void;
+  onBtwSubmit?: (
+    sessionId: string,
+    turn: Block[],
+    threadId: string,
+    messageId: string,
+    text: string,
+    model?: string,
+    modelSettings?: Record<string, string>,
+  ) => boolean | void;
+  onBtwRetry?: (sessionId: string, turn: Block[], threadId: string) => void;
+  onBtwDelete?: (sessionId: string, turn: Block[], threadId: string) => void;
+  onBtwStop?: (sessionId: string, turn: Block[], threadId: string) => void;
+  onBtwModelChange?: (
+    sessionId: string,
+    turn: Block[],
+    threadId: string,
+    model: string,
+    modelSettings: Record<string, string>,
+  ) => void;
   onMovePane: (fromId: string, toId: string, edge: PaneEdge) => void;
   onDetachPane: (
     paneId: string,
@@ -216,6 +244,9 @@ function PaneTreeComponent({
   onQueuedMessageEditingChange,
   onSteerQueuedMessage,
   onResumeQueue,
+  onUsageLimitResume,
+  onUsageLimitResumeAtReset,
+  onUsageLimitDismiss,
   onInboxCardDismiss,
   onLinkedWorkItemUpdateCardDismiss,
   onNoteCardDismiss,
@@ -233,6 +264,11 @@ function PaneTreeComponent({
   onUpdatePlan,
   onBuildPlan,
   onSecondOpinion,
+  onBtwSubmit,
+  onBtwRetry,
+  onBtwDelete,
+  onBtwStop,
+  onBtwModelChange,
   onHandoff,
   onMovePane,
   onDetachPane,
@@ -525,6 +561,9 @@ function PaneTreeComponent({
                 onQueuedMessageEditingChange={onQueuedMessageEditingChange}
                 onSteerQueuedMessage={onSteerQueuedMessage}
                 onResumeQueue={onResumeQueue}
+                onUsageLimitResume={onUsageLimitResume}
+                onUsageLimitResumeAtReset={onUsageLimitResumeAtReset}
+                onUsageLimitDismiss={onUsageLimitDismiss}
                 onInboxCardDismiss={onInboxCardDismiss}
                 onLinkedWorkItemUpdateCardDismiss={
                   onLinkedWorkItemUpdateCardDismiss
@@ -543,6 +582,11 @@ function PaneTreeComponent({
                 onBuildPlan={onBuildPlan}
                 onSecondOpinion={onSecondOpinion}
                 onHandoff={onHandoff}
+                onBtwSubmit={onBtwSubmit}
+                onBtwRetry={onBtwRetry}
+                onBtwDelete={onBtwDelete}
+                onBtwStop={onBtwStop}
+                onBtwModelChange={onBtwModelChange}
                 onNewTerminal={onNewTerminal}
                 onPaneDragStart={onPaneDragStart}
                 transcriptPool={transcriptPool}

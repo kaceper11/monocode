@@ -181,7 +181,7 @@ describe("model picker", () => {
     act(() => container.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!.click());
     hover([...container.querySelectorAll('button')].find(button => button.textContent?.startsWith("Model"))!);
     expect(container.querySelector('[role="dialog"][aria-label="Models"]')?.textContent)
-      .toContain(cwd ? "Provider unavailable" : "Loading Codex models…");
+      .toContain(cwd ? "Provider unavailable" : "Default");
   });
 
   it("shows the model name and effort in the combined picker", () => {

@@ -1,3 +1,4 @@
+import { refreshHarnessCatalogs } from "../../../integrations/harness/core/registry";
 import { wslLocation } from "../../../shared/lib/paths";
 import { useWslStatus } from "../model/wslStatus";
 import {
@@ -22,7 +23,6 @@ import {
 } from "react";
 import {
   coerceModelPickerTab,
-  findModel,
   getModelSnapshot,
   getPickerVisibilitySnapshot,
   isEffortSettingId,
@@ -33,8 +33,6 @@ import {
   hasLiveCatalog,
   isModelCatalogRefreshing,
   modelCatalogKey,
-  modelsFor,
-  resolveModel,
   saveFavoriteModels,
   showProviderInModelPicker,
   subscribeModels,
@@ -51,19 +49,17 @@ import {
 import {
   harnessAuthHint,
   harnessUnavailableHint,
-  hasProbedHarnessAvailability,
-  isHarnessAvailable,
-  probeHarnessAvailability,
   subscribeHarnessAvailability,
   getHarnessAvailabilitySnapshot,
 } from "../../../integrations/harness/core/availability";
-import { refreshHarnessCatalogs } from "../../../integrations/harness/core/registry";
+import { useModelSource, type ModelSource } from "./modelSource";
 import { HARNESSES, HARNESS_TITLE, type HarnessId } from "../model/session";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
 import { LAYER } from "../../../shared/lib/layers";
 import { HarnessIcon } from "./HarnessIcon";
 import { Popover } from "../../../shared/ui/Popover";
 import { MOD } from "../../../platform/tauri/platform";
+import { keybindingPressed } from "../../settings/model/settings";
 
 type Props = {
   harness: HarnessId;
@@ -73,6 +69,8 @@ type Props = {
   project?: string;
   /** Hide option rows from the menu when they render as pills beside the picker. */
   hideSettings?: boolean;
+  /** Limit provider tabs for surfaces that only support one harness. */
+  allowedHarnesses?: readonly HarnessId[];
   hotkeys?: boolean;
   cwd?: string;
   onChange: (harness: HarnessId, model: string) => void;
@@ -192,9 +190,12 @@ function settingValueLabel(
   );
 }
 
-function recentMenuModels(current: AgentModel, cwd?: string): AgentModel[] {
+function recentMenuModels(
+  current: AgentModel,
+  source: ModelSource,
+): AgentModel[] {
   const models = loadRecentModelChoices().flatMap((choice) => {
-    const item = findModel(choice.model, cwd);
+    const item = source.find(choice.model);
     return item?.harness === choice.harness ? [item] : [];
   });
   if (!models.some((item) => item.id === current.id)) models.push(current);
@@ -230,12 +231,14 @@ export function ModelPicker({
   values,
   project,
   hideSettings = false,
+  allowedHarnesses,
   hotkeys = false,
   cwd,
   onChange,
   onSettingsChange,
   onClose,
 }: Props) {
+  const source = useModelSource(cwd);
   const catalogVersion = useSyncExternalStore(
     subscribeModels,
     getModelSnapshot,
@@ -280,7 +283,7 @@ export function ModelPicker({
   openRef.current = open;
   recentOpenRef.current = recentMenu != null;
 
-  const current = resolveModel(harness, model, cwd);
+  const current = source.resolve(harness, model);
   currentRef.current = current;
   const settings = useMemo(() => {
     void catalogVersion;
@@ -313,21 +316,24 @@ export function ModelPicker({
   ]
     .filter(Boolean)
     .join(" · ");
-
   const pickerHarnesses = useMemo(() => {
     void availabilityVersion;
     void visibilityVersion;
     void projectVersion;
     return HARNESSES.filter(
       (id) =>
+        (!allowedHarnesses || allowedHarnesses.includes(id)) &&
         !isProviderHidden(project, id) &&
-        showProviderInModelPicker(
-          id,
-          isHarnessAvailable(id, cwd),
-          hasProbedHarnessAvailability(cwd),
-        ),
+        showProviderInModelPicker(id, source.available(id), source.probed()),
     );
-  }, [availabilityVersion, visibilityVersion, projectVersion, project, cwd]);
+  }, [
+    source,
+    allowedHarnesses,
+    availabilityVersion,
+    visibilityVersion,
+    projectVersion,
+    project,
+  ]);
   const providerKey = pickerHarnesses.join(",");
   const visibleTab = coerceModelPickerTab(tab, (id) =>
     pickerHarnesses.includes(id),
@@ -339,19 +345,19 @@ export function ModelPicker({
     const pool =
       visibleTab === "favorites"
         ? favorites
-            .map((id) => findModel(id, cwd))
+            .map((id) => source.find(id))
             .filter(
               (item): item is AgentModel =>
                 item != null && pickerHarnesses.includes(item.harness),
             )
-        : modelsFor(visibleTab, cwd);
+        : source.modelsFor(visibleTab);
     if (!needle) return pool;
     return pool.filter((item) =>
       `${item.name} ${HARNESS_TITLE[item.harness]} ${item.provider?.name ?? ""} ${item.provider?.id ?? ""}`
         .toLowerCase()
         .includes(needle),
     );
-  }, [catalogVersion, favorites, providerKey, query, visibleTab, cwd]);
+  }, [source, catalogVersion, favorites, providerKey, query, visibleTab]);
 
   const dismiss = (restore: boolean) => {
     setOpen(false);
@@ -371,7 +377,7 @@ export function ModelPicker({
   const openRecentMenu = () => {
     const selected = currentRef.current;
     if (!selected) return;
-    const models = recentMenuModels(selected, cwd);
+    const models = recentMenuModels(selected, source);
     const selectedIndex = models.findIndex((item) => item.id === selected.id);
     setOpen(false);
     setSubmenu(null);
@@ -412,9 +418,8 @@ export function ModelPicker({
 
   useEffect(() => {
     if (!open) return;
-    void probeHarnessAvailability({ cwd });
-    void refreshHarnessCatalogs([current.harness], cwd);
-  }, [open, current.harness, cwd, wslStatus]);
+    source.refresh([current.harness]);
+  }, [open, current.harness, cwd, wslStatus, source]);
 
   useEffect(() => { setRecentMenu(null); }, [cwd]);
 
@@ -427,8 +432,8 @@ export function ModelPicker({
     if (!open || submenu?.kind !== "models" || visibleTab === "favorites") {
       return;
     }
-    void refreshHarnessCatalogs([visibleTab], cwd);
-  }, [open, submenu?.kind, visibleTab, cwd, wslStatus]);
+    source.refresh([visibleTab]);
+  }, [open, submenu?.kind, visibleTab, source, wslStatus]);
 
   useEffect(() => {
     if (!open) return;
@@ -464,12 +469,14 @@ export function ModelPicker({
     const onKey = (event: KeyboardEvent) => {
       if (event.isComposing) return;
       const mod = event.metaKey || event.ctrlKey;
-      if (
-        hotkeys &&
+      const defaultSwitch =
         mod &&
         !event.altKey &&
         !event.shiftKey &&
-        (event.key === "." || event.code === "Period")
+        (event.key === "." || event.code === "Period");
+      if (
+        hotkeys &&
+        keybindingPressed("App: Switch Model", event, defaultSwitch)
       ) {
         if (!openRef.current && inBlockingUi(event.target)) return;
         event.preventDefault();
@@ -495,14 +502,14 @@ export function ModelPicker({
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("open_model_picker", onMenu);
     };
-  }, [hotkeys, cwd]);
+  }, [hotkeys, source]);
 
   const setSetting = (setting: ModelSetting, value: string) => {
     onSettingsChange({ ...values, [setting.id]: value });
   };
 
   const pickModel = (item: AgentModel) => {
-    if (!isHarnessAvailable(item.harness, cwd)) return;
+    if (!source.available(item.harness)) return;
     onChange(item.harness, item.id);
     dismiss(true);
   };
@@ -914,7 +921,7 @@ export function ModelPicker({
           {recentMenu.models.map((item, index) => {
             const selected = item.id === current.id;
             const highlighted = index === recentActive;
-            const disabled = !isHarnessAvailable(item.harness, cwd);
+            const disabled = !source.available(item.harness);
             return (
               <button
                 key={item.id}
@@ -984,7 +991,7 @@ export function ModelControlPills({
     getModelSnapshot,
   );
   void catalogVersion;
-  const current = resolveModel(harness, model, cwd);
+  const current = useModelSource(cwd).resolve(harness, model);
   const pills = pillSettings(current);
   const effort = pills.find(
     (setting) => setting.kind === "select" && isEffortSetting(setting),
@@ -1260,6 +1267,7 @@ function ModelFlyout({
   onPick: (model: AgentModel) => void;
   onToggleFavorite: (id: string) => void;
 }) {
+  const source = useModelSource(cwd);
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const activeRef = useRef<HTMLButtonElement>(null);
   const groups = modelGroups(tab, models);
@@ -1410,7 +1418,7 @@ function ModelFlyout({
               type="button"
               disabled={!ready || refreshing}
               className="shrink-0 whitespace-nowrap rounded px-2 py-1 hover:bg-content/10 focus-visible:ring-1 focus-visible:ring-content/30 disabled:opacity-40"
-              onClick={() => { void refreshHarnessCatalogs([tab], cwd, true); }}
+              onClick={() => { if (source.id) source.refresh([tab]); else void refreshHarnessCatalogs([tab], cwd, true); }}
             >
               {refreshing ? "Refreshing…" : "Retry models"}
             </button>
@@ -1427,7 +1435,7 @@ function ModelFlyout({
             <div className="px-2 py-3 text-[12px] text-content/50">
               {tab === "favorites" && !query.trim()
                 ? "No favorite models"
-                : tab !== "favorites" && !isHarnessAvailable(tab, cwd)
+                : tab !== "favorites" && !source.available(tab)
                   ? harnessUnavailableHint(tab, cwd)
                   : integrationHint
                     ? integrationHint
@@ -1451,7 +1459,7 @@ function ModelFlyout({
                   const selected = item.id === currentId;
                   const highlighted = index === active;
                   const favorited = favorites.includes(item.id);
-                  const disabled = !isHarnessAvailable(item.harness, cwd);
+                  const disabled = !source.available(item.harness);
                   // Favorites mix harnesses, so every row names its source.
                   // Provider first (OpenCode Go vs OpenCode), else harness.
                   const provenance =

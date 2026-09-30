@@ -84,6 +84,7 @@ it("reads quota and consumes resets on the selected WSL host with isolated child
       ["app-server"],
       cwd,
       { provider: "codex", id: "default" },
+      "codex",
     ]);
   expect(
     mocks.requests.find((r) => r.method.endsWith("/consume"))?.params,
@@ -114,6 +115,7 @@ it("reads Copilot account quota over its SDK transport without creating a sessio
     ["--headless", "--no-auto-update", "--stdio"],
     cwd,
     undefined,
+    "copilot",
   );
   expect(mocks.requests.map((r) => r.method)).toEqual([
     "connect",

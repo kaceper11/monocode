@@ -716,15 +716,10 @@ async function startLive(
   );
 
   try {
-    await spawnChild(
-      input.sessionId,
-      path,
-      museSpawnArgs({
+    await spawnChild(input.sessionId, path, museSpawnArgs({
         planning,
         fullAccess: input.runtimeMode === "full-access",
-      }),
-      input.cwd,
-    );
+      }), input.cwd, undefined, "muse");
     assertStarting();
 
     try {

@@ -55,7 +55,7 @@ async function discoverCopilotModels(projectCwd?: string) {
   );
 
   try {
-    await spawnChild(PROBE_ID, path, copilotSpawnArgs(), cwd);
+    await spawnChild(PROBE_ID, path, copilotSpawnArgs(), cwd, undefined, "copilot");
     return await withTimeout(
       DISCOVERY_TIMEOUT_MS,
       async () => {

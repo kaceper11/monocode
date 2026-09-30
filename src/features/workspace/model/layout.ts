@@ -450,9 +450,7 @@ export function isVirtualDocumentTab(file: FilePaneTab): boolean {
 
 export function isFilesystemTab(file: FilePaneTab): boolean {
   return (
-    !isTerminalTab(file) &&
-    !isVirtualDocumentTab(file) &&
-    !file.sessionChanges
+    !isTerminalTab(file) && !isVirtualDocumentTab(file) && !file.sessionChanges
   );
 }
 
@@ -612,9 +610,22 @@ export function openEditorTab(
               ...pane,
               files: options.pin
                 ? pane.files.map((entry) =>
-                    entry === existingFile ? withoutPreview(entry) : entry,
+                    entry === existingFile
+                      ? {
+                          ...withoutPreview(entry),
+                          ...(file.review
+                            ? { changeKind: file.changeKind }
+                            : {}),
+                        }
+                      : entry,
                   )
-                : pane.files,
+                : file.review
+                  ? pane.files.map((entry) =>
+                      entry === existingFile
+                        ? { ...entry, changeKind: file.changeKind }
+                        : entry,
+                    )
+                  : pane.files,
               activeFileId: existingFile.id,
             }
           : pane,
@@ -680,10 +691,9 @@ export function openChangesTab(
 ): WorkspaceTab {
   tab = isolateTerminalPanes(tab);
   const next = newChangesTab(cwd, focusPath, focusKind, projectCwd);
-  const matches = (file: FilePaneTab) => editorTabKey(file) === editorTabKey(next);
-  const existingPane = tab.editorPanes.find((pane) =>
-    pane.files.some(matches),
-  );
+  const matches = (file: FilePaneTab) =>
+    editorTabKey(file) === editorTabKey(next);
+  const existingPane = tab.editorPanes.find((pane) => pane.files.some(matches));
   const existingFile = existingPane?.files.find(matches);
 
   if (existingPane && existingFile) {
@@ -720,8 +730,7 @@ export function openChangesTab(
         ? {
             ...pane,
             files: dropPerFileReviewTabs(pane.files, cwd),
-            activeFileId:
-              pane.files.find(matches)?.id ?? pane.activeFileId,
+            activeFileId: pane.files.find(matches)?.id ?? pane.activeFileId,
           }
         : pane,
     ),
@@ -780,11 +789,16 @@ export function openCommitTab(
   return openEditorTab(tab, newCommitTab(cwd, commit, projectCwd), { pin });
 }
 
-function dropPerFileReviewTabs(files: FilePaneTab[], cwd: string): FilePaneTab[] {
+function dropPerFileReviewTabs(
+  files: FilePaneTab[],
+  cwd: string,
+): FilePaneTab[] {
   return files.filter(
     (file) =>
       file.cwd !== cwd ||
-      !isReviewTab(file) || isChangesTab(file) || isSessionChangesTab(file),
+      !isReviewTab(file) ||
+      isChangesTab(file) ||
+      isSessionChangesTab(file),
   );
 }
 

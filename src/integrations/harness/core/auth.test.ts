@@ -77,6 +77,8 @@ describe("harness login", () => {
       "/bin/claude",
       ["auth", "login"],
       "/home/alice",
+      undefined,
+      "claude",
     );
 
     const onExit = child.watchChild.mock.calls[0]?.[2] as
@@ -94,6 +96,7 @@ describe("harness login", () => {
       ["login"],
       "/home/alice",
       { provider: "codex", id: "account-work" },
+      "codex",
     );
 
     const onExit = child.watchChild.mock.calls[0]?.[2] as
@@ -131,7 +134,7 @@ it("isolates native and WSL login and rejects native profiles before starting a 
   const guest = loginHarness("codex", "default", cwd);
   await vi.waitFor(() => expect(child.spawnChild).toHaveBeenCalledTimes(2));
   expect(child.resolveCodexBinary).toHaveBeenCalledWith(cwd);
-  expect(child.spawnChild).toHaveBeenCalledWith("monocode-provider-login-test-window-codex-wsl-ubuntu", "/bin/codex", ["login"], cwd);
+  expect(child.spawnChild).toHaveBeenCalledWith("monocode-provider-login-test-window-codex-wsl-ubuntu", "/bin/codex", ["login"], cwd, undefined, "codex");
   for (const call of child.watchChild.mock.calls) (call[2] as (code: number) => void)(0);
   await Promise.all([native, guest]);
   await expect(loginHarness("codex", "work", cwd)).rejects.toThrow("Native account profiles");

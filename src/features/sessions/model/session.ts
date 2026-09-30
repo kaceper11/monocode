@@ -49,6 +49,7 @@ export const HARNESSES: HarnessId[] = [
 export type BlockRole =
   | "user"
   | "assistant"
+  | "image"
   | "reasoning"
   | "tool"
   | "approval"
@@ -70,6 +71,8 @@ export type TaskListItem = {
 export type TaskListMeta = {
   /** Provider identity for replacing later snapshots of the same list. */
   key?: string;
+  /** Provider conversation that produced this list, when the provider scopes task ids to one. */
+  providerSessionId?: string;
   explanation?: string;
   items: TaskListItem[];
 };
@@ -118,6 +121,39 @@ export type HandoffMeta = {
   status: HandoffStatus;
   /** Inject this brief into prompts to `to` until that harness accepts a turn. */
   pending?: boolean;
+};
+
+/** One persisted question/answer in a completed turn's side conversation. */
+export type BtwMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  createdAt: number;
+  /** Rich harness activity for assistant replies, when available. */
+  blocks?: Block[];
+};
+
+export type BtwThreadStatus = "running" | "ready" | "error";
+
+/** Independent, read-only "by the way" conversation anchored to a turn. */
+export type BtwThread = {
+  id: string;
+  sourceEndBlockId: string;
+  createdAt: number;
+  updatedAt: number;
+  status: BtwThreadStatus;
+  messages: BtwMessage[];
+  /** Provider that answered this side thread. */
+  harness?: HarnessId;
+  /** Selected harness model for this side thread; absent means session default. */
+  model?: string;
+  /** Provider settings selected for this side thread's model. */
+  modelSettings?: Record<string, string>;
+  /** Provider-specific side-thread id when the text runner supports resume. */
+  providerThreadId?: string;
+  error?: string;
+  /** Live harness blocks for the in-flight reply; not persisted. */
+  pendingBlocks?: Block[];
 };
 
 /** Compact transcript card for a second-opinion or split-pane handoff turn. */
@@ -175,6 +211,7 @@ export type AgentStep = {
   text: string;
   toolKind?: string;
   status?: string;
+  detail?: string;
   preview?: ToolPreview;
 };
 
@@ -194,6 +231,14 @@ export type AgentRunMeta = {
 };
 
 export type AttachmentKind = "image" | "audio" | "file";
+
+export type GeneratedImageMeta = {
+  path: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  alt?: string;
+};
 
 export type Attachment = {
   /** Live transcript only; deliberately excluded from persisted attachments. */
@@ -222,6 +267,14 @@ export type QueuedMessage = {
 
 export type MessageQueueStatus = "active" | "paused" | "resuming";
 
+/** The provider stopped the last turn at a usage limit. */
+export type UsageLimit = {
+  /** Epoch ms when the provider's window resets, once known. */
+  resetsAt?: number;
+  /** Send a continue turn once the window resets. */
+  resumeAtReset?: boolean;
+};
+
 /** Provider/model provenance captured when a user turn is submitted. */
 export type TurnModel = {
   harness: HarnessId;
@@ -243,6 +296,7 @@ export type Block = {
   id: string;
   role: BlockRole;
   text: string;
+  image?: GeneratedImageMeta;
   attachments?: Attachment[];
   streaming?: boolean;
   /** Epoch ms when this user turn started. */
@@ -255,6 +309,12 @@ export type Block = {
   providerTurnId?: string;
   /** User turn saved to the session but not submitted to the harness yet. */
   draft?: boolean;
+  /** This user turn activated MonoCode app access for its thread. */
+  monocode?: boolean;
+  /** The Plan or Orchestrator mode this user turn was sent in. */
+  intent?: Extract<TurnIntent, "plan" | "orchestrate">;
+  /** Stable CLI request that submitted this turn, for safe retries. */
+  appRequestId?: string;
   /** Provider-reported token metrics for this user turn, when available. */
   turnMetrics?: TurnMetrics;
   tool?: {
@@ -286,7 +346,8 @@ export type Block = {
   internal?: boolean;
   handoff?: HandoffMeta;
   secondOpinion?: SecondOpinionMeta;
-  /** Note chip shown on this user turn. Body is not stored; the harness already received it. */
+  /** Independent read-only side conversations anchored to this user turn. */
+  btwThreads?: BtwThread[];
   noteCard?: NoteCardMeta;
   /** Exact CI repair instructions and evidence supplied with this user turn. */
   ciContext?: string;
@@ -377,6 +438,8 @@ export type Session = {
   queueStatus?: MessageQueueStatus;
   /** Prevent auto-dispatch while this queued row is being edited. In-memory only. */
   editingQueuedMessageId?: string;
+  /** Last turn hit a provider usage limit; cleared by the next send. In-memory only. */
+  usageLimit?: UsageLimit;
   /** Provider-side conversation id (Cursor ACP session id). */
   providerSessionId?: string;
   /** Named local credential profile used by Claude or Codex. */
@@ -574,7 +637,10 @@ export function retargetSessionToProject(
 }
 
 /** New conversation carrying another session's harness, model and settings. */
-export function newSessionLike(seed: Session | undefined, cwd: string): Session {
+export function newSessionLike(
+  seed: Session | undefined,
+  cwd: string,
+): Session {
   return newSession(
     seed?.harness ?? "claude",
     cwd,

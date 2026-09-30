@@ -5,6 +5,14 @@ let onLine: ((line: string) => void) | undefined;
 const writeChild = vi.fn(async (_id: string, line: string) => {
   sent.push(line);
 });
+const saveGeneratedImage = vi.hoisted(() =>
+  vi.fn(async () => ({
+    path: "/app-data/generated-images/image.png",
+    mimeType: "image/png",
+    size: 8,
+  })),
+);
+const deleteGeneratedImages = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("../../core/child", () => ({
   resolveCodexBinary: async () => ({ path: "/fake/codex" }),
@@ -15,6 +23,11 @@ vi.mock("../../core/child", () => ({
     onLine = line;
   },
   writeChild,
+}));
+
+vi.mock("../../../../platform/tauri/fs", () => ({
+  saveGeneratedImage,
+  deleteGeneratedImages,
 }));
 
 const {
@@ -72,6 +85,7 @@ async function startTurn(
     expectResume?: boolean;
     beforeThreadReply?: () => Promise<void>;
     onAccepted?: () => void;
+    controlsAgents?: boolean;
   } = {},
 ) {
   const events: HarnessEvent[] = [];
@@ -90,6 +104,7 @@ async function startTurn(
     modelSettings: {},
     providerAccountId: options.providerAccountId,
     runtimeMode: options.runtimeMode ?? "supervised",
+    controlsAgents: options.controlsAgents,
     intent: options.intent,
     text: "summarize the changelog",
     attachments: [],
@@ -130,6 +145,8 @@ describe("codex live turn sequence", () => {
     sent.length = 0;
     onLine = undefined;
     writeChild.mockClear();
+    saveGeneratedImage.mockClear();
+    deleteGeneratedImages.mockClear();
   });
 
   afterEach(async () => {
@@ -216,6 +233,191 @@ describe("codex live turn sequence", () => {
     expect(onAccepted).toHaveBeenCalledOnce();
     notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
     await turn;
+  });
+
+  it("reopens a thread when app access changes its network policy", async () => {
+    const first = await startTurn("codex-live", { runtimeMode: "auto" });
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await first.turn;
+
+    sent.length = 0;
+    const appTurn = await startTurn("codex-live", {
+      runtimeMode: "auto",
+      controlsAgents: true,
+      expectResume: true,
+    });
+    expect(parse().find((message) => message.method === "thread/resume")?.params)
+      .toMatchObject({ sandboxPolicy: { networkAccess: true } });
+    expect(parse().find((message) => message.method === "turn/start")?.params)
+      .toMatchObject({ sandboxPolicy: { networkAccess: true } });
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await appTurn.turn;
+
+    sent.length = 0;
+    const ordinaryTurn = await startTurn("codex-live", {
+      runtimeMode: "auto",
+      expectResume: true,
+    });
+    expect(parse().find((message) => message.method === "thread/resume")?.params)
+      .toMatchObject({ sandboxPolicy: { type: "workspaceWrite" } });
+    expect(
+      (parse().find((message) => message.method === "thread/resume")?.params as {
+        sandboxPolicy: Record<string, unknown>;
+      }).sandboxPolicy,
+    ).not.toHaveProperty("networkAccess");
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await ordinaryTurn.turn;
+  });
+
+  it("materializes image generations before completing the turn", async () => {
+    const { events, turn } = await startTurn("codex-live");
+
+    notify("item/completed", {
+      item: {
+        id: "image_1",
+        type: "imageGeneration",
+        result: "aW1hZ2U=",
+        revisedPrompt: "A clean product photo",
+      },
+    });
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
+
+    expect(saveGeneratedImage).toHaveBeenCalledWith({
+      data: "aW1hZ2U=",
+      name: "generated-image",
+    });
+    expect(events).toContainEqual({
+      type: "image.generated",
+      itemId: "image_1",
+      path: "/app-data/generated-images/image.png",
+      name: "generated-image",
+      mimeType: "image/png",
+      size: 8,
+      alt: "A clean product photo",
+    });
+    expect(
+      events.reduce(applyHarnessEvent, newSession("codex", "/repo")).blocks,
+    ).toMatchObject([
+      {
+        role: "image",
+        image: {
+          path: "/app-data/generated-images/image.png",
+          mimeType: "image/png",
+        },
+      },
+    ]);
+  });
+
+  it("keeps later notifications ordered after delayed image materialization", async () => {
+    let release: (() => void) | undefined;
+    saveGeneratedImage.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () =>
+            resolve({
+              path: "/app-data/generated-images/image.png",
+              mimeType: "image/png",
+              size: 8,
+            });
+        }),
+    );
+    const { events, turn } = await startTurn("codex-live");
+    notify("item/completed", {
+      item: { id: "image_1", type: "imageGeneration", result: "aW1hZ2U=" },
+    });
+    notify("item/agentMessage/delta", { itemId: "after_image", delta: "after image" });
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await Promise.resolve();
+
+    expect(
+      events.some(
+        (event) => event.type === "message.delta" && event.text === "after image",
+      ),
+    ).toBe(false);
+    release?.();
+    await turn;
+    await Promise.resolve();
+    notify("item/agentMessage/delta", { itemId: "post_turn", delta: "post turn" });
+
+    expect(
+      events.some(
+        (event) => event.type === "message.delta" && event.text === "post turn",
+      ),
+    ).toBe(true);
+  });
+
+  it("cleans up an image that finishes saving after cancellation", async () => {
+    let release: (() => void) | undefined;
+    saveGeneratedImage.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () =>
+            resolve({
+              path: "/app-data/generated-images/image.png",
+              mimeType: "image/png",
+              size: 8,
+            });
+        }),
+    );
+    const { turn } = await startTurn("codex-live");
+    notify("item/completed", {
+      item: { id: "image_1", type: "imageGeneration", result: "aW1hZ2U=" },
+    });
+    const cancelling = cancelCodexTurn("codex-live");
+    await waitFor(
+      () => parse().some((message) => message.method === "turn/interrupt"),
+      "interrupt",
+    );
+    reply(
+      parse().find((message) => message.method === "turn/interrupt")!.id as number,
+      {},
+    );
+    await cancelling;
+    release?.();
+    await turn;
+
+    expect(deleteGeneratedImages).toHaveBeenCalledWith([
+      "/app-data/generated-images/image.png",
+    ]);
+  });
+
+  it("does not flush queued notifications after the session stops", async () => {
+    let release: (() => void) | undefined;
+    saveGeneratedImage.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () =>
+            resolve({
+              path: "/app-data/generated-images/image.png",
+              mimeType: "image/png",
+              size: 8,
+            });
+        }),
+    );
+    const { events, turn } = await startTurn("codex-live");
+    notify("item/completed", {
+      item: { id: "image_1", type: "imageGeneration", result: "aW1hZ2U=" },
+    });
+    notify("item/agentMessage/delta", {
+      itemId: "after_image",
+      delta: "after image",
+    });
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await stopCodexSession("codex-live");
+    release?.();
+    await turn;
+    await Promise.resolve();
+
+    expect(
+      events.some(
+        (event) => event.type === "message.delta" && event.text === "after image",
+      ),
+    ).toBe(false);
+    expect(events.some((event) => event.type === "image.generated")).toBe(false);
+    expect(deleteGeneratedImages).toHaveBeenCalledWith([
+      "/app-data/generated-images/image.png",
+    ]);
   });
 
   it.each([
@@ -1768,6 +1970,39 @@ describe("codex subagents", () => {
       ["tool", "npm test"],
       ["message", "No regressions found."],
     ]);
+  });
+
+  it("materializes images generated by child threads", async () => {
+    const { events, turn } = await startTurn("s1");
+    notify("item/started", {
+      threadId: "thr_1",
+      item: {
+        id: "collab_1",
+        type: "collabAgentToolCall",
+        tool: "spawnAgent",
+        status: "inProgress",
+        agentsStates: { thr_child: { status: "running" } },
+      },
+    });
+    notify("item/completed", {
+      threadId: "thr_child",
+      item: {
+        id: "child_image",
+        type: "imageGeneration",
+        result: "aW1hZ2U=",
+      },
+    });
+    notify("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    await turn;
+
+    expect(events).toContainEqual({
+      type: "image.generated",
+      itemId: "child_image",
+      path: "/app-data/generated-images/image.png",
+      name: "generated-image",
+      mimeType: "image/png",
+      size: 8,
+    });
   });
 
   it("banks a child's opening moves until its row is known", async () => {

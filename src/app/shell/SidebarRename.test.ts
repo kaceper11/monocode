@@ -9,6 +9,7 @@ import { loadSessionFolders } from "../../features/sessions/model/sessionFolders
 import { addTask } from "../../features/board/boardStore";
 import { detachTaskSession } from "../../features/board/taskSession";
 import { useProjectDiffStats } from "../../features/source-control/hooks/useProjectDiffStats";
+import { copyText } from "../../platform/tauri/clipboard";
 
 // Keep native services out of these menu/input interaction tests.
 vi.mock("../../features/source-control/hooks/useProjectDiffStats", () => ({
@@ -19,6 +20,9 @@ vi.mock("../../features/source-control/hooks/useGitFileStatuses", () => ({
 }));
 vi.mock("./SidebarUpdate", () => ({ SidebarUpdateFooter: () => null }));
 vi.mock("../../features/files/ui/FileTree", () => ({ FileTree: () => null }));
+vi.mock("../../platform/tauri/clipboard", () => ({
+  copyText: vi.fn().mockResolvedValue(undefined),
+}));
 
 let container: HTMLDivElement;
 let root: Root;
@@ -100,6 +104,7 @@ it("groups task sessions under their purpose and restores ordinary rows after de
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.mocked(copyText).mockReset().mockResolvedValue(undefined);
   vi.mocked(useProjectDiffStats).mockReturnValue(null);
   const stored = new Map<string, string>();
   vi.stubGlobal("localStorage", {
@@ -158,6 +163,32 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+describe("project rail visibility", () => {
+  it("keeps the mounted rail and its scroll state when collapsed", async () => {
+    props = {
+      ...props,
+      recents: [{ path: "/workspace/project", openedAt: Date.now() }],
+      projectRailOpen: true,
+      compactProjectRail: false,
+      onSelectProject: vi.fn(),
+      onOpenProject: vi.fn(),
+    };
+    await act(async () => render());
+    const rail = container.querySelector<HTMLElement>('nav[aria-label="Projects"]');
+    expect(rail).not.toBeNull();
+    rail!.scrollTop = 37;
+
+    props = { ...props, projectRailOpen: false };
+    await act(async () => render());
+    expect(rail?.classList.contains("hidden")).toBe(true);
+
+    props = { ...props, projectRailOpen: true };
+    await act(async () => render());
+    expect(container.querySelector('nav[aria-label="Projects"]')).toBe(rail);
+    expect(rail?.scrollTop).toBe(37);
+  });
 });
 
 describe("sidebar session multiselection", () => {
@@ -446,6 +477,69 @@ describe("sidebar session multiselection", () => {
   });
 });
 
+describe("sidebar session IDs", () => {
+  function openCopyIdMenu(sessionId: string) {
+    act(() => {
+      container
+        .querySelector(`[data-session-card="${sessionId}"]`)!
+        .dispatchEvent(
+          new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+        );
+    });
+    const trigger = Array.from(
+      document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    ).find((item) => item.textContent === "Copy session ID")!;
+    expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
+    act(() => trigger.click());
+    return document.querySelector<HTMLElement>(
+      '[role="menu"][aria-label="Copy session ID"]',
+    )!;
+  }
+
+  it("copies either ID from the right-clicked session", async () => {
+    props.sessions = [
+      { ...props.sessions[0], providerSessionId: "harness-session-1" },
+      {
+        ...props.sessions[0],
+        id: "session-2",
+        providerSessionId: "harness-session-2",
+        updatedAt: props.sessions[0].updatedAt - 1,
+      },
+    ];
+    act(() => render());
+    const harnessMenu = openCopyIdMenu("session-2");
+    const copyHarnessId = Array.from(
+      harnessMenu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    ).find((item) => item.textContent === "Harness session ID")!;
+    expect(copyHarnessId.disabled).toBe(false);
+    await act(async () => copyHarnessId.click());
+    expect(copyText).toHaveBeenNthCalledWith(1, "harness-session-2");
+
+    const monocodeMenu = openCopyIdMenu("session-2");
+    const copyMonoCodeId = Array.from(
+      monocodeMenu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    ).find((item) => item.textContent === "MonoCode session ID")!;
+    expect(copyMonoCodeId.disabled).toBe(false);
+    await act(async () => copyMonoCodeId.click());
+    expect(copyText).toHaveBeenNthCalledWith(2, "session-2");
+  });
+
+  it("keeps the MonoCode ID available before the harness supplies an ID", async () => {
+    act(() => render());
+    const copyMenu = openCopyIdMenu("session-1");
+    const copyHarnessId = Array.from(
+      copyMenu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    ).find((item) => item.textContent === "Harness session ID")!;
+    const copyMonoCodeId = Array.from(
+      copyMenu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    ).find((item) => item.textContent === "MonoCode session ID")!;
+    expect(copyHarnessId.disabled).toBe(true);
+    expect(copyMonoCodeId.disabled).toBe(false);
+    await act(async () => copyMonoCodeId.click());
+    expect(copyText).toHaveBeenCalledExactlyOnceWith("session-1");
+  });
+});
+
 describe("sidebar session rename", () => {
   it.each(["idle", "working", "needs approval"])(
     "renames from the menu and restores navigation (status=%s)",
@@ -696,8 +790,8 @@ describe("sidebar orchestration card", () => {
       props.linkedSessionUpdateIds = new Set(["session-1"]);
       const lead = {
         ...props.sessions[0],
-        harness: "claude" as const,
-        model: "claude:sonnet-5",
+        harness: "codex" as const,
+        model: "codex:gpt-5.6-sol",
         pinned,
         linkedWorkItem: {
           kind: "pr" as const,
@@ -749,7 +843,7 @@ describe("sidebar orchestration card", () => {
       // The lead card carries the sidebar's ordinary active treatment.
       expect(card().className).toContain("bg-selection");
       // The lead names its own model, like every agent row beneath it.
-      expect(card().textContent).toContain("Claude Sonnet 5");
+      expect(card().textContent).toContain("GPT-5.6-Sol");
       expect(card().textContent).not.toContain("Orchestrator");
       const orchestrationIcon = card().querySelector<HTMLButtonElement>(
         "[data-orchestration-icon]",

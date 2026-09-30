@@ -54,7 +54,7 @@ async function discoverMuseModels(projectCwd?: string): Promise<AgentModel[]> {
   );
 
   try {
-    await spawnChild(probeId, path, ["serve"], cwd);
+    await spawnChild(probeId, path, ["serve"], cwd, undefined, "muse");
     return await withTimeout(
       DISCOVERY_TIMEOUT_MS,
       async () => {

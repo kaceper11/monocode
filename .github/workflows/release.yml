@@ -6,15 +6,19 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     if: github.repository == 'kaceper11/monocode'
-    needs: [linux, windows]
+    needs: [linux, linux-rpm, windows, host]
+    permissions:
+      contents: write
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -166,6 +170,18 @@ jobs:
           name: windows-packages
           path: target/release/bundle/nsis
 
+      - name: Download Linux rpm package
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-rpm-package
+          path: target/release/bundle/rpm
+
+      - name: Download host packages
+        uses: actions/download-artifact@v4
+        with:
+          name: host-packages
+          path: build/host-packages
+
       - name: Stage GitHub release
         run: |
           set -euo pipefail
@@ -215,7 +231,18 @@ jobs:
             fi
           done
 
+          RPMS=("$BUNDLE"/rpm/*.rpm)
+          HOST_ARCHIVES=(build/host-packages/*.tar.gz build/host-packages/*.zip)
+          if (( ${#RPMS[@]} != 1 || ${#HOST_ARCHIVES[@]} != 6 )); then
+            echo "Expected one rpm and six host archives" >&2
+            exit 1
+          fi
           mkdir -p release-artifacts
+          cp "${RPMS[0]}" release-artifacts/
+          for archive in "${HOST_ARCHIVES[@]}"; do
+            test -f "$archive.sha256"
+            cp "$archive" "$archive.sha256" release-artifacts/
+          done
           cp "$DMG" release-artifacts/MonoCode.dmg
           cp "$TAR" release-artifacts/MonoCode.app.tar.gz
           cp "$SIG" release-artifacts/MonoCode.app.tar.gz.sig
@@ -278,10 +305,47 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          gh release create "$GITHUB_REF_NAME" \
-            --title "MonoCode $VERSION" \
-            --notes "See CHANGELOG.md for details. macOS uses Apple signing when its optional secrets are configured; the Windows installer is not Authenticode-signed." \
-            release-artifacts/*
+          shopt -s nullglob
+          RELEASE_FILES=(release-artifacts/*)
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --title "MonoCode $VERSION" \
+              --notes "See CHANGELOG.md for details. macOS uses Apple signing when its optional secrets are configured; the Windows installer is not Authenticode-signed."
+          fi
+          verify_release() {
+            local expected_draft="$1"
+            gh release view "$GITHUB_REF_NAME" --json isDraft,assets > "$RUNNER_TEMP/release-state.json"
+            node - "$RUNNER_TEMP/release-state.json" "$expected_draft" "${RELEASE_FILES[@]}" <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const release = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          if (release.isDraft !== (process.argv[3] === "true")) {
+            console.error("GitHub Release publication state is unexpected.");
+            process.exit(1);
+          }
+          const names = new Set(release.assets.map((asset) => asset.name));
+          for (const file of process.argv.slice(4)) {
+            const name = path.basename(file);
+            if (!names.has(name)) {
+              console.error(`GitHub Release is missing ${name}.`);
+              process.exit(1);
+            }
+          }
+          NODE
+          }
+          IS_DRAFT=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)
+          if [[ "$IS_DRAFT" == true ]]; then
+            # Draft assets can be replaced after an interrupted upload. A
+            # published release is immutable, so only resume drafts.
+            gh release upload "$GITHUB_REF_NAME" "${RELEASE_FILES[@]}" --clobber
+            verify_release true
+            gh release edit "$GITHUB_REF_NAME" --draft=false
+          elif [[ "$IS_DRAFT" != false ]]; then
+            echo "Unexpected GitHub Release state: $IS_DRAFT" >&2
+            exit 1
+          fi
+          verify_release false
 
   linux:
     if: github.repository == 'kaceper11/monocode'
@@ -289,6 +353,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -331,6 +397,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -385,5 +453,102 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-packages
+          path: release-artifacts/
+          if-no-files-found: error
+
+  host:
+    if: github.repository == 'kaceper11/monocode'
+    name: Standalone host packages
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run test:host
+      - run: npm run host:package -- --all
+        if: runner.os == 'Linux'
+      - run: npm run host:package
+        if: runner.os != 'Linux'
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: host-packages
+          path: |
+            build/host-packages/*.tar.gz
+            build/host-packages/*.zip
+            build/host-packages/*.sha256
+          if-no-files-found: error
+
+
+  linux-rpm:
+    if: github.repository == 'kaceper11/monocode'
+    name: Linux rpm package
+    runs-on: ubuntu-latest
+    # Build on EL 10 so the published rpm's glibc requirement matches the
+    # oldest advertised target. Fedora 43 is newer and would install on EL 10
+    # while failing to load.
+    container: almalinux:10
+    steps:
+      # almalinux:10 ships no git, which actions/checkout otherwise has to work
+      # around with a REST API tarball download.
+      - name: Install git
+        run: dnf install -y git
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Enterprise Linux system dependencies
+        run: bash scripts/install-linux-deps-fedora.sh
+
+      - run: npm ci
+
+      - name: Build rpm package
+        run: npm run build:fedora
+
+      - name: Install and stage the generated rpm
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundle=(target/release/bundle/rpm/*.rpm)
+          if (( ${#bundle[@]} != 1 )); then
+            echo "Expected exactly one .rpm" >&2
+            exit 1
+          fi
+          # tauri-bundler derives rpm Requires only from
+          # bundle.linux.rpm.depends, and the setup script has already
+          # installed every -devel package, so assert the metadata directly.
+          requires="$(rpm -qp --requires "${bundle[0]}")"
+          for dep in webkit2gtk4.1 gtk3 libappindicator-gtk3 librsvg2 openssl-libs; do
+            if ! grep -qx "$dep" <<<"$requires"; then
+              echo "rpm is missing Requires: $dep" >&2
+              exit 1
+            fi
+          done
+          dnf install -y "${bundle[0]}"
+          rpm -q "$(rpm -qp --queryformat '%{NAME}' "${bundle[0]}")"
+          mkdir -p release-artifacts
+          cp "${bundle[0]}" release-artifacts/
+
+      - name: Upload rpm package
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-rpm-package
           path: release-artifacts/
           if-no-files-found: error

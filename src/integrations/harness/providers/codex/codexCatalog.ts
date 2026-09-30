@@ -33,12 +33,14 @@ export function refreshCodexCatalog(cwd?: string): Promise<void> {
   return refreshModelCatalog("codex", cwd, discoverCodexModels);
 }
 
-async function discoverCodexModels(projectCwd?: string): Promise<AgentModel[]> {
+export async function discoverCodexModels(
+  projectCwd?: string,
+): Promise<AgentModel[]> {
   const { path } = await resolveCodexBinary(projectCwd);
-  const cwd = projectCwd ?? await homeDir();
-  const PROBE_ID = `monocode-codex-probe-${crypto.randomUUID()}`;
+  const cwd = projectCwd ?? (await homeDir());
+  const probeId = `monocode-codex-probe-${crypto.randomUUID()}`;
   const rpc = new JsonRpcClient(
-    PROBE_ID,
+    probeId,
     {
       onRequest: (id) => {
         void rpc.respond(id, {}).catch(() => undefined);
@@ -49,8 +51,8 @@ async function discoverCodexModels(projectCwd?: string): Promise<AgentModel[]> {
 
   const stop = async () => {
     rpc.close();
-    unwatchChild(PROBE_ID);
-    await killChild(PROBE_ID).catch(() => undefined);
+    unwatchChild(probeId);
+    await killChild(probeId).catch(() => undefined);
   };
 
   // The probe's stderr carries the real failure on WSL (e.g. "WSL process:
@@ -58,7 +60,7 @@ async function discoverCodexModels(projectCwd?: string): Promise<AgentModel[]> {
   // the cause instead of a bare "probe exited"/timeout.
   const stderrTail: string[] = [];
   watchChild(
-    PROBE_ID,
+    probeId,
     (line) => rpc.pushLine(line),
     () => rpc.close(new Error("Codex probe exited")),
     (line) => {
@@ -68,37 +70,43 @@ async function discoverCodexModels(projectCwd?: string): Promise<AgentModel[]> {
   );
 
   try {
-    await spawnChild(PROBE_ID, path, ["app-server"], cwd);
-    return await withTimeout(DISCOVERY_TIMEOUT_MS, async () => {
-      await rpc.request(
-        "initialize",
-        {
-          clientInfo: {
-            name: "monocode",
-            title: "MonoCode",
-            version: "0.1.0",
+    await spawnChild(probeId, path, ["app-server"], cwd, undefined, "codex");
+    return await withTimeout(
+      DISCOVERY_TIMEOUT_MS,
+      async () => {
+        await rpc.request(
+          "initialize",
+          {
+            clientInfo: {
+              name: "monocode",
+              title: "MonoCode",
+              version: "0.1.0",
+            },
+            capabilities: { experimentalApi: true },
           },
-          capabilities: { experimentalApi: true },
-        },
-        REQUEST_TIMEOUT_MS,
-      );
-      await rpc.notify("initialized", undefined);
+          REQUEST_TIMEOUT_MS,
+        );
+        await rpc.notify("initialized", undefined);
 
-      const account = await rpc
-        .request<{
-          account?: unknown;
-          requiresOpenaiAuth?: boolean;
-        }>("account/read", {}, REQUEST_TIMEOUT_MS)
-        .catch(() => null);
+        const account = await rpc
+          .request<{
+            account?: unknown;
+            requiresOpenaiAuth?: boolean;
+          }>("account/read", {}, REQUEST_TIMEOUT_MS)
+          .catch(() => null);
 
-      if (account && !account.account && account.requiresOpenaiAuth) {
-        throw new Error(CODEX_SIGN_IN_ERROR);
-      }
+        if (account && !account.account && account.requiresOpenaiAuth) {
+          throw new Error(
+            "Codex CLI is not authenticated. Run `codex login` and try again.",
+          );
+        }
 
-      return await listAllModels(rpc);
-    }, () => {
-      void stop();
-    });
+        return await listAllModels(rpc);
+      },
+      () => {
+        void stop();
+      },
+    );
   } catch (error) {
     throw projectCwd ? probeError(error, stderrTail) : error;
   } finally {
@@ -147,10 +155,12 @@ async function listAllModels(rpc: JsonRpcClient): Promise<AgentModel[]> {
 
 export function parseCodexModelList(data: unknown[]): AgentModel[] {
   return orderDefaultFirst(
-    uniqueByNative(data.flatMap((row) => {
-      const model = parseModel(row);
-      return model ? [model] : [];
-    })),
+    uniqueByNative(
+      data.flatMap((row) => {
+        const model = parseModel(row);
+        return model ? [model] : [];
+      }),
+    ),
     data,
   );
 }
@@ -165,9 +175,7 @@ function parseModel(raw: unknown): AgentModel | null {
     stringField(rec, "id");
   if (!nativeId) return null;
   const name = formatDisplayName(
-    stringField(rec, "displayName") ??
-      stringField(rec, "name") ??
-      nativeId,
+    stringField(rec, "displayName") ?? stringField(rec, "name") ?? nativeId,
   );
   const settings = parseModelSettings(rec);
   return {
@@ -195,8 +203,7 @@ function parseModelSettings(rec: Record<string, unknown>): ModelSetting[] {
       continue;
     }
     const row = asRecord(entry);
-    const value =
-      stringField(row, "reasoningEffort") ?? stringField(row, "id");
+    const value = stringField(row, "reasoningEffort") ?? stringField(row, "id");
     if (!value) continue;
     effortOptions.push({
       value,
@@ -242,8 +249,7 @@ function parseModelSettings(rec: Record<string, unknown>): ModelSetting[] {
     });
   }
   if (tierOptions.length > 1) {
-    const defaultTier =
-      stringField(rec, "defaultServiceTier") ?? "default";
+    const defaultTier = stringField(rec, "defaultServiceTier") ?? "default";
     settings.push({
       id: "serviceTier",
       label: "Service Tier",

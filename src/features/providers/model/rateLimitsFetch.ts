@@ -160,7 +160,9 @@ export async function fetchCodexRateLimits(
       accountId,
     );
     const parsed = parseCodexRateLimits(result);
-    if (parsed.session || parsed.weekly || parsed.resetCredits) return parsed;
+    if (parsed.session || parsed.weekly || parsed.monthly || parsed.resetCredits) {
+      return parsed;
+    }
     const rec = asRecord(result);
     if (rec && !parsed.session && !parsed.weekly) {
       return unavailableRateLimits("codex", "No Codex usage data");
@@ -211,7 +213,25 @@ export async function consumeCodexRateLimitResetCredit(
   throw new Error("Codex returned an unknown reset result");
 }
 
-async function requestCodexAccount<T>(
+// Serialize Codex account probes across footer and Settings views while each
+// probe keeps its own child identity for cross-window and host isolation.
+let codexUsageQueue: Promise<unknown> = Promise.resolve();
+
+function requestCodexAccount<T>(
+  path: string,
+  cwd: string,
+  method: string,
+  params: unknown,
+  accountId: string,
+): Promise<T> {
+  const run = codexUsageQueue.then(() =>
+    runCodexAccountRequest<T>(path, cwd, method, params, accountId),
+  );
+  codexUsageQueue = run.catch(() => undefined);
+  return run;
+}
+
+async function runCodexAccountRequest<T>(
   path: string,
   cwd: string,
   method: string,
@@ -282,6 +302,7 @@ async function usageRpc<T>(
       provider === "codex"
         ? { provider, id: accountId ?? "default" }
         : undefined,
+      provider,
     );
     return await withTimeout(
       DISCOVERY_TIMEOUT_MS,

@@ -18,7 +18,7 @@ function refreshCatalog(flavor: PiFlavor, cwd?: string): Promise<void> {
 
 async function discoverModels(flavor: PiFlavor, projectCwd?: string) {
   const { path } = await flavor.resolveBinary(projectCwd);
-  const cwd = projectCwd ?? await homeDir();
+  const cwd = projectCwd ?? (await homeDir());
   const probeId = `${flavor.probeChildId}-${crypto.randomUUID()}`;
   const rpc = new PiRpc(probeId, () => undefined, flavor.label);
 
@@ -34,17 +34,20 @@ async function discoverModels(flavor: PiFlavor, projectCwd?: string) {
     () => rpc.close(new Error(`${flavor.label} catalog probe exited`)),
   );
 
+  let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     await spawnChild(
       probeId,
       path,
       buildPiSpawnArgs(flavor, { noSession: true, noExtensions: true }),
       cwd,
+      undefined,
+      flavor.id,
     );
     const response = await Promise.race([
       rpc.request({ type: "get_available_models" }, DISCOVERY_TIMEOUT_MS),
       new Promise<never>((_, reject) => {
-        setTimeout(
+        timeout = setTimeout(
           () => reject(new Error(`${flavor.label} model discovery timed out`)),
           DISCOVERY_TIMEOUT_MS,
         );
@@ -52,6 +55,7 @@ async function discoverModels(flavor: PiFlavor, projectCwd?: string) {
     ]);
     return modelsFromRpcData(flavor, response.data);
   } finally {
+    if (timeout) clearTimeout(timeout);
     await stop();
   }
 }
@@ -62,4 +66,12 @@ export function refreshPiCatalog(cwd?: string): Promise<void> {
 
 export function refreshOmpCatalog(cwd?: string): Promise<void> {
   return refreshCatalog(OMP_FLAVOR, cwd);
+}
+
+export function discoverPiModels(workingDirectory: string) {
+  return discoverModels(PI_FLAVOR, workingDirectory);
+}
+
+export function discoverOmpModels(workingDirectory: string) {
+  return discoverModels(OMP_FLAVOR, workingDirectory);
 }

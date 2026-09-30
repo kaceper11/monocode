@@ -266,6 +266,8 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     path,
     fxSpawnArgs(input.model, input.cwd),
     input.cwd,
+    undefined,
+    "fx",
   );
 
   try {

@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
+  RATE_LIMIT_MIN_REFETCH_MS,
+  isRateLimitSnapshotStale,
+  shouldFetchProvider,
+  shouldFetchRateLimits,
   clampUsedPercent,
+  exhaustedWindowResetAt,
   formatRateLimitWindowChipLabel,
   formatResetCountdown,
   formatResetDuration,
   formatUsagePercent,
   formatWindowLabel,
   idleRateLimits,
-  isRateLimitSnapshotStale,
   mapUsageWindow,
   parseClaudeOAuthUsage,
   parseCodexRateLimits,
@@ -15,10 +19,7 @@ import {
   parseCopilotQuota,
   parseOpencodeGoUsage,
   parseResetTimestamp,
-  RATE_LIMIT_MIN_REFETCH_MS,
   rateLimitWindowTooltip,
-  shouldFetchProvider,
-  shouldFetchRateLimits,
 } from "./rateLimits";
 
 describe("formatWindowLabel", () => {
@@ -93,6 +94,27 @@ describe("formatUsagePercent", () => {
     expect(formatUsagePercent(58.6)).toBe("59%");
     expect(formatUsagePercent(140)).toBe("140%");
     expect(clampUsedPercent(140)).toBe(100);
+  });
+});
+
+describe("exhaustedWindowResetAt", () => {
+  it("returns the latest reset among spent windows", () => {
+    const limits = {
+      ...idleRateLimits("codex"),
+      session: { usedPercent: 100, windowMinutes: 300, resetsAt: 2_000 },
+      weekly: { usedPercent: 100, windowMinutes: 10_080, resetsAt: 9_000 },
+    };
+    expect(exhaustedWindowResetAt(limits)).toBe(9_000);
+  });
+
+  it("ignores windows with room left", () => {
+    const limits = {
+      ...idleRateLimits("claude"),
+      session: { usedPercent: 100, windowMinutes: 300, resetsAt: 2_000 },
+      weekly: { usedPercent: 40, windowMinutes: 10_080, resetsAt: 9_000 },
+    };
+    expect(exhaustedWindowResetAt(limits)).toBe(2_000);
+    expect(exhaustedWindowResetAt(idleRateLimits("claude"))).toBeNull();
   });
 });
 
@@ -225,6 +247,26 @@ describe("parseCodexRateLimits", () => {
     expect(limits.resetCredits).toEqual({ availableCount: 3, credits: null });
   });
 
+  it("maps a free plan's lone 30-day primary window to monthly", () => {
+    const limits = parseCodexRateLimits({
+      rateLimits: {
+        primary: {
+          usedPercent: 4,
+          windowDurationMins: 43_200,
+          resetsAt: 1_792_550_273,
+        },
+        secondary: null,
+      },
+    });
+    expect(limits.session).toBeNull();
+    expect(limits.weekly).toBeNull();
+    expect(limits.monthly).toEqual({
+      usedPercent: 4,
+      windowMinutes: 43_200,
+      resetsAt: 1_792_550_273_000,
+    });
+  });
+
   it("falls back to primary=session when durations are unknown", () => {
     const limits = parseCodexRateLimits({
       primary: { usedPercent: 10, resetsAt: 100 },
@@ -245,7 +287,11 @@ describe("parseOpencodeGoUsage", () => {
           resetsAt: "2026-09-16T16:27:38.287Z",
         },
         weekly: { status: "ok", percent: 30, resetsAt: "2026-09-23T00:00:00Z" },
-        monthly: { status: "ok", percent: 12, resetsAt: "2026-10-16T00:00:00Z" },
+        monthly: {
+          status: "ok",
+          percent: 12,
+          resetsAt: "2026-10-16T00:00:00Z",
+        },
       },
     });
     expect(limits.provider).toBe("opencode");

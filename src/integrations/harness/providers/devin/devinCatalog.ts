@@ -42,7 +42,7 @@ async function discoverDevinModels(projectCwd?: string) {
 async function discoverViaCli(projectCwd?: string) {
   const { path } = await resolveDevinBinary(projectCwd);
   const cwd = projectCwd ?? (await homeDir());
-  const stdout = await execChild(path, ["models", "list", "--format", "json"], cwd);
+  const stdout = await execChild(path, ["models", "list", "--format", "json"], cwd, "devin");
   return devinModelsFromOutput(stdout);
 }
 
@@ -75,7 +75,7 @@ async function discoverViaAcp(projectCwd?: string) {
   );
 
   try {
-    await spawnChild(PROBE_ID, path, devinSpawnArgs(), cwd);
+    await spawnChild(PROBE_ID, path, devinSpawnArgs(), cwd, undefined, "devin");
     return await withTimeout(
       DISCOVERY_TIMEOUT_MS,
       async () => {

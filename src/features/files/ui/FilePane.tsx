@@ -1,6 +1,7 @@
 import { requestBrowserOpen } from "../../sessions/model/browser";
 import { BrowserView } from "../../sessions/ui/BrowserView.tsx";
 import type { BrowserMetaPatch } from "../../sessions/model/browserWorkspace";
+import { lazySurface } from "../../../shared/ui/lazySurface";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { memo, useSyncExternalStore } from "react";
 import {
@@ -28,16 +29,36 @@ import { editorPathsEqual } from "../../search/model/search";
 import type { PlanBuildTarget, Session } from "../../sessions/model/session";
 import { Play, Plus } from "../../../shared/ui/icons";
 import { BuildTargetButton } from "../../sessions/ui/SecondOpinionButton";
-import { loadDiffViewer, subscribeDiffViewer } from "../../settings/model/settings";
+import {
+  loadDiffViewer,
+  subscribeDiffViewer,
+} from "../../settings/model/settings";
 import { AgentTabView } from "../../sessions/ui/AgentTabView";
 import { MarkdownPreview } from "../../sessions/ui/AgentMarkdown";
 import { BinaryFileView } from "./BinaryFileView";
-import { CommitDiff } from "../../source-control/ui/CommitDiff";
-import { FileEditor } from "./FileEditor";
 import { ReleaseNotesSurface } from "../../../app/ui/ReleaseNotesSurface";
-import { SessionChangesDiff } from "../../source-control/ui/SessionChangesDiff";
-import { TerminalView } from "../../terminal/ui/TerminalView";
-import { WorkingTreeDiff } from "../../source-control/ui/WorkingTreeDiff";
+import { isRemoteProjectPath } from "../../projects/model/recents";
+
+const CommitDiff = lazySurface(async () => {
+  const module = await import("../../source-control/ui/CommitDiff");
+  return { default: module.CommitDiff };
+});
+const FileEditor = lazySurface(async () => {
+  const module = await import("./FileEditor");
+  return { default: module.FileEditor };
+});
+const SessionChangesDiff = lazySurface(async () => {
+  const module = await import("../../source-control/ui/SessionChangesDiff");
+  return { default: module.SessionChangesDiff };
+});
+const TerminalView = lazySurface(async () => {
+  const module = await import("../../terminal/ui/TerminalView");
+  return { default: module.TerminalView };
+});
+const WorkingTreeDiff = lazySurface(async () => {
+  const module = await import("../../source-control/ui/WorkingTreeDiff");
+  return { default: module.WorkingTreeDiff };
+});
 
 type Props = {
   pane: EditorPane;
@@ -308,6 +329,7 @@ function PlanSurface({
   const block = plan
     ? session?.blocks.find((entry) => entry.id === plan.blockId)
     : undefined;
+  const remote = !!session && isRemoteProjectPath(session.cwd);
 
   if (!block || !plan) {
     return (
@@ -358,7 +380,7 @@ function PlanSurface({
               <Play className="size-3" />
               {buildLabel}
             </button>
-            {session ? (
+            {session && !remote ? (
               <BuildTargetButton
                 cwd={file.cwd}
                 from={session.harness}
@@ -378,6 +400,7 @@ function PlanSurface({
             spellCheck={false}
             value={block.text}
             disabled={
+              remote ||
               block.plan?.status === "streaming" ||
               block.plan?.status === "building" ||
               block.plan?.status === "built"

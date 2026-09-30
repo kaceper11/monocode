@@ -5,29 +5,22 @@ import {
   useRef,
   useState,
   type ComponentProps,
-  type Dispatch,
   type ReactNode,
-  type SetStateAction,
 } from "react";
 import { HarnessIcon } from "../../features/sessions/ui/HarnessIcon";
 import { Popover, type PopoverDismissReason } from "../../shared/ui/Popover";
-import {
-  consumeCodexRateLimitResetCredit,
-  fetchClaudeRateLimits,
-  fetchCodexRateLimits,
-  fetchOpencodeGoRateLimits,
-  fetchAdditionalRateLimits,
-} from "../../features/providers/model/rateLimitsFetch";
+import { consumeCodexRateLimitResetCredit } from "../../features/providers/model/rateLimitsFetch";
 import {
   errorRateLimits,
-  fetchingRateLimits,
-  idleRateLimits,
-  RATE_LIMIT_POLL_MS,
-  shouldFetchProvider,
   unavailableRateLimits,
-  type ProviderRateLimits,
   type RateLimitProvider,
 } from "../../features/providers/model/rateLimits";
+import {
+  getCachedRateLimits,
+  loadRateLimits,
+  setCachedRateLimits,
+  useCachedRateLimits,
+} from "../../features/providers/model/rateLimitsCache";
 import {
   HARNESS_LABEL,
   HARNESS_TITLE,
@@ -43,6 +36,7 @@ import {
 } from "../../features/terminal/model/terminalTab";
 import { MOD } from "../../platform/tauri/platform";
 import { UsageProviderChip } from "./UsageProviderChip";
+import { PiUsage } from "./PiUsage";
 import {
   ProviderSignInPanel,
   type ProviderSignInState,
@@ -65,6 +59,7 @@ const CLOCK_MS = 30_000;
 export type UsageFooterSession = {
   id?: string;
   harness: HarnessId;
+  model?: string;
   authRequired?: boolean;
   providerAccountId?: string;
   cwd?: string;
@@ -131,30 +126,11 @@ function UsageFooterContent({
     (provider): provider is "copilot" | "muse" | "devin" =>
       provider === "copilot" || provider === "muse" || provider === "devin",
   );
-  const [extra, setExtra] = useState<ProviderRateLimits>(() =>
-    idleRateLimits(additional ?? "devin"),
-  );
-  const extraRef = useRef(extra);
-  extraRef.current = extra;
-  const [claude, setClaude] = useState<ProviderRateLimits>(() =>
-    idleRateLimits("claude"),
-  );
-  const [codex, setCodex] = useState<ProviderRateLimits>(() =>
-    idleRateLimits("codex"),
-  );
-  const [opencode, setOpencode] = useState<ProviderRateLimits>(() =>
-    idleRateLimits("opencode"),
-  );
+  const extra = useCachedRateLimits(additional ?? "devin", "default", cwd, session?.id);
   const [now, setNow] = useState(() => Date.now());
   const [refreshing, setRefreshing] = useState(false);
   const [, setAccountsVersion] = useState(0);
   const inflight = useRef<Promise<void> | null>(null);
-  const claudeRef = useRef(claude);
-  const codexRef = useRef(codex);
-  const opencodeRef = useRef(opencode);
-  claudeRef.current = claude;
-  codexRef.current = codex;
-  opencodeRef.current = opencode;
   const claudeAccountId =
     session?.harness === "claude" && session.providerAccountId
       ? session.providerAccountId
@@ -170,10 +146,23 @@ function UsageFooterContent({
     claudeAccountId,
   );
   const codexAccountAvailable = providerAccountExists("codex", codexAccountId);
-  const claudeAccountRef = useRef(claudeAccountId);
   const codexAccountRef = useRef(codexAccountId);
-  claudeAccountRef.current = claudeAccountId;
   codexAccountRef.current = codexAccountId;
+  const cachedClaude = useCachedRateLimits("claude", claudeAccountId, cwd);
+  const cachedCodex = useCachedRateLimits("codex", codexAccountId, cwd);
+  const opencode = useCachedRateLimits("opencode", "default", cwd);
+  const claude = claudeAccountAvailable
+    ? cachedClaude
+    : unavailableRateLimits(
+        "claude",
+        "This conversation uses a removed account",
+      );
+  const codex = codexAccountAvailable
+    ? cachedCodex
+    : unavailableRateLimits(
+        "codex",
+        "This conversation uses a removed account",
+      );
 
   useEffect(
     () =>
@@ -181,145 +170,67 @@ function UsageFooterContent({
     [],
   );
 
-  const refresh = useCallback(
-    (force = false) => {
-      if (inflight.current) return inflight.current;
-      const visible = document.visibilityState === "visible";
-      const fetchClaude =
-        wantClaude &&
-        claudeAccountAvailable &&
-        shouldFetchProvider(claudeRef.current, { force, visible });
-      const fetchCodex =
-        wantCodex &&
-        codexAccountAvailable &&
-        shouldFetchProvider(codexRef.current, { force, visible });
-      const fetchOpencode =
-        wantOpencode &&
-        shouldFetchProvider(opencodeRef.current, { force, visible });
-      const fetchExtra =
-        additional && shouldFetchProvider(extraRef.current, { force, visible });
-      if (!fetchClaude && !fetchCodex && !fetchOpencode && !fetchExtra) return;
-      if (force) setRefreshing(true);
-      const jobs: Promise<void>[] = [];
-      if (fetchClaude) {
-        const accountId = claudeAccountId;
-        setClaude((current) => fetchingRateLimits("claude", current));
-        jobs.push(
-          fetchClaudeRateLimits(accountId, cwd).then((value) => {
-            if (mounted.current && accountId === claudeAccountRef.current)
-              setClaude(value);
-          }),
-        );
-      }
-      if (fetchCodex) {
-        const accountId = codexAccountId;
-        setCodex((current) => fetchingRateLimits("codex", current));
-        jobs.push(
-          fetchCodexRateLimits(accountId, cwd).then((value) => {
-            if (mounted.current && accountId === codexAccountRef.current)
-              setCodex(value);
-          }),
-        );
-      }
-      if (fetchOpencode) {
-        setOpencode((current) => fetchingRateLimits("opencode", current));
-        jobs.push(
-          fetchOpencodeGoRateLimits(cwd).then((value) => {
-            setOpencode(value);
-          }),
-        );
-      }
-      if (fetchExtra && additional) {
-        setExtra((current) => fetchingRateLimits(additional, current));
-        jobs.push(
-          fetchAdditionalRateLimits(additional, cwd, session?.id).then(
-            (value) => {
-              if (mounted.current) setExtra(value);
-            },
-          ),
-        );
-      }
-      const run = Promise.allSettled(jobs)
-        .then(() => undefined)
-        .finally(() => {
-          inflight.current = null;
-          setRefreshing(false);
-        });
-      inflight.current = run;
-      return run;
-    },
-    [
-      cwd,
-      claudeAccountAvailable,
-      claudeAccountId,
-      codexAccountAvailable,
-      codexAccountId,
-      wantClaude,
-      wantCodex,
-      wantOpencode,
-      additional,
-      session?.id,
-    ],
-  );
-
+  // New accounts load once. Returning from Settings or focusing the window
+  // reads the shared snapshot without starting another provider request.
   useEffect(() => {
-    const next = claudeAccountAvailable
-      ? idleRateLimits("claude")
-      : unavailableRateLimits(
-          "claude",
-          "This conversation uses a removed account",
-        );
-    claudeRef.current = next;
-    setClaude(next);
-    const pending = inflight.current;
-    if (pending) void pending.finally(() => refresh(true));
-  }, [claudeAccountAvailable, claudeAccountId, refresh]);
+    if (wantClaude && claudeAccountAvailable)
+      void loadRateLimits("claude", claudeAccountId, false, cwd);
+    if (wantCodex && codexAccountAvailable)
+      void loadRateLimits("codex", codexAccountId, false, cwd);
+    if (wantOpencode) void loadRateLimits("opencode", "default", false, cwd);
+    if (additional) void loadRateLimits(additional, "default", false, cwd, session?.id);
+  }, [
+    claudeAccountAvailable,
+    claudeAccountId,
+    codexAccountAvailable,
+    codexAccountId,
+    wantClaude,
+    wantCodex,
+    wantOpencode,
+    additional, cwd, session?.id,
+  ]);
 
-  useEffect(() => {
-    const next = codexAccountAvailable
-      ? idleRateLimits("codex")
-      : unavailableRateLimits(
-          "codex",
-          "This conversation uses a removed account",
-        );
-    codexRef.current = next;
-    setCodex(next);
-    const pending = inflight.current;
-    if (pending) void pending.finally(() => refresh(true));
-  }, [codexAccountAvailable, codexAccountId, refresh]);
-
-  useEffect(() => {
-    void refresh();
-    const poll = window.setInterval(() => void refresh(), RATE_LIMIT_POLL_MS);
-    const onVisible = () => {
-      if (document.visibilityState === "visible") void refresh();
-    };
-    const onUsage = (event: Event) => {
-      if (
-        (event as CustomEvent<{ sessionId: string }>).detail.sessionId !==
-        session?.id
-      )
-        return;
-      const pending = inflight.current;
-      if (pending)
-        void pending.finally(() => {
-          if (mounted.current) void refresh(true);
-        });
-      else void refresh(true);
-    };
-    window.addEventListener("monocode-provider-usage-changed", onUsage);
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      window.clearInterval(poll);
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("monocode-provider-usage-changed", onUsage);
-    };
-  }, [refresh, session?.id]);
+  const refresh = useCallback(() => {
+    if (inflight.current) return inflight.current;
+    setRefreshing(true);
+    const jobs: Promise<unknown>[] = [];
+    if (wantClaude && claudeAccountAvailable)
+      jobs.push(loadRateLimits("claude", claudeAccountId, true, cwd));
+    if (wantCodex && codexAccountAvailable)
+      jobs.push(loadRateLimits("codex", codexAccountId, true, cwd));
+    if (wantOpencode) jobs.push(loadRateLimits("opencode", "default", true, cwd));
+    if (additional) jobs.push(loadRateLimits(additional, "default", true, cwd, session?.id));
+    const run = Promise.allSettled(jobs)
+      .then(() => undefined)
+      .finally(() => {
+        inflight.current = null;
+        setRefreshing(false);
+      });
+    inflight.current = run;
+    return run;
+  }, [
+    claudeAccountAvailable,
+    claudeAccountId,
+    codexAccountAvailable,
+    codexAccountId,
+    wantClaude,
+    wantCodex,
+    wantOpencode,
+    additional, cwd, session?.id,
+  ]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), CLOCK_MS);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    const onUsage = (event: Event) => {
+      if ((event as CustomEvent<{ sessionId: string }>).detail.sessionId === session?.id) void refresh();
+    };
+    window.addEventListener("monocode-provider-usage-changed", onUsage);
+    return () => window.removeEventListener("monocode-provider-usage-changed", onUsage);
+  }, [refresh, session?.id]);
 
   const consumeCodexReset = useCallback(
     async (creditId?: string) => {
@@ -329,7 +240,6 @@ function UsageFooterContent({
           "The usage destination changed. Reopen usage and retry.",
         );
       setRefreshing(true);
-      setCodex((current) => fetchingRateLimits("codex", current));
       let outcome: Awaited<ReturnType<typeof consumeCodexRateLimitResetCredit>>;
       const operation = (async () => {
         try {
@@ -338,13 +248,22 @@ function UsageFooterContent({
             codexAccountId,
             cwd,
           );
-          setCodex(await fetchCodexRateLimits(codexAccountId, cwd));
+          await loadRateLimits("codex", codexAccountId, true, cwd);
         } catch (error) {
           const message =
             error instanceof Error
               ? error.message
               : "Could not use Codex reset";
-          setCodex((current) => errorRateLimits("codex", message, current));
+          setCachedRateLimits(
+            "codex",
+            codexAccountId,
+            errorRateLimits(
+              "codex",
+              message,
+              getCachedRateLimits("codex", codexAccountId, cwd),
+            ),
+            cwd,
+          );
           throw error;
         }
       })();
@@ -360,24 +279,17 @@ function UsageFooterContent({
   );
 
   const reconnectProvider = useCallback(
-    async (
-      provider: RateLimitProvider,
-      accountId: string,
-      fetchLimits: () => Promise<ProviderRateLimits>,
-      setLimits: Dispatch<SetStateAction<ProviderRateLimits>>,
-    ) => {
+    async (provider: RateLimitProvider, accountId: string) => {
       while (inflight.current) await inflight.current;
       if (!mounted.current)
         throw new Error(
           "The usage destination changed. Reopen usage and retry.",
         );
       setRefreshing(true);
-      setLimits((current) => fetchingRateLimits(provider, current));
       const operation = (async () => {
         try {
           await loginHarness(provider, accountId, cwd);
-          const value = await fetchLimits();
-          setLimits(value);
+          const value = await loadRateLimits(provider, accountId, true, cwd);
           if (value.status !== "ok") {
             throw new Error(
               value.error ||
@@ -389,7 +301,16 @@ function UsageFooterContent({
             error instanceof Error
               ? error.message
               : "Could not complete sign-in";
-          setLimits((current) => errorRateLimits(provider, message, current));
+          setCachedRateLimits(
+            provider,
+            accountId,
+            errorRateLimits(
+              provider,
+              message,
+              getCachedRateLimits(provider, accountId, cwd),
+            ),
+            cwd,
+          );
           throw error;
         }
       })();
@@ -404,25 +325,13 @@ function UsageFooterContent({
   );
 
   const reconnectClaude = useCallback(
-    () =>
-      reconnectProvider(
-        "claude",
-        claudeAccountId,
-        () => fetchClaudeRateLimits(claudeAccountId, cwd),
-        setClaude,
-      ),
-    [claudeAccountId, cwd, reconnectProvider],
+    () => reconnectProvider("claude", claudeAccountId),
+    [claudeAccountId, reconnectProvider],
   );
 
   const reconnectCodex = useCallback(
-    () =>
-      reconnectProvider(
-        "codex",
-        codexAccountId,
-        () => fetchCodexRateLimits(codexAccountId, cwd),
-        setCodex,
-      ),
-    [codexAccountId, cwd, reconnectProvider],
+    () => reconnectProvider("codex", codexAccountId),
+    [codexAccountId, reconnectProvider],
   );
 
   const selectAccount = useCallback(
@@ -455,7 +364,7 @@ function UsageFooterContent({
   const onTerminalClick = projectTerminalActive
     ? (onShowTerminal ?? onNewTerminal)
     : (onNewTerminal ?? onShowTerminal);
-  const ariaLabel = showUsage
+  const ariaLabel = showUsage || session?.harness === "pi"
     ? "Provider usage"
     : showTerminals || showTerminalButton
       ? "Terminals"
@@ -476,7 +385,9 @@ function UsageFooterContent({
           {wsl.distribution}
         </span>
       ) : null}
-      {showUsage ? (
+      {session?.harness === "pi" ? (
+        <PiUsage key={`${session.id}:${session.model}`} model={session.model} now={now} />
+      ) : showUsage ? (
         <>
           {wantClaude ? (
             <UsageProviderChip
@@ -517,6 +428,7 @@ function UsageFooterContent({
               limits={codex}
               now={now}
               project={project}
+              cwd={cwd}
               accounts={
                 wsl
                   ? codexAccounts
@@ -558,7 +470,7 @@ function UsageFooterContent({
             aria-label="Refresh usage"
             title="Refresh usage"
             disabled={refreshing}
-            onClick={() => void refresh(true)}
+            onClick={() => void refresh()}
           >
             <RefreshCw
               className={`size-2.5 ${refreshing ? "animate-spin" : ""}`}

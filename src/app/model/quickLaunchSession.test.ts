@@ -10,7 +10,9 @@ import {
   type Session,
 } from "../../features/sessions/model/session";
 import {
+  leafIds,
   newTab,
+  splitPane,
   type WorkspaceTab,
 } from "../../features/workspace/model/layout";
 import { filterTabsForProject } from "../../features/workspace/model/workspaceTabGroups";
@@ -19,6 +21,14 @@ import {
   submitAfterProjectSync,
   type SubmissionAcceptance,
 } from "./submissionAcceptance";
+
+const storedValues = new Map<string, string>();
+vi.stubGlobal("localStorage", {
+  clear: () => storedValues.clear(),
+  getItem: (key: string) => storedValues.get(key) ?? null,
+  setItem: (key: string, value: string) => storedValues.set(key, value),
+  removeItem: (key: string) => storedValues.delete(key),
+});
 
 beforeEach(() => {
   localStorage.clear();
@@ -79,7 +89,7 @@ function setup(reveal = false) {
     setRecents: vi.fn((recents: typeof state.recents) => {
       state.recents = recents;
     }),
-    revealTab: vi.fn((id: string) => {
+    revealTab: vi.fn((id: string, cwd: string) => {
       // Assert the title bar and recents already point at the revealed project.
       expect(
         filterTabsForProject(state.tabs, state.sessions, state.projectCwd).some(
@@ -87,9 +97,37 @@ function setup(reveal = false) {
         ),
       ).toBe(true);
       expect(state.recents[0].path).toBe(request.cwd);
+      expect(cwd).toBe(request.cwd);
       state.activeTabId = id;
     }),
     submit,
+    saveDraft: vi.fn(
+      (
+        id: string,
+        text: string,
+        _attachments: Attachment[],
+        requestId: string,
+      ) => {
+        state.sessions = state.sessions.map((session) =>
+          session.id === id
+            ? {
+                ...session,
+                blocks: [
+                  ...session.blocks,
+                  {
+                    id: "draft-turn",
+                    role: "user" as const,
+                    text,
+                    draft: true,
+                    appRequestId: requestId,
+                  },
+                ],
+              }
+            : session,
+        );
+        return true;
+      },
+    ),
   };
   const queue = [{ id: "quick-session", request }];
   const ack = vi.fn(async () => {
@@ -131,6 +169,142 @@ it("leaves the selected project, recents, and active tab unchanged for backgroun
   expect(workspace.setProjectCwd).not.toHaveBeenCalled();
   expect(workspace.setRecents).not.toHaveBeenCalled();
   expect(workspace.revealTab).not.toHaveBeenCalled();
+});
+
+it("starts the first turn in the mode picked in the floating composer", async () => {
+  const { request, workspace } = setup();
+  request.intent = "orchestrate";
+  await acceptQuickLaunch(request, "quick-session", workspace);
+  expect(workspace.submit).toHaveBeenCalledWith(
+    "quick-session",
+    request.prompt,
+    [],
+    { intent: "orchestrate" },
+  );
+});
+
+it("creates a draft-only session without submitting an agent turn", async () => {
+  const { state, request, workspace } = setup();
+  request.draft = true;
+  await acceptQuickLaunch(request, "quick-session", workspace);
+  expect(workspace.submit).not.toHaveBeenCalled();
+  expect(workspace.saveDraft).toHaveBeenCalledWith(
+    "quick-session",
+    request.prompt,
+    [],
+    "quick-session",
+  );
+  expect(
+    state.sessions.find((session) => session.id === "quick-session"),
+  ).toMatchObject({
+    quickLaunchAccepted: true,
+    blocks: [
+      {
+        role: "user",
+        text: request.prompt,
+        draft: true,
+        appRequestId: "quick-session",
+      },
+    ],
+  });
+  await acceptQuickLaunch(request, "quick-session", workspace);
+  expect(workspace.saveDraft).toHaveBeenCalledOnce();
+  state.sessions = state.sessions.map((session) =>
+    session.id === "quick-session"
+      ? {
+          ...session,
+          quickLaunchAccepted: undefined,
+          blocks: session.blocks.map((block) => ({ ...block, draft: false })),
+        }
+      : session,
+  );
+  await acceptQuickLaunch(request, "quick-session", workspace);
+  expect(workspace.saveDraft).toHaveBeenCalledOnce();
+});
+
+it("places successive sessions in right and down splits of the same tab", async () => {
+  const { state, oldTab, request, workspace } = setup(true);
+  request.cwd = state.sessions[0].cwd;
+  request.draft = true;
+  const placeSession = vi.fn(
+    (
+      sessionId: string,
+      placement: { direction: "right" | "down"; besideSessionId: string },
+    ) => {
+      const tab = state.tabs.find((entry) =>
+        leafIds(entry.layout).includes(placement.besideSessionId),
+      );
+      if (!tab) throw new Error("Target pane unavailable");
+      state.tabs = state.tabs.map((entry) =>
+        entry.id === tab.id
+          ? {
+              ...entry,
+              layout: splitPane(
+                entry.layout,
+                placement.besideSessionId,
+                placement.direction,
+                sessionId,
+              ),
+              focusedId: sessionId,
+            }
+          : entry,
+      );
+      return tab.id;
+    },
+  );
+  await acceptQuickLaunch(
+    request,
+    "right-session",
+    { ...workspace, placeSession },
+    { direction: "right", besideSessionId: state.sessions[0].id },
+  );
+  await acceptQuickLaunch(
+    request,
+    "down-session",
+    { ...workspace, placeSession },
+    { direction: "down", besideSessionId: "right-session" },
+  );
+  expect(state.tabs).toHaveLength(1);
+  expect(state.tabs[0].id).toBe(oldTab.id);
+  expect(state.tabs[0].layout).toMatchObject({
+    type: "split",
+    dir: "right",
+    children: [
+      { type: "leaf", id: state.sessions[0].id },
+      {
+        type: "split",
+        dir: "down",
+        children: [
+          { type: "leaf", id: "right-session" },
+          { type: "leaf", id: "down-session" },
+        ],
+      },
+    ],
+  });
+  expect(workspace.appendTab).not.toHaveBeenCalled();
+  expect(workspace.revealTab).toHaveBeenLastCalledWith(oldTab.id, request.cwd);
+  expect(workspace.submit).not.toHaveBeenCalled();
+});
+
+it("rejects a missing pane before adding or submitting a session", async () => {
+  const { state, request, workspace } = setup();
+  await expect(
+    acceptQuickLaunch(
+      request,
+      "lost-session",
+      {
+        ...workspace,
+        placeSession: () => {
+          throw new Error("Target pane unavailable");
+        },
+      },
+      { direction: "right", besideSessionId: "missing" },
+    ),
+  ).rejects.toThrow("Target pane unavailable");
+  expect(state.sessions.some((session) => session.id === "lost-session")).toBe(
+    false,
+  );
+  expect(workspace.submit).not.toHaveBeenCalled();
 });
 
 it("does not acknowledge or mark accepted while project synchronization is pending", async () => {

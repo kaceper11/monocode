@@ -523,7 +523,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   );
 
   try {
-    await spawnChild(input.sessionId, path, copilotSpawnArgs(effort), input.cwd);
+    await spawnChild(input.sessionId, path, copilotSpawnArgs(effort), input.cwd, undefined, "copilot");
   } catch (error) {
     unwatchChild(input.sessionId);
     acp.close(error instanceof Error ? error : new Error(String(error)));

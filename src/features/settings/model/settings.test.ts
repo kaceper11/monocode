@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   COMPOSER_RUNNER_DEFAULT,
+  AUTOSAVE_DEFAULT,
   COLLAPSED_PROJECT_RAIL_MODE_DEFAULT,
   searchSettings,
   SETTINGS_INDEX,
@@ -15,18 +16,24 @@ import {
   LIVE_AGENTS_ENABLED_DEFAULT,
   TAB_ANIMATIONS_ENABLED_DEFAULT,
   loadComposerRunner,
+  loadAutosave,
   loadCollapsedProjectRailMode,
   loadModelControls,
   loadDiffViewer,
+  loadKeybindingOverrides,
   loadFormatOnSave,
   loadFileTabMode,
   loadFollowUpBehavior,
   loadGridArcadeEnabled,
   loadLiveAgentsEnabled,
   loadNotesEnabled,
+  keybindingPressed,
+  matchCustomKeybinding,
+  loadQuickComposerShortcut,
   loadTabAnimationsEnabled,
   NOTES_ENABLED_DEFAULT,
   saveComposerRunner,
+  saveAutosave,
   saveCollapsedProjectRailMode,
   saveModelControls,
   saveDiffViewer,
@@ -36,18 +43,24 @@ import {
   saveGridArcadeEnabled,
   saveLiveAgentsEnabled,
   saveNotesEnabled,
+  saveKeybindingOverride,
+  type KeybindingOverride,
+  saveQuickComposerShortcut,
   saveTabAnimationsEnabled,
 } from "./settings";
-import { MOD, SHIFT } from "../../../platform/tauri/platform";
+import { IS_MAC, MOD, SHIFT } from "../../../platform/tauri/platform";
 
 const KEY = "monocode.composerRunner";
 const MODEL_CONTROLS_KEY = "monocode.modelControls";
 const LEGACY_EFFORT_VISIBLE_KEY = "monocode.composerEffortVisible";
 const NOTES_KEY = "monocode.notesEnabled";
+const KEYBINDING_OVERRIDES_KEY = "monocode.keybindingOverrides";
+const QUICK_COMPOSER_SHORTCUT_KEY = "monocode.quickComposerShortcut";
 const LIVE_AGENTS_KEY = "monocode.liveAgentsEnabled";
 const GRID_ARCADE_KEY = "monocode.gridArcadeEnabled";
 const DIFF_VIEWER_KEY = "monocode.diffViewer";
 const FORMAT_ON_SAVE_KEY = "monocode.formatOnSave";
+const AUTOSAVE_KEY = "monocode.autosave";
 const FILE_TAB_MODE_KEY = "monocode.fileTabMode";
 const FOLLOW_UP_BEHAVIOR_KEY = "monocode.followUpBehavior";
 const TAB_ANIMATIONS_KEY = "monocode.tabAnimationsEnabled";
@@ -170,6 +183,169 @@ describe("notes enabled setting", () => {
     expect(loadNotesEnabled()).toBe(false);
     saveNotesEnabled(true);
     expect(loadNotesEnabled()).toBe(true);
+  });
+});
+
+describe("keybinding overrides", () => {
+  beforeEach(mockLocalStorage);
+
+  const key = (
+    code: string,
+    modifiers: Partial<{
+      metaKey: boolean;
+      ctrlKey: boolean;
+      altKey: boolean;
+      shiftKey: boolean;
+    }> = {},
+  ) => ({
+    code,
+    metaKey: false,
+    ctrlKey: false,
+    altKey: false,
+    shiftKey: false,
+    ...modifiers,
+  });
+
+  it("persists a custom shortcut and matches only that combination", () => {
+    saveKeybindingOverride("App: Search", { shortcut: "Command+Shift+KeyY" });
+    expect(localStorage.getItem(KEYBINDING_OVERRIDES_KEY)).toBe(
+      '{"App: Search":{"shortcut":"Command+Shift+KeyY"}}',
+    );
+    expect(
+      keybindingPressed(
+        "App: Search",
+        key("KeyY", { metaKey: true, shiftKey: true }),
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      keybindingPressed("App: Search", key("KeyK", { metaKey: true }), true),
+    ).toBe(false);
+    expect(
+      matchCustomKeybinding(key("KeyY", { metaKey: true, shiftKey: true })),
+    ).toBe("App: Search");
+
+    saveKeybindingOverride("App: Search", {});
+    expect(localStorage.getItem(KEYBINDING_OVERRIDES_KEY)).toBeNull();
+  });
+
+  it("matches real keyboard events whose modifiers are prototype accessors", () => {
+    saveKeybindingOverride("App: Search", { shortcut: "Control+Shift+KeyY" });
+    // Browsers define metaKey/ctrlKey/altKey/shiftKey on KeyboardEvent.prototype,
+    // so they are not own properties and must be read, never spread.
+    const prototyped = Object.create({
+      code: "KeyY",
+      metaKey: false,
+      ctrlKey: true,
+      altKey: false,
+      shiftKey: true,
+    }) as Parameters<typeof keybindingPressed>[1];
+
+    expect(keybindingPressed("App: Search", prototyped, false)).toBe(true);
+    expect(matchCustomKeybinding(prototyped)).toBe("App: Search");
+  });
+
+  it("serves a cached value without letting callers mutate it", () => {
+    saveKeybindingOverride("App: Search", { shortcut: "Command+KeyY" });
+    const first = loadKeybindingOverrides();
+    (first as Record<string, KeybindingOverride>)["App: Go to File"] = {
+      disabled: true,
+    };
+    expect(loadKeybindingOverrides()["App: Go to File"]).toBeUndefined();
+  });
+
+  it("disables a shortcut and restores the default", () => {
+    saveKeybindingOverride("App: Search", { disabled: true });
+    expect(loadKeybindingOverrides()).toEqual({
+      "App: Search": { disabled: true },
+    });
+    expect(
+      keybindingPressed("App: Search", key("KeyK", { metaKey: true }), true),
+    ).toBe(false);
+  });
+
+  it("rejects a shortcut already used by another command", () => {
+    saveKeybindingOverride("App: Search", { shortcut: "Command+KeyY" });
+    expect(() =>
+      saveKeybindingOverride("App: Go to File", { shortcut: "Command+KeyY" }),
+    ).toThrow("Already used by App: Search");
+  });
+
+  it("rejects a shortcut that shadows another command's default", () => {
+    // `App: Go to File` is bound to the platform modifier, so hardcoding
+    // Control here clashes with nothing on macOS and the assertion passes
+    // vacuously.
+    const mod = IS_MAC ? "Command" : "Control";
+    expect(() =>
+      saveKeybindingOverride("App: Search", { shortcut: `${mod}+KeyP` }),
+    ).toThrow("Already used by App: Go to File");
+    expect(() =>
+      saveKeybindingOverride("Tab: New", { shortcut: "Control+Tab" }),
+    ).toThrow("Already used by Tab: Cycle Next");
+  });
+
+  it("protects every chord in the grouped tab activation range", () => {
+    const mod = IS_MAC ? "Command" : "Control";
+    for (const digit of [1, 4, 8]) {
+      expect(() =>
+        saveKeybindingOverride("App: Search", {
+          shortcut: `${mod}+Digit${digit}`,
+        }),
+      ).toThrow("Already used by Tab: Activate 1–8");
+    }
+  });
+
+  it("rejects a chord the command cannot use and invalid chords", () => {
+    expect(() =>
+      saveKeybindingOverride("Tab: Activate 1–8", { shortcut: "Control+KeyY" }),
+    ).toThrow("needs a number key");
+    expect(() =>
+      saveKeybindingOverride("App: Search", { shortcut: "KeyK" }),
+    ).toThrow("not a valid shortcut");
+  });
+
+  it("normalises modifier order when reading stored shortcuts", () => {
+    localStorage.setItem(
+      KEYBINDING_OVERRIDES_KEY,
+      JSON.stringify({ "App: Search": { shortcut: "Shift+Command+KeyY" } }),
+    );
+    expect(loadKeybindingOverrides()).toEqual({
+      "App: Search": { shortcut: "Command+Shift+KeyY" },
+    });
+  });
+
+  it("ignores malformed, unknown, and invalid stored overrides", () => {
+    localStorage.setItem(
+      KEYBINDING_OVERRIDES_KEY,
+      JSON.stringify({
+        "Unknown: Command": { disabled: true },
+        "App: Search": { shortcut: "KeyK" },
+        "Tab: New": { shortcut: "Command+KeyT" },
+      }),
+    );
+    expect(loadKeybindingOverrides()).toEqual({
+      "Tab: New": { shortcut: "Command+KeyT" },
+    });
+    localStorage.setItem(KEYBINDING_OVERRIDES_KEY, "not-json");
+    expect(loadKeybindingOverrides()).toEqual({});
+  });
+});
+
+describe("quick composer shortcut setting", () => {
+  beforeEach(mockLocalStorage);
+
+  it("defaults to the existing shortcut and persists a custom binding", () => {
+    expect(loadQuickComposerShortcut()).toBe("Command+Shift+Space");
+    saveQuickComposerShortcut("Command+Option+KeyK");
+    expect(localStorage.getItem(QUICK_COMPOSER_SHORTCUT_KEY)).toBe(
+      "Command+Option+KeyK",
+    );
+    expect(loadQuickComposerShortcut()).toBe("Command+Option+KeyK");
+  });
+
+  it("ignores malformed stored bindings", () => {
+    localStorage.setItem(QUICK_COMPOSER_SHORTCUT_KEY, "Shift+Space");
+    expect(loadQuickComposerShortcut()).toBe("Command+Shift+Space");
   });
 });
 
@@ -311,6 +487,21 @@ describe("format on save setting", () => {
   });
 });
 
+describe("autosave setting", () => {
+  beforeEach(mockLocalStorage);
+  afterEach(() => {
+    localStorage.removeItem(AUTOSAVE_KEY);
+  });
+
+  it("defaults to off and persists changes", () => {
+    expect(AUTOSAVE_DEFAULT).toBe(false);
+    expect(loadAutosave()).toBe(false);
+    saveAutosave(true);
+    expect(localStorage.getItem(AUTOSAVE_KEY)).toBe("1");
+    expect(loadAutosave()).toBe(true);
+  });
+});
+
 describe("diff viewer setting", () => {
   beforeEach(mockLocalStorage);
   afterEach(() => {
@@ -412,10 +603,12 @@ describe("settings navigation", () => {
     ]);
     expect(groups.flatMap((group) => group.sections.map((s) => s.id))).toEqual([
       "general",
+      "connections",
       "appearance",
       "keybindings",
       "chat",
       "providers",
+      "mcp",
       "skills",
       "inbox",
       "archive",
