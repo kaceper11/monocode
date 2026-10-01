@@ -59,9 +59,11 @@ export type OmpInterjectionAnchor = InterjectionMeta & {
 
 export function ompSessionInterjections(
   providerSessionId: string,
+  cwd?: string,
 ): Promise<OmpInterjectionAnchor[]> {
   return invoke<OmpInterjectionAnchor[]>("omp_session_interjections", {
     providerSessionId,
+    cwd,
   });
 }
 
@@ -73,8 +75,8 @@ export interface OmpAssistantText {
   concat: string;
 }
 
-export function ompActiveAssistantTexts(providerSessionId: string): Promise<OmpAssistantText[]> {
-  return invoke<OmpAssistantText[]>("omp_active_assistant_texts", { providerSessionId });
+export function ompActiveAssistantTexts(providerSessionId: string, cwd?: string): Promise<OmpAssistantText[]> {
+  return invoke<OmpAssistantText[]>("omp_active_assistant_texts", { providerSessionId, cwd });
 }
 
 export function claudeShellCommands(
@@ -118,8 +120,8 @@ export type ExternalEditor = {
   name: string;
 };
 
-export function listExternalEditors(): Promise<ExternalEditor[]> {
-  return invoke<ExternalEditor[]>("list_external_editors");
+export function listExternalEditors(cwd?: string): Promise<ExternalEditor[]> {
+  return invoke<ExternalEditor[]>("list_external_editors", { cwd });
 }
 
 export function openInExternalEditor(

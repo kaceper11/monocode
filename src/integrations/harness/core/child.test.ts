@@ -97,6 +97,16 @@ describe("concurrent binary discovery", () => {
   });
 });
 
+describe("Antigravity guest resolution", () => {
+  it("resolves the guest wrapper with POSIX args and ignores a native override", async () => {
+    const child = await loadChild();
+    mocks.invoke.mockResolvedValue({ path: "/home/me/.local/bin/agy_acp_server.par" });
+    const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
+    await expect(child.resolveAntigravityBinary(cwd, "C:/native/agy.exe")).resolves.toEqual({ path: "/home/me/.local/bin/agy_acp_server.par", args: ["--uid="] });
+    expect(mocks.invoke).toHaveBeenLastCalledWith("wsl_resolve_harness", { cwd, provider: "antigravity" });
+  });
+});
+
 describe("child bridge", () => {
   it("waits until every listener is installed", async () => {
     const pending = deferred<UnlistenFn>();

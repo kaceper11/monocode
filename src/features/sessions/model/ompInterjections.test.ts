@@ -458,6 +458,26 @@ describe("persisted session loading", () => {
     return { ...newSession(harness, "/tmp/project"), id: "repair-load", providerSessionId, blocks: oldBlocks() };
   }
 
+  it("reads recovery logs from the WSL worktree, never the native session root", async () => {
+    const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
+    const worktreeCwd = "//wsl.localhost/Debian/home/me/worktree";
+    const record = { ...stored(), cwd, worktreeCwd, blocks: [
+      { id: "a", role: "assistant", text: "First." },
+      { id: "status", role: "system", text: "Reviewed" },
+      { id: "b", role: "assistant", text: "Second." },
+    ] as Block[] };
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "session_get") return record;
+      if (command === "omp_session_interjections" || command === "omp_active_assistant_texts") {
+        expect(args).toEqual({ providerSessionId: "provider", cwd: worktreeCwd });
+        return [];
+      }
+      throw new Error(command);
+    });
+    await getSession(record.id);
+    expect(mocks.invoke.mock.calls.map(call => call[0])).toEqual(["session_get", "omp_session_interjections", "omp_active_assistant_texts"]);
+  });
+
   it("repairs before returning and persists only the first repair", async () => {
     let record = stored();
     let writes = 0;
@@ -491,7 +511,7 @@ describe("persisted session loading", () => {
       if (command === "session_get") return record;
       if (command === "omp_session_interjections") return [];
       if (command === "omp_active_assistant_texts") {
-        expect(args).toEqual({ providerSessionId: "provider" });
+        expect(args).toEqual({ providerSessionId: "provider", cwd: "/tmp/project" });
         return verified ? [{ text: "First.Second.", concat: "First.Second." }] : [];
       }
       if (command === "session_upsert") {

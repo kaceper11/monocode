@@ -181,10 +181,10 @@ fn resolve_editor(editor: &EditorDefinition) -> Option<EditorLauncher> {
         .map(EditorLauncher::Command)
 }
 
-fn installed_editors_sync() -> Vec<ExternalEditor> {
+fn installed_editors_sync(guest: bool) -> Vec<ExternalEditor> {
     EDITORS
         .iter()
-        .filter(|editor| resolve_editor(editor).is_some())
+        .filter(|editor| (!guest || supports_wsl(editor.id)) && resolve_editor(editor).is_some())
         .map(|editor| ExternalEditor {
             id: editor.id,
             name: editor.name,
@@ -193,16 +193,96 @@ fn installed_editors_sync() -> Vec<ExternalEditor> {
 }
 
 #[tauri::command(async)]
-pub async fn list_external_editors() -> Result<Vec<ExternalEditor>, String> {
-    tauri::async_runtime::spawn_blocking(installed_editors_sync)
+pub async fn list_external_editors(cwd: Option<String>) -> Result<Vec<ExternalEditor>, String> {
+    let guest = cwd
+        .as_deref()
+        .map(crate::wsl::location)
+        .transpose()?
+        .flatten()
+        .is_some();
+    tauri::async_runtime::spawn_blocking(move || installed_editors_sync(guest))
         .await
         .map_err(|error| error.to_string())
 }
 
+fn supports_wsl(editor_id: &str) -> bool {
+    matches!(editor_id, "vscode" | "vscode-insiders")
+}
+
+#[cfg(any(windows, test))]
+fn wsl_editor_args(location: &crate::wsl::Location) -> Vec<String> {
+    vec![
+        "--remote".into(),
+        format!("wsl+{}", location.distribution),
+        format!("{}/", location.path.trim_end_matches('/')),
+    ]
+}
+
+#[cfg(windows)]
+fn vscode_cli(program: &std::path::Path) -> Result<Command, String> {
+    // Use the shipped CLI rather than treating an Electron GUI as a shell.
+    let cli = program
+        .parent()
+        .ok_or("Could not locate the VS Code installation")?
+        .join("resources/app/out/cli.js");
+    if !cli.is_file() {
+        return Err(
+            "Choose a standard Windows VS Code or Insiders installation with its CLI.".into(),
+        );
+    }
+    let mut command = Command::new(program);
+    command.env("ELECTRON_RUN_AS_NODE", "1").arg(cli);
+    Ok(command)
+}
+
 fn launch_editor_sync(editor_id: &str, cwd: &str) -> Result<(), String> {
     let editor = definition(editor_id).ok_or_else(|| "Unknown external editor.".to_string())?;
-    if crate::wsl::location(cwd)?.is_some() {
-        return Err("Open this project from its WSL terminal to choose a remote editor.".into());
+    if let Some(_location) = crate::wsl::location(cwd)? {
+        if !supports_wsl(editor_id) {
+            return Err(format!(
+                "{} does not support opening WSL workspaces in MonoCode.",
+                editor.name
+            ));
+        }
+        #[cfg(not(windows))]
+        return Err("WSL remote editors require the Windows app.".into());
+        #[cfg(windows)]
+        {
+            let _: String =
+                crate::wsl::request(&_location, "canonical_directory", serde_json::json!({}))?;
+            let Some(EditorLauncher::Command(program)) = resolve_editor(editor) else {
+                return Err(format!("{} is no longer installed.", editor.name));
+            };
+            let mut probe = vscode_cli(&program)?;
+            probe.arg("--list-extensions");
+            let installed = crate::bounded_process::output(
+                &mut probe,
+                std::time::Duration::from_secs(15),
+                512 * 1024,
+            )?;
+            if !installed.status.success()
+                || !String::from_utf8_lossy(&installed.stdout)
+                    .lines()
+                    .any(|line| {
+                        line.trim()
+                            .eq_ignore_ascii_case("ms-vscode-remote.remote-wsl")
+                    })
+            {
+                return Err(format!(
+                    "Install the WSL extension in {} before opening this workspace.",
+                    editor.name
+                ));
+            }
+            let mut command = vscode_cli(&program)?;
+            command.args(wsl_editor_args(&_location));
+            return command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(|_| ())
+                .map_err(|error| format!("Could not open {} in WSL: {error}", editor.name));
+        }
     }
     let cwd = expand_home(cwd);
     if !cwd.is_dir() {
@@ -268,6 +348,22 @@ mod tests {
             );
             assert!(!editor.commands.is_empty());
         }
+    }
+
+    #[test]
+    fn wsl_remote_launch_preserves_the_named_distro_and_linux_folder() {
+        let location = crate::wsl::Location::new("Ubuntu Dev", "/home/me/a project.v1").unwrap();
+        assert_eq!(
+            wsl_editor_args(&location),
+            vec!["--remote", "wsl+Ubuntu Dev", "/home/me/a project.v1/"]
+        );
+        assert!(supports_wsl("vscode"));
+        assert!(supports_wsl("vscode-insiders"));
+        assert!(!supports_wsl("cursor"));
+        assert!(!supports_wsl("sublime-text"));
+        assert!(launch_editor_sync("sublime-text", &location.identity())
+            .unwrap_err()
+            .contains("does not support"));
     }
 
     #[test]

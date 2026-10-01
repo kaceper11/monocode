@@ -191,8 +191,9 @@ pub struct OmpAssistantText {
 #[tauri::command(async)]
 pub fn omp_session_interjections(
     provider_session_id: String,
+    cwd: Option<String>,
 ) -> Result<Vec<OmpInterjectionAnchor>, String> {
-    let Some(path) = omp_session_path(&provider_session_id)? else {
+    let Some(path) = omp_session_path(&provider_session_id, cwd.as_deref())? else {
         return Ok(Vec::new());
     };
     parse_omp_interjections(&path)
@@ -201,8 +202,9 @@ pub fn omp_session_interjections(
 #[tauri::command(async)]
 pub fn omp_active_assistant_texts(
     provider_session_id: String,
+    cwd: Option<String>,
 ) -> Result<Vec<OmpAssistantText>, String> {
-    let Some(path) = omp_session_path(&provider_session_id)? else {
+    let Some(path) = omp_session_path(&provider_session_id, cwd.as_deref())? else {
         return Ok(Vec::new());
     };
     active_omp_assistant_texts(&path)
@@ -307,7 +309,10 @@ fn claude_shell_commands_from_file(
     Ok(commands)
 }
 
-fn omp_session_path(provider_session_id: &str) -> Result<Option<PathBuf>, String> {
+fn omp_session_path(
+    provider_session_id: &str,
+    cwd: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
     if provider_session_id.is_empty()
         || !provider_session_id
             .bytes()
@@ -315,10 +320,15 @@ fn omp_session_path(provider_session_id: &str) -> Result<Option<PathBuf>, String
     {
         return Err("Invalid OMP provider session id".into());
     }
-    let root = dirs_home()
-        .map(PathBuf::from)
-        .ok_or("Home directory is unavailable")?
-        .join(".omp/agent/sessions");
+    let guest = cwd.map(wsl::location).transpose()?.flatten();
+    let root = if let Some(location) = guest {
+        wsl::config_path(&location, None, ".omp/agent/sessions")?
+    } else {
+        dirs_home()
+            .map(PathBuf::from)
+            .ok_or("Home directory is unavailable")?
+            .join(".omp/agent/sessions")
+    };
     Ok(find_omp_session_file(&root, provider_session_id))
 }
 

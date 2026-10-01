@@ -1,5 +1,5 @@
 import { homeDir } from "../../../../platform/tauri/fs";
-import { setHarnessModels } from "../../../../features/sessions/model/models";
+import { refreshModelCatalog } from "../../../../features/sessions/model/models";
 import { AcpClient } from "../../core/acp";
 import {
   killChild,
@@ -15,26 +15,12 @@ import {
 
 const PROBE_ID = "monocode-antigravity-probe";
 const REQUEST_TIMEOUT_MS = 12_000;
-let inflight: Promise<void> | null = null;
-
-export function refreshAntigravityCatalog(): Promise<void> {
-  if (inflight) return inflight;
-  inflight = discoverAntigravityModels()
-    .then((models) => {
-      if (models.length > 0) setHarnessModels("antigravity", models);
-    })
-    .catch((error: unknown) => {
-      // Preserve the last live catalog (or startup seeds) when offline/logged out.
-      console.debug("[monocode] antigravity catalog", error);
-    })
-    .finally(() => {
-      inflight = null;
-    });
-  return inflight;
+export function refreshAntigravityCatalog(cwd?: string): Promise<void> {
+  return refreshModelCatalog("antigravity", cwd, discoverAntigravityModels);
 }
 
 export async function discoverAntigravityModels(workingDirectory?: string) {
-  const { path, args } = await resolveAntigravityBinary();
+  const { path, args } = await resolveAntigravityBinary(workingDirectory);
   const cwd = workingDirectory ?? (await homeDir());
   const probeId = `${PROBE_ID}-${crypto.randomUUID()}`;
   const acp = new AcpClient(probeId, {

@@ -46,17 +46,9 @@ type OpencodeGoUsageFetch = {
 export async function fetchOpencodeGoRateLimits(
   cwd?: string,
 ): Promise<ProviderRateLimits> {
-  if (cwd && wslLocation(cwd))
-    return {
-      ...unavailableRateLimits(
-        "opencode",
-        "OpenCode usage is not supported inside WSL yet.",
-      ),
-      status: "unsupported",
-    };
   let result: OpencodeGoUsageFetch;
   try {
-    result = await invoke<OpencodeGoUsageFetch>("fetch_opencode_go_usage");
+    result = await invoke<OpencodeGoUsageFetch>("fetch_opencode_go_usage", { cwd });
   } catch (error) {
     return errorRateLimits(
       "opencode",

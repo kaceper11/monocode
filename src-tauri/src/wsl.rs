@@ -367,6 +367,8 @@ pub fn agent_acknowledgement(acknowledgement: &str, cmd: &Command) -> Result<Str
         "MONOCODE_CONTROL_TOKEN",
         "MONOCODE_APP_ENDPOINT",
         "MONOCODE_APP_TOKEN",
+        "OPENCODE_SERVER_PASSWORD",
+        "OPENCODE_SERVER_USERNAME",
         "TMPDIR",
         "TMP",
         "TEMP",
@@ -403,7 +405,7 @@ pub fn agent_acknowledgement(acknowledgement: &str, cmd: &Command) -> Result<Str
 
 /// The login-shell environment changes only through refresh_environment, which
 /// bumps the bridge generation, so launches reuse the cached payload.
-fn agent_environment(location: &Location) -> Result<Arc<Value>, String> {
+pub(crate) fn agent_environment(location: &Location) -> Result<Arc<Value>, String> {
     let bridge = bridge_for(location)?;
     let generation = bridge.generation.load(Ordering::SeqCst);
     {
@@ -1494,6 +1496,214 @@ mod tests {
         .is_err());
     }
 
+    /// Explicit acceptance entrypoint. Never treat a missing distro as a pass.
+    #[test]
+    #[ignore = "requires Windows/WSL2; run scripts/test-wsl.ps1 -Distribution <name>"]
+    fn live_wsl_acceptance() {
+        use base64::Engine;
+        if !cfg!(windows) {
+            panic!("Real acceptance requires Windows and wsl.exe");
+        }
+        let distro = std::env::var("MONOCODE_TEST_WSL_DISTRO")
+            .expect("Choose MONOCODE_TEST_WSL_DISTRO explicitly");
+        assert!(
+            wsl_distributions()
+                .unwrap()
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&distro)),
+            "The selected distro is not installed"
+        );
+        let setup = "import tempfile,subprocess; from pathlib import Path; p=tempfile.mkdtemp(prefix='monocode-wsl-acceptance-',dir='/tmp'); subprocess.run(['git','init','-q',p],check=True); (Path(p)/'a file.txt').write_text('guest-only'); print(p)";
+        let output = crate::bounded_process::output(
+            wsl_command().unwrap().args(wsl_args(
+                &distro,
+                "/",
+                "/usr/bin/python3",
+                &["-c".into(), setup.into()],
+            )),
+            Duration::from_secs(20),
+            8192,
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let root = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        assert!(root.starts_with("/tmp/monocode-wsl-acceptance-"));
+        let location = Location::new(&distro, &root).unwrap();
+        struct Cleanup(Location);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(hosts) = HOSTS.get() {
+                    hosts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&self.0.distribution.to_lowercase());
+                }
+                if let Ok(mut command) = wsl_command() {
+                    command.args(wsl_args(
+                        &self.0.distribution,
+                        "/",
+                        "/usr/bin/python3",
+                        &[
+                            "-c".into(),
+                            "import shutil,sys; shutil.rmtree(sys.argv[1])".into(),
+                            self.0.path.clone(),
+                        ],
+                    ));
+                    let _ =
+                        crate::bounded_process::output(&mut command, Duration::from_secs(10), 8192);
+                }
+            }
+        }
+        let _cleanup = Cleanup(location.clone());
+        let mut bridge_command = wsl_command().unwrap();
+        bridge_command.args(wsl_args(
+            &distro,
+            "/",
+            "/usr/bin/python3",
+            &["-u".into(), "-c".into(), stdin_bootstrap(SCRIPT)],
+        ));
+        connect_bridge(
+            HOSTS.get_or_init(Mutex::default),
+            &location,
+            &mut bridge_command,
+            None,
+        )
+        .unwrap();
+        let file = location.with_path(&format!("{root}/a file.txt")).unwrap();
+        assert_eq!(
+            request::<String>(&file, "read_text", json!({})).unwrap(),
+            "guest-only"
+        );
+        let status: Value =
+            request(&location, "git", json!({"args":["status", "--porcelain"]})).unwrap();
+        assert!(status.to_string().contains("a file.txt"));
+
+        let password = uuid::Uuid::new_v4().to_string();
+        let fixture = include_str!("../../scripts/wsl-acceptance-server.py");
+        let (mut command, nonce, acknowledgement) = agent_command(
+            &location,
+            "/usr/bin/python3",
+            &["-u".into(), "-c".into(), fixture.into()],
+        )
+        .unwrap();
+        command
+            .env("OPENCODE_SERVER_PASSWORD", &password)
+            .env("OPENCODE_SERVER_USERNAME", "opencode");
+        let acknowledgement = agent_acknowledgement(&acknowledgement, &command).unwrap();
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (reader, process) =
+            agent_handshake(child.stdout.take().unwrap(), location.clone(), &nonce).unwrap();
+        struct OwnedChild(std::process::Child, LinuxProcess);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.1.stop();
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut owned = OwnedChild(child, process);
+        let input = owned.0.stdin.as_mut().unwrap();
+        writeln!(input, "{acknowledgement}").unwrap();
+        input.flush().unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut line = String::new();
+            let _ = send.send(reader.read_line(&mut line).map(|_| line));
+        });
+        let url = receive
+            .recv_timeout(Duration::from_secs(15))
+            .expect("Guest server startup timed out")
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert!(url.starts_with("http://127.0.0.1:"));
+        let headers = HashMap::from([(
+            "Authorization".into(),
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("opencode:{password}"))
+            ),
+        )]);
+        let mut health = None;
+        for _ in 0..30 {
+            if let Ok(response) = tauri::async_runtime::block_on(crate::harness::harness_http(
+                format!("{url}/global/health"),
+                "GET".into(),
+                Some(headers.clone()),
+                None,
+                Some(500),
+            )) {
+                if response.status == 200 {
+                    health = Some(serde_json::from_str::<Value>(&response.body).unwrap());
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let health = health.expect(
+            "Windows cannot reach the owned guest loopback server; check WSL localhost forwarding",
+        );
+        assert_eq!(health["healthy"], true);
+        assert_eq!(health["cwd"], root);
+        let wrong = tauri::async_runtime::block_on(crate::harness::harness_http(
+            format!("{url}/global/health"),
+            "GET".into(),
+            None,
+            None,
+            Some(1000),
+        ))
+        .unwrap();
+        assert_eq!(wrong.status, 401);
+        let (send, receive) = mpsc::sync_channel(1);
+        let event_url = format!("{url}/event");
+        let stream = tauri::async_runtime::spawn(async move {
+            let mut events = Vec::new();
+            let result =
+                crate::harness::receive_sse(&event_url, Some(&headers), |event| events.push(event))
+                    .await;
+            let _ = send.send(result.map(|_| events));
+        });
+        let events = receive.recv_timeout(Duration::from_secs(5));
+        stream.abort();
+        assert_eq!(
+            events.unwrap().unwrap(),
+            vec![r#"{"type":"fixture.ready"}"#]
+        );
+        owned.1.stop().unwrap();
+        let worker = location.with_path(&format!("{root}/worker.pid")).unwrap();
+        let worker: String = request(&worker, "read_text", json!({})).unwrap();
+        assert!(worker.bytes().all(|byte| byte.is_ascii_digit()));
+        let stopped = format!("import pathlib; p=pathlib.Path('/proc/{worker}/stat'); assert not p.exists() or p.read_text().split(') ')[1].split()[0]=='Z', 'Owned descendant survived cancellation'");
+        std::thread::sleep(Duration::from_millis(500));
+        let checked = crate::bounded_process::output(
+            wsl_command().unwrap().args(wsl_args(
+                &distro,
+                "/",
+                "/usr/bin/python3",
+                &["-c".into(), stopped],
+            )),
+            Duration::from_secs(10),
+            8192,
+        )
+        .unwrap();
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        println!("Real WSL bridge, guest process, authenticated HTTP/SSE and descendant cleanup passed for {distro}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn guest_cli_mutations_resolve_on_their_own_channel_and_reject_changed_binaries() {
@@ -1518,11 +1728,7 @@ with tempfile.TemporaryDirectory() as directory:
         except ValueError:
             pass
     assert handle({**request, 'provider':'opencode'}).strip() == 'guest-version'
-    try:
-        find_agent('opencode')
-        raise AssertionError('unsupported agent transport became available')
-    except ValueError:
-        pass
+    assert find_agent('opencode') == str(opencode)
 "#;
         let script = format!(
             "__name__='fixture'\nexec({})\n{}",
@@ -1611,6 +1817,8 @@ with tempfile.TemporaryDirectory() as directory:
             .env("MONOCODE_APP_TOKEN", "app-session-only")
             .env("MONOCODE_APP_ENDPOINT", "127.0.0.1:8765")
             .env("TMPDIR", "/tmp/worker")
+            .env("OPENCODE_SERVER_PASSWORD", "owned-server-only")
+            .env("OPENCODE_SERVER_USERNAME", "opencode")
             .env("PATH", "C:/Windows")
             .env("UNRELATED_SECRET", "never-transfer");
         let message: Value =
@@ -1618,6 +1826,14 @@ with tempfile.TemporaryDirectory() as directory:
         assert_eq!(message["nonce"], "one");
         assert_eq!(message["environment"]["PATH"], "/linux/bin");
         assert_eq!(message["environment"]["TMPDIR"], "/tmp/worker");
+        assert_eq!(
+            message["environment"]["OPENCODE_SERVER_PASSWORD"],
+            "owned-server-only"
+        );
+        assert_eq!(
+            message["environment"]["OPENCODE_SERVER_USERNAME"],
+            "opencode"
+        );
         assert_eq!(
             message["environment"]["MONOCODE_CONTROL_TOKEN"],
             "session-only"

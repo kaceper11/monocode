@@ -409,10 +409,10 @@ export async function getSession(sessionId: string): Promise<Session | null> {
     return recoverCursorSubagents(session);
   }
   try {
-    const anchors = await ompSessionInterjections(session.providerSessionId);
+    const anchors = await ompSessionInterjections(session.providerSessionId, session.worktreeCwd ?? session.cwd);
     // Missing source order must not prevent the existing anchored repair.
     const source = ompStatusSplitTexts(session.blocks).length
-      ? await ompActiveAssistantTexts(session.providerSessionId).catch(() => [])
+      ? await ompActiveAssistantTexts(session.providerSessionId, session.worktreeCwd ?? session.cwd).catch(() => [])
       : [];
     const blocks = backfillOmpInterjections(session.blocks, anchors, source);
     if (blocks !== session.blocks) {

@@ -133,8 +133,6 @@ export function harnessUnavailableHint(id: HarnessId, cwd?: string): string {
   const error = probes.get(hostKey(cwd))?.errors[id];
   if (error) return error;
   if (cwd && wslLocation(cwd)) {
-    if (id === "opencode")
-      return "OpenCode HTTP is not supported in WSL yet. Choose a stdio agent such as Claude or Codex.";
     return `${CLI[id].name} is unavailable in ${wslLocation(cwd)!.distribution}. Install its Linux CLI, reconnect WSL and retry.`;
   }
   const { name, install } = CLI[id];
@@ -244,7 +242,7 @@ export function probeHarnessAvailability(options?: {
     devin: resolveDevinBinary,
     copilot: resolveCopilotBinary,
     muse: resolveMuseBinary,
-    antigravity: () => resolveAntigravityBinary(),
+    antigravity: resolveAntigravityBinary,
   };
   current.inflight = Promise.all(
     HARNESSES.map(async (id) => {

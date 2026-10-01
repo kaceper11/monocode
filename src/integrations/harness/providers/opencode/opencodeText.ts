@@ -1,3 +1,4 @@
+import { wslLocation } from "../../../../shared/lib/paths";
 import { modelsFor } from "../../../../features/sessions/model/models";
 import type { TurnIntent } from "../../../../features/sessions/model/session";
 import {
@@ -172,6 +173,7 @@ async function startLive(
   }
 
   serverUrl = "";
+  let serverExited = false;
   watchChild(
     TEXT_CHILD_ID,
     (line) => {
@@ -179,6 +181,7 @@ async function startLive(
       if (parsed) serverUrl = parsed;
     },
     () => {
+      serverExited = true;
       if (live) live = null;
     },
     (line) => {
@@ -187,7 +190,8 @@ async function startLive(
     },
   );
 
-  const port = await freeHarnessPort();
+  const serverPassword = wslLocation(cwd) ? crypto.randomUUID() : undefined;
+  const port = serverPassword ? 0 : await freeHarnessPort();
   await spawnChild(
     TEXT_CHILD_ID,
     path,
@@ -195,11 +199,13 @@ async function startLive(
     cwd,
     undefined,
     "opencode",
+    ...(serverPassword ? [serverPassword] as const : [] as const),
   );
 
   try {
     const url = await waitForUrl(() => serverUrl, SERVER_TIMEOUT_MS);
-    const client = new OpenCodeClient(url, cwd);
+    const client = new OpenCodeClient(url, cwd, serverPassword);
+    await client.waitUntilReady(() => !serverExited);
     const created = await client.createSession({
       permission: [{ permission: "*", pattern: "*", action: "deny" }],
     });

@@ -1,3 +1,4 @@
+import { wslLocation } from "../../../../shared/lib/paths";
 import { modelContextWindow, nativeModelId } from "../../../../features/sessions/model/models";
 import type { RuntimeMode, TurnMetrics } from "../../../../features/sessions/model/session";
 import { taskListFromToolInput } from "../../../../features/sessions/model/taskList";
@@ -257,7 +258,7 @@ export async function steerOpenCodeTurn(input: SteerTurnInput): Promise<void> {
     );
   }
 
-  const parts = toOpenCodePromptParts(input.text, input.attachments);
+  const parts = toOpenCodePromptParts(input.text, input.attachments, input.cwd);
   if (parts.length === 0) return;
 
   await live.client.promptAsync({
@@ -404,7 +405,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     },
   );
 
-  const port = await freeHarnessPort();
+  const serverPassword = wslLocation(input.cwd) ? crypto.randomUUID() : undefined;
+  const port = serverPassword ? 0 : await freeHarnessPort();
   await spawnChild(
     input.sessionId,
     path,
@@ -412,6 +414,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     input.cwd,
     undefined,
     "opencode",
+    ...(serverPassword ? [serverPassword] as const : [] as const),
   );
 
   try {
@@ -420,7 +423,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       () => serverExited,
       SERVER_TIMEOUT_MS,
     );
-    const client = new OpenCodeClient(url, input.cwd);
+    const client = new OpenCodeClient(url, input.cwd, serverPassword);
+    await client.waitUntilReady(() => serverExited === undefined);
     const openCodeSession = await resolveSession(client, {
       resume: canResume ? resume : undefined,
       runtimeMode: input.runtimeMode,

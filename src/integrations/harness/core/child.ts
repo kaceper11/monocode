@@ -332,6 +332,7 @@ export async function spawnChild(
   cwd: string,
   account?: { provider: "claude" | "codex"; id: string },
   binaryProvider?: ConfigurableBinaryProvider,
+  openCodeServerPassword?: string,
 ): Promise<void> {
   const generation = ++nextGeneration;
   childGeneration.set(sessionId, generation);
@@ -357,6 +358,7 @@ export async function spawnChild(
       account,
       binaryProvider,
       binaryPath,
+      ...(openCodeServerPassword ? { openCodeServerPassword } : {}),
     }));
   } catch (error) {
     if (childGeneration.get(sessionId) === generation)
@@ -610,8 +612,9 @@ export function resolveMuseBinary(cwd?: string, binaryPath?: string | null): Pro
   return resolveBinary("muse", cwd, binaryPath);
 }
 
-export function resolveAntigravityBinary(binaryPath?: string | null): Promise<{ path: string; args: string[] }> {
-  return resolveHarnessBinary("antigravity", binaryPath) as Promise<{ path: string; args: string[] }>;
+export async function resolveAntigravityBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string; args: string[] }> {
+  const binary = await resolveBinary("antigravity", cwd, binaryPath);
+  return wslLocation(cwd ?? "") ? { ...binary, args: ["--uid="] } : binary as { path: string; args: string[] };
 }
 
 export function freeHarnessPort(): Promise<number> {

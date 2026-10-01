@@ -1,3 +1,4 @@
+import { wslLocation, wslPath } from "../../../../shared/lib/paths";
 import {
   closeHarnessSse,
   harnessHttp,
@@ -38,10 +39,15 @@ export class OpenCodeClient {
   constructor(
     readonly baseUrl: string,
     readonly directory: string,
+    private readonly serverPassword?: string,
   ) {}
 
   async getSession(sessionID: string): Promise<OpenCodeSession> {
-    return this.request<OpenCodeSession>("GET", `/session/${enc(sessionID)}`);
+    const session = await this.request<OpenCodeSession>("GET", `/session/${enc(sessionID)}`);
+    const guest = wslLocation(this.directory);
+    return guest && session.directory
+      ? { ...session, directory: wslPath(guest.distribution, this.wireDirectory(session.directory)) }
+      : session;
   }
 
   async getMessages(sessionID: string): Promise<OpenCodeMessage[]> {
@@ -84,7 +90,7 @@ export class OpenCodeClient {
       "POST",
       `/session/${enc(sessionID)}/fork`,
       {
-        query: { directory },
+        query: { directory: this.wireDirectory(directory) },
         body: {},
       },
     );
@@ -238,9 +244,39 @@ export class OpenCodeClient {
     return unwrapData<T>(parsed);
   }
 
+  /** Only readiness reads are retried; session writes are never replayed. */
+  async waitUntilReady(isAlive: () => boolean): Promise<void> {
+    if (!this.serverPassword) return;
+    const deadline = Date.now() + 10_000;
+    while (isAlive() && Date.now() < deadline) {
+      try {
+        const health = await this.request<{ healthy?: boolean }>("GET", "/global/health", { timeoutMs: 500 });
+        if (health?.healthy === true && isAlive()) return;
+      } catch (error) {
+        if (error instanceof OpenCodeHttpError && (error.status === 401 || error.status === 403)) {
+          throw new Error("The WSL OpenCode endpoint did not authenticate as the owned server.");
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error("Could not reach the owned OpenCode server. Check WSL localhost forwarding and retry.");
+  }
+
+  private wireDirectory(directory: string): string {
+    const guest = wslLocation(this.directory);
+    if (!guest) return directory;
+    const target = wslLocation(directory);
+    if (target && target.distribution.toLowerCase() !== guest.distribution.toLowerCase()) {
+      throw new Error("OpenCode directory belongs to another WSL distribution.");
+    }
+    const path = target?.path ?? directory;
+    wslPath(guest.distribution, path); // Validate the Linux path before sending it.
+    return path;
+  }
+
   private url(path: string, query?: Record<string, string>): string {
     const url = new URL(path, `${this.baseUrl.replace(/\/$/, "")}/`);
-    url.searchParams.set("directory", this.directory);
+    url.searchParams.set("directory", this.wireDirectory(this.directory));
     if (query) {
       for (const [key, value] of Object.entries(query)) {
         url.searchParams.set(key, value);
@@ -252,7 +288,8 @@ export class OpenCodeClient {
   private headers(json = false): Record<string, string> {
     return {
       ...(json ? { "Content-Type": "application/json" } : {}),
-      "x-opencode-directory": encodeURIComponent(this.directory),
+      "x-opencode-directory": encodeURIComponent(this.wireDirectory(this.directory)),
+      ...(this.serverPassword ? { Authorization: `Basic ${btoa(`opencode:${this.serverPassword}`)}` } : {}),
     };
   }
 }

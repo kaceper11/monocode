@@ -364,6 +364,28 @@ describe("settings pages", () => {
     expect(providerAccounts("codex")).toHaveLength(1);
   });
 
+  it("inspects the selected guest CLI without offering native override editing", async () => {
+    const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
+    localStorage.setItem("monocode.providerBinaryPaths.v1", JSON.stringify({ codex: "C:/custom/codex.exe" }));
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "wsl_resolve_harness") {
+        expect(args).toEqual({ cwd, provider: "codex" });
+        return { path: "/home/me/.local/bin/codex" };
+      }
+      if (command === "harness_exec") return "codex 1.0.0";
+      return undefined;
+    });
+    await render("providers", { cwd });
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Show Codex CLI details"]')!.click());
+    const dialog = document.querySelector('[aria-label="Codex CLI details"]')!;
+    expect(dialog.textContent).toContain("WSL · Ubuntu");
+    expect(dialog.textContent).toContain("/home/me/.local/bin/codex");
+    expect(dialog.textContent).toContain("Windows CLI overrides do not apply");
+    expect(dialog.querySelector('[aria-label="Edit Codex CLI path"]')).toBeNull();
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("harness_exec", expect.objectContaining({ cwd, command: "/home/me/.local/bin/codex", binaryPath: undefined }));
+    expect(localStorage.getItem("monocode.providerBinaryPaths.v1")).toContain("C:/custom/codex.exe");
+  });
+
   it("validates and stores Codex and OpenCode binary overrides", async () => {
     let failAutoCodex = false;
     vi.mocked(invoke).mockImplementation(async (command, args) => {

@@ -1097,7 +1097,18 @@ pub fn harness_spawn(
     account: Option<HarnessAccount>,
     binary_provider: Option<String>,
     binary_path: Option<String>,
+    open_code_server_password: Option<String>,
 ) -> Result<u32, String> {
+    if let Some(password) = &open_code_server_password {
+        if binary_provider.as_deref() != Some("opencode")
+            || !(32..=128).contains(&password.len())
+            || !password
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err("Invalid owned OpenCode server credentials".into());
+        }
+    }
     let location = crate::wsl::location(&cwd)?;
     validate_account_host(account.as_ref(), location.as_ref())?;
     let workdir = expand_home(&cwd);
@@ -1134,6 +1145,11 @@ pub fn harness_spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_provider_account(&app, &mut cmd, account.as_ref())?;
+
+    if let Some(password) = &open_code_server_password {
+        cmd.env("OPENCODE_SERVER_PASSWORD", password)
+            .env("OPENCODE_SERVER_USERNAME", "opencode");
+    }
 
     crate::control::configure_child(&app, &session_id, &mut cmd);
     let acknowledgement = acknowledgement
@@ -1629,7 +1645,11 @@ pub async fn harness_http(
     tauri::async_runtime::spawn_blocking(move || {
         assert_loopback(&url)?;
         let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1));
-        let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+        let agent = ureq::AgentBuilder::new()
+            .timeout(timeout)
+            .redirects(0)
+            .try_proxy_from_env(false)
+            .build();
         let mut request = agent.request(&method, &url);
         if let Some(headers) = &headers {
             for (key, value) in headers {
@@ -1708,7 +1728,7 @@ fn read_http_response(response: ureq::Response) -> Result<HarnessHttpResponse, S
     Ok(HarnessHttpResponse { status, body })
 }
 
-async fn receive_sse(
+pub(crate) async fn receive_sse(
     url: &str,
     headers: Option<&HashMap<String, String>>,
     mut emit: impl FnMut(String),

@@ -17,6 +17,7 @@ const harnessHttp = vi.fn(
     body?: string;
   }): Promise<{ status: number; body: string }> => {
     const url = new URL(input.url);
+    if (url.pathname === "/global/health") return { status: 200, body: '{"healthy":true}' };
     if (input.method === "POST" && url.pathname === "/session") {
       return { status: 200, body: JSON.stringify({ id: "session_1" }) };
     }
@@ -81,11 +82,11 @@ const waitFor = async (predicate: () => boolean, label: string) => {
 
 function turn(
   events: HarnessEvent[],
-  options: { runtimeMode?: RuntimeMode; onAccepted?: () => void } = {},
+  options: { runtimeMode?: RuntimeMode; onAccepted?: () => void; cwd?: string } = {},
 ) {
   return sendOpenCodeTurn({
     sessionId: "opencode-live",
-    cwd: "/repo",
+    cwd: options.cwd ?? "/repo",
     model: "opencode:openrouter/anthropic/claude-sonnet-4.6",
     runtimeMode: options.runtimeMode ?? "supervised",
     text: "delegate the investigation",
@@ -149,6 +150,20 @@ beforeEach(() => {
 afterEach(async () => {
   await stopOpenCodeSession("opencode-live");
   __openCodeTestReset();
+});
+
+it("starts an owned WSL server on a guest-selected port before sending Linux-scoped requests", async () => {
+  const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
+  const events: HarnessEvent[] = [];
+  const onAccepted = vi.fn();
+  const done = turn(events, { cwd, onAccepted });
+  await waitFor(() => onAccepted.mock.calls.length === 1, "guest turn acceptance");
+  expect(spawnChild).toHaveBeenCalledWith("opencode-live", "/fake/opencode", ["serve", "--hostname=127.0.0.1", "--port=0"], cwd, undefined, "opencode", expect.stringMatching(/^[0-9a-f-]{36}$/));
+  for (const [request] of harnessHttp.mock.calls) {
+    expect(new URL(request.url).searchParams.get("directory")).toBe("/home/me/repo");
+  }
+  idle();
+  await done;
 });
 
 it("reports when OpenCode accepts a turn", async () => {

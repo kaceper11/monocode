@@ -387,7 +387,7 @@ async function startLive(input: SendTurnInput, life: number): Promise<Live> {
   if (retired()) throw new Error("Antigravity session stopped during startup");
   const childKey = `${input.sessionId}#${childSeq++}`;
 
-  const { path, args } = await resolveAntigravityBinary();
+  const { path, args } = await resolveAntigravityBinary(input.cwd);
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(childKey, handlers);
   const pendingSetup = { acp, childKey };

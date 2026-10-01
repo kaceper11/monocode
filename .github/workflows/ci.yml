@@ -53,6 +53,9 @@ jobs:
 
       - run: npm ci
       - run: npm test
+      - name: WSL guest bridge regressions
+        if: runner.os != 'Windows'
+        run: python3 scripts/test-wsl-bridge.py
       - run: npx tsc --noEmit
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings

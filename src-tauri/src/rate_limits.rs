@@ -47,8 +47,8 @@ const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 /// Runs in the host process so the webview CORS policy does not apply.
 /// The key never leaves the host process.
 #[tauri::command]
-pub async fn fetch_opencode_go_usage() -> Result<OpencodeGoUsageFetch, String> {
-    tauri::async_runtime::spawn_blocking(fetch_opencode_go_usage_sync)
+pub async fn fetch_opencode_go_usage(cwd: Option<String>) -> Result<OpencodeGoUsageFetch, String> {
+    tauri::async_runtime::spawn_blocking(move || fetch_opencode_go_usage_sync(cwd.as_deref()))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -67,8 +67,13 @@ fn opencode_go_result(
     }
 }
 
-fn fetch_opencode_go_usage_sync() -> Result<OpencodeGoUsageFetch, String> {
-    let Some(api_key) = read_opencode_go_api_key() else {
+fn fetch_opencode_go_usage_sync(cwd: Option<&str>) -> Result<OpencodeGoUsageFetch, String> {
+    let guest = cwd.map(crate::wsl::location).transpose()?.flatten();
+    let api_key = match guest {
+        Some(location) => read_guest_opencode_go_api_key(&location)?,
+        None => read_opencode_go_api_key(),
+    };
+    let Some(api_key) = api_key else {
         return Ok(opencode_go_result(
             "unavailable",
             None,
@@ -189,6 +194,68 @@ fn read_opencode_go_api_key() -> Option<String> {
         })
         .ok()?;
     extract_opencode_go_api_key(&raw)
+}
+
+/// Read only the selected guest's configuration; never try native credentials.
+fn read_guest_opencode_go_api_key(
+    location: &crate::wsl::Location,
+) -> Result<Option<String>, String> {
+    let environment = crate::wsl::agent_environment(location)?;
+    let lookup = |key: &str| {
+        environment[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    if let Some(blob) = lookup("OPENCODE_AUTH_CONTENT") {
+        if let Ok(value) = serde_json::from_str::<Value>(&blob) {
+            if value.is_object() {
+                return Ok(extract_opencode_go_key(&value));
+            }
+        }
+    }
+    if let Some(value) =
+        lookup("OPENCODE_CONFIG_CONTENT").and_then(|raw| parse_opencode_config(&raw))
+    {
+        if let Some(key) = config_go_api_key_with_lookup(&value, lookup) {
+            return Ok(Some(key));
+        }
+    }
+    let mut paths = Vec::new();
+    if lookup("OPENCODE_CONFIG").is_some() {
+        paths.push(crate::wsl::config_path(
+            location,
+            Some("OPENCODE_CONFIG"),
+            "",
+        )?);
+    }
+    let config =
+        crate::wsl::config_path(location, Some("XDG_CONFIG_HOME"), ".config")?.join("opencode");
+    paths.extend([config.join("opencode.jsonc"), config.join("opencode.json")]);
+    for path in paths {
+        if let Some(value) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| parse_opencode_config(&raw))
+        {
+            if let Some(key) = config_go_api_key_with_lookup(&value, lookup) {
+                return Ok(Some(key));
+            }
+        }
+    }
+    let data = if lookup("OPENCODE_DATA_DIR").is_some() {
+        crate::wsl::config_path(location, Some("OPENCODE_DATA_DIR"), "")?
+    } else {
+        let app = lookup("OPENCODE_APPNAME").unwrap_or_else(|| "opencode".into());
+        if matches!(app.as_str(), "." | "..") || app.contains(['/', '\\', ':']) {
+            return Err("OPENCODE_APPNAME must be a guest directory name".into());
+        }
+        crate::wsl::config_path(location, Some("XDG_DATA_HOME"), ".local/share")?.join(app)
+    };
+    let auth = data.join("auth.json");
+    Ok(std::fs::read_to_string(auth)
+        .ok()
+        .and_then(|raw| extract_opencode_go_api_key(&raw)))
 }
 
 /// Explicit `provider.options.apiKey` for the Go provider in opencode
@@ -332,6 +399,13 @@ fn strip_jsonc_trailing_commas(raw: &str) -> String {
 }
 
 fn config_go_api_key(value: &Value) -> Option<String> {
+    config_go_api_key_with_lookup(value, env_var)
+}
+
+fn config_go_api_key_with_lookup(
+    value: &Value,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
     let providers = value.get("provider")?.as_object()?;
     for id in ["opencode-go", "opencode"] {
         let Some(api_key) = providers
@@ -348,7 +422,7 @@ fn config_go_api_key(value: &Value) -> Option<String> {
             .strip_prefix("{env:")
             .and_then(|rest| rest.strip_suffix('}'))
         {
-            if let Some(resolved) = env_var(var) {
+            if let Some(resolved) = lookup(var) {
                 return Some(resolved);
             }
             continue;
@@ -842,6 +916,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config_go_api_key(&value).as_deref(), Some("sk-go-cfg"));
+    }
+
+    #[test]
+    fn opencode_config_environment_references_use_the_selected_host() {
+        let value: Value = serde_json::from_str(
+            r#"{"provider":{"opencode-go":{"options":{"apiKey":"{env:SELECTED_KEY}"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config_go_api_key_with_lookup(&value, |name| (name == "SELECTED_KEY")
+                .then(|| "guest-only-key".into())),
+            Some("guest-only-key".into())
+        );
+        assert_eq!(config_go_api_key_with_lookup(&value, |_| None), None);
     }
 
     #[test]

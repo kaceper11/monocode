@@ -23,7 +23,7 @@ it("keeps native and distribution probes separate, coalesces requests and refres
         return {
           codex: { path: "/usr/bin/codex", authenticated: true },
           pi: { path: "/home/me/.local/bin/pi", authenticated: false },
-          opencode: { error: "OpenCode HTTP is not supported in WSL yet" },
+          opencode: { path: "/usr/bin/opencode" },
         };
       return {};
     }
@@ -55,6 +55,7 @@ it("keeps native and distribution probes separate, coalesces requests and refres
   expect(isHarnessAvailable("codex", cwd)).toBe(true);
   expect(isHarnessAvailable("claude", cwd)).toBe(false);
   expect(isHarnessAvailable("pi", cwd)).toBe(true);
+  expect(isHarnessAvailable("opencode", cwd)).toBe(true);
   // Auth is reported separately from binary discovery.
   expect(harnessAuthHint("codex", cwd)).toBeUndefined();
   expect(harnessAuthHint("pi", cwd)).toContain("not signed in");

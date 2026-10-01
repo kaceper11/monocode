@@ -1,6 +1,6 @@
 import { useWslStatus } from "../../sessions/model/wslStatus";
 import { KeepAwakeControl } from "../../sessions/ui/KeepAwakeControl";
-import { wslLocation } from "../../../shared/lib/paths";
+import { wslLocation, wslPath } from "../../../shared/lib/paths";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ConnectionsSettings } from "../../connections/ui/ConnectionsSettings";
@@ -2754,9 +2754,12 @@ function binaryInspectionError(
 
 function ProviderBinaryControl({
   provider,
+  cwd,
 }: {
   provider: ConfigurableBinaryProvider;
+  cwd?: string;
 }) {
+  const guest = wslLocation(cwd ?? "");
   const root = useRef<HTMLSpanElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const editInput = useRef<HTMLInputElement>(null);
@@ -2782,10 +2785,10 @@ function ProviderBinaryControl({
       setError(null);
       setRevealError(null);
       try {
-        const next = await inspectHarnessBinary(provider, binaryPath);
+        const next = await inspectHarnessBinary(provider, guest ? null : binaryPath, cwd);
         setInspection({
           ...next,
-          overridden: Boolean(binaryPath?.trim()),
+          overridden: !guest && Boolean(binaryPath?.trim()),
         });
         setError(binaryInspectionError(provider, next));
         return next;
@@ -2797,7 +2800,7 @@ function ProviderBinaryControl({
         setWorking(false);
       }
     },
-    [provider],
+    [provider, cwd],
   );
 
   useEffect(() => {
@@ -2849,7 +2852,7 @@ function ProviderBinaryControl({
   };
 
   const title = HARNESS_TITLE[provider];
-  const restartRequired = providerBinaryPathChangePending(provider);
+  const restartRequired = !guest && providerBinaryPathChangePending(provider);
 
   return (
     <span ref={root} className="inline-flex align-middle">
@@ -2917,14 +2920,14 @@ function ProviderBinaryControl({
             </span>
             <div className="flex items-center gap-1.5">
               <span className="rounded-full bg-content/10 px-1.5 py-0.5 text-[10px] text-content/50">
-                Global path
+                {guest ? `WSL · ${guest.distribution}` : IS_WIN ? "Windows CLI path" : "Native CLI path"}
               </span>
               <span className="rounded-full bg-content/10 px-1.5 py-0.5 text-[10px] text-content/50">
                 {error
                   ? "Needs attention"
                   : restartRequired
                     ? "Restart required"
-                    : overridden
+                    : !guest && overridden
                       ? "Configured"
                       : "Auto-detected"}
               </span>
@@ -3013,19 +3016,20 @@ function ProviderBinaryControl({
                    Could not open the CLI location: {revealError}
                  </span>
                ) : null}
+               {guest ? <p className="mt-2 text-[11px] text-content/50">The Linux CLI is discovered from this distro’s login environment. Windows CLI overrides do not apply.</p> : null}
                <div className="mt-3 flex justify-end gap-2">
                 {error ? (
                   <SecondaryButton
                     disabled={working}
                     aria-label={`Retry ${title} ${
-                      overridden ? "configured path" : "auto-detect"
+                      !guest && overridden ? "configured path" : "auto-detect"
                     }`}
                     onClick={() =>
                       void inspect(overridden ? draft.trim() || null : null)
                     }
                   >
                     <RefreshCw className="size-3.5" strokeWidth={1.75} />
-                    {overridden ? "Retry configured path" : "Retry auto-detect"}
+                    {!guest && overridden ? "Retry configured path" : "Retry auto-detect"}
                   </SecondaryButton>
                 ) : null}
                 <SecondaryButton
@@ -3033,7 +3037,7 @@ function ProviderBinaryControl({
                   disabled={!inspection}
                   onClick={() => {
                     if (inspection) {
-                      void revealPath(inspection.path).catch((cause) => {
+                      void revealPath(guest ? wslPath(guest.distribution, inspection.path) : inspection.path).catch((cause) => {
                         setRevealError(
                           cause instanceof Error ? cause.message : String(cause),
                         );
@@ -3044,14 +3048,14 @@ function ProviderBinaryControl({
                   <ExternalLink className="size-3.5" strokeWidth={1.75} />
                   Open location
                 </SecondaryButton>
-                <SecondaryButton
+                {!guest ? <SecondaryButton
                   aria-label={`Edit ${title} CLI path`}
                   disabled={working}
                   onClick={() => setEditing(true)}
                 >
                   <Pencil className="size-3.5" strokeWidth={1.75} />
                   Edit path
-                </SecondaryButton>
+                </SecondaryButton> : null}
               </div>
             </>
           )}
@@ -3680,7 +3684,7 @@ function ProviderRow({
         <span className="flex items-center gap-2">
           <HarnessIcon harness={harness} className="size-4 shrink-0" />
           {HARNESS_TITLE[harness]}
-          <ProviderBinaryControl provider={harness} />
+          <ProviderBinaryControl key={`${harness}:${cwd ?? "native"}`} provider={harness} cwd={cwd} />
           {isDefault ? (
             <span className="rounded-full bg-content/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-content/60">
               Default

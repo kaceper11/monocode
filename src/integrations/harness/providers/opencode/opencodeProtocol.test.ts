@@ -23,6 +23,7 @@ import {
   parseServerUrlFromOutput,
   sortOpenCodeVariants,
   toOpenCodePermissionReply,
+  toOpenCodePromptParts,
   toolKindFromName,
 } from "./opencodeProtocol";
 
@@ -369,5 +370,17 @@ describe("flattenOpenCodeModels context window", () => {
       [],
     );
     expect(models[0]?.contextWindow).toBe(200_000);
+  });
+});
+
+
+describe("WSL OpenCode attachments", () => {
+  const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
+  it("translates structured guest attachment paths without rewriting user text", () => {
+    const prompt = "Literal //wsl.localhost/Debian/home/me/reference";
+    const parts = toOpenCodePromptParts(prompt, [{ id: "a", name: "file.txt", mimeType: "text/plain", path: `${cwd}/a file.txt` }], cwd);
+    expect(parts[0]).toMatchObject({ type: "text", text: expect.stringContaining(prompt) });
+    expect(parts.find(part => part.type === "file")).toMatchObject({ url: "file:///home/me/repo/a%20file.txt" });
+    expect(() => toOpenCodePromptParts("", [{ id: "b", name: "file.txt", mimeType: "text/plain", path: "//wsl.localhost/Debian/home/me/file.txt" }], cwd)).toThrow("selected WSL distribution");
   });
 });

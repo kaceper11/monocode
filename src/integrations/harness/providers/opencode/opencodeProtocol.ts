@@ -1,3 +1,4 @@
+import { wslLocation, wslPath } from "../../../../shared/lib/paths";
 import type {
   Attachment,
   RuntimeMode,
@@ -177,7 +178,19 @@ export type OpenCodePromptPart =
 export function toOpenCodePromptParts(
   text: string,
   attachments: Attachment[] | undefined,
+  cwd?: string,
 ): OpenCodePromptPart[] {
+  const guest = wslLocation(cwd ?? "");
+  if (guest) attachments = attachments?.map((attachment) => {
+    if (!attachment.path) return attachment;
+    const source = wslLocation(attachment.path);
+    if (!source && attachment.data) return { ...attachment, path: undefined };
+    if (!source || source.distribution.toLowerCase() !== guest.distribution.toLowerCase()) {
+      throw new Error("Attach a file from the selected WSL distribution.");
+    }
+    wslPath(guest.distribution, source.path);
+    return { ...attachment, path: source.path };
+  });
   const body = promptText(text, attachments ?? []);
   const textParts = body ? [body] : [];
   const parts: Array<{

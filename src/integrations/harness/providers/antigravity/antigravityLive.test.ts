@@ -273,6 +273,16 @@ describe.each(providers)("$id offline ACP transport", (provider) => {
     expect(mock.kill).toHaveBeenCalledWith(genKey);
   });
 
+  it("keeps native and WSL catalog probes and wrapper working directories separate", async () => {
+    resetHarnessModelOverlays();
+    const cwd = "//wsl.localhost/Ubuntu/home/me/project";
+    await provider.refresh(cwd);
+    expect(mock.spawn).toHaveBeenCalledWith(expect.stringContaining("monocode-antigravity-probe"), provider.path, provider.args, "//wsl.localhost/Ubuntu/fake", undefined, "antigravity");
+    expect(mock.sent.find(message => message.method === "session/new")?.params?.cwd).toBe(cwd);
+    expect(modelsFor(provider.id, cwd).map(model => model.nativeId)).toEqual(["m1", "m2"]);
+    expect(modelsFor(provider.id).some(model => model.nativeId === "m1")).toBe(false);
+  });
+
   it("probes catalogs over ACP once, kills the probe, and preserves models on failure", async () => {
     const first = provider.refresh();
     expect(provider.refresh()).toBe(first);

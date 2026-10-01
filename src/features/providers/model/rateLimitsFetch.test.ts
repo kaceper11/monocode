@@ -159,3 +159,13 @@ it("keeps WSL connection failures visible instead of reporting a missing native 
   });
   expect(mocks.spawn).not.toHaveBeenCalled();
 });
+
+
+it("routes OpenCode Go usage to the selected guest rather than reporting unsupported", async () => {
+  const { fetchOpencodeGoRateLimits } = await import("./rateLimitsFetch");
+  const cwd = "//wsl.localhost/Ubuntu/home/me/worktree";
+  mocks.invoke.mockResolvedValue({ status: "unavailable", error: "Guest Go account not connected" });
+  const limits = await fetchOpencodeGoRateLimits(cwd);
+  expect(mocks.invoke).toHaveBeenCalledWith("fetch_opencode_go_usage", { cwd });
+  expect(limits.status).toBe("unavailable");
+});

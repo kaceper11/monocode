@@ -209,7 +209,7 @@ def bounded_tree(path):
                     pending.append(Path(entry.path))
 
 
-AGENT_PROVIDERS = ["claude", "codex", "cursor", "opencode", "pi", "omp", "fx", "grok", "hermes", "devin", "copilot", "muse"]
+AGENT_PROVIDERS = ["claude", "codex", "cursor", "opencode", "pi", "omp", "fx", "grok", "hermes", "devin", "copilot", "muse", "antigravity"]
 AGENT_NAMES = {
     "claude": ["claude"],
     "codex": ["codex"],
@@ -223,6 +223,7 @@ AGENT_NAMES = {
     "devin": ["devin"],
     "copilot": ["copilot"],
     "muse": ["muse"],
+    "antigravity": ["agy_acp_server.par"],
 }
 # Linux tool folders that are not always exported to the login PATH.
 AGENT_FOLDERS = [
@@ -351,9 +352,7 @@ def verify_agent(provider, name, candidate, resolved, home):
     return True
 
 
-def find_agent(provider, cli_only=False):
-    if provider == "opencode" and not cli_only:
-        raise ValueError("OpenCode's HTTP transport is not supported in WSL yet. Choose a stdio agent such as Claude or Codex.")
+def find_agent(provider):
     names = list(AGENT_NAMES.get(provider) or [])
     if not names:
         raise ValueError("Unknown agent provider")
@@ -367,6 +366,8 @@ def find_agent(provider, cli_only=False):
         if version:
             names = names + ["muse-bin-" + version]
     folders = [home / suffix for suffix in AGENT_FOLDERS]
+    if provider == "antigravity":
+        folders = [home / ".local/bin", home / ".local/share/agy-acp"] + folders
     if provider == "hermes":
         folders += [home / ".hermes/hermes-agent/venv/bin", home / ".hermes/hermes-agent/.venv/bin"]
     folders = [Path(folder) for folder in os.environ.get("PATH", "").split(":") if folder.startswith("/") and not folder.startswith("/mnt/")] + folders
@@ -386,18 +387,36 @@ def find_agent(provider, cli_only=False):
     raise ValueError("%s is not installed in this WSL distribution; install its Linux CLI and retry" % provider)
 
 
+def config_root(key, default):
+    home = str(Path.home())
+    value = os.environ.get(key) or home.rstrip("/") + "/" + default
+    if value == "~":
+        value = home
+    elif value.startswith("~/"):
+        value = home.rstrip("/") + value[1:]
+    if not value.startswith("/") or value.startswith("//") or "\\" in value or ".." in value.split("/") or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("%s must be an absolute path inside this WSL distribution" % key)
+    return Path(value)
+
+
+def auth_path(relative):
+    for prefix, key in ((".codex", "CODEX_HOME"), (".claude", "CLAUDE_CONFIG_DIR"), (".pi/agent", "PI_CODING_AGENT_DIR")):
+        if relative.startswith(prefix + "/"):
+            return config_root(key, prefix) / relative[len(prefix) + 1:]
+    return Path.home() / relative
+
+
 def agent_authenticated(provider):
     checks = AGENT_AUTH.get(provider)
     if checks is None:
         return None
     if any(os.environ.get(name) for name in checks.get("env", ())):
         return True
-    home = Path.home()
-    if any((home / relative).is_file() for relative in checks.get("files", ())):
+    if any(auth_path(relative).is_file() for relative in checks.get("files", ())):
         return True
     for relative in checks.get("settings", ()):
         try:
-            settings = json.loads((home / relative).read_text())
+            settings = json.loads(auth_path(relative).read_text())
         except (OSError, ValueError):
             continue
         if isinstance(settings, dict) and settings.get("apiKeyHelper"):
@@ -519,7 +538,7 @@ def claude_usage():
     import urllib.error
     prepare_environment()
     try:
-        config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude"))
+        config = config_root("CLAUDE_CONFIG_DIR", ".claude")
         raw = json.loads((config / ".credentials.json").read_text())
         oauth = raw.get("claudeAiOauth", raw)
         token = oauth.get("accessToken")
@@ -617,10 +636,10 @@ def handle(request):
         return resolved
     if op in ("agent_exec", "agent_run"):
         # CLI mutations stay on the serialized channel and resolve their binary
-        # here. OpenCode configuration does not enable its unsupported transport.
+        # here, rather than trusting a path from a previous discovery.
         if op == "agent_run":
             prepare_environment()
-            command = find_agent(request["provider"], cli_only=True)
+            command = find_agent(request["provider"])
             if request.get("command") is not None and request["command"] != command:
                 raise ValueError("The selected guest CLI changed; inspect it again before updating")
         else:
