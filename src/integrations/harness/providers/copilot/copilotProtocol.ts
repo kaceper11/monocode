@@ -137,7 +137,8 @@ export function copilotCurrentModelId(
     stringField(asRecord(rec?.models) ?? {}, "current_model_id");
   if (fromModels) return fromModels;
   const configId = acpModelConfigId(options);
-  return options.find((option) => option.id === configId)?.currentValue;
+  const value = options.find((option) => option.id === configId)?.currentValue;
+  return typeof value === "string" ? value : undefined;
 }
 
 export function copilotStopReasonMessage(stopReason: string): string | undefined {

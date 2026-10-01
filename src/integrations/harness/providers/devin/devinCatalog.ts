@@ -11,6 +11,7 @@ import {
 } from "../../core/child.ts";
 import {
   DEVIN_CLIENT_CAPABILITIES,
+  DEVIN_CLIENT_INFO,
   asRecord,
   devinConfigOptions,
   devinModelsFromConfig,
@@ -52,13 +53,14 @@ async function discoverViaAcp(projectCwd?: string) {
   const PROBE_ID = `monocode-devin-probe-${crypto.randomUUID()}`;
   const acp = new AcpClient(PROBE_ID, {
     onRequest: (id, method) => {
-      const result =
-        method === "session/request_permission"
-          ? { outcome: { outcome: "cancelled" } }
+      const response = method === "_cognition.ai/request_diagnostics"
+        ? acp.respond(id, {})
+        : method === "session/request_permission"
+          ? acp.respond(id, { outcome: { outcome: "cancelled" } })
           : method === "elicitation/create"
-            ? { action: "cancel" }
-            : {};
-      void acp.respond(id, result).catch(() => undefined);
+            ? acp.respond(id, { action: "cancel" })
+            : acp.respondError(id, { code: -32601, message: `Method not found: ${method}` });
+      void response.catch(() => undefined);
     },
   });
 
@@ -84,7 +86,7 @@ async function discoverViaAcp(projectCwd?: string) {
           {
             protocolVersion: 1,
             clientCapabilities: DEVIN_CLIENT_CAPABILITIES,
-            clientInfo: { name: "monocode", version: "0.1.0" },
+            clientInfo: DEVIN_CLIENT_INFO,
           },
           REQUEST_TIMEOUT_MS,
         );

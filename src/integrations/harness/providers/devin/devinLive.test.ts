@@ -5,8 +5,8 @@ let onLine: ((line: string) => void) | undefined;
 let onExit: ((code: number | null) => void) | undefined;
 
 vi.mock("../../core/child.ts", () => ({
-  resolveDevinBinary: async () => ({ path: "/fake/devin" }),
-  spawnChild: async () => undefined,
+  resolveDevinBinary: vi.fn(async (_cwd?: string) => ({ path: "/fake/devin" })),
+  spawnChild: vi.fn(async () => undefined),
   killChild: async () => undefined,
   unwatchChild: () => undefined,
   watchChild: (
@@ -26,10 +26,14 @@ const {
   sendDevinTurn,
   steerDevinTurn,
   cancelDevinTurn,
+  compactDevinContext,
   respondDevinApproval,
   setDevinRuntimeMode,
   stopDevinSession,
 } = await import("./devin");
+import { resolveDevinBinary, spawnChild } from "../../core/child.ts";
+import { devinAdapter } from "./devinAdapter.ts";
+import { DEVIN_CLIENT_INFO, DEVIN_CLIENT_CAPABILITIES } from "./devinProtocol.ts";
 import type { HarnessEvent } from "../../core/types.ts";
 import {
   resetHarnessModelOverlays,
@@ -94,6 +98,7 @@ const baseInput = (events: HarnessEvent[], text: string, id = "t1") => ({
 describe("devin live turn sequence", () => {
   beforeEach(() => {
     sent.length = 0;
+    vi.clearAllMocks();
     resetHarnessModelOverlays();
   });
 
@@ -111,11 +116,11 @@ describe("devin live turn sequence", () => {
     expect(newMsg.params.cwd).toBe("/repo");
     reply(newMsg.id, SETUP);
 
-    // supervised maps to accept-edits; the session is in smart, so it switches.
+    // supervised maps to ask; the session is in smart, so it switches.
     await waitFor(() => byMethod("session/set_mode").length > 0, "set_mode");
     expect(lastByMethod("session/set_mode").params).toMatchObject({
       sessionId: "S1",
-      modeId: "accept-edits",
+      modeId: "ask",
     });
     reply(lastByMethod("session/set_mode").id, {});
 
@@ -147,91 +152,25 @@ describe("devin live turn sequence", () => {
     await stopDevinSession("t1");
   });
 
-  it("steers an in-flight turn with a second session/prompt", async () => {
+  it("rejects steering and serializes a queued follow-up", async () => {
     const events: HarnessEvent[] = [];
     const turn = sendDevinTurn(baseInput(events, "first", "t2") as never);
-
     await waitFor(() => byMethod("initialize").length > 0, "initialize");
-    reply(byMethod("initialize")[0].id, {
-      protocolVersion: 1,
-      agentCapabilities: { loadSession: true },
-    });
+    reply(lastByMethod("initialize").id, { agentCapabilities: { loadSession: true } });
     await waitFor(() => byMethod("session/new").length > 0, "session/new");
-    reply(byMethod("session/new")[0].id, {
-      ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
-    });
+    reply(lastByMethod("session/new").id, { ...SETUP, modes: { ...SETUP.modes, currentModeId: "ask" } });
     await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
-    const mainPromptId = lastByMethod("session/prompt").id;
-
-    // While the main prompt is unanswered, a steer is its own session/prompt.
-    const steer = steerDevinTurn({
-      sessionId: "t2",
-      cwd: "/repo",
-      model: "devin:default",
-      text: "also check the tests",
-      attachments: [],
-    } as never);
-    await waitFor(
-      () => byMethod("session/prompt").length === 2,
-      "steer prompt",
-    );
-    const steerPromptId = lastByMethod("session/prompt").id;
-    expect(byMethod("session/prompt")[1].params.prompt[0].text).toBe(
-      "also check the tests",
-    );
-
-    reply(steerPromptId, { stopReason: "end_turn" });
-    await steer;
-    reply(mainPromptId, { stopReason: "end_turn" });
-    await turn;
+    await expect(steerDevinTurn({ sessionId: "t2", cwd: "/repo", text: "steer" } as never))
+      .rejects.toThrow("Devin does not support steering");
+    const followUp = sendDevinTurn(baseInput(events, "queued", "t2") as never);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(byMethod("session/prompt")).toHaveLength(1);
+    reply(lastByMethod("session/prompt").id, { stopReason: "end_turn" });
+    await waitFor(() => byMethod("session/prompt").length === 2, "queued prompt");
+    expect(lastByMethod("session/prompt").params.prompt[0].text).toBe("queued");
+    reply(lastByMethod("session/prompt").id, { stopReason: "end_turn" });
+    await Promise.all([turn, followUp]);
     await stopDevinSession("t2");
-  });
-
-  it.each([false, true])("waits for a follow-up when the main prompt finishes first (failed=%s)", async (failed) => {
-    const events: HarnessEvent[] = [];
-    const turn = sendDevinTurn(baseInput(events, "first", `main-first-${failed}`) as never);
-
-    await waitFor(() => byMethod("initialize").length > 0, "initialize");
-    reply(byMethod("initialize")[0].id, {
-      protocolVersion: 1,
-      agentCapabilities: { loadSession: true },
-    });
-    await waitFor(() => byMethod("session/new").length > 0, "session/new");
-    reply(byMethod("session/new")[0].id, {
-      ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
-    });
-    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
-    const mainPromptId = lastByMethod("session/prompt").id;
-
-    // While the main prompt is unanswered, a steer is its own session/prompt.
-    const steer = steerDevinTurn({
-      sessionId: `main-first-${failed}`,
-      cwd: "/repo",
-      model: "devin:default",
-      text: "also check the tests",
-      attachments: [],
-    } as never);
-    await waitFor(
-      () => byMethod("session/prompt").length === 2,
-      "steer prompt",
-    );
-    const steerPromptId = lastByMethod("session/prompt").id;
-    expect(byMethod("session/prompt")[1].params.prompt[0].text).toBe(
-      "also check the tests",
-    );
-
-    let settled = false;
-    void turn.then(() => { settled = true; });
-    reply(mainPromptId, { stopReason: "end_turn" });
-    await new Promise(r => setTimeout(r, 0));
-    expect(settled).toBe(false);
-    reply(steerPromptId, { stopReason: failed ? "max_tokens" : "end_turn" });
-    await steer;
-    await turn;
-    expect(events.some(e => e.type === "session.error")).toBe(failed);
-    await stopDevinSession(`main-first-${failed}`);
   });
 
   it("surfaces a permission request in supervised mode and resolves it", async () => {
@@ -246,7 +185,7 @@ describe("devin live turn sequence", () => {
     await waitFor(() => byMethod("session/new").length > 0, "session/new");
     reply(byMethod("session/new")[0].id, {
       ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+      modes: { ...SETUP.modes, currentModeId: "ask" },
     });
     await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
     const promptId = lastByMethod("session/prompt").id;
@@ -311,7 +250,7 @@ describe("devin live turn sequence", () => {
     await waitFor(() => byMethod("session/new").length > 0, "session/new");
     reply(byMethod("session/new")[0].id, {
       ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+      modes: { ...SETUP.modes, currentModeId: "ask" },
     });
     await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
     const promptId = lastByMethod("session/prompt").id;
@@ -377,7 +316,7 @@ describe("devin live turn sequence", () => {
     await waitFor(() => byMethod("session/new").length > 0, "session/new");
     reply(byMethod("session/new")[0].id, {
       ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+      modes: { ...SETUP.modes, currentModeId: "ask" },
     });
     // Full access switches the provider to bypass and auto-answers any ask
     // that still arrives — MCP included, matching the real CLIs.
@@ -431,7 +370,7 @@ describe("devin live turn sequence", () => {
     await waitFor(() => byMethod("session/new").length > 0, "session/new");
     reply(byMethod("session/new")[0].id, {
       ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+      modes: { ...SETUP.modes, currentModeId: "ask" },
     });
     await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
     const promptId = lastByMethod("session/prompt").id;
@@ -489,7 +428,7 @@ describe("devin live turn sequence", () => {
     await waitFor(() => byMethod("session/new").length > 0, "session/new");
     reply(byMethod("session/new")[0].id, {
       ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+      modes: { ...SETUP.modes, currentModeId: "ask" },
     });
     await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
     reply(lastByMethod("session/prompt").id, { stopReason: "end_turn" });
@@ -530,7 +469,7 @@ describe("devin live turn sequence", () => {
     await waitFor(() => byMethod("session/new").length > 0, "session/new");
     reply(byMethod("session/new")[0].id, {
       ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+      modes: { ...SETUP.modes, currentModeId: "ask" },
     });
     await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
 
@@ -591,7 +530,7 @@ describe("devin live turn sequence", () => {
     await waitFor(() => byMethod("session/new").length > 0, "session/new");
     reply(byMethod("session/new")[0].id, {
       ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+      modes: { ...SETUP.modes, currentModeId: "ask" },
     });
     await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
     onExit!(1);
@@ -606,7 +545,7 @@ describe("devin live turn sequence", () => {
     ];
     const setup = {
       ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+      modes: { ...SETUP.modes, currentModeId: "ask" },
       configOptions: [
         {
           id: "model",
@@ -725,7 +664,7 @@ describe("devin live turn sequence", () => {
     await waitFor(() => byMethod("session/new").length > 0, "session/new");
     reply(byMethod("session/new")[0].id, {
       ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+      modes: { ...SETUP.modes, currentModeId: "ask" },
     });
 
     // The foreign uid is not offered by swe-2 → the base variant is sent.
@@ -756,7 +695,7 @@ describe("devin live turn sequence", () => {
     await waitFor(() => byMethod("session/new").length > 0, "session/new");
     reply(byMethod("session/new")[0].id, {
       ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+      modes: { ...SETUP.modes, currentModeId: "ask" },
     });
     await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
     const promptId = lastByMethod("session/prompt").id;
@@ -831,7 +770,7 @@ describe("devin live turn sequence", () => {
     await waitFor(() => byMethod("session/new").length > 0, "session/new");
     reply(byMethod("session/new")[0].id, {
       ...SETUP,
-      modes: { ...SETUP.modes, currentModeId: "accept-edits" },
+      modes: { ...SETUP.modes, currentModeId: "ask" },
     });
     await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
     const promptId = lastByMethod("session/prompt").id;
@@ -895,5 +834,205 @@ describe("devin live turn sequence", () => {
     reply(lastByMethod("session/prompt").id, { stopReason: "end_turn" });
     await queued;
     await stopDevinSession("t11");
+  });
+});
+
+
+const CONFIG_SETUP = {
+  sessionId: "S1",
+  configOptions: [
+    SETUP.configOptions[0],
+    { id: "mode", category: "mode", type: "select", currentValue: "smart",
+      options: MODES.map((value) => ({ value, name: value })) },
+  ],
+};
+
+async function startConfigTurn(input: ReturnType<typeof baseInput>, setup = CONFIG_SETUP) {
+  const turn = sendDevinTurn(input);
+  void turn.catch(() => undefined);
+  await waitFor(() => byMethod("initialize").length > 0, "initialize");
+  reply(lastByMethod("initialize").id, { agentCapabilities: { loadSession: true } });
+  await waitFor(() => byMethod("session/new").length > 0, "session/new");
+  reply(lastByMethod("session/new").id, setup);
+  return { turn };
+}
+
+function serverRequest(id: number | string, method: string, params: unknown = {}) {
+  onLine!(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+}
+const permissionParams = (sessionId = "S1") => ({
+  sessionId, toolCall: { toolCallId: "late-tool", kind: "execute", title: "run command" },
+  options: [{ optionId: "allow_once", kind: "allow_once" }, { optionId: "reject_once", kind: "reject_once" }],
+});
+
+async function applyRequestedMode() {
+  await waitFor(() => byMethod("session/set_config_option").length > 0, "mode config");
+  const request = lastByMethod("session/set_config_option");
+  const mode = CONFIG_SETUP.configOptions[1];
+  reply(request.id, { configOptions: [{ ...mode, currentValue: request.params.value }] });
+}
+
+async function finishConfigTurn(turn: Promise<void>, thread: string) {
+  reply(lastByMethod("session/prompt").id, { stopReason: "end_turn" });
+  await turn;
+  await stopDevinSession(thread);
+}
+
+describe("Devin upstream compatibility", () => {
+  beforeEach(() => {
+    sent.length = 0;
+    vi.clearAllMocks();
+    resetHarnessModelOverlays();
+  });
+
+  it.each([
+    ["supervised", false, "ask"], ["auto-accept-edits", false, "accept-edits"],
+    ["auto", false, "smart"], ["full-access", false, "bypass"], ["supervised", true, "plan"],
+  ] as const)("applies %s (planning=%s) through config options", async (runtimeMode, planning, expected) => {
+    const events: HarnessEvent[] = [];
+    const thread = `config-${expected}`;
+    const { turn } = await startConfigTurn({ ...baseInput(events, "hello", thread), runtimeMode,
+      ...(planning ? { intent: "plan" } : {}) } as never, {
+      ...CONFIG_SETUP, configOptions: [CONFIG_SETUP.configOptions[0], {
+        ...CONFIG_SETUP.configOptions[1], currentValue: expected === "smart" ? "ask" : "smart",
+      }],
+    });
+    await applyRequestedMode();
+    expect(lastByMethod("session/set_config_option").params).toEqual({ sessionId: "S1", configId: "mode", value: expected });
+    expect(byMethod("session/set_mode")).toHaveLength(0);
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
+    await finishConfigTurn(turn, thread);
+  });
+
+  it("answers diagnostics during startup and a live turn with the scoped client identity", async () => {
+    const turn = sendDevinTurn(baseInput([], "hello", "diagnostics"));
+    await waitFor(() => byMethod("initialize").length > 0, "initialize");
+    expect(lastByMethod("initialize").params).toMatchObject({ clientInfo: DEVIN_CLIENT_INFO, clientCapabilities: DEVIN_CLIENT_CAPABILITIES });
+    serverRequest("startup-diagnostics", "_cognition.ai/request_diagnostics");
+    serverRequest("startup-permission", "session/request_permission", permissionParams());
+    serverRequest("unknown", "unsupported/request");
+    await waitFor(() => parse().some((message) => message.id === "unknown"), "startup responses");
+    expect(parse().find((message) => message.id === "startup-diagnostics").result).toEqual({});
+    expect(parse().find((message) => message.id === "startup-permission").result).toEqual({ outcome: { outcome: "cancelled" } });
+    expect(parse().find((message) => message.id === "unknown").error.code).toBe(-32601);
+    reply(lastByMethod("initialize").id, { agentCapabilities: { loadSession: true } });
+    await waitFor(() => byMethod("session/new").length > 0, "new");
+    reply(lastByMethod("session/new").id, CONFIG_SETUP);
+    await applyRequestedMode();
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
+    serverRequest("live-diagnostics", "_cognition.ai/request_diagnostics");
+    await waitFor(() => parse().some((message) => message.id === "live-diagnostics"), "live diagnostics");
+    expect(parse().find((message) => message.id === "live-diagnostics").result).toEqual({});
+    await finishConfigTurn(turn, "diagnostics");
+  });
+
+  it("serializes model, boolean setting and mode before accepting the prompt", async () => {
+    const onAccepted = vi.fn();
+    const { turn } = await startConfigTurn({ ...baseInput([], "hello", "settings"),
+      model: "devin:swe-2-high", modelSettings: { fast: "true" }, onAccepted } as never, {
+      ...CONFIG_SETUP, configOptions: [...CONFIG_SETUP.configOptions,
+        { id: "fast", type: "boolean", currentValue: false } as never],
+    });
+    await waitFor(() => byMethod("session/set_config_option").length === 1, "model");
+    expect(lastByMethod("session/set_config_option").params).toMatchObject({ configId: "model", value: "swe-2-high" });
+    expect(onAccepted).not.toHaveBeenCalled();
+    reply(lastByMethod("session/set_config_option").id, { configOptions: [{ ...SETUP.configOptions[0], currentValue: "swe-2-high" }] });
+    await waitFor(() => byMethod("session/set_config_option").length === 2, "boolean");
+    expect(lastByMethod("session/set_config_option").params).toEqual({ sessionId: "S1", configId: "fast", value: true, type: "boolean" });
+    reply(lastByMethod("session/set_config_option").id, { configOptions: [{ id: "fast", type: "boolean", currentValue: true }] });
+    await waitFor(() => byMethod("session/set_config_option").length === 3, "mode");
+    expect(onAccepted).not.toHaveBeenCalled();
+    await applyRequestedMode();
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
+    expect(onAccepted).toHaveBeenCalledTimes(1);
+    await finishConfigTurn(turn, "settings");
+  });
+
+  it.each(["unsupported", "rejected", "ignored", "invalid boolean"])("does not accept or prompt after %s settings", async (failure) => {
+    const onAccepted = vi.fn();
+    const setup = { ...CONFIG_SETUP, configOptions: [...CONFIG_SETUP.configOptions,
+      { id: "fast", type: "boolean", currentValue: false } as never] };
+    if (failure === "unsupported") setup.configOptions[1] = { ...setup.configOptions[1], options: [{ value: "smart", name: "Smart" }] };
+    const { turn } = await startConfigTurn({ ...baseInput([], "hello", `failure-${failure}`), onAccepted,
+      ...(failure === "invalid boolean" ? { modelSettings: { fast: "maybe" } } : {}) } as never, setup);
+    const rejected = expect(turn).rejects.toThrow();
+    if (failure === "rejected" || failure === "ignored") {
+      await waitFor(() => byMethod("session/set_config_option").length > 0, "mode");
+      const id = lastByMethod("session/set_config_option").id;
+      if (failure === "rejected") onLine!(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: "mode rejected" } }));
+      else reply(id, { configOptions: CONFIG_SETUP.configOptions });
+    }
+    await rejected;
+    expect(byMethod("session/prompt")).toHaveLength(0);
+    expect(onAccepted).not.toHaveBeenCalled();
+    await stopDevinSession(`failure-${failure}`);
+  });
+
+  it("rejects mismatched and late requests and settles asks when a prompt finishes", async () => {
+    const events: HarnessEvent[] = [];
+    const { turn } = await startConfigTurn(baseInput(events, "hello", "late-asks"));
+    await applyRequestedMode();
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
+    serverRequest("wrong-session", "session/request_permission", permissionParams("other"));
+    serverRequest("pending", "session/request_permission", permissionParams());
+    serverRequest("pending-form", "elicitation/create", { sessionId: "S1", requestedSchema: { properties: { choice: { type: "string" } } } });
+    await waitFor(() => events.some((event) => event.type === "approval.requested") && events.some((event) => event.type === "question.asked"), "pending asks");
+    reply(lastByMethod("session/prompt").id, { stopReason: "end_turn" });
+    await turn;
+    await waitFor(() => parse().some((message) => message.id === "pending-form"), "settled form");
+    for (const id of ["wrong-session", "pending"]) expect(parse().find((message) => message.id === id).result).toEqual({ outcome: { outcome: "cancelled" } });
+    expect(parse().find((message) => message.id === "pending-form").result).toEqual({ action: "cancel" });
+    setDevinRuntimeMode("late-asks", "full-access");
+    serverRequest("late", "session/request_permission", permissionParams());
+    serverRequest("late-form", "elicitation/create", { requestedSchema: { properties: { choice: { type: "string" } } } });
+    await waitFor(() => byMethod("session/set_config_option").length === 2, "late mode change");
+    await applyRequestedMode();
+    await waitFor(() => parse().some((message) => message.id === "late-form"), "late replies");
+    expect(parse().find((message) => message.id === "late").result).toEqual({ outcome: { outcome: "cancelled" } });
+    expect(parse().find((message) => message.id === "late-form").result).toEqual({ action: "cancel" });
+    expect(events.filter((event) => event.type === "approval.requested")).toHaveLength(1);
+    await stopDevinSession("late-asks");
+  });
+
+  it("retains cwd-qualified WSL discovery and spawn and advertises no steering", async () => {
+    const cwd = "//wsl.localhost/Ubuntu/home/me/repo space";
+    const { turn } = await startConfigTurn({ ...baseInput([], "hello", "wsl-config"), cwd });
+    expect(resolveDevinBinary).toHaveBeenCalledWith(cwd);
+    expect(spawnChild).toHaveBeenCalledWith("wsl-config", "/fake/devin", ["acp"], cwd, undefined, "devin");
+    expect(lastByMethod("session/new").params.cwd).toBe(cwd);
+    expect(devinAdapter.canSteer).toBe(false);
+    expect(devinAdapter.commands).toBeDefined();
+    expect(devinAdapter.compactContext).toBeDefined();
+    expect(devinAdapter.respondQuestion).toBeDefined();
+    await applyRequestedMode();
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
+    await finishConfigTurn(turn, "wsl-config");
+    sent.length = 0;
+    const resumed = sendDevinTurn({ ...baseInput([], "resume", "wsl-config"), cwd });
+    await waitFor(() => byMethod("initialize").length > 0, "resume initialize");
+    reply(lastByMethod("initialize").id, { agentCapabilities: { loadSession: true } });
+    await waitFor(() => byMethod("session/load").length > 0, "guest load");
+    expect(lastByMethod("session/load").params).toMatchObject({ sessionId: "S1", cwd });
+    expect(byMethod("session/new")).toHaveLength(0);
+    reply(lastByMethod("session/load").id, CONFIG_SETUP);
+    await applyRequestedMode();
+    await waitFor(() => byMethod("session/prompt").length > 0, "resumed prompt");
+    await finishConfigTurn(resumed, "wsl-config");
+  });
+
+  it("retains provider compaction on the same live session", async () => {
+    const events: HarnessEvent[] = [];
+    const input = baseInput(events, "hello", "compact");
+    const { turn } = await startConfigTurn(input);
+    await applyRequestedMode();
+    await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
+    reply(lastByMethod("session/prompt").id, { stopReason: "end_turn" });
+    await turn;
+    const compacted = compactDevinContext(input);
+    await waitFor(() => byMethod("session/prompt").length === 2, "compact prompt");
+    expect(lastByMethod("session/prompt").params).toMatchObject({ sessionId: "S1", prompt: [{ type: "text", text: "/compact" }] });
+    expect(events).toContainEqual({ type: "status", text: "Compacting context…" });
+    expect(byMethod("initialize")).toHaveLength(1);
+    await finishConfigTurn(compacted, "compact");
   });
 });

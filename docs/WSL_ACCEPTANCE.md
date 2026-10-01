@@ -47,6 +47,12 @@ Repeat the identity checks with another distro and with a task worktree.
 - Install/sign in to Antigravity in the guest. Check models, first turn,
   resume, permission denial, cancellation and cleanup. Switch projects/distro
   during model discovery and confirm catalogs stay isolated.
+- Install/sign in to Devin in the guest. Check CLI model discovery and ACP
+  fallback, first turn, queued follow-ups, resume, approvals/questions,
+  compaction, cancellation and cleanup. Verify Supervised uses `ask`, edits
+  use `accept-edits`, Auto uses `smart`, Full access uses `bypass`, and Plan
+  uses `plan`. Native CLI overrides must not affect guest discovery; repeat
+  with another distro and a task worktree to check cwd and catalog isolation.
 - Install/sign in to OpenCode in the guest. Check models, chat and text
   generation, SSE updates, Go usage, approvals/questions, resume, worktree fork,
   same-distro file/image attachments and cancellation. Block localhost

@@ -1,10 +1,14 @@
 import { modelsFor, type AgentModel } from "../../../../features/sessions/model/models.ts";
+import type { RuntimeMode } from "../../../../features/sessions/model/session.ts";
 import { acpAuthError, acpAutoOption, acpCommandsFromUpdate, acpConfigOptions, acpCurrentModelId, acpElicitation, acpElicitationResult, acpEventsFromUpdate, acpModeId, acpModeIdsFromConfig, acpModesFromSetup, acpModelConfigId, acpPermissionOptionId, acpPermissionRequest, acpPromptBlocks, acpStopReasonMessage, asRecord, sessionIdFromResult, stringField, type AcpConfigOption, type AcpElicitField } from "../../core/acpProtocol.ts";
 
 export { asRecord, sessionIdFromResult, stringField };
 
 export type DevinConfigOption = AcpConfigOption;
 export type DevinElicitField = AcpElicitField;
+
+// Scoped to Devin ACP compatibility (upstream PR #442), not app identity.
+export const DEVIN_CLIENT_INFO = { name: "windsurf", version: "1.110.1" } as const;
 
 /**
  * `elicitation.form` advertises form-mode questions; an empty `elicitation`
@@ -13,6 +17,8 @@ export type DevinElicitField = AcpElicitField;
 export const DEVIN_CLIENT_CAPABILITIES = {
   fs: { readTextFile: false, writeTextFile: false },
   terminal: false,
+  session: { configOptions: { boolean: {} } },
+  _meta: { "cognition.ai/requestDiagnostics": true },
   elicitation: { form: {} },
 };
 
@@ -43,7 +49,18 @@ export function devinSpawnArgs(): string[] {
   return ["acp"];
 }
 
-export const devinModeId = acpModeId;
+export function devinModeId(runtimeMode: RuntimeMode, planning: boolean, advertised: string[]): string | undefined {
+  if (planning) return advertised.includes("plan") ? "plan" : undefined;
+  if (!planning && runtimeMode === "supervised") {
+    return ["ask", "normal", "manual", "default"].find((id) => advertised.includes(id));
+  }
+  return acpModeId(runtimeMode, planning, advertised);
+}
+
+export function devinModeConfigOption(options: DevinConfigOption[]): DevinConfigOption | undefined {
+  return options.find((option) => option.type !== "boolean" &&
+    (option.id === "mode" || option.category === "mode" || option.id === "permission_mode"));
+}
 export const devinModesFromSetup = acpModesFromSetup;
 export const devinModeIdsFromConfig = acpModeIdsFromConfig;
 export const devinConfigOptions = acpConfigOptions;
@@ -249,9 +266,7 @@ function devinGroupedModels(
 export function devinModelsFromConfig(
   options: DevinConfigOption[],
 ): AgentModel[] {
-  const model =
-    options.find((option) => option.id === "model") ??
-    options.find((option) => option.category === "model");
+  const model = options.find((option) => option.id === devinModelConfigId(options));
   const seen = new Set<string>();
   const variants: DevinVariant[] = [];
   for (const choice of (model?.options ?? []).slice(0, MAX_CATALOG_VARIANTS)) {
@@ -261,7 +276,7 @@ export function devinModelsFromConfig(
       parseDevinVariant(choice.value, choice.name, choice.contextWindow),
     );
   }
-  return devinGroupedModels(variants, model?.currentValue);
+  return devinGroupedModels(variants, typeof model?.currentValue === "string" ? model.currentValue : undefined);
 }
 
 /**

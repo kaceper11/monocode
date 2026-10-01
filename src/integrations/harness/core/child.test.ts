@@ -82,17 +82,18 @@ describe("concurrent binary discovery", () => {
     },
   );
 
-  it("keeps guest workspaces and providers separate and retries failed lookups", async () => {
+  it.each(["Codex", "Devin"] as const)("keeps %s guest workspaces separate and retries failed lookups", async (provider) => {
     const child = await loadChild();
     mocks.invoke.mockRejectedValue(new Error("missing"));
+    const resolve = child[`resolve${provider}Binary`];
     const workspaces = ["C:/repo", "//wsl.localhost/Ubuntu/home/me/repo", "//wsl.localhost/Debian/home/me/repo"];
-    const pending = workspaces.map(cwd => child.resolveCodexBinary(cwd));
+    const pending = workspaces.map(cwd => resolve(cwd));
     pending.push(child.resolveClaudeBinary());
     await Promise.all(pending.map(p => expect(p).rejects.toThrow("missing")));
     expect(mocks.invoke).toHaveBeenCalledTimes(4);
-    expect(mocks.invoke).toHaveBeenCalledWith("wsl_resolve_harness", { cwd: workspaces[1], provider: "codex" });
+    expect(mocks.invoke).toHaveBeenCalledWith("wsl_resolve_harness", { cwd: workspaces[1], provider: provider.toLowerCase() });
     mocks.invoke.mockResolvedValue({ path: "installed.exe" });
-    await expect(child.resolveCodexBinary()).resolves.toEqual({ path: "installed.exe" });
+    await expect(resolve()).resolves.toEqual({ path: "installed.exe" });
     expect(mocks.invoke).toHaveBeenCalledTimes(5);
   });
 });

@@ -16,7 +16,7 @@ import { registerHarness, type HarnessAdapter } from "../../core/registry.ts";
 export const devinAdapter: HarnessAdapter = {
   id: "devin",
   live: true,
-  canSteer: true,
+  canSteer: false,
   commands: devinCommandProvider,
   sendTurn: sendDevinTurn,
   compactContext: compactDevinContext,

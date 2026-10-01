@@ -9,6 +9,7 @@ import {
   HARNESS_IDLE_PARK_MS,
   bindHarnessSession,
   canCompactHarnessContext,
+  canSteerHarness,
   canRunHarnessTextPrompt,
   runHarnessTextPrompt,
   canRewindHarnessLastTurn,
@@ -237,6 +238,17 @@ describe("harness registry", () => {
     expect(adapter.refreshCatalog).toBeTypeOf("function");
     expect(adapter.generateTitle).toBeUndefined();
     expect(adapter.generateCommitMessage).toBeUndefined();
+  });
+
+  it("keeps Devin extras while routing follow-ups through the composer queue", () => {
+    registerBuiltinHarnesses();
+    const adapter = listHarnesses().find((adapter) => adapter.id === "devin")!;
+    expect(adapter.live).toBe(true);
+    expect(canSteerHarness("devin")).toBe(false);
+    expect(adapter.canSteer).toBe(false);
+    expect(adapter.commands).toBeDefined();
+    expect(adapter.compactContext).toBeTypeOf("function");
+    expect(adapter.respondQuestion).toBeTypeOf("function");
   });
 
   it("refreshes only the requested catalogs", async () => {

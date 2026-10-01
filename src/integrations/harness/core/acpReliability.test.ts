@@ -128,6 +128,10 @@ function setup(thread: string) {
     } } : {}),
     configOptions: [
       { id: "model", category: "model", currentValue: provider.model },
+      ...(!wire.modeSetup && provider.id === "devin" ? [{
+        id: "mode", category: "mode", type: "select", currentValue: "ask",
+        options: ["ask", "accept-edits", "smart", "plan", "bypass"].map((value) => ({ value })),
+      }] : []),
     ],
     models: {
       currentModelId: provider.model,
@@ -378,7 +382,9 @@ it.each(["devin", "copilot"])(
       id === "devin" ? respondDevinQuestion : respondCopilotQuestion;
     const events: HarnessEvent[] = [];
     const turn = input(provider, events);
-    await provider.send(turn);
+    wire.holdPrompt = true;
+    const running = provider.send(turn);
+    await until(() => methods(turn.sessionId).includes("session/prompt"));
     wire.listeners.get(turn.sessionId)!(
       JSON.stringify({
         jsonrpc: "2.0",
@@ -434,6 +440,8 @@ it.each(["devin", "copilot"])(
         decision: "answered",
       }),
     );
+    await provider.cancel(turn.sessionId);
+    await running;
   },
 );
 
@@ -481,7 +489,9 @@ describe.each(questionProviders)("$id overlapping questions", ({ id, method, res
     const provider = providers.find((p) => p.id === id)!;
     const events: HarnessEvent[] = [];
     const turn = input(provider, events);
-    await provider.send(turn);
+    wire.holdPrompt = true;
+    const running = provider.send(turn);
+    await until(() => methods(turn.sessionId).includes("session/prompt"));
     ask(turn.sessionId, 801, method);
     ask(turn.sessionId, 802, method);
     await until(() => events.some((event) => event.type === "question.asked"));
@@ -500,6 +510,8 @@ describe.each(questionProviders)("$id overlapping questions", ({ id, method, res
     session = events.reduce(applyHarnessEvent, newSession(provider.id, turn.cwd));
     expect(session.pendingQuestion).toBeUndefined();
     expect(wire.sent.filter((message) => [801, 802].includes(message.id ?? 0))).toHaveLength(2);
+    await provider.cancel(turn.sessionId);
+    await running;
   });
 
   it("cancels visible and queued requests without exposing a cancelled form on the next turn", async () => {
@@ -532,7 +544,9 @@ it.each(["devin", "copilot"])("%s keeps a form open when a required field is ski
   const respond = id === "devin" ? respondDevinQuestion : respondCopilotQuestion;
   const events: HarnessEvent[] = [];
   const turn = input(provider, events);
-  await provider.send(turn);
+  wire.holdPrompt = true;
+  const running = provider.send(turn);
+  await until(() => methods(turn.sessionId).includes("session/prompt"));
   wire.listeners.get(turn.sessionId)!(JSON.stringify({
     jsonrpc: "2.0", id: 806, method: "elicitation/create",
     params: { requestedSchema: {
@@ -552,6 +566,8 @@ it.each(["devin", "copilot"])("%s keeps a form open when a required field is ski
   expect(wire.sent.find((message) => message.id === 806)?.result).toEqual({
     action: "accept", content: { host: "example.com", port: 443 },
   });
+  await provider.cancel(turn.sessionId);
+  await running;
 });
 
 it("supports titled MCP multiselect choices and preserves their wire values", () => {

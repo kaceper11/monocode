@@ -23,7 +23,7 @@ export type AcpConfigOption = {
   name?: string;
   category?: string;
   type?: string;
-  currentValue?: string;
+  currentValue?: string | boolean;
   options: AcpConfigChoice[];
 };
 
@@ -158,7 +158,8 @@ export function acpConfigOptions(raw: unknown): AcpConfigOption[] {
         category: stringField(rec ?? {}, "category"),
         type: stringField(rec ?? {}, "type"),
         currentValue:
-          typeof rec?.currentValue === "string" && rec.currentValue.trim()
+          typeof rec?.currentValue === "boolean" ||
+          (typeof rec?.currentValue === "string" && rec.currentValue.trim())
             ? rec.currentValue
             : undefined,
         options: choices.flatMap((choice) => {
@@ -185,11 +186,12 @@ export function acpConfigOptions(raw: unknown): AcpConfigOption[] {
 }
 
 export function acpModelConfigId(options: AcpConfigOption[]): string {
-  const exact = options.find((option) => option.id === "model");
+  const exact = options.find((option) => option.id === "model" && option.type !== "boolean");
   if (exact) return exact.id;
   const byCategory = options.find(
     (option) =>
       option.category === "model" &&
+      option.id !== "provider" &&
       option.type === "select" &&
       option.options.length > 0,
   );
@@ -199,7 +201,8 @@ export function acpModelConfigId(options: AcpConfigOption[]): string {
 /** The model the agent reports as active after setup or a config update. */
 export function acpCurrentModelId(options: AcpConfigOption[]): string {
   const id = acpModelConfigId(options);
-  return options.find((option) => option.id === id)?.currentValue ?? "";
+  const value = options.find((option) => option.id === id)?.currentValue;
+  return typeof value === "string" ? value : "";
 }
 
 export function acpCommandsFromUpdate(

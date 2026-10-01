@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEVIN_CLIENT_INFO,
+  DEVIN_CLIENT_CAPABILITIES,
   devinAuthError,
   devinAutoOption,
   devinCommandsFromUpdate,
@@ -9,6 +11,7 @@ import {
   devinElicitationResult,
   devinEventsFromUpdate,
   devinModeId,
+  devinModelConfigId,
   devinModeIdsFromConfig,
   devinModesFromSetup,
   devinModelSelectionForUid,
@@ -62,7 +65,7 @@ const SESSION_NEW = {
 
 describe("devinModeId", () => {
   it("maps MonoCode runtime modes onto advertised Devin modes only", () => {
-    expect(devinModeId("supervised", false, DEVIN_MODES)).toBe("accept-edits");
+    expect(devinModeId("supervised", false, DEVIN_MODES)).toBe("ask");
     expect(devinModeId("auto-accept-edits", false, DEVIN_MODES)).toBe(
       "accept-edits",
     );
@@ -77,6 +80,8 @@ describe("devinModeId", () => {
     expect(devinModeId("auto", false, ["accept-edits", "ask"])).toBeUndefined();
     expect(devinModeId("supervised", false, ["bypass"])).toBeUndefined();
     expect(devinModeId("auto", false, [])).toBeUndefined();
+    expect(devinModeId("supervised", false, ["accept-edits"])).toBeUndefined();
+    expect(devinModeId("supervised", true, ["ask"])).toBeUndefined();
   });
 
   it("prefers a real supervised mode when Devin advertises one", () => {
@@ -676,5 +681,30 @@ describe("misc", () => {
     ]);
     expect(blocks[0]).toEqual({ type: "text", text: "hi" });
     expect(blocks[1]).toMatchObject({ type: "image", data: "aGk=" });
+  });
+});
+
+
+it("preserves boolean config values and keeps provider/boolean selectors out of model IDs", () => {
+  const options = devinConfigOptions([
+    { id: "model", type: "boolean", currentValue: false },
+    { id: "provider", category: "model", type: "select", currentValue: "gateway", options: [{ value: "gateway" }] },
+    { id: "selected_model", category: "model", type: "select", currentValue: "swe-2", options: [{ value: "swe-2" }] },
+    { id: "fast", type: "boolean", currentValue: true },
+  ]);
+  expect(options.find((option) => option.id === "model")?.currentValue).toBe(false);
+  expect(options.find((option) => option.id === "fast")?.currentValue).toBe(true);
+  expect(devinModelConfigId(options)).toBe("selected_model");
+  expect(devinCurrentModelId(options)).toBe("swe-2");
+  expect(devinCurrentModelId(options.slice(0, 2))).toBe("");
+});
+
+
+it("advertises Devin compatibility without filesystem or terminal authority", () => {
+  expect(DEVIN_CLIENT_INFO).toEqual({ name: "windsurf", version: "1.110.1" });
+  expect(DEVIN_CLIENT_CAPABILITIES).toEqual({
+    fs: { readTextFile: false, writeTextFile: false }, terminal: false,
+    session: { configOptions: { boolean: {} } },
+    _meta: { "cognition.ai/requestDiagnostics": true }, elicitation: { form: {} },
   });
 });
