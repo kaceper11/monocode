@@ -5,6 +5,10 @@ from unittest.mock import patch
 with tempfile.TemporaryDirectory() as temporary:
     home = Path(temporary)
     with patch.object(Path, "home", return_value=home):
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(home / "guest-config")}):
+            assert handle({"op": "config_home", "path": str(home)}) == str(home / "guest-config")
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}):
+            assert handle({"op": "config_home", "path": str(home)}) == str(home / ".config")
         parent = home / ".cursor/acp-sessions/parent"
         parent.mkdir(parents=True)
         connection = sqlite3.connect(parent / "store.db")

@@ -302,6 +302,131 @@ pub async fn azure_devops_mr_diff(
     .map_err(|error| error.to_string())?
 }
 
+/// Create a pull request on Azure Repos and return its web URL.
+/// Returns `Ok(None)` when the push remote is not an Azure DevOps remote.
+/// The GitHub flow remains available for non-Azure push destinations. Azure
+/// configuration failures must not redirect a write to another provider.
+pub(crate) fn try_create_pull_request(
+    app: &AppHandle,
+    root: &Path,
+    title: &str,
+    body: &str,
+    base: &str,
+    head: &str,
+    draft: bool,
+) -> Result<Option<String>, String> {
+    let Some((org_key, project, repo_name)) = azure_remote_for(root)? else {
+        return Ok(None);
+    };
+    let Some(config) = read_config(app)? else {
+        return Err(
+            "Connect this Azure DevOps organization in Settings before creating its PR".into(),
+        );
+    };
+    require_pr_organization(&config.url, &org_key)?;
+    create_pull_request(
+        &config, &project, &repo_name, title, body, base, head, draft,
+    )
+    .map(Some)
+}
+
+fn require_pr_organization(config_url: &str, remote_org: &str) -> Result<(), String> {
+    if config_url
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(remote_org)
+    {
+        Ok(())
+    } else {
+        Err("Connect the Azure DevOps organization of the push remote in Settings before creating its PR".into())
+    }
+}
+
+/// Shared Azure API creation used by source control and Board delivery.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_pull_request(
+    config: &AzureDevOpsConfig,
+    project: &str,
+    repo_name: &str,
+    title: &str,
+    body: &str,
+    base: &str,
+    head: &str,
+    draft: bool,
+) -> Result<String, String> {
+    let head = head
+        .trim()
+        .strip_prefix("refs/heads/")
+        .unwrap_or(head.trim());
+    let base = base
+        .trim()
+        .strip_prefix("refs/heads/")
+        .unwrap_or(base.trim());
+    if title.trim().is_empty() || head.is_empty() || base.is_empty() || head == base {
+        return Err("Pull request requires a title and different base and head branches".into());
+    }
+    let path = format!(
+        "/{}/_apis/git/repositories/{}/pullrequests?api-version={}",
+        encode_segment(project),
+        encode_segment(repo_name),
+        API_VERSION
+    );
+    let payload = json!({
+        "sourceRefName": format!("refs/heads/{head}"),
+        "targetRefName": format!("refs/heads/{base}"),
+        "title": title.trim(),
+        "description": body.trim(),
+        "isDraft": draft,
+    });
+    let response = azure_post_json(config, &path, payload)?;
+    let url = response
+        .value
+        .get("_links")
+        .and_then(|links| links.get("web"))
+        .and_then(|web| web.get("href"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string);
+    if let Some(url) = url {
+        return Ok(url);
+    }
+    // Fall back to the canonical web URL when the API omits _links.web.
+    let number = response.value.get("pullRequestId").and_then(Value::as_i64);
+    match number {
+        Some(id) if id > 0 => Ok(pr_web_url(config, project, repo_name, id)),
+        _ => Err("Azure DevOps did not return a pull request URL".into()),
+    }
+}
+
+/// Azure DevOps coordinates of the branch's push destination, resolved with
+/// the same remote `git push` uses (upstream remote, else default remote).
+/// Returns `Ok(None)` when that push remote is not an Azure DevOps remote,
+/// so callers fall back to the GitHub CLI path.
+fn azure_remote_for(root: &Path) -> Result<Option<(String, String, String)>, String> {
+    let Some(remote) = crate::fs::git_push_remote_name(root) else {
+        return Ok(None);
+    };
+    let url = git_remote_url(root, &remote)?;
+    let Some(parsed) = parse_azure_remote(&url) else {
+        return Ok(None);
+    };
+    if !valid_repo_parts(&parsed.1, &parsed.2) {
+        return Ok(None);
+    }
+    Ok(Some(parsed))
+}
+
+/// Push URL of a git remote. Unknown remotes yield an empty string so the
+/// caller treats them as non-Azure instead of failing.
+fn git_remote_url(root: &Path, remote: &str) -> Result<String, String> {
+    Ok(
+        crate::fs::git_stdout(root, &["remote", "get-url", "--push", remote])
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+    )
+}
+
 fn azure_devops_list_work_items_for(
     config: &AzureDevOpsConfig,
     repo: &str,
@@ -1577,8 +1702,8 @@ pub(crate) fn pr_web_url(
     format!(
         "{}/{}/_git/{}/pullrequest/{}",
         config.url.trim_end_matches('/'),
-        project.trim(),
-        repo.trim(),
+        encode_segment(project.trim()),
+        encode_segment(repo.trim()),
         number
     )
 }
@@ -2311,6 +2436,167 @@ mod tests {
             project_repo_from_remote("https://dev.azure.com/other/platform/_git/web", org)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pr_organization_mismatch_errors_instead_of_falling_back_to_github() {
+        assert!(require_pr_organization(
+            "https://dev.azure.com/other",
+            "https://dev.azure.com/acme"
+        )
+        .is_err());
+        assert!(require_pr_organization(
+            "https://dev.azure.com/ACME/",
+            "https://dev.azure.com/acme"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn creates_draft_pr_with_encoded_destination_and_normalized_branches() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = AzureDevOpsConfig {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "test-token".into(),
+        };
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut payload = vec![0; length];
+            reader.read_exact(&mut payload).unwrap();
+            let response = r#"{"pullRequestId":42}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+            (request, serde_json::from_slice::<Value>(&payload).unwrap())
+        });
+        let url = create_pull_request(
+            &config,
+            "My Project",
+            "web%2Fapp",
+            " title ",
+            " body ",
+            "refs/heads/main",
+            "refs/heads/feature",
+            true,
+        )
+        .unwrap();
+        let (request, payload) = server.join().unwrap();
+        assert!(request.starts_with(
+            "POST /My%20Project/_apis/git/repositories/web%252Fapp/pullrequests?api-version=7.1 "
+        ));
+        assert_eq!(
+            payload,
+            json!({ "sourceRefName": "refs/heads/feature", "targetRefName": "refs/heads/main", "title": "title", "description": "body", "isDraft": true })
+        );
+        assert!(url.ends_with("/My%20Project/_git/web%252Fapp/pullrequest/42"));
+        assert!(create_pull_request(
+            &config,
+            "p",
+            "r",
+            "title",
+            "",
+            "main",
+            "refs/heads/main",
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn encodes_special_characters_in_pr_urls() {
+        let config = AzureDevOpsConfig {
+            url: "https://dev.azure.com/acme/".to_string(),
+            token: "token".to_string(),
+        };
+        assert_eq!(
+            pr_web_url(&config, "My Project", "weird%2Fname", 3),
+            "https://dev.azure.com/acme/My%20Project/_git/weird%252Fname/pullrequest/3"
+        );
+    }
+
+    #[test]
+    fn resolves_the_push_url_when_fetch_and_push_differ() {
+        let dir = temp_git_dir("azure-push-url");
+        // Fetch from GitHub but push to Azure: the push destination wins.
+        git(
+            &dir,
+            &["remote", "add", "origin", "https://github.com/acme/web.git"],
+        );
+        git(
+            &dir,
+            &[
+                "config",
+                "remote.origin.pushurl",
+                "https://dev.azure.com/acme/shop/_git/web",
+            ],
+        );
+        assert_eq!(
+            azure_remote_for(&dir)
+                .unwrap()
+                .as_ref()
+                .map(|remote| remote.1.clone() + "/" + &remote.2),
+            Some("shop/web".to_string())
+        );
+        // Fetch from Azure but push to GitHub: not an Azure push destination.
+        git(&dir, &["remote", "remove", "origin"]);
+        git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://dev.azure.com/acme/shop/_git/web",
+            ],
+        );
+        git(
+            &dir,
+            &[
+                "config",
+                "remote.origin.pushurl",
+                "https://github.com/acme/web.git",
+            ],
+        );
+        assert!(azure_remote_for(&dir).unwrap().is_none());
+    }
+
+    static GIT_TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn temp_git_dir(name: &str) -> PathBuf {
+        let id = GIT_TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("monocode-{name}-{}-{}", std::process::id(), id));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init"]);
+        git(&dir, &["config", "user.name", "MonoCode"]);
+        git(&dir, &["config", "user.email", "monocode@test"]);
+        dir
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git must run in tests");
+        assert!(status.success(), "git {args:?} failed in tests");
     }
 
     #[test]

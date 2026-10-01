@@ -13,9 +13,8 @@ use tauri::AppHandle;
 
 use crate::azure_devops::{
     azure_devops_repo_for, azure_get, azure_request_json, encode_segment, match_remote,
-    parse_azure_remote, parse_pr, percent_decode, pr_web_url, read_config, remote_urls,
-    repository_id, require_config, short_ref, split_repo, string_field, AzureDevOpsConfig,
-    API_VERSION,
+    parse_azure_remote, parse_pr, percent_decode, read_config, remote_urls, repository_id,
+    require_config, short_ref, split_repo, string_field, AzureDevOpsConfig, API_VERSION,
 };
 use crate::fs::{expand_home, git_branch, GitPr, GitPrCheck};
 
@@ -446,34 +445,10 @@ pub async fn azure_devops_pr_create(
     draft: bool,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        if title.trim().is_empty() {
-            return Err("Pull request title cannot be empty".into());
-        }
         let (config, project, repo) = repo_context(&app, &cwd)?;
-        let path = format!(
-            "/{}/_apis/git/repositories/{}/pullrequests?api-version={}",
-            encode_segment(&project),
-            encode_segment(&repo),
-            API_VERSION
-        );
-        let response = azure_request_json(
-            &config,
-            "POST",
-            &path,
-            json!({
-                "sourceRefName": ref_name(&head),
-                "targetRefName": ref_name(&base),
-                "title": title.trim(),
-                "description": body,
-                "isDraft": draft,
-            }),
-        )?;
-        let number = response
-            .value
-            .get("pullRequestId")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| "Azure DevOps did not return the pull request".to_string())?;
-        Ok(pr_web_url(&config, &project, &repo, number))
+        crate::azure_devops::create_pull_request(
+            &config, &project, &repo, &title, &body, &base, &head, draft,
+        )
     })
     .await
     .map_err(|error| error.to_string())?

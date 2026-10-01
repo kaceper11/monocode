@@ -653,6 +653,8 @@ def handle(request):
         return out.decode("utf-8", errors="replace")
     if op == "home":
         return str(Path.home())
+    if op == "config_home":
+        return os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     if op == "skill_entries":
         result = []
         if not path.is_dir():

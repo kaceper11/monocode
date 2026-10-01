@@ -7,7 +7,7 @@ import { useWslStatus } from "../features/sessions/model/wslStatus";
 import { SavedCommandsControl } from "../features/sessions/ui/SavedCommandsControl";
 import { prepareSavedCommandLaunch, type SavedCommandLaunch } from "../features/sessions/model/savedCommandLaunch";
 import { pruneQueuedSavedCommands } from "../features/sessions/model/savedCommandRun";
-import { useKeepAwake } from "../features/sessions/model/keepAwake";
+import { useKeepAwake } from "../features/settings/model/keepAwake";
 import { LinkChoiceMenu } from "../features/sessions/ui/LinkChoiceMenu";
 import { newBrowserTab, openBrowserTab, closeBrowserTabs, updateBrowserTab, type BrowserMetaPatch } from "../features/sessions/model/browserWorkspace";
 import { OPEN_BROWSER_EVENT, requestBrowserCommand, isBrowserOpenRequest, normalizeBrowserUrl, rememberedBrowserUrl, browserTabLabel } from "../features/sessions/model/browser";

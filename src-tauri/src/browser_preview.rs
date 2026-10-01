@@ -1,11 +1,19 @@
 //! Small companion preview. Neither child is an application/session window.
 //! Remote pages cannot navigate to the trusted app origin or invoke commands.
+use std::{
+    collections::HashMap,
+    sync::{LazyLock, Mutex},
+};
+
 use tauri::{
     webview::{NewWindowResponse, PageLoadEvent, WebviewBuilder},
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Url, Webview, WebviewUrl,
     WindowBuilder, WindowEvent,
 };
 use tauri_plugin_opener::OpenerExt;
+
+// PR #334: native URL reads can panic while WKWebView is loading or tearing down.
+static URLS: LazyLock<Mutex<HashMap<String, Url>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const BAR_HEIGHT: f64 = 88.0;
 const EVENT: &str = "browser-preview-state";
@@ -56,6 +64,9 @@ pub async fn browser_preview_open(owner: tauri::WebviewWindow) -> Result<(), Str
         .visible(false)
         .build()
         .map_err(|e| e.to_string())?;
+    URLS.lock()
+        .unwrap()
+        .insert(page_label.clone(), Url::parse("about:blank").unwrap());
     let result = (|| -> Result<(), String> {
         let size = window
             .inner_size()
@@ -83,6 +94,7 @@ pub async fn browser_preview_open(owner: tauri::WebviewWindow) -> Result<(), Str
         let popup_toolbar = toolbar_label.clone();
         let download_app = app.clone();
         let download_toolbar = toolbar_label.clone();
+        let load_page = page_label.clone();
         let page = window.add_child(
             WebviewBuilder::new(&page_label, WebviewUrl::External(Url::parse("about:blank").unwrap()))
                 .incognito(true)
@@ -93,14 +105,16 @@ pub async fn browser_preview_open(owner: tauri::WebviewWindow) -> Result<(), Str
                         Err(error) => { notice(&nav_app, &nav_toolbar, None, &error); false }
                     }
                 })
-                .on_page_load(move |view, payload| {
-                    // Read the native top-level URL; do not trust page-script messages.
-                    let url = view.url().ok();
+                .on_page_load(move |_, payload| {
+                    let url = payload.url();
+                    if let Some(current) = URLS.lock().unwrap().get_mut(&load_page) {
+                        *current = url.clone();
+                    }
                     let message = match payload.event() {
                         PageLoadEvent::Started => "Loading…",
                         PageLoadEvent::Finished => "Preview runs on this computer. WSL localhost access depends on your network setup.",
                     };
-                    notice(&load_app, &load_toolbar, url.as_ref().map(Url::as_str), message);
+                    notice(&load_app, &load_toolbar, Some(url.as_str()), message);
                 })
                 .on_new_window(move |_, _| {
                     notice(&popup_app, &popup_toolbar, None, "Popups are blocked. Use Open externally for this workflow.");
@@ -113,7 +127,11 @@ pub async fn browser_preview_open(owner: tauri::WebviewWindow) -> Result<(), Str
             LogicalPosition::new(0.0, BAR_HEIGHT), LogicalSize::new(size.width, (size.height - BAR_HEIGHT).max(1.0)),
         ).map_err(|e| e.to_string())?;
         let resize_window = window.clone();
+        let closed_page = page_label.clone();
         window.on_window_event(move |event| {
+            if matches!(event, WindowEvent::Destroyed) {
+                URLS.lock().unwrap().remove(&closed_page);
+            }
             if matches!(
                 event,
                 WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }
@@ -135,6 +153,7 @@ pub async fn browser_preview_open(owner: tauri::WebviewWindow) -> Result<(), Str
     })();
     if result.is_err() {
         let _ = window.destroy();
+        URLS.lock().unwrap().remove(&page_label);
     }
     result
 }
@@ -168,7 +187,12 @@ pub async fn browser_preview_action(
         "forward" => page.eval("history.forward()").map_err(|e| e.to_string()),
         "reload" => page.reload().map_err(|e| e.to_string()),
         "external" => {
-            let url = page.url().map_err(|e| e.to_string())?;
+            let url = URLS
+                .lock()
+                .unwrap()
+                .get(page.label())
+                .cloned()
+                .ok_or("The preview has not loaded an address yet.")?;
             allowed_url(&url, &app_url)?;
             view.app_handle()
                 .opener()

@@ -75,8 +75,29 @@ const MAX_URL_LEN: usize = 8192;
 const MAX_LABEL_LEN: usize = 120;
 const MAX_TITLE_LEN: usize = 200;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+// PR #334: reject app commands from Tauri-managed browser pages.
+fn is_browser_page(label: &str) -> bool {
+    label.starts_with("embedded-browser-")
+        || (label.starts_with("preview-") && label.ends_with("-page"))
+}
+
+pub fn restrict_commands(
+    handler: impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static,
+) -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
+    move |invoke| {
+        let label = invoke.message.webview_ref().label();
+        if is_browser_page(label) {
+            invoke
+                .resolver
+                .reject("Browser pages cannot call app commands");
+            return true;
+        }
+        handler(invoke)
+    }
+}
+
 /// App-owned origins are excluded even though this raw child has no app IPC.
-const LOCAL_HOSTS: [&str; 2] = ["tauri.localhost", "asset.localhost"];
+const LOCAL_HOSTS: [&str; 3] = ["tauri.localhost", "asset.localhost", "ipc.localhost"];
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Rust-side bounds on untrusted page output — the page decides what the
 /// eval returns, so sizes are enforced here, not only in the script.
@@ -1916,12 +1937,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_dispatch_rejects_browser_pages_but_preserves_app_controls() {
+        for label in [
+            "embedded-browser-main",
+            "preview-main-page",
+            "preview-mono-2-page",
+        ] {
+            assert!(is_browser_page(label), "{label}");
+        }
+        for label in ["main", "mono-2", "preview-main-toolbar", "browser-1"] {
+            assert!(!is_browser_page(label), "{label}");
+        }
+    }
+
+    #[test]
     fn remote_page_policy_excludes_app_origins_credentials_and_protocols() {
         for value in [
             "file:///tmp/private",
             "tauri://localhost",
             "https://tauri.localhost",
             "http://asset.localhost",
+            "http://ipc.localhost",
             "https://user:password@example.test",
             "http://localhost:1420/path",
         ] {

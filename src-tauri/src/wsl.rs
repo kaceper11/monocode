@@ -788,6 +788,7 @@ impl Bridge {
                         | "canonical_directory"
                         | "project_location"
                         | "home"
+                        | "config_home"
                         | "skill_entries"
                         | "terminal_resources"
                         | "resolve_agent"

@@ -2,8 +2,8 @@ mod bounded_process;
 mod browser;
 mod browser_preview;
 pub mod dictation;
+mod keep_awake;
 mod planning;
-mod power;
 mod saved_commands;
 mod wsl;
 use tauri::Manager;
@@ -233,7 +233,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(browser::BrowserState::default())
-        .manage(power::PowerHost::new())
+        .manage(keep_awake::KeepAwakeState::new())
         .manage(dictation::DictationHost::new())
         .plugin(tauri_plugin_dialog::init())
         .plugin(
@@ -277,11 +277,8 @@ pub fn run() {
         .on_menu_event(|app, event| {
             menu::dispatch(app, event.id().as_ref());
         })
-        .invoke_handler(tauri::generate_handler![
-            power::power_sync,
-            power::power_set_enabled,
-            power::power_status,
-            power::power_retry,
+        .invoke_handler(browser::restrict_commands(tauri::generate_handler![
+            keep_awake::set_keep_awake,
             dictation::dictation_catalog,
             dictation::dictation_model_install,
             dictation::dictation_model_cancel_download,
@@ -634,7 +631,7 @@ pub fn run() {
             project_logo::save_project_logo,
             project_logo::remove_project_logo,
             project_logo::forget_logo_file,
-        ])
+        ]))
         .build(tauri::generate_context!())
         .expect("error while building MonoCode");
 
@@ -662,8 +659,8 @@ pub fn run() {
             ..
         } => {
             handle
-                .state::<power::PowerHost>()
-                .drop_window(Some(handle), &label);
+                .state::<keep_awake::KeepAwakeState>()
+                .window_closed(&label);
             handle
                 .state::<dictation::DictationHost>()
                 .shutdown_window(&label);
@@ -692,7 +689,7 @@ pub fn run() {
         }
         tauri::RunEvent::Exit => {
             handle.state::<dictation::DictationHost>().shutdown();
-            handle.state::<power::PowerHost>().release(Some(handle));
+            handle.state::<keep_awake::KeepAwakeState>().shutdown();
             handle.state::<remote::RemoteConnections>().shutdown();
             reap_harness_children(handle);
         }

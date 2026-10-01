@@ -233,15 +233,25 @@ pub fn list_skills(
     disabled_paths: Option<Vec<String>>,
 ) -> Result<Vec<DiscoveredSkill>, String> {
     let project = expand_home(&cwd);
-    let home = if let Some(location) = crate::wsl::location(&cwd)? {
+    let location = crate::wsl::location(&cwd)?;
+    let home = if let Some(location) = &location {
         Some(PathBuf::from(crate::wsl::path_request(
-            &location,
+            location,
             "home",
             serde_json::json!({}),
         )?))
     } else {
         dirs_home().map(PathBuf::from)
     };
+    if let Some(location) = location {
+        let config = crate::wsl::path_request(&location, "config_home", serde_json::json!({}))?;
+        return Ok(list_skills_with_xdg(
+            &project,
+            home.as_deref(),
+            disabled_paths.as_deref(),
+            Some(std::ffi::OsStr::new(&config)),
+        ));
+    }
     Ok(list_skills_from(
         &project,
         home.as_deref(),
@@ -249,10 +259,32 @@ pub fn list_skills(
     ))
 }
 
+/// Muse user skills: `$XDG_CONFIG_HOME/muse/skills`, else `~/.config/muse/skills`.
+fn muse_user_skill_root(home: &Path, xdg_config_home: Option<&std::ffi::OsStr>) -> PathBuf {
+    match xdg_config_home.filter(|xdg| !xdg.is_empty()) {
+        Some(xdg) => PathBuf::from(xdg).join("muse/skills"),
+        None => home.join(".config/muse/skills"),
+    }
+}
+
 pub(crate) fn list_skills_from(
     project: &Path,
     home: Option<&Path>,
     disabled_paths: Option<&[String]>,
+) -> Vec<DiscoveredSkill> {
+    // Never use the desktop's XDG_CONFIG_HOME for a guest filesystem.
+    let xdg = match crate::wsl::path_location(project) {
+        Ok(None) => std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()),
+        _ => None,
+    };
+    list_skills_with_xdg(project, home, disabled_paths, xdg.as_deref())
+}
+
+fn list_skills_with_xdg(
+    project: &Path,
+    home: Option<&Path>,
+    disabled_paths: Option<&[String]>,
+    xdg_config_home: Option<&std::ffi::OsStr>,
 ) -> Vec<DiscoveredSkill> {
     let disabled_filter = DisabledFilter::new(disabled_paths);
     let mut by_name: HashMap<String, DiscoveredSkill> = HashMap::new();
@@ -328,6 +360,15 @@ pub(crate) fn list_skills_from(
         if root.is_dir() {
             add_root(root, "user", "antigravity");
         }
+    }
+    // Preserve established roots' precedence over Muse.
+    if let Some(root) = match xdg_config_home {
+        Some(xdg) if !xdg.is_empty() => Some(muse_user_skill_root(Path::new(""), Some(xdg))),
+        _ => home.map(|home| muse_user_skill_root(home, None)),
+    } {
+        add_root(root, "user", "muse");
+    }
+    if let Some(home) = home {
         for (root, scope, namespace) in claude_plugin_skill_roots(home, project) {
             add_namespaced_root(
                 &mut by_name,
@@ -1184,6 +1225,82 @@ mod tests {
         let agy = skills.iter().find(|s| s.name == "agy-review").unwrap();
         assert_eq!(agy.source, "antigravity");
         assert_eq!(agy.scope, "user");
+    }
+
+    #[test]
+    fn discovers_muse_user_skills_from_config_home() {
+        let project = tmp("proj-muse");
+        let home = tmp("home-muse");
+        write_skill(
+            &home.0.join(".config/muse/skills"),
+            "muse-review",
+            "---\nname: muse-review\ndescription: Muse user skill\n---\n",
+        );
+        let skills = list_skills_with_xdg(&project.0, Some(&home.0), None, None);
+        let skill = skills.iter().find(|s| s.name == "muse-review").unwrap();
+        assert_eq!(skill.source, "muse");
+        assert_eq!(skill.scope, "user");
+    }
+
+    #[test]
+    fn muse_user_skills_follow_xdg_config_home() {
+        let project = tmp("proj-muse-xdg");
+        let home = tmp("home-muse-xdg");
+        let xdg = tmp("xdg-muse");
+        write_skill(
+            &xdg.0.join("muse/skills"),
+            "muse-xdg",
+            "---\nname: muse-xdg\ndescription: XDG Muse skill\n---\n",
+        );
+        write_skill(
+            &home.0.join(".config/muse/skills"),
+            "muse-fallback",
+            "---\nname: muse-fallback\ndescription: Fallback Muse skill\n---\n",
+        );
+        let skills = list_skills_with_xdg(&project.0, Some(&home.0), None, Some(xdg.0.as_os_str()));
+        assert!(skills
+            .iter()
+            .any(|s| s.name == "muse-xdg" && s.source == "muse"));
+        assert!(skills.iter().all(|s| s.name != "muse-fallback"));
+        assert_eq!(
+            muse_user_skill_root(&home.0, None),
+            home.0.join(".config/muse/skills")
+        );
+    }
+
+    #[test]
+    fn muse_skills_do_not_override_agents_skills() {
+        let project = tmp("proj-muse-shadow");
+        let home = tmp("home-muse-shadow");
+        write_skill(
+            &project.0.join(".agents/skills"),
+            "shared-name",
+            "---\nname: shared-name\ndescription: Agents project skill\n---\n",
+        );
+        write_skill(
+            &home.0.join(".config/muse/skills"),
+            "shared-name",
+            "---\nname: shared-name\ndescription: Muse user skill\n---\n",
+        );
+        let skills = list_skills_with_xdg(&project.0, Some(&home.0), None, None);
+        let skill = skills.iter().find(|s| s.name == "shared-name").unwrap();
+        assert_eq!(skill.description, "Agents project skill");
+        assert_eq!(skill.source, "agents");
+    }
+
+    #[test]
+    fn discovers_muse_xdg_skills_without_a_home_directory() {
+        let project = tmp("proj-muse-nohome");
+        let xdg = tmp("xdg-muse-nohome");
+        write_skill(
+            &xdg.0.join("muse/skills"),
+            "muse-xdg-only",
+            "---\nname: muse-xdg-only\ndescription: XDG Muse skill\n---\n",
+        );
+        let skills = list_skills_with_xdg(&project.0, None, None, Some(xdg.0.as_os_str()));
+        let skill = skills.iter().find(|s| s.name == "muse-xdg-only").unwrap();
+        assert_eq!(skill.source, "muse");
+        assert_eq!(skill.scope, "user");
     }
 
     #[test]
