@@ -348,8 +348,8 @@ export function gitStagedContext(cwd: string): Promise<GitStagedContext> {
   return invoke<GitStagedContext>("git_staged_context", { cwd });
 }
 
-export function gitPush(cwd: string): Promise<void> {
-  return invoke<void>("git_push", { cwd });
+export function gitPush(cwd: string, remote?: string, expectedBranch?: string): Promise<void> {
+  return invoke<void>("git_push", { cwd, remote, expectedBranch });
 }
 
 export function gitPull(cwd: string): Promise<void> {
@@ -404,8 +404,9 @@ export function gitPrCreate(
   base: string,
   head: string,
   draft: boolean,
+  repo?: string,
 ): Promise<string> {
-  return invoke<string>("git_pr_create", { cwd, title, body, base, head, draft });
+  return invoke<string>("git_pr_create", { cwd, title, body, base, head, draft, repo });
 }
 
 export type GitPrCheck = {

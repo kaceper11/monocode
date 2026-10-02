@@ -70,6 +70,13 @@ function origin(side: PopoverSide, align: PopoverAlign): string {
   return side === "right" ? `0% ${near}` : `100% ${near}`;
 }
 
+/** Every popover listens for Escape on window, and stopPropagation can't
+ * block listeners on the same node — without a stack, one keypress would
+ * dismiss a nested menu and every enclosing popover. Only the most recently
+ * mounted dismisses; it still swallows the event so app-level Escape stays
+ * put. */
+const escapeStack: object[] = [];
+
 function anchorElement(anchor: PopoverAnchor): HTMLElement | null {
   if (!anchor) return null;
   if (anchor instanceof HTMLElement) return anchor;
@@ -153,15 +160,37 @@ function NativePopover({
 }: Props & { host: HTMLElement }) {
   const surface = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    if (autoFocus) surface.current?.focus({ preventScroll: true });
+    if (!autoFocus) return;
+    const previous = document.activeElement;
+    surface.current?.focus({ preventScroll: true });
+    return () => {
+      // Restore only when focus fell to <body> — components that return
+      // focus to their own trigger have already claimed it.
+      if (
+        previous instanceof HTMLElement &&
+        previous.isConnected &&
+        document.activeElement === document.body
+      )
+        previous.focus({ preventScroll: true });
+    };
   }, [autoFocus]);
+  const dismissRef = useRef(onDismiss);
+  dismissRef.current = onDismiss;
   useEffect(() => {
-    if (!onDismiss) return;
+    // Register once per mount — deps that change identity per render (an
+    // inline onDismiss) would splice the token and re-push it on top of a
+    // later-mounted popover, breaking topmost-first Escape order.
+    const token = {};
+    escapeStack.push(token);
     const key = (event: KeyboardEvent) => {
-      if (!dismissOnEscape || event.key !== "Escape") return;
+      if (event.key !== "Escape") return;
+      if (escapeStack[escapeStack.length - 1] !== token) return;
+      // A popover without a dismisser must not swallow Escape — leave the
+      // event for layers below.
+      if (!dismissRef.current) return;
       event.preventDefault();
       event.stopPropagation();
-      onDismiss("escape");
+      if (dismissOnEscape) dismissRef.current("escape");
     };
     const outside = (event: PointerEvent) => {
       const target = event.target;
@@ -171,15 +200,18 @@ function NativePopover({
         (ignore && target.closest(ignore))
       )
         return;
-      onDismiss("outside");
+      dismissRef.current?.("outside");
     };
     window.addEventListener("keydown", key, true);
     window.addEventListener("pointerdown", outside);
     return () => {
+      const at = escapeStack.indexOf(token);
+      if (at >= 0) escapeStack.splice(at, 1);
       window.removeEventListener("keydown", key, true);
       window.removeEventListener("pointerdown", outside);
     };
-  }, [onDismiss, dismissOnEscape, ignore]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dismissOnEscape, ignore]);
   // These position the ordinary web popover; the OS positions this surface.
   const {
     anchor: _anchor,
@@ -248,7 +280,17 @@ function WebPopover({
     if (!el || !rect) return;
     const next = placePopover(
       rect,
-      { width: el.offsetWidth, height: el.offsetHeight },
+      // Measure the desired height, not just the clipped frame. Otherwise
+      // clipping makes a long menu look short and repeatedly flips its side.
+      {
+        width: el.offsetWidth,
+        height: Math.max(
+          el.offsetHeight,
+          ...Array.from(el.querySelectorAll<HTMLElement>("[role=listbox]")).map(
+            (list) => list.scrollHeight + list.offsetTop,
+          ),
+        ),
+      },
       { width: window.innerWidth, height: window.innerHeight },
       { side, align, gap, padding, width, minHeight, maxHeight },
     );
@@ -274,11 +316,22 @@ function WebPopover({
   }, [place]);
 
   useEffect(() => {
-    if (autoFocus) surface.current?.focus();
+    if (!autoFocus) return;
+    const previous = document.activeElement;
+    surface.current?.focus();
+    return () => {
+      if (
+        previous instanceof HTMLElement &&
+        previous.isConnected &&
+        document.activeElement === document.body
+      )
+        previous.focus({ preventScroll: true });
+    };
   }, [autoFocus]);
 
   useEffect(() => {
-    if (!onDismiss) return;
+    // Same mount-order rule — keep `onDismiss` out of the deps so an inline
+    // callback can't reorder this token above a newer popover.
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as Node | null;
       if (!target) return;
@@ -289,19 +342,27 @@ function WebPopover({
       if (ignore && el?.closest(ignore)) return;
       dismissRef.current?.("outside");
     };
+    const token = {};
+    escapeStack.push(token);
     const onKey = (event: KeyboardEvent) => {
-      if (!dismissOnEscape || event.key !== "Escape") return;
+      if (event.key !== "Escape") return;
+      if (escapeStack[escapeStack.length - 1] !== token) return;
+      // Same pass-through — no dismisser means the event isn't ours.
+      if (!dismissRef.current) return;
       event.preventDefault();
       event.stopPropagation();
-      dismissRef.current?.("escape");
+      if (dismissOnEscape) dismissRef.current("escape");
     };
     window.addEventListener("pointerdown", onPointerDown);
     window.addEventListener("keydown", onKey, true);
     return () => {
+      const at = escapeStack.indexOf(token);
+      if (at >= 0) escapeStack.splice(at, 1);
       window.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener("keydown", onKey, true);
     };
-  }, [onDismiss, dismissOnEscape, ignore]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dismissOnEscape, ignore]);
 
   // The first pass measures the surface off to the side; the layout effect
   // lands it before the browser paints.

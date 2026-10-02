@@ -37,7 +37,7 @@ import {
 } from "./boardData";
 import { buildStandup } from "./standup";
 import { defaultReviewProject } from "./ReviewLocallyDialog";
-import { worktreeLaneOptions } from "./NewTaskDialog";
+import { worktreeCopyPicks } from "./NewTaskDialog";
 import {
   listWorktrees,
   type Worktree,
@@ -330,6 +330,44 @@ describe("buildBoardCards", () => {
     expect(row.sessions.map((ref) => ref.id)).toEqual(["s1", "s2"]);
     // …and the live one is the row's display ref.
     expect(row.session?.id).toBe("s2");
+  });
+
+  it("keeps a session on the first task when two tasks claim it", () => {
+    // Conflicting membership can't render twice — the earlier task keeps the
+    // session instead of the later task silently stealing it, matching the
+    // "Conflicting task membership" label in the session list.
+    const cards = buildBoardCards({
+      items: [],
+      sessions: [liveSession({ id: "s" })],
+      summaries: [],
+      tasks: [
+        task({ id: "first", taskSessionIds: ["s"] }),
+        task({
+          id: "second",
+          taskSessionIds: ["s"],
+          workstreams: [
+            {
+              id: "w",
+              projectPath: "/repo",
+              branch: "b",
+              base: "main",
+              sessionIds: ["s"],
+            },
+          ],
+        }),
+      ],
+    });
+    expect(cards).toHaveLength(2);
+    const [first, second] = cards;
+    expect(first!.task!.id).toBe("first");
+    expect(first!.sessions.map((s) => s.id)).toEqual(["s"]);
+    expect(first!.sessions[0]!.live).toBe(true);
+    expect(second!.task!.id).toBe("second");
+    // The second card keeps only the task-owned placeholder — the live ref
+    // stays with the first claimer.
+    expect(second!.sessions).toEqual([
+      expect.objectContaining({ id: "s", live: false }),
+    ]);
   });
 
   it("discovers pull requests carrying a linked ticket's key", () => {
@@ -2692,9 +2730,9 @@ const wt = (partial: Partial<Worktree>): Worktree => ({
   ...partial,
 });
 
-describe("worktreeLaneOptions", () => {
+describe("worktreeCopyPicks", () => {
   it("lists bindable worktrees and keeps a stale bound path visible", () => {
-    const options = worktreeLaneOptions(
+    const picks = worktreeCopyPicks(
       [
         wt({ path: "/repo", branch: "main", isMain: true }),
         wt({ path: "/repo-wt/feat", branch: "feat" }),
@@ -2704,14 +2742,19 @@ describe("worktreeLaneOptions", () => {
       "/repo-wt/stale",
     );
     // Detached and missing copies can't be lanes; the bound-but-gone path
-    // stays listed so the pick doesn't render blank.
-    expect(options.map((option) => option.value)).toEqual([
+    // stays listed so the pick doesn't render blank — and leads the list.
+    expect(picks.map((pick) => pick.value)).toEqual([
+      "/repo-wt/stale",
       "/repo",
       "/repo-wt/feat",
-      "/repo-wt/stale",
     ]);
-    expect(options[0]!.label).toContain("Project checkout");
-    expect(options[2]!.label).toContain("missing");
+    expect(picks[0]!.detail).toContain("missing");
+    expect(picks[1]!.title).toContain("Main checkout");
+    // The bound pick is marked as the current copy.
+    expect(
+      worktreeCopyPicks([wt({ path: "/repo", branch: "main" })], "/repo")[0]!
+        .detail,
+    ).toContain("current");
   });
 });
 
@@ -2908,4 +2951,10 @@ describe("provider parent groups", () => {
     expect(buildBoardCards({ ...input, items: [{ ...a, parent: { ...b, account: "two" } }, b] })).toHaveLength(2);
     expect(buildBoardCards({ ...input, items: [a, b] })).toHaveLength(2);
   });
+});
+
+it("keeps additional task-wide conversations on their task card without duplicates", () => {
+  const cards = buildBoardCards({items: [], summaries: [], sessions: [], tasks: [{id: "task:wide", title: "Checkout", links: [], workstreams: [], createdAt: 1, primarySessionId: "lead", taskSessionIds: ["lead", "extra"]}]});
+  expect(cards).toHaveLength(1);
+  expect(cards[0].sessions.map(session => session.id)).toEqual(["lead", "extra"]);
 });

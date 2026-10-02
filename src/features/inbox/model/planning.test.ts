@@ -135,8 +135,10 @@ it("keeps remote choices distinct and claimed branches visible but disabled", ()
     "refs/remotes/origin/topic",
     "refs/remotes/upstream/topic",
   ]);
+  // Remote choices keep a remote-qualified base — provider-safe `<remote>/<branch>`
+  // form, not the raw ref.
   expect(taskBranchChoice("refs/remotes/upstream/feature/topic")).toEqual({
     branch: "feature/topic",
-    base: "refs/remotes/upstream/feature/topic",
+    base: "upstream/feature/topic",
   });
 });

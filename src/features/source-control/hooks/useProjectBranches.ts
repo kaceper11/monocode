@@ -143,12 +143,6 @@ export function useProjectBranches(
   return useProjectBranchesState(cwd, enabled).branches;
 }
 
-/** Cached branch list without subscribing — for submit-time checks inside
- * event handlers (e.g. "is this typed name an existing local branch?"). */
-export function peekProjectBranches(cwd: string): GitBranches | null {
-  return entries.get(cwd)?.state.branches ?? null;
-}
-
 /** Select options for the repo's LOCAL branches only — adoptable targets.
  * Remote-qualified names would create a new local branch instead. */
 export function localBranchOptions(
@@ -169,6 +163,18 @@ export function taskBranchOptions(branches: GitBranches | null, claimed: Readonl
   }));
 }
 export function taskBranchChoice(value: string): { branch: string; base?: string } {
-  if (value.startsWith("refs/remotes/")) return { branch: value.split("/").slice(3).join("/"), base: value };
+  // Persist the `<remote>/<branch>` form — git resolves it for checkouts and
+  // merges, and provider calls can strip the remote prefix. Storing the raw
+  // `refs/remotes/…` ref would leak into PR base fields that reject it.
+  if (value.startsWith("refs/remotes/"))
+    return {
+      branch: value.split("/").slice(3).join("/"),
+      base: value.slice("refs/remotes/".length),
+    };
   return { branch: value };
+}
+
+/** Stored bases from older builds can still carry the full ref form. */
+export function storedBaseName(base: string): string {
+  return base.startsWith("refs/remotes/") ? base.slice("refs/remotes/".length) : base;
 }

@@ -58,7 +58,7 @@ export function Select({
   const pick = (next: string) => {
     onChange(next);
     setOpen(false);
-    trigger.current?.focus();
+    trigger.current?.focus({ preventScroll: true });
   };
 
   const onMenuKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -86,7 +86,7 @@ export function Select({
       const option = options[active];
       if (option && option.value !== value) onChange(option.value);
       setOpen(false);
-      trigger.current?.focus();
+      trigger.current?.focus({ preventScroll: true });
       return;
     }
     if (e.key === "Enter") {
@@ -128,7 +128,7 @@ export function Select({
           autoFocus
           onDismiss={(reason) => {
             setOpen(false);
-            if (reason === "escape") trigger.current?.focus();
+            if (reason === "escape") trigger.current?.focus({ preventScroll: true });
           }}
           role="listbox"
           aria-label={label}

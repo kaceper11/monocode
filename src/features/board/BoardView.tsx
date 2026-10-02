@@ -1,9 +1,15 @@
+import { taskWideSessionIds } from "./boardStore";
 import { periodKey } from "../inbox/model/planning";
 import { PlanningFilter } from "./PlanningFilter";
 import { JIRA_CHANGE_EVENT } from "../inbox/model/jira";
 import { inboxIntegrationCacheKey } from "../sessions/model/inboxIntegrations";
-import { AgentHandoffDialog, type HandoffKind } from "./AgentHandoffDialog";
-import { currentDeliveryStatuses, deliveryKey, type SendToSession } from "./delivery";
+import { AgentHandoffDialog } from "./AgentHandoffDialog";
+import type { HandoffKind } from "./handoff";
+import {
+  currentDeliveryStatuses,
+  deliveryKey,
+  type SendToSession,
+} from "./delivery";
 import {
   useCallback,
   useEffect,
@@ -23,7 +29,6 @@ import {
   ChevronDown,
   CircleDot,
   Clock,
-  Folder,
   GitPullRequest,
   ListBullet,
   ListFilter,
@@ -37,12 +42,10 @@ import {
   X,
   Zap,
 } from "../../shared/ui/icons";
+import { LAYER } from "../../shared/lib/layers";
 import { Popover } from "../../shared/ui/Popover";
 import { SearchableSelect } from "../../shared/ui/SearchableSelect";
 import { SecondaryButton } from "../../shared/ui/SecondaryButton";
-import { ProjectLogoIcon } from "../projects/ui/ProjectLogoIcon";
-import { ProjectMascot } from "../projects/ui/ProjectMascot";
-import { useTabGroupLogos } from "../projects/hooks/useTabGroupLogos";
 import {
   inboxProjectsForRail,
   listInboxItems,
@@ -60,17 +63,17 @@ import {
 } from "../inbox/model/inboxFilters";
 import { timeFilterStart } from "../sessions/model/sessionFilters";
 import { IS_MAC } from "../../platform/tauri/platform";
-import { pathKey, projectKey, projectName } from "../../shared/lib/paths";
-import { looksLikeProject, sameProjectPath, type RecentProject } from "../projects/model/recents";
-import type { LinkedWorkItem, Session } from "../sessions/model/session";
+import { pathKey, projectName } from "../../shared/lib/paths";
 import {
-  loadTabGroupColors,
-  loadTabGroupCustomColors,
-  loadTabGroupMascots,
-  resolveTabGroupColor,
-  resolveTabGroupLogo,
-  resolveTabGroupMascot,
-} from "../workspace/model/tabGroups";
+  looksLikeProject,
+  sameProjectPath,
+  type RecentProject,
+} from "../projects/model/recents";
+import {
+  sessionWorkCwd,
+  type LinkedWorkItem,
+  type Session,
+} from "../sessions/model/session";
 import type { SessionSummary } from "../sessions/data/sessionStore";
 import {
   linkedSessionUpdates,
@@ -119,6 +122,7 @@ import {
   updateWorkstreamFromBase,
   type WorkstreamResult,
 } from "./taskOps";
+import { withTaskGitLock } from "./TaskGitActions";
 import { standupSections } from "./standup";
 import { StandupDialog } from "./StandupDialog";
 import { ReviewLocallyDialog } from "./ReviewLocallyDialog";
@@ -171,6 +175,21 @@ import {
   type TaskWorkstream,
 } from "./boardStore";
 
+function relationshipSummary(
+  relationships: BoardFilterSpec["relationships"],
+): string {
+  const labels = {
+    all: "Everyone",
+    related: "Related to me",
+    assigned: "Assigned to me",
+    created: "Created by me",
+    reviewing: "Reviewing",
+  };
+  return relationships?.length
+    ? relationships.map((value) => labels[value]).join(", ")
+    : "Everyone";
+}
+
 const DRAG_THRESHOLD = 5;
 
 const BOARD_TIME_OPTIONS: { id: InboxTimeFilter; label: string }[] = [
@@ -201,20 +220,25 @@ type DragState = {
 };
 
 // Presentation snapshots survive navigation. Mutations still probe live delivery state.
-let boardStatusSnapshot: {
-  key: string;
-  scope: string;
-  statuses: ReadonlyMap<string, WorkstreamStatus>;
-} | undefined;
-let boardChecksSnapshot: {
-  key: string;
-  scope: string;
-  checks: ReadonlyMap<string, GitPrCheck[]>;
-} | undefined;
+let boardStatusSnapshot:
+  | {
+      key: string;
+      scope: string;
+      statuses: ReadonlyMap<string, WorkstreamStatus>;
+    }
+  | undefined;
+let boardChecksSnapshot:
+  | {
+      key: string;
+      scope: string;
+      checks: ReadonlyMap<string, GitPrCheck[]>;
+    }
+  | undefined;
 
 export function BoardView({
   taskRequest,
   newTaskRequest,
+  detailTaskId,
   besideRail = false,
   recents,
   cwd,
@@ -227,11 +251,13 @@ export function BoardView({
   onSendToSession,
   onSpawnSession,
   onPrepareWorktree,
-  onBindSession,
   onRemoveWorktree,
 }: {
   taskRequest?: { id: string } | null;
-  newTaskRequest?: { item: InboxItem } | null;
+  newTaskRequest?: { item?: InboxItem } | null;
+  /** Docked mode — render only this task's details panel beside the
+   * workspace; `onClose` then means "un-dock", not "leave the board". */
+  detailTaskId?: string;
   besideRail?: boolean;
   recents: RecentProject[];
   cwd: string;
@@ -252,8 +278,6 @@ export function BoardView({
       links: LinkedWorkItem[];
     },
   ) => Promise<{ sessionId: string; worktreePath: string }>;
-  /** Attach a work-item link to an existing live session. */
-  onBindSession: (sessionId: string, linked: LinkedWorkItem | null) => void;
   /** App-level worktree removal — session detach, persist guards, and
    * open-file checks live there; the model helper alone bypasses them. */
   onRemoveWorktree: (
@@ -270,14 +294,22 @@ export function BoardView({
     () => inboxProjectsForRail(recents, cwd),
     [recents, cwd],
   );
-  const connections = useInboxConnections();
+  const connections = useInboxConnections(!detailTaskId);
   // Fetch-level "my work" filter — every provider honors it; off shows the wider listing.
   const [initialView] = useState(loadBoardView);
   const [mineOnly, setMineOnly] = useState(initialView.mineOnly);
-  const [relationships, setRelationships] = useState(initialView.relationships ?? []);
+  const [relationships, setRelationships] = useState(
+    initialView.relationships ?? [],
+  );
   const [periods, setPeriods] = useState(initialView.periods ?? []);
   const query = useMemo<InboxQuery>(
-    () => ({ assignedToMe: mineOnly, relationships, periods, state: "all", search: "" }),
+    () => ({
+      assignedToMe: mineOnly,
+      relationships,
+      periods,
+      state: "all",
+      search: "",
+    }),
     [mineOnly, relationships, periods],
   );
 
@@ -295,9 +327,9 @@ export function BoardView({
   useEffect(() => {
     const changed = (event: Event) => {
       if (event instanceof CustomEvent && event.detail === "connection") {
-        setItems(items => items.filter(item => item.provider !== "jira"));
+        setItems((items) => items.filter((item) => item.provider !== "jira"));
       }
-      setRefresh(value => value + 1);
+      setRefresh((value) => value + 1);
     };
     window.addEventListener(JIRA_CHANGE_EVENT, changed);
     return () => window.removeEventListener(JIRA_CHANGE_EVENT, changed);
@@ -311,6 +343,9 @@ export function BoardView({
       setErrors(cached.errors);
       setLoaded(true);
     }
+    // Docked panels reuse the cached inbox — a details pane must not fan
+    // out a second provider fetch behind the open board/workspace.
+    if (detailTaskId) return;
     setFetching(true);
     setLoadError("");
     void listInboxItems(projects, query, { force: refresh > 0 })
@@ -320,15 +355,20 @@ export function BoardView({
           setItems(result.items);
           setErrors(result.errors);
         },
-        (error) => { if (!cancelled) setLoadError(String(error)); },
+        (error) => {
+          if (!cancelled) setLoadError(String(error));
+        },
       )
       .finally(() => {
-        if (!cancelled) { setFetching(false); setLoaded(true); }
+        if (!cancelled) {
+          setFetching(false);
+          setLoaded(true);
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [projects, query, refresh]);
+  }, [projects, query, refresh, detailTaskId]);
 
   // linkedSessionUpdates needs a provider-keyed item map — same keys the
   // linked-session seen tracking uses.
@@ -342,7 +382,8 @@ export function BoardView({
   }, [items]);
 
   const updates = useMemo(
-    () => linkedSessionUpdates(linkedSessions, workItemMap, linkedSessionSeenAt),
+    () =>
+      linkedSessionUpdates(linkedSessions, workItemMap, linkedSessionSeenAt),
     [linkedSessions, workItemMap],
   );
 
@@ -353,9 +394,15 @@ export function BoardView({
         setRefresh((value) => value + 1);
       }
     }, 30_000);
-    const onVisible = () => { if (document.visibilityState === "visible") setRefresh(value => value + 1); };
+    const onVisible = () => {
+      if (document.visibilityState === "visible")
+        setRefresh((value) => value + 1);
+    };
     document.addEventListener("visibilitychange", onVisible);
-    return () => { window.clearInterval(id); document.removeEventListener("visibilitychange", onVisible); };
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
   // Per-workstream PR + checks probe — refreshed with the inbox tick. The
@@ -363,14 +410,17 @@ export function BoardView({
   // writes (drags, placements) don't refire the git/CI fan-out.
   const probeStreams = useMemo(
     () =>
-      board.tasks.flatMap((task) =>
+      (detailTaskId
+        ? board.tasks.filter((task) => task.id === detailTaskId)
+        : board.tasks
+      ).flatMap((task) =>
         task.archived
           ? []
           : // A cleaned-up lane keeps probing its pinned PR from the
             // project root — the merged record shouldn't vanish.
             task.workstreams.filter((ws) => ws.worktreePath || ws.prUrl),
       ),
-    [board.tasks],
+    [board.tasks, detailTaskId],
   );
   // Every lane on the board, archived included — a worktree or branch serves
   // one lane board-wide; claims must see other tasks' lanes too.
@@ -378,19 +428,16 @@ export function BoardView({
     () => board.tasks.flatMap((task) => task.workstreams),
     [board.tasks],
   );
-  const probeKey = probeStreams
-    .map(
-      (ws) =>
-        deliveryKey(ws),
-    )
-    .join("\n");
+  const probeKey = probeStreams.map((ws) => deliveryKey(ws)).join("\n");
   const probeRef = useRef(probeStreams);
   useEffect(() => {
     probeRef.current = probeStreams;
   });
   const statusScope = inboxIntegrationCacheKey();
   const probeScope = JSON.stringify([statusScope, probeKey]);
-  const [settledProbes, setSettledProbes] = useState(boardStatusSnapshot?.key ?? "");
+  const [settledProbes, setSettledProbes] = useState(
+    boardStatusSnapshot?.key ?? "",
+  );
   const [probedStatus, setWsStatus] = useState<
     ReadonlyMap<string, WorkstreamStatus>
   >(() =>
@@ -399,10 +446,11 @@ export function BoardView({
       : new Map(),
   );
   const wsStatus = useMemo(
-    () => currentDeliveryStatuses(
-      probeStreams,
-      boardStatusSnapshot?.scope === statusScope ? probedStatus : new Map(),
-    ),
+    () =>
+      currentDeliveryStatuses(
+        probeStreams,
+        boardStatusSnapshot?.scope === statusScope ? probedStatus : new Map(),
+      ),
     [probeStreams, probedStatus, statusScope],
   );
   useEffect(() => {
@@ -414,9 +462,7 @@ export function BoardView({
       return;
     }
     void Promise.allSettled(
-      streams.map(
-        async (ws) => [ws.id, await probeWorkstream(ws)] as const,
-      ),
+      streams.map(async (ws) => [ws.id, await probeWorkstream(ws)] as const),
     ).then((results) => {
       if (cancelled) return;
       const next = new Map<string, WorkstreamStatus>();
@@ -427,20 +473,32 @@ export function BoardView({
         // another checkout's or an older revision's green checks forward.
         next.set(result.value[0], status);
       }
-      boardStatusSnapshot = { key: probeScope, scope: statusScope, statuses: next };
+      // A docked panel probes one task's lanes — writing its partial map
+      // as the board-wide snapshot would drop every other lane's status.
+      if (!detailTaskId)
+        boardStatusSnapshot = {
+          key: probeScope,
+          scope: statusScope,
+          statuses: next,
+        };
       setSettledProbes(probeScope);
       setWsStatus(next);
     });
     return () => {
       cancelled = true;
     };
-  }, [probeKey, refresh, statusScope]);
+  }, [probeKey, refresh, statusScope, detailTaskId]);
 
   const checksScope = JSON.stringify([
     statusScope,
     items
-      .filter(item => item.provider === "azuredevops" && item.kind === "pr")
-      .map(item => [inboxItemKey(item), item.repo, item.sourceRefName, item.updatedAt]),
+      .filter((item) => item.provider === "azuredevops" && item.kind === "pr")
+      .map((item) => [
+        inboxItemKey(item),
+        item.repo,
+        item.sourceRefName,
+        item.updatedAt,
+      ]),
   ]);
   const [cardChecks, setCardChecks] = useState<
     ReadonlyMap<string, GitPrCheck[]>
@@ -462,7 +520,8 @@ export function BoardView({
         groups: board.groups,
         cardGroups: board.cardGroups,
         workstreamStatus: wsStatus,
-        cardChecks: boardChecksSnapshot?.scope === checksScope ? cardChecks : new Map(),
+        cardChecks:
+          boardChecksSnapshot?.scope === checksScope ? cardChecks : new Map(),
       }),
     [
       items,
@@ -502,16 +561,26 @@ export function BoardView({
     )
     .join("\n");
   const cardCheckScope = JSON.stringify([checksScope, azureCheckKey]);
-  const [settledChecks, setSettledChecks] = useState(boardChecksSnapshot?.key ?? "");
+  const [settledChecks, setSettledChecks] = useState(
+    boardChecksSnapshot?.key ?? "",
+  );
   const [revealed, setRevealed] = useState(false);
-  const firstLoadComplete = loaded && (!probeStreams.length || settledProbes === probeScope) && (!azureCheckTargets.length || settledChecks === cardCheckScope);
+  const firstLoadComplete =
+    loaded &&
+    (!probeStreams.length || settledProbes === probeScope) &&
+    (!azureCheckTargets.length || settledChecks === cardCheckScope);
   const boardLoading = !revealed && !firstLoadComplete;
-  useEffect(() => { if (firstLoadComplete) setRevealed(true); }, [firstLoadComplete]);
+  useEffect(() => {
+    if (firstLoadComplete) setRevealed(true);
+  }, [firstLoadComplete]);
   const azureCheckRef = useRef(azureCheckTargets);
   useEffect(() => {
     azureCheckRef.current = azureCheckTargets;
   });
   useEffect(() => {
+    // A docked view renders no card badges — probing here would also
+    // overwrite the board's shared checks snapshot with a different scope.
+    if (detailTaskId) return;
     let cancelled = false;
     const targets = azureCheckRef.current;
     if (boardChecksSnapshot?.scope !== checksScope) setCardChecks(new Map());
@@ -537,18 +606,24 @@ export function BoardView({
       for (const result of results)
         if (result.status === "fulfilled")
           next.set(result.value[0], result.value[1]);
-      boardChecksSnapshot = { key: cardCheckScope, scope: checksScope, checks: next };
+      boardChecksSnapshot = {
+        key: cardCheckScope,
+        scope: checksScope,
+        checks: next,
+      };
       setSettledChecks(cardCheckScope);
       setCardChecks(next);
     });
     return () => {
       cancelled = true;
     };
-  }, [azureCheckKey, refresh, checksScope]);
+  }, [azureCheckKey, refresh, checksScope, detailTaskId]);
 
   // --- filters -----------------------------------------------------------
   const [search, setSearch] = useState(initialView.search ?? "");
-  const [hiddenProviders, setHiddenProviders] = useState<InboxProvider[]>(initialView.hiddenProviders ?? []);
+  const [hiddenProviders, setHiddenProviders] = useState<InboxProvider[]>(
+    initialView.hiddenProviders ?? [],
+  );
   const [projectFilter, setProjectFilter] = useState(initialView.project);
   // Group filter — group ids, plus `UNGROUPED` for cards with no group.
   const [groupFilter, setGroupFilter] = useState<ReadonlySet<string>>(
@@ -557,18 +632,24 @@ export function BoardView({
   const [actionOnly, setActionOnly] = useState(initialView.actionOnly);
   // Attention-first is a per-column sort, but it lives in the same spec so a
   // saved filter restores the ordering too.
-  const [attentionFirst, setAttentionFirst] = useState(initialView.attentionFirst);
+  const [attentionFirst, setAttentionFirst] = useState(
+    initialView.attentionFirst,
+  );
   // Item kinds to hide (issues vs pull requests) — task/local cards always
   // pass; the filter trims standalone provider cards.
-  const [hiddenKinds, setHiddenKinds] = useState<
-    ReadonlySet<"issue" | "pr">
-  >(new Set(initialView.hiddenKinds));
-  const [statuses, setStatuses] = useState<BoardProviderStatus[]>(initialView.statuses);
+  const [hiddenKinds, setHiddenKinds] = useState<ReadonlySet<"issue" | "pr">>(
+    new Set(initialView.hiddenKinds),
+  );
+  const [statuses, setStatuses] = useState<BoardProviderStatus[]>(
+    initialView.statuses,
+  );
   const statusOptions = useMemo(
     () => boardStatusOptions(cards, statuses),
     [cards, statuses],
   );
-  const [timeFilter, setTimeFilter] = useState<InboxTimeFilter>(initialView.time);
+  const [timeFilter, setTimeFilter] = useState<InboxTimeFilter>(
+    initialView.time,
+  );
   const [filterAnchor, setFilterAnchor] = useState<HTMLElement | null>(null);
   // Column editor popover — rename/delete the target column, or flip to
   // add mode for a new one.
@@ -581,7 +662,10 @@ export function BoardView({
   // what applying one writes back.
   const currentSpec = useMemo<BoardFilterSpec>(
     () => ({
-      search, hiddenProviders, relationships, periods,
+      search,
+      hiddenProviders,
+      relationships,
+      periods,
       project: projectFilter,
       groups: [...groupFilter],
       mineOnly,
@@ -592,7 +676,10 @@ export function BoardView({
       attentionFirst,
     }),
     [
-      search, hiddenProviders, relationships, periods,
+      search,
+      hiddenProviders,
+      relationships,
+      periods,
       projectFilter,
       groupFilter,
       mineOnly,
@@ -618,13 +705,92 @@ export function BoardView({
     setAttentionFirst(spec.attentionFirst);
   }, []);
   useEffect(() => saveBoardView(currentSpec), [currentSpec]);
-  const filtersActive = !sameBoardFilterSpec(
-    { ...currentSpec, actionOnly: false },
-    DEFAULT_BOARD_FILTER,
-  );
+  // Toolbar controls have their own indicators; only menu criteria belong here.
+  const filterChips: { label: string; clear: () => void }[] = [
+    ...(projectFilter
+      ? [
+          {
+            label: `Repository: ${projectName(projectFilter)}`,
+            clear: () => setProjectFilter(""),
+          },
+        ]
+      : []),
+    ...(groupFilter.size
+      ? [
+          {
+            label: `Groups: ${[...groupFilter].map((id) => (id === UNGROUPED ? "Ungrouped" : (board.groups.find((group) => group.id === id)?.name ?? id))).join(", ")}`,
+            clear: () => setGroupFilter(new Set()),
+          },
+        ]
+      : []),
+    ...(statuses.length
+      ? [
+          {
+            label: `Status: ${statuses.map((status) => `${INBOX_SOURCE_LABELS[status.provider]}: ${status.state}`).join(", ")}`,
+            clear: () => setStatuses([]),
+          },
+        ]
+      : []),
+    ...(periods.length
+      ? [
+          {
+            label: `Sprint / cycle: ${periods.map((period) => `${INBOX_SOURCE_LABELS[period.scope.provider]}: ${period.label}`).join(", ")}`,
+            clear: () => setPeriods([]),
+          },
+        ]
+      : []),
+    ...(!sameBoardFilterSpec(
+      { ...DEFAULT_BOARD_FILTER, relationships, mineOnly },
+      DEFAULT_BOARD_FILTER,
+    )
+      ? [
+          {
+            label: `Relationship: ${relationshipSummary(relationships)}`,
+            clear: () => {
+              setRelationships(["assigned"]);
+              setMineOnly(true);
+            },
+          },
+        ]
+      : []),
+    ...(timeFilter !== "all"
+      ? [
+          {
+            label: `Updated: ${BOARD_TIME_OPTIONS.find((option) => option.id === timeFilter)?.label}`,
+            clear: () => setTimeFilter("all"),
+          },
+        ]
+      : []),
+    ...(hiddenKinds.size
+      ? [
+          {
+            label:
+              hiddenKinds.size === 2
+                ? "Provider items hidden"
+                : hiddenKinds.has("pr")
+                  ? "Tickets only"
+                  : "Pull requests only",
+            clear: () => setHiddenKinds(new Set()),
+          },
+        ]
+      : []),
+    ...(attentionFirst
+      ? [{ label: "Attention first", clear: () => setAttentionFirst(false) }]
+      : []),
+  ];
+  const filtersActive = filterChips.length > 0;
+  const clearMenuFilters = () => {
+    setAppliedFilterId(null);
+    applySpec({ ...DEFAULT_BOARD_FILTER, search, hiddenProviders, actionOnly });
+  };
   // The last explicitly applied saved filter — kept while the user tweaks
   // criteria (the panel marks it modified rather than dropping it).
-  const [appliedFilterId, setAppliedFilterId] = useState<string | null>(() => board.filters.find(filter => sameBoardFilterSpec(filter.spec, initialView))?.id ?? null);
+  const [appliedFilterId, setAppliedFilterId] = useState<string | null>(
+    () =>
+      board.filters.find((filter) =>
+        sameBoardFilterSpec(filter.spec, initialView),
+      )?.id ?? null,
+  );
   // An exact spec match always wins — if the state matches another saved
   // filter, that is the view being shown. Otherwise the applied id holds.
   const activeFilter =
@@ -642,6 +808,18 @@ export function BoardView({
   const visibleSources = useMemo(
     () => visibleInboxSources(connections),
     [connections],
+  );
+
+  const filterProviders = useMemo(
+    () => [
+      ...new Set([
+        ...visibleSources,
+        ...items.map((item) => item.provider),
+        ...statusOptions.map((status) => status.provider),
+        ...periods.map((period) => period.scope.provider),
+      ]),
+    ],
+    [visibleSources, items, statusOptions, periods],
   );
 
   // The fetch layer reports "Connect X in Settings" hints for providers that
@@ -663,13 +841,26 @@ export function BoardView({
     const timeStart =
       timeFilter === "all" ? 0 : timeFilterStart(timeFilter, Date.now());
     const selectedPeriods = new Set(periods.map(periodKey));
-    const inPeriod = (item: InboxItem) => item.planningPeriods?.some(p => selectedPeriods.has(periodKey(p)));
+    const inPeriod = (item: InboxItem) =>
+      item.planningPeriods?.some((p) => selectedPeriods.has(periodKey(p)));
     const matches = (card: BoardCard) => {
-      if (hiddenCards.has(card.id) || card.item?.planningContextOnly) return false;
-      if (periods.length && !(card.item && inPeriod(card.item)) && !items.some(item => inPeriod(item) && (
-        card.task?.links.some(link => [link, ...(link.additionalItems ?? [])].some(ref => inboxItemMatchesLinkedWorkItem(item, ref))) ||
-        (!card.task && card.url === item.url)
-      ))) return false;
+      if (hiddenCards.has(card.id) || card.item?.planningContextOnly)
+        return false;
+      if (
+        periods.length &&
+        !(card.item && inPeriod(card.item)) &&
+        !items.some(
+          (item) =>
+            inPeriod(item) &&
+            (card.task?.links.some((link) =>
+              [link, ...(link.additionalItems ?? [])].some((ref) =>
+                inboxItemMatchesLinkedWorkItem(item, ref),
+              ),
+            ) ||
+              (!card.task && card.url === item.url)),
+        )
+      )
+        return false;
       if (!matchesBoardStatuses(card, selectedStatuses)) return false;
       // Snoozed — until the time passes or the wake fingerprint changes.
       if (isCardSnoozed(card, board.snoozed[card.id])) return false;
@@ -684,17 +875,16 @@ export function BoardView({
         hiddenKinds.has(card.itemKind)
       )
         return false;
-      // Cards without a project (locals, linked-only items) pass any filter.
+      // Repository scope excludes cards without a matching checkout.
       // Tasks match when any workstream lives in the filtered project.
       if (projectFilter) {
         const projectsOf = new Set(
-          [card.projectPath, ...(card.workstreams ?? []).map((w) => w.projectPath)]
-            .filter((p): p is string => Boolean(p)),
+          [
+            card.projectPath,
+            ...(card.workstreams ?? []).map((w) => w.projectPath),
+          ].filter((p): p is string => Boolean(p)),
         );
-        if (
-          projectsOf.size &&
-          ![...projectsOf].some((p) => sameProjectPath(p, projectFilter))
-        )
+        if (![...projectsOf].some((p) => sameProjectPath(p, projectFilter)))
           return false;
       }
       if (groupFilter.size) {
@@ -737,10 +927,16 @@ export function BoardView({
         fields.some((field) => field?.toLowerCase().includes(token)),
       );
     };
-    return cards.filter(card => !hiddenCards.has(card.id) && !isCardSnoozed(card, board.snoozed[card.id]) &&
-      (card.members ? card.members.some(matches) : matches(card)));
+    return cards.filter(
+      (card) =>
+        !hiddenCards.has(card.id) &&
+        !isCardSnoozed(card, board.snoozed[card.id]) &&
+        (card.members ? card.members.some(matches) : matches(card)),
+    );
   }, [
-    cards, items, periods,
+    cards,
+    items,
+    periods,
     search,
     hiddenProviders,
     statuses,
@@ -769,9 +965,7 @@ export function BoardView({
     if ([...groupFilter].some((id) => id !== UNGROUPED && !valid.has(id))) {
       setGroupFilter(
         new Set(
-          [...groupFilter].filter(
-            (id) => id === UNGROUPED || valid.has(id),
-          ),
+          [...groupFilter].filter((id) => id === UNGROUPED || valid.has(id)),
         ),
       );
     }
@@ -856,12 +1050,18 @@ export function BoardView({
         columnCards(pool, column.id, board.placements, board.locals),
       );
     return map;
-  }, [cards, board.hidden, board.snoozed, board.columns, board.placements, board.locals]);
+  }, [
+    cards,
+    board.hidden,
+    board.snoozed,
+    board.columns,
+    board.placements,
+    board.locals,
+  ]);
 
   // Archived = dismissed derived cards + archived tasks — restored together.
   const archivedCount =
-    board.hidden.length +
-    board.tasks.filter((task) => task.archived).length;
+    board.hidden.length + board.tasks.filter((task) => task.archived).length;
 
   // Drop indices are measured against the column's VISUAL order — group
   // wrappers pull non-contiguous members together, so the DOM order is the
@@ -914,9 +1114,7 @@ export function BoardView({
       if (event.button !== 0) return;
       const startX = event.clientX;
       const startY = event.clientY;
-      const rect = (
-        event.currentTarget as HTMLElement
-      ).getBoundingClientRect();
+      const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
       const state: DragState = {
         cardId: card.id,
         x: startX,
@@ -953,8 +1151,8 @@ export function BoardView({
         if (!root) return;
         const hit = document.elementFromPoint(clientX, clientY);
         state.overGroup =
-          hit?.closest<HTMLElement>("[data-board-group]")?.dataset
-            .boardGroup ?? null;
+          hit?.closest<HTMLElement>("[data-board-group]")?.dataset.boardGroup ??
+          null;
         const element = hit?.closest<HTMLElement>("[data-board-column]");
         if (!element) {
           state.overColumn = null;
@@ -1083,26 +1281,79 @@ export function BoardView({
   );
 
   // --- actions -----------------------------------------------------------
-  const [handoff, setHandoff] = useState<{ workstreams: TaskWorkstream[]; taskId?: string; kind: HandoffKind; title: string; links: LinkedWorkItem[] } | null>(null);
-  const openHandoff = useCallback((card: BoardCard, kind: HandoffKind, workstreamId?: string) => {
-    if (card.task) {
-      setHandoff({workstreams: card.task.workstreams.filter(w => !workstreamId || w.id === workstreamId), taskId: card.task.id, kind, title: card.title, links: card.task.links});
-      return;
-    }
-    const ids = new Set(card.sessions.map(s => s.id));
-    const candidates = [...sessions, ...linkedSessions.filter(s => !sessions.some(live => live.id === s.id))].filter(s => ids.has(s.id) && !s.worktreeRemoved);
-    const rows = new Map<string, TaskWorkstream>();
-    for (const session of candidates) {
-      const cwd = session.worktreeCwd || session.cwd;
-      const row = rows.get(cwd);
-      if (row) row.sessionIds!.push(session.id);
-      else rows.set(cwd, {id: session.id, projectPath: session.cwd, worktreePath: cwd, branch: session.branch || "", base: "HEAD", sessionIds:[session.id], prUrl: card.itemKind === "pr" ? card.url : undefined, prProvider: card.provider === "github" || card.provider === "gitlab" || card.provider === "azuredevops" ? card.provider : undefined});
-    }
-    setHandoff({workstreams:[...rows.values()],kind,title:card.title,links:[]});
-  }, [sessions, linkedSessions]);
+  const [handoff, setHandoff] = useState<{
+    workstreams: TaskWorkstream[];
+    taskId?: string;
+    kind: HandoffKind;
+    evidenceIds?: readonly string[];
+    title: string;
+    links: LinkedWorkItem[];
+  } | null>(null);
+  const openHandoff = useCallback(
+    (
+      card: BoardCard,
+      kind: HandoffKind,
+      workstreamId?: string,
+      evidenceIds?: readonly string[],
+    ) => {
+      if (card.task) {
+        setHandoff({
+          workstreams: card.task.workstreams.filter(
+            (w) => !workstreamId || w.id === workstreamId,
+          ),
+          taskId: card.task.id,
+          kind,
+          evidenceIds,
+          title: card.title,
+          links: card.task.links,
+        });
+        return;
+      }
+      const ids = new Set(card.sessions.map((s) => s.id));
+      const candidates = [
+        ...sessions,
+        ...linkedSessions.filter(
+          (s) => !sessions.some((live) => live.id === s.id),
+        ),
+      ].filter((s) => ids.has(s.id) && !s.worktreeRemoved);
+      const rows = new Map<string, TaskWorkstream>();
+      for (const session of candidates) {
+        const cwd = session.worktreeCwd || session.cwd;
+        const row = rows.get(cwd);
+        if (row) row.sessionIds!.push(session.id);
+        else
+          rows.set(cwd, {
+            id: session.id,
+            projectPath: session.cwd,
+            worktreePath: cwd,
+            branch: session.branch || "",
+            base: "HEAD",
+            sessionIds: [session.id],
+            prUrl: card.itemKind === "pr" ? card.url : undefined,
+            prProvider:
+              card.provider === "github" ||
+              card.provider === "gitlab" ||
+              card.provider === "azuredevops"
+                ? card.provider
+                : undefined,
+          });
+      }
+      setHandoff({
+        workstreams: [...rows.values()],
+        kind,
+        title: card.title,
+        links: [],
+      });
+    },
+    [sessions, linkedSessions],
+  );
 
-  const [selectedCardId, setSelectedCardId] = useState<string | null>(boardPosition.selected);
-  useEffect(() => { boardPosition.selected = selectedCardId; }, [selectedCardId]);
+  const [selectedCardId, setSelectedCardId] = useState<string | null>(
+    boardPosition.selected,
+  );
+  useEffect(() => {
+    boardPosition.selected = selectedCardId;
+  }, [selectedCardId]);
   useEffect(() => {
     if (taskRequest) setSelectedCardId(taskRequest.id);
   }, [taskRequest]);
@@ -1110,12 +1361,25 @@ export function BoardView({
   const [reviewItem, setReviewItem] = useState<InboxItem | null>(null);
   const [standupOpen, setStandupOpen] = useState(false);
   const selectedCard = useMemo(
-    () =>
-      selectedCardId
-        ? (boardCardMembers(cards).find((card) => card.id === selectedCardId) ?? null)
-        : null,
-    [cards, selectedCardId],
+    () => {
+      const id = detailTaskId ?? selectedCardId;
+      return id
+        ? (boardCardMembers(cards).find((card) => card.id === id) ?? null)
+        : null;
+    },
+    [cards, selectedCardId, detailTaskId],
   );
+  // A docked panel closes itself when its task leaves the board — pinning a
+  // deleted or archived task has no meaningful state to show.
+  useEffect(() => {
+    if (
+      detailTaskId &&
+      !board.tasks.some(
+        (task) => task.id === detailTaskId && !task.archived,
+      )
+    )
+      onClose();
+  }, [detailTaskId, board.tasks, onClose]);
 
   const onCardAction = useCallback(
     (card: BoardCard, action: BoardCardAction) => {
@@ -1131,11 +1395,24 @@ export function BoardView({
           return;
         case "start":
           if (!card.item) return;
-          if (card.item.kind === "pr") { setReviewItem(card.item); return; }
+          if (card.item.kind === "pr") {
+            setReviewItem(card.item);
+            return;
+          }
           {
-            const existing = loadBoard().tasks.find(task => !task.archived && task.links.some(link =>
-              [link, ...(link.additionalItems ?? [])].some(ref => inboxItemMatchesLinkedWorkItem(card.item!, ref))));
-            if (existing) { setSelectedCardId(existing.id); return; }
+            const existing = loadBoard().tasks.find(
+              (task) =>
+                !task.archived &&
+                task.links.some((link) =>
+                  [link, ...(link.additionalItems ?? [])].some((ref) =>
+                    inboxItemMatchesLinkedWorkItem(card.item!, ref),
+                  ),
+                ),
+            );
+            if (existing) {
+              setSelectedCardId(existing.id);
+              return;
+            }
           }
           setTaskFromInbox(card.item);
           setPromoteFrom(null);
@@ -1178,8 +1455,12 @@ export function BoardView({
             wake: action.wakeOnChange ? snoozeWakeKey(card) : undefined,
           });
           return;
-        case "fix-ci": openHandoff(card, "ci"); return;
-        case "comments": openHandoff(card, "comments"); return;
+        case "fix-ci":
+          openHandoff(card, "ci");
+          return;
+        case "comments":
+          openHandoff(card, "comments");
+          return;
         case "ungroup":
           if (card.kind === "task" && card.task) {
             updateTask(card.task.id, (current) => ({
@@ -1249,32 +1530,73 @@ export function BoardView({
   const [taskFromInbox, setTaskFromInbox] = useState<InboxItem | null>(null);
   useEffect(() => {
     if (!newTaskRequest) return;
-    if (newTaskRequest.item.kind === "pr") { setReviewItem(newTaskRequest.item); return; }
-    setTaskFromInbox(newTaskRequest.item);
+    if (newTaskRequest.item?.kind === "pr") {
+      setReviewItem(newTaskRequest.item);
+      return;
+    }
+    setTaskFromInbox(newTaskRequest.item ?? null);
     setPromoteFrom(null);
     setTaskError("");
     setTaskDialogOpen(true);
   }, [newTaskRequest]);
   const [createdSessionId, setCreatedSessionId] = useState<string | null>(null);
   useEffect(() => {
-    if (!createdSessionId || !sessions.some(session => session.id === createdSessionId)) return;
+    if (
+      !createdSessionId ||
+      !sessions.some((session) => session.id === createdSessionId)
+    )
+      return;
     setCreatedSessionId(null);
     onOpenSession(createdSessionId);
   }, [createdSessionId, sessions, onOpenSession]);
-  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  // A Set — two lane ops can overlap (`merge:x` then `merge:y`); a single
+  // slot would let the first finisher clear the busy flag mid-flight.
+  const [actionBusy, setActionBusy] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
   const [actionResults, setActionResults] = useState<
     ReadonlyMap<string, WorkstreamResult>
   >(new Map());
+  // Results belong to lanes of the open card — switching/closing the card
+  // drops them all, and removing a lane drops its key, so no stale banner
+  // can resurrect on reopen or outlive its lane.
+  useEffect(() => {
+    const live = new Set(
+      selectedCard?.task?.workstreams.map((ws) => ws.id) ?? [],
+    );
+    setActionResults((current) => {
+      if ([...current.keys()].every((id) => live.has(id))) return current;
+      const next = new Map(current);
+      for (const id of next.keys()) if (!live.has(id)) next.delete(id);
+      return next;
+    });
+  }, [selectedCard]);
 
   const onCreateTask = useCallback(
     async (spec: NewTaskSpec) => {
+      // taskBusy is the re-entry guard — dialog disabled-state alone isn't.
+      if (taskBusy) return;
       if (taskFromInbox) {
-        const existing = loadBoard().tasks.find(task => !task.archived && task.links.some(link => [link, ...(link.additionalItems ?? [])].some(ref => inboxItemMatchesLinkedWorkItem(taskFromInbox, ref))));
-        if (existing) { setTaskDialogOpen(false); setSelectedCardId(existing.id); return; }
+        const existing = loadBoard().tasks.find(
+          (task) =>
+            !task.archived &&
+            task.links.some((link) =>
+              [link, ...(link.additionalItems ?? [])].some((ref) =>
+                inboxItemMatchesLinkedWorkItem(taskFromInbox, ref),
+              ),
+            ),
+        );
+        if (existing) {
+          setTaskDialogOpen(false);
+          setSelectedCardId(existing.id);
+          return;
+        }
       }
       // Reject a full board before preparing any working copies.
       // Archived tasks don't render — they shouldn't count toward the cap.
-      if (loadBoard().tasks.filter((task) => !task.archived).length >= MAX_TASKS) {
+      if (
+        loadBoard().tasks.filter((task) => !task.archived).length >= MAX_TASKS
+      ) {
         setTaskError("Board is full — archive some tasks first.");
         return;
       }
@@ -1303,6 +1625,7 @@ export function BoardView({
           projectPath: ws.projectPath,
           branch: ws.branch,
           base: ws.base,
+          remote: ws.remote,
         });
       };
       // A branch lives in one worktree and a worktree serves one lane —
@@ -1340,6 +1663,7 @@ export function BoardView({
             projectPath: ws.projectPath,
             branch: ws.branch,
             base: ws.base,
+            remote: ws.remote,
           });
           continue;
         }
@@ -1350,6 +1674,7 @@ export function BoardView({
             projectPath: ws.projectPath,
             branch: ws.branch,
             base: ws.base,
+            remote: ws.remote,
             worktreePath,
           });
         } catch (error) {
@@ -1366,6 +1691,7 @@ export function BoardView({
       // details panel's "Create worktree" retries them.
       const id = addTask({
         title: spec.title,
+        projectId: spec.projectId,
         links: spec.links,
         workstreams,
         groupIds: spec.groupIds,
@@ -1392,11 +1718,19 @@ export function BoardView({
       const primary = workstreams.find((ws) => ws.worktreePath);
       if (primary) {
         try {
-          const spawned = await onSpawnSession({ ...primary, title: spec.title, links: spec.links });
+          const spawned = await onSpawnSession({
+            ...primary,
+            title: spec.title,
+            links: spec.links,
+          });
           primarySessionId = spawned.sessionId;
           updateTask(id, { primarySessionId });
         } catch (error) {
-          failed.set(primary.id, { workstreamId: primary.id, ok: false, message: `Task session: ${shortError(error)}` });
+          failed.set(primary.id, {
+            workstreamId: primary.id,
+            ok: false,
+            message: `Task session: ${shortError(error)}`,
+          });
         }
       }
       setTaskBusy(false);
@@ -1427,7 +1761,9 @@ export function BoardView({
       onSpawnSession,
       onPrepareWorktree,
       onRemoveWorktree,
-      promoteFrom, taskFromInbox,
+      promoteFrom,
+      taskBusy,
+      taskFromInbox,
       cards,
       board.placements,
       board.locals,
@@ -1437,26 +1773,51 @@ export function BoardView({
   const refreshNow = useCallback(() => setRefresh((value) => value + 1), []);
 
   const runTaskOp = useCallback(
-    async (
-      busyKey: string,
-      run: () => Promise<WorkstreamResult[]>,
-    ) => {
-      setActionBusy(busyKey);
+    async (busyKey: string, run: () => Promise<WorkstreamResult[]>) => {
+      setActionBusy((current) => new Set(current).add(busyKey));
       try {
         const results = await run();
+        // A card switch mid-op must not resurrect the old card's lane
+        // banners — drop results for lanes that aren't live any more.
+        const live = new Set(
+          liveCard.current?.task?.workstreams.map((ws) => ws.id) ?? [],
+        );
         setActionResults((current) => {
           const next = new Map(current);
-          for (const result of results) next.set(result.workstreamId, result);
+          for (const result of results)
+            if (live.has(result.workstreamId))
+              next.set(result.workstreamId, result);
           return next;
         });
       } finally {
-        setActionBusy(null);
+        setActionBusy((current) => {
+          const next = new Set(current);
+          next.delete(busyKey);
+          return next;
+        });
         refreshNow();
       }
     },
     [refreshNow],
   );
 
+  const onDismissResult = useCallback(
+    (workstreamId: string) =>
+      setActionResults((current) => {
+        if (!current.has(workstreamId)) return current;
+        const next = new Map(current);
+        next.delete(workstreamId);
+        return next;
+      }),
+    [],
+  );
+
+  const liveTaskSessions = useRef(sessions);
+  liveTaskSessions.current = sessions;
+  // Mirrors `selectedCard` for async op handlers — a card switch mid-op
+  // leaves `task` (below) stale, so live lane ids come from the ref.
+  const liveCard = useRef(selectedCard);
+  liveCard.current = selectedCard;
   const taskOpsHandlers = useMemo(() => {
     if (!selectedCard?.task) return null;
     const task = selectedCard.task;
@@ -1479,17 +1840,35 @@ export function BoardView({
               },
         );
       });
+    const mergeWorkstream = (
+      ws: TaskWorkstream,
+      ref: string,
+    ): Promise<WorkstreamResult> => {
+      const isBlocked = () =>
+        liveTaskSessions.current.some(
+          (session) =>
+            (session.busy || session.worktreePreparing) &&
+            (taskWideSessionIds(task).includes(session.id) ||
+              ws.sessionIds?.includes(session.id) ||
+              (ws.worktreePath &&
+                pathKey(sessionWorkCwd(session)) === pathKey(ws.worktreePath))),
+        );
+      return updateWorkstreamFromBase(ws, ref, isBlocked);
+    };
     return {
-      onClose: () => setSelectedCardId(null),
+      onClose: detailTaskId ? onClose : () => setSelectedCardId(null),
       onOpenSession,
       onSendToSession,
       onSpawnSession: async (spec: TaskWorkstreamSpec) =>
         onSpawnSession({ ...spec, title: task.title, links: task.links }),
-      onBindSession,
       onSubmitPrs: (only: ReadonlySet<string>, opts: PrSubmit) =>
         runTaskOp("prs", async () => {
           // A chosen target is the lane's base going forward — persist it so
           // "Update branches" merges from the same branch the PR targets.
+          // Apply inside the updater so a concurrent write isn't clobbered,
+          // then feed the freshly-stored task to createTaskPrs: its
+          // live-binding check compares against the store, which now holds
+          // these bases.
           updateTask(task.id, (current) => ({
             workstreams: current.workstreams.map((ws) =>
               opts.bases.has(ws.id)
@@ -1497,9 +1876,11 @@ export function BoardView({
                 : ws,
             ),
           }));
+          const live =
+            loadBoard().tasks.find((entry) => entry.id === task.id) ?? task;
           // Full task context — `only` restricts creation, so bodies still
           // list sibling branches and existing sibling PRs.
-          return createTaskPrs(task, wsStatus, only, {
+          return createTaskPrs(live, wsStatus, only, {
             title: opts.title,
             body: opts.body,
             bases: opts.bases,
@@ -1507,21 +1888,36 @@ export function BoardView({
             draft: opts.draft,
           });
         }),
-      onUpdateBranches: () =>
-        run("merge", task.workstreams, (ws) =>
-          updateWorkstreamFromBase(ws),
-        ),
-      onUpdateWorkstream: (wsId: string) =>
-        run(`merge:${wsId}`, task.workstreams.filter((ws) => ws.id === wsId), (ws) =>
-          updateWorkstreamFromBase(ws),
+      onUpdateBranches: (refs: Record<string, string>) =>
+        runTaskOp("merge", async () => {
+          const results: WorkstreamResult[] = [];
+          for (const ws of task.workstreams.filter(
+            (ws) => ws.worktreePath && refs[ws.id],
+          ))
+            results.push(await mergeWorkstream(ws, refs[ws.id]));
+          return results;
+        }),
+      onUpdateWorkstream: (wsId: string, ref: string) =>
+        run(
+          `merge:${wsId}`,
+          task.workstreams.filter((ws) => ws.id === wsId),
+          (ws) => mergeWorkstream(ws, ref),
         ),
       onCleanupWorkstream: (wsId: string) =>
         runTaskOp(`cleanup:${wsId}`, async () => {
-          const ws = task.workstreams.find((entry) => entry.id === wsId);
-          if (!ws?.worktreePath) return [];
+          // Re-read the lane — a rebind between render and click must not
+          // remove a worktree that now belongs to another lane.
+          const ws = loadBoard()
+            .tasks.find((entry) => entry.id === task.id)
+            ?.workstreams.find((entry) => entry.id === wsId);
+          const path = ws?.worktreePath;
+          if (!ws || !path) return [];
           // keepSessions — bound sessions are stale but their records
-          // aren't the lane's to delete.
-          await onRemoveWorktree(ws.projectPath, ws.worktreePath, false, true);
+          // aren't the lane's to delete. The git lock keeps the removal
+          // from racing an in-flight merge/push in that copy.
+          await withTaskGitLock(ws.projectPath, "worktree removal", () =>
+            onRemoveWorktree(ws.projectPath, path, false, true),
+          );
           // Pin the PR so the lane keeps probing it via the project
           // root — clearing the worktree must not erase the record.
           const prUrl = ws.prUrl ?? (wsStatus.get(wsId)?.pr?.url || undefined);
@@ -1540,15 +1936,19 @@ export function BoardView({
     wsStatus,
     runTaskOp,
     onSpawnSession,
-    onBindSession,
     onOpenSession,
     onSendToSession,
     onRemoveWorktree,
+    detailTaskId,
+    onClose,
   ]);
 
   const [newCardTitle, setNewCardTitle] = useState("");
 
   useEffect(() => {
+    // Docked panels share the workspace — a global Escape here would un-dock
+    // on keypresses meant for the session beside it.
+    if (detailTaskId) return;
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented) return;
       // Board popovers/menus preventDefault their own Escape — reaching here
@@ -1559,7 +1959,72 @@ export function BoardView({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, detailTaskId]);
+
+  const detailsPanel =
+    selectedCard?.kind === "task" && taskOpsHandlers ? (
+      <TaskDetailsPanel
+        onHandoff={(id, kind, evidenceIds) =>
+          openHandoff(selectedCard!, kind, id, evidenceIds)
+        }
+        key={selectedCard.id}
+        card={selectedCard}
+        lanes={boardLanes}
+        items={items}
+        recents={recents}
+        sessions={sessions}
+        busyAction={actionBusy}
+        results={actionResults}
+        onDismissResult={onDismissResult}
+        onClose={taskOpsHandlers.onClose}
+        onOpenSession={taskOpsHandlers.onOpenSession}
+        onSessionCreated={setCreatedSessionId}
+        onSendToSession={taskOpsHandlers.onSendToSession}
+        onSpawnSession={taskOpsHandlers.onSpawnSession}
+        onPrepareWorktree={onPrepareWorktree}
+        wsStatus={wsStatus}
+        onUpdateBranches={taskOpsHandlers.onUpdateBranches}
+        onUpdateWorkstream={taskOpsHandlers.onUpdateWorkstream}
+        onSubmitPrs={taskOpsHandlers.onSubmitPrs}
+        onCleanupWorkstream={taskOpsHandlers.onCleanupWorkstream}
+        onGitDone={refreshNow}
+      />
+    ) : null;
+
+  const handoffDialog = handoff ? (
+    <AgentHandoffDialog
+      key={`${handoff.taskId || handoff.title}:${handoff.kind}:${handoff.workstreams.map((w) => w.id).join()}`}
+      workstreams={handoff.workstreams}
+      taskId={handoff.taskId}
+      kind={handoff.kind}
+      evidenceIds={handoff.evidenceIds}
+      sessions={sessions}
+      onSend={onSendToSession}
+      onClose={() => setHandoff(null)}
+      onSpawn={(ws) =>
+        onSpawnSession({ ...ws, title: handoff.title, links: handoff.links })
+      }
+    />
+  ) : null;
+
+  if (detailTaskId)
+    return (
+      <div className="flex min-h-0 shrink-0 text-content">
+        {detailsPanel ?? (
+          <div className="flex min-h-0 w-56 flex-col items-center justify-center gap-2 p-4 text-center text-[12px] text-content/45">
+            <p>This task is no longer on the board.</p>
+            <button
+              type="button"
+              className="shrink-0 rounded-md border border-content/10 bg-content/3 px-2.5 py-1 text-[11px] font-medium text-content/75 hover:bg-content/8 hover:text-content focus-visible:outline-accent"
+              onClick={onClose}
+            >
+              Close
+            </button>
+          </div>
+        )}
+        {handoffDialog}
+      </div>
+    );
 
   return (
     <div
@@ -1586,6 +2051,13 @@ export function BoardView({
             <input
               value={search}
               onChange={(event) => setSearch(event.target.value)}
+              onKeyDown={(event) => {
+                // Escape means "clear/blur the field", not "close the board".
+                if (event.key !== "Escape") return;
+                event.preventDefault();
+                if (search) setSearch("");
+                event.currentTarget.blur();
+              }}
               placeholder="Filter cards…"
               aria-label="Filter cards"
               className="h-7 w-full rounded-md bg-content/6 pl-7 pr-2 text-[12px] text-content outline-none placeholder:text-content/40 focus:ring-1 focus:ring-accent/40"
@@ -1613,7 +2085,11 @@ export function BoardView({
                   )
                 }
               >
-                <InboxProviderMark provider={provider} className="size-3.5" />
+                <InboxProviderMark
+                  provider={provider}
+                  colorful
+                  className="size-3.5"
+                />
               </button>
             );
           })}
@@ -1622,7 +2098,7 @@ export function BoardView({
             aria-label="Needs action"
             aria-pressed={actionOnly}
             title="Show only cards that need action"
-            onClick={() => setActionOnly(current => !current)}
+            onClick={() => setActionOnly((current) => !current)}
             className={`flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent ${actionOnly ? "bg-accent/15 text-accent" : "text-content/50 hover:bg-content/8 hover:text-content"}`}
           >
             <Zap className="size-3.5" strokeWidth={1.75} />
@@ -1647,6 +2123,7 @@ export function BoardView({
             <SlidersHorizontal className="size-3.5" strokeWidth={1.75} />
             <span className="min-w-0 max-w-36 truncate">
               {activeFilter?.name ?? "Filters"}
+              {filtersActive ? ` · ${filterChips.length}` : ""}
             </span>
             <ChevronDown
               className="size-3 shrink-0 text-content/35"
@@ -1664,19 +2141,22 @@ export function BoardView({
               {snoozedIds.length}
             </button>
           ) : null}
-          <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 bg-content/10" />
+          <span
+            aria-hidden
+            className="mx-0.5 h-4 w-px shrink-0 bg-content/10"
+          />
           <IconButton
             label="Standup report"
             onClick={() => setStandupOpen(true)}
           >
             <ListBullet className="size-3.5" strokeWidth={1.75} />
           </IconButton>
-          <IconButton
-            label="Refresh"
-            onClick={refreshNow}
-          >
+          <IconButton label="Refresh" onClick={refreshNow}>
             {fetching ? (
-              <LoaderCircle className="size-3.5 animate-spin" strokeWidth={1.75} />
+              <LoaderCircle
+                className="size-3.5 animate-spin"
+                strokeWidth={1.75}
+              />
             ) : (
               <RefreshCw className="size-3.5" strokeWidth={1.75} />
             )}
@@ -1700,232 +2180,290 @@ export function BoardView({
         {IS_MAC ? null : <WindowControls />}
       </div>
 
-      {boardLoading && <p role="status" className="flex shrink-0 items-center gap-1.5 px-4 pt-2 text-[11px] text-content/40"><LoaderCircle className="size-3 animate-spin" />Loading board…</p>}
-      {loadError && <p role="alert" className="px-4 pt-2 text-[11px] text-red-400">Couldn’t refresh board: {loadError}</p>}
-      <div className="flex min-h-0 min-w-0 flex-1" aria-busy={fetching || boardLoading}>
+      {filtersActive ? (
         <div
-          ref={node => { boardRef.current = node; if (node) node.scrollLeft = boardPosition.left; }}
-          onScroll={event => { if (event.target === event.currentTarget) boardPosition.left = event.currentTarget.scrollLeft; }}
+          aria-label="Active Board filters"
+          className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-b border-stroke px-3 py-1.5"
+        >
+          {filterChips.map((chip) => (
+            <button
+              key={chip.label}
+              type="button"
+              aria-label={`Remove ${chip.label} filter`}
+              title={chip.label}
+              onClick={chip.clear}
+              className="flex h-6 max-w-64 shrink-0 items-center gap-1 rounded-md bg-content/6 px-2 text-[11px] text-content/70 hover:bg-content/10 hover:text-content focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent"
+            >
+              <span className="truncate">{chip.label}</span>
+              <X className="size-3 shrink-0" />
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={clearMenuFilters}
+            className="h-6 shrink-0 rounded-md px-1.5 text-[11px] text-content/45 hover:bg-content/6 hover:text-content"
+          >
+            Clear filters
+          </button>
+        </div>
+      ) : null}
+
+      {boardLoading && (
+        <p
+          role="status"
+          className="flex shrink-0 items-center gap-1.5 px-4 pt-2 text-[11px] text-content/40"
+        >
+          <LoaderCircle className="size-3 animate-spin" />
+          Loading board…
+        </p>
+      )}
+      {loadError && (
+        <p role="alert" className="px-4 pt-2 text-[11px] text-red-400">
+          Couldn’t refresh board: {loadError}
+        </p>
+      )}
+      <div
+        className="flex min-h-0 min-w-0 flex-1"
+        aria-busy={fetching || boardLoading}
+      >
+        <div
+          ref={(node) => {
+            boardRef.current = node;
+            if (node) node.scrollLeft = boardPosition.left;
+          }}
+          onScroll={(event) => {
+            if (event.target === event.currentTarget)
+              boardPosition.left = event.currentTarget.scrollLeft;
+          }}
           className="flex min-h-0 min-w-0 flex-1 items-stretch gap-3 overflow-auto p-3"
         >
-        {board.columns.map((column) => {
-          const columnList = cardsByColumn.get(column.id) ?? [];
-          const units = columnUnits(columnList);
-          // `drag.overIndex` counts rows with the dragged card removed, in
-          // DOM order — which is the flattened unit order once group
-          // wrappers pull members together.
-          const orderedList = units.flatMap((unit) =>
-            unit.type === "group" ? unit.cards : [unit.card],
-          );
-          const visibleIds = drag?.cardId
-            ? orderedList.filter((card) => card.id !== drag.cardId)
-            : orderedList;
-          const visibleIndex = new Map(
-            visibleIds.map((card, index) => [card.id, index] as const),
-          );
-          const renderCard = (card: BoardCard, inGroup?: string) => (
-            <BoardCardView
-              key={card.id}
-              card={card}
-              column={column.id}
-              columns={board.columns}
-              manual={
-                card.kind !== "local" &&
-                board.placements[card.id] !== undefined
-              }
-              pinned={pinnedIds.has(card.id)}
-              placedAt={placedAts.get(card.id)}
-              dragging={drag?.active === true && drag.cardId === card.id}
-              dropTarget={
-                drag?.active === true &&
-                drag.overColumn === column.id &&
-                drag.overIndex === visibleIndex.get(card.id)
-              }
-              inGroup={inGroup}
-              onAction={onCardAction}
-              onDragStart={onDragStart}
-            />
-          );
-          return (
-            <section
-              key={column.id}
-              data-board-column={column.id}
-              aria-label={column.label}
-              className={`group/col flex min-h-24 min-w-64 flex-1 flex-col rounded-xl border border-content/8 bg-content/[0.02] ${
-                drag?.active && drag.overColumn === column.id
-                  ? "ring-1 ring-accent/40"
-                  : ""
-              }`}
-            >
-              <header className="flex h-8 shrink-0 items-center gap-1.5 px-2.5">
-                <span
-                  aria-hidden
-                  className={`size-1.5 rounded-full ${columnDot(column.id)}`}
-                />
-                <h2 className="min-w-0 truncate text-[12px] font-medium text-content/80">
-                  {column.label}
-                </h2>
-                <span className="text-[11px] text-content/40">
-                  {boardLoading ? "—" : columnList.length}
-                </span>
-                <span className="ml-auto flex items-center gap-0.5">
-                {column.id === "done" && columnList.length ? (
-                  <button
-                    type="button"
-                    title="Archive the cards shown in Done"
-                    aria-label="Archive the cards shown in Done"
-                    className="grid size-5 place-items-center rounded text-content/35 hover:bg-content/10 hover:text-content"
-                    onClick={() => {
-                      const taskIds: string[] = [];
-                      const hideIds: string[] = [];
-                      for (const card of columnList) {
-                        if (card.kind === "task" && card.task) {
-                          taskIds.push(card.task.id);
-                        } else {
-                          hideIds.push(card.id);
-                        }
-                      }
-                      archiveTasks(taskIds);
-                      hideCards(hideIds);
-                    }}
-                  >
-                    <Archive className="size-3" strokeWidth={1.75} />
-                  </button>
-                ) : null}
-                <button
-                  type="button"
-                  title={`Edit column ${column.label}`}
-                  aria-label={`Edit column ${column.label}`}
-                  className="grid size-5 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover/col:opacity-100 focus-visible:opacity-100"
-                  onClick={(event) =>
-                    setColumnEdit({
-                      anchor: event.currentTarget,
-                      column,
-                    })
-                  }
-                >
-                  <Pencil className="size-3" strokeWidth={1.75} />
-                </button>
-                </span>
-              </header>
-              <div ref={node => { if (node) node.scrollTop = boardPosition.columns.get(column.id) ?? 0; }} onScroll={event => { boardPosition.columns.set(column.id, event.currentTarget.scrollTop); }} className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
-                {boardLoading && <div aria-hidden="true" className="space-y-2">{[0, 1].map(index => <div key={index} className="rounded-lg border border-content/5 bg-content/[0.025] p-3"><div className={`h-2 rounded bg-content/6 ${index ? "w-3/5" : "w-4/5"}`} /><div className="mt-2 h-2 w-2/5 rounded bg-content/4" /><div className="mt-5 h-1.5 w-1/3 rounded bg-content/4" /></div>)}</div>}
-                {!boardLoading && units.map((unit) =>
-                  unit.type === "group" ? (
-                    <div
-                      key={unit.group.id}
-                      data-board-group={unit.group.id}
-                      className={`rounded-xl border p-1.5 ${
-                        groupSwatch(unit.group.color).card
-                      } ${
-                        drag?.active &&
-                        drag.overGroup === unit.group.id &&
-                        dragCard &&
-                        dragCard.kind !== "session"
-                          ? "ring-1 ring-accent/60"
-                          : ""
-                      }`}
-                    >
-                      <p className="mb-1.5 flex items-center gap-1.5 px-1">
-                        <span
-                          aria-hidden
-                          className={`size-1.5 shrink-0 rounded-full ${
-                            groupSwatch(unit.group.color).dot
-                          }`}
-                        />
-                        <span className="min-w-0 flex-1 truncate text-[10px] font-semibold text-content/60">
-                          {unit.group.name}
-                        </span>
-                        <span className="shrink-0 text-[10px] text-content/35">
-                          {unit.cards.length}
-                        </span>
-                      </p>
-                      <div className="flex flex-col gap-1.5">
-                        {unit.cards.map((card) =>
-                          renderCard(card, unit.group.id),
-                        )}
-                      </div>
-                    </div>
-                  ) : (
-                    renderCard(unit.card)
-                  ),
-                )}
-                {drag?.active &&
-                drag.overColumn === column.id &&
-                drag.overIndex >= visibleIds.length ? (
-                  <div
+          {board.columns.map((column) => {
+            const columnList = cardsByColumn.get(column.id) ?? [];
+            const units = columnUnits(columnList);
+            // `drag.overIndex` counts rows with the dragged card removed, in
+            // DOM order — which is the flattened unit order once group
+            // wrappers pull members together.
+            const orderedList = units.flatMap((unit) =>
+              unit.type === "group" ? unit.cards : [unit.card],
+            );
+            const visibleIds = drag?.cardId
+              ? orderedList.filter((card) => card.id !== drag.cardId)
+              : orderedList;
+            const visibleIndex = new Map(
+              visibleIds.map((card, index) => [card.id, index] as const),
+            );
+            const renderCard = (card: BoardCard, inGroup?: string) => (
+              <BoardCardView
+                key={card.id}
+                card={card}
+                column={column.id}
+                columns={board.columns}
+                manual={
+                  card.kind !== "local" &&
+                  board.placements[card.id] !== undefined
+                }
+                pinned={pinnedIds.has(card.id)}
+                placedAt={placedAts.get(card.id)}
+                dragging={drag?.active === true && drag.cardId === card.id}
+                dropTarget={
+                  drag?.active === true &&
+                  drag.overColumn === column.id &&
+                  drag.overIndex === visibleIndex.get(card.id)
+                }
+                inGroup={inGroup}
+                onAction={onCardAction}
+                onDragStart={onDragStart}
+              />
+            );
+            return (
+              <section
+                key={column.id}
+                data-board-column={column.id}
+                aria-label={column.label}
+                className={`group/col flex min-h-24 min-w-64 flex-1 flex-col rounded-xl border border-content/8 bg-content/[0.02] ${
+                  drag?.active && drag.overColumn === column.id
+                    ? "ring-1 ring-accent/40"
+                    : ""
+                }`}
+              >
+                <header className="flex h-8 shrink-0 items-center gap-1.5 px-2.5">
+                  <span
                     aria-hidden
-                    className="h-0.5 shrink-0 rounded bg-accent"
+                    className={`size-1.5 rounded-full ${columnDot(column.id)}`}
                   />
-                ) : null}
-                {column.id === "todo" ? (
-                  <form
-                    className="mt-auto pt-1"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      if (addLocalCard(newCardTitle)) setNewCardTitle("");
-                    }}
-                  >
-                    <label className="flex h-7 items-center gap-1.5 rounded-md px-1.5 text-content/40 focus-within:bg-content/6 focus-within:text-content/60">
-                      <Plus className="size-3.5 shrink-0" strokeWidth={1.75} />
-                      <input
-                        value={newCardTitle}
-                        onChange={(event) =>
-                          setNewCardTitle(event.target.value)
-                        }
-                        placeholder="Add a card"
-                        aria-label="Add a local card"
-                        className="min-w-0 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/40"
-                      />
-                    </label>
-                  </form>
-                ) : null}
-                {!boardLoading && !columnList.length && column.id !== "todo" ? (
-                  <p className="px-2 pb-3 text-[11px] text-content/30">
-                    Nothing here
-                  </p>
-                ) : null}
-                {column.id === "done" && archivedCount ? (
-                  <button
-                    type="button"
-                    className="mx-1 mb-1 flex h-6 items-center justify-center rounded-md text-[10px] text-content/35 hover:bg-content/6 hover:text-content/60"
-                    onClick={unarchiveAll}
-                  >
-                    Restore {archivedCount} archived
-                  </button>
-                ) : null}
-              </div>
-            </section>
-          );
-        })}
+                  <h2 className="min-w-0 truncate text-[12px] font-medium text-content/80">
+                    {column.label}
+                  </h2>
+                  <span className="text-[11px] text-content/40">
+                    {boardLoading ? "—" : columnList.length}
+                  </span>
+                  <span className="ml-auto flex items-center gap-0.5">
+                    {column.id === "done" && columnList.length ? (
+                      <button
+                        type="button"
+                        title="Archive the cards shown in Done"
+                        aria-label="Archive the cards shown in Done"
+                        className="grid size-5 place-items-center rounded text-content/35 hover:bg-content/10 hover:text-content"
+                        onClick={() => {
+                          const taskIds: string[] = [];
+                          const hideIds: string[] = [];
+                          for (const card of columnList) {
+                            if (card.kind === "task" && card.task) {
+                              taskIds.push(card.task.id);
+                            } else {
+                              hideIds.push(card.id);
+                            }
+                          }
+                          archiveTasks(taskIds);
+                          hideCards(hideIds);
+                        }}
+                      >
+                        <Archive className="size-3" strokeWidth={1.75} />
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      title={`Edit column ${column.label}`}
+                      aria-label={`Edit column ${column.label}`}
+                      className="grid size-5 place-items-center rounded text-content/35 opacity-0 hover:bg-content/10 hover:text-content group-hover/col:opacity-100 focus-visible:opacity-100"
+                      onClick={(event) =>
+                        setColumnEdit({
+                          anchor: event.currentTarget,
+                          column,
+                        })
+                      }
+                    >
+                      <Pencil className="size-3" strokeWidth={1.75} />
+                    </button>
+                  </span>
+                </header>
+                <div
+                  ref={(node) => {
+                    if (node)
+                      node.scrollTop =
+                        boardPosition.columns.get(column.id) ?? 0;
+                  }}
+                  onScroll={(event) => {
+                    boardPosition.columns.set(
+                      column.id,
+                      event.currentTarget.scrollTop,
+                    );
+                  }}
+                  className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2"
+                >
+                  {boardLoading && (
+                    <div aria-hidden="true" className="space-y-2">
+                      {[0, 1].map((index) => (
+                        <div
+                          key={index}
+                          className="rounded-lg border border-content/5 bg-content/[0.025] p-3"
+                        >
+                          <div
+                            className={`h-2 rounded bg-content/6 ${index ? "w-3/5" : "w-4/5"}`}
+                          />
+                          <div className="mt-2 h-2 w-2/5 rounded bg-content/4" />
+                          <div className="mt-5 h-1.5 w-1/3 rounded bg-content/4" />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {!boardLoading &&
+                    units.map((unit) =>
+                      unit.type === "group" ? (
+                        <div
+                          key={unit.group.id}
+                          data-board-group={unit.group.id}
+                          className={`rounded-xl border p-1.5 ${
+                            groupSwatch(unit.group.color).card
+                          } ${
+                            drag?.active &&
+                            drag.overGroup === unit.group.id &&
+                            dragCard &&
+                            dragCard.kind !== "session"
+                              ? "ring-1 ring-accent/60"
+                              : ""
+                          }`}
+                        >
+                          <p className="mb-1.5 flex items-center gap-1.5 px-1">
+                            <span
+                              aria-hidden
+                              className={`size-1.5 shrink-0 rounded-full ${
+                                groupSwatch(unit.group.color).dot
+                              }`}
+                            />
+                            <span className="min-w-0 flex-1 truncate text-[10px] font-semibold text-content/60">
+                              {unit.group.name}
+                            </span>
+                            <span className="shrink-0 text-[10px] text-content/35">
+                              {unit.cards.length}
+                            </span>
+                          </p>
+                          <div className="flex flex-col gap-1.5">
+                            {unit.cards.map((card) =>
+                              renderCard(card, unit.group.id),
+                            )}
+                          </div>
+                        </div>
+                      ) : (
+                        renderCard(unit.card)
+                      ),
+                    )}
+                  {drag?.active &&
+                  drag.overColumn === column.id &&
+                  drag.overIndex >= visibleIds.length ? (
+                    <div
+                      aria-hidden
+                      className="h-0.5 shrink-0 rounded bg-accent"
+                    />
+                  ) : null}
+                  {column.id === "todo" ? (
+                    <form
+                      className="mt-auto pt-1"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        if (addLocalCard(newCardTitle)) setNewCardTitle("");
+                      }}
+                    >
+                      <label className="flex h-7 items-center gap-1.5 rounded-md px-1.5 text-content/40 focus-within:bg-content/6 focus-within:text-content/60">
+                        <Plus
+                          className="size-3.5 shrink-0"
+                          strokeWidth={1.75}
+                        />
+                        <input
+                          value={newCardTitle}
+                          onChange={(event) =>
+                            setNewCardTitle(event.target.value)
+                          }
+                          placeholder="Add a card"
+                          aria-label="Add a local card"
+                          className="min-w-0 flex-1 bg-transparent text-[12px] text-content outline-none placeholder:text-content/40"
+                        />
+                      </label>
+                    </form>
+                  ) : null}
+                  {!boardLoading &&
+                  !columnList.length &&
+                  column.id !== "todo" ? (
+                    <p className="px-2 pb-3 text-[11px] text-content/30">
+                      Nothing here
+                    </p>
+                  ) : null}
+                  {column.id === "done" && archivedCount ? (
+                    <button
+                      type="button"
+                      className="mx-1 mb-1 flex h-6 items-center justify-center rounded-md text-[10px] text-content/35 hover:bg-content/6 hover:text-content/60"
+                      onClick={unarchiveAll}
+                    >
+                      Restore {archivedCount} archived
+                    </button>
+                  ) : null}
+                </div>
+              </section>
+            );
+          })}
         </div>
         {!boardLoading && selectedCard ? (
-          selectedCard.kind === "task" && taskOpsHandlers ? (
-            <TaskDetailsPanel
-              onHandoff={(id, kind) => openHandoff(selectedCard!, kind, id)}
-            key={selectedCard.id}
-            card={selectedCard}
-            lanes={boardLanes}
-            items={items}
-            recents={recents}
-            sessions={sessions}
-            busyAction={actionBusy ?? ""}
-            results={actionResults}
-            onClose={taskOpsHandlers.onClose}
-            onOpenSession={taskOpsHandlers.onOpenSession}
-            onSessionCreated={setCreatedSessionId}
-            onSendToSession={taskOpsHandlers.onSendToSession}
-            onSpawnSession={taskOpsHandlers.onSpawnSession}
-            onPrepareWorktree={onPrepareWorktree}
-            onBindSession={taskOpsHandlers.onBindSession}
-            wsStatus={wsStatus}
-            onUpdateBranches={taskOpsHandlers.onUpdateBranches}
-            onUpdateWorkstream={taskOpsHandlers.onUpdateWorkstream}
-            onSubmitPrs={taskOpsHandlers.onSubmitPrs}
-            onCleanupWorkstream={taskOpsHandlers.onCleanupWorkstream}
-            onGitDone={refreshNow}
-          />
-          ) : (
+          (detailsPanel ?? (
             <CardDetailsPanel
               card={selectedCard}
               onClose={() => setSelectedCardId(null)}
@@ -1955,7 +2493,7 @@ export function BoardView({
                   : undefined
               }
             />
-          )
+          ))
         ) : null}
       </div>
       {drag?.active && dragCard ? (
@@ -1990,31 +2528,37 @@ export function BoardView({
           aria-label="Unattached conversations"
           className="shrink-0 border-t border-stroke px-3 py-1.5"
         >
-          <summary className="cursor-pointer text-[11px] text-content/45 hover:text-content">Unattached conversations · {sessionCards.reduce((count, card) => count + card.sessions.length, 0)}</summary>
+          <summary className="cursor-pointer text-[11px] text-content/45 hover:text-content">
+            Unattached conversations ·{" "}
+            {sessionCards.reduce(
+              (count, card) => count + card.sessions.length,
+              0,
+            )}
+          </summary>
           <div className="mt-2 grid max-h-40 grid-cols-2 gap-1 overflow-y-auto sm:grid-cols-3 lg:grid-cols-4">
-          {sessionCards.map((card) =>
-            card.sessions.map((session) => (
-              <button
-                key={session.id}
-                type="button"
-                title={
-                  session.needsInput
-                    ? `${session.title} — waiting on you`
-                    : session.busy
-                      ? `${session.title} — working`
-                      : session.title
-                }
-                className="flex max-w-56 shrink-0 items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[11px] text-content/60 outline-none hover:bg-content/8 hover:text-content focus-visible:ring-1 focus-visible:ring-accent/60"
-                onClick={() => onOpenSession(session.id)}
-              >
-                <span
-                  aria-hidden
-                  className={`size-1.5 shrink-0 rounded-full ${sessionDotClass(session)}`}
-                />
-                <span className="truncate">{session.title}</span>
-              </button>
-            )),
-          )}
+            {sessionCards.map((card) =>
+              card.sessions.map((session) => (
+                <button
+                  key={session.id}
+                  type="button"
+                  title={
+                    session.needsInput
+                      ? `${session.title} — waiting on you`
+                      : session.busy
+                        ? `${session.title} — working`
+                        : session.title
+                  }
+                  className="flex max-w-56 shrink-0 items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[11px] text-content/60 outline-none hover:bg-content/8 hover:text-content focus-visible:ring-1 focus-visible:ring-accent/60"
+                  onClick={() => onOpenSession(session.id)}
+                >
+                  <span
+                    aria-hidden
+                    className={`size-1.5 shrink-0 rounded-full ${sessionDotClass(session)}`}
+                  />
+                  <span className="truncate">{session.title}</span>
+                </button>
+              )),
+            )}
           </div>
         </details>
       ) : null}
@@ -2022,12 +2566,24 @@ export function BoardView({
         <BoardFiltersPopover
           anchor={filterAnchor}
           recents={recents}
+          repositoryPaths={[
+            ...new Set(
+              cards.flatMap((card) =>
+                [
+                  card.projectPath,
+                  ...(card.workstreams ?? []).map((ws) => ws.projectPath),
+                ].filter((path): path is string => Boolean(path)),
+              ),
+            ),
+          ]}
           groups={board.groups}
           saved={board.filters}
           statusOptions={statusOptions}
+          providers={filterProviders}
           spec={currentSpec}
           appliedId={appliedFilterId}
           onSpec={applySpec}
+          onReset={clearMenuFilters}
           onApply={applyFilter}
           onClose={() => setFilterAnchor(null)}
         />
@@ -2050,16 +2606,39 @@ export function BoardView({
       ) : null}
       {taskDialogOpen ? (
         <NewTaskDialog
-          sessions={sessions}
-          items={taskFromInbox ? [taskFromInbox, ...items.filter(item => inboxItemKey(item) !== inboxItemKey(taskFromInbox))] : items}
+          items={
+            taskFromInbox
+              ? [
+                  taskFromInbox,
+                  ...items.filter(
+                    (item) =>
+                      inboxItemKey(item) !== inboxItemKey(taskFromInbox),
+                  ),
+                ]
+              : items
+          }
           recents={recents}
           lanes={boardLanes}
           busy={taskBusy}
           error={taskError}
           key={taskFromInbox ? inboxItemKey(taskFromInbox) : "new-task"}
           initialTitle={taskFromInbox?.title ?? promoteFrom?.title}
-          initialLinks={taskFromInbox ? [boardLinkFromInboxItem(taskFromInbox)].filter((link): link is LinkedWorkItem => !!link) : undefined}
-          initialProject={taskFromInbox ? (looksLikeProject(taskFromInbox.projectPath) ? taskFromInbox.projectPath : undefined) : looksLikeProject(cwd) ? cwd : undefined}
+          initialLinks={
+            taskFromInbox
+              ? [boardLinkFromInboxItem(taskFromInbox)].filter(
+                  (link): link is LinkedWorkItem => !!link,
+                )
+              : undefined
+          }
+          initialProject={
+            taskFromInbox
+              ? looksLikeProject(taskFromInbox.projectPath)
+                ? taskFromInbox.projectPath
+                : undefined
+              : looksLikeProject(cwd)
+                ? cwd
+                : undefined
+          }
           onSubmit={onCreateTask}
           onCancel={() => {
             setTaskDialogOpen(false);
@@ -2067,11 +2646,7 @@ export function BoardView({
           }}
         />
       ) : null}
-      {handoff && <AgentHandoffDialog key={`${handoff.taskId || handoff.title}:${handoff.kind}:${handoff.workstreams.map(w => w.id).join()}`} workstreams={handoff.workstreams} taskId={handoff.taskId} kind={handoff.kind} sessions={sessions} onSend={onSendToSession} onClose={() => setHandoff(null)} onSpawn={async ws => {
-        const created = await onSpawnSession({...ws, title: handoff.title, links: handoff.links});
-        if (handoff.taskId) updateTask(handoff.taskId, current => ({workstreams: current.workstreams.map(w => w.id === ws.id ? {...w, sessionIds: [...new Set([...(w.sessionIds || []), created.sessionId])]} : w)}));
-        return created;
-      }}/>}
+      {handoffDialog}
       {reviewItem ? (
         <ReviewLocallyDialog
           item={reviewItem}
@@ -2110,39 +2685,6 @@ export function BoardView({
   );
 }
 
-/** Sidebar-style project mark — logo when set, colored mascot otherwise. */
-function BoardProjectMark({ path }: { path: string }) {
-  const logos = useTabGroupLogos();
-  const key = projectKey(path);
-  const name = projectName(path);
-  const logo = resolveTabGroupLogo(key, logos);
-  if (logo) {
-    return (
-      <ProjectLogoIcon
-        path={logo}
-        className="size-3.5 shrink-0 rounded-sm"
-        imageClassName="size-3.5"
-      />
-    );
-  }
-  return (
-    <ProjectMascot
-      project={name}
-      color={resolveTabGroupColor(
-        key,
-        loadTabGroupColors(),
-        loadTabGroupCustomColors(),
-        name,
-      )}
-      name={resolveTabGroupMascot(key, loadTabGroupMascots())}
-      className="size-3.5 shrink-0"
-    />
-  );
-}
-
-const FILTER_SECTION =
-  "px-2 pb-0.5 pt-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-content/40";
-
 /** All board filters in one popover: project, groups, fetch/view filters,
  * the action/attention switches — plus the saved-filter list. Pick a saved
  * filter to apply it (click again to clear); a diverged applied filter keeps
@@ -2151,27 +2693,32 @@ const FILTER_SECTION =
 function BoardFiltersPopover({
   anchor,
   recents,
+  repositoryPaths: boardRepositoryPaths,
   groups,
   saved,
   statusOptions,
+  providers,
   spec,
   appliedId,
   onSpec,
+  onReset,
   onApply,
   onClose,
 }: {
   anchor: HTMLElement;
   recents: RecentProject[];
+  repositoryPaths: string[];
   groups: BoardGroup[];
   saved: SavedBoardFilter[];
   statusOptions: BoardProviderStatus[];
+  providers: InboxProvider[];
   spec: BoardFilterSpec;
   appliedId: string | null;
   onSpec: (spec: BoardFilterSpec) => void;
+  onReset: () => void;
   onApply: (filter: SavedBoardFilter | null) => void;
   onClose: () => void;
 }) {
-  const [projectSearch, setProjectSearch] = useState("");
   const [newGroup, setNewGroup] = useState("");
   const [saveName, setSaveName] = useState("");
   const [saving, setSaving] = useState(false);
@@ -2202,15 +2749,17 @@ function BoardFiltersPopover({
     else renameGroup(rename.id, rename.value);
     setRename(null);
   };
-  const dirty = !sameBoardFilterSpec(spec, DEFAULT_BOARD_FILTER);
-  const projectRows = recents.filter(
-    (project) =>
-      !projectSearch ||
-      projectName(project.path)
-        .toLowerCase()
-        .includes(projectSearch.toLowerCase()) ||
-      project.path.toLowerCase().includes(projectSearch.toLowerCase()),
+  const dirty = !sameBoardFilterSpec(
+    { ...spec, search: "", hiddenProviders: [], actionOnly: false },
+    DEFAULT_BOARD_FILTER,
   );
+  const repositoryPaths = [
+    ...new Set([
+      ...boardRepositoryPaths,
+      ...recents.map((project) => project.path),
+      ...(spec.project ? [spec.project] : []),
+    ]),
+  ];
 
   const renameInput = (
     <input
@@ -2236,25 +2785,129 @@ function BoardFiltersPopover({
       anchor={anchor}
       onDismiss={onClose}
       ignore="[data-dialog-popover]"
-      width={320}
-      maxHeight={560}
+      width={360}
+      maxHeight={600}
       aria-label="Board filters"
-      className="overflow-y-auto"
+      className="flex flex-col overflow-hidden"
     >
-      <div className="p-1.5" role="group" aria-label="Board filters">
-        <div className="mb-1 flex items-center justify-between border-b border-content/8 px-2 pb-1.5">
-          <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-content/40">
+      <div
+        className="min-h-0 overflow-y-auto p-2"
+        role="group"
+        aria-label="Board filters"
+      >
+        <div className="mb-2 flex items-center justify-between px-1 pb-1">
+          <span className="text-[13px] font-medium text-content/85">
             Filters
           </span>
           {dirty ? (
             <button
               type="button"
               className="text-[11px] font-medium text-content/50 transition-colors hover:text-content"
-              onClick={() => onApply(null)}
+              onClick={onReset}
             >
               Clear
             </button>
           ) : null}
+        </div>
+
+        <div className="space-y-3 border-b border-content/8 px-1 pb-3 pt-1">
+          <div className="space-y-1.5">
+            <p className="text-[11px] font-medium text-content/60">
+              Repository
+            </p>
+            <SearchableSelect
+              label="Repository"
+              value={spec.project}
+              options={[
+                { value: "", label: "All repositories" },
+                ...repositoryPaths.map((path) => ({
+                  value: path,
+                  label: repositoryPaths.some(
+                    (other) =>
+                      other !== path &&
+                      projectName(other) === projectName(path),
+                  )
+                    ? `${projectName(path)} · ${path}`
+                    : projectName(path),
+                  keywords: path,
+                })),
+              ]}
+              onChange={(project) => onSpec({ ...spec, project })}
+              variant="transparent"
+              searchPlaceholder="Search repositories…"
+              layer={LAYER.submenu}
+            />
+            {spec.project ? (
+              <p
+                title={spec.project}
+                className="truncate px-0.5 text-[10px] text-content/40"
+              >
+                {spec.project}
+              </p>
+            ) : null}
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <div className="space-y-1.5">
+              <p className="text-[11px] font-medium text-content/60">Updated</p>
+              <SearchableSelect
+                label="Updated"
+                value={spec.time}
+                options={BOARD_TIME_OPTIONS.map((option) => ({
+                  value: option.id,
+                  label: option.label,
+                }))}
+                onChange={(value) =>
+                  onSpec({ ...spec, time: value as InboxTimeFilter })
+                }
+                variant="transparent"
+                searchable={false}
+                layer={LAYER.submenu}
+                minMenuWidth={168}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <p className="text-[11px] font-medium text-content/60">Order</p>
+              <SearchableSelect
+                label="Order"
+                value={spec.attentionFirst ? "attention" : "board"}
+                options={[
+                  { value: "board", label: "Board order" },
+                  { value: "attention", label: "Attention first" },
+                ]}
+                onChange={(value) =>
+                  onSpec({ ...spec, attentionFirst: value === "attention" })
+                }
+                variant="transparent"
+                searchable={false}
+                layer={LAYER.submenu}
+                minMenuWidth={168}
+                align="end"
+              />
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="mr-auto text-[11px] font-medium text-content/60">
+              Provider items
+            </span>
+            {(
+              [
+                ["issue", "Tickets", CircleDot],
+                ["pr", "Pull requests", GitPullRequest],
+              ] as const
+            ).map(([kind, label, Icon]) => (
+              <button
+                key={kind}
+                type="button"
+                aria-label={label}
+                aria-pressed={!spec.hiddenKinds.includes(kind)}
+                onClick={() => toggleKind(kind)}
+                className={`flex h-7 items-center gap-1.5 rounded-md border px-2 text-[11px] transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent ${!spec.hiddenKinds.includes(kind) ? "border-accent/20 bg-accent/8 text-content/85" : "border-content/8 text-content/40 hover:bg-content/5"}`}
+              >
+                <Icon className="size-3 shrink-0" />
+                <span>{label}</span>
+              </button>
+            ))}
+          </div>
         </div>
 
         {saved.length > 0 ? (
@@ -2353,21 +3006,55 @@ function BoardFiltersPopover({
             })}
           </BoardFilterSection>
         ) : null}
-        <div className="border-b border-content/8 py-1.5">
-          <BoardFilterSection label="Relationship" summary="Match any selected">
-            {([['all', 'All'], ['related', 'Related to me'], ['assigned', 'Assigned to me'], ['created', 'Created by me'], ['reviewing', 'Reviewing']] as const).map(([id, label]) => (
-              <BoardFilterRow key={id} label={label}
-                checked={id === "all" ? !spec.relationships?.length : !!spec.relationships?.includes(id)}
+        <div>
+          <BoardFilterSection
+            label="Relationship"
+            summary={relationshipSummary(spec.relationships ?? [])}
+          >
+            {(
+              [
+                ["all", "All"],
+                ["related", "Related to me"],
+                ["assigned", "Assigned to me"],
+                ["created", "Created by me"],
+                ["reviewing", "Reviewing"],
+              ] as const
+            ).map(([id, label]) => (
+              <BoardFilterRow
+                key={id}
+                label={label}
+                checked={
+                  id === "all"
+                    ? !spec.relationships?.length
+                    : !!spec.relationships?.includes(id)
+                }
                 onClick={() => {
-                  const next = id === "all" ? [] : spec.relationships?.includes(id)
-                    ? spec.relationships.filter(r => r !== id) : [...(spec.relationships ?? []), id];
-                  onSpec({ ...spec, relationships: next, mineOnly: next.length > 0 });
-                }} />
+                  const next =
+                    id === "all"
+                      ? []
+                      : spec.relationships?.includes(id)
+                        ? spec.relationships.filter((r) => r !== id)
+                        : [...(spec.relationships ?? []), id];
+                  onSpec({
+                    ...spec,
+                    relationships: next,
+                    mineOnly: next.length > 0,
+                  });
+                }}
+              />
             ))}
-            <p className="px-2 pb-1 text-[10px] text-content/40">Reviewing matches PRs; Jira and Linear have no review relationship.</p>
+            <p className="px-2 pb-1 text-[10px] text-content/40">
+              Reviewing matches PRs; Jira and Linear have no review
+              relationship.
+            </p>
           </BoardFilterSection>
         </div>
-        <PlanningFilter selected={spec.periods ?? []} recents={recents} onChange={periods => onSpec({ ...spec, periods })} />
+        <PlanningFilter
+          providers={providers}
+          selected={spec.periods ?? []}
+          recents={recents}
+          onChange={(periods) => onSpec({ ...spec, periods })}
+        />
         <BoardFilterSection
           label="Provider status"
           summary={
@@ -2386,6 +3073,9 @@ function BoardFiltersPopover({
             checked={!spec.statuses.length}
             onClick={() => onSpec({ ...spec, statuses: [] })}
           />
+          <p className="px-2 pb-1 text-[10px] text-content/40">
+            Match any linked item · Loaded statuses
+          </p>
           <div className="max-h-48 overflow-y-auto">
             {Object.entries(INBOX_SOURCE_LABELS).map(([provider, label]) => {
               const options = statusOptions.filter(
@@ -2398,7 +3088,12 @@ function BoardFiltersPopover({
                   role="group"
                   aria-label={`${label} statuses`}
                 >
-                  <p className="px-2 py-1 text-[11px] text-content/40">
+                  <p className="flex items-center gap-1.5 px-2 pb-1 pt-2 text-[11px] text-content/55">
+                    <InboxProviderMark
+                      provider={provider as InboxProvider}
+                      colorful
+                      className="size-3"
+                    />
                     {label}
                   </p>
                   {options.map((status) => {
@@ -2433,36 +3128,6 @@ function BoardFiltersPopover({
               No provider statuses loaded.
             </p>
           ) : null}
-        </BoardFilterSection>
-        <BoardFilterSection
-          label="Project"
-          summary={spec.project ? projectName(spec.project) : "All projects"}
-        >
-          {recents.length > 5 ? (
-            <input
-              value={projectSearch}
-              onChange={(event) => setProjectSearch(event.target.value)}
-              placeholder="Search projects…"
-              aria-label="Search projects"
-              className="mb-1 h-7 w-full rounded-md bg-content/6 px-2 text-[12px] text-content outline-none placeholder:text-content/40 focus:ring-1 focus:ring-accent/40"
-            />
-          ) : null}
-          <ProjectPickRow
-            label="All projects"
-            selected={!spec.project}
-            onPick={() => onSpec({ ...spec, project: "" })}
-          />
-          <div className="max-h-36 overflow-y-auto">
-            {projectRows.map((project) => (
-              <ProjectPickRow
-                key={project.path}
-                label={projectName(project.path)}
-                mark={<BoardProjectMark path={project.path} />}
-                selected={sameProjectPath(project.path, spec.project)}
-                onPick={() => onSpec({ ...spec, project: project.path })}
-              />
-            ))}
-          </div>
         </BoardFilterSection>
         <BoardFilterSection
           label="Groups"
@@ -2587,67 +3252,6 @@ function BoardFiltersPopover({
             />
           </label>
         </BoardFilterSection>
-        <BoardFilterSection
-          label="Display"
-          summary={[
-            BOARD_TIME_OPTIONS.find((option) => option.id === spec.time)?.label,
-            spec.hiddenKinds.length === 2
-              ? "No items"
-              : spec.hiddenKinds.includes("pr")
-                ? "Issues"
-                : spec.hiddenKinds.includes("issue")
-                  ? "Pull requests"
-                  : "All types",
-            ...(spec.attentionFirst ? ["Attention first"] : []),
-          ].join(" · ")}
-        >
-          <div className="flex items-center justify-between gap-2 px-2 py-1 text-[12px] text-content/70">
-            <span>Updated</span>
-            <SearchableSelect
-              label="Updated"
-              value={spec.time}
-              options={BOARD_TIME_OPTIONS.map((option) => ({
-                value: option.id,
-                label: option.label,
-              }))}
-              onChange={(value) =>
-                onSpec({ ...spec, time: value as InboxTimeFilter })
-              }
-              variant="row"
-              searchable={false}
-              align="end"
-            />
-          </div>
-          <p className={FILTER_SECTION}>Type</p>
-          <BoardFilterRow
-            label="Issues"
-            checked={!spec.hiddenKinds.includes("issue")}
-            icon={
-              <CircleDot className="size-3.5 shrink-0" strokeWidth={1.75} />
-            }
-            onClick={() => toggleKind("issue")}
-          />
-          <BoardFilterRow
-            label="Pull requests"
-            checked={!spec.hiddenKinds.includes("pr")}
-            icon={
-              <GitPullRequest
-                className="size-3.5 shrink-0"
-                strokeWidth={1.75}
-              />
-            }
-            onClick={() => toggleKind("pr")}
-          />
-          <p className={FILTER_SECTION}>Sort</p>
-          <BoardFilterRow
-            label="Attention first"
-            checked={spec.attentionFirst}
-            icon={<Zap className="size-3.5 shrink-0" strokeWidth={1.75} />}
-            onClick={() =>
-              onSpec({ ...spec, attentionFirst: !spec.attentionFirst })
-            }
-          />
-        </BoardFilterSection>
         <div className="mt-1 border-t border-content/8 pt-1.5">
           {saving ? (
             <form
@@ -2734,11 +3338,10 @@ function BoardFilterRow({
   return (
     <button
       type="button"
-      role="menuitemcheckbox"
-      aria-checked={checked}
+      aria-pressed={checked}
       onMouseDown={(event) => event.preventDefault()}
       onClick={onClick}
-      className="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] leading-none text-content/75 transition-colors hover:bg-content/5 hover:text-content focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent"
+      className={`flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] leading-none transition-colors focus-visible:outline focus-visible:outline-1 focus-visible:outline-accent ${checked ? "bg-accent/8 text-content" : "text-content/65 hover:bg-content/5 hover:text-content"}`}
     >
       {icon}
       <span className="min-w-0 flex-1 truncate leading-label">{label}</span>
@@ -2828,7 +3431,11 @@ function ColumnPopover({
           <p className="px-0.5 pb-1 text-[10px] text-content/45">
             Move {cardCount} {cardCount === 1 ? "card" : "cards"} to
           </p>
-          <div role="radiogroup" aria-label="Move cards to" className="max-h-36 overflow-y-auto">
+          <div
+            role="group"
+            aria-label="Move cards to"
+            className="max-h-36 overflow-y-auto"
+          >
             {[
               { id: "", label: "Their status columns" },
               ...columns.filter((entry) => entry.id !== column.id),
@@ -2836,8 +3443,7 @@ function ColumnPopover({
               <button
                 key={entry.id || "auto"}
                 type="button"
-                role="radio"
-                aria-checked={target === entry.id}
+                aria-pressed={target === entry.id}
                 className={`flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] ${
                   target === entry.id
                     ? "bg-accent/12 text-content"
@@ -2878,38 +3484,8 @@ function ColumnPopover({
   );
 }
 
-function ProjectPickRow({
-  label,
-  mark,
-  selected,
-  onPick,
-}: {
-  label: string;
-  mark?: React.ReactNode;
-  selected: boolean;
-  onPick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      role="option"
-      aria-selected={selected}
-      className={`flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] ${
-        selected
-          ? "bg-accent/12 text-content"
-          : "text-content/70 hover:bg-content/6 hover:text-content"
-      }`}
-      onClick={onPick}
-    >
-      {mark ?? (
-        <Folder className="size-3.5 shrink-0 text-content/40" strokeWidth={1.75} />
-      )}
-      <span className="min-w-0 flex-1 truncate">{label}</span>
-      {selected ? (
-        <span aria-hidden className="size-1.5 rounded-full bg-accent" />
-      ) : null}
-    </button>
-  );
-}
-
-const boardPosition = { selected: null as string | null, left: 0, columns: new Map<string, number>() };
+const boardPosition = {
+  selected: null as string | null,
+  left: 0,
+  columns: new Map<string, number>(),
+};

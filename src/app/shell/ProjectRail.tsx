@@ -1,3 +1,6 @@
+import { SavedProjectsSection } from "../../features/projects/ui/SavedProjectsSection";
+import { useSavedProjects } from "../../features/projects/model/savedProjects";
+import { SidebarTasksSection } from "../../features/board/SidebarTasksSection";
 import { WslBadge } from "../../features/sessions/ui/WslBadge.tsx";
 import {
   BellOff,
@@ -29,10 +32,7 @@ import {
   PROJECT_RAIL_WIDTH_MIN,
   saveProjectRailWidth,
 } from "../../features/settings/model/appearance";
-import {
-  basename,
-  type GitDiffStats,
-} from "../../platform/tauri/fs";
+import { basename, type GitDiffStats } from "../../platform/tauri/fs";
 import { IS_MAC, MOD } from "../../platform/tauri/platform";
 import { formatInteger } from "../../shared/lib/numbers";
 import { pathKey, projectKey, projectName } from "../../shared/lib/paths";
@@ -120,6 +120,7 @@ type Props = {
   liveAgents?: LiveAgent[];
   activeSessionId?: string;
   onSelectAgent?: (sessionId: string) => void;
+  onSelectTaskSession?: (sessionId: string) => void;
   settingsOpen?: boolean;
   settingsSection?: SettingsSectionId;
   onOpenSettings?: () => void;
@@ -159,6 +160,7 @@ export function ProjectRail({
   liveAgents = [],
   activeSessionId,
   onSelectAgent,
+  onSelectTaskSession,
   settingsOpen = false,
   settingsSection = "general",
   onOpenSettings,
@@ -232,6 +234,7 @@ export function ProjectRail({
     const status = notificationMuteStatus(notificationPreferences[project.id]);
     for (const path of project.paths) muteStatuses.set(pathKey(path), status);
   }
+  const { projects: savedProjects } = useSavedProjects(cwd);
   const sections = useMemo(
     () => projectRailSections(recents, cwd, railOrder, pinnedPaths),
     [cwd, pinnedPaths, railOrder, recents],
@@ -258,6 +261,25 @@ export function ProjectRail({
       })),
     };
   }, [projectGroupAssignments, projectGroups, sections.projects]);
+  // Saved projects are the curated list — recents that a saved project
+  // already covers would only repeat them, so they drop out of the raw
+  // list. Uncovered recents (including the current folder when no project
+  // claims it) keep the section — and its open-folder affordance — alive.
+  const savedMemberPaths = useMemo(
+    () =>
+      new Set(
+        savedProjects.flatMap((project) =>
+          project.members.map((member) => pathKey(member)),
+        ),
+      ),
+    [savedProjects],
+  );
+  const looseProjects =
+    savedProjects.length === 0
+      ? groupedProjectSections.ungrouped
+      : groupedProjectSections.ungrouped.filter(
+          (project) => !savedMemberPaths.has(pathKey(project.path)),
+        );
   const busy = useMemo(() => {
     const set = new Set<string>();
     for (const path of busyPaths ?? []) set.add(path);
@@ -276,7 +298,9 @@ export function ProjectRail({
   useEffect(() => {
     // Saving announces the change, which reloads `pinnedPaths`.
     const pinned = loadPinnedProjects();
-    const next = pinned.filter((path) => allProjects.has(path));
+    // `allProjects` is keyed by pathKey — match that form or drive-letter,
+    // UNC and WSL-cased pins all look missing and get silently dropped.
+    const next = pinned.filter((path) => allProjects.has(pathKey(path)));
     if (next.length !== pinned.length) savePinnedProjects(next);
   }, [allProjects]);
 
@@ -334,7 +358,11 @@ export function ProjectRail({
   const pinnedIds = sections.pinned.map((item) => item.path);
   const projectIds = groupedProjectSections.ungrouped.map((item) => item.path);
   const pinnedSortable = useAnimatedReorder(pinnedIds, onReorderPinned, "y");
-  const projectSortable = useAnimatedReorder(projectIds, onReorderProjects, "y");
+  const projectSortable = useAnimatedReorder(
+    projectIds,
+    onReorderProjects,
+    "y",
+  );
   return (
     <nav
       ref={resize.setPaneRef}
@@ -425,6 +453,18 @@ export function ProjectRail({
             }}
             className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-none pb-2"
           >
+            <SavedProjectsSection
+              cwd={cwd}
+              recents={recents}
+              onSelect={onSelectProject}
+            />
+            {onSelectTaskSession && (
+              <SidebarTasksSection
+                cwd={cwd}
+                activeSessionId={activeSessionId}
+                onSelectSession={onSelectTaskSession}
+              />
+            )}
             {sections.pinned.length > 0 ? (
               <ProjectSection
                 label="Pinned"
@@ -460,74 +500,84 @@ export function ProjectRail({
                   onAddGroup={(x, y) => projectMenu.createGroup(x, y)}
                 />
                 <div className="flex flex-col gap-px px-2">
-                  {groupedProjectSections.grouped.map(({ group, items }) => (
-                    <ProjectGroupSection
-                      key={group.id}
-                      group={group}
-                      items={items}
-                      muteStatuses={muteStatuses}
-                      cwd={cwd}
-                      busy={busy}
-                      statsEnabled={visible}
-                      searchActive={
-                        searchActive ||
-                        inboxActive ||
-                        notesActive ||
-                        automationsActive
-                      }
-                      onSelect={onSelectProject}
-                      onTogglePin={toggleProjectPin}
-                      onContextMenu={onProjectContextMenu}
-                      onOpenMenu={projectMenu.open}
-                      onReorder={onReorderProjects}
-                      onToggleCollapsed={() =>
-                        updateProjectGroup(group.id, (current) => ({
-                          ...current,
-                          collapsed: !current.collapsed,
-                        }))
-                      }
-                      onOpenGroupMenu={(x, y) =>
-                        projectMenu.openGroupMenu(group.id, x, y)
-                      }
-                      groupLabels={groupLabels}
-                      groupColors={groupColors}
-                      groupCustomColors={groupCustomColors}
-                      groupLogos={groupLogos}
-                      groupMascots={groupMascots}
-                    />
-                  ))}
+                  {groupedProjectSections.grouped.map(
+                    ({ group, items }) => (
+                      <ProjectGroupSection
+                        key={group.id}
+                        group={group}
+                        items={items}
+                        muteStatuses={muteStatuses}
+                        cwd={cwd}
+                        busy={busy}
+                        statsEnabled={visible}
+                        searchActive={
+                          searchActive ||
+                          inboxActive ||
+                          notesActive ||
+                          automationsActive
+                        }
+                        onSelect={onSelectProject}
+                        onTogglePin={toggleProjectPin}
+                        onContextMenu={onProjectContextMenu}
+                        onOpenMenu={projectMenu.open}
+                        onReorder={onReorderProjects}
+                        onToggleCollapsed={() =>
+                          updateProjectGroup(group.id, (current) => ({
+                            ...current,
+                            collapsed: !current.collapsed,
+                          }))
+                        }
+                        onOpenGroupMenu={(x, y) =>
+                          projectMenu.openGroupMenu(group.id, x, y)
+                        }
+                        groupLabels={groupLabels}
+                        groupColors={groupColors}
+                        groupCustomColors={groupCustomColors}
+                        groupLogos={groupLogos}
+                        groupMascots={groupMascots}
+                      />
+                    ),
+                  )}
                 </div>
               </div>
             ) : null}
 
-            <ProjectSection
-              label="Projects"
-              items={groupedProjectSections.ungrouped}
-              muteStatuses={muteStatuses}
-              emptyLabel={
-                sections.projects.length === 0 && projectGroups.length === 0
-                  ? "No projects yet"
-                  : undefined
-              }
-              onAdd={onOpenProject}
-              cwd={cwd}
-              busy={busy}
-              statsEnabled={visible}
-              sortable={projectSortable}
-              pinned={false}
-              searchActive={
-                searchActive || inboxActive || notesActive || automationsActive
-              }
-              onSelect={onSelectProject}
-              onTogglePin={toggleProjectPin}
-              onContextMenu={onProjectContextMenu}
-              onOpenMenu={projectMenu.open}
-              groupLabels={groupLabels}
-              groupColors={groupColors}
-              groupCustomColors={groupCustomColors}
-              groupLogos={groupLogos}
-              groupMascots={groupMascots}
-            />
+            {/* Raw recents save no space once saved projects exist — only
+             * repos no project covers render here (with the open-folder
+             * affordance). Pinned and grouped recents always render. */}
+            {savedProjects.length === 0 || looseProjects.length > 0 ? (
+              <ProjectSection
+                label="Repositories"
+                items={looseProjects}
+                muteStatuses={muteStatuses}
+                emptyLabel={
+                  sections.projects.length === 0 && projectGroups.length === 0
+                    ? "No projects yet"
+                    : undefined
+                }
+                onAdd={onOpenProject}
+                cwd={cwd}
+                busy={busy}
+                statsEnabled={visible}
+                sortable={projectSortable}
+                pinned={false}
+                searchActive={
+                  searchActive ||
+                  inboxActive ||
+                  notesActive ||
+                  automationsActive
+                }
+                onSelect={onSelectProject}
+                onTogglePin={toggleProjectPin}
+                onContextMenu={onProjectContextMenu}
+                onOpenMenu={projectMenu.open}
+                groupLabels={groupLabels}
+                groupColors={groupColors}
+                groupCustomColors={groupCustomColors}
+                groupLogos={groupLogos}
+                groupMascots={groupMascots}
+              />
+            ) : null}
           </div>
           <LiveAgentsPreview
             agents={liveAgents}
@@ -763,7 +813,9 @@ function ProjectGroupSection({
         className="project-reorder-item group relative flex h-8 items-stretch rounded-md px-2 opacity-65 cursor-default"
         onContextMenu={(event) => {
           event.preventDefault();
-          event.currentTarget.querySelector<HTMLButtonElement>("button")?.focus();
+          event.currentTarget
+            .querySelector<HTMLButtonElement>("button")
+            ?.focus();
           openMenu(event.currentTarget, event.clientX, event.clientY);
         }}
       >
@@ -937,9 +989,7 @@ function ProjectCard({
       ref={(el) => sortable.setItemRef(item.path, el)}
       data-selected={selected || undefined}
       className={`reorder-item project-reorder-item group relative flex touch-none items-stretch rounded-md px-2 h-8 ${
-        selected
-          ? "bg-selection-strong text-content"
-          : "opacity-65"
+        selected ? "bg-selection-strong text-content" : "opacity-65"
       } cursor-default`}
       onPointerDown={(event) => {
         if (event.button !== 0) return;
@@ -960,7 +1010,8 @@ function ProjectCard({
         if (
           event.key !== "ContextMenu" &&
           !(event.shiftKey && event.key === "F10")
-        ) return;
+        )
+          return;
         event.preventDefault();
         event.stopPropagation();
         const rect = event.currentTarget.getBoundingClientRect();
@@ -970,7 +1021,9 @@ function ProjectCard({
       <button
         type="button"
         title={muteStatus ? `${cardTitle}\n${muteStatus}` : cardTitle}
-        aria-label={muteStatus ? `${cardAriaLabel}, ${muteStatus}` : cardAriaLabel}
+        aria-label={
+          muteStatus ? `${cardAriaLabel}, ${muteStatus}` : cardAriaLabel
+        }
         aria-current={selected ? "true" : undefined}
         className="flex min-w-0 flex-1 cursor-default items-center gap-2 text-left transition-[padding] duration-150 motion-reduce:transition-none group-hover:pr-6 group-has-[:focus-visible]:pr-6"
       >
@@ -1015,7 +1068,11 @@ function ProjectCard({
             aria-label={connection}
             className="relative grid size-4 shrink-0 place-items-center text-content/45"
           >
-            <Internet className="size-3" strokeWidth={1.75} aria-hidden="true" />
+            <Internet
+              className="size-3"
+              strokeWidth={1.75}
+              aria-hidden="true"
+            />
             <span
               aria-hidden="true"
               className={`absolute right-0 bottom-0 size-1.5 rounded-full ring-1 ring-background-base ${
@@ -1031,7 +1088,11 @@ function ProjectCard({
             title={muteStatus}
             className="grid size-4 shrink-0 place-items-center text-amber-400"
           >
-            <BellOff className="size-3.5" strokeWidth={1.75} aria-hidden="true" />
+            <BellOff
+              className="size-3.5"
+              strokeWidth={1.75}
+              aria-hidden="true"
+            />
           </span>
         ) : null}
       </button>

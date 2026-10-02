@@ -1,8 +1,15 @@
-import { cleanPlanningPeriods, periodKey, type PlanningPeriod } from "../inbox/model/planning";
+import {
+  cleanPlanningPeriods,
+  periodKey,
+  type PlanningPeriod,
+} from "../inbox/model/planning";
 import type { CiBinding, DeliveryProvider } from "./delivery";
 import type { InboxProvider } from "../inbox/model/githubTasks";
 import type { LinkedWorkItem } from "../sessions/model/session";
-import { type InboxRelationship, type InboxTimeFilter } from "../inbox/model/inboxFilters";
+import {
+  type InboxRelationship,
+  type InboxTimeFilter,
+} from "../inbox/model/inboxFilters";
 import { pathKey } from "../../shared/lib/paths";
 
 /** Group-filter sentinel for cards with no group assigned. */
@@ -80,6 +87,7 @@ export type TaskWorkstream = {
   projectPath: string;
   branch: string;
   base: string;
+  remote?: string;
   worktreePath?: string;
   /** Pinned provider PR — review lanes fetch `pr/<N>` branches that never
    * match the PR's real head name, so probes target this url directly. */
@@ -96,9 +104,12 @@ export type TaskWorkstream = {
  * ticket state, PRs and CI are always read live in boardData.ts.
  */
 export type BoardTask = {
+  projectId?: string;
   id: string;
   /** Main conversation spanning the task working copies; older lane sessions remain valid. */
   primarySessionId?: string;
+  /** Additional conversations with access to the task's prepared repositories. */
+  taskSessionIds?: string[];
   title: string;
   links: LinkedWorkItem[];
   workstreams: TaskWorkstream[];
@@ -106,7 +117,34 @@ export type BoardTask = {
   groupIds?: string[];
   createdAt: number;
   archived?: boolean;
+  replyDrafts?: Record<string, string>;
+  replyRequest?: {
+    id: string;
+    sessionId: string;
+    scope: string;
+    threadIds: string[];
+    identity: string;
+    fingerprint: string;
+  };
 };
+
+export function taskWideSessionIds(task: BoardTask): string[] {
+  return [
+    ...new Set([
+      ...(task.primarySessionId ? [task.primarySessionId] : []),
+      ...(task.taskSessionIds ?? []),
+    ]),
+  ];
+}
+
+export function taskSessionIds(task: BoardTask): string[] {
+  return [
+    ...new Set([
+      ...taskWideSessionIds(task),
+      ...task.workstreams.flatMap((ws) => ws.sessionIds ?? []),
+    ]),
+  ];
+}
 
 /** A named grouping label. `color` indexes `GROUP_SWATCHES` in boardData —
  * stored so a rename/delete of another group never shifts its hue. */
@@ -153,7 +191,10 @@ export type SavedBoardFilter = {
 };
 
 export const DEFAULT_BOARD_FILTER: BoardFilterSpec = {
-  periods: [], search: "", hiddenProviders: [], relationships: ["assigned"],
+  periods: [],
+  search: "",
+  hiddenProviders: [],
+  relationships: ["assigned"],
   project: "",
   groups: [],
   mineOnly: true,
@@ -237,7 +278,8 @@ const PROVIDER_IDS = new Set([
 
 function cleanLinkedItem(value: unknown, depth = 0): LinkedWorkItem | null {
   if (!isRecord(value)) return null;
-  const kind = value.kind === "issue" || value.kind === "pr" ? value.kind : null;
+  const kind =
+    value.kind === "issue" || value.kind === "pr" ? value.kind : null;
   const url = cleanString(value.url, 600);
   if (!kind || !url) return null;
   // Fork-era boards persisted Azure links as "azure"; normalize to upstream's
@@ -261,7 +303,9 @@ function cleanLinkedItem(value: unknown, depth = 0): LinkedWorkItem | null {
     repo: cleanString(value.repo) ?? "",
     number: cleanNumber(value.number) ?? 0,
     ...(provider ? { provider } : {}),
-    ...(cleanString(value.account) ? { account: cleanString(value.account) } : {}),
+    ...(cleanString(value.account)
+      ? { account: cleanString(value.account) }
+      : {}),
     ...(cleanString(value.identifier)
       ? { identifier: cleanString(value.identifier) }
       : {}),
@@ -292,6 +336,7 @@ function sanitizeTasks(value: unknown): BoardTask[] {
       ? raw.links
           .map((entry) => cleanLinkedItem(entry))
           .filter((entry): entry is LinkedWorkItem => entry !== null)
+          .slice(0, MAX_LINKS)
       : [];
     const workstreams: TaskWorkstream[] = [];
     if (Array.isArray(raw.workstreams)) {
@@ -318,13 +363,20 @@ function sanitizeTasks(value: unknown): BoardTask[] {
           projectPath,
           branch,
           base: cleanString(ws.base, 200) ?? "HEAD",
+          ...(cleanString(ws.remote, 200)
+            ? { remote: cleanString(ws.remote, 200) }
+            : {}),
           ...(cleanString(ws.worktreePath, 600)
             ? { worktreePath: cleanString(ws.worktreePath, 600) }
             : {}),
           ...(cleanString(ws.prUrl, 600)
             ? { prUrl: cleanString(ws.prUrl, 600) }
             : {}),
-          ...(["github", "gitlab", "azuredevops"].includes(String(ws.prProvider)) ? { prProvider: ws.prProvider as DeliveryProvider } : {}),
+          ...(["github", "gitlab", "azuredevops"].includes(
+            String(ws.prProvider),
+          )
+            ? { prProvider: ws.prProvider as DeliveryProvider }
+            : {}),
           ...(cleanCiBinding(ws.ci) ? { ci: cleanCiBinding(ws.ci) } : {}),
           ...(sessionIds.length ? { sessionIds } : {}),
         });
@@ -342,7 +394,40 @@ function sanitizeTasks(value: unknown): BoardTask[] {
       title,
       links,
       workstreams,
-      ...(cleanString(raw.primarySessionId, 120) ? { primarySessionId: cleanString(raw.primarySessionId, 120) } : {}),
+      ...(isRecord(raw.replyDrafts)
+        ? {
+            replyDrafts: Object.fromEntries(
+              Object.entries(raw.replyDrafts)
+                .slice(-200)
+                .filter(
+                  ([key, value]) =>
+                    key.length <= 2000 &&
+                    typeof value === "string" &&
+                    value.length <= 32_768,
+                ),
+            ) as Record<string, string>,
+          }
+        : {}),
+      ...(cleanReplyRequest(raw.replyRequest)
+        ? { replyRequest: cleanReplyRequest(raw.replyRequest) }
+        : {}),
+      ...(cleanString(raw.projectId, 120)
+        ? { projectId: cleanString(raw.projectId, 120) }
+        : {}),
+      ...(cleanString(raw.primarySessionId, 120)
+        ? { primarySessionId: cleanString(raw.primarySessionId, 120) }
+        : {}),
+      ...(Array.isArray(raw.taskSessionIds)
+        ? {
+            taskSessionIds: [
+              ...new Set(
+                raw.taskSessionIds
+                  .map((id) => cleanString(id, 120))
+                  .filter((id): id is string => !!id),
+              ),
+            ].slice(0, 256),
+          }
+        : {}),
       ...(groupIds.length ? { groupIds } : {}),
       createdAt: cleanNumber(raw.createdAt) ?? Date.now(),
       ...(isArchived ? { archived: true } : {}),
@@ -392,8 +477,29 @@ function cleanFilterSpec(value: unknown): BoardFilterSpec {
   return {
     periods: cleanPlanningPeriods(raw.periods),
     search: typeof raw.search === "string" ? raw.search.slice(0, 2000) : "",
-    hiddenProviders: Array.isArray(raw.hiddenProviders) ? [...new Set(raw.hiddenProviders.filter((p): p is InboxProvider => typeof p === "string" && PROVIDER_IDS.has(p)))] : [],
-    relationships: Array.isArray(raw.relationships) ? [...new Set(raw.relationships.filter((r): r is InboxRelationship => ["related", "assigned", "created", "reviewing"].includes(String(r))))] : raw.mineOnly === false ? [] : ["assigned"],
+    hiddenProviders: Array.isArray(raw.hiddenProviders)
+      ? [
+          ...new Set(
+            raw.hiddenProviders.filter(
+              (p): p is InboxProvider =>
+                typeof p === "string" && PROVIDER_IDS.has(p),
+            ),
+          ),
+        ]
+      : [],
+    relationships: Array.isArray(raw.relationships)
+      ? [
+          ...new Set(
+            raw.relationships.filter((r): r is InboxRelationship =>
+              ["related", "assigned", "created", "reviewing"].includes(
+                String(r),
+              ),
+            ),
+          ),
+        ]
+      : raw.mineOnly === false
+        ? []
+        : ["assigned"],
     statuses: [...statuses.values()],
     project: cleanString(raw.project, 600) ?? "",
     groups,
@@ -618,26 +724,70 @@ const EMPTY_STORE: Store = {
 };
 
 export function loadBoard(): Store {
-  const raw = readRaw();
-  if (!raw) return EMPTY_STORE;
-  try {
-    return sanitizeStore(JSON.parse(raw));
-  } catch {
-    return EMPTY_STORE;
-  }
+  return boardFromSnapshot(readRaw());
+}
+
+function cleanReplyRequest(value: unknown): BoardTask["replyRequest"] {
+  if (!isRecord(value) || !Array.isArray(value.threadIds)) return undefined;
+  const id = cleanString(value.id, 120),
+    sessionId = cleanString(value.sessionId, 120),
+    scope = cleanString(value.scope, 2000),
+    identity = cleanString(value.identity, 4000),
+    fingerprint = cleanString(value.fingerprint, 128 * 1024);
+  if (!id || !sessionId || !scope || !identity || !fingerprint)
+    return undefined;
+  return {
+    id,
+    sessionId,
+    scope,
+    identity,
+    fingerprint,
+    threadIds: [
+      ...new Set(
+        value.threadIds.filter(
+          (id): id is string => typeof id === "string" && id.length <= 500,
+        ),
+      ),
+    ].slice(0, 200),
+  };
 }
 
 function cleanCiBinding(value: unknown): CiBinding | undefined {
-  if (!isRecord(value) || !["github", "gitlab", "azuredevops"].includes(String(value.provider))) return undefined;
-  return { provider: value.provider as DeliveryProvider,
-    repo: cleanString(value.repo, 600), project: cleanString(value.project, 200), host: cleanString(value.host, 600),
-    definitionIds: Array.isArray(value.definitionIds) ? [...new Set(value.definitionIds.filter((id): id is number => typeof id === "number" && Number.isSafeInteger(id) && id > 0))].slice(0, 100) : undefined };
+  if (
+    !isRecord(value) ||
+    !["github", "gitlab", "azuredevops"].includes(String(value.provider))
+  )
+    return undefined;
+  return {
+    provider: value.provider as DeliveryProvider,
+    repo: cleanString(value.repo, 600),
+    project: cleanString(value.project, 200),
+    host: cleanString(value.host, 600),
+    definitionIds: Array.isArray(value.definitionIds)
+      ? [
+          ...new Set(
+            value.definitionIds.filter(
+              (id): id is number =>
+                typeof id === "number" && Number.isSafeInteger(id) && id > 0,
+            ),
+          ),
+        ].slice(0, 100)
+      : undefined,
+  };
 }
 
 function writeStore(store: Store) {
   const raw = JSON.stringify(store);
   try {
-    if (store.tasks.some(task => task.workstreams.some(ws => ws.ci || ws.prProvider)) && !localStorage.getItem(`${KEY}.before-delivery`)) {
+    if (
+      store.tasks.some(
+        (task) =>
+          task.replyDrafts ||
+          task.replyRequest ||
+          task.workstreams.some((ws) => ws.ci || ws.prProvider || ws.remote),
+      ) &&
+      !localStorage.getItem(`${KEY}.before-delivery`)
+    ) {
       const previous = localStorage.getItem(KEY);
       if (previous) localStorage.setItem(`${KEY}.before-delivery`, previous);
     }
@@ -739,9 +889,7 @@ export function pinCard(
         ...Object.values(store.placements)
           .filter((p) => p.column === column)
           .map((p) => p.order),
-        ...store.locals
-          .filter((c) => c.column === column)
-          .map((c) => c.order),
+        ...store.locals.filter((c) => c.column === column).map((c) => c.order),
       ) - 1024
     : 0;
   if (store.locals.some((card) => card.id === cardId)) {
@@ -938,6 +1086,7 @@ export function archiveTasks(ids: readonly string[]) {
 }
 
 export function addTask(input: {
+  projectId?: string;
   title: string;
   links: LinkedWorkItem[];
   workstreams: TaskWorkstream[];
@@ -962,9 +1111,12 @@ export function addTask(input: {
       {
         id,
         title,
+        ...(input.projectId ? { projectId: input.projectId } : {}),
         links: input.links.slice(0, MAX_LINKS),
         workstreams: input.workstreams.slice(0, MAX_WORKSTREAMS),
-        ...(input.primarySessionId ? { primarySessionId: input.primarySessionId } : {}),
+        ...(input.primarySessionId
+          ? { primarySessionId: input.primarySessionId }
+          : {}),
         ...(groupIds.length ? { groupIds } : {}),
         createdAt: Date.now(),
       },
@@ -986,11 +1138,34 @@ export function updateTask(
   if (!store.tasks.some((task) => task.id === id)) return;
   writeStore({
     ...store,
-    tasks: store.tasks.map((task) =>
-      task.id === id
-        ? { ...task, ...(typeof patch === "function" ? patch(task) : patch), id }
-        : task,
-    ),
+    tasks: store.tasks.map((task) => {
+      if (task.id !== id) return task;
+      const changes = {
+        ...(typeof patch === "function" ? patch(task) : patch),
+      };
+      // Same caps as addTask — an uncapped write would persist past sanitize
+      // until the next load silently truncated it.
+      if (changes.links) changes.links = changes.links.slice(0, MAX_LINKS);
+      if (changes.groupIds)
+        changes.groupIds = changes.groupIds
+          .filter((groupId) =>
+            store.groups.some((group) => group.id === groupId),
+          )
+          .slice(0, MAX_TASK_GROUPS);
+      // Changing the default conversation must not detach the previous one.
+      if (
+        changes.primarySessionId &&
+        task.primarySessionId &&
+        changes.primarySessionId !== task.primarySessionId
+      )
+        changes.taskSessionIds = [
+          ...new Set([
+            ...(changes.taskSessionIds ?? task.taskSessionIds ?? []),
+            task.primarySessionId,
+          ]),
+        ];
+      return { ...task, ...changes, id };
+    }),
   });
 }
 
@@ -1143,9 +1318,7 @@ export function removeColumn(id: string, target?: string) {
     ...Object.values(store.placements)
       .filter((p) => p.column === appendTo)
       .map((p) => p.order),
-    ...store.locals
-      .filter((c) => c.column === appendTo)
-      .map((c) => c.order),
+    ...store.locals.filter((c) => c.column === appendTo).map((c) => c.order),
   );
   const placements: Record<string, BoardPlacement> = {};
   const now = Date.now();
@@ -1182,10 +1355,12 @@ export function sameBoardFilterSpec(
 ): boolean {
   const ids = (list: readonly string[]) => [...list].sort().join("\n");
   return (
-    ids((a.periods ?? []).map(periodKey)) === ids((b.periods ?? []).map(periodKey)) &&
+    ids((a.periods ?? []).map(periodKey)) ===
+      ids((b.periods ?? []).map(periodKey)) &&
     (a.search ?? "") === (b.search ?? "") &&
     ids(a.hiddenProviders ?? []) === ids(b.hiddenProviders ?? []) &&
-    ids(a.relationships ?? (a.mineOnly ? ["assigned"] : [])) === ids(b.relationships ?? (b.mineOnly ? ["assigned"] : [])) &&
+    ids(a.relationships ?? (a.mineOnly ? ["assigned"] : [])) ===
+      ids(b.relationships ?? (b.mineOnly ? ["assigned"] : [])) &&
     pathKey(a.project) === pathKey(b.project) &&
     a.mineOnly === b.mineOnly &&
     a.time === b.time &&
@@ -1209,9 +1384,7 @@ export function saveBoardFilter(
   const store = loadBoard();
   const valid = new Set(store.groups.map((group) => group.id));
   const clean = cleanFilterSpec(spec);
-  clean.groups = clean.groups.filter(
-    (id) => id === UNGROUPED || valid.has(id),
-  );
+  clean.groups = clean.groups.filter((id) => id === UNGROUPED || valid.has(id));
   const existing = store.filters.find(
     (filter) => filter.name.toLowerCase() === cleaned.toLowerCase(),
   );
@@ -1259,9 +1432,18 @@ export function deleteBoardFilter(id: string) {
 
 const VIEW_KEY = "monocode.board.view.v1";
 export function loadBoardView(): BoardFilterSpec {
-  try { return cleanFilterSpec(JSON.parse(localStorage.getItem(VIEW_KEY) ?? "null")); }
-  catch { return cleanFilterSpec(null); }
+  try {
+    return cleanFilterSpec(
+      JSON.parse(localStorage.getItem(VIEW_KEY) ?? "null"),
+    );
+  } catch {
+    return cleanFilterSpec(null);
+  }
 }
 export function saveBoardView(spec: BoardFilterSpec) {
-  try { localStorage.setItem(VIEW_KEY, JSON.stringify(cleanFilterSpec(spec))); } catch { /* storage unavailable */ }
+  try {
+    localStorage.setItem(VIEW_KEY, JSON.stringify(cleanFilterSpec(spec)));
+  } catch {
+    /* storage unavailable */
+  }
 }

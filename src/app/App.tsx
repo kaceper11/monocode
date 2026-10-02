@@ -1,3 +1,9 @@
+import { loadProjectSessionHistory } from "../features/sessions/data/projectSessionHistory";
+import { projectSessionSummaries, scopedSessions, type SessionListScope } from "../features/board/sessionScope";
+import { taskSessionIds } from "../features/board/boardStore";
+import { useSavedProjects, selectSavedProject, readSavedProjects } from "../features/projects/model/savedProjects";
+import { repositoryScopes, selectedRepository, type GitRepositoryScope } from "../features/source-control/model/repositoryScope";
+import { NEW_TASK_EVENT } from "../features/board/SidebarTasksSection";
 import { matchesTarget, type DeliveryTarget } from "../features/board/delivery";
 import {
   startHarnessTiming, markHarnessTiming, finishHarnessTiming, measureHarnessTiming,
@@ -578,8 +584,9 @@ import { AddRemoteProjectDialog } from "../features/connections/ui/AddRemoteProj
 import type { ConnectableInboxSource } from "../features/inbox/model/inboxFilters";
 import { BoardView } from "../features/board/BoardView";
 import { CREATE_TASK_EVENT } from "../features/board/InboxTaskLinks";
-import { OPEN_TASK_EVENT } from "../features/board/taskSession";
+import { DOCK_TASK_EVENT, OPEN_TASK_EVENT, sessionTaskBindings, taskConversationCheckout, attachTaskSession, detachTaskSession } from "../features/board/taskSession";
 import type { TaskWorkstreamSpec } from "../features/board/NewTaskDialog";
+import { withTaskGitLock } from "../features/board/TaskGitActions";
 import {
   boardSnapshot,
   loadBoard,
@@ -988,7 +995,10 @@ export default function App({
   const [searchViewFocusToken, setSearchViewFocusToken] = useState(0);
   const [inboxViewOpen, setInboxViewOpen] = useState(false);
   const [boardViewOpen, setBoardViewOpen] = useState(false);
-  const [boardNewTaskRequest, setBoardNewTaskRequest] = useState<{ item: InboxItem } | null>(null);
+  // Task details docked beside the workspace — lives independently of the
+  // full board view so an agent conversation stays visible next to it.
+  const [taskDockId, setTaskDockId] = useState<string | null>(null);
+  const [boardNewTaskRequest, setBoardNewTaskRequest] = useState<{ item?: InboxItem } | null>(null);
   const [boardTaskRequest, setBoardTaskRequest] = useState<{ id: string } | null>(null);
   const [linkedWorkItemPanels, setLinkedWorkItemPanels] = useState<
     ReadonlyMap<string, LinkedWorkItemPanelState>
@@ -1574,14 +1584,76 @@ export default function App({
     sidebarCwd && sidebarCwd !== "~" ? normalizeProjectPath(sidebarCwd) : null;
   const historyFailed =
     sidebarCwdKey != null && historyErrorCwd === sidebarCwdKey;
-  // True from the very first frame that shows a project we have never listed,
-  // so the sidebar can stay blank instead of flashing "No sessions yet".
-  const historyPending =
-    sidebarCwdKey != null &&
-    !loadedProjects.has(sidebarCwdKey) &&
-    !historyFailed;
   const gitCwd =
     activeFile?.cwd ?? (active ? sessionWorkCwd(active) : sidebarCwd);
+  const { selected: savedProject } = useSavedProjects(sidebarCwd);
+  const sessionTasks = useMemo(() => loadBoard().tasks, [boardVersion]);
+  const activeBindings = active
+    ? sessionTaskBindings(sessionTasks, active.id)
+    : [];
+  const activeTask =
+    activeBindings.length === 1 ? activeBindings[0].task : undefined;
+  const [sessionListScope, setSessionListScope] = useState<SessionListScope>({
+    kind: "all",
+  });
+  const [sessionCreationError, setSessionCreationError] = useState("");
+  const sessionCreating = useRef(false);
+  const sessionCreationContext = JSON.stringify([
+    active?.id,
+    savedProject?.id,
+    sessionListScope,
+  ]);
+  const sessionCreationContextRef = useRef(sessionCreationContext);
+  sessionCreationContextRef.current = sessionCreationContext;
+  const sessionProjectKey = savedProject?.id ?? pathKey(sidebarCwd);
+  const previousSessionProject = useRef(sessionProjectKey);
+  useEffect(() => {
+    const projectChanged = previousSessionProject.current !== sessionProjectKey;
+    previousSessionProject.current = sessionProjectKey;
+    setSessionListScope(
+      activeTask
+        ? { kind: "task", taskId: activeTask.id }
+        : active?.id && !projectChanged
+          ? { kind: "adhoc" }
+          : { kind: "all" },
+    );
+    setSessionCreationError("");
+  }, [active?.id, activeTask?.id, sessionProjectKey]);
+  const listTask =
+    sessionListScope.kind === "task"
+      ? sessionTasks.find((task) => task.id === sessionListScope.taskId)
+      : undefined;
+  const sessionProjectPaths = useMemo(
+    () => [
+      ...new Map(
+        (listTask
+          ? listTask.workstreams.map((ws) => ws.projectPath)
+          : (savedProject?.members ?? [sidebarCwd])
+        ).map((path) => [pathKey(path), path]),
+      ).values(),
+    ],
+    [listTask, savedProject, sidebarCwd],
+  );
+  const sessionProjectPathsKey = JSON.stringify(sessionProjectPaths);
+  const sessionProjectPathsRef = useRef(sessionProjectPaths);
+  sessionProjectPathsRef.current = sessionProjectPaths;
+  // True while any local member's first session listing is still outstanding —
+  // a multi-repo scope isn't "loaded" when only the sidebar cwd resolved.
+  const historyPending =
+    !historyFailed &&
+    (isRemoteProjectPath(sidebarCwd)
+      ? [sidebarCwd]
+      : sessionProjectPaths.filter(
+          (path) => path && path !== "~" && !isRemoteProjectPath(path),
+        )
+    ).some((path) => !loadedProjects.has(normalizeProjectPath(path)));
+  const [sessionHistoryError, setSessionHistoryError] = useState("");
+  const [sessionHistoryRetry, setSessionHistoryRetry] = useState(0);
+
+  const gitScope = useMemo(() => repositoryScopes(sessionTasks, active?.id, savedProject), [sessionTasks, active?.id, savedProject]);
+  const [repositorySelection, setRepositorySelection] = useState({ key: "", id: "" });
+  const gitRepository = selectedRepository(gitScope.repositories, gitCwd, repositorySelection.key === gitScope.key ? repositorySelection.id : undefined);
+  const sourceControlCwd = gitRepository?.cwd ?? gitCwd;
   const gitCwdBranches = useProjectBranches(
     gitCwd,
     Boolean(gitCwd) && gitCwd !== "~" && !isRemoteProjectPath(sidebarCwd),
@@ -1907,13 +1979,13 @@ export default function App({
     setHistoryErrorCwd((prev) => (prev === key ? null : prev));
     try {
       const rows = await listSessionsByProject(cwd);
-      if (cwd !== sidebarCwdRef.current) return;
+      if (!sessionProjectPathsRef.current.some(path => sameProjectPath(path, cwd))) return;
       setHistory((current) => replaceProjectHistory(current, cwd, rows));
       setLoadedProjects((prev) =>
         prev.has(key) ? prev : new Set(prev).add(key),
       );
     } catch {
-      if (cwd !== sidebarCwdRef.current) return;
+      if (!sessionProjectPathsRef.current.some(path => sameProjectPath(path, cwd))) return;
       // A failed revalidate keeps the cached cards rather than replacing a
       // good list with an error.
       if (!loadedProjectsRef.current.has(key)) setHistoryErrorCwd(key);
@@ -1921,8 +1993,37 @@ export default function App({
   }, []);
 
   useEffect(() => {
-    void refreshHistory(sidebarCwd);
-  }, [sidebarCwd, refreshHistory]);
+    if (isRemoteProjectPath(sidebarCwd)) {
+      void refreshHistory(sidebarCwd);
+      return;
+    }
+    let cancelled = false;
+    setSessionHistoryError("");
+    const paths = sessionProjectPaths.filter(
+      (cwd) => cwd && cwd !== "~" && !isRemoteProjectPath(cwd),
+    );
+    void loadProjectSessionHistory(
+      paths,
+      (cwd, rows) => {
+        setHistory((current) => replaceProjectHistory(current, cwd, rows));
+        setLoadedProjects((current) =>
+          new Set(current).add(normalizeProjectPath(cwd)),
+        );
+        setHistoryErrorCwd((current) =>
+          current === normalizeProjectPath(cwd) ? null : current,
+        );
+      },
+      () => !cancelled,
+    ).then((failed) => {
+      if (!cancelled && failed.length)
+        setSessionHistoryError(
+          `Couldn’t load sessions from ${failed.map(projectName).join(", ")}.`,
+        );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionProjectPathsKey, sessionHistoryRetry, refreshHistory]);
 
   useEffect(() => {
     if (!inboxViewOpen && !boardViewOpen) return;
@@ -1959,7 +2060,11 @@ export default function App({
       .then((summary) => {
         if (!summary) return;
         lastPersisted.current.set(session.id, fingerprint);
-        if (summary.cwd === sidebarCwdRef.current) {
+        if (
+          sessionProjectPathsRef.current.some((path) =>
+            sameProjectPath(path, summary.cwd),
+          )
+        ) {
           setHistory((current) => mergeProjectHistorySummary(current, summary));
         }
       })
@@ -2027,7 +2132,11 @@ export default function App({
           const summary = await upsertSession(session).catch(() => null);
           if (!summary) return;
           lastPersisted.current.set(session.id, fingerprint);
-          if (summary.cwd === sidebarCwdRef.current) {
+          if (
+            sessionProjectPathsRef.current.some((path) =>
+              sameProjectPath(path, summary.cwd),
+            )
+          ) {
             setHistory((current) =>
               mergeProjectHistorySummary(current, summary),
             );
@@ -2343,26 +2452,117 @@ export default function App({
     setWhatsNewVersion(document.source.version);
   }, []);
 
+  const onNewAdHoc = useCallback(
+    (cwdOverride?: string) => {
+      setSessionCreationError("");
+      setBoardViewOpen(false);
+      setSearchViewOpen(false);
+      setInboxViewOpen(false);
+      setNotesViewOpen(false);
+      setAutomationsViewOpen(false);
+      const cwd =
+        cwdOverride ?? active?.cwd ?? sessionDefaults?.cwd ?? projectCwd;
+      const session = newDefaultSession(cwd, sessionDefaults?.runtimeMode);
+      const tab = newTab(session.id);
+      setSessions((prev) => [...prev, session]);
+      appendTab(tab, cwd);
+      setActiveTabId(tab.id);
+      setComposerFocused(true);
+      return session.id;
+    },
+    [
+      active?.cwd,
+      appendTab,
+      sessionDefaults?.cwd,
+      sessionDefaults?.runtimeMode,
+      projectCwd,
+    ],
+  );
+
+  const onNewTaskSession = useCallback(
+    async (repositoryId?: string) => {
+      if (sessionCreating.current) return;
+      sessionCreating.current = true;
+      const context = sessionCreationContextRef.current;
+      setSessionCreationError("");
+      try {
+        const taskId =
+          sessionListScope.kind === "task"
+            ? sessionListScope.taskId
+            : activeTask?.id;
+        const task = loadBoard().tasks.find(
+          (task) => task.id === taskId && !task.archived,
+        );
+        if (!task)
+          throw new Error(
+            "This task is unavailable. Choose another task or create an ad hoc session.",
+          );
+        const preferred =
+          active && taskSessionIds(task).includes(active.id)
+            ? sessionWorkCwd(active)
+            : undefined;
+        const primary = sessionsRef.current.find(
+          (session) => session.id === task.primarySessionId,
+        );
+        const lane = await taskConversationCheckout(
+          task.id,
+          [preferred, primary ? sessionWorkCwd(primary) : undefined].filter(
+            (path): path is string => !!path,
+          ),
+          repositoryId,
+        );
+        if (context !== sessionCreationContextRef.current)
+          throw new Error(
+            "The selected session scope changed. Create the conversation again in the current scope.",
+          );
+        const session = {
+          ...newDefaultSession(lane.projectPath, sessionDefaults?.runtimeMode),
+          worktreeCwd: lane.worktreePath,
+          branch: lane.branch,
+        };
+        attachTaskSession(
+          session.id,
+          lane,
+          task.id,
+          repositoryId ? "repository" : "task",
+        );
+        const tab = newTab(session.id);
+        setSearchViewOpen(false);
+        setInboxViewOpen(false);
+        setNotesViewOpen(false);
+        setAutomationsViewOpen(false);
+        setBoardViewOpen(false);
+        setSessions((current) => [...current, session]);
+        persistSession(session);
+        appendTab(tab, session.cwd);
+        setActiveTabId(tab.id);
+        setComposerFocused(true);
+        return session.id;
+      } catch (error) {
+        setSessionCreationError(
+          error instanceof Error ? error.message : String(error),
+        );
+      } finally {
+        sessionCreating.current = false;
+      }
+    },
+    [
+      sessionListScope,
+      activeTask?.id,
+      active,
+      sessionDefaults?.runtimeMode,
+      appendTab,
+      persistSession,
+    ],
+  );
   const onNew = useCallback(() => {
-    setSearchViewOpen(false);
-    setInboxViewOpen(false);
-    setNotesViewOpen(false);
-    setAutomationsViewOpen(false);
-    const cwd = active?.cwd ?? sessionDefaults?.cwd ?? projectCwd;
-    const session = newDefaultSession(cwd, sessionDefaults?.runtimeMode);
-    const tab = newTab(session.id);
-    setSessions((prev) => [...prev, session]);
-    appendTab(tab, cwd);
-    setActiveTabId(tab.id);
-    setComposerFocused(true);
-    return session.id;
-  }, [
-    active?.cwd,
-    appendTab,
-    sessionDefaults?.cwd,
-    sessionDefaults?.runtimeMode,
-    projectCwd,
-  ]);
+    if (sessionListScope.kind === "task") {
+      void onNewTaskSession();
+      return;
+    }
+    setSessionCreationError("");
+    return onNewAdHoc();
+  }, [sessionListScope.kind, onNewTaskSession, onNewAdHoc]);
 
   const onSelectRemoteSession = useCallback(
     (project: string, remoteSessionId: string) => {
@@ -3646,13 +3846,14 @@ export default function App({
       session?: { sessionId: string; cwd: string },
       changeKind?: GitFileDiffKind,
       pin = false,
+      repository?: GitRepositoryScope,
     ) => {
       void (async () => {
-        const diffCwd = session?.cwd ?? gitCwdRef.current;
-        const diffProjectCwd = session
+        const diffCwd = repository?.cwd ?? session?.cwd ?? gitCwdRef.current;
+        const diffProjectCwd = repository?.projectPath ?? (session
           ? sessionsRef.current.find((entry) => entry.id === session.sessionId)
               ?.cwd
-          : sidebarCwdRef.current;
+          : sidebarCwdRef.current);
         const resolved = path
           ? ((await resolveOpenablePath(diffCwd, path)) ?? path)
           : undefined;
@@ -3695,22 +3896,22 @@ export default function App({
   );
 
   const onOpenWorkingTreeDiff = useCallback(
-    (path: string, kind?: GitFileDiffKind, pin?: boolean) =>
-      onOpenDiff(path, undefined, kind, pin),
+    (path: string, kind?: GitFileDiffKind, pin?: boolean, repository?: GitRepositoryScope) =>
+      onOpenDiff(path, undefined, kind, pin, repository),
     [onOpenDiff],
   );
 
   /** Stack every working-tree change in one review, whatever the diff-view setting. */
-  const onOpenAllChanges = useCallback(() => {
+  const onOpenAllChanges = useCallback((repository?: GitRepositoryScope) => {
     setTabs((prev) =>
       prev.map((tab) =>
         tab.id === activeTabId
           ? openChangesTab(
               tab,
-              gitCwdRef.current,
+              repository?.cwd ?? gitCwdRef.current,
               undefined,
               undefined,
-              sidebarCwdRef.current,
+              repository?.projectPath ?? sidebarCwdRef.current,
             )
           : tab,
       ),
@@ -3719,19 +3920,19 @@ export default function App({
   }, [activeTabId]);
 
   const onOpenCommit = useCallback(
-    (commit: GitHistoryCommit, pin?: boolean) => {
+    (commit: GitHistoryCommit, pin?: boolean, repository?: GitRepositoryScope) => {
       setTabs((prev) =>
         prev.map((tab) =>
           tab.id === activeTabId
             ? openCommitTab(
                 tab,
-                gitCwdRef.current,
+                repository?.cwd ?? gitCwdRef.current,
                 {
                   sha: commit.sha,
                   shortSha: commit.shortSha,
                   subject: commit.subject,
                 },
-                sidebarCwdRef.current,
+                repository?.projectPath ?? sidebarCwdRef.current,
                 pin,
               )
             : tab,
@@ -5307,6 +5508,7 @@ export default function App({
       // meant cancelling a folder picker shut whatever the user had open.
       // Nothing below opens a project without also leaving one of these views.
       setSearchViewOpen(false);
+      setBoardViewOpen(false);
       setInboxViewOpen(false);
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
@@ -9603,7 +9805,7 @@ export default function App({
     [history, sidebarCwd],
   );
 
-  const sidebarHistory = useMemo(
+  const repositoryHistory = useMemo(
     () =>
       historyWithLiveSessions(
         history,
@@ -9621,11 +9823,53 @@ export default function App({
       ),
     [history, projectBranches, sessions, sidebarCwd, orchestrationRuns],
   );
+  const scopedHistory = useMemo(
+    () =>
+      projectSessionSummaries(
+        history,
+        sessions,
+        sessionProjectPaths,
+        orchestrationRuns,
+      ),
+    [history, sessions, sessionProjectPathsKey, orchestrationRuns],
+  );
+  const sidebarHistory = useMemo(
+    () => scopedSessions(scopedHistory, sessionTasks, sessionListScope),
+    [scopedHistory, sessionTasks, sessionListScope],
+  );
+  // Sidebar prop — memoized so the folder-prune effect depending on it does
+  // not re-run (re-parsing the folders store) on every unrelated render.
+  const sidebarOpenSessions = useMemo(
+    () =>
+      sessions
+        .filter(
+          (session) =>
+            !session.inboxAsk &&
+            !session.orchestrationLeadId &&
+            sessionProjectPaths.some((path) =>
+              sameProjectPath(path, session.cwd),
+            ) &&
+            sidebarHistory.some((summary) => summary.id === session.id),
+        )
+        .map((session) => summaryFromSession(session)),
+    [sessions, sessionProjectPaths, sidebarHistory],
+  );
+
+  // Memoized — sessions tick per turn event and an inline array would defeat
+  // the rail's busy memo on every App render.
+  const busyProjectPaths = useMemo(
+    () =>
+      sessions.flatMap((session) =>
+        session.busy && session.cwd ? [session.cwd] : [],
+      ),
+    [sessions],
+  );
+
   const {
     unseen: inboxUnseen,
     linkedSessionUpdateIds,
     linkedSessionUpdates,
-  } = useInboxActivity(recents, sidebarCwd, sidebarHistory, {
+  } = useInboxActivity(recents, sidebarCwd, repositoryHistory, {
     onAppeared: onInboxAppeared,
   });
   linkedSessionUpdatesRef.current = linkedSessionUpdates;
@@ -9636,9 +9880,7 @@ export default function App({
     // Sessions bound to board-task workstreams stay resolvable even for
     // ticketless tasks, which have no linkedWorkItem to carry them.
     const taskBound = new Set(
-      loadBoard().tasks.flatMap((task) =>
-        task.workstreams.flatMap((ws) => ws.sessionIds ?? []),
-      ),
+      loadBoard().tasks.flatMap(taskSessionIds),
     );
     for (const session of history) {
       if (session.linkedWorkItem || taskBound.has(session.id))
@@ -9674,27 +9916,6 @@ export default function App({
   const repairSessions = useMemo(
     () => ciRepairSessions(history, sessions),
     [history, sessions],
-  );
-  const openProjectSessions = useMemo(
-    () =>
-      sessions
-        .filter(
-          (session) =>
-            !session.inboxAsk &&
-            !session.orchestrationLeadId &&
-            sameProjectPath(session.cwd, sidebarCwd),
-        )
-        .map((session) =>
-          summaryFromSession(session, {
-            ...(projectBranches?.current
-              ? { branch: projectBranches.current }
-              : {}),
-            ...(sidebarCwd && sidebarCwd !== "~"
-              ? { repo: projectName(sidebarCwd) }
-              : {}),
-          }),
-        ),
-    [projectBranches, sessions, sidebarCwd],
   );
 
   const onToggleSidebar = useCallback(() => {
@@ -9815,23 +10036,59 @@ export default function App({
       onOpenBoard();
       setBoardNewTaskRequest({ item });
     };
+    const dockTask = (event: Event) => {
+      const id: unknown = (event as CustomEvent).detail;
+      if (typeof id !== "string") return;
+      // Toggle — a second dock request for the same task un-docks it.
+      setTaskDockId((current) => (current === id ? null : id));
+    };
+    window.addEventListener(DOCK_TASK_EVENT, dockTask);
+    const newTask = () => { onOpenBoard(); setBoardNewTaskRequest({}); };
+    window.addEventListener(NEW_TASK_EVENT, newTask);
     window.addEventListener(OPEN_TASK_EVENT, openTask);
     window.addEventListener(CREATE_TASK_EVENT, createTask);
     return () => {
+      window.removeEventListener(NEW_TASK_EVENT, newTask);
       window.removeEventListener(OPEN_TASK_EVENT, openTask);
       window.removeEventListener(CREATE_TASK_EVENT, createTask);
+      window.removeEventListener(DOCK_TASK_EVENT, dockTask);
     };
   }, [onOpenBoard]);
 
   const onOpenBoardSession = useCallback(
     (sessionId: string) => {
-      // Remember the board was the origin — one visit-back returns to it.
-      rememberBoardReturn(true);
-      setBoardViewOpen(false);
-      setSidebarTab("sessions");
-      void onSelectHistorySession(sessionId);
+      const owner = loadBoard().tasks.find(task => taskSessionIds(task).includes(sessionId));
+      if (owner?.projectId && readSavedProjects().some(project => project.id === owner.projectId)) selectSavedProject(owner.projectId);
+      void (async () => {
+        const session = await ensureOpenSession(sessionId);
+        if (!session) {
+          // The conversation is gone but the task still references it —
+          // prune the dead binding (the row disappears from the reopened
+          // details instead of Open silently doing nothing).
+          const task = loadBoard().tasks.find(task => taskSessionIds(task).includes(sessionId));
+          detachTaskSession(sessionId);
+          if (task) { onOpenBoard(); setBoardTaskRequest({ id: task.id }); }
+          return;
+        }
+        if (session.inboxAsk) {
+          // Inbox asks render inside the inbox surface, not session tabs.
+          rememberBoardReturn(boardViewOpen);
+          setBoardViewOpen(false);
+          setInboxViewOpen(true);
+          return;
+        }
+        rememberBoardReturn(boardViewOpen);
+        setBoardViewOpen(false);
+        setSettingsOpen(false);
+        setSearchViewOpen(false);
+        setInboxViewOpen(false);
+        setNotesViewOpen(false);
+        setAutomationsViewOpen(false);
+        setSidebarTab("sessions");
+        await onSelectHistorySession(sessionId);
+      })();
     },
-    [onSelectHistorySession],
+    [onSelectHistorySession, ensureOpenSession, onOpenBoard, boardViewOpen, setSidebarTab],
   );
 
   const onBoardSendToSession = useCallback(
@@ -9859,48 +10116,52 @@ export default function App({
 
   // Board working copies are prepared independently of conversations.
   const onBoardPrepareWorktree = useCallback(
-    async (spec: TaskWorkstreamSpec) => {
-      let worktreePath = spec.worktreePath;
-      if (!worktreePath) {
-        const branches = await gitBranches(spec.projectPath);
-        const existing = branches.branches.some(branch => !branch.remote && branch.name === spec.branch);
-        const created = await createWorktree(
-          spec.projectPath,
-          spec.branch,
-          spec.base,
-          existing,
-        ).catch((error) =>
-          !existing && /already exists/i.test(String(error))
-            ? createWorktree(spec.projectPath, spec.branch, spec.base, true)
-            : Promise.reject(error),
-        );
-        worktreePath = created.path;
-      } else {
-        // The stored path may have been deleted externally — refuse to bind
-        // a session to a directory that isn't a live worktree anymore. A
-        // failed listing is fatal too: skipping the guard would bind to a
-        // path we couldn't verify.
-        const live = await listWorktrees(spec.projectPath);
-        const bound = live.worktrees.find(
-          (entry) => pathKey(entry.path) === pathKey(spec.worktreePath!),
-        );
-        // A deleted dir stays registered until git prunes it — `missing`
-        // marks it, so path-presence alone isn't proof the copy is usable.
-        if (!bound || bound.missing) {
-          throw new Error(
-            "Worktree is gone — repoint it in the lane's editor or remove the lane",
+    async (spec: TaskWorkstreamSpec) =>
+      // Serialize against other board git ops on this repo — a prepare
+      // racing a merge/switch corrupts either side's view of the checkout.
+      // Callers no longer need their own lock.
+      withTaskGitLock(spec.projectPath, "worktree preparation", async () => {
+        let worktreePath = spec.worktreePath;
+        if (!worktreePath) {
+          const branches = await gitBranches(spec.projectPath);
+          const existing = branches.branches.some(branch => !branch.remote && branch.name === spec.branch);
+          const created = await createWorktree(
+            spec.projectPath,
+            spec.branch,
+            spec.base,
+            existing,
+          ).catch((error) =>
+            !existing && /already exists/i.test(String(error))
+              ? createWorktree(spec.projectPath, spec.branch, spec.base, true)
+              : Promise.reject(error),
           );
-        }
-        // Someone checked out another branch in this worktree — the session
-        // would silently work the wrong branch.
-        if (bound.branch !== spec.branch) {
-          throw new Error(
-            `Worktree is on ${bound.branch ?? "a detached HEAD"}, expected ${spec.branch} — repoint it in the lane's editor`,
+          worktreePath = created.path;
+        } else {
+          // The stored path may have been deleted externally — refuse to bind
+          // a session to a directory that isn't a live worktree anymore. A
+          // failed listing is fatal too: skipping the guard would bind to a
+          // path we couldn't verify.
+          const live = await listWorktrees(spec.projectPath);
+          const bound = live.worktrees.find(
+            (entry) => pathKey(entry.path) === pathKey(spec.worktreePath!),
           );
+          // A deleted dir stays registered until git prunes it — `missing`
+          // marks it, so path-presence alone isn't proof the copy is usable.
+          if (!bound || bound.missing) {
+            throw new Error(
+              "Worktree is gone — repoint it in the lane's editor or remove the lane",
+            );
+          }
+          // Someone checked out another branch in this worktree — the session
+          // would silently work the wrong branch.
+          if (bound.branch !== spec.branch) {
+            throw new Error(
+              `Worktree is on ${bound.branch ?? "a detached HEAD"}, expected ${spec.branch} — repoint it in the lane's editor`,
+            );
+          }
         }
-      }
-      return worktreePath;
-    },
+        return worktreePath;
+      }),
     [],
   );
 
@@ -9922,51 +10183,6 @@ export default function App({
       return { sessionId: session.id, worktreePath };
     },
     [appendTab, sessionDefaults?.runtimeMode, onBoardPrepareWorktree],
-  );
-
-  const onBoardBindSession = useCallback(
-    (sessionId: string, linked: LinkedWorkItem | null) => {
-      const current = sessionsRef.current.find(
-        (session) => session.id === sessionId,
-      );
-      if (current) {
-        const updated = {
-          ...current,
-          ...(linked ? { linkedWorkItem: linked } : {}),
-        };
-        if (!linked) delete updated.linkedWorkItem;
-        const next = sessionsRef.current.map((session) =>
-          session.id === sessionId ? updated : session,
-        );
-        sessionsRef.current = next;
-        setSessions(next);
-        persistSession(updated);
-        return;
-      }
-      // Dormant session — the workstream may list a stored summary. Patch
-      // the record too, or a cleared link silently rejoins it to the task
-      // card via the link join on the next board build.
-      void getSession(sessionId)
-        .then((stored) => {
-          if (!stored) return null;
-          if (linked) stored.linkedWorkItem = linked;
-          else delete stored.linkedWorkItem;
-          return upsertSession(stored);
-        })
-        .then((summary) => {
-          if (!summary) return;
-          setHistory((current) =>
-            mergeProjectHistorySummary(current, summary),
-          );
-          setStoredLinkedSessions((current) =>
-            summary.linkedWorkItem
-              ? mergeProjectHistorySummary(current, summary)
-              : current.filter((entry) => entry.id !== summary.id),
-          );
-        })
-        .catch(() => undefined);
-    },
-    [persistSession],
   );
 
   const onOpenLinkedWorkItem = useCallback(
@@ -10943,6 +11159,11 @@ export default function App({
             <Sidebar
               cwd={sidebarCwd}
               gitCwd={gitCwd}
+              sourceControlCwd={sourceControlCwd}
+              gitRepositories={gitScope.repositories}
+              gitRepository={gitRepository}
+              onSelectGitRepository={id => setRepositorySelection({ key: gitScope.key, id })}
+              onSelectTaskSession={onOpenBoardSession}
               explorerRootLabel={explorerRootLabel}
               open={sessionSidebarOpen}
               tab={sidebarTab}
@@ -10952,6 +11173,14 @@ export default function App({
               onOpenFilesSearch={onFindInProject}
               searchFocusToken={searchFocusToken}
               sessions={sidebarHistory}
+              sessionTasks={sessionTasks}
+              sessionScope={sessionListScope}
+              onSessionScopeChange={setSessionListScope}
+              sessionProjectPaths={sessionProjectPaths}
+              sessionScopeError={sessionCreationError || sessionHistoryError}
+              onRetrySessionScope={() => { setSessionCreationError(""); setSessionHistoryRetry(value => value + 1); }}
+              onNewAdHoc={onNewAdHoc}
+              onNewRepositorySession={(id) => { void onNewTaskSession(id); }}
               busySessionIds={busySessionIds}
               approvalSessionIds={approvalSessionIds}
               activeSessionId={active?.id}
@@ -10994,7 +11223,7 @@ export default function App({
               onOpenAllChanges={onOpenAllChanges}
               onOpenCommit={onOpenCommit}
               selectedDiffPath={
-                activeTab ? selectedChangePath(activeTab, gitCwd) : undefined
+                activeTab ? selectedChangePath(activeTab, sourceControlCwd) : undefined
               }
               selectedDiffKind={
                 activeTab ? selectedChangeKind(activeTab) : undefined
@@ -11004,16 +11233,14 @@ export default function App({
               }
               textHarness={pickTextHarness(active?.harness)}
               recents={recents}
-              busyProjectPaths={sessions.flatMap((session) =>
-                session.busy && session.cwd ? [session.cwd] : [],
-              )}
+              busyProjectPaths={busyProjectPaths}
               liveAgents={liveAgents}
               onSelectAgent={onSelectLiveAgent}
               onSelectProject={onSelectProject}
               onOpenProject={pickProject}
               onRemoveProject={onRemoveProject}
               onNew={onNew}
-              openSessions={openProjectSessions}
+              openSessions={sidebarOpenSessions}
               onNewTerminal={onNewTerminal}
               onSearch={onOpenSearch}
               onOpenInbox={onOpenInbox}
@@ -11222,6 +11449,25 @@ export default function App({
                           </div>
                         ))}
                       </div>
+                      {taskDockId ? (
+                        // Task details docked beside the workspace — the same
+                        // BoardView, but detailTaskId renders only the panel.
+                        <BoardView
+                          detailTaskId={taskDockId}
+                          recents={recents}
+                          cwd={sidebarCwd}
+                          sessions={sessions}
+                          linkedSessions={inboxRelatedSessions}
+                          onClose={() => setTaskDockId(null)}
+                          onToggleSidebar={onToggleSidebar}
+                          onOpenSession={onOpenBoardSession}
+                          onStartItem={onStartInboxItem}
+                          onSendToSession={onBoardSendToSession}
+                          onSpawnSession={onBoardSpawnSession}
+                          onPrepareWorktree={onBoardPrepareWorktree}
+                          onRemoveWorktree={onRemoveWorktree}
+                        />
+                      ) : null}
                     </div>
                   </div>
                   {[...linkedWorkItemPanels.values()].map((panel) => (
@@ -11344,7 +11590,6 @@ export default function App({
                   onSendToSession={onBoardSendToSession}
                   onSpawnSession={onBoardSpawnSession}
                   onPrepareWorktree={onBoardPrepareWorktree}
-                  onBindSession={onBoardBindSession}
                   onRemoveWorktree={onRemoveWorktree}
                 />
               ) : null}
@@ -11380,7 +11625,7 @@ export default function App({
                   notificationSettingsRequest={notificationSettingsRequest}
                   recents={recents}
                   cwd={sidebarCwd}
-                  sessions={sidebarHistory}
+                  sessions={repositoryHistory}
                   liveSessions={sessions}
                   onRemoveWorktree={onRemoveWorktree}
                   onCheckWorktreeRemoval={onCheckWorktreeRemoval}

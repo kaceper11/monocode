@@ -1,5 +1,6 @@
+import { RemotePicker } from "./RemotePicker";
 import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeWorkspace as invoke } from "../../platform/tauri/fs";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Checkbox } from "../../shared/ui/Checkbox";
 import { SearchableSelect } from "../../shared/ui/SearchableSelect";
@@ -31,7 +32,7 @@ import type { WorkstreamStatus } from "./boardData";
 
 const buttonClass =
   "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] hover:bg-content/8 focus-visible:ring-1 focus-visible:ring-accent";
-const CHECK_APPEARANCE = {
+export const CHECK_APPEARANCE = {
   failed: {
     icon: CircleX,
     tone: "text-red-700 dark:text-red-400",
@@ -74,9 +75,11 @@ const CHECK_APPEARANCE = {
 export function CiBadge({
   status,
   onFix,
+  onDetails,
 }: {
   status?: WorkstreamStatus;
   onFix: () => void;
+  onDetails?: () => void;
 }) {
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const checks = status?.checks ?? [];
@@ -100,9 +103,12 @@ export function CiBadge({
         ? CircleDashed
         : appearance.icon;
   const tone = error || !states.length ? "text-content/45" : appearance.tone;
-  const summaryLabel = status?.ciError && checks.length
-    ? "CI incomplete"
-    : status ? ciLabel(checks, error) : "CI loading…";
+  const summaryLabel =
+    status?.ciError && checks.length
+      ? "CI incomplete"
+      : status
+        ? ciLabel(checks, error)
+        : "CI loading…";
   return (
     <>
       <button
@@ -110,7 +116,7 @@ export function CiBadge({
         title={`${summaryLabel} · Show check details`}
         aria-label="Show CI checks"
         aria-expanded={!!anchor}
-        onClick={(e) => setAnchor(e.currentTarget)}
+        onClick={(e) => (onDetails ? onDetails() : setAnchor(e.currentTarget))}
       >
         <StateIcon
           aria-hidden="true"
@@ -225,9 +231,13 @@ export function DeliverySettings({
 }: {
   ws: TaskWorkstream;
   snapshot?: DeliverySnapshot;
-  onSave: (patch: Pick<TaskWorkstream, "prProvider" | "prUrl" | "ci">) => void;
+  onSave: (
+    patch: Pick<TaskWorkstream, "prProvider" | "prUrl" | "ci" | "remote">,
+  ) => void;
   onClose: () => void;
 }) {
+  const [remote, setRemote] = useState(ws.remote);
+  const [ciOverride, setCiOverride] = useState(!!ws.ci);
   const [prProvider, setPrProvider] = useState<DeliveryProvider | "">(
     ws.prProvider || "",
   );
@@ -272,11 +282,15 @@ export function DeliverySettings({
       const patch = {
         prProvider: prProvider || undefined,
         prUrl: prUrl.trim() || undefined,
-        ci,
+        ci: ciOverride ? ci : undefined,
+        remote,
       };
       const result = await probeDelivery({ ...ws, ...patch });
       if (result.ciError) throw new Error(result.ciError);
-      onSave({ ...patch, ci: { ...ci, host: result.ciSource?.host } });
+      onSave({
+        ...patch,
+        ci: ciOverride ? { ...ci, host: result.ciSource?.host } : undefined,
+      });
       onClose();
     } catch (e) {
       setError(String(e));
@@ -294,6 +308,13 @@ export function DeliverySettings({
       }}
     >
       <div className="flex flex-col gap-3 p-4 text-[12px]">
+        <RemotePicker
+          cwd={ws.worktreePath || ws.projectPath}
+          branch={ws.branch}
+          value={remote}
+          onChange={setRemote}
+          disabled={busy}
+        />
         <label>
           Pull requests
           <SearchableSelect
@@ -328,101 +349,120 @@ export function DeliverySettings({
             placeholder="Follow this branch, or paste a PR URL"
           />
         </label>
-        <label>
-          CI provider
-          <SearchableSelect
-            label="CI provider"
-            variant="transparent"
-            searchable={false}
-            disabled={busy}
-            value={ci.provider}
-            onChange={(value) => {
-              setCi({ provider: value as DeliveryProvider });
-              setDefinitions([]);
-              setPartial(false);
-            }}
-            options={Object.entries(PROVIDER_NAMES).map(([value, label]) => ({
-              value,
-              label: value === "azuredevops" ? "Azure Pipelines" : label,
-            }))}
-          />
-        </label>
-        {ci.provider === "azuredevops" ? (
+        <Checkbox
+          visibleLabel
+          label="Override CI source"
+          checked={ciOverride}
+          onChange={() => setCiOverride((value) => !value)}
+          disabled={busy}
+        />
+        {ciOverride && (
           <>
             <label>
-              Azure project
-              <input
-                aria-label="Azure project"
-                className={inputClass}
+              CI provider
+              <SearchableSelect
+                label="CI provider"
+                variant="transparent"
+                searchable={false}
                 disabled={busy}
-                value={ci.project || ""}
-                onChange={(e) => {
-                  setCi((c) => ({
-                    ...c,
-                    project: e.target.value,
-                    definitionIds: [],
-                  }));
+                value={ci.provider}
+                onChange={(value) => {
+                  setCi({ provider: value as DeliveryProvider });
                   setDefinitions([]);
+                  setPartial(false);
                 }}
+                options={Object.entries(PROVIDER_NAMES).map(
+                  ([value, label]) => ({
+                    value,
+                    label: value === "azuredevops" ? "Azure Pipelines" : label,
+                  }),
+                )}
               />
             </label>
-            <SecondaryButton
-              disabled={busy || !ci.project?.trim()}
-              onClick={() => void loadDefinitions()}
-            >
-              Load pipelines
-            </SecondaryButton>
-            {definitions.map((d) => (
-              <label key={d.id} className="flex items-center gap-2">
-                <Checkbox
-                  label={d.name}
+            {ci.provider === "azuredevops" ? (
+              <>
+                <label>
+                  Azure project
+                  <input
+                    aria-label="Azure project"
+                    className={inputClass}
+                    disabled={busy}
+                    value={ci.project || ""}
+                    onChange={(e) => {
+                      setCi((c) => ({
+                        ...c,
+                        project: e.target.value,
+                        definitionIds: [],
+                      }));
+                      setDefinitions([]);
+                    }}
+                  />
+                </label>
+                <SecondaryButton
+                  disabled={busy || !ci.project?.trim()}
+                  onClick={() => void loadDefinitions()}
+                >
+                  Load pipelines
+                </SecondaryButton>
+                {definitions.map((d) => (
+                  <label key={d.id} className="flex items-center gap-2">
+                    <Checkbox
+                      label={d.name}
+                      disabled={busy}
+                      checked={ci.definitionIds?.includes(d.id) || false}
+                      onChange={() =>
+                        setCi((c) => ({
+                          ...c,
+                          definitionIds: !c.definitionIds?.includes(d.id)
+                            ? [...(c.definitionIds || []), d.id]
+                            : (c.definitionIds || []).filter(
+                                (id) => id !== d.id,
+                              ),
+                        }))
+                      }
+                    />
+                    {d.name}
+                  </label>
+                ))}
+                {!definitions.length && !!ci.definitionIds?.length && (
+                  <p>Selected pipeline IDs: {ci.definitionIds.join(", ")}</p>
+                )}
+                {partial && (
+                  <p className="text-amber-700 dark:text-amber-300">
+                    Only the first 100 pipelines are listed.
+                  </p>
+                )}
+              </>
+            ) : (
+              <label>
+                CI repository
+                <input
+                  aria-label="CI repository"
+                  className={inputClass}
                   disabled={busy}
-                  checked={ci.definitionIds?.includes(d.id) || false}
-                  onChange={() =>
-                    setCi((c) => ({
-                      ...c,
-                      definitionIds: !c.definitionIds?.includes(d.id)
-                        ? [...(c.definitionIds || []), d.id]
-                        : (c.definitionIds || []).filter((id) => id !== d.id),
-                    }))
+                  value={ci.repo || ""}
+                  onChange={(e) =>
+                    setCi((c) => ({ ...c, repo: e.target.value }))
+                  }
+                  placeholder="Use the selected provider’s repository remote"
+                />
+              </label>
+            )}
+            {ci.provider === "github" && (
+              <label>
+                GitHub host
+                <input
+                  aria-label="GitHub CI host"
+                  className={inputClass}
+                  disabled={busy}
+                  value={ci.host || "github.com"}
+                  onChange={(e) =>
+                    setCi((c) => ({ ...c, host: e.target.value }))
                   }
                 />
-                {d.name}
               </label>
-            ))}
-            {!definitions.length && !!ci.definitionIds?.length && (
-              <p>Selected pipeline IDs: {ci.definitionIds.join(", ")}</p>
-            )}
-            {partial && (
-              <p className="text-amber-700 dark:text-amber-300">
-                Only the first 100 pipelines are listed.
-              </p>
             )}
           </>
-        ) : (
-          <label>
-            CI repository
-            <input
-              aria-label="CI repository"
-              className={inputClass}
-              disabled={busy}
-              value={ci.repo || ""}
-              onChange={(e) => setCi((c) => ({ ...c, repo: e.target.value }))}
-              placeholder="Use the selected provider’s repository remote"
-            />
-          </label>
-        )}
-        {ci.provider === "github" && (
-          <label>
-            GitHub host
-            <input
-              aria-label="GitHub CI host"
-              className={inputClass}
-              disabled={busy}
-              value={ci.host || "github.com"}
-              onChange={(e) => setCi((c) => ({ ...c, host: e.target.value }))}
-            />
-          </label>
         )}
         <p className="break-all text-[11px] text-content/50">
           {ci.host || "Uses the existing provider connection from Settings."} ·

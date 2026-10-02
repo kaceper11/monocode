@@ -20,3 +20,5 @@ The approved task-awareness slice extends the existing Board with session-header
 Follow upstream for core features. Retire duplicate implementations when upstream supplies them. Keep provider choices independent and make unsupported operations explicit. Do not reinstate the old custom tasks/projects, action dispatchers, repairs, schedules/watchers or extensions-manager backlog. The browser side panel, Keep Awake, saved project commands without task scope, draft-only Actions prompts, terminal resource manager and dictation remain in scope. Features supplied by upstream remain available.
 
 Keep the existing fork identity, session/credential isolation, licences and release safeguards. No roadmap item authorizes publication or external mutations.
+
+Task-awareness follow-up authorized in the Board workflow: saved repository compositions and subset presets, separate sidebar task navigation, and repository-scoped Git review reuse the existing Board and session lifecycles. These do not restore the former custom task engine.

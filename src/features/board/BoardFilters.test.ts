@@ -4,6 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import * as taskOps from "./taskOps";
 import * as azureDevOps from "../inbox/model/azureDevOps";
+import { listWorktrees } from "../source-control/model/worktrees";
 import { deliveryKey } from "./delivery";
 import { BoardView } from "./BoardView";
 import { addTask, loadBoard, updateTask } from "./boardStore";
@@ -17,6 +18,8 @@ vi.mock("./NewTaskDialog", async (original) => {
     return createElement(actual.NewTaskDialog, props);
   } };
 });
+
+vi.mock("../source-control/model/worktrees", async (original) => ({ ...(await original<typeof import("../source-control/model/worktrees")>()), listWorktrees: vi.fn(async () => ({ defaultRoot: "/", worktrees: [{ path: "/repo", branch: "main", isMain: true }] })) }));
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async () => null),
@@ -87,7 +90,6 @@ async function renderBoard(overrides: Partial<ComponentProps<typeof BoardView>> 
         onSendToSession: vi.fn(),
         onSpawnSession: vi.fn(),
         onPrepareWorktree: vi.fn(async (spec) => `${spec.projectPath}-task`),
-        onBindSession: vi.fn(),
         onRemoveWorktree: vi.fn(),
         ...overrides,
       }),
@@ -138,7 +140,7 @@ it("filters provider cards and restores saved statuses after reopening Board", a
     sections.map(
       (section) => section.querySelector("summary span")?.textContent,
     ),
-  ).toEqual(["Relationship", "Provider status", "Project", "Groups", "Display"]);
+  ).toEqual(["Relationship", "Provider status", "Groups"]);
   expect(sections.every((section) => !section.open)).toBe(true);
   await act(async () => sections[1]!.querySelector("summary")!.click());
   expect(sections[1]!.open).toBe(true);
@@ -149,7 +151,7 @@ it("filters provider cards and restores saved statuses after reopening Board", a
   const selected = button("In Review", jiraGroup);
   selected.focus();
   expect(document.activeElement).toBe(selected);
-  expect(selected.getAttribute("aria-checked")).toBe("true");
+  expect(selected.getAttribute("aria-pressed")).toBe("true");
 
   await click("Save view…");
   const input = document.querySelector<HTMLInputElement>(
@@ -201,11 +203,6 @@ it("filters provider cards and restores saved statuses after reopening Board", a
 it("keeps Board filters open when choosing an Updated dropdown option", async () => {
   await renderBoard();
   await click("Board filters");
-  const display = [...document.querySelectorAll("details")].find(
-    (section) =>
-      section.querySelector("summary span")?.textContent === "Display",
-  )!;
-  await act(async () => display.querySelector("summary")!.click());
   await click("Updated: All time");
   const option = button(
     "Last 7 days",
@@ -216,9 +213,7 @@ it("keeps Board filters open when choosing an Updated dropdown option", async ()
     option.click();
   });
   expect(button("Updated: Last 7 days")).toBeDefined();
-  expect(display.querySelector("summary")?.textContent).toContain(
-    "Last 7 days",
-  );
+  expect(document.querySelector('[role="group"][aria-label="Board filters"]')).not.toBeNull();
   expect(document.querySelector('[aria-label="Updated options"]')).toBeNull();
 });
 
@@ -258,7 +253,10 @@ it("can adopt an existing repository conversation as primary without starting an
   const onSpawnSession = vi.fn();
   const onOpenSession = vi.fn();
   await renderBoard({ taskRequest: { id }, onSpawnSession, onOpenSession, sessions: [{ id: "existing", title: "Existing conversation", cwd: "/repo", worktreeCwd: "/repo-task", harness: "codex", model: "", modelSettings: {}, runtimeMode: "supervised", blocks: [] }] });
+  vi.mocked(listWorktrees).mockResolvedValue({ defaultRoot: "/", worktrees: [{ path: "/repo-task", branch: "feature", missing: false }] } as Awaited<ReturnType<typeof listWorktrees>>);
+  // "Use for task" sets the primary directly — the session is already bound.
   await click("Use for task");
+  expect(document.querySelector('[role="alert"]')?.textContent).toBeUndefined();
   expect(loadBoard().tasks[0].primarySessionId).toBe("existing");
   expect(loadBoard().tasks[0].workstreams[0].sessionIds).toEqual(["existing"]);
   expect(onSpawnSession).not.toHaveBeenCalled();
@@ -414,4 +412,90 @@ it("keeps unattached conversations in a collapsed, clearly named Board tray", as
   await act(async () => tray.querySelector("summary")!.click());
   await act(async () => tray.querySelector<HTMLButtonElement>("button")!.click());
   expect(onOpenSession).toHaveBeenCalledWith("loose");
+});
+
+
+it("does not duplicate toolbar filters and clears menu criteria independently", async () => {
+  await renderBoard();
+  await click("Needs action");
+  await click("Jira cards");
+  const search = document.querySelector<HTMLInputElement>('[aria-label="Filter cards"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(search, "review");
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(button("Board filters").getAttribute("aria-pressed")).toBe("false");
+  await click("Board filters");
+  await click("In Review", document.querySelector('[aria-label="Linear statuses"]')!);
+  expect(button("Board filters").textContent).toContain("Filters · 1");
+  expect(document.querySelector('[aria-label="Active Board filters"]')?.textContent).toContain("Linear: In Review");
+  await click("Clear filters");
+  expect(button("Needs action").getAttribute("aria-pressed")).toBe("true");
+  expect(button("Jira cards").getAttribute("aria-pressed")).toBe("false");
+  expect(search.value).toBe("review");
+  expect(button("Board filters").getAttribute("aria-pressed")).toBe("false");
+});
+
+it("scopes tasks to any matching repository and excludes unrelated or unscoped cards", async () => {
+  addTask({ title: "Multi repo task", links: [], workstreams: [{ id: "a", projectPath: "/api", branch: "main", base: "main" }, { id: "b", projectPath: "/web", branch: "main", base: "main" }] });
+  addTask({ title: "Other task", links: [], workstreams: [{ id: "c", projectPath: "/other", branch: "main", base: "main" }] });
+  addTask({ title: "Unscoped task", links: [], workstreams: [] });
+  await renderBoard({ recents: [{ path: "/api", lastOpened: Date.now() }] });
+  await click("Board filters");
+  await click("Repository: All repositories");
+  await click("api", document.querySelector('[aria-label="Repository options"]')!);
+  expect(document.querySelector('[role="group"][aria-label="Board filters"]')).not.toBeNull();
+  expect(container.textContent).toContain("Multi repo task");
+  expect(container.textContent).not.toContain("Other task");
+  expect(container.textContent).not.toContain("Unscoped task");
+  expect(container.textContent).not.toContain("jira review ticket");
+  await click("Remove Repository: api filter");
+  expect(container.textContent).toContain("Other task");
+  expect(container.textContent).toContain("Unscoped task");
+});
+
+
+it("limits sprint providers to connected or loaded sources and colors toolbar marks", async () => {
+  await renderBoard();
+  expect(button("Jira cards").querySelector("img")).not.toBeNull();
+  expect(button("Linear cards").querySelector("svg")?.getAttribute("fill")).toBe("#8B8CF5");
+  await click("Board filters");
+  await click("Sprint / cycleAll");
+  const providers = document.querySelector('[aria-label="Sprint provider"]')!;
+  expect([...providers.querySelectorAll("button")].map(el => el.getAttribute("aria-label"))).toEqual(["Linear", "Jira"]);
+  expect(providers.querySelector('[aria-label="ADO"]')).toBeNull();
+  expect(providers.querySelector('[aria-label="GitHub"]')).toBeNull();
+});
+
+
+it("keeps a used provider available even when its connection is absent", async () => {
+  const loaded: InboxItem = { ...items[0], provider: "gitlab", kind: "issue", title: "Loaded GitLab issue", state: "opened" };
+  vi.mocked(peekInboxList).mockReturnValueOnce({ items: [loaded], errors: {} });
+  vi.mocked(listInboxItems).mockResolvedValueOnce({ items: [loaded], errors: {} });
+  await renderBoard();
+  await click("Board filters");
+  await click("Sprint / cycleAll");
+  const providers = document.querySelector('[aria-label="Sprint provider"]')!;
+  expect(button("GitLab", providers)).toBeDefined();
+  expect(providers.querySelector('[aria-label="GitHub"]')).toBeNull();
+  expect(providers.querySelector('[aria-label="ADO"]')).toBeNull();
+});
+
+
+it("shows the repository field directly and includes task repositories outside recents", async () => {
+  addTask({ title: "Api task", links: [], workstreams: [{ id: "api", projectPath: "/services/api", branch: "main", base: "main" }] });
+  await renderBoard();
+  await click("Board filters");
+  const repository = button("Repository: All repositories");
+  expect(repository.closest("details")).toBeNull();
+  expect(button("Updated: All time").closest("details")).toBeNull();
+  await act(async () => repository.click());
+  const input = document.querySelector<HTMLInputElement>('[aria-label="Search repositories…"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "/services");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await click("api", document.querySelector('[aria-label="Repository options"]')!);
+  expect(document.querySelector('[role="group"][aria-label="Board filters"]')?.textContent).toContain("/services/api");
+  expect(container.textContent).toContain("Api task");
 });

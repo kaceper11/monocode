@@ -8,6 +8,7 @@ import {
   type TaskWorkstream,
 } from "./boardStore";
 import {
+  taskConversationCheckout,
   attachTaskSession,
   detachTaskSession,
   sessionTaskBindings,
@@ -135,6 +136,24 @@ it("reads current task data on every dispatch, isolates other tasks, and stops e
   );
 });
 
+it("includes issue identifiers in the task snapshot", () => {
+  const id = task([checkout({ sessionIds: ["s"] })]);
+  updateTask(id, {
+    links: [
+      {
+        kind: "issue",
+        provider: "github",
+        identifier: "#42",
+        title: "Checkout drops coupons",
+        url: "https://github.com/a/b/issues/42",
+      },
+    ],
+  });
+  const prompt = taskSessionPrompt("work", "s", "/web-task");
+  expect(prompt).toContain('"identifier":"#42"');
+  expect(prompt).toContain("https://github.com/a/b/issues/42");
+});
+
 it("bounds untrusted reference data without truncating the user's message", () => {
   const id = task([checkout({ sessionIds: ["s"] })]);
   updateTask(id, {
@@ -217,7 +236,7 @@ it("persists a task-level conversation across working copies without inventing l
     true,
   );
   const prompt = taskSessionPrompt("Implement checkout", "lead", "/web-task");
-  expect(prompt).toContain("task's primary conversation");
+  expect(prompt).toContain("task-wide conversation");
   expect(prompt).toContain('"executionCwd":"/api-task"');
   expect(prompt).not.toContain(
     "assigned only to its current working directory",
@@ -256,4 +275,111 @@ it("provides Linux paths only for working copies on the primary session's WSL ho
   expect(prompt).not.toContain('"executionCwd":"/other-task"');
   expect(prompt).not.toContain('"executionCwd":"C:/native-task"');
   expect(prompt).toContain("different execution host; not accessible");
+});
+
+it("treats remote:// machines by id and emits guest paths, never URIs", () => {
+  addTask({
+    title: "Remote task",
+    links: [],
+    primarySessionId: "lead",
+    workstreams: [
+      checkout({ worktreePath: "remote://box/home/u/web-task" }),
+      checkout({ id: "peer", worktreePath: "remote://box/home/u/api-task" }),
+      checkout({ id: "other", worktreePath: "remote://other/home/u/x-task" }),
+    ],
+  });
+  const prompt = taskSessionPrompt(
+    "Work",
+    "lead",
+    "remote://box/home/u/web-task",
+  );
+  // Same remote machine → usable guest path; a different machine stays hidden.
+  expect(prompt).toContain('"executionCwd":"/home/u/api-task"');
+  expect(prompt).not.toContain('"executionCwd":"/home/u/x-task"');
+  expect(prompt).not.toContain('"executionCwd":"remote://');
+});
+
+it("does not hand remote lanes to a native session as host paths", () => {
+  addTask({
+    title: "Mixed hosts",
+    links: [],
+    primarySessionId: "lead",
+    workstreams: [
+      checkout({ worktreePath: "/web-task" }),
+      checkout({ id: "remote", worktreePath: "remote://box/home/u/repo-task" }),
+      checkout({ id: "wsl", worktreePath: "//wsl.localhost/Ubuntu/wsl-task" }),
+    ],
+  });
+  const prompt = taskSessionPrompt("Work", "lead", "/web-task");
+  expect(prompt).not.toContain('"executionCwd":"remote://');
+  expect(prompt).not.toContain('"executionCwd":"/wsl-task"');
+  expect(prompt).toContain("different execution host; not accessible");
+});
+
+it("keeps multiple task-wide conversations, primary replacement and detach independent", () => {
+  const id = task([checkout({ sessionIds: ["repo-session"] })]);
+  attachTaskSession("first", checkout(), id, "task");
+  attachTaskSession("second", checkout(), id, "task");
+  expect(loadBoard().tasks[0].primarySessionId).toBe("first");
+  expect(loadBoard().tasks[0].workstreams[0].sessionIds).toEqual([
+    "repo-session",
+  ]);
+  expect(taskSessionPrompt("Fix", "second", "/web-task")).toContain(
+    "task-wide conversation",
+  );
+  expect(taskSessionPrompt("Fix", "repo-session", "/web-task")).toContain(
+    "assigned only to its current working directory",
+  );
+  updateTask(id, { primarySessionId: "second" });
+  expect(sessionTaskBindings(loadBoard().tasks, "first")).toHaveLength(1);
+  detachTaskSession("second");
+  expect(loadBoard().tasks[0].primarySessionId).toBeUndefined();
+  expect(sessionTaskBindings(loadBoard().tasks, "second")).toHaveLength(0);
+  expect(sessionTaskBindings(loadBoard().tasks, "first")).toHaveLength(1);
+  expect(loadBoard().tasks[0].workstreams[0].sessionIds).toEqual([
+    "repo-session",
+  ]);
+});
+
+it("preserves a legacy primary conversation when choosing a different default", () => {
+  const id = task([checkout()]);
+  updateTask(id, { primarySessionId: "legacy" });
+  updateTask(id, { primarySessionId: "new" });
+  expect(loadBoard().tasks[0].taskSessionIds).toContain("legacy");
+  expect(taskSessionPrompt("Next", "legacy", "/web-task")).toContain(
+    "task-wide conversation",
+  );
+});
+
+it("falls back from an unavailable starting copy but never substitutes an explicitly selected repository", async () => {
+  const id = task([
+    checkout(),
+    checkout({ id: "api", projectPath: "/api", worktreePath: "/api-task" }),
+  ]);
+  vi.mocked(listWorktrees).mockImplementation(
+    async (cwd) =>
+      ({
+        defaultRoot: "/",
+        worktrees:
+          cwd === "/web"
+            ? []
+            : [{ path: "/api-task", branch: "feature", missing: false }],
+      }) as Awaited<ReturnType<typeof listWorktrees>>,
+  );
+  expect((await taskConversationCheckout(id, ["/web-task"])).id).toBe("api");
+  await expect(taskConversationCheckout(id, [], "web")).rejects.toThrow(
+    "available Git working copy",
+  );
+  expect(loadBoard().tasks[0].primarySessionId).toBeUndefined();
+});
+it("rejects a task changed during asynchronous checkout verification", async () => {
+  const id = task([checkout()]);
+  vi.mocked(listWorktrees).mockImplementation(async () => {
+    updateTask(id, { title: "Changed" });
+    return {
+      defaultRoot: "/",
+      worktrees: [{ path: "/web-task", branch: "feature", missing: false }],
+    } as Awaited<ReturnType<typeof listWorktrees>>;
+  });
+  await expect(taskConversationCheckout(id)).rejects.toThrow("task changed");
 });

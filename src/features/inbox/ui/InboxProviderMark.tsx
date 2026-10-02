@@ -5,9 +5,11 @@ import jiraMark from "../../../assets/providers/jira.svg";
 export function InboxProviderMark({
   provider,
   className,
+  colorful = false,
 }: {
   provider: InboxProvider;
   className?: string;
+  colorful?: boolean;
 }) {
   if (provider === "jira") {
     // Devicon's original colored marks; attribution ships in public/DEVICON-LICENSE.txt.
@@ -47,7 +49,7 @@ export function InboxProviderMark({
     return (
       <svg
         viewBox="0 0 16 16"
-        fill="currentColor"
+        fill={colorful ? "#0078D4" : "currentColor"}
         aria-hidden
         className={className}
       >
@@ -59,7 +61,7 @@ export function InboxProviderMark({
     return (
       <svg
         viewBox="0 0 100 100"
-        fill="currentColor"
+        fill={colorful ? "#8B8CF5" : "currentColor"}
         aria-hidden
         className={className}
       >
@@ -71,7 +73,7 @@ export function InboxProviderMark({
     return (
       <svg
         viewBox="0 0 24 24"
-        fill="currentColor"
+        fill={colorful ? "#A78BFA" : "currentColor"}
         aria-hidden
         className={className}
       >

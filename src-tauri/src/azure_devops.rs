@@ -1040,6 +1040,17 @@ fn parse_pr_thread(
             status.to_ascii_lowercase().as_str(),
             "fixed" | "closed" | "resolved"
         );
+        let context = thread.get("threadContext");
+        let path = context
+            .and_then(|ctx| string_field(ctx, "filePath"))
+            .unwrap_or_default();
+        let line = context
+            .and_then(|ctx| {
+                ctx.get("rightFileStart")
+                    .or_else(|| ctx.get("leftFileStart"))
+            })
+            .and_then(|edge| edge.get("line"))
+            .and_then(Value::as_i64);
         let Some(thread_comments) = thread.get("comments").and_then(Value::as_array) else {
             continue;
         };
@@ -1047,6 +1058,14 @@ fn parse_pr_thread(
             if comment
                 .get("isDeleted")
                 .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            // System entries (status/vote noise) are not review comments —
+            // GitLab drops its `system` notes the same way.
+            if string_field(comment, "commentType")
+                .map(|kind| kind.eq_ignore_ascii_case("system"))
                 .unwrap_or(false)
             {
                 continue;
@@ -1080,8 +1099,8 @@ fn parse_pr_thread(
                     .unwrap_or_default(),
                 url: pr_url.into(),
                 state: String::new(),
-                path: String::new(),
-                line: None,
+                path: path.clone(),
+                line,
                 resolved,
                 thread_id: thread_id.clone(),
                 replies: Vec::new(),
@@ -2797,10 +2816,16 @@ mod tests {
         let value = json!({ "value": [{
             "id": 3,
             "status": "fixed",
+            "threadContext": {
+                "filePath": "/src/app.ts",
+                "rightFileStart": { "line": 42 }
+            },
             "comments": [
                 { "id": 1, "content": "", "author": { "displayName": "Ada" } },
                 { "id": 2, "content": "Looks good", "publishedDate": "2026-09-09T10:00:00Z",
-                  "author": { "displayName": "Ada" }, "isDeleted": false }
+                  "author": { "displayName": "Ada" }, "isDeleted": false },
+                { "id": 3, "content": "Pull request updated", "commentType": "system",
+                  "author": { "displayName": "System" } }
             ]
         }]});
         let thread = parse_pr_thread(&value, "https://example.com/pr/9", false).unwrap();
@@ -2808,6 +2833,8 @@ mod tests {
         assert_eq!(thread.comments[0].author, "Ada");
         assert!(thread.comments[0].resolved);
         assert_eq!(thread.comments[0].id, "3-2");
+        assert_eq!(thread.comments[0].path, "/src/app.ts");
+        assert_eq!(thread.comments[0].line, Some(42));
     }
 
     #[test]

@@ -5,8 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { formatSessionTitle } from "../../features/sessions/model/session";
 import { formatReminderTime } from "../../features/sessions/model/sessionReminders";
 import { Sidebar } from "./Sidebar";
-import { loadSessionFolders } from "../../features/sessions/model/sessionFolders";
-import { addTask } from "../../features/board/boardStore";
+import {
+  loadSessionFolders,
+  saveSessionFolders,
+} from "../../features/sessions/model/sessionFolders";
+import { addTask, loadBoard } from "../../features/board/boardStore";
 import { detachTaskSession } from "../../features/board/taskSession";
 import { useProjectDiffStats } from "../../features/source-control/hooks/useProjectDiffStats";
 import { copyText } from "../../platform/tauri/clipboard";
@@ -80,25 +83,28 @@ function startRename() {
   return renameInput();
 }
 
-it("groups task sessions under their purpose and restores ordinary rows after detach", async () => {
+it("keeps task conversations in the ordinary list without rewriting saved folders", async () => {
   await act(async () => {
-    addTask({ title: "Checkout across services", links: [], workstreams: [{
-      id: "web", projectPath: props.cwd, worktreePath: props.cwd,
-      branch: "main", base: "main", sessionIds: ["session-1"],
-    }] });
+    addTask({
+      title: "Checkout across services",
+      links: [],
+      workstreams: [
+        {
+          id: "web",
+          projectPath: props.cwd,
+          worktreePath: props.cwd,
+          branch: "main",
+          base: "main",
+          sessionIds: ["session-1"],
+        },
+      ],
+    });
     render();
   });
-  const group = container.querySelector('[data-task-session-group]')!;
-  expect(group.textContent).toContain("Checkout across services");
-  expect(group.querySelector('[data-session-card="session-1"]')).toBeTruthy();
+  expect(container.querySelector("[data-task-session-group]")).toBeNull();
+  expect(card()).toBeTruthy();
   expect(loadSessionFolders(props.cwd)).toEqual([]);
-  const header = group.querySelector<HTMLButtonElement>('button[aria-expanded]')!;
-  await act(async () => header.click());
-  expect(group.querySelector('[data-session-card="session-1"]')).toBeNull();
-  await act(async () => header.click());
-  expect(group.querySelector('[data-session-card="session-1"]')).toBeTruthy();
   await act(async () => detachTaskSession("session-1"));
-  expect(container.querySelector('[data-task-session-group]')).toBeNull();
   expect(card()).toBeTruthy();
 });
 
@@ -165,6 +171,56 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("session folder pruning", () => {
+  it("keeps remote member folders a host listing can never satisfy", async () => {
+    saveSessionFolders("remote://box/home/r", [
+      { id: "rf", name: "Remote", sessionIds: ["r-1"], collapsed: false },
+    ]);
+    props = {
+      ...props,
+      cwd: "/a",
+      sessions: props.sessions.map((s) => ({ ...s, cwd: "/a" })),
+      sessionProjectPaths: ["/a", "remote://box/home/r"],
+    };
+    await act(async () => render());
+    // The host prune must not touch buckets it cannot list.
+    expect(loadSessionFolders("remote://box/home/r")).toHaveLength(1);
+  });
+
+  it("does not prune the previous scope's folders into a switched project", async () => {
+    props = {
+      ...props,
+      cwd: "/a",
+      sessions: props.sessions.map((s) => ({ ...s, cwd: "/a" })),
+      sessionProjectPaths: ["/a"],
+    };
+    await act(async () => render());
+    saveSessionFolders("/b", [
+      { id: "bf", name: "B", sessionIds: ["b-live"], collapsed: false },
+    ]);
+    props = {
+      ...props,
+      cwd: "/b",
+      sessions: [
+        {
+          id: "b-live",
+          cwd: "/b",
+          harness: "codex",
+          model: "",
+          runtimeMode: "supervised",
+          title: "B session",
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      ],
+      sessionProjectPaths: ["/b"],
+      activeSessionId: "b-live",
+    };
+    await act(async () => render());
+    expect(loadSessionFolders("/b")).toHaveLength(1);
+  });
+});
+
 describe("project rail visibility", () => {
   it("keeps the mounted rail and its scroll state when collapsed", async () => {
     props = {
@@ -176,7 +232,9 @@ describe("project rail visibility", () => {
       onOpenProject: vi.fn(),
     };
     await act(async () => render());
-    const rail = container.querySelector<HTMLElement>('nav[aria-label="Projects"]');
+    const rail = container.querySelector<HTMLElement>(
+      'nav[aria-label="Projects"]',
+    );
     expect(rail).not.toBeNull();
     rail!.scrollTop = 37;
 
@@ -1608,7 +1666,9 @@ describe("collapsed rail Inbox actions", () => {
 
       act(() =>
         container
-          .querySelector<HTMLButtonElement>('button[aria-label^="Switch project"]')!
+          .querySelector<HTMLButtonElement>(
+            'button[aria-label^="Switch project"]',
+          )!
           .click(),
       );
       const row = document.querySelector<HTMLButtonElement>(
@@ -1650,7 +1710,9 @@ describe("collapsed rail Inbox actions", () => {
 
     act(() =>
       container
-        .querySelector<HTMLButtonElement>('button[aria-label^="Switch project"]')!
+        .querySelector<HTMLButtonElement>(
+          'button[aria-label^="Switch project"]',
+        )!
         .click(),
     );
     pressKey(projectSearchInput()!, "ArrowDown");
@@ -1678,7 +1740,9 @@ describe("collapsed rail Inbox actions", () => {
 
     act(() =>
       container
-        .querySelector<HTMLButtonElement>('button[aria-label^="Switch project"]')!
+        .querySelector<HTMLButtonElement>(
+          'button[aria-label^="Switch project"]',
+        )!
         .click(),
     );
     const row = document.querySelector<HTMLButtonElement>(
@@ -1710,11 +1774,15 @@ describe("collapsed rail Inbox actions", () => {
 
     act(() =>
       container
-        .querySelector<HTMLButtonElement>('button[aria-label^="Switch project"]')!
+        .querySelector<HTMLButtonElement>(
+          'button[aria-label^="Switch project"]',
+        )!
         .click(),
     );
     const row = () =>
-      document.querySelector<HTMLButtonElement>('button[title="/workspace/other"]')!;
+      document.querySelector<HTMLButtonElement>(
+        'button[title="/workspace/other"]',
+      )!;
     await act(async () => {
       row().dispatchEvent(
         new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
@@ -1901,4 +1969,70 @@ it("labels preserved sessions as having no branch selected", () => {
   act(render);
   expect(card().textContent).not.toContain("No branch selected");
   expect(card().textContent).toContain("project/main");
+});
+
+it("shows task execution scope and exposes task, repository and ad hoc creation", async () => {
+  const id = addTask({
+    title: "Checkout",
+    links: [],
+    primarySessionId: "session-1",
+    workstreams: [
+      {
+        id: "repo",
+        projectPath: props.cwd,
+        worktreePath: props.cwd,
+        branch: "main",
+        base: "main",
+      },
+    ],
+  })!;
+  const adHoc = vi.fn();
+  const repository = vi.fn();
+  props.sessionTasks = loadBoard().tasks;
+  props.sessionScope = { kind: "task", taskId: id };
+  props.onSessionScopeChange = vi.fn();
+  props.onNew = vi.fn();
+  props.onNewAdHoc = adHoc;
+  props.onNewRepositorySession = repository;
+  await act(async () => render());
+  expect(card().textContent).toContain("All repositories");
+  const options = container.querySelector<HTMLButtonElement>(
+    '[aria-label="New session options"]',
+  )!;
+  await act(async () => options.click());
+  const adHocButton = [
+    ...document.querySelectorAll<HTMLButtonElement>("button"),
+  ].find((button) => button.textContent === "New ad hoc session")!;
+  expect(adHocButton).toBeDefined();
+  await act(async () => adHocButton.click());
+  expect(adHoc).toHaveBeenCalledOnce();
+  expect(props.onNew).not.toHaveBeenCalled();
+  await act(async () => options.click());
+  const repoButton = [
+    ...document.querySelectorAll<HTMLButtonElement>("button"),
+  ].find(
+    (button) =>
+      button.getAttribute("role") === "menuitem" &&
+      button.textContent?.includes("main"),
+  )!;
+  await act(async () => repoButton.click());
+  expect(repository).toHaveBeenCalledWith("repo");
+});
+
+it("switches the session list scope without changing membership or saved folders", async () => {
+  props.sessionScope = { kind: "all" };
+  props.sessionTasks = [];
+  props.onSessionScopeChange = vi.fn();
+  await act(async () => render());
+  const select = container.querySelector<HTMLButtonElement>(
+    '[aria-label="Session scope: All project sessions"]',
+  );
+  expect(select).not.toBeNull();
+  await act(async () => select!.click());
+  const adHoc = [
+    ...document.querySelectorAll<HTMLElement>('[role="option"]'),
+  ].find((option) => option.textContent?.trim() === "Ad hoc")!;
+  await act(async () => adHoc.click());
+  expect(props.onSessionScopeChange).toHaveBeenCalledWith({ kind: "adhoc" });
+  expect(loadSessionFolders(props.cwd)).toEqual([]);
 });

@@ -19,7 +19,10 @@ import {
 import { LAYER } from "../../shared/lib/layers";
 import { projectName } from "../../shared/lib/paths";
 import { gitPrPreflight } from "../../platform/tauri/fs";
-import { useProjectBranchesState } from "../source-control/hooks/useProjectBranches";
+import {
+  storedBaseName,
+  useProjectBranchesState,
+} from "../source-control/hooks/useProjectBranches";
 import type { BoardTask } from "./boardStore";
 import type { BoardWorkstreamRow, WorkstreamStatus } from "./boardData";
 import { DEFAULT_PR_TEMPLATE, laneProblem } from "./taskOps";
@@ -78,6 +81,10 @@ function LaneRow({
 
   const [check, setCheck] = useState<LaneCheck>({ kind: "checking" });
   const seq = useRef(0);
+  // onChange is inline at the call site — a ref keeps its identity out of
+  // the effect deps so a parent re-render can't re-fire the preflight.
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
   useEffect(() => {
     const id = ++seq.current;
     const report = (next: LaneCheck) => {
@@ -102,7 +109,7 @@ function LaneRow({
           preflight.baseBranch &&
           preflight.baseBranch !== value
         ) {
-          onChange(preflight.baseBranch);
+          onChangeRef.current(preflight.baseBranch);
           return;
         }
         const problem = laneProblem(row, value, preflight);
@@ -211,7 +218,9 @@ export function CreatePrsDialog({
   );
   const [draft, setDraft] = useState(false);
   const [bases, setBases] = useState<ReadonlyMap<string, string>>(
-    () => new Map(rows.map((row) => [row.id, row.base])),
+    // Stored bases can be legacy `refs/remotes/…` refs — the picker and the
+    // PR body want the `<remote>/<branch>` name.
+    () => new Map(rows.map((row) => [row.id, storedBaseName(row.base)])),
   );
   const [checks, setChecks] = useState<ReadonlyMap<string, LaneCheck>>(
     () => new Map(),
@@ -243,11 +252,13 @@ export function CreatePrsDialog({
     .filter((row) => checks.get(row.id)?.kind === "ok")
     .map((row) => row.id);
 
+  const [submitError, setSubmitError] = useState("");
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
     if (busy || checking || !validIds.length) return;
-    // `onSubmit` is async upstream — swallow the rejection so a wholesale
-    // failure doesn't surface as an unhandled promise rejection.
+    setSubmitError("");
+    // The dialog stays open through the run — surface a wholesale failure
+    // here rather than only in the panel banner behind the modal.
     void Promise.resolve(
       onSubmit(new Set(validIds), {
         title: title.trim(),
@@ -256,7 +267,7 @@ export function CreatePrsDialog({
         descriptions,
         draft,
       }),
-    ).catch(() => {});
+    ).catch((reason) => setSubmitError(String(reason)));
   };
 
   return (
@@ -415,6 +426,12 @@ export function CreatePrsDialog({
           />
           Create as draft
         </label>
+
+        {submitError ? (
+          <p role="alert" className="break-words text-[11px] text-red-300">
+            {submitError}
+          </p>
+        ) : null}
       </form>
     </Modal>
   );

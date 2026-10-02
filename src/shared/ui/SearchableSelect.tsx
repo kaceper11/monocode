@@ -236,7 +236,7 @@ export function SearchableSelect({
         }
       >
         <span
-          className={`min-w-0 truncate ${variant === "panel" ? "flex-1 text-right" : variant === "pill" || variant === "row" ? "" : "flex-1"} ${selected || (creatable && value) ? "text-content" : "text-content/40"}`}
+          className={`min-w-0 truncate ${variant === "panel" ? "flex-1 text-right" : variant === "pill" || variant === "row" ? "" : "flex-1"} ${selected || (creatable && value) ? "text-content" : "text-content/60"}`}
         >
           {shown}
         </span>

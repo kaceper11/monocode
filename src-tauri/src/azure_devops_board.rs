@@ -26,6 +26,25 @@ fn repo_context(app: &AppHandle, cwd: &str) -> Result<(AzureDevOpsConfig, String
     Ok((config, project, name))
 }
 
+fn selected_repo_context(
+    app: &AppHandle,
+    cwd: &str,
+    selected: Option<&str>,
+) -> Result<(AzureDevOpsConfig, String, String), String> {
+    let Some(selected) = selected else {
+        return repo_context(app, cwd);
+    };
+    let config = require_config(app)?;
+    let remotes = remote_urls(&expand_home(cwd))?;
+    if !remotes.iter().any(|(_, url)| {
+        crate::azure_devops::project_repo_from_remote(url, &config.url).as_deref() == Some(selected)
+    }) {
+        return Err("No local remote matches this PR repository".into());
+    }
+    let (project, name) = split_repo(selected)?;
+    Ok((config, project, name))
+}
+
 /// `repo_context` plus the worktree's checked-out branch.
 fn board_context(
     app: &AppHandle,
@@ -435,6 +454,7 @@ fn ref_name(branch: &str) -> String {
 
 /// Create an Azure DevOps pull request and return its web URL.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Keep the existing command payload compatible.
 pub async fn azure_devops_pr_create(
     app: AppHandle,
     cwd: String,
@@ -443,9 +463,10 @@ pub async fn azure_devops_pr_create(
     base: String,
     head: String,
     draft: bool,
+    repo: Option<String>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (config, project, repo) = repo_context(&app, &cwd)?;
+        let (config, project, repo) = selected_repo_context(&app, &cwd, repo.as_deref())?;
         crate::azure_devops::create_pull_request(
             &config, &project, &repo, &title, &body, &base, &head, draft,
         )
@@ -463,9 +484,10 @@ pub async fn azure_devops_pr_update_body(
     cwd: String,
     body: String,
     pr_id: Option<i64>,
+    repo: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (config, project, repo) = repo_context(&app, &cwd)?;
+        let (config, project, repo) = selected_repo_context(&app, &cwd, repo.as_deref())?;
         let id = match pr_id {
             Some(id) => id,
             None => {

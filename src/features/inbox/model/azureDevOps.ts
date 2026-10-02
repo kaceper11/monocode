@@ -73,7 +73,8 @@ export type AzureDevOpsMrDiff = {
 
 export const AZUREDEVOPS_CHANGE_EVENT = "monocode:azuredevops-change";
 
-const repoByPath = new Map<string, string>();
+// Remotes can change under a live session — same TTL as `matchByPath` below.
+const repoByPath = new Map<string, { at: number; repo: string }>();
 const detailsByKey = new Map<string, AzureDevOpsWorkItemDetails>();
 const detailsInflight = new Map<string, Promise<AzureDevOpsWorkItemDetails>>();
 const threadByKey = new Map<string, AzureDevOpsWorkItemThread>();
@@ -128,9 +129,9 @@ export async function disconnectAzureDevOps(
 export async function azureDevOpsRepo(cwd: string): Promise<string> {
   const key = normalizeProjectPath(cwd);
   const cached = repoByPath.get(key);
-  if (cached !== undefined) return cached;
+  if (cached && Date.now() - cached.at < MATCH_TTL_MS) return cached.repo;
   const repo = await invoke<string>("azure_devops_repo", { cwd });
-  repoByPath.set(key, repo);
+  repoByPath.set(key, { at: Date.now(), repo });
   return repo;
 }
 
@@ -327,6 +328,7 @@ export function azureDevOpsPrCreate(
   base: string,
   head: string,
   draft: boolean,
+  repo?: string,
 ): Promise<string> {
   return invoke<string>("azure_devops_pr_create", {
     cwd,
@@ -335,6 +337,7 @@ export function azureDevOpsPrCreate(
     base,
     head,
     draft,
+    repo,
   });
 }
 
@@ -344,11 +347,13 @@ export function azureDevOpsPrUpdateBody(
   cwd: string,
   body: string,
   prId?: number,
+  repo?: string,
 ): Promise<void> {
   return invoke<void>("azure_devops_pr_update_body", {
     cwd,
     body,
     prId: prId ?? null,
+    repo,
   });
 }
 
@@ -368,8 +373,11 @@ export function azureDevOpsRepoMatch(cwd: string): Promise<boolean> {
   if (entry && Date.now() - entry.at < MATCH_TTL_MS) return entry.match;
   const match = invoke<boolean>("azure_devops_repo_match", { cwd });
   // A transient failure (git subprocess, auth) must not poison the cache —
-  // evict rejections so the next probe retries.
-  match.catch(() => matchByPath.delete(key));
+  // evict rejections so the next probe retries. Only evict our own entry —
+  // a newer in-flight match for the same path must survive.
+  match.catch(() => {
+    if (matchByPath.get(key)?.match === match) matchByPath.delete(key);
+  });
   matchByPath.set(key, { at: Date.now(), match });
   return match;
 }

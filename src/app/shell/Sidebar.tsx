@@ -1,6 +1,22 @@
+import { projectName } from "../../shared/lib/paths";
+import {
+  folderLocation,
+  loadProjectSessionFolders,
+  saveProjectSessionFolders,
+} from "../../features/sessions/model/projectSessionFolders";
+import {
+  sessionScopeLabel,
+  type SessionListScope,
+} from "../../features/board/sessionScope";
+import type { BoardTask } from "../../features/board/boardStore";
+import {
+  SidebarTasksSection,
+  tasksForProject,
+} from "../../features/board/SidebarTasksSection";
+import { useSavedProjects } from "../../features/projects/model/savedProjects";
+import { SearchableSelect } from "../../shared/ui/SearchableSelect";
+import type { GitRepositoryScope } from "../../features/source-control/model/repositoryScope";
 import { NO_BRANCH_LABEL } from "../../features/source-control/model/worktrees";
-import { boardFromSnapshot, boardSnapshot, subscribeBoard } from "../../features/board/boardStore";
-import { taskSessionFolders, withTaskSessionFolders } from "../../features/board/taskSessionGroups";
 import { OrchestrationSidebarAgents } from "../../features/orchestration/ui/OrchestrationSidebarAgents";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -8,7 +24,6 @@ import {
   ChartBreakoutSquare,
   Chatting,
   Check,
-  CheckCircle,
   ChevronDown,
   ChevronRight,
   CircleAlert,
@@ -38,7 +53,6 @@ import {
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
   type ComponentProps,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
@@ -89,7 +103,6 @@ import {
   folderShellFill,
   loadPinnedSessionsCollapsed,
   loadReminderSessionsCollapsed,
-  loadSessionFolders,
   mergeFolderSessionSummaries,
   pruneSessionFolders,
   removeSessionFromFolder,
@@ -97,7 +110,6 @@ import {
   reorderSessionFolders,
   savePinnedSessionsCollapsed,
   saveReminderSessionsCollapsed,
-  saveSessionFolders,
   sessionListNavigationIds,
   setFolderCollapsed,
   setFolderColor,
@@ -180,7 +192,11 @@ import {
   remoteSessionFor,
   useRemoteProjectSessions,
 } from "../../features/connections/model/connections";
-import { parseRemotePath, remotePath, remoteProjectFor } from "../../features/connections/model/remoteProjects";
+import {
+  parseRemotePath,
+  remotePath,
+  remoteProjectFor,
+} from "../../features/connections/model/remoteProjects";
 
 const MIN_WIDTH = 260;
 const MAX_WIDTH = 560;
@@ -217,9 +233,22 @@ function projectPathBusy(
 }
 
 type Props = {
+  sessionTasks?: readonly BoardTask[];
+  sessionScope?: SessionListScope;
+  onSessionScopeChange?: (scope: SessionListScope) => void;
+  sessionProjectPaths?: string[];
+  sessionScopeError?: string;
+  onRetrySessionScope?: () => void;
+  onNewAdHoc?: (cwd?: string) => string | void;
+  onNewRepositorySession?: (id: string) => void;
   cwd: string;
   /** Working copy for Changes / explorer git. Falls back to `cwd`. */
   gitCwd?: string;
+  sourceControlCwd?: string;
+  gitRepositories?: GitRepositoryScope[];
+  gitRepository?: GitRepositoryScope;
+  onSelectGitRepository?: (id: string) => void;
+  onSelectTaskSession?: (id: string) => void;
   /** Branch identity shown for a worktree whose folder has a temporary name. */
   explorerRootLabel?: string;
   open: boolean;
@@ -273,9 +302,18 @@ type Props = {
   canGoForward?: boolean;
   onGoBack?: () => void;
   onGoForward?: () => void;
-  onOpenDiff?: (path: string, kind?: GitFileDiffKind, pin?: boolean) => void;
-  onOpenAllChanges?: () => void;
-  onOpenCommit?: (commit: GitHistoryCommit, pin?: boolean) => void;
+  onOpenDiff?: (
+    path: string,
+    kind?: GitFileDiffKind,
+    pin?: boolean,
+    repository?: GitRepositoryScope,
+  ) => void;
+  onOpenAllChanges?: (repository?: GitRepositoryScope) => void;
+  onOpenCommit?: (
+    commit: GitHistoryCommit,
+    pin?: boolean,
+    repository?: GitRepositoryScope,
+  ) => void;
   selectedDiffPath?: string;
   selectedDiffKind?: GitFileDiffKind;
   selectedCommitSha?: string;
@@ -322,8 +360,21 @@ type Props = {
 };
 
 function SidebarComponent({
+  sessionTasks = [],
+  sessionScope,
+  onSessionScopeChange,
+  sessionProjectPaths,
+  sessionScopeError,
+  onRetrySessionScope,
+  onNewAdHoc,
+  onNewRepositorySession,
   cwd,
   gitCwd,
+  sourceControlCwd,
+  gitRepositories,
+  gitRepository,
+  onSelectGitRepository,
+  onSelectTaskSession,
   explorerRootLabel,
   open,
   sessions,
@@ -415,7 +466,12 @@ function SidebarComponent({
   const hostProject = remoteProject ? remoteProjectFor(cwd) : undefined;
   const remoteChange = async (
     sessionId: string,
-    patch: { title?: string; archived?: boolean; pinned?: boolean; linkedWorkItem?: LinkedWorkItem | null },
+    patch: {
+      title?: string;
+      archived?: boolean;
+      pinned?: boolean;
+      linkedWorkItem?: LinkedWorkItem | null;
+    },
   ) => {
     if (!remote.machine || !hostProject) {
       window.alert("Connect this project's machine to change its sessions.");
@@ -438,9 +494,12 @@ function SidebarComponent({
       window.alert("Connect this project's machine to delete its sessions.");
       return;
     }
-    if (!window.confirm(
-      `Delete ${sessionIds.length === 1 ? "this conversation" : `${sessionIds.length} conversations`}? This can’t be undone.`,
-    )) return;
+    if (
+      !window.confirm(
+        `Delete ${sessionIds.length === 1 ? "this conversation" : `${sessionIds.length} conversations`}? This can’t be undone.`,
+      )
+    )
+      return;
     try {
       for (const sessionId of sessionIds) {
         await remoteRequest(remote.machine.id, "sessions.delete", {
@@ -459,20 +518,30 @@ function SidebarComponent({
     ? (sessionId: string) => onSelectRemoteSession?.(cwd, sessionId)
     : onSelectLocalSession;
   const onPrefetchSession = remoteProject ? undefined : onPrefetchLocalSession;
-  const onPlaceSessionOnPane = remoteProject ? undefined : onPlaceLocalSessionOnPane;
+  const onPlaceSessionOnPane = remoteProject
+    ? undefined
+    : onPlaceLocalSessionOnPane;
   const onRenameSession = remoteProject
-    ? (sessionId: string, title: string) => { void remoteChange(sessionId, { title }); }
+    ? (sessionId: string, title: string) => {
+        void remoteChange(sessionId, { title });
+      }
     : onRenameLocalSession;
   const onArchiveSession = remoteProject
-    ? (sessionId: string, archived: boolean) => { void remoteChange(sessionId, { archived }); }
+    ? (sessionId: string, archived: boolean) => {
+        void remoteChange(sessionId, { archived });
+      }
     : onArchiveLocalSession;
   const onArchiveSessions = remoteProject
     ? (sessionIds: readonly string[], archived: boolean) => {
-        void Promise.all(sessionIds.map((id) => remoteChange(id, { archived })));
+        void Promise.all(
+          sessionIds.map((id) => remoteChange(id, { archived })),
+        );
       }
     : onArchiveLocalSessions;
   const onPinSession = remoteProject
-    ? (sessionId: string, pinned: boolean) => { void remoteChange(sessionId, { pinned }); }
+    ? (sessionId: string, pinned: boolean) => {
+        void remoteChange(sessionId, { pinned });
+      }
     : onPinLocalSession;
   const onPinSessions = remoteProject
     ? (sessionIds: readonly string[], pinned: boolean) => {
@@ -480,10 +549,14 @@ function SidebarComponent({
       }
     : onPinLocalSessions;
   const onDeleteSession = remoteProject
-    ? (sessionId: string) => { void remoteDelete([sessionId]); }
+    ? (sessionId: string) => {
+        void remoteDelete([sessionId]);
+      }
     : onDeleteLocalSession;
   const onDeleteSessions = remoteProject
-    ? (sessionIds: readonly string[]) => { void remoteDelete(sessionIds); }
+    ? (sessionIds: readonly string[]) => {
+        void remoteDelete(sessionIds);
+      }
     : onDeleteLocalSessions;
   const onSetSessionLinkedWorkItem = remoteProject
     ? (sessionId: string, item: LinkedWorkItem | undefined) => {
@@ -493,43 +566,62 @@ function SidebarComponent({
   const activeRemoteId = activeSessionId
     ? remoteSessionFor(activeSessionId)
     : undefined;
-  const activeListedSessionId = remoteProject ? activeRemoteId : activeSessionId;
+  const activeListedSessionId = remoteProject
+    ? activeRemoteId
+    : activeSessionId;
   const listedBusySessionIds = remoteProject
-    ? new Set(remote.sessions.filter((session) => session.status === "running" && !session.needsInput).map((session) => session.id))
+    ? new Set(
+        remote.sessions
+          .filter(
+            (session) => session.status === "running" && !session.needsInput,
+          )
+          .map((session) => session.id),
+      )
     : busySessionIds;
   const listedApprovalSessionIds = remoteProject
-    ? new Set(remote.sessions.filter((session) => session.needsInput).map((session) => session.id))
+    ? new Set(
+        remote.sessions
+          .filter((session) => session.needsInput)
+          .map((session) => session.id),
+      )
     : approvalSessionIds;
-  const projectSessions: SessionSummary[] = useMemo(() => remoteProject
-    ? remote.sessions.map((session) => ({
-        id: session.id,
-        cwd,
-        harness: session.harness,
-        model: session.model ?? "",
-        runtimeMode: session.runtimeMode ?? "supervised",
-        providerSessionId: session.providerSessionId ?? undefined,
-        title: session.title,
-        createdAt: session.createdAt ?? session.updatedAt,
-        updatedAt: session.updatedAt,
-        archived: session.archived,
-        pinned: session.pinned,
-        linkedWorkItem: session.linkedWorkItem,
-        draft: session.draft,
-        repo: session.repo,
-        branch: session.branch,
-        worktreeCwd: session.worktreeCwd,
-      }))
-    : sessions, [remoteProject, remote.sessions, sessions, cwd]);
+  const projectSessions: SessionSummary[] = useMemo(
+    () =>
+      remoteProject
+        ? remote.sessions.map((session) => ({
+            id: session.id,
+            cwd,
+            harness: session.harness,
+            model: session.model ?? "",
+            runtimeMode: session.runtimeMode ?? "supervised",
+            providerSessionId: session.providerSessionId ?? undefined,
+            title: session.title,
+            createdAt: session.createdAt ?? session.updatedAt,
+            updatedAt: session.updatedAt,
+            archived: session.archived,
+            pinned: session.pinned,
+            linkedWorkItem: session.linkedWorkItem,
+            draft: session.draft,
+            repo: session.repo,
+            branch: session.branch,
+            worktreeCwd: session.worktreeCwd,
+          }))
+        : sessions,
+    [remoteProject, remote.sessions, sessions, cwd],
+  );
   const remoteExecutionCwd =
     remote.sessions.find((session) => session.id === activeRemoteId)?.cwd ??
     (activeSessionId ? remotePendingWorktree(activeSessionId) : undefined) ??
     (remoteProject && gitCwd && gitCwd !== cwd
-      ? parseRemotePath(gitCwd)?.hostPath ?? gitCwd
+      ? (parseRemotePath(gitCwd)?.hostPath ?? gitCwd)
       : undefined) ??
     undefined;
   const gitRoot =
     remoteProject && hostProject
-      ? remotePath(hostProject.environmentId, remoteExecutionCwd ?? hostProject.cwd)
+      ? remotePath(
+          hostProject.environmentId,
+          remoteExecutionCwd ?? hostProject.cwd,
+        )
       : gitCwd || cwd;
   const resize = useDragResize({
     min: MIN_WIDTH,
@@ -544,6 +636,15 @@ function SidebarComponent({
   const [now, setNow] = useState(() => Date.now());
   const sessionsLock = useLockOverscroll<HTMLDivElement>();
   const sessionsScrollRef = useRef<HTMLDivElement>(null);
+  const { selected: savedProject } = useSavedProjects(cwd);
+  const scopedTask =
+    sessionScope?.kind === "task"
+      ? sessionTasks.find((task) => task.id === sessionScope.taskId)
+      : undefined;
+  const availableTasks = tasksForProject(sessionTasks, cwd, savedProject);
+  const [creationAnchor, setCreationAnchor] = useState<HTMLElement | null>(
+    null,
+  );
   const [sessionMenu, setSessionMenu] = useState<{
     x: number;
     y: number;
@@ -566,9 +667,34 @@ function SidebarComponent({
     null,
   );
   const [renamingFolderId, setRenamingFolderId] = useState<string | null>(null);
+  // Remote members' folders live under remote:// buckets the host listing can
+  // never populate — keeping them in folderPaths would prune them as deleted
+  // (they share the remoteMembersHidden contract: shown on the remote, not here).
+  const folderPaths = remoteProject
+    ? [cwd]
+    : (sessionProjectPaths ?? [cwd]).filter(
+        (path) => !isRemoteProjectPath(path),
+      );
+  const folderPathsKey = JSON.stringify(folderPaths);
+  // Saved projects/tasks can mix host and remote repositories — the host
+  // listing can't show remote members' sessions, so say so rather than
+  // silently presenting a partial list.
+  const remoteMembersHidden =
+    !remoteProject && (sessionProjectPaths ?? []).some(isRemoteProjectPath);
+  const [folderError, setFolderError] = useState("");
   const [sessionFolders, setSessionFolders] = useState<SessionFolder[]>(() =>
-    loadSessionFolders(cwd),
+    loadProjectSessionFolders(folderPaths),
   );
+  const persistFolders = (next: SessionFolder[]) => {
+    try {
+      saveProjectSessionFolders(folderPaths, next, projectSessions, cwd);
+      setFolderError("");
+      return true;
+    } catch (error) {
+      setFolderError(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  };
   const [pinnedSessionsCollapsed, setPinnedSessionsCollapsed] = useState(() =>
     loadPinnedSessionsCollapsed(cwd),
   );
@@ -612,18 +738,21 @@ function SidebarComponent({
   const pendingFirstLoad = remoteProject
     ? !!remote.machine && !remote.loaded && projectSessions.length === 0
     : pending && sessions.length === 0;
-  const taskSnapshot = useSyncExternalStore(subscribeBoard, boardSnapshot);
-  const [collapsedTasks, setCollapsedTasks] = useState<Set<string>>(new Set());
-  const taskFolders = useMemo(
-    () => taskSessionFolders(boardFromSnapshot(taskSnapshot).tasks, collapsedTasks),
-    [taskSnapshot, collapsedTasks],
-  );
-  const taskFolderIds = new Set(taskFolders.map(folder => folder.id));
-  const taskSessionIds = new Set(taskFolders.flatMap(folder => folder.sessionIds));
-  const displayFolders = withTaskSessionFolders(sessionFolders, taskFolders);
+  const scopedIds = new Set(projectSessions.map((session) => session.id));
+  const displayFolders =
+    sessionScope && sessionScope.kind !== "all"
+      ? sessionFolders
+          .map((folder) => ({
+            ...folder,
+            sessionIds: folder.sessionIds.filter((id) => scopedIds.has(id)),
+          }))
+          .filter((folder) => folder.sessionIds.length > 0)
+      : sessionFolders;
   const listedSessions = mergeFolderSessionSummaries(
     projectSessions,
-    remoteProject ? [] : openSessions,
+    remoteProject
+      ? []
+      : openSessions,
     remoteProject ? sessionFolders : displayFolders,
   ).filter((session) => !session.orchestrationLeadId);
   const visibleSessions = [
@@ -713,7 +842,7 @@ function SidebarComponent({
     );
   }, [cwd, tab, sessionNavigationKey]);
   const hasMoreSessions = shownUngroupedCount < ungroupedVisible.length;
-  const sessionListKey = `${cwd}\0${sessionFilters.showArchived}\0${sessionFilters.time}\0${sessionFilters.hiddenHarnesses.join(",")}\0${sessionFilters.status.working}\0${sessionFilters.status.needsApproval}\0${sessionFilters.status.done}\0${searchQuery}`;
+  const sessionListKey = `${cwd}\0${folderPathsKey}\0${JSON.stringify(sessionScope)}\0${sessionFilters.showArchived}\0${sessionFilters.time}\0${sessionFilters.hiddenHarnesses.join(",")}\0${sessionFilters.status.working}\0${sessionFilters.status.needsApproval}\0${sessionFilters.status.done}\0${searchQuery}`;
   const sessionHarnesses = harnessesInSessions(projectSessions);
   const narrowedByUser = searchNarrowed || filtersActive;
   const visibleTabs = tabOrder.filter((itemId) => itemId !== "inbox");
@@ -726,17 +855,16 @@ function SidebarComponent({
     saveSidebarTabOrder(next);
   });
   const visibleFolderIds = sessionListEntries.flatMap((entry) =>
-    entry.kind === "folder" && !taskFolderIds.has(entry.folder.id) ? [entry.folder.id] : [],
+    entry.kind === "folder" ? [entry.folder.id] : [],
   );
   const folderSortable = useSortable(
     visibleFolderIds,
     (ids) => {
-      setSessionFolders((current) => {
-        const next = reorderSessionFolders(current, ids);
-        if (next === current) return current;
-        saveSessionFolders(cwd, next);
-        return next;
-      });
+      // Persist outside the updater — updaters may run twice under
+      // StrictMode, and a double-persist would double-fire the error state.
+      const next = reorderSessionFolders(sessionFolders, ids);
+      if (next !== sessionFolders && persistFolders(next))
+        setSessionFolders(next);
     },
     { axis: "y" },
   );
@@ -881,36 +1009,53 @@ function SidebarComponent({
   }, [tab, hasMoreSessions, shownUngroupedCount]);
 
   useEffect(() => {
-    setSessionFolders(loadSessionFolders(cwd));
+    setSessionFolders(loadProjectSessionFolders(folderPaths));
     setPinnedSessionsCollapsed(loadPinnedSessionsCollapsed(cwd));
     setReminderSessionsCollapsed(loadReminderSessionsCollapsed(cwd));
     setRenamingFolderId(null);
     setFolderMenu(null);
     setSessionDrop(null);
     pendingFolderSessionIds.current.clear();
-  }, [cwd]);
-
-  useEffect(
-    () =>
-      subscribeSessionFolders(cwd, () => {
-        setSessionFolders(loadSessionFolders(cwd));
-      }),
-    [cwd],
-  );
+  }, [cwd, folderPathsKey]);
 
   useEffect(() => {
+    const stops = folderPaths.map((path) =>
+      subscribeSessionFolders(path, () =>
+        setSessionFolders(loadProjectSessionFolders(folderPaths)),
+      ),
+    );
+    return () => stops.forEach((stop) => stop());
+  }, [folderPathsKey]);
+
+  useEffect(() => {
+    // Pruning needs the full membership view — scoped lists and a partially
+    // failed multi-repo load would make valid folder entries look deleted.
+    if ((sessionScope && sessionScope.kind !== "all") || sessionScopeError)
+      return;
     if (pending || status === "error") return;
     if (remoteProject && !remote.loaded) return;
     const known = new Set(projectSessions.map((session) => session.id));
     const completedFolderSessions = new Map<string, string>();
-    for (const session of remoteProject ? [] : openSessions) known.add(session.id);
+    for (const session of remoteProject ? [] : openSessions)
+      known.add(session.id);
     if (activeListedSessionId) known.add(activeListedSessionId);
     if (remoteProject && activeSessionId) known.add(activeSessionId);
+    // Read storage, not state — on a project switch this effect still sees the
+    // previous scope's folders, and pruning those against the new `known` set
+    // would wipe the new scope's folder buckets.
+    const stored = loadProjectSessionFolders(folderPaths);
     if (remoteProject) {
-      for (const folder of sessionFolders) {
+      for (const folder of stored) {
         for (const shellId of folder.sessionIds) {
           const hostId = remoteSessionFor(shellId);
-          if (hostId && known.has(hostId)) completedFolderSessions.set(shellId, hostId);
+          if (hostId && known.has(hostId)) {
+            completedFolderSessions.set(shellId, hostId);
+          } else if (hostId) {
+            // The shell binds a remote session the latest listing doesn't
+            // carry yet — keep the entry rather than prune on a transient
+            // gap; a later listing either migrates it or clears the binding.
+            known.add(shellId);
+          }
         }
       }
     }
@@ -929,19 +1074,30 @@ function SidebarComponent({
         pendingFolderSessionIds.current.delete(id);
       }
     }
-    setSessionFolders((current) => {
-      const migrated = completedFolderSessions.size
-        ? current.map((folder) => ({
-            ...folder,
-            sessionIds: folder.sessionIds.map((id) => completedFolderSessions.get(id) ?? id),
-          }))
-        : current;
-      const next = pruneSessionFolders(migrated, known);
-      if (next === current) return current;
-      saveSessionFolders(cwd, next);
-      return next;
-    });
-  }, [activeListedSessionId, activeSessionId, cwd, openSessions, pending, projectSessions, remoteProject, remote.loaded, sessionFolders, status]);
+    const migrated = completedFolderSessions.size
+      ? stored.map((folder) => ({
+          ...folder,
+          sessionIds: folder.sessionIds.map(
+            (id) => completedFolderSessions.get(id) ?? id,
+          ),
+        }))
+      : stored;
+    const next = pruneSessionFolders(migrated, known);
+    if (next !== stored && persistFolders(next)) setSessionFolders(next);
+  }, [
+    activeListedSessionId,
+    activeSessionId,
+    cwd,
+    folderPathsKey,
+    openSessions,
+    pending,
+    projectSessions,
+    remoteProject,
+    remote.loaded,
+    sessionScope,
+    sessionScopeError,
+    status,
+  ]);
 
   useEffect(() => {
     if (tab !== "sessions") return;
@@ -997,24 +1153,35 @@ function SidebarComponent({
   }, [selectedSessionIds.size]);
 
   const commitSessionFolders = (next: SessionFolder[]) => {
-    setSessionFolders(next);
-    saveSessionFolders(cwd, next);
+    if (!persistFolders(next)) return false;
+    setSessionFolders(loadProjectSessionFolders(folderPaths));
+    return true;
+  };
+
+  // A freshly created folder reports its raw id, but the reloaded state wraps
+  // it as [cwd, id] under multi-repo scopes — mirror the wrap or the rename
+  // target matches nothing.
+  const wrappedFolderId = (createdId: string, sessionId?: string) => {
+    if (folderPaths.length <= 1) return createdId;
+    const ownerCwd =
+      projectSessions.find((session) => session.id === sessionId)?.cwd ?? cwd;
+    const owner =
+      folderPaths.find((path) => sameProjectPath(path, ownerCwd)) ?? cwd;
+    return JSON.stringify([owner, createdId]);
   };
 
   const onNewInFolder = (folderId: string) => {
-    const sessionId = onNew?.();
+    const owner = folderLocation(folderId, cwd).cwd;
+    const sessionId = onNewAdHoc ? onNewAdHoc(owner) : onNew?.();
     if (!sessionId) return;
     pendingFolderSessionIds.current.add(sessionId);
     setSearchQuery("");
-    setSessionFolders((current) => {
-      const next = setFolderCollapsed(
-        addSessionToFolder(current, folderId, sessionId),
-        folderId,
-        false,
-      );
-      saveSessionFolders(cwd, next);
-      return next;
-    });
+    const next = setFolderCollapsed(
+      addSessionToFolder(sessionFolders, folderId, sessionId),
+      folderId,
+      false,
+    );
+    if (persistFolders(next)) setSessionFolders(next);
   };
 
   const menuSessionIds = sessionMenu
@@ -1274,8 +1441,9 @@ function SidebarComponent({
         sessionIds,
       );
       if (!createdId) return;
-      commitSessionFolders(folders);
-      setRenamingFolderId(createdId);
+      // A refused save leaves no folder to rename — don't point state at it.
+      if (commitSessionFolders(folders))
+        setRenamingFolderId(wrappedFolderId(createdId, sessionIds[0]));
       return;
     }
     if (id.startsWith("folder-add:")) {
@@ -1344,15 +1512,15 @@ function SidebarComponent({
     draggedId: string,
     target: SessionListDropTarget,
   ) => {
-    if (taskSessionIds.has(draggedId) || (target.kind === "session" && taskSessionIds.has(target.id))) return;
     const { folders, createdId } = applySessionListDrop(
       sessionFolders,
       draggedId,
       target,
     );
     if (folders === sessionFolders) return;
-    commitSessionFolders(folders);
-    if (createdId) setRenamingFolderId(createdId);
+    // A refused save leaves no folder to rename — don't point state at it.
+    if (!commitSessionFolders(folders)) return;
+    if (createdId) setRenamingFolderId(wrappedFolderId(createdId, draggedId));
   };
 
   const isSessionDrop = (kind: "folder" | "session", id: string) =>
@@ -1375,7 +1543,8 @@ function SidebarComponent({
       ) {
         selectionAnchorRef.current = null;
       }
-      const anchor = selectionAnchorRef.current ?? activeListedSessionId ?? sessionId;
+      const anchor =
+        selectionAnchorRef.current ?? activeListedSessionId ?? sessionId;
       const start = visibleIds.indexOf(anchor);
       const end = visibleIds.indexOf(sessionId);
       const range =
@@ -1468,6 +1637,15 @@ function SidebarComponent({
     ) : (
       <SessionCard
         session={session}
+        scopeLabel={
+          sessionScope
+            ? sessionScopeLabel(
+                sessionTasks,
+                session,
+                sessionScope.kind !== "task",
+              )
+            : undefined
+        }
         isActive={session.id === activeListedSessionId}
         isSelected={selectedSessionIds.has(session.id)}
         busy={listedBusySessionIds.has(session.id)}
@@ -1478,13 +1656,17 @@ function SidebarComponent({
         compact={compact}
         now={now}
         onSelect={cardActions.select}
-        onOpenWorkItem={onOpenInboxItem && !remoteProject ? cardActions.openWorkItem : undefined}
+        onOpenWorkItem={
+          onOpenInboxItem && !remoteProject
+            ? cardActions.openWorkItem
+            : undefined
+        }
         onPrefetch={onPrefetchSession ? cardActions.prefetch : undefined}
         onPlaceOnPane={
           onPlaceSessionOnPane ? cardActions.placeOnPane : undefined
         }
         onListDrop={
-          (reminderIds.has(session.id) || taskSessionIds.has(session.id)) ? undefined : cardActions.listDrop
+          reminderIds.has(session.id) ? undefined : cardActions.listDrop
         }
         onListDropTargetChange={setSessionDrop}
         onContextMenu={cardActions.contextMenu}
@@ -1615,7 +1797,15 @@ function SidebarComponent({
             <span className="min-w-0 flex-1 truncate text-sm font-medium leading-tight">
               Workspace
             </span>
-            <WorkspaceTitleActions onSearch={onGoToFile} onNew={onNew} />
+            <WorkspaceTitleActions
+              onSearch={onGoToFile}
+              onNew={onNew}
+              newLabel={
+                sessionScope?.kind === "task"
+                  ? "New task session"
+                  : "New ad hoc session"
+              }
+            />
           </div>
           <div
             role="tablist"
@@ -1712,6 +1902,135 @@ function SidebarComponent({
             </p>
           )}
         </div>
+        {tab === "sessions" &&
+          sessionScope &&
+          onSessionScopeChange &&
+          !remoteProject && (
+            <div className="flex shrink-0 items-center gap-1 border-b border-stroke px-2 py-1.5">
+              <div className="min-w-0 flex-1">
+                <SearchableSelect
+                  label="Session scope"
+                  value={
+                    sessionScope.kind === "task"
+                      ? sessionScope.taskId
+                      : sessionScope.kind
+                  }
+                  options={[
+                    ...[
+                      ...availableTasks,
+                      ...(scopedTask &&
+                      !availableTasks.some((task) => task.id === scopedTask.id)
+                        ? [scopedTask]
+                        : []),
+                    ].map((task) => ({
+                      value: task.id,
+                      label: `Task: ${task.title}`,
+                    })),
+                    { value: "all", label: "All project sessions" },
+                    { value: "adhoc", label: "Ad hoc" },
+                  ]}
+                  onChange={(value) =>
+                    onSessionScopeChange(
+                      value === "all" || value === "adhoc"
+                        ? { kind: value }
+                        : { kind: "task", taskId: value },
+                    )
+                  }
+                />
+              </div>
+              {onNewAdHoc && (
+                <button
+                  type="button"
+                  aria-label="New session options"
+                  aria-haspopup="menu"
+                  aria-expanded={!!creationAnchor}
+                  title="New session options"
+                  onClick={(event) =>
+                    setCreationAnchor(
+                      creationAnchor ? null : event.currentTarget,
+                    )
+                  }
+                  className="grid size-7 shrink-0 place-items-center rounded-md text-content/65 hover:bg-content/8 focus-visible:outline-accent"
+                >
+                  <ChevronDown className="size-3.5" />
+                </button>
+              )}
+            </div>
+          )}
+        {tab === "sessions" && (sessionScopeError || folderError) && (
+          <div
+            role="alert"
+            className="flex shrink-0 items-start gap-2 px-3 py-2 text-[11px] text-content/65"
+          >
+            <span className="min-w-0 flex-1">
+              {sessionScopeError || folderError}
+            </span>
+            <button
+              className="text-accent"
+              onClick={() => {
+                setFolderError("");
+                onRetrySessionScope?.();
+              }}
+            >
+              Retry
+            </button>
+          </div>
+        )}
+        {creationAnchor && (
+          <Popover
+            anchor={creationAnchor}
+            align="end"
+            width={240}
+            role="menu"
+            aria-label="New session options"
+            onDismiss={() => setCreationAnchor(null)}
+            className="p-1"
+          >
+            {scopedTask && (
+              <button
+                role="menuitem"
+                className="w-full rounded-md px-2.5 py-2 text-left text-[12px] hover:bg-content/8"
+                onClick={() => {
+                  setCreationAnchor(null);
+                  onNew?.();
+                }}
+              >
+                New task session
+              </button>
+            )}
+            <button
+              role="menuitem"
+              className="w-full rounded-md px-2.5 py-2 text-left text-[12px] hover:bg-content/8"
+              onClick={() => {
+                setCreationAnchor(null);
+                onNewAdHoc?.();
+              }}
+            >
+              New ad hoc session
+            </button>
+            {scopedTask && onNewRepositorySession && (
+              <>
+                <div className="mt-1 border-t border-content/8 px-2.5 pt-2 text-[10px] text-content/50">
+                  New repository session
+                </div>
+                {scopedTask.workstreams.map((ws) => (
+                  <button
+                    role="menuitem"
+                    key={ws.id}
+                    disabled={!ws.worktreePath}
+                    className="w-full truncate rounded-md px-2.5 py-2 text-left text-[12px] hover:bg-content/8 disabled:opacity-40"
+                    onClick={() => {
+                      setCreationAnchor(null);
+                      onNewRepositorySession(ws.id);
+                    }}
+                  >
+                    {projectName(ws.projectPath)} · {ws.branch}
+                  </button>
+                ))}
+              </>
+            )}
+          </Popover>
+        )}
         {tab === "sessions" && cwd && cwd !== "~" ? (
           <div className="flex h-9 shrink-0 items-center gap-1 border-b border-stroke px-2">
             <div className="relative flex h-7 min-w-0 flex-1 items-center">
@@ -1738,6 +2057,13 @@ function SidebarComponent({
             tab === "sessions" ? "" : "hidden"
           }`}
         >
+          {compactRailVisible && (
+            <SidebarTasksSection
+              cwd={cwd}
+              activeSessionId={activeSessionId}
+              onSelectSession={onSelectTaskSession ?? onSelectLocalSession}
+            />
+          )}
           {!cwd || cwd === "~" ? (
             <p className="px-3 py-2 text-[12px] text-content/50">
               No project folder
@@ -1851,69 +2177,6 @@ function SidebarComponent({
                       );
                     }
                     if (entry.kind === "folder") {
-                      if (taskFolderIds.has(entry.folder.id)) {
-                        const expanded = searchNarrowed || !entry.folder.collapsed;
-                        const count = listWindowSize(
-                          entry.sessions.length,
-                          sessionListLimit,
-                          entry.sessions.findIndex((session) => session.id === activeSessionId),
-                        );
-                        return (
-                          <li
-                            key={entry.folder.id}
-                            data-task-session-group={entry.folder.id}
-                            className="mb-1.5 overflow-hidden rounded-md bg-content/5"
-                          >
-                            <FolderRow
-                              folder={entry.folder}
-                              sessions={entry.sessions}
-                              expanded={expanded}
-                              dropTarget={false}
-                              groupIcon={
-                                <CheckCircle className="size-3.5 text-accent" strokeWidth={1.75} />
-                              }
-                              busy={entry.sessions.some((session) =>
-                                busySessionIds.has(session.id),
-                              )}
-                              done={entry.sessions.some((session) =>
-                                unseenFinishedIds.has(session.id),
-                              )}
-                              needsApproval={entry.sessions.some((session) =>
-                                approvalSessionIds.has(session.id),
-                              )}
-                              onToggle={() => {
-                                if (searchNarrowed) return;
-                                setCollapsedTasks((current) => {
-                                  const next = new Set(current);
-                                  if (next.has(entry.folder.id)) next.delete(entry.folder.id);
-                                  else next.add(entry.folder.id);
-                                  return next;
-                                });
-                              }}
-                            />
-                            {expanded ? (
-                              <ul className="flex flex-col gap-px p-1">
-                                {entry.sessions.slice(0, count).map((session) => (
-                                  <li key={session.id}>{renderSessionCard(session, true)}</li>
-                                ))}
-                                {count < entry.sessions.length ? (
-                                  <li>
-                                    <button
-                                      type="button"
-                                      className="w-full rounded px-2 py-1.5 text-left text-[11px] text-content/50 hover:bg-content/8"
-                                      onClick={() =>
-                                        setSessionListLimit((current) => current + LIST_PAGE_SIZE)
-                                      }
-                                    >
-                                      Show more sessions
-                                    </button>
-                                  </li>
-                                ) : null}
-                              </ul>
-                            ) : null}
-                          </li>
-                        );
-                      }
                       const expanded =
                         searchNarrowed || !entry.folder.collapsed;
                       const shellFill = folderShellFill(
@@ -1964,27 +2227,46 @@ function SidebarComponent({
                           >
                             {renamingFolderId === entry.folder.id ? (
                               <FolderRenameRow
-                                folder={entry.folder}
+                                folder={
+                                  folderPaths.length > 1
+                                    ? {
+                                        ...entry.folder,
+                                        name: `${entry.folder.name} · ${projectName(folderLocation(entry.folder.id, cwd).cwd)}`,
+                                      }
+                                    : entry.folder
+                                }
                                 memberCount={entry.sessions.length}
                                 dropTarget={isSessionDrop(
                                   "folder",
                                   entry.folder.id,
                                 )}
                                 onCommit={(name) => {
-                                  commitSessionFolders(
-                                    renameFolder(
-                                      sessionFolders,
-                                      entry.folder.id,
-                                      name,
-                                    ),
-                                  );
-                                  setRenamingFolderId(null);
+                                  // Keep the row in rename mode when the
+                                  // persist failed — clearing it would drop
+                                  // the typed name with no retry path.
+                                  if (
+                                    commitSessionFolders(
+                                      renameFolder(
+                                        sessionFolders,
+                                        entry.folder.id,
+                                        name,
+                                      ),
+                                    )
+                                  )
+                                    setRenamingFolderId(null);
                                 }}
                                 onCancel={() => setRenamingFolderId(null)}
                               />
                             ) : (
                               <FolderRow
-                                folder={entry.folder}
+                                folder={
+                                  folderPaths.length > 1
+                                    ? {
+                                        ...entry.folder,
+                                        name: `${entry.folder.name} · ${projectName(folderLocation(entry.folder.id, cwd).cwd)}`,
+                                      }
+                                    : entry.folder
+                                }
                                 sessions={entry.sessions}
                                 expanded={expanded}
                                 dropTarget={isSessionDrop(
@@ -2078,25 +2360,40 @@ function SidebarComponent({
                   ) : null}
                 </ul>
               )}
+              {remoteMembersHidden ? (
+                <p className="px-3 pb-2 text-[10px] text-content/40">
+                  Sessions in remote repositories aren’t listed here.
+                </p>
+              ) : null}
             </div>
           )}
         </div>
         {tab === "changes" ? (
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
             <SourceControl
-                cwd={gitRoot}
-                enabled={panelOpen}
-                textHarness={textHarness}
-                selectedPath={selectedDiffPath}
-                selectedKind={selectedDiffKind}
-                selectedSha={selectedCommitSha}
-                onOpenFile={
-                  onOpenDiff ??
-                  ((path) => onOpenFile(path, undefined, { exact: true }))
-                }
-                onOpenAllChanges={onOpenAllChanges ?? (() => {})}
-                onOpenCommit={onOpenCommit ?? (() => {})}
-              />
+              cwd={
+                sourceControlCwd && sourceControlCwd !== gitCwd
+                  ? sourceControlCwd
+                  : gitRoot
+              }
+              repositories={gitRepositories}
+              selectedRepositoryId={gitRepository?.id}
+              onSelectRepository={onSelectGitRepository}
+              enabled={panelOpen}
+              textHarness={textHarness}
+              selectedPath={selectedDiffPath}
+              selectedKind={selectedDiffKind}
+              selectedSha={selectedCommitSha}
+              onOpenFile={(path, kind) =>
+                onOpenDiff
+                  ? onOpenDiff(path, kind, false, gitRepository)
+                  : onOpenFile(path, undefined, { exact: true })
+              }
+              onOpenAllChanges={() => onOpenAllChanges?.(gitRepository)}
+              onOpenCommit={(commit) =>
+                onOpenCommit?.(commit, false, gitRepository)
+              }
+            />
           </div>
         ) : null}
         {showSidebarFooter ? (
@@ -2238,6 +2535,7 @@ function SidebarComponent({
       ) : null}
       {railMounted.current && onSelectProject && onOpenProject ? (
         <ProjectRail
+          onSelectTaskSession={onSelectTaskSession ?? onSelectLocalSession}
           visible={railVisible}
           cwd={cwd}
           recents={recents}
@@ -2717,9 +3015,11 @@ function CompactRailAction({
 }
 
 function WorkspaceTitleActions({
+  newLabel = "New session",
   onSearch,
   onNew,
 }: {
+  newLabel?: string;
   onSearch?: () => void;
   onNew?: () => void;
 }) {
@@ -2735,7 +3035,7 @@ function WorkspaceTitleActions({
         </IconButton>
       ) : null}
       {onNew ? (
-        <IconButton label={`New session (${MOD}T)`} onClick={onNew}>
+        <IconButton label={`${newLabel} (${MOD}T)`} onClick={onNew}>
           <Plus className="size-3.5" strokeWidth={1.75} />
         </IconButton>
       ) : null}
@@ -2783,7 +3083,8 @@ function sessionListDropFromPoint(
 ): SessionListDropTarget | null {
   const el = document.elementFromPoint(x, y);
   if (!el) return null;
-  if (el.closest("[data-reminder-sessions], [data-task-session-group]")) return null;
+  if (el.closest("[data-reminder-sessions], [data-task-session-group]"))
+    return null;
   const card = el.closest("[data-session-card]") as HTMLElement | null;
   const cardId = card?.dataset.sessionCard;
   if (cardId === draggedId) return null;
@@ -3016,6 +3317,7 @@ const SESSION_PREFETCH_DELAY_MS = 120;
 
 const SessionCard = memo(function SessionCard({
   session,
+  scopeLabel,
   isActive,
   isSelected,
   busy,
@@ -3037,6 +3339,7 @@ const SessionCard = memo(function SessionCard({
   onDelete,
 }: {
   session: SessionSummary;
+  scopeLabel?: string;
   isActive: boolean;
   isSelected: boolean;
   busy: boolean;
@@ -3436,10 +3739,21 @@ const SessionCard = memo(function SessionCard({
           />
         ) : null}
         <span className="relative mt-1 flex items-center gap-2">
-          {gitLabel ? (
+          {scopeLabel ? (
+            <span
+              className="min-w-0 flex-1 truncate text-[10px] text-content/55"
+              title={scopeLabel}
+            >
+              {scopeLabel}
+            </span>
+          ) : gitLabel ? (
             <span
               className="flex min-w-0 flex-1 items-center gap-1 text-[11px] text-content/45"
-              title={session.worktreeCwd ? `${gitLabel}\n${session.worktreeCwd}` : gitLabel}
+              title={
+                session.worktreeCwd
+                  ? `${gitLabel}\n${session.worktreeCwd}`
+                  : gitLabel
+              }
             >
               <GitBranch className="size-3 shrink-0" strokeWidth={1.75} />
               <span className="min-w-0 truncate">{gitLabel}</span>

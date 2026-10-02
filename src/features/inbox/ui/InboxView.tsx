@@ -298,6 +298,7 @@ function InboxSourceTab({
       <span className="flex items-center gap-1.5">
         <InboxProviderMark
           provider={source}
+          colorful
           className="block size-3.5 shrink-0"
         />
         <span className="leading-none">{label}</span>

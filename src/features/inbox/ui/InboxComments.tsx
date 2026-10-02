@@ -14,6 +14,7 @@ import {
   type InboxProvider,
 } from "../model/githubTasks";
 import { MOD } from "../../../platform/tauri/platform";
+import { isHttpUrl } from "../model/githubPrChecks";
 import { AgentMarkdown } from "../../sessions/ui/AgentMarkdown";
 
 export type InboxReplyTarget = {
@@ -45,6 +46,7 @@ type InboxThread = {
 
 type Props = {
   thread: InboxThread | null;
+  showHeader?: boolean;
   loading: boolean;
   error: string | null;
   cwd: string;
@@ -54,6 +56,7 @@ type Props = {
 };
 
 export function InboxComments({
+  showHeader = true,
   thread,
   loading,
   error,
@@ -91,8 +94,8 @@ export function InboxComments({
             : "GitHub";
 
   return (
-    <section className="flex flex-col gap-3 border-t border-stroke pt-5">
-      <div className="flex items-center gap-2 text-[12px] text-content/50">
+    <section className={`flex flex-col gap-3 ${showHeader ? "border-t border-stroke pt-5" : ""}`}>
+      {showHeader && <div className="flex items-center gap-2 text-[12px] text-content/50">
         <h2 className="text-content/70">{label}</h2>
         {thread.truncated ? (
           <span>Latest comments · more on {moreOn}</span>
@@ -103,7 +106,7 @@ export function InboxComments({
             strokeWidth={1.75}
           />
         ) : null}
-      </div>
+      </div>}
       {error ? <p className="text-[12px] text-content/45">{error}</p> : null}
       <ol className="flex flex-col gap-2">
         {thread.comments.map((comment) => (
@@ -283,7 +286,7 @@ function InboxComment({
             className="flex min-w-0 items-center gap-2"
           >
             <span aria-hidden>·</span>
-            {comment.url && part === time ? (
+            {comment.url && isHttpUrl(comment.url) && part === time ? (
               <button
                 type="button"
                 title={

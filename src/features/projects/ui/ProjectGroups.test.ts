@@ -10,6 +10,8 @@ import {
   saveProjectGroups,
 } from "../model/projectGroups";
 import { savePinnedProjects } from "../model/recents";
+import { saveSavedProject, selectSavedProject } from "../model/savedProjects";
+import { addTask } from "../../board/boardStore";
 import { ProjectRail } from "../../../app/shell/ProjectRail";
 import { useProjectDiffStats } from "../../source-control/hooks/useProjectDiffStats";
 
@@ -51,6 +53,7 @@ async function renderRail(visible = true) {
         ],
         onSelectProject: vi.fn(),
         onOpenProject: vi.fn(),
+        onSelectTaskSession: vi.fn(),
       }),
     ),
   );
@@ -58,12 +61,16 @@ async function renderRail(visible = true) {
 
 it("suspends project Git stats while the rail is hidden", async () => {
   await renderRail();
-  expect(vi.mocked(useProjectDiffStats).mock.calls.some(([, enabled]) => enabled)).toBe(true);
+  expect(
+    vi.mocked(useProjectDiffStats).mock.calls.some(([, enabled]) => enabled),
+  ).toBe(true);
 
   vi.mocked(useProjectDiffStats).mockClear();
   await renderRail(false);
   expect(vi.mocked(useProjectDiffStats).mock.calls.length).toBeGreaterThan(0);
-  expect(vi.mocked(useProjectDiffStats).mock.calls.every(([, enabled]) => !enabled)).toBe(true);
+  expect(
+    vi.mocked(useProjectDiffStats).mock.calls.every(([, enabled]) => !enabled),
+  ).toBe(true);
   expect(container.querySelector('nav[aria-label="Projects"]')).not.toBeNull();
 });
 
@@ -81,7 +88,9 @@ function button(label: string): HTMLButtonElement {
 function sectionLabels(): string[] {
   return [...container.querySelectorAll("span")]
     .map((element) => element.textContent ?? "")
-    .filter((text) => ["Pinned", "Groups", "Projects"].includes(text));
+    .filter((text) =>
+      ["Pinned", "Groups", "Projects", "Repositories"].includes(text),
+    );
 }
 
 it("renders assigned projects in persistent collapsible groups", async () => {
@@ -94,7 +103,12 @@ it("renders assigned projects in persistent collapsible groups", async () => {
 
   expect(button("personal")).toBeDefined();
   expect(button("client")).toBeDefined();
-  expect(sectionLabels()).toEqual(["Pinned", "Groups", "Projects"]);
+  expect(sectionLabels()).toEqual([
+    "Projects",
+    "Pinned",
+    "Groups",
+    "Repositories",
+  ]);
 
   const group = container.querySelector<HTMLElement>(
     '[data-project-group="clients"]',
@@ -148,7 +162,7 @@ it("renders assigned projects in persistent collapsible groups", async () => {
 
 it("creates, styles, assigns, and deletes a group from the rail", async () => {
   await renderRail();
-  expect(sectionLabels()).toEqual(["Projects"]);
+  expect(sectionLabels()).toEqual(["Projects", "Repositories"]);
   expect(
     document.querySelector('button[aria-label="New project group"]'),
   ).toBeNull();
@@ -202,8 +216,68 @@ it("creates, styles, assigns, and deletes a group from the rail", async () => {
   expect(loadProjectGroups()).toEqual([]);
   expect(loadProjectGroupAssignments()).toEqual({});
   expect(button("personal")).toBeDefined();
-  expect(sectionLabels()).toEqual(["Projects"]);
+  expect(sectionLabels()).toEqual(["Projects", "Repositories"]);
   expect(
     document.querySelector('button[aria-label="New project group"]'),
   ).toBeNull();
+});
+
+it("hides the recents list when saved projects own the rail", async () => {
+  saveSavedProject({
+    id: "personal",
+    name: "Personal",
+    members: ["/work/personal"],
+    presets: [],
+  });
+  selectSavedProject("personal");
+  addTask({
+    projectId: "personal",
+    title: "Project task",
+    links: [],
+    workstreams: [
+      {
+        id: "repo",
+        projectPath: "/work/personal",
+        branch: "main",
+        base: "main",
+        sessionIds: [],
+      },
+    ],
+  });
+  addTask({ title: "Other project task", projectId: "other", links: [], workstreams: [] });
+  await renderRail();
+  const task = button("Project task");
+  expect(task.closest('[aria-label="Saved projects"]')).toBeNull();
+  expect(task.closest('[aria-label="Tasks"]')?.textContent).toContain(
+    "Personal",
+  );
+  expect(container.textContent).not.toContain("Working copies");
+  expect(container.querySelector('[aria-label="Saved projects"]')).not.toBeNull();
+  // Saved projects cover /work/personal — it drops out of the raw recents,
+  // while the uncovered /work/client recent keeps the section (and its
+  // open-folder affordance) alive.
+  const reposSection = [...container.querySelectorAll("span")]
+    .find((element) => element.textContent === "Repositories")
+    ?.closest("div.mb-2");
+  expect(reposSection?.textContent).toContain("client");
+  expect(reposSection?.textContent).not.toContain("personal");
+  expect(container.textContent).not.toContain("Other project task");
+  await act(async () => button("Show all tasks").click());
+  expect(container.textContent).toContain("Other project task");
+  expect(container.querySelector('[title^="Project task"]')?.textContent).toContain("Personal");
+  expect(container.querySelector('[title^="Other project task"]')?.textContent).toContain("No project");
+  expect(localStorage.getItem("monocode.selectedSavedProject")).toBe("personal");
+  await act(async () => button("Show project tasks").click());
+  expect(container.textContent).not.toContain("Other project task");
+});
+
+it("hides the recents section once saved projects cover every recent", async () => {
+  saveSavedProject({
+    id: "all",
+    name: "Everything",
+    members: ["/work/personal", "/work/client"],
+    presets: [],
+  });
+  await renderRail();
+  expect(container.textContent).not.toContain("Repositories");
 });

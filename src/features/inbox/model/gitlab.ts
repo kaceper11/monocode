@@ -69,7 +69,10 @@ export type GitlabMrDiff = {
 
 export const GITLAB_CHANGE_EVENT = "monocode:gitlab-change";
 
-const repoByPath = new Map<string, string>();
+// Repo lookup is a git subprocess per call — cache briefly so a remote
+// repoint still lands within a session instead of sticking until restart.
+const REPO_TTL_MS = 60_000;
+const repoByPath = new Map<string, { at: number; repo: string }>();
 const detailsByKey = new Map<string, GitlabWorkItemDetails>();
 const threadByKey = new Map<string, GitlabWorkItemThread>();
 const threadInflight = new Map<string, Promise<GitlabWorkItemThread>>();
@@ -119,9 +122,9 @@ export async function disconnectGitlab(url: string): Promise<GitlabStatus> {
 export async function gitlabRepo(cwd: string): Promise<string> {
   const key = normalizeProjectPath(cwd);
   const cached = repoByPath.get(key);
-  if (cached !== undefined) return cached;
+  if (cached && Date.now() - cached.at < REPO_TTL_MS) return cached.repo;
   const repo = await invoke<string>("gitlab_repo", { cwd });
-  repoByPath.set(key, repo);
+  repoByPath.set(key, { at: Date.now(), repo });
   return repo;
 }
 

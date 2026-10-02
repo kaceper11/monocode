@@ -17,8 +17,10 @@ import {
  * The inbox's provider connection state, probed once per mount. The board
  * seeds from the same persisted answer so both surfaces show the same
  * sources; `null` (unprobed) stays visible until proven otherwise.
+ * `active: false` serves the persisted snapshot without probing — for
+ * surfaces that render no inbox UI (a docked task panel).
  */
-export function useInboxConnections(): InboxSourceConnections {
+export function useInboxConnections(active = true): InboxSourceConnections {
   const [connections, setConnections] = useState(loadInboxConnections);
   // Persist probe results only — writing the just-loaded value back on
   // mount would be a no-op write.
@@ -29,6 +31,7 @@ export function useInboxConnections(): InboxSourceConnections {
   }, [connections]);
 
   useEffect(() => {
+    if (!active) return;
     let cancelled = false;
     let latest = 0;
     const read = () => {
@@ -72,7 +75,7 @@ export function useInboxConnections(): InboxSourceConnections {
       cancelled = true;
       for (const event of events) window.removeEventListener(event, read);
     };
-  }, []);
+  }, [active]);
 
   return connections;
 }

@@ -1,4 +1,5 @@
-import { checkState, type DeliverySnapshot } from "./delivery";
+import { taskSessionIds, taskWideSessionIds } from "./boardStore";
+import { ciLabel, checkState, type DeliverySnapshot } from "./delivery";
 import {
   inboxItemKey,
   inboxItemRef,
@@ -42,8 +43,7 @@ const COLUMN_DOTS: Record<string, string> = {
   review: "bg-amber-400",
   done: "bg-accent",
 };
-export const columnDot = (id: string) =>
-  COLUMN_DOTS[id] ?? "bg-content/30";
+export const columnDot = (id: string) => COLUMN_DOTS[id] ?? "bg-content/30";
 
 /** Group chip palette — literal classes so Tailwind keeps them. `color` on a
  * `BoardGroup` indexes this list; the store cycles indices on creation.
@@ -160,6 +160,7 @@ export type BoardWorkstreamRow = {
   projectPath: string;
   branch: string;
   base: string;
+  remote?: string;
   worktreePath?: string;
   /** All bound session ids — a lane can hold multiple conversations. */
   sessionIds: string[];
@@ -195,6 +196,7 @@ export type BoardWorkstreamRow = {
   probeError?: string;
   ciError?: string;
   ciBlocked?: boolean;
+  ciSummary?: string;
 };
 
 export type WorkstreamStatus = {
@@ -257,8 +259,11 @@ export type BoardCard = {
 
 /** Read the provider states, never the card's derived/manual column. */
 export function boardCardStatuses(card: BoardCard): BoardProviderStatus[] {
-  return [card, ...(card.tickets ?? []), ...(card.prs ?? []),
-    ...(card.workstreams ?? []).flatMap((row) => row.pr ? [row.pr] : []),
+  return [
+    card,
+    ...(card.tickets ?? []),
+    ...(card.prs ?? []),
+    ...(card.workstreams ?? []).flatMap((row) => (row.pr ? [row.pr] : [])),
   ].flatMap(({ provider, state }) =>
     provider && state?.trim() ? [{ provider, state: state.trim() }] : [],
   );
@@ -272,8 +277,9 @@ export function boardStatusOptions(
   for (const status of [...selected, ...cards.flatMap(boardCardStatuses)]) {
     options.set(boardStatusKey(status), status);
   }
-  return [...options.values()].sort((a, b) =>
-    a.provider.localeCompare(b.provider) || a.state.localeCompare(b.state),
+  return [...options.values()].sort(
+    (a, b) =>
+      a.provider.localeCompare(b.provider) || a.state.localeCompare(b.state),
   );
 }
 
@@ -281,8 +287,11 @@ export function matchesBoardStatuses(
   card: BoardCard,
   selected: ReadonlySet<string>,
 ): boolean {
-  return !selected.size || boardCardStatuses(card).some((status) =>
-    selected.has(boardStatusKey(status)),
+  return (
+    !selected.size ||
+    boardCardStatuses(card).some((status) =>
+      selected.has(boardStatusKey(status)),
+    )
   );
 }
 
@@ -349,8 +358,7 @@ export function providerStage(item: {
 }): "done" | "progress" | "review" | null {
   const state = (item.state ?? "").trim().toLowerCase();
   const stateType = (item.stateType ?? "").trim().toLowerCase();
-  if (DONE_STATES.has(state) || DONE_STATE_TYPES.has(stateType))
-    return "done";
+  if (DONE_STATES.has(state) || DONE_STATE_TYPES.has(stateType)) return "done";
   if (/review|verify|validate|qa\b/.test(state)) return "review";
   if (
     stateType === "started" ||
@@ -443,7 +451,10 @@ export const prIsOpen = (state?: string) => {
  * conflicts-only `mergeStatus` can't rule out. Threads must be a known
  * zero — a failed count probe isn't "no threads". Drafts never signal. */
 export function lanePrSignal(
-  row: Pick<BoardWorkstreamRow, "pr" | "ciFailing" | "ciRunning" | "ciError" | "ciBlocked" | "probeError">,
+  row: Pick<
+    BoardWorkstreamRow,
+    "pr" | "ciFailing" | "ciRunning" | "ciError" | "ciBlocked" | "probeError"
+  >,
 ): "ready" | "conflicts" | "blocked" | "behind" | null {
   const pr = row.pr;
   if (!pr || !prIsOpen(pr.state) || pr.draft) return null;
@@ -454,7 +465,9 @@ export function lanePrSignal(
     pr.mergeState === "clean" &&
     !row.ciFailing &&
     !row.ciRunning &&
-    !row.ciError && !row.ciBlocked && !row.probeError &&
+    !row.ciError &&
+    !row.ciBlocked &&
+    !row.probeError &&
     pr.reviewDecision !== "CHANGES_REQUESTED" &&
     pr.reviewDecision !== "REVIEW_REQUIRED" &&
     pr.unresolvedThreads === 0
@@ -490,28 +503,41 @@ export function cardAttentionLines(
         : `${needsInput.length} sessions need input`,
     );
   if (card.ciFailing)
-    lines.push(card.ciFailing === 1 ? "CI failing" : `CI failing ×${card.ciFailing}`);
+    lines.push(
+      card.ciFailing === 1 ? "CI failing" : `CI failing ×${card.ciFailing}`,
+    );
   // Lane PRs carrying a review verdict or unresolved threads.
   const changesRequested = (card.workstreams ?? []).filter(
-    (row) => row.pr && prIsOpen(row.pr.state) && row.pr.reviewDecision === "CHANGES_REQUESTED",
+    (row) =>
+      row.pr &&
+      prIsOpen(row.pr.state) &&
+      row.pr.reviewDecision === "CHANGES_REQUESTED",
   ).length;
   if (changesRequested)
     lines.push(
-      changesRequested === 1 ? "Changes requested" : `Changes requested ×${changesRequested}`,
+      changesRequested === 1
+        ? "Changes requested"
+        : `Changes requested ×${changesRequested}`,
     );
   const unresolved = (card.workstreams ?? []).reduce(
-    (sum, row) => sum + (row.pr && prIsOpen(row.pr.state) ? (row.pr.unresolvedThreads ?? 0) : 0),
+    (sum, row) =>
+      sum +
+      (row.pr && prIsOpen(row.pr.state) ? (row.pr.unresolvedThreads ?? 0) : 0),
     0,
   );
   if (unresolved)
-    lines.push(unresolved === 1 ? "1 open thread" : `${unresolved} open threads`);
+    lines.push(
+      unresolved === 1 ? "1 open thread" : `${unresolved} open threads`,
+    );
   // Provider-side mergeability — conflicts/blocks are problems, "ready" is
   // the positive counterpart answering "what can I land right now".
   const signals = (card.workstreams ?? []).map(lanePrSignal);
   const conflicts = signals.filter((signal) => signal === "conflicts").length;
   const blocked = signals.filter((signal) => signal === "blocked").length;
   if (conflicts)
-    lines.push(conflicts === 1 ? "Merge conflicts" : `Merge conflicts ×${conflicts}`);
+    lines.push(
+      conflicts === 1 ? "Merge conflicts" : `Merge conflicts ×${conflicts}`,
+    );
   if (blocked)
     lines.push(blocked === 1 ? "Merge blocked" : `Merge blocked ×${blocked}`);
   // Provider-side staleness — the lane's own `behind` count covers
@@ -541,7 +567,9 @@ export function cardAttentionLines(
   if (working)
     lines.push(working === 1 ? "Working" : `${working} sessions working`);
   if (card.ciRunning && !working)
-    lines.push(card.ciRunning === 1 ? "CI running" : `CI running ×${card.ciRunning}`);
+    lines.push(
+      card.ciRunning === 1 ? "CI running" : `CI running ×${card.ciRunning}`,
+    );
   return lines;
 }
 
@@ -553,13 +581,17 @@ export function attentionScore(card: BoardCard): number {
   if (card.ciFailing) score += 6;
   if (
     (card.workstreams ?? []).some(
-      (row) => row.pr && prIsOpen(row.pr.state) && row.pr.reviewDecision === "CHANGES_REQUESTED",
+      (row) =>
+        row.pr &&
+        prIsOpen(row.pr.state) &&
+        row.pr.reviewDecision === "CHANGES_REQUESTED",
     )
   )
     score += 5;
   if (
     (card.workstreams ?? []).some(
-      (row) => row.pr && prIsOpen(row.pr.state) && (row.pr.unresolvedThreads ?? 0) > 0,
+      (row) =>
+        row.pr && prIsOpen(row.pr.state) && (row.pr.unresolvedThreads ?? 0) > 0,
     )
   )
     score += 4;
@@ -688,12 +720,22 @@ export function itemMatchesTicketKey(item: InboxItem, key: string): boolean {
  * but board links need every source, so this keeps the item's identity
  * fields verbatim and `inboxIdentityKey` produces the match key.
  */
-export function boardLinkFromInboxItem(
-  item: InboxItem,
-): LinkedWorkItem | null {
+export function boardLinkFromInboxItem(item: InboxItem): LinkedWorkItem | null {
   if (!item.url) return null;
   const linked = linkedWorkItemFromInboxItem(item);
-  if (linked) return linked;
+  if (linked) {
+    // The inbox-matching path keeps a slim identity; board links also carry
+    // display fields (provider mark, identifier, title) so task surfaces can
+    // render the item without re-resolving it.
+    const identifier = linked.identifier ?? cardIdentifier(item);
+    const title = linked.title ?? item.title;
+    return {
+      ...linked,
+      provider: linked.provider ?? item.provider,
+      ...(identifier ? { identifier } : {}),
+      ...(title ? { title } : {}),
+    };
+  }
   return {
     provider: item.provider,
     kind: item.kind === "pr" ? "pr" : "issue",
@@ -701,7 +743,7 @@ export function boardLinkFromInboxItem(
     repo: item.repo ?? "",
     number: item.number,
     ...(item.account ? { account: item.account } : {}),
-    ...(item.identifier ? { identifier: item.identifier } : {}),
+    ...(cardIdentifier(item) ? { identifier: cardIdentifier(item) } : {}),
     ...(item.id ? { id: item.id } : {}),
     ...(item.site ? { site: item.site } : {}),
     ...(item.title ? { title: item.title } : {}),
@@ -782,13 +824,12 @@ function linkedPrFromItem(item: InboxItem): BoardLinkedPr {
 }
 
 function checkCiState(check: GitPrCheck): "failing" | "running" | "other" {
-  const bucket = check.bucket.toLowerCase();
-  const state = check.state.toLowerCase();
-  if (bucket === "fail" || bucket === "cancel" || /fail|error|timed/.test(state))
-    return "failing";
-  if (bucket === "pending" || /pending|progress|queued|wait|expected|required/.test(state))
-    return "running";
-  return "other";
+  const state = checkState(check);
+  return state === "failed"
+    ? "failing"
+    : state === "running"
+      ? "running"
+      : "other";
 }
 
 function newItemCard(item: InboxItem): MutableCard {
@@ -806,9 +847,7 @@ function newItemCard(item: InboxItem): MutableCard {
     ...(item.state ? { state: item.state } : {}),
     ...(item.stateType ? { stateType: item.stateType } : {}),
     ...(item.draft ? { draft: true } : {}),
-    ...(item.attentionReason
-      ? { attentionReason: item.attentionReason }
-      : {}),
+    ...(item.attentionReason ? { attentionReason: item.attentionReason } : {}),
     item,
     relatedItems: [item],
     sessions: [],
@@ -844,7 +883,9 @@ function newTaskCard(
     kind: "task",
     title: task.title,
     task,
-    tickets: task.links.flatMap(link => sessionWorkItems({ linkedWorkItem: link })).map(ticketChipFromLink),
+    tickets: task.links
+      .flatMap((link) => sessionWorkItems({ linkedWorkItem: link }))
+      .map(ticketChipFromLink),
     ...(resolved.length ? { groups: resolved } : {}),
     prs: [],
     sessions: [],
@@ -895,7 +936,10 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
 
   // --- task cards + lookup indexes -------------------------------------
   const taskCards: MutableCard[] = [];
-  const taskBySession = new Map<string, { card: MutableCard; workstreamId?: string }>();
+  const taskBySession = new Map<
+    string,
+    { card: MutableCard; workstreamId?: string }
+  >();
   /** Lowercase workstream branch → candidate lanes — Azure PRs join by
    * `sourceRefName`. Several lanes can share a branch name across repos, so
    * the item's repo name breaks the tie before a lane is trusted. */
@@ -914,10 +958,19 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     const card = newTaskCard(task, groupById);
     cards.set(card.id, card);
     taskCards.push(card);
-    if (task.primarySessionId) taskBySession.set(task.primarySessionId, { card });
+    for (const id of taskWideSessionIds(task)) {
+      const bound = taskBySession.get(id);
+      // First task wins on conflicting membership — a lane refine below may
+      // still narrow this task's own entry, but a later task must not steal
+      // the session from an earlier card.
+      if (!bound || bound.card === card) taskBySession.set(id, { card });
+    }
     taskPatterns.set(
       card,
-      task.links.flatMap(link => sessionWorkItems({ linkedWorkItem: link })).flatMap(ticketKeys).map(ticketKeyPattern),
+      task.links
+        .flatMap((link) => sessionWorkItems({ linkedWorkItem: link }))
+        .flatMap(ticketKeys)
+        .map(ticketKeyPattern),
     );
     for (const ws of task.workstreams) {
       const row: BoardWorkstreamRow = {
@@ -925,6 +978,7 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
         projectPath: ws.projectPath,
         branch: ws.branch,
         base: ws.base,
+        remote: ws.remote,
         ...(ws.worktreePath ? { worktreePath: ws.worktreePath } : {}),
         sessionIds: ws.sessionIds ?? [],
         sessions: [],
@@ -934,8 +988,16 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
       };
       const status = input.workstreamStatus?.get(ws.id);
       if (status?.error) row.probeError = status.error;
-      row.ciError = status?.ciError || (status?.fetchedAt && Date.now() - status.fetchedAt > 60_000 ? "CI status is stale" : undefined);
-      row.ciBlocked = status?.checks.some(c => ["unknown", "blocked", "canceled"].includes(checkState(c)));
+      row.ciError =
+        status?.ciError ||
+        (status?.fetchedAt && Date.now() - status.fetchedAt > 60_000
+          ? "CI status is stale"
+          : undefined);
+      if (status)
+        row.ciSummary = ciLabel(status.checks, row.ciError || status.error);
+      row.ciBlocked = status?.checks.some((c) =>
+        ["unknown", "blocked", "canceled"].includes(checkState(c)),
+      );
       if (status?.merging) row.merging = true;
       if (status?.behind) row.behind = status.behind;
       if (status?.pr) {
@@ -978,17 +1040,34 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
         });
         taskByBranch.set(laneBranch, lanes);
       }
-      for (const sessionId of ws.sessionIds ?? [])
-        taskBySession.set(sessionId, { card, workstreamId: ws.id });
+      for (const sessionId of ws.sessionIds ?? []) {
+        const bound = taskBySession.get(sessionId);
+        // First task wins on conflicting membership — the lane refine only
+        // applies when the session's task-wide entry is this same card.
+        if (!bound || bound.card === card)
+          taskBySession.set(sessionId, { card, workstreamId: ws.id });
+      }
     }
   }
 
-  const sessionsById = new Map([...input.summaries.filter(s => !s.archived), ...input.sessions].map(s => [s.id, s]));
+  const sessionsById = new Map(
+    [...input.summaries.filter((s) => !s.archived), ...input.sessions].map(
+      (s) => [s.id, s],
+    ),
+  );
   const taskLinks = (card: MutableCard) => {
     const task = card.task!;
-    const ids = new Set([task.primarySessionId, ...task.workstreams.flatMap(ws => ws.sessionIds ?? [])]);
-    return [...task.links.flatMap(link => sessionWorkItems({ linkedWorkItem: link })),
-      ...[...ids].flatMap(id => id && sessionsById.has(id) ? sessionWorkItems(sessionsById.get(id)!) : [])];
+    const ids = new Set(taskSessionIds(task));
+    return [
+      ...task.links.flatMap((link) =>
+        sessionWorkItems({ linkedWorkItem: link }),
+      ),
+      ...[...ids].flatMap((id) =>
+        id && sessionsById.has(id)
+          ? sessionWorkItems(sessionsById.get(id)!)
+          : [],
+      ),
+    ];
   };
   const tasksByItem = indexByWorkItem(taskCards, taskLinks);
 
@@ -1003,12 +1082,18 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
   ): boolean => {
     if (via === "link") {
       card.relatedItems ??= [];
-      if (!card.relatedItems.some(row => inboxItemKey(row) === inboxItemKey(item))) card.relatedItems.push(item);
+      if (
+        !card.relatedItems.some(
+          (row) => inboxItemKey(row) === inboxItemKey(item),
+        )
+      )
+        card.relatedItems.push(item);
       for (const link of taskLinks(card)) {
         if (!inboxItemMatchesLinkedWorkItem(item, link)) continue;
         const key = linkedWorkItemInboxKey(link);
-        const index = card.tickets!.findIndex(ticket => ticket.key === key);
-        if (index >= 0) card.tickets![index] = { ...ticketChipFromItem(item), key };
+        const index = card.tickets!.findIndex((ticket) => ticket.key === key);
+        if (index >= 0)
+          card.tickets![index] = { ...ticketChipFromItem(item), key };
         else card.tickets!.push({ ...ticketChipFromItem(item), key });
       }
       return true;
@@ -1044,7 +1129,11 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
   const taskForItem = (
     item: InboxItem,
   ):
-    | { card: MutableCard; via: "link" | "branch" | "key"; workstreamId?: string }
+    | {
+        card: MutableCard;
+        via: "link" | "branch" | "key";
+        workstreamId?: string;
+      }
     | undefined => {
     if (item.kind !== "pr") return undefined;
     // Azure/GitLab PRs carry `sourceRefName` — a match on a workstream's
@@ -1110,7 +1199,9 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     ref: BoardCardSession,
     cwd?: string,
   ) => {
-    const tasks = linkedWorkItemNeedsAccount(linked) ? [] : relatedFromIndex(linked, tasksByItem);
+    const tasks = linkedWorkItemNeedsAccount(linked)
+      ? []
+      : relatedFromIndex(linked, tasksByItem);
     if (tasks.length) {
       for (const task of tasks) pushSession(task, ref);
       return tasks[0];
@@ -1204,9 +1295,17 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
   for (const card of cards.values()) {
     // Task-owned conversations remain reachable even when the history query
     // only returned sessions with ticket links.
-    if (card.task?.primarySessionId && !card.sessionIds.has(card.task.primarySessionId)) {
-      pushSession(card, { id: card.task.primarySessionId, title: card.task.title, live: false, busy: false, needsInput: false });
-    }
+    if (card.task)
+      for (const id of taskWideSessionIds(card.task)) {
+        if (!card.sessionIds.has(id))
+          pushSession(card, {
+            id,
+            title: card.task.title,
+            live: false,
+            busy: false,
+            needsInput: false,
+          });
+      }
     // Resolve each lane's bound refs in binding order; the card's own
     // `sessions` list already collected exactly these via taskBySession.
     const refsById = new Map(card.sessions.map((ref) => [ref.id, ref]));
@@ -1254,7 +1353,10 @@ export function buildBoardCards(input: BoardInput): BoardCard[] {
     // Non-task cards carry membership in the store's cardGroups map — tasks
     // already resolved theirs from `groupIds` in newTaskCard.
     if (!card.groups?.length) {
-      const resolved = resolveCardGroups(input.cardGroups?.[card.id], groupById);
+      const resolved = resolveCardGroups(
+        input.cardGroups?.[card.id],
+        groupById,
+      );
       if (resolved.length) card.groups = resolved;
     }
     return card;
@@ -1268,16 +1370,26 @@ function hierarchyKey(item: InboxItem): string {
 }
 
 export function boardCardMembers(cards: readonly BoardCard[]): BoardCard[] {
-  return cards.flatMap(card => [card, ...(card.members ?? [])]);
+  return cards.flatMap((card) => [card, ...(card.members ?? [])]);
 }
 
-function groupRelatedCards(cards: BoardCard[], items: readonly InboxItem[]): BoardCard[] {
+function groupRelatedCards(
+  cards: BoardCard[],
+  items: readonly InboxItem[],
+): BoardCard[] {
   const families = new Map<string, { parent: InboxItem; items: InboxItem[] }>();
-  const loaded = new Map(items.map(item => [hierarchyKey(item), item]));
-  const parentOf = (child: InboxItem): InboxItem | undefined => child.parent ? {
-    ...child.parent, parent: undefined, provider: child.provider, account: child.account,
-    site: child.site, projectPath: child.projectPath,
-  } : undefined;
+  const loaded = new Map(items.map((item) => [hierarchyKey(item), item]));
+  const parentOf = (child: InboxItem): InboxItem | undefined =>
+    child.parent
+      ? {
+          ...child.parent,
+          parent: undefined,
+          provider: child.provider,
+          account: child.account,
+          site: child.site,
+          projectPath: child.projectPath,
+        }
+      : undefined;
   const cyclic = (child: InboxItem) => {
     const seen = new Set<string>();
     let current: InboxItem | undefined = child;
@@ -1292,58 +1404,122 @@ function groupRelatedCards(cards: BoardCard[], items: readonly InboxItem[]): Boa
   };
   for (const child of items) {
     if (!child.parent || child.kind === "pr" || cyclic(child)) continue;
-    if ((child.parent.provider && child.parent.provider !== child.provider) ||
-        (child.parent.account && child.parent.account !== child.account) ||
-        (child.parent.site && child.parent.site !== child.site)) continue;
-    const parent: InboxItem = { ...child.parent, parent: undefined, provider: child.provider,
-      account: child.account, site: child.site, projectPath: child.projectPath };
-    if (!parent.url || parent.kind === "pr" || hierarchyKey(parent) === hierarchyKey(child)) continue;
+    if (
+      (child.parent.provider && child.parent.provider !== child.provider) ||
+      (child.parent.account && child.parent.account !== child.account) ||
+      (child.parent.site && child.parent.site !== child.site)
+    )
+      continue;
+    const parent: InboxItem = {
+      ...child.parent,
+      parent: undefined,
+      provider: child.provider,
+      account: child.account,
+      site: child.site,
+      projectPath: child.projectPath,
+    };
+    if (
+      !parent.url ||
+      parent.kind === "pr" ||
+      hierarchyKey(parent) === hierarchyKey(child)
+    )
+      continue;
     const key = hierarchyKey(parent);
     const family = families.get(key) ?? { parent, items: [parent] };
-    family.items.push(child); families.set(key, family);
+    family.items.push(child);
+    families.set(key, family);
   }
   // Two explicit local tasks for the same provider item also share one wrapper.
   for (const item of items) {
-    const owners = cards.filter(card => card.task && card.relatedItems?.some(row => hierarchyKey(row) === hierarchyKey(item)));
+    const owners = cards.filter(
+      (card) =>
+        card.task &&
+        card.relatedItems?.some(
+          (row) => hierarchyKey(row) === hierarchyKey(item),
+        ),
+    );
     if (owners.length > 1 && !item.parent && !families.has(hierarchyKey(item)))
       families.set(hierarchyKey(item), { parent: item, items: [item] });
   }
   const consumed = new Set<string>();
   const grouped: BoardCard[] = [];
-  for (const [key, family] of [...families].sort(([a], [b]) => a.localeCompare(b))) {
+  for (const [key, family] of [...families].sort(([a], [b]) =>
+    a.localeCompare(b),
+  )) {
     const keys = new Set(family.items.map(hierarchyKey));
-    const members = cards.filter(card => !consumed.has(card.id) && (
-      (card.relatedItems ?? (card.item ? [card.item] : [])).some(item => keys.has(hierarchyKey(item))) ||
-      card.task?.links.flatMap(link => sessionWorkItems({ linkedWorkItem: link })).some(link =>
-        family.items.some(item => inboxItemMatchesLinkedWorkItem(item, link)))
-    ));
+    const members = cards.filter(
+      (card) =>
+        !consumed.has(card.id) &&
+        ((card.relatedItems ?? (card.item ? [card.item] : [])).some((item) =>
+          keys.has(hierarchyKey(item)),
+        ) ||
+          card.task?.links
+            .flatMap((link) => sessionWorkItems({ linkedWorkItem: link }))
+            .some((link) =>
+              family.items.some((item) =>
+                inboxItemMatchesLinkedWorkItem(item, link),
+              ),
+            )),
+    );
     if (!members.length) continue;
-    members.forEach(card => consumed.add(card.id));
+    members.forEach((card) => consumed.add(card.id));
     // Keep missing parent context accessible, without pretending it matched the query.
-    if (!members.some(card => card.item && hierarchyKey(card.item) === key)) {
-      members.push(toCard(newItemCard({ ...family.parent, planningContextOnly: true })));
+    if (!members.some((card) => card.item && hierarchyKey(card.item) === key)) {
+      members.push(
+        toCard(newItemCard({ ...family.parent, planningContextOnly: true })),
+      );
     }
-    const tasks = members.filter(card => card.kind === "task");
-    const representative = tasks.length === 1 ? tasks[0] : toCard(newItemCard(family.parent));
-    const unique = <T,>(rows: T[], id: (row: T) => string) => [...new Map(rows.map(row => [id(row), row])).values()];
-    const workstreams = unique(members.flatMap(card => card.workstreams ?? []), row => row.id);
-    const states = members.map(card => card.derived);
-    grouped.push({ ...representative,
+    const tasks = members.filter((card) => card.kind === "task");
+    const representative =
+      tasks.length === 1 ? tasks[0] : toCard(newItemCard(family.parent));
+    const unique = <T>(rows: T[], id: (row: T) => string) => [
+      ...new Map(rows.map((row) => [id(row), row])).values(),
+    ];
+    const workstreams = unique(
+      members.flatMap((card) => card.workstreams ?? []),
+      (row) => row.id,
+    );
+    const states = members.map((card) => card.derived);
+    grouped.push({
+      ...representative,
       id: tasks.length === 1 ? representative.id : `hierarchy:${key}`,
-      members, relatedItems: unique(family.items, hierarchyKey),
-      tickets: unique([...members.flatMap(card => card.tickets ?? []), ...family.items.map(ticketChipFromItem)], row => row.key),
-      sessions: unique(members.flatMap(card => card.sessions), row => row.id), workstreams,
-      prs: unique(members.flatMap(card => card.prs ?? []), row => row.id),
-      groups: unique(members.flatMap(card => card.groups ?? []), row => row.id),
-      hasUpdate: members.some(card => card.hasUpdate),
+      members,
+      relatedItems: unique(family.items, hierarchyKey),
+      tickets: unique(
+        [
+          ...members.flatMap((card) => card.tickets ?? []),
+          ...family.items.map(ticketChipFromItem),
+        ],
+        (row) => row.key,
+      ),
+      sessions: unique(
+        members.flatMap((card) => card.sessions),
+        (row) => row.id,
+      ),
+      workstreams,
+      prs: unique(
+        members.flatMap((card) => card.prs ?? []),
+        (row) => row.id,
+      ),
+      groups: unique(
+        members.flatMap((card) => card.groups ?? []),
+        (row) => row.id,
+      ),
+      hasUpdate: members.some((card) => card.hasUpdate),
       ciTotal: workstreams.reduce((n, row) => n + row.ciTotal, 0),
       ciFailing: workstreams.reduce((n, row) => n + row.ciFailing, 0),
       ciRunning: workstreams.reduce((n, row) => n + row.ciRunning, 0),
-      updatedAt: Math.max(...members.map(card => card.updatedAt)),
-      derived: states.includes("review") ? "review" : states.includes("progress") ? "progress" : states.every(state => state === "done") ? "done" : "todo",
+      updatedAt: Math.max(...members.map((card) => card.updatedAt)),
+      derived: states.includes("review")
+        ? "review"
+        : states.includes("progress")
+          ? "progress"
+          : states.every((state) => state === "done")
+            ? "done"
+            : "todo",
     });
   }
-  return [...cards.filter(card => !consumed.has(card.id)), ...grouped];
+  return [...cards.filter((card) => !consumed.has(card.id)), ...grouped];
 }
 
 /** Column contents: pinned cards first (their placement order decides among

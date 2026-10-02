@@ -10,10 +10,14 @@ export function WslProjectDialog({
   cwd,
   onOpen,
   onClose,
+  title = "Open project",
+  confirmLabel = "Open",
 }: {
   cwd: string;
   onOpen: (paths: string[]) => void;
   onClose: () => void;
+  title?: string;
+  confirmLabel?: string;
 }) {
   const form = useRef<HTMLFormElement>(null);
   const previousFocus = useRef(document.activeElement);
@@ -120,7 +124,7 @@ export function WslProjectDialog({
     <Modal
       size="sm"
       className="[&_header_p]:text-content/75"
-      title="Open project"
+      title={title}
       description="Choose where this repository and its tools run."
       onClose={close}
     >
@@ -273,7 +277,7 @@ export function WslProjectDialog({
             disabled={busy || Boolean(distribution && (loading || !path.trim()))}
             className="rounded-md bg-content px-3 py-1.5 text-background-base disabled:opacity-40"
           >
-            {busy ? "Opening…" : distribution ? "Open" : "Browse…"}
+            {busy ? "Connecting…" : distribution ? confirmLabel : "Browse…"}
           </button>
         </div>
       </form>

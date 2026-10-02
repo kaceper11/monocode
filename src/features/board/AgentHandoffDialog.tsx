@@ -1,4 +1,9 @@
-import { ChevronRight, ExternalLink, RefreshCw } from "../../shared/ui/icons";
+import {
+  ChevronRight,
+  ExternalLink,
+  LoaderCircle,
+  RefreshCw,
+} from "../../shared/ui/icons";
 import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Checkbox } from "../../shared/ui/Checkbox";
@@ -9,26 +14,22 @@ import { getSession } from "../sessions/data/sessionStore";
 import { type Session } from "../sessions/model/session";
 import { listWorktrees } from "../source-control/model/worktrees";
 import { pathKey, prettyCwd, projectName } from "../../shared/lib/paths";
-import { loadBoard, type TaskWorkstream } from "./boardStore";
+import { type TaskWorkstream } from "./boardStore";
 import {
   checkEvidence,
-  checkState,
   commentEvidence,
   deliveryKey,
-  evidenceFingerprint,
-  handoffPrompt,
+  isFailedCheck,
   loadComments,
   matchesTarget,
   probeDelivery,
-  snapshotIdentity,
   type DeliverySnapshot,
   type DeliveryTarget,
   type Evidence,
   type ReviewComment,
   type SendToSession,
 } from "./delivery";
-
-export type HandoffKind = "ci" | "comments";
+import { sendHandoff, type HandoffKind } from "./handoff";
 const inputClass =
   "w-full rounded-md border border-stroke bg-background-base px-2 py-1.5 text-[12px] text-content outline-none focus-visible:ring-1 focus-visible:ring-accent";
 export function AgentHandoffDialog({
@@ -39,9 +40,11 @@ export function AgentHandoffDialog({
   onSpawn,
   onSend,
   onClose,
+  evidenceIds,
 }: {
   workstreams: TaskWorkstream[];
   taskId?: string;
+  evidenceIds?: readonly string[];
   kind: HandoffKind;
   sessions: Session[];
   onSpawn: (
@@ -50,6 +53,7 @@ export function AgentHandoffDialog({
   onSend: SendToSession;
   onClose: () => void;
 }) {
+  const [requestId] = useState(() => crypto.randomUUID());
   const [laneId, setLaneId] = useState(
     workstreams.length === 1 ? workstreams[0].id : "",
   );
@@ -86,7 +90,11 @@ export function AgentHandoffDialog({
   ) {
     if (kind === "ci") {
       if (value.ciError) throw new Error(value.ciError);
-      const failed = value.checks.filter((c) => checkState(c) === "failed");
+      const failed = value.checks.filter(
+        (c) =>
+          isFailedCheck(c, value.checks) &&
+          (!evidenceIds || evidenceIds.includes(c.id)),
+      );
       const result: Evidence[] = [];
       // ponytail: four 32 KiB log excerpts per review; remaining failures keep direct links.
       let excerpts = 0;
@@ -113,7 +121,7 @@ export function AgentHandoffDialog({
     }
     const thread = await loadComments(current, value);
     return {
-      items: (thread.comments as ReviewComment[]).map(commentEvidence),
+      items: (thread.comments as ReviewComment[]).map(commentEvidence).map(item => ({ ...item, selected: evidenceIds ? evidenceIds.includes(item.id) : item.selected })),
       truncated: thread.truncated,
     };
   }
@@ -166,9 +174,7 @@ export function AgentHandoffDialog({
       setTarget(dest);
       setItems(content.items);
       setCandidates(matching);
-      setRecipient(
-        matching.length === 1 ? matching[0].id : matching.length ? "" : "new",
-      );
+      setRecipient("new");
       setNotice(
         content.truncated
           ? "Only the fetched comments are shown; more are available on the provider."
@@ -202,76 +208,26 @@ export function AgentHandoffDialog({
     setSending(true);
     setError("");
     try {
-      const current = taskId
-        ? loadBoard()
-            .tasks.find((t) => t.id === taskId && !t.archived)
-            ?.workstreams.find((w) => w.id === ws.id)
-        : ws;
-      if (!current || deliveryKey(current) !== loadedKey.current)
-        throw new Error(
-          "Repository settings changed. Close and reopen this review.",
-        );
-      const trees = await listWorktrees(ws.projectPath);
-      const tree = trees.worktrees.find(
-        (t) => pathKey(t.path) === pathKey(target.cwd),
-      );
-      if (
-        !tree ||
-        tree.missing ||
-        tree.branch !== target.branch ||
-        tree.head !== target.head
-      )
-        throw new Error("Working copy changed. Refresh and review again.");
-      const fresh = await probeDelivery(current);
-      if (
-        snapshotIdentity(fresh) !== snapshotIdentity(snapshot) ||
-        (kind === "ci" && fresh.ciError)
-      )
-        throw new Error(
-          "Provider, revision or CI source changed. Refresh and review again.",
-        );
-      if (kind === "ci") {
-        const chosen = new Set(
-          items.filter((i) => i.selected).map((i) => i.id),
-        );
-        const before = snapshot.checks.filter((c) => chosen.has(c.id));
-        const after = fresh.checks.filter((c) => chosen.has(c.id));
-        if (JSON.stringify(before) !== JSON.stringify(after))
-          throw new Error("Selected checks changed. Refresh and review again.");
-      } else {
-        const latest = await evidence(current, fresh, false);
-        const chosen = new Set(
-          items.filter((i) => i.selected).map((i) => i.id),
-        );
-        if (
-          evidenceFingerprint(items.filter((i) => chosen.has(i.id))) !==
-          evidenceFingerprint(latest.items.filter((i) => chosen.has(i.id)))
-        )
-          throw new Error(
-            "Selected comments changed. Refresh and review again.",
-          );
-      }
-      let id = recipient;
-      if (recipient === "new") {
-        if (createdSession.current?.lane === ws.id)
-          id = createdSession.current.id;
-        else {
-          const created = await onSpawn(current);
-          if (pathKey(created.worktreePath) !== pathKey(target.cwd))
-            throw new Error("New session has a different working copy.");
-          id = created.sessionId;
-          createdSession.current = { lane: ws.id, id };
-        }
-      }
-      const accepted = await onSend(
-        id,
-        handoffPrompt(snapshot, target, instructions, items),
+      await sendHandoff({
+        taskId,
+        kind,
+        workstream: ws,
+        loadedKey: loadedKey.current,
+        snapshot,
         target,
-      );
-      if (!accepted)
-        throw new Error(
-          "The agent did not accept the request. Your selection and instructions are preserved.",
-        );
+        items,
+        instructions,
+        recipient,
+        requestId,
+        reuseSession: createdSession.current,
+        onSpawned: (spawned) => {
+          createdSession.current = spawned;
+        },
+        evidenceNow: async (current, fresh) =>
+          (await evidence(current, fresh, false)).items,
+        onSpawn,
+        onSend,
+      });
       onClose();
     } catch (e) {
       setError(String(e));
@@ -319,9 +275,19 @@ export function AgentHandoffDialog({
           </div>
         )}
         {loading ? (
-          <p role="status">Loading current evidence…</p>
+          <p
+            role="status"
+            aria-label="Loading current evidence"
+            className="flex justify-center py-6 text-content/50"
+          >
+            <LoaderCircle className="size-4 animate-spin" />
+          </p>
         ) : (
           <div className="max-h-64 space-y-2 overflow-y-auto">
+            {!!items.length && <div className="flex gap-3 text-[11px] text-content/60">
+              <button type="button" disabled={sending} onClick={() => setItems(current => current.map(item => ({ ...item, selected: true })))}>Select all loaded</button>
+              <button type="button" disabled={sending} onClick={() => setItems(current => current.map(item => ({ ...item, selected: false })))}>Clear selection</button>
+            </div>}
             {items.map((item, index) => (
               <div
                 key={item.id}

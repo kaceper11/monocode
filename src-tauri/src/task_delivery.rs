@@ -1,5 +1,5 @@
 //! Read-only, revision-bound delivery evidence for the existing board lanes.
-use crate::fs::{expand_home, gh_checked, git_pr_status_for, git_run, GitPr};
+use crate::fs::{expand_home, gh_checked, git_branch, git_pr_status_for_target, git_run, GitPr};
 use crate::{azure_devops as az, azure_devops_board as az_board, gitlab as gl};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -58,6 +58,7 @@ pub struct Check {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    remote_name: String,
     pr: Option<GitPr>,
     source: Source,
     head_sha: String,
@@ -137,6 +138,7 @@ fn source(
     root: &Path,
     provider: &Provider,
     binding: Option<&CiBinding>,
+    remote_url: Option<&str>,
 ) -> Result<Source, String> {
     let (repo, host, account) = match provider {
         Provider::Github => {
@@ -152,6 +154,8 @@ fn source(
                     return Err("Invalid GitHub host".into());
                 }
                 (b.repo.clone(), host.to_string())
+            } else if let Some(remote_url) = remote_url {
+                remote_parts(remote_url)?
             } else {
                 let value: Value = serde_json::from_str(&gh_checked(
                     root,
@@ -179,7 +183,11 @@ fn source(
             let config = gl::require_config(app)?;
             let repo = match binding.filter(|b| !b.repo.is_empty()) {
                 Some(b) => gl::validate_repo(&b.repo)?,
-                None => gl::gitlab_repo_for(root, &config.url)?,
+                None => match remote_url {
+                    Some(url) => gl::project_from_remote(url, &config.url)
+                        .ok_or("Selected remote does not match the GitLab connection")?,
+                    None => gl::gitlab_repo_for(root, &config.url)?,
+                },
             };
             (repo, config.url, account(&config.token))
         }
@@ -187,7 +195,11 @@ fn source(
             let config = az::require_config(app)?;
             let repo = match binding.filter(|b| !b.project.is_empty()) {
                 Some(b) => b.project.clone(),
-                None => az::azure_devops_repo_for(root, &config.url)?,
+                None => match remote_url {
+                    Some(url) => az::project_repo_from_remote(url, &config.url)
+                        .ok_or("Selected remote does not match the Azure connection")?,
+                    None => az::azure_devops_repo_for(root, &config.url)?,
+                },
             };
             (repo, config.url, account(&config.token))
         }
@@ -212,20 +224,117 @@ fn source(
         account,
     })
 }
-fn detect(app: &AppHandle, root: &Path) -> Result<Provider, String> {
-    if let Some(config) = az::read_config(app)? {
-        if az::azure_devops_repo_for(root, &config.url).is_ok() {
-            return Ok(Provider::Azuredevops);
-        }
+fn remote_parts(remote: &str) -> Result<(String, String), String> {
+    let parsed = if remote.contains("://") {
+        url::Url::parse(remote).map_err(|_| "Invalid remote URL")?
+    } else {
+        let (authority, path) = remote.split_once(':').ok_or("Unsupported local remote")?;
+        url::Url::parse(&format!("ssh://{authority}/{path}")).map_err(|_| "Invalid remote URL")?
+    };
+    let host = parsed.host_str().ok_or("Remote has no host")?.to_string();
+    let repo = parsed
+        .path()
+        .trim_matches('/')
+        .trim_end_matches(".git")
+        .to_string();
+    Ok((repo, host))
+}
+fn detect_remote(app: &AppHandle, remote: &str) -> Result<Provider, String> {
+    if az::parse_azure_remote(remote).is_some() {
+        return Ok(Provider::Azuredevops);
     }
-    if let Some(config) = gl::read_config(app)? {
-        if gl::gitlab_repo_for(root, &config.url).is_ok() {
-            return Ok(Provider::Gitlab);
-        }
+    let (_, host) = remote_parts(remote)?;
+    if host.eq_ignore_ascii_case("gitlab.com")
+        || gl::read_config(app)?.is_some_and(|c| gl::project_from_remote(remote, &c.url).is_some())
+    {
+        return Ok(Provider::Gitlab);
     }
-    // gh must resolve a real GitHub repository; no successful fallback to an empty status.
-    gh_checked(root, &["repo", "view", "--json", "nameWithOwner"])?;
-    Ok(Provider::Github)
+    if host.eq_ignore_ascii_case("github.com") {
+        return Ok(Provider::Github);
+    }
+    Err("Choose a PR provider for this remote host in PR / CI sources".into())
+}
+fn selected_remote(root: &Path, branch: &str, selected: Option<&str>) -> Result<String, String> {
+    let remotes = git_run(root, &["remote"]).ok_or("Cannot list Git remotes")?;
+    let names: Vec<&str> = remotes.lines().collect();
+    let tracked = git_run(
+        root,
+        &["config", "--get", &format!("branch.{branch}.remote")],
+    );
+    let preferred = tracked
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| names.contains(name));
+    let name = selected
+        .or(preferred)
+        .or_else(|| names.iter().find(|n| **n == "origin").copied())
+        .or_else(|| {
+            if names.len() == 1 {
+                names.first().copied()
+            } else {
+                None
+            }
+        })
+        .ok_or("Choose a Git remote for this task")?;
+    if !names.contains(&name) || name.starts_with('-') {
+        return Err("Selected Git remote is no longer available".into());
+    }
+    Ok(name.to_string())
+}
+#[tauri::command]
+pub async fn task_delivery_validate_source(
+    app: AppHandle,
+    cwd: String,
+    expected: Source,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let binding = CiBinding {
+            provider: expected.provider.clone(),
+            repo: expected.repo.clone(),
+            project: if expected.provider == Provider::Azuredevops {
+                expected.repo.clone()
+            } else {
+                String::new()
+            },
+            definition_ids: vec![],
+            host: expected.host.clone(),
+        };
+        let current = source(
+            &app,
+            &expand_home(&cwd),
+            &expected.provider,
+            Some(&binding),
+            None,
+        )?;
+        if current != expected {
+            return Err("Provider connection changed; refresh the evidence".into());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub async fn task_delivery_remotes(cwd: String, branch: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        let preferred = selected_remote(&root, &branch, None).ok();
+        let names = git_run(&root, &["remote"]).ok_or("Cannot list Git remotes")?;
+        let rows: Vec<Value> = names
+            .lines()
+            .map(|name| {
+                // Display repository identity, never an HTTPS password/token embedded in a URL.
+                let raw = git_run(&root, &["remote", "get-url", name]).unwrap_or_default();
+                let url = remote_parts(raw.trim())
+                    .map(|(repo, host)| format!("{host}/{repo}"))
+                    .unwrap_or_else(|_| "Local remote".into());
+                json!({"name":name,"url":url,"preferred":preferred.as_deref()==Some(name)})
+            })
+            .collect();
+        Ok(json!(rows))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 fn pinned_number(pin: Option<&str>, source: &Source) -> Result<Option<i64>, String> {
     let Some(pin) = pin.filter(|p| !p.trim().is_empty()) else {
@@ -280,7 +389,12 @@ fn pr_snapshot(
     let number = pinned_number(pin, source)?;
     match source.provider {
         Provider::Github => {
-            let pr = git_pr_status_for(root, pin)?;
+            let pr = git_pr_status_for_target(
+                root,
+                pin,
+                Some((&source.repo, &source.host)),
+                Some(branch),
+            )?;
             let Some(pr) = pr else {
                 return Ok((None, String::new(), vec![], branch.to_string()));
             };
@@ -395,10 +509,14 @@ fn pr_snapshot(
 fn bucket(state: &str) -> &str {
     match state.to_ascii_lowercase().as_str() {
         "success" | "succeeded" => "pass",
-        "failed" | "failure" | "error" | "startup_failure" | "timed_out" | "partiallysucceeded" => {
-            "fail"
-        }
-        "canceled" | "cancelled" => "cancel",
+        "failed"
+        | "failure"
+        | "error"
+        | "startup_failure"
+        | "timed_out"
+        | "partiallysucceeded"
+        | "succeededwithissues" => "fail",
+        "canceled" | "cancelled" | "abandoned" => "cancel",
         "skipped" | "neutral" => "skipping",
         "manual" | "blocked" | "action_required" => "blocked",
         "scheduled"
@@ -419,6 +537,7 @@ fn gitlab_checks(
     source: &Source,
     sha: &str,
     validation: &[String],
+    refs: &[String],
 ) -> Result<Vec<Check>, String> {
     let config = gl::require_config(app)?;
     let prefix = format!("/projects/{}", gl::encode_path_component(&source.repo));
@@ -443,6 +562,7 @@ fn gitlab_checks(
             .as_array()
             .ok_or("Invalid GitLab pipelines")?
             .iter()
+            .filter(|run| field(run, "sha") == revision && ci_ref_matches(&field(run, "ref"), refs))
             .filter(|run| sources.insert(field(run, "source")))
         {
             let run_id = run["id"].as_i64().ok_or("Missing pipeline ID")?;
@@ -559,7 +679,9 @@ fn azure_checks(
                 {
                     let revision = field(run, "sourceVersion");
                     let pr_source = pointer(run, "/triggerInfo/pr.sourceSha");
-                    if !revision_matches(&revision, &pr_source, sha, validation) {
+                    if !ci_ref_matches(&field(run, "sourceBranch"), refs)
+                        || !revision_matches(&revision, &pr_source, sha, validation)
+                    {
                         continue;
                     }
                     let definition = run["definition"]["id"]
@@ -637,8 +759,103 @@ fn revision_matches(revision: &str, pr_source: &str, head: &str, validation: &[S
             || pr_source == head
             || (!revision.is_empty() && validation.iter().any(|s| s == revision)))
 }
-fn github_checks(root: &Path, source: &Source, sha: &str) -> Result<Vec<Check>, String> {
+// Branch names and native full refs compare exactly; never match by suffix.
+/// True when `branch` is the synthetic `pr/<number>` checkout of a pinned
+/// review lane — there the pin is the identity, not the branch name.
+fn review_lane_branch(branch: &str, pr_number: i64) -> bool {
+    branch == format!("pr/{pr_number}")
+}
+
+/// CI refs to poll for a lane. A review lane's checkout branch is the
+/// synthetic `pr/<N>` — no pipeline ever runs on it; the PR's real head
+/// branch (`source_branch`) carries the push-triggered CI instead.
+fn ci_refs(
+    branch: &str,
+    source_branch: &str,
+    review_lane: bool,
+    pr_number: Option<i64>,
+    provider: &Provider,
+) -> Vec<String> {
+    let ci_branch = if review_lane && !source_branch.is_empty() {
+        source_branch
+    } else {
+        branch
+    };
+    let mut refs = vec![format!(
+        "refs/heads/{}",
+        ci_branch.strip_prefix("refs/heads/").unwrap_or(ci_branch)
+    )];
+    if let Some(number) = pr_number {
+        refs.push(match provider {
+            Provider::Github | Provider::Azuredevops => format!("refs/pull/{number}/merge"),
+            Provider::Gitlab => format!("refs/merge-requests/{number}/merge"),
+        });
+        if *provider == Provider::Gitlab {
+            refs.push(format!("refs/merge-requests/{number}/head"));
+        }
+    }
+    refs
+}
+
+fn ci_ref_matches(value: &str, refs: &[String]) -> bool {
+    refs.is_empty()
+        || (!value.is_empty()
+            && refs.iter().any(|reference| {
+                reference.strip_prefix("refs/heads/").unwrap_or(reference)
+                    == value.strip_prefix("refs/heads/").unwrap_or(value)
+            }))
+}
+fn github_suite_matches(suite: &Value, sha: &str, branch: &str) -> bool {
+    if field(suite, "head_sha") != sha {
+        return false;
+    }
+    let head_branch = field(suite, "head_branch");
+    if !head_branch.is_empty() {
+        return ci_ref_matches(&head_branch, &[branch.into()]);
+    }
+    // Fork checks can have no head_branch; the PR's source ref is the fallback.
+    suite["pull_requests"].as_array().is_some_and(|prs| {
+        prs.iter().any(|pr| {
+            ci_ref_matches(&pointer(pr, "/head/ref"), &[branch.into()])
+                && !pointer(pr, "/head/sha").is_empty()
+        })
+    })
+}
+fn github_checks(
+    root: &Path,
+    source: &Source,
+    sha: &str,
+    branch: &str,
+) -> Result<Vec<Check>, String> {
     let mut checks = vec![];
+    let mut suites = HashSet::new();
+    for page in 1..=5 {
+        let value = github(
+            root,
+            &source.host,
+            &format!(
+                "repos/{}/commits/{}/check-suites?per_page=100&page={page}",
+                source.repo, sha
+            ),
+        )?;
+        let rows = value["check_suites"]
+            .as_array()
+            .ok_or("Invalid GitHub check suites")?;
+        for suite in rows
+            .iter()
+            .filter(|suite| github_suite_matches(suite, sha, branch))
+        {
+            if let Some(id) = suite["id"].as_i64() {
+                suites.insert(id);
+            }
+        }
+        if rows.len() < 100 {
+            break;
+        }
+        if page == 5 {
+            return Err("GitHub check suite results are incomplete".into());
+        }
+    }
     for page in 1..=5 {
         let value = github(
             root,
@@ -652,6 +869,13 @@ fn github_checks(root: &Path, source: &Source, sha: &str) -> Result<Vec<Check>, 
             .as_array()
             .ok_or("Invalid GitHub checks")?;
         for row in rows {
+            if field(row, "head_sha") != sha
+                || !row["check_suite"]["id"]
+                    .as_i64()
+                    .is_some_and(|id| suites.contains(&id))
+            {
+                continue;
+            }
             let state = if field(row, "conclusion").is_empty() {
                 field(row, "status")
             } else {
@@ -666,7 +890,7 @@ fn github_checks(root: &Path, source: &Source, sha: &str) -> Result<Vec<Check>, 
                 url: field(row, "details_url"),
                 sha: field(row, "head_sha"),
                 source: source.clone(),
-                run_id: None,
+                run_id: github_job(&field(row, "details_url"), source).map(|(run, _)| run),
                 job_id: Some(id),
             });
         }
@@ -677,42 +901,12 @@ fn github_checks(root: &Path, source: &Source, sha: &str) -> Result<Vec<Check>, 
             return Err("GitHub check results are incomplete".into());
         }
     }
-    for page in 1..=5 {
-        let value = github(
-            root,
-            &source.host,
-            &format!(
-                "repos/{}/commits/{}/status?per_page=100&page={page}",
-                source.repo, sha
-            ),
-        )?;
-        let rows = value["statuses"]
-            .as_array()
-            .ok_or("Invalid GitHub statuses")?;
-        for row in rows {
-            let state = field(row, "state");
-            checks.push(Check {
-                id: format!("github-status:{}", row["id"]),
-                name: field(row, "context"),
-                bucket: bucket(&state).into(),
-                state,
-                url: field(row, "target_url"),
-                sha: sha.into(),
-                source: source.clone(),
-                run_id: None,
-                job_id: None,
-            });
-        }
-        if rows.len() < 100 {
-            break;
-        }
-        if page == 5 {
-            return Err("GitHub status results are incomplete".into());
-        }
-    }
+    // Legacy commit statuses carry no branch identity. Showing them here could
+    // attach another branch's CI to this task when both branches share a SHA.
     Ok(checks)
 }
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Keep the existing command payload compatible.
 pub async fn task_delivery_probe(
     app: AppHandle,
     cwd: String,
@@ -720,6 +914,8 @@ pub async fn task_delivery_probe(
     pr_url: Option<String>,
     pr_provider: Option<Provider>,
     ci: Option<CiBinding>,
+    remote: Option<String>,
+    checkout_bound: Option<bool>,
 ) -> Result<Snapshot, String> {
     tauri::async_runtime::spawn_blocking(move || {
         if let Some(binding) = &ci {
@@ -733,40 +929,115 @@ pub async fn task_delivery_probe(
             }
         }
         let root = expand_home(&cwd);
+        // `cwd` is the lane's own checkout only when the caller says so — a
+        // cleaned lane probes via the project root, and a drifted worktree is
+        // not the lane's checkout either. In both cases only the pinned PR is
+        // meaningful, so the checkout-branch check does not apply.
+        let checkout_bound = checkout_bound.unwrap_or(true);
+        if checkout_bound
+            && !ci_ref_matches(
+                &git_branch(&root).unwrap_or_default(),
+                std::slice::from_ref(&branch),
+            )
+        {
+            return Err(
+                "Task checkout branch changed. Review its repository binding before refreshing CI."
+                    .into(),
+            );
+        }
+        let name = selected_remote(&root, &branch, remote.as_deref())?;
+        let remote_url = git_run(&root, &["remote", "get-url", &name])
+            .ok_or("Cannot read selected Git remote")?;
+        let detected = detect_remote(&app, remote_url.trim());
+        let explicit = pr_provider.is_some();
         let provider = match pr_provider {
             Some(p) => p,
-            None => detect(&app, &root)?,
+            None => detected.clone()?,
         };
-        let source = source(&app, &root, &provider, None)?;
-        let local_head = git_run(&root, &["rev-parse", "HEAD"])
-            .ok_or("Could not read checkout HEAD")?
-            .trim()
-            .to_string();
+        let use_remote = !explicit
+            || detected.as_ref().is_err()
+            || detected.as_ref().is_ok_and(|p| *p == provider);
+        let source = source(
+            &app,
+            &root,
+            &provider,
+            None,
+            use_remote.then_some(remote_url.trim()),
+        )?;
+        // Only meaningful for the lane's own checkout — for a project-root
+        // probe the root's HEAD belongs to the user's main checkout, and
+        // recording it would drift the lane's snapshot identity on every move.
+        let local_head = if checkout_bound {
+            git_run(&root, &["rev-parse", "HEAD"])
+                .ok_or("Could not read checkout HEAD")?
+                .trim()
+                .to_string()
+        } else {
+            String::new()
+        };
         let (pr, head, validation, source_branch) =
             pr_snapshot(&app, &root, &source, &branch, pr_url.as_deref())?;
         if pr.is_some() && head.is_empty() {
             return Err("Provider did not return the PR head revision".into());
         }
+        // Review lanes check out the synthetic `pr/<number>` branch — it
+        // never equals the PR's real head name, so the pin (not the branch)
+        // is the identity there. Any other lane must still match its PR.
+        let review_lane = pr
+            .as_ref()
+            .is_some_and(|pr| review_lane_branch(&branch, pr.number));
+        if pr.is_some()
+            && !review_lane
+            && !ci_ref_matches(&source_branch, std::slice::from_ref(&branch))
+        {
+            return Err(
+                "The linked PR belongs to a different branch than this task checkout.".into(),
+            );
+        }
+        let refs = ci_refs(
+            &branch,
+            &source_branch,
+            review_lane,
+            pr.as_ref().map(|pr| pr.number),
+            &source.provider,
+        );
         let head_sha = if head.is_empty() {
             local_head.clone()
         } else {
             head
         };
         let ci_source = match &ci {
-            Some(b) => self::source(&app, &root, &b.provider, Some(b)),
+            Some(b) => self::source(
+                &app,
+                &root,
+                &b.provider,
+                Some(b),
+                if b.provider == source.provider && use_remote {
+                    Some(remote_url.trim())
+                } else {
+                    None
+                },
+            ),
             None => Ok(source.clone()),
         };
         let (checks, ci_error, ci_source) = match ci_source {
             Ok(cs) => {
                 let result = match cs.provider {
                     Provider::Github => (|| {
-                        let mut checks = github_checks(&root, &cs, &head_sha)?;
+                        // Review lanes carry the synthetic `pr/<N>` name while
+                        // suites report the PR's real head branch.
+                        let suite_branch = if review_lane && !source_branch.is_empty() {
+                            &source_branch
+                        } else {
+                            &branch
+                        };
+                        let mut checks = github_checks(&root, &cs, &head_sha, suite_branch)?;
                         if cs == source {
                             for sha in validation
                                 .iter()
                                 .filter(|sha| !sha.is_empty() && **sha != head_sha)
                             {
-                                checks.extend(github_checks(&root, &cs, sha)?);
+                                checks.extend(github_checks(&root, &cs, sha, suite_branch)?);
                             }
                         }
                         let mut seen = HashSet::new();
@@ -779,32 +1050,10 @@ pub async fn task_delivery_probe(
                         &cs,
                         &head_sha,
                         if cs == source { &validation } else { &[] },
+                        if cs == source { &refs } else { &refs[..1] },
                     )
                     .map(|checks| (checks, None)),
                     Provider::Azuredevops => az::require_config(&app).and_then(|config| {
-                        let source_branch = if source_branch.is_empty() {
-                            &branch
-                        } else {
-                            &source_branch
-                        };
-                        let mut refs = vec![if source_branch.starts_with("refs/") {
-                            source_branch.clone()
-                        } else {
-                            format!("refs/heads/{source_branch}")
-                        }];
-                        // Native PR providers expose these validation refs to Azure Pipelines.
-                        if let Some(pr) = &pr {
-                            refs.push(match source.provider {
-                                Provider::Github | Provider::Azuredevops => {
-                                    format!("refs/pull/{}/merge", pr.number)
-                                }
-                                Provider::Gitlab => {
-                                    format!("refs/merge-requests/{}/merge", pr.number)
-                                }
-                            });
-                        }
-                        refs.sort();
-                        refs.dedup();
                         azure_checks(
                             &config,
                             &cs,
@@ -822,7 +1071,22 @@ pub async fn task_delivery_probe(
             }
             Err(e) => (vec![], Some(e), None),
         };
+        if checkout_bound
+            && (!ci_ref_matches(
+                &git_branch(&root).unwrap_or_default(),
+                std::slice::from_ref(&branch),
+            ) || git_run(&root, &["rev-parse", "HEAD"])
+                .map(|value| value.trim().to_string())
+                .as_deref()
+                != Some(&local_head))
+        {
+            return Err(
+                "Task checkout changed while refreshing CI. Refresh after reviewing its branch."
+                    .into(),
+            );
+        }
         Ok(Snapshot {
+            remote_name: name,
             pr,
             source,
             head_sha,
@@ -862,6 +1126,175 @@ fn read_log(response: ureq::Response) -> Result<Log, String> {
         text: String::from_utf8_lossy(&bytes).into_owned(),
         truncated,
     })
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailNode {
+    id: String,
+    parent_id: Option<String>,
+    kind: String,
+    name: String,
+    state: String,
+    started_at: String,
+    completed_at: String,
+}
+#[derive(Serialize)]
+pub struct CheckDetails {
+    nodes: Vec<DetailNode>,
+    annotations: Value,
+    notice: Option<String>,
+}
+fn detail_node(
+    value: &Value,
+    id: String,
+    parent_id: Option<String>,
+    kind: &str,
+    state: &str,
+    start: &str,
+    end: &str,
+) -> DetailNode {
+    DetailNode {
+        id,
+        parent_id,
+        kind: kind.into(),
+        name: field(value, "name"),
+        state: bucket(state).into(),
+        started_at: field(value, start),
+        completed_at: field(value, end),
+    }
+}
+fn timeline_nodes(timeline: &Value) -> Result<Vec<DetailNode>, String> {
+    let mut records = timeline["records"]
+        .as_array()
+        .ok_or("Build timeline unavailable")?
+        .iter()
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    records.retain(|record| {
+        seen.insert((field(record, "id"), record["attempt"].as_i64().unwrap_or(1)))
+    });
+    records.sort_by_key(|v| v["order"].as_i64().unwrap_or_default());
+    let ids = records
+        .iter()
+        .map(|record| (field(record, "id"), record["attempt"].as_i64().unwrap_or(1)))
+        .collect::<HashSet<_>>();
+    Ok(records
+        .into_iter()
+        .take(1000)
+        .map(|record| {
+            let result = field(record, "result");
+            let state = if result.is_empty() {
+                field(record, "state")
+            } else {
+                result
+            };
+            let kind = match field(record, "type").as_str() {
+                "Stage" => "stage",
+                "Job" => "job",
+                _ => "step",
+            };
+            let attempt = record["attempt"].as_i64().unwrap_or(1);
+            let node_id = |id: String, attempt: i64| {
+                if attempt > 1 {
+                    format!("{id}:attempt:{attempt}")
+                } else {
+                    id
+                }
+            };
+            let parent = record["parentId"].as_str().map(|id| {
+                node_id(
+                    id.to_string(),
+                    if ids.contains(&(id.to_string(), attempt)) {
+                        attempt
+                    } else {
+                        1
+                    },
+                )
+            });
+            let mut node = detail_node(
+                record,
+                node_id(field(record, "id"), attempt),
+                parent,
+                kind,
+                &state,
+                "startTime",
+                "finishTime",
+            );
+            if attempt > 1 {
+                node.name = format!("{} · attempt {}", node.name, attempt);
+            }
+            node
+        })
+        .collect())
+}
+#[tauri::command]
+pub async fn task_delivery_details(
+    app: AppHandle,
+    cwd: String,
+    check: Check,
+) -> Result<CheckDetails, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        let s = &check.source;
+        let mut details = CheckDetails { nodes: vec![], annotations: json!([]), notice: None };
+        match s.provider {
+            Provider::Github => {
+                if s.repo.split('/').count() != 2 || !s.repo.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.')) { return Err("Invalid GitHub repository".into()); }
+                let user = github(&root, &s.host, "user")?;
+                if user["id"].as_u64() != s.account.parse::<u64>().ok() { return Err("GitHub account changed".into()); }
+                let id = check.job_id.filter(|id| *id > 0).ok_or("External check: details are available on its provider")?;
+                let run = github(&root, &s.host, &format!("repos/{}/check-runs/{id}", s.repo))?;
+                if field(&run, "head_sha") != check.sha { return Err("Check revision changed".into()); }
+                let (_, job) = github_job(&field(&run, "details_url"), s).ok_or("External check: details are available on its provider")?;
+                let native = crate::fs::github_check_details_with(&s.repo, &job.to_string(), &s.host, |endpoint| github_read(&root, &["api", "--hostname", &s.host, endpoint]))?;
+                let native = serde_json::to_value(native).map_err(|e| e.to_string())?;
+                details.nodes = native["steps"].as_array().ok_or("Job steps unavailable")?.iter().enumerate().map(|(index, step)| DetailNode { id: index.to_string(), parent_id: None, kind: "step".into(), name: field(step, "name"), state: field(step, "state"), started_at: field(step, "startedAt"), completed_at: field(step, "completedAt") }).collect();
+                details.annotations = native["annotations"].clone();
+                details.notice = native["notice"].as_str().map(str::to_string);
+            }
+            Provider::Azuredevops => {
+                let config = az::require_config(&app)?;
+                if config.url != s.host || account(&config.token) != s.account { return Err("Azure connection changed".into()); }
+                let id = check.run_id.filter(|id| *id > 0).ok_or("Missing build ID")?;
+                let prefix = format!("/{}/_apis/build/builds/{id}", az::encode_segment(&s.repo));
+                let build = az::azure_get(&config, &format!("{prefix}?api-version=7.1"))?.value;
+                if field(&build, "sourceVersion") != check.sha { return Err("Build revision changed".into()); }
+                let timeline = az::azure_get(&config, &format!("{prefix}/timeline?api-version=7.1"))?.value;
+                details.nodes = timeline_nodes(&timeline)?;
+                details.annotations = json!(timeline["records"].as_array().into_iter().flatten().flat_map(|record| record["issues"].as_array().into_iter().flatten().map(|issue| json!({"path":"","line":0,"message":field(issue,"message"),"level":field(issue,"type")}))).take(100).collect::<Vec<_>>());
+                if timeline["records"].as_array().is_some_and(|r| r.len() > 1000) { details.notice = Some("Timeline truncated; open Azure for the complete run".into()); }
+            }
+            Provider::Gitlab => {
+                let config = gl::require_config(&app)?;
+                if config.url != s.host || account(&config.token) != s.account { return Err("GitLab connection changed".into()); }
+                let repo = gl::validate_repo(&s.repo)?;
+                let prefix = format!("/projects/{}", gl::encode_path_component(&repo));
+                if let Some(id) = check.job_id.filter(|id| *id > 0) {
+                    let job = gl::gitlab_get(&config, &format!("{prefix}/jobs/{id}"))?.value;
+                    if pointer(&job, "/commit/id") != check.sha { return Err("Job revision changed".into()); }
+                    details.nodes.push(detail_node(&job, id.to_string(), None, "job", &field(&job,"status"), "started_at", "finished_at"));
+                    details.notice = Some("GitLab reports job status; script details are in the job log".into());
+                } else {
+                    let id = check.run_id.filter(|id| *id > 0).ok_or("Missing pipeline ID")?;
+                    let run = gl::gitlab_get(&config, &format!("{prefix}/pipelines/{id}"))?.value;
+                    if field(&run,"sha") != check.sha { return Err("Pipeline revision changed".into()); }
+                    let mut stages = HashSet::new();
+                    for page in 1..=5 {
+                        let response = gl::gitlab_get(&config, &format!("{prefix}/pipelines/{id}/jobs?per_page=100&page={page}"))?;
+                        for job in response.value.as_array().ok_or("Invalid GitLab jobs")? {
+                            let stage = field(job,"stage");
+                            let stage_id = format!("stage:{stage}");
+                            if stages.insert(stage.clone()) { details.nodes.push(DetailNode { id: stage_id.clone(), parent_id: None, kind: "stage".into(), name: stage, state: "unknown".into(), started_at: String::new(), completed_at: String::new() }); }
+                            details.nodes.push(detail_node(job, job["id"].to_string(), Some(stage_id), "job", &field(job,"status"), "started_at", "finished_at"));
+                        }
+                        if !response.has_next_page { break; }
+                        if page == 5 { details.notice = Some("Job list truncated; open GitLab for the complete pipeline".into()); }
+                    }
+                }
+            }
+        }
+        Ok(details)
+    }).await.map_err(|e| e.to_string())?
 }
 #[tauri::command]
 pub async fn task_delivery_log(app: AppHandle, cwd: String, check: Check) -> Result<Log, String> {
@@ -1007,6 +1440,153 @@ pub async fn task_delivery_log(app: AppHandle, cwd: String, check: Check) -> Res
 mod tests {
     use super::*;
 
+    #[test]
+    fn remote_identity_hides_credentials_and_accepts_ssh() {
+        for remote in [
+            "https://user:password@github.com/team/app.git",
+            "git@github.com:team/app.git",
+            "ssh://git@github.com/team/app.git",
+        ] {
+            assert_eq!(
+                remote_parts(remote).unwrap(),
+                ("team/app".into(), "github.com".into())
+            );
+        }
+        assert!(remote_parts("/local/repository").is_err());
+    }
+
+    #[test]
+    fn azure_native_timeline_preserves_hierarchy_order_and_uncertain_states() {
+        let nodes = timeline_nodes(&json!({"records":[
+            {"id":"step","parentId":"job","type":"Task","name":"Tests","order":3,"result":"failed"},
+            {"id":"stage","type":"Stage","name":"Build","order":1,"state":"inProgress"},
+            {"id":"job","parentId":"stage","type":"Job","name":"Linux","order":2,"result":"canceled"},
+            {"id":"unknown","type":"Task","name":"Unavailable","order":4,"state":"unavailable"}
+        ]})).unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["stage", "job", "step", "unknown"]
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.state.as_str())
+                .collect::<Vec<_>>(),
+            ["pending", "cancel", "fail", "unknown"]
+        );
+        assert_eq!(nodes[2].parent_id.as_deref(), Some("job"));
+        assert!(timeline_nodes(&json!({})).is_err());
+    }
+
+    #[test]
+    fn timeline_keeps_distinct_attempts_and_drops_duplicate_records() {
+        let record =
+            json!({"id":"job", "type":"Job", "name":"Tests", "order":1, "result":"failed"});
+        let retry = json!({"id":"job", "attempt":2, "type":"Job", "name":"Tests", "order":2, "result":"succeeded"});
+        let nodes = timeline_nodes(&json!({"records":[record.clone(), record, retry]})).unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].id, "job");
+        assert_eq!(nodes[1].id, "job:attempt:2");
+        assert_eq!(nodes[1].name, "Tests · attempt 2");
+    }
+
+    #[test]
+    fn ci_rejects_other_branches_even_when_the_commit_is_identical() {
+        let refs = vec![
+            "refs/heads/feature/a".into(),
+            "refs/merge-requests/42/merge".into(),
+        ];
+        assert!(ci_ref_matches("feature/a", &refs));
+        assert!(ci_ref_matches("refs/merge-requests/42/merge", &refs));
+        assert!(!ci_ref_matches("main", &refs));
+        assert!(!ci_ref_matches("refs/heads/other/feature/a", &refs));
+        assert!(!ci_ref_matches("refs/merge-requests/43/merge", &refs));
+        assert!(!ci_ref_matches("", &refs));
+        assert!(github_suite_matches(
+            &json!({"head_sha":"same", "head_branch":"feature/a"}),
+            "same",
+            "feature/a"
+        ));
+        assert!(!github_suite_matches(
+            &json!({"head_sha":"same", "head_branch":"main"}),
+            "same",
+            "feature/a"
+        ));
+        assert!(!github_suite_matches(
+            &json!({"head_sha":"old", "head_branch":"feature/a"}),
+            "same",
+            "feature/a"
+        ));
+        assert!(!github_suite_matches(
+            &json!({"head_sha":"same", "head_branch":null}),
+            "same",
+            "feature/a"
+        ));
+        assert!(github_suite_matches(
+            &json!({"head_sha":"same", "head_branch":null, "pull_requests":[{"head":{"ref":"feature/a", "sha":"same"}}]}),
+            "same",
+            "feature/a"
+        ));
+    }
+
+    #[test]
+    fn review_lane_branch_matches_only_the_pin_number() {
+        assert!(review_lane_branch("pr/42", 42));
+        assert!(!review_lane_branch("pr/43", 42));
+        assert!(!review_lane_branch("feature/pr/42", 42));
+        assert!(!review_lane_branch("pr/42-extra", 42));
+        assert!(!review_lane_branch("", 42));
+    }
+
+    #[test]
+    fn ci_refs_use_the_source_branch_for_review_lanes() {
+        // A review lane checks out synthetic `pr/42` — pipelines run on the
+        // PR's real head branch, so the branch ref must come from it.
+        assert_eq!(
+            ci_refs("pr/42", "feature/x", true, Some(42), &Provider::Github),
+            vec!["refs/heads/feature/x", "refs/pull/42/merge"]
+        );
+        assert_eq!(
+            ci_refs("pr/42", "feature/x", true, Some(42), &Provider::Gitlab),
+            vec![
+                "refs/heads/feature/x",
+                "refs/merge-requests/42/merge",
+                "refs/merge-requests/42/head"
+            ]
+        );
+        // Ordinary lanes keep their own branch; an empty source_branch falls
+        // back to it even on a review lane.
+        assert_eq!(
+            ci_refs("feature/x", "", false, Some(7), &Provider::Azuredevops),
+            vec!["refs/heads/feature/x", "refs/pull/7/merge"]
+        );
+        assert_eq!(
+            ci_refs("pr/42", "", true, Some(42), &Provider::Github),
+            vec!["refs/heads/pr/42", "refs/pull/42/merge"]
+        );
+        // No pin → branch ref alone, whatever the provider.
+        assert_eq!(
+            ci_refs("feature/x", "", false, None, &Provider::Gitlab),
+            vec!["refs/heads/feature/x"]
+        );
+    }
+
+    #[test]
+    fn review_binding_keeps_azure_project_repo_whole() {
+        // source()/pinned_number()/remote matching all expect the full
+        // "Project/Repo" — splitting it here broke every Azure review lane.
+        let binding = review_binding(&Provider::Azuredevops, "Project/Repo").unwrap();
+        assert_eq!(binding.project, "Project/Repo");
+        assert_eq!(binding.repo, "Project/Repo");
+        assert!(review_binding(&Provider::Azuredevops, "bare-repo").is_err());
+        let binding = review_binding(&Provider::Github, "a/b").unwrap();
+        assert!(binding.project.is_empty());
+        assert_eq!(binding.repo, "a/b");
+    }
+
     fn build(id: i64, definition: i64, sha: &str) -> Value {
         json!({"id": id, "definition": {"id": definition, "name": "Build"}, "sourceVersion": sha, "result": "succeeded"})
     }
@@ -1097,17 +1677,21 @@ mod tests {
     #[test]
     fn azure_ci_scopes_source_and_validation_refs_and_keeps_newest_run() {
         let mut running = build(11, 7, "merge");
+        running["sourceBranch"] = json!("refs/pull/42/merge");
         running["queueTime"] = json!("2026-09-24T12:00:00Z");
         running["result"] = json!("");
         running["status"] = json!("inProgress");
         let mut old = build(10, 7, "head");
+        old["sourceBranch"] = json!("refs/heads/feature/a");
+        let mut wrong_branch = build(99, 7, "head");
+        wrong_branch["sourceBranch"] = json!("refs/heads/main");
         old["queueTime"] = json!("2026-09-24T11:00:00Z");
         let (checks, error, requests) = azure_ref_pages(
             vec![
                 (
                     200,
                     Some("thousands-of-older-builds".into()),
-                    json!({"value":[old]}),
+                    json!({"value":[wrong_branch, old]}),
                 ),
                 (
                     200,
@@ -1333,6 +1917,27 @@ mod tests {
     }
 }
 
+/// The binding `task_review_remote` resolves through `source()`.
+/// `CiBinding.project` carries Azure's full "project/repo" form — the same
+/// convention `task_delivery_validate_source` uses. Splitting it here would
+/// hand `source()` a bare project name that `split_repo` and remote matching
+/// (which yields "project/repo") can never satisfy.
+fn review_binding(provider: &Provider, repo: &str) -> Result<CiBinding, String> {
+    let project = if *provider == Provider::Azuredevops {
+        az::split_repo(repo)?;
+        repo.to_string()
+    } else {
+        String::new()
+    };
+    Ok(CiBinding {
+        provider: provider.clone(),
+        repo: repo.to_string(),
+        project,
+        definition_ids: vec![],
+        host: String::new(),
+    })
+}
+
 /// Resolve the PR's exact repository before the review workflow fetches its head.
 #[tauri::command]
 pub async fn task_review_remote(
@@ -1344,20 +1949,19 @@ pub async fn task_review_remote(
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = expand_home(&cwd);
-        let (project, name) = if provider == Provider::Azuredevops {
-            let (project, name) = az::split_repo(&repo)?;
-            (project, name)
-        } else {
-            (String::new(), repo)
-        };
-        let binding = CiBinding {
-            provider: provider.clone(),
-            repo: name,
-            project,
-            definition_ids: vec![],
-            host: String::new(),
-        };
-        let expected = source(&app, &root, &provider, Some(&binding))?;
+        let mut binding = review_binding(&provider, &repo)?;
+        // A GitHub Enterprise pin names its instance — without it source()
+        // resolves github.com and both the pin check and the remote match
+        // below can never succeed for GHE repositories.
+        if provider == Provider::Github && binding.host.is_empty() {
+            if let Some(host) = url::Url::parse(&pr_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string))
+            {
+                binding.host = host;
+            }
+        }
+        let expected = source(&app, &root, &provider, Some(&binding), None)?;
         pinned_number(Some(&pr_url), &expected)?.ok_or("A review needs a PR URL")?;
         if provider == Provider::Github {
             return crate::fs::remote_matching_github_url(
@@ -1377,7 +1981,11 @@ pub async fn task_review_remote(
             } else {
                 az::project_repo_from_remote(parts[1], &expected.host)
             };
-            if matched.as_deref() == Some(expected.repo.as_str()) {
+            // Clone URLs can differ in case from the API's canonical path.
+            if matched
+                .as_deref()
+                .is_some_and(|m| m.eq_ignore_ascii_case(expected.repo.as_str()))
+            {
                 return Ok(parts[0].to_string());
             }
         }

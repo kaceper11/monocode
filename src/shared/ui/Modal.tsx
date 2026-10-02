@@ -47,13 +47,25 @@ export function ModalPanel({
 }: Props) {
   const popupHost = useContext(NativePopupHost);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const uid = useId();
   const titleId = `${uid}-title`;
   const descriptionId = description ? `${uid}-desc` : undefined;
 
   useEffect(() => {
+    const previous = document.activeElement;
     if (!minimalHeader) closeRef.current?.focus();
+    return () => {
+      // Only reclaim focus nobody else claimed — a follow-up dialog or an
+      // opener that restores its own trigger must not be overridden.
+      if (
+        previous instanceof HTMLElement &&
+        previous.isConnected &&
+        document.activeElement === document.body
+      )
+        previous.focus({ preventScroll: true });
+    };
   }, [minimalHeader]);
 
   useEffect(() => {
@@ -61,6 +73,8 @@ export function ModalPanel({
       if (
         event.key !== "Escape" ||
         event.defaultPrevented ||
+        Array.from(document.querySelectorAll('[aria-modal="true"]')).pop() !==
+          dialogRef.current ||
         (event.target instanceof Element &&
           event.target.closest("[data-dialog-popover]"))
       )
@@ -82,6 +96,7 @@ export function ModalPanel({
       }
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -90,7 +105,9 @@ export function ModalPanel({
         className={`relative isolate flex flex-col overflow-hidden rounded-2xl border border-content/7 shadow-2xl ${fitViewport ? "max-h-[calc(100dvh-32px)]" : "max-h-full"} ${className ?? ""}`}
       >
         <GlassBackdrop className="bg-background-base/55" />
-        <div className="modal-panel relative z-[1] flex min-h-0 flex-1 flex-col">
+        <div
+          className={`modal-panel relative z-[1] flex min-h-0 flex-col ${fitViewport ? "max-h-[calc(100dvh-34px)]" : "flex-1"}`}
+        >
           <header
             className={
               minimalHeader

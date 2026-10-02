@@ -35,7 +35,7 @@ it("summarizes tasks and expands details without opening or dragging the card", 
   })));
   expect(container.textContent).toContain("1 repo · 0 conversations · 1 ticket");
   expect(container.textContent).toContain("Worktree needs attention");
-  expect(container.textContent).not.toContain("feature/checkout");
+  expect(container.textContent).toContain("feature/checkout");
   expect(container.textContent).not.toContain("TASK-1");
   const expand = container.querySelector<HTMLButtonElement>('[aria-label="Details for Checkout"]')!;
   await act(async () => {
@@ -48,7 +48,7 @@ it("summarizes tasks and expands details without opening or dragging the card", 
   expect(onAction).not.toHaveBeenCalled();
   expect(onDragStart).not.toHaveBeenCalled();
   await act(async () => expand.click());
-  expect(container.textContent).not.toContain("feature/checkout");
+  expect(container.textContent).toContain("feature/checkout");
   await act(async () => container.querySelector<HTMLElement>('[data-board-card]')!.click());
   expect(onAction).toHaveBeenCalledWith(card, { kind: "open-task" });
 });
@@ -62,6 +62,29 @@ it("keeps validation errors in the CI details with wrapping and the complete mes
   expect(alert.textContent).toBe(error);
   expect(alert.className).toContain("[overflow-wrap:anywhere]");
   expect(alert.className).toContain("whitespace-pre-wrap");
+});
+
+it.each([
+  { ciTotal: 0, ciFailing: 0, ciRunning: 0, ciError: "Pipeline request failed", ciSummary: "CI unavailable" },
+  { ciTotal: 1, ciFailing: 0, ciRunning: 0, ciBlocked: true, ciSummary: "CI · 1 unknown" },
+])("preserves lane CI evidence when expanding and collapsing the task", async (ci) => {
+  const card: BoardCard = {
+    id: "task:ci", kind: "task", title: "CI task", sessions: [],
+    hasUpdate: false, ciTotal: ci.ciTotal, ciFailing: 0, ciRunning: 0, updatedAt: 0, derived: "todo",
+    workstreams: [{ id: "repo", projectPath: "/demo/frontend", branch: "feature", base: "main", sessionIds: [], sessions: [], ...ci }],
+  };
+  await act(async () => root.render(createElement(BoardCardView, {
+    card, column: "todo", columns: [], manual: false, pinned: false,
+    dragging: false, dropTarget: false, onAction: vi.fn(),
+  })));
+  const expand = container.querySelector<HTMLButtonElement>('[aria-label="Details for CI task"]')!;
+  expect(container.textContent).toContain(ci.ciSummary);
+  await act(async () => expand.click());
+  expect(container.textContent).toContain(ci.ciSummary);
+  expect(container.textContent).not.toContain("CI ✓");
+  if (ci.ciError) expect(container.querySelector('[title="Pipeline request failed"]')).not.toBeNull();
+  await act(async () => expand.click());
+  expect(container.textContent).toContain(ci.ciSummary);
 });
 
 it("expands a family and opens the selected original task", async () => {

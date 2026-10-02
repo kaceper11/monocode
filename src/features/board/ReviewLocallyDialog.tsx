@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invokeWorkspace as invoke } from "../../platform/tauri/fs";
 import { useId, useMemo, useState } from "react";
 import { Modal } from "../../shared/ui/Modal";
 import { Checkbox } from "../../shared/ui/Checkbox";
@@ -20,6 +20,7 @@ import {
   placeColumnOrder,
 } from "./boardStore";
 import { prHeadRemoteRef } from "./taskOps";
+import { withTaskGitLock } from "./TaskGitActions";
 import { createWorktree } from "../source-control/model/worktrees";
 import { gitFetchBranch } from "../../platform/tauri/fs";
 import { LAYER } from "../../shared/lib/layers";
@@ -121,15 +122,17 @@ export function ReviewLocallyDialog({
         throw new Error(`A lane already tracks ${branch}.`);
       // PR refs live on the base repo, so fork PRs resolve too; Azure
       // fetches the source branch (or the merge ref when it's unknown).
-      await gitFetchBranch(
-        projectPath,
-        remote,
-        prHeadRemoteRef(
-          item.provider as "github" | "gitlab" | "azuredevops",
-          item.number,
-          item.sourceRefName,
+      await withTaskGitLock(projectPath, "fetch", () =>
+        gitFetchBranch(
+          projectPath,
+          remote,
+          prHeadRemoteRef(
+            item.provider as "github" | "gitlab" | "azuredevops",
+            item.number,
+            item.sourceRefName,
+          ),
+          branch,
         ),
-        branch,
       );
       const base =
         item.targetRefName?.replace(/^refs\/heads\//, "") || "HEAD";
@@ -156,7 +159,9 @@ export function ReviewLocallyDialog({
       } else {
         // The fetch just created the branch — adopt it, don't rebuild.
         worktreePath = (
-          await createWorktree(projectPath, branch, base, true)
+          await withTaskGitLock(projectPath, "worktree creation", () =>
+            createWorktree(projectPath, branch, base, true),
+          )
         ).path;
       }
       const taskId = addTask({

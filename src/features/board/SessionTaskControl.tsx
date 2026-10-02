@@ -1,3 +1,4 @@
+import { useSavedProjects } from "../projects/model/savedProjects";
 import {
   useEffect,
   useMemo,
@@ -6,30 +7,52 @@ import {
   useSyncExternalStore,
 } from "react";
 import { Popover } from "../../shared/ui/Popover";
+import { LinkedIssueRow } from "./LinkedIssueRow";
+import { SearchableSelect } from "../../shared/ui/SearchableSelect";
 import {
-  CheckCircle,
+  ChartBreakoutSquare,
   ChevronDown,
   ExternalLink,
+  FolderTree,
   GitBranch,
+  PanelRight,
   Plus,
   X,
 } from "../../shared/ui/icons";
-import { pathKey, prettyCwd, projectName } from "../../shared/lib/paths";
+import {
+  pathKey,
+  prettyCwd,
+  projectName,
+} from "../../shared/lib/paths";
 import { sessionWorkCwd, type Session } from "../sessions/model/session";
 import {
+  taskWideSessionIds,
   boardFromSnapshot,
   boardSnapshot,
   subscribeBoard,
+  type BoardTask,
   type TaskWorkstream,
 } from "./boardStore";
 import { NewTaskDialog, type NewTaskSpec } from "./NewTaskDialog";
 import {
   attachTaskSession,
   detachTaskSession,
+  DOCK_TASK_EVENT,
   OPEN_TASK_EVENT,
+  sameExecutionHost,
   sessionTaskBindings,
   taskSessionCheckout,
 } from "./taskSession";
+
+/** Pick-row meta: up to two issue identifiers (then +N) and the lane count. */
+const pickMeta = (task: BoardTask) => {
+  const ids = task.links.map((link) => link.identifier).filter(Boolean);
+  return [
+    ...ids.slice(0, 2),
+    ...(ids.length > 2 ? [`+${ids.length - 2}`] : []),
+    `${task.workstreams.length} ${task.workstreams.length === 1 ? "repository" : "repositories"}`,
+  ].join(" · ");
+};
 
 const button =
   "rounded px-2 py-1 text-[11px] text-content/65 hover:bg-content/8 focus-visible:outline focus-visible:outline-accent disabled:opacity-40";
@@ -60,7 +83,13 @@ export function SessionTaskControl({ session }: { session: Session }) {
     };
   }, []);
   const cwd = sessionWorkCwd(session);
-  const primary = binding?.task.primarySessionId === session.id;
+  const taskWide =
+    !!binding && taskWideSessionIds(binding.task).includes(session.id);
+  const { projects } = useSavedProjects(session.cwd);
+  const project = projects.find(
+    (project) => project.id === binding?.task.projectId,
+  );
+  const [attachScope, setAttachScope] = useState<"task" | "repository">("task");
   const currentWorkstream =
     binding?.workstream ??
     binding?.task.workstreams.find(
@@ -72,10 +101,6 @@ export function SessionTaskControl({ session }: { session: Session }) {
     (session.workspaceMode === "worktree" && !session.worktreeCwd);
 
   const openTask = () => {
-    if (binding?.task.archived) {
-      setOpen(true);
-      return;
-    }
     if (binding)
       window.dispatchEvent(
         new CustomEvent(OPEN_TASK_EVENT, { detail: binding.task.id }),
@@ -87,6 +112,7 @@ export function SessionTaskControl({ session }: { session: Session }) {
     setOpen(false);
     setCreating(null);
     setError("");
+    setQuery("");
     trigger.current?.focus();
   };
   const run = async (action: (checkout: TaskWorkstream) => void) => {
@@ -133,9 +159,15 @@ export function SessionTaskControl({ session }: { session: Session }) {
         title: spec.title,
         links: spec.links,
         groupIds: spec.groupIds,
+        projectId: spec.projectId,
       });
       setCreating(null);
+      // Inline close — close() refuses while `working` is still set (it
+      // clears in run's finally, after this callback returns).
       setOpen(false);
+      setError("");
+      setQuery("");
+      trigger.current?.focus();
     });
 
   return (
@@ -159,17 +191,17 @@ export function SessionTaskControl({ session }: { session: Session }) {
           }}
           className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px] text-content/65 outline-none hover:bg-content/7 hover:text-content focus-visible:ring-1 focus-visible:ring-accent/60"
         >
-          <CheckCircle
+          <ChartBreakoutSquare
             aria-hidden
             className={`size-3.5 shrink-0 ${binding ? "text-accent" : "text-content/35"}`}
             strokeWidth={1.75}
           />
           <span className="truncate font-medium">
             {binding
-              ? binding.task.title
+              ? `${project ? `${project.name} / ` : ""}Task · ${binding.task.title}`
               : bindings.length
                 ? "Resolve task association"
-                : "Add to task"}
+                : `Ad hoc · ${projectName(session.cwd)}`}
           </span>
           {binding?.task.archived ? (
             <span className="text-content/40">Archived</span>
@@ -181,13 +213,15 @@ export function SessionTaskControl({ session }: { session: Session }) {
         </button>
         {binding ? (
           <span
-            className="ml-auto hidden min-w-0 items-center gap-1 truncate text-[10px] text-content/40 @sm:flex"
+            className="ml-auto flex shrink-0 items-center gap-1 truncate text-[10px] text-content/55"
             title={cwd}
           >
             <GitBranch aria-hidden className="size-3 shrink-0" />
-            {primary
-              ? `${binding.task.workstreams.length} working copies`
-              : currentWorkstream?.branch}
+            {taskWide
+              ? "All repositories"
+              : currentWorkstream
+                ? `${projectName(currentWorkstream.projectPath)} · ${currentWorkstream.branch}`
+                : projectName(session.cwd)}
           </span>
         ) : null}
       </div>
@@ -201,13 +235,21 @@ export function SessionTaskControl({ session }: { session: Session }) {
           role="dialog"
           aria-label={binding ? "Task context" : "Add to task"}
           onDismiss={close}
+          // The scope SearchableSelect's menu portals to body — it isn't an
+          // "outside" click, and it must not dismiss this popover.
+          ignore="[data-dialog-popover]"
           autoFocus={bindings.length > 0}
           tabIndex={-1}
         >
           <div className="flex flex-col text-[12px]">
             <div className="border-b border-content/8 px-3.5 py-3">
-              <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-content/40">
-                {binding ? "Shared task" : "Organize this conversation"}
+              <div className="mb-1 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-content/40">
+                <ChartBreakoutSquare
+                  aria-hidden
+                  className="size-3 shrink-0"
+                  strokeWidth={1.75}
+                />
+                {binding ? (project?.name ?? "Task") : "Ad hoc conversation"}
               </div>
               <div className="font-medium leading-snug text-content">
                 {binding ? binding.task.title : "Add to a task"}
@@ -216,17 +258,29 @@ export function SessionTaskControl({ session }: { session: Session }) {
                 {binding
                   ? binding.task.archived
                     ? "Archived task. Context is no longer added to messages."
-                    : primary
+                    : taskWide
                       ? "One conversation across this task’s working copies. Provider approvals still apply."
                       : "Task context is included with your next message."
                   : "Keep related agents and working copies together."}
               </p>
+              {binding && binding.task.links.length ? (
+                <div
+                  role="group"
+                  className="mt-2 flex flex-col"
+                  aria-label="Linked issues"
+                >
+                  {/* cleanLinkedItem guarantees a non-empty url on board data. */}
+                  {binding.task.links.map((link, index) => (
+                    <LinkedIssueRow key={index} issue={link} />
+                  ))}
+                </div>
+              ) : null}
             </div>
             {binding ? (
               <>
                 <div className="px-3.5 py-3">
                   <div className="mb-2 flex items-center gap-2 text-[10px] font-medium uppercase tracking-wider text-content/40">
-                    <span>Working copies</span>
+                    <span>Repositories</span>
                     <span className="rounded bg-content/6 px-1.5 py-px">
                       {binding.task.workstreams.length}
                     </span>
@@ -234,6 +288,29 @@ export function SessionTaskControl({ session }: { session: Session }) {
                   <div className="flex max-h-56 flex-col gap-1 overflow-y-auto">
                     {binding.task.workstreams.map((ws) => {
                       const current = ws.id === currentWorkstream?.id;
+                      const sameHost = sameExecutionHost(
+                        cwd,
+                        ws.worktreePath,
+                      );
+                      // Task-wide sessions can work in any lane's copy — they
+                      // count toward occupancy everywhere.
+                      const occupied = new Set([
+                        ...(ws.sessionIds ?? []),
+                        ...taskWideSessionIds(binding.task),
+                      ]).size;
+                      const status = !ws.worktreePath
+                        ? "Not prepared"
+                        : current
+                          ? taskWide
+                            ? "Starting directory"
+                            : "This session"
+                          : taskWide
+                            ? "Task working copy"
+                            : occupied
+                              ? `${occupied} ${occupied === 1 ? "session" : "sessions"}${sameHost ? "" : " · other host"}`
+                              : sameHost
+                                ? "Prepared"
+                                : "Different host";
                       return (
                         <div
                           key={ws.id}
@@ -244,15 +321,9 @@ export function SessionTaskControl({ session }: { session: Session }) {
                               {projectName(ws.projectPath)}
                             </span>
                             <span
-                              className={`shrink-0 text-[10px] ${current ? "text-accent" : "text-content/40"}`}
+                              className={`shrink-0 rounded px-1.5 py-px text-[10px] font-medium ${current ? "bg-accent/12 text-accent" : "text-content/45"}`}
                             >
-                              {current
-                                ? primary
-                                  ? "Starting directory"
-                                  : "This session"
-                                : primary
-                                  ? "Task working copy"
-                                  : `${ws.sessionIds?.length ?? 0} ${(ws.sessionIds?.length ?? 0) === 1 ? "session" : "sessions"}`}
+                              {status}
                             </span>
                           </div>
                           <div className="mt-1 flex items-center gap-1 text-[11px] text-content/55">
@@ -260,33 +331,35 @@ export function SessionTaskControl({ session }: { session: Session }) {
                               aria-hidden
                               className="size-3 shrink-0"
                             />
-                            <span className="truncate">{ws.branch}</span>
+                            <span className="min-w-0 truncate font-mono text-content/70">
+                              {ws.branch}
+                            </span>
+                            {ws.base ? (
+                              <span className="min-w-0 truncate text-content/35">
+                                → {ws.base}
+                              </span>
+                            ) : null}
                           </div>
-                          <div
-                            className="mt-0.5 truncate text-[10px] text-content/35"
-                            title={ws.worktreePath}
-                          >
-                            {ws.worktreePath
-                              ? prettyCwd(ws.worktreePath)
-                              : "Working copy not prepared"}
+                          <div className="mt-0.5 flex items-center gap-1 text-[10px] text-content/35">
+                            {ws.worktreePath ? (
+                              <FolderTree
+                                aria-hidden
+                                className="size-3 shrink-0"
+                              />
+                            ) : null}
+                            <span
+                              className="truncate"
+                              title={ws.worktreePath}
+                            >
+                              {ws.worktreePath
+                                ? prettyCwd(ws.worktreePath)
+                                : "Working copy not prepared"}
+                            </span>
                           </div>
                         </div>
                       );
                     })}
                   </div>
-                  {binding.task.links.length ? (
-                    <div className="mt-2 flex flex-wrap gap-1">
-                      {binding.task.links.map((link, index) => (
-                        <span
-                          key={index}
-                          className="max-w-full truncate rounded bg-content/6 px-1.5 py-0.5 text-[10px] text-content/55"
-                          title={link.title}
-                        >
-                          {link.identifier ?? link.title ?? link.url}
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
                 </div>
               </>
             ) : bindings.length ? (
@@ -296,6 +369,23 @@ export function SessionTaskControl({ session }: { session: Session }) {
               </p>
             ) : (
               <div className="p-2">
+                <div className="mb-2 flex items-center justify-between gap-2 px-1 text-[11px] text-content/65">
+                  <span>Scope</span>
+                  <SearchableSelect
+                    label="Conversation scope"
+                    value={attachScope}
+                    onChange={(value) =>
+                      setAttachScope(value as "task" | "repository")
+                    }
+                    options={[
+                      { value: "task", label: "All task repositories" },
+                      { value: "repository", label: "Current repository" },
+                    ]}
+                    searchable={false}
+                    variant="pill"
+                    align="end"
+                  />
+                </div>
                 <input
                   autoFocus
                   aria-label="Search tasks"
@@ -319,22 +409,28 @@ export function SessionTaskControl({ session }: { session: Session }) {
                         disabled={busy || unavailable}
                         onClick={() =>
                           void run((checkout) => {
-                            attachTaskSession(session.id, checkout, task.id);
+                            attachTaskSession(
+                              session.id,
+                              checkout,
+                              task.id,
+                              attachScope,
+                            );
                             setOpen(false);
                             trigger.current?.focus();
                           })
                         }
                         className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left outline-none hover:bg-content/6 focus-visible:bg-content/6 disabled:opacity-40"
                       >
-                        <CheckCircle
+                        <ChartBreakoutSquare
                           aria-hidden
                           className="size-3.5 shrink-0 text-content/35"
+                          strokeWidth={1.75}
                         />
                         <span className="min-w-0 flex-1 truncate text-content/80">
                           {task.title}
                         </span>
-                        <span className="text-[10px] text-content/35">
-                          {task.workstreams.length} worktrees
+                        <span className="min-w-0 max-w-[45%] truncate text-[10px] text-content/35">
+                          {pickMeta(task)}
                         </span>
                       </button>
                     ))}
@@ -354,14 +450,33 @@ export function SessionTaskControl({ session }: { session: Session }) {
               {bindings.length ? (
                 <>
                   {binding && !binding.task.archived ? (
-                    <button
-                      type="button"
-                      className={`${button} flex items-center gap-1.5`}
-                      onClick={openTask}
-                    >
-                      <ExternalLink aria-hidden className="size-3" />
-                      Open on Board
-                    </button>
+                    <span className="flex items-center gap-0.5">
+                      <button
+                        type="button"
+                        className={`${button} flex items-center gap-1.5`}
+                        onClick={openTask}
+                      >
+                        <ExternalLink aria-hidden className="size-3" />
+                        Open on Board
+                      </button>
+                      <button
+                        type="button"
+                        title="Dock the task panel beside this conversation"
+                        className={`${button} flex items-center gap-1.5`}
+                        onClick={() => {
+                          window.dispatchEvent(
+                            new CustomEvent(DOCK_TASK_EVENT, {
+                              detail: binding.task.id,
+                            }),
+                          );
+                          setOpen(false);
+                          trigger.current?.focus();
+                        }}
+                      >
+                        <PanelRight aria-hidden className="size-3" />
+                        Dock panel
+                      </button>
+                    </span>
                   ) : (
                     <span />
                   )}
@@ -418,6 +533,9 @@ export function SessionTaskControl({ session }: { session: Session }) {
           error={error}
           initialTitle={session.title}
           fixedWorkstream={creating}
+          // Anchor project resolution to the workstream's repo — without it
+          // the dialog falls back to the globally active saved project.
+          initialProject={creating.projectPath}
           initialLinks={
             session.linkedWorkItem
               ? [

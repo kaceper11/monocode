@@ -6,14 +6,16 @@ export function Checkbox({
   disabled,
   onChange,
   className,
+  visibleLabel = false,
 }: {
+  visibleLabel?: boolean;
   label: string;
   checked: boolean;
   disabled?: boolean;
   onChange: () => void;
   className?: string;
 }) {
-  return (
+  const control = (
     <span
       className={`relative inline-flex size-4 shrink-0 ${className ?? "mt-0.5"}`}
     >
@@ -29,5 +31,13 @@ export function Checkbox({
         <Check className="size-3" strokeWidth={2} />
       </span>
     </span>
+  );
+  return visibleLabel ? (
+    <label className="inline-flex cursor-pointer items-center gap-2 text-[12px] text-content/70">
+      {control}
+      <span>{label}</span>
+    </label>
+  ) : (
+    control
   );
 }

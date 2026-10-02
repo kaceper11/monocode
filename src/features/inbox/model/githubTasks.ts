@@ -216,8 +216,11 @@ type InboxListCache = InboxListResult & {
 const inboxListCache = new Map<string, InboxListCache>();
 let inboxGeneration = 0;
 const inboxListInflight = new Map<string, Promise<InboxListResult>>();
-const repoByPath = new Map<string, string>();
-const repositoriesByPath = new Map<string, string[]>();
+// Repo resolution shells out to git/gh — cache briefly so a mid-session
+// remote repoint still lands instead of sticking until a cache reset.
+const REPO_TTL_MS = 60_000;
+const repoByPath = new Map<string, { at: number; repo: string }>();
+const repositoriesByPath = new Map<string, { at: number; repos: string[] }>();
 const workItemByKey = new Map<string, GithubWorkItem>();
 const workItemInflight = new Map<string, Promise<GithubWorkItem>>();
 const detailsByKey = new Map<string, GithubWorkItemDetails>();
@@ -301,26 +304,28 @@ export function starMonocodeOnGithub(): Promise<void> {
 export async function githubRepo(cwd: string): Promise<string> {
   const key = normalizeProjectPath(cwd);
   const cached = repoByPath.get(key);
-  if (cached !== undefined) return cached;
+  if (cached && Date.now() - cached.at < REPO_TTL_MS) return cached.repo;
   const repositories = repositoriesByPath.get(key);
-  if (repositories?.[0]) return repositories[0];
+  if (repositories?.repos[0] && Date.now() - repositories.at < REPO_TTL_MS)
+    return repositories.repos[0];
   const repo = await invoke<string>("git_github_repo", { cwd });
-  repoByPath.set(key, repo);
+  repoByPath.set(key, { at: Date.now(), repo });
   return repo;
 }
 
 export async function githubRepositories(cwd: string): Promise<string[]> {
   const key = normalizeProjectPath(cwd);
   const cached = repositoriesByPath.get(key);
-  if (cached) return cached;
+  if (cached && Date.now() - cached.at < REPO_TTL_MS) return cached.repos;
   const repositories = await invoke<string[]>("git_github_repositories", {
     cwd,
   });
   if (repositories.length === 0) {
     throw new Error("GitHub did not return a repository");
   }
-  repositoriesByPath.set(key, repositories);
-  repoByPath.set(key, repositories[0]!);
+  const at = Date.now();
+  repositoriesByPath.set(key, { at, repos: repositories });
+  repoByPath.set(key, { at, repo: repositories[0]! });
   return repositories;
 }
 
@@ -493,9 +498,9 @@ export async function githubWorkItemThread(
   repo: string,
   kind: GithubTaskKind,
   number: number,
-  options?: { force?: boolean },
+  options?: { force?: boolean; host?: string },
 ): Promise<GithubWorkItemThread> {
-  const key = detailsCacheKey(repo, kind, number);
+  const key = options?.host && options.host !== "github.com" ? `${options.host}:${detailsCacheKey(repo, kind, number)}` : detailsCacheKey(repo, kind, number);
   if (options?.force) {
     threadByKey.delete(key);
     threadInflight.delete(key);
@@ -507,6 +512,7 @@ export async function githubWorkItemThread(
     repo,
     kind,
     number,
+    ...(options?.host ? { host: options.host } : {}),
   })
     .then((thread) => {
       threadByKey.set(key, thread);
@@ -878,10 +884,11 @@ async function fetchRepositoryInboxItems(
   );
 
   if (provider === "gitlab" && query.relationship && query.relationship !== "all") {
+    const localPathByRepo = new Map(grouped.map(project => [project.repo.toLowerCase(), project.path]));
     const kinds = query.relationship === "reviewing" ? ["pr"] as const : ["issue", "pr"] as const;
     const jobs = kinds.map(async kind => {
       const rows = await invoke<GitlabWorkItem[]>("gitlab_relationship_items", { kind, relationship: query.relationship });
-      return rows.map(row => gitlabWorkItemToInboxItem(row, grouped.find(p => p.repo === row.repo)?.path ?? "", row.repo));
+      return rows.map(row => gitlabWorkItemToInboxItem(row, localPathByRepo.get(row.repo.toLowerCase()) ?? "", row.repo));
     });
     return collectInboxResults(await Promise.allSettled(jobs), preferredPaths, true);
   }

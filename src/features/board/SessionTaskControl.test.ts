@@ -4,7 +4,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { SessionTaskControl } from "./SessionTaskControl";
 import { addTask, loadBoard } from "./boardStore";
-import { OPEN_TASK_EVENT, taskSessionPrompt } from "./taskSession";
+import {
+  DOCK_TASK_EVENT,
+  OPEN_TASK_EVENT,
+  taskSessionPrompt,
+} from "./taskSession";
 import type { Session } from "../sessions/model/session";
 import {
   listWorktrees,
@@ -85,15 +89,21 @@ it("attaches a running session, opens task details, and detaches without changin
   const before = structuredClone(session);
   await click("Add to task");
   await click("Attach to Checkout");
-  expect(loadBoard().tasks[0].workstreams[0].sessionIds).toEqual(["s"]);
+  expect(loadBoard().tasks[0].taskSessionIds).toEqual(["s"]);
   expect(taskSessionPrompt("next", "s", "/repo-task")).toContain("Checkout");
   const onOpen = vi.fn();
   window.addEventListener(OPEN_TASK_EVENT, onOpen);
   await click("Task context: Checkout");
-  expect(document.body.textContent).toContain("This session");
+  expect(document.body.textContent).toContain("Starting directory");
   await click("Open on Board");
   expect((onOpen.mock.calls[0][0] as CustomEvent).detail).toBe(id);
   window.removeEventListener(OPEN_TASK_EVENT, onOpen);
+  const onDock = vi.fn();
+  window.addEventListener(DOCK_TASK_EVENT, onDock);
+  await click("Task context: Checkout");
+  await click("Dock panel");
+  expect((onDock.mock.calls[0][0] as CustomEvent).detail).toBe(id);
+  window.removeEventListener(DOCK_TASK_EVENT, onDock);
   await click("Task context: Checkout");
   await click("Detach");
   expect(loadBoard().tasks[0].workstreams[0].sessionIds ?? []).toEqual([]);
@@ -142,4 +152,59 @@ it("displays a Git failure without binding and rejects a checkout change during 
     "working copy changed",
   );
   expect(loadBoard().tasks).toEqual([]);
+});
+
+it("shows the task's linked issues and lane branch in the task popover", async () => {
+  await act(async () => {
+    addTask({
+      title: "Checkout",
+      links: [
+        {
+          kind: "issue",
+          provider: "github",
+          identifier: "#42",
+          title: "Checkout drops coupons",
+          url: "https://github.com/a/b/issues/42",
+        },
+      ],
+      workstreams: [],
+    });
+  });
+  await click("Add to task");
+  // The pick list shows the task's issue identifiers next to its repo count.
+  const row = [...document.querySelectorAll("button")].find(
+    (element) => element.getAttribute("aria-label") === "Attach to Checkout",
+  )!;
+  expect(row.textContent).toContain("#42");
+  expect(row.textContent).toContain("0 repositories");
+  await click("Conversation scope: All task repositories");
+  await click("Current repository");
+  await click("Attach to Checkout");
+  // The header now names the lane's repo + branch, not just the task.
+  expect(document.body.textContent).toContain("repo · feature");
+  await click("Task context: Checkout");
+  const links = document.querySelector('[aria-label="Linked issues"]');
+  expect(links?.textContent).toContain("#42");
+  // The working-copy row carries the branch identity in mono.
+  expect(
+    [...document.querySelectorAll(".font-mono")].map((el) => el.textContent),
+  ).toContain("feature");
+});
+
+it("keeps repository-specific attachment available without changing the session", async () => {
+  await act(async () => {
+    addTask({ title: "Repo task", links: [], workstreams: [] });
+  });
+  await click("Add to task");
+  expect(document.querySelector("select")).toBeNull();
+  await click("Conversation scope: All task repositories");
+  await click("Current repository");
+  await click("Attach to Repo task");
+  expect(loadBoard().tasks[0].taskSessionIds).toBeUndefined();
+  expect(loadBoard().tasks[0].workstreams[0].sessionIds).toEqual([session.id]);
+  expect(document.body.textContent).toContain("Task · Repo task");
+  expect(document.body.textContent).toContain("repo");
+  expect(taskSessionPrompt("Next", session.id, "/repo-task")).toContain(
+    "assigned only to its current working directory",
+  );
 });

@@ -1,87 +1,172 @@
-import { useState, useSyncExternalStore, type ReactNode } from "react";
-import { gitRefreshBranches, gitTaskBranch } from "../../platform/tauri/fs";
+import { useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
+import { gitRefreshBranches } from "../../platform/tauri/fs";
 import { pathKey, projectName } from "../../shared/lib/paths";
-import { loadBoard } from "./boardStore";
 import { TaskActionFeedback } from "./TaskActionFeedback";
-import { Download, LoaderCircle, MoreHorizontal, RefreshCw } from "../../shared/ui/icons";
+import {
+  CheckCircle,
+  LoaderCircle,
+  RefreshCw,
+} from "../../shared/ui/icons";
 
-import { Popover } from "../../shared/ui/Popover";
-import { LAYER } from "../../shared/lib/layers";
-
-type Target = { id?: string; projectPath: string; worktreePath?: string; branch: string; base: string; blocked?: boolean };
-const pending = new Set<string>();
+type Target = { projectPath: string };
+const pending = new Map<string, string>();
 const listeners = new Set<() => void>();
 let revision = 0;
-const publish = () => { revision++; for (const listener of listeners) listener(); };
-const subscribe = (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; };
+const publish = () => {
+  revision++;
+  for (const listener of listeners) listener();
+};
+const subscribe = (listener: () => void) => {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+};
+
+export async function withTaskGitLock<T>(
+  projectPath: string,
+  label: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  const key = pathKey(projectPath);
+  const running = pending.get(key);
+  if (running)
+    throw new Error(
+      `A Git operation (${running}) is already running for this repository.`,
+    );
+  pending.set(key, label);
+  publish();
+  try {
+    return await run();
+  } finally {
+    pending.delete(key);
+    publish();
+  }
+}
 
 export function useTaskGitBusy(paths: readonly string[]): boolean {
   useSyncExternalStore(subscribe, () => revision);
-  return paths.some(path => pending.has(pathKey(path)));
+  return paths.some((path) => pending.has(pathKey(path)));
+}
+
+/** The label of the op holding the repo's git lock, if any — lets surfaces
+ * explain the block instead of just disabling controls. */
+export function useTaskGitOperation(
+  paths: readonly string[],
+): string | undefined {
+  useSyncExternalStore(subscribe, () => revision);
+  for (const path of paths) {
+    const label = pending.get(pathKey(path));
+    if (label) return label;
+  }
+  return undefined;
 }
 
 /** The same guarded Git operations for draft rows, saved lanes and bulk actions. */
-export function TaskGitActions({ targets, all = false, disabled = false, onDone, children, layer = LAYER.popover }: {
-  children?: ReactNode; targets: readonly Target[]; all?: boolean; disabled?: boolean; onDone?: () => void; layer?: number;
+export function TaskGitActions({
+  targets,
+  all = false,
+  disabled = false,
+  children,
+}: {
+  children?: ReactNode;
+  targets: readonly Target[];
+  all?: boolean;
+  disabled?: boolean;
 }) {
-  const gitBusy = useTaskGitBusy(targets.map(target => target.projectPath));
-  const [results, setResults] = useState<{ name: string; error?: string; message: string }[]>([]);
+  const gitBusy = useTaskGitBusy(targets.map((target) => target.projectPath));
+  const [results, setResults] = useState<
+    { name: string; error?: string; message: string }[]
+  >([]);
+  // Successful fetches report inline for a moment — a bordered card per repo
+  // would stretch the toolbar row they live in.
+  const [succeeded, setSucceeded] = useState(0);
   const [running, setRunning] = useState("");
-  const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const busy = !!running || gitBusy;
-  const run = async (action: "fetch" | "pull") => {
+  const run = async () => {
     if (busy || disabled) return;
-    setAnchor(null);
-    const unique = [...new Map(targets.filter(t => t.projectPath).map(t => [
-      pathKey(action === "fetch" ? t.projectPath : t.worktreePath || t.projectPath), t,
-    ])).values()];
-    const keys = unique.map(t => pathKey(t.projectPath));
-    if (keys.some(key => pending.has(key))) return;
-    keys.forEach(key => pending.add(key)); publish();
-    setRunning(action); setResults([]);
+    const unique = [
+      ...new Map(
+        targets
+          .filter((t) => t.projectPath)
+          .map((t) => [pathKey(t.projectPath), t]),
+      ).values(),
+    ];
+    const keys = unique.map((t) => pathKey(t.projectPath));
+    if (keys.some((key) => pending.has(key))) return;
+    keys.forEach((key) => pending.set(key, "fetch"));
+    publish();
+    setRunning("fetch");
+    setResults([]);
+    setSucceeded(0);
     try {
       for (const target of unique) {
         const name = projectName(target.projectPath);
         try {
-          if (action === "fetch") await gitRefreshBranches(target.projectPath);
-          else {
-            if (target.id) {
-              const current = loadBoard().tasks.flatMap(task => task.workstreams).find(row => row.id === target.id);
-              if (!current || current.branch !== target.branch || current.worktreePath !== target.worktreePath || current.projectPath !== target.projectPath)
-                throw new Error("Working copy binding changed. Refresh before retrying.");
-            }
-            if (!target.worktreePath) throw new Error("Select an existing working copy first");
-            if (target.blocked) throw new Error("Agent is working in this task or working copy");
-            await gitTaskBranch(target.worktreePath, target.branch, target.branch, target.base, "update");
-          }
-          setResults(rows => [...rows, { name, message: action === "fetch" ? "Fetch completed" : "Pull completed" }]);
+          await gitRefreshBranches(target.projectPath);
+          setSucceeded((count) => count + 1);
         } catch (error) {
-          setResults(rows => [...rows, { name, message: action === "fetch" ? "Fetch failed" : "Pull failed", error: String(error) }]);
+          setResults((rows) => [
+            ...rows,
+            { name, message: "Fetch failed", error: String(error) },
+          ]);
         }
       }
-      onDone?.();
     } finally {
-      keys.forEach(key => pending.delete(key)); publish(); setRunning("");
+      keys.forEach((key) => pending.delete(key));
+      publish();
+      setRunning("");
     }
   };
-  const label = all ? "Actions for all repositories" : `Git actions for ${projectName(targets[0]?.projectPath ?? "repository")}`;
-  const buttonClass = "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] text-content/75 hover:bg-content/6 focus-visible:outline-accent disabled:opacity-35";
-  return <div className="w-full min-w-0 text-[11px]">
-    <div className="flex items-center gap-1.5">
-      {children}
-      <span className="flex-1" />
-      {running && <span role="status" className="text-content/45">{running === "fetch" ? "Fetching…" : "Pulling…"}</span>}
-      <button type="button" aria-label={label} title={label} aria-haspopup="menu" aria-expanded={!!anchor} disabled={disabled || busy || !targets.some(t => t.projectPath)} onClick={event => setAnchor(anchor ? null : event.currentTarget)} className="grid size-7 shrink-0 place-items-center rounded-md text-content/45 hover:bg-content/6 hover:text-content focus-visible:outline-accent disabled:opacity-35">
-        {running ? <LoaderCircle className="size-3.5 animate-spin" /> : <MoreHorizontal className="size-4" />}
-      </button>
+  useEffect(() => {
+    if (!succeeded || running) return;
+    const timer = setTimeout(() => setSucceeded(0), 5000);
+    return () => clearTimeout(timer);
+  }, [succeeded, running]);
+  // A single remote op doesn't need a menu — the button is the action.
+  const label = all
+    ? "Fetch all repositories"
+    : `Fetch ${projectName(targets[0]?.projectPath ?? "repository")}`;
+  return (
+    <div className={`${children ? "w-full" : "shrink-0"} min-w-0 text-[11px]`}>
+      <div className="flex items-center gap-1.5">
+        {children}
+        <span className="flex-1" />
+        {running ? null : succeeded ? (
+          <span
+            role="status"
+            className="inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-300"
+          >
+            <CheckCircle className="size-3" strokeWidth={2} />
+            {succeeded > 1 ? `Fetched ${succeeded}` : "Fetched"}
+          </span>
+        ) : null}
+        <button
+          type="button"
+          aria-label={label}
+          title="Fetch remote branches without changing your working copy"
+          disabled={disabled || busy || !targets.some((t) => t.projectPath)}
+          onClick={() => void run()}
+          className="grid size-8 shrink-0 place-items-center rounded-md border border-content/10 bg-content/3 text-content/65 hover:bg-content/8 hover:text-content focus-visible:outline-accent disabled:opacity-35"
+        >
+          {running ? (
+            <LoaderCircle className="size-3.5 animate-spin" />
+          ) : (
+            <RefreshCw className="size-4" />
+          )}
+        </button>
+      </div>
+      {results.map((result, index) => (
+        <TaskActionFeedback
+          key={index}
+          title={`${result.name}: ${result.message}`}
+          message={result.error}
+          error={!!result.error}
+          onDismiss={() =>
+            setResults((rows) => rows.filter((_, i) => i !== index))
+          }
+        />
+      ))}
     </div>
-    {anchor && <Popover anchor={anchor} align="end" width={192} layer={layer} role="menu" aria-label={label} onDismiss={() => setAnchor(null)} className="bg-background-base p-1">
-      <button type="button" role="menuitem" title="Fetch remote branches without changing your working copy" className={buttonClass} disabled={disabled || busy} onClick={() => void run("fetch")}><RefreshCw className="size-3.5 shrink-0" />{all ? "Fetch all" : "Fetch"}</button>
-      <button type="button" role="menuitem" title="Pull from the tracked upstream · fast-forward only" className={buttonClass} disabled={disabled || busy || !targets.some(t => t.worktreePath && !t.blocked)} onClick={() => void run("pull")}><Download className="size-3.5 shrink-0" />{all ? "Pull all" : "Pull"}</button>
-      <p className="px-2 pb-1 pt-0.5 text-[10px] text-content/35">Pull uses fast-forward only</p>
-    </Popover>}
-    {results.map((result, index) => <TaskActionFeedback key={index}
-      title={`${result.name}: ${result.message}`} message={result.error}
-      error={!!result.error} onDismiss={() => setResults(rows => rows.filter((_, i) => i !== index))} />)}
-  </div>;
+  );
 }

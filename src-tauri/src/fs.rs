@@ -1158,17 +1158,47 @@ pub async fn git_head_message(cwd: String) -> Result<String, String> {
 
 /// Push the current branch to its upstream, or set upstream on first push.
 #[tauri::command]
-pub async fn git_push(cwd: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || git_push_for(&expand_home(&cwd)))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn git_push(
+    cwd: String,
+    remote: Option<String>,
+    expected_branch: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        if expected_branch
+            .as_deref()
+            .is_some_and(|branch| git_branch(&root).as_deref() != Some(branch))
+        {
+            return Err("Working copy branch changed before push".into());
+        }
+        match remote.as_deref() {
+            Some(remote) => {
+                if remote.starts_with('-')
+                    || !git_stdout(&root, &["remote"])
+                        .unwrap_or_default()
+                        .lines()
+                        .any(|name| name == remote)
+                {
+                    return Err("Selected Git remote is unavailable".into());
+                }
+                let branch = git_branch(&root).ok_or("Not on a branch")?;
+                git_remote_checked(
+                    &root,
+                    &["push", remote, &format!("HEAD:refs/heads/{branch}")],
+                )
+            }
+            None => git_push_for(&root),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Fast-forward the current branch from its upstream.
 #[tauri::command]
 pub async fn git_pull(cwd: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        git_checked(&expand_home(&cwd), &["pull", "--ff-only"])
+        git_remote_checked(&expand_home(&cwd), &["pull", "--ff-only"])
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1242,6 +1272,7 @@ pub async fn git_pr_status(cwd: String, pr_url: Option<String>) -> Result<Option
 
 #[derive(Deserialize)]
 struct GitPrCreateInput {
+    repo: Option<String>,
     title: String,
     body: String,
     base: String,
@@ -1261,12 +1292,14 @@ pub async fn git_pr_create(
     base: String,
     head: String,
     draft: bool,
+    repo: Option<String>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         git_pr_create_for(
             &app,
             &expand_home(&cwd),
             &GitPrCreateInput {
+                repo,
                 title,
                 body,
                 base,
@@ -1403,6 +1436,7 @@ fn status_context_bucket(state: &str) -> &'static str {
 /// `name/branch` splits as `<remote>/<branch>` only when `name` is a real
 /// remote — a local base like `release/1.2` must not be split.
 fn remote_qualified_ref(root: &Path, git_ref: &str) -> Option<(String, String)> {
+    let git_ref = git_ref.strip_prefix("refs/remotes/").unwrap_or(git_ref);
     let (remote, branch) = git_ref.split_once('/')?;
     (!remote.is_empty()
         && !branch.is_empty()
@@ -1435,10 +1469,10 @@ fn safe_fetch_name(name: &str) -> bool {
 fn fetch_and_merge(root: &Path, remote: &str, branch: &str) -> Result<(), String> {
     // Bail on unsafe input — skipping the fetch would fall through to a
     // merge of a stale FETCH_HEAD from some earlier, unrelated fetch.
-    if !safe_fetch_name(branch) {
-        return Err(format!("Invalid base branch `{branch}`"));
+    if !safe_fetch_name(remote) || !safe_fetch_name(branch) {
+        return Err(format!("Invalid base `{remote}/{branch}`"));
     }
-    git_checked(root, &["fetch", remote, branch])?;
+    git_remote_checked(root, &["fetch", remote, branch])?;
     let tracked = format!("refs/remotes/{remote}/{branch}");
     let target = if git_ref_exists(root, &tracked) {
         tracked
@@ -1464,10 +1498,27 @@ pub async fn git_merge_from(cwd: String, git_ref: String) -> Result<(), String> 
         if !safe_fetch_name(&git_ref) {
             return Err(format!("Invalid base branch `{git_ref}`"));
         }
-        if let Some((remote, branch)) = remote_qualified_ref(&root, &git_ref) {
+        if git_ref.starts_with("refs/heads/") {
+            git_checked(&root, &["merge", "--no-edit", &git_ref])
+        } else if let Some((remote, branch)) = remote_qualified_ref(&root, &git_ref) {
             fetch_and_merge(&root, &remote, &branch)
         } else if let Some(remote) = git_remote_name(&root) {
-            fetch_and_merge(&root, &remote, &git_ref)
+            let tracked = format!("refs/remotes/{remote}/{git_ref}");
+            if git_ref_exists(&root, &tracked) {
+                fetch_and_merge(&root, &remote, &git_ref)
+            } else if git_ref_exists(&root, &format!("refs/heads/{git_ref}")) {
+                // A local-only base can still lag the remote's copy — fetch
+                // first; only a remote that truly lacks the ref falls back
+                // to the local branch.
+                match fetch_and_merge(&root, &remote, &git_ref) {
+                    Err(err) if err.contains("couldn't find remote ref") => {
+                        git_checked(&root, &["merge", "--no-edit", &git_ref])
+                    }
+                    result => result,
+                }
+            } else {
+                fetch_and_merge(&root, &remote, &git_ref)
+            }
         } else {
             git_checked(&root, &["merge", "--no-edit", &git_ref])
         }
@@ -1521,15 +1572,15 @@ fn git_pr_preflight_for(root: &Path, base: &str) -> GitPrPreflight {
     // origin-preferred remote first.
     let fetchable = safe_fetch_name(&base);
     let remote_base = if let Some((remote, branch)) = &qualified {
-        if fetchable && safe_fetch_name(branch) {
-            let _ = git_checked(root, &["fetch", remote, branch]);
+        if fetchable && safe_fetch_name(remote) && safe_fetch_name(branch) {
+            let _ = git_remote_checked(root, &["fetch", remote, branch]);
         }
         git_ref_exists(root, &format!("refs/remotes/{remote}/{branch}"))
             .then(|| format!("{remote}/{branch}"))
     } else {
         ordered_remote_names(root).iter().find_map(|remote| {
-            if fetchable {
-                let _ = git_checked(root, &["fetch", remote, &base]);
+            if fetchable && safe_fetch_name(remote) {
+                let _ = git_remote_checked(root, &["fetch", remote, &base]);
             }
             git_ref_exists(root, &format!("refs/remotes/{remote}/{base}"))
                 .then(|| format!("{remote}/{base}"))
@@ -1654,12 +1705,17 @@ pub async fn git_fetch_branch(
                 return Err(format!("Invalid ref `{part}`"));
             }
         }
+        // A colon-free local path (`../other-repo`) is a legal fetch source —
+        // only configured remotes may feed a review lane.
+        if !git_remote_names(&root).iter().any(|name| name == &remote) {
+            return Err(format!("Git remote `{remote}` is not configured here"));
+        }
         if git_branch(&root).as_deref() == Some(branch.as_str()) {
             return Err(format!(
                 "`{branch}` is checked out here — pick another name or worktree"
             ));
         }
-        git_checked(
+        git_remote_checked(
             &root,
             &[
                 "fetch",
@@ -1970,9 +2026,16 @@ pub async fn git_github_work_item_thread(
     repo: String,
     kind: String,
     number: i64,
+    host: Option<String>,
 ) -> Result<GitHubWorkItemThread, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        git_github_work_item_thread_for(&expand_home(&cwd), &repo, &kind, number)
+        git_github_work_item_thread_for(
+            &expand_home(&cwd),
+            &repo,
+            &kind,
+            number,
+            host.as_deref().unwrap_or("github.com"),
+        )
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2122,7 +2185,7 @@ pub async fn git_github_check_details(
     job_id: String,
 ) -> Result<GitHubCheckDetails, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        github_check_details_with(&repo, &job_id, |endpoint| {
+        github_check_details_with(&repo, &job_id, "github.com", |endpoint| {
             gh_checked(
                 &expand_home(&cwd),
                 &["api", "--hostname", "github.com", endpoint],
@@ -2133,9 +2196,10 @@ pub async fn git_github_check_details(
     .map_err(|e| e.to_string())?
 }
 
-fn github_check_details_with(
+pub(crate) fn github_check_details_with(
     repo: &str,
     job_id: &str,
+    host: &str,
     mut fetch: impl FnMut(&str) -> Result<String, String>,
 ) -> Result<GitHubCheckDetails, String> {
     let (owner, name) = split_github_repo(repo)?;
@@ -2188,7 +2252,12 @@ fn github_check_details_with(
         annotations: vec![],
         notice: None,
     };
-    let check_prefix = format!("https://api.github.com/{prefix}/check-runs/");
+    let api = if host == "github.com" {
+        "https://api.github.com".to_string()
+    } else {
+        format!("https://{host}/api/v3")
+    };
+    let check_prefix = format!("{api}/{prefix}/check-runs/");
     let check_id = job
         .check_run_url
         .as_deref()
@@ -3261,17 +3330,17 @@ pub(crate) fn git_push_remote_name(root: &Path) -> Option<String> {
 
 fn git_push_for(root: &Path) -> Result<(), String> {
     if git_stdout(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_some() {
-        return git_checked(root, &["push"]);
+        return git_remote_checked(root, &["push"]);
     }
     let remote =
         git_push_remote_name(root).ok_or_else(|| "No git remote to push to".to_string())?;
-    git_checked(root, &["push", "-u", &remote, "HEAD"])
+    git_remote_checked(root, &["push", "-u", &remote, "HEAD"])
 }
 
 fn git_sync_changes_for(root: &Path) -> Result<(), String> {
     if git_stdout(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_some() {
-        git_checked(root, &["pull", "--no-edit", "--ff"]).map_err(with_signing_hint)?;
-        return git_checked(root, &["push"]);
+        git_remote_checked(root, &["pull", "--no-edit", "--ff"]).map_err(with_signing_hint)?;
+        return git_remote_checked(root, &["push"]);
     }
     git_push_for(root)
 }
@@ -3307,6 +3376,15 @@ fn git_range_context_for(root: &Path) -> Result<GitRangeContext, String> {
 }
 
 pub(crate) fn git_pr_status_for(root: &Path, url: Option<&str>) -> Result<Option<GitPr>, String> {
+    git_pr_status_for_target(root, url, None, None)
+}
+
+pub(crate) fn git_pr_status_for_target(
+    root: &Path,
+    url: Option<&str>,
+    target: Option<(&str, &str)>,
+    selected_branch: Option<&str>,
+) -> Result<Option<GitPr>, String> {
     let url = url
         .map(str::trim)
         .filter(|u| !u.is_empty() && !u.starts_with('-'));
@@ -3330,22 +3408,33 @@ pub(crate) fn git_pr_status_for(root: &Path, url: Option<&str>) -> Result<Option
         // rather than reporting "no PR" on a pinned lane.
         let pr = parse_gh_pr_row(&json)
             .ok_or_else(|| "gh returned a pull request that couldn't be parsed".to_string())?;
-        (Some(pr), gh_pr_url_parts(url))
+        (
+            Some(pr),
+            gh_pr_url_parts(url).map(|(repo, number, host)| (repo, number, Some(host))),
+        )
     } else {
-        let Some(branch) = git_branch(root) else {
+        let Some(branch) = selected_branch
+            .map(str::to_string)
+            .or_else(|| git_branch(root))
+        else {
             return Ok(None);
         };
         // Not a GitHub remote (Azure/GitLab lane) — quiet None, the board
         // routes those providers elsewhere. Errors past this point are
         // real: the list call runs only once gh+repo resolved.
-        let Some(repo) = git_github_repo_for(root).ok() else {
+        let Some(repo) = target
+            .map(|(repo, _)| repo.to_string())
+            .or_else(|| git_github_repo_for(root).ok())
+        else {
             return Ok(None);
         };
-        let json = gh_checked(
-            root,
-            &[
-                "pr",
-                "list",
+        let repo_url = target.map(|(repo, host)| format!("https://{host}/{repo}"));
+        let mut args = vec!["pr", "list"];
+        if let Some(repo_url) = &repo_url {
+            args.extend(["--repo", repo_url]);
+        }
+        args.extend([
+
                 // `--head` takes the BARE branch — gh doesn't support the
                 // `owner:branch` syntax (it goes verbatim into headRefName
                 // and matches nothing). `headRepositoryOwner` is fetched
@@ -3358,29 +3447,37 @@ pub(crate) fn git_pr_status_for(root: &Path, url: Option<&str>) -> Result<Option
                 "20",
                 "--state",
                 "all",
-            ],
-        )?;
+            ]);
+        let json = gh_checked(root, &args)?;
         let pr = parse_gh_pr_list(&json, &repo);
-        let threads_key = pr.as_ref().map(|p| (repo.clone(), p.number));
+        let threads_key = pr.as_ref().map(|p| (repo.clone(), p.number, None));
         (pr, threads_key)
     };
     let Some(mut pr) = pr else {
         return Ok(None);
     };
     // `pr view --json` has no reviewThreads field — unresolved threads
-    // come from GraphQL, scoped to the PR's own repository.
+    // come from GraphQL, scoped to the PR's own repository. A pinned url's
+    // host wins — it may point at a different (Enterprise) instance.
     if pr.state == "open" {
-        if let Some((repo, number)) = threads_key {
-            pr.unresolved_threads = gh_pr_unresolved_threads(root, &repo, number);
+        if let Some((repo, number, pin_host)) = threads_key {
+            pr.unresolved_threads = gh_pr_unresolved_threads(
+                root,
+                &repo,
+                number,
+                pin_host
+                    .as_deref()
+                    .or(target.map(|(_, host)| host))
+                    .unwrap_or("github.com"),
+            );
         }
     }
     Ok(Some(pr))
 }
 
-/// `…/<owner>/<repo>/pull/<n>` → (`owner/repo`, n). Host-agnostic — GHES
-/// urls share the path shape.
-fn gh_pr_url_parts(url: &str) -> Option<(String, i64)> {
-    let path = url.split_once("://")?.1.split_once('/')?.1;
+/// `…/<host>/<owner>/<repo>/pull/<n>` → (`owner/repo`, n, host).
+fn gh_pr_url_parts(url: &str) -> Option<(String, i64, String)> {
+    let (authority, path) = url.split_once("://")?.1.split_once('/')?;
     let (repo_path, tail) = path.rsplit_once("/pull/")?;
     let number: i64 = tail
         .chars()
@@ -3394,7 +3491,11 @@ fn gh_pr_url_parts(url: &str) -> Option<(String, i64)> {
     }
     let repo = segments.pop()?;
     let owner = segments.pop()?;
-    Some((format!("{owner}/{repo}"), number))
+    Some((
+        format!("{owner}/{repo}"),
+        number,
+        authority.rsplit('@').next()?.to_string(),
+    ))
 }
 
 const GITHUB_PR_THREADS_COUNT_QUERY: &str = r#"
@@ -3411,7 +3512,7 @@ query BoardPrThreads($owner: String!, $name: String!, $number: Int!) {
 
 /// Unresolved review-thread count via `gh api graphql` — `pr view --json`
 /// has no reviewThreads field. Best-effort: failures leave the badge unset.
-fn gh_pr_unresolved_threads(root: &Path, repo: &str, number: i64) -> Option<i64> {
+fn gh_pr_unresolved_threads(root: &Path, repo: &str, number: i64, host: &str) -> Option<i64> {
     let (owner, name) = split_github_repo(repo).ok()?;
     let json = gh_stdout(
         root,
@@ -3420,6 +3521,8 @@ fn gh_pr_unresolved_threads(root: &Path, repo: &str, number: i64) -> Option<i64>
             "graphql",
             "-f",
             &format!("query={GITHUB_PR_THREADS_COUNT_QUERY}"),
+            "--hostname",
+            host,
             // `-f` not `-F` for the strings — typed field coercion would
             // turn a repo named "2024" or "true" into a non-string and the
             // query would fail silently.
@@ -3833,6 +3936,7 @@ fn git_github_work_item_thread_for(
     repo: &str,
     kind: &str,
     number: i64,
+    host: &str,
 ) -> Result<GitHubWorkItemThread, String> {
     let kind = kind.trim();
     if kind != "issue" && kind != "pr" {
@@ -3855,6 +3959,8 @@ fn git_github_work_item_thread_for(
         &[
             "api",
             "graphql",
+            "--hostname",
+            host,
             "-f",
             &format!("query={query}"),
             // `-f` keeps owner/name strings literal — `-F` coerces
@@ -4465,7 +4571,12 @@ fn parse_github_pr_oids(json: &str) -> Result<(String, String), String> {
     let row: Row = serde_json::from_str(json).map_err(|error| error.to_string())?;
     let base = row.base_ref_oid.trim();
     let head = row.head_ref_oid.trim();
-    if base.is_empty() || head.is_empty() {
+    // OIDs land in `git fetch`/`git diff` arguments — provider JSON is not a
+    // trusted source, so require a real object id, not a refspec or option.
+    let oid = |value: &str| {
+        (40..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_hexdigit())
+    };
+    if !oid(base) || !oid(head) {
         return Err("Pull request is missing base or head commit".into());
     }
     Ok((base.to_string(), head.to_string()))
@@ -4638,7 +4749,7 @@ fn ensure_merge_base(root: &Path, base: &str, head: &str) -> Result<(), String> 
     }
     if let Some(remote) = github_fetch_remote(root) {
         for deepen in ["50", "200", "800"] {
-            let _ = git_output(root, &["fetch", "--no-tags", "--deepen", deepen, &remote]);
+            let _ = git_remote_run(root, &["fetch", "--no-tags", "--deepen", deepen, &remote]);
             if merge_base_exists(root, base, head) {
                 return Ok(());
             }
@@ -4659,7 +4770,7 @@ fn ensure_git_commit(root: &Path, oid: &str) -> Result<(), String> {
         return Ok(());
     }
     if let Some(remote) = github_fetch_remote(root) {
-        let _ = git_output(root, &["fetch", "--no-tags", "--depth", "1", &remote, oid]);
+        let _ = git_remote_run(root, &["fetch", "--no-tags", "--depth", "1", &remote, oid]);
     }
     if git_output(root, &["cat-file", "-e", &spec]).is_some() {
         return Ok(());
@@ -4711,8 +4822,9 @@ pub(crate) fn remote_matching_github_url(root: &Path, url: &str) -> Option<Strin
     let wanted = normalize_github_remote_url(url);
     for line in remotes.lines() {
         let mut parts = line.split_whitespace();
-        let name = parts.next()?;
-        let remote_url = parts.next()?;
+        let (Some(name), Some(remote_url)) = (parts.next(), parts.next()) else {
+            continue;
+        };
         if normalize_github_remote_url(remote_url) == wanted {
             return Some(name.to_string());
         }
@@ -4722,17 +4834,29 @@ pub(crate) fn remote_matching_github_url(root: &Path, url: &str) -> Option<Strin
 
 fn normalize_github_remote_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
-    if let Some((_, rest)) = trimmed.split_once("github.com:") {
-        return format!(
-            "github.com/{}",
-            rest.trim_start_matches('/').to_ascii_lowercase()
-        );
-    }
-    if let Some((_, rest)) = trimmed.split_once("github.com/") {
-        return format!(
-            "github.com/{}",
-            rest.trim_start_matches('/').to_ascii_lowercase()
-        );
+    // Reduce any remote form — https, ssh, scp-style `user@host:path` — to a
+    // bare `host/path` so github.com and Enterprise remotes compare alike.
+    let authority_path = trimmed
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .or_else(|| {
+            let (authority, path) = trimmed.split_once(':')?;
+            (!authority.contains('/')).then_some((authority, path))
+        });
+    if let Some((authority, path)) = authority_path {
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let host = match host.strip_prefix('[') {
+            Some(inner) => inner.split(']').next().unwrap_or(inner),
+            None => host.split(':').next().unwrap_or(host),
+        };
+        let path = path.trim_start_matches('/');
+        if !host.is_empty() && !path.is_empty() {
+            return format!(
+                "{}/{}",
+                host.to_ascii_lowercase(),
+                path.to_ascii_lowercase()
+            );
+        }
     }
     trimmed.to_ascii_lowercase()
 }
@@ -4940,16 +5064,18 @@ fn git_pr_create_for(
     root: &Path,
     input: &GitPrCreateInput,
 ) -> Result<String, String> {
-    if let Some(url) = crate::azure_devops::try_create_pull_request(
-        app,
-        root,
-        &input.title,
-        &input.body,
-        &input.base,
-        &input.head,
-        input.draft,
-    )? {
-        return Ok(url);
+    if input.repo.is_none() {
+        if let Some(url) = crate::azure_devops::try_create_pull_request(
+            app,
+            root,
+            &input.title,
+            &input.body,
+            &input.base,
+            &input.head,
+            input.draft,
+        )? {
+            return Ok(url);
+        }
     }
     let title = input.title.trim();
     if title.is_empty() {
@@ -4974,6 +5100,13 @@ fn git_pr_create_for(
         "--head",
         input.head.trim(),
     ];
+    if let Some(repo) = input.repo.as_deref() {
+        if remote_matching_github_url(root, repo).is_none() {
+            let _ = std::fs::remove_file(&body_path);
+            return Err("No local remote matches this PR repository".into());
+        }
+        args.extend(["--repo", repo]);
+    }
     if input.draft {
         args.push("--draft");
     }
@@ -5055,11 +5188,18 @@ fn gh_run(root: &Path, args: &[&str], allow_empty: bool) -> Result<String, Strin
         .env("GIT_PAGER", "cat");
     crate::harness::apply_gui_env(&mut cmd);
     crate::hide_window_console(&mut cmd);
-    let output = cmd.output().map_err(|error| {
-        if error.kind() == ErrorKind::NotFound {
+    // Bounded — a stalled gh (network hang, credential helper) must not park
+    // a spawn_blocking worker and leave the lane loading forever.
+    let output = crate::bounded_process::output(
+        &mut cmd,
+        std::time::Duration::from_secs(60),
+        16 * 1024 * 1024,
+    )
+    .map_err(|error| {
+        if error.contains("os error 2") || error.contains("not found") {
             "GitHub CLI (`gh`) is not installed.".to_string()
         } else {
-            error.to_string()
+            error
         }
     })?;
     if output.status.success() {
@@ -5126,6 +5266,33 @@ fn git_cmd_for_args(args: &[&str]) -> Command {
 
 pub(crate) fn git_checked(root: &Path, args: &[&str]) -> Result<(), String> {
     git_check_output(git_command_output(root, args)?, args)
+}
+
+/// Remote-touching git ops (fetch/push/pull) wait on the network — a stalled
+/// remote or a credential prompt must not park the spawn_blocking worker
+/// forever. WSL requests carry their own timeout.
+fn git_remote_output(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    if let Some(location) = wsl::path_location(root)? {
+        return wsl::git(&location, args, None);
+    }
+    let mut command = git_command(root, args);
+    crate::bounded_process::output(
+        &mut command,
+        std::time::Duration::from_secs(120),
+        16 * 1024 * 1024,
+    )
+}
+
+fn git_remote_checked(root: &Path, args: &[&str]) -> Result<(), String> {
+    git_check_output(git_remote_output(root, args)?, args)
+}
+
+fn git_remote_run(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = git_remote_output(root, args).ok()?;
+    if git_status_ok(&output.status, args) {
+        return Some(output.stdout);
+    }
+    None
 }
 
 fn git_blob(root: &Path, spec: &str) -> Option<Vec<u8>> {
@@ -6974,6 +7141,40 @@ mod tests {
     }
 
     #[test]
+    fn github_remote_url_normalization_matches_equivalent_forms_per_host() {
+        // github.com: https/ssh/scp forms, .git suffix and case all collapse.
+        let wanted = "github.com/owner/repo";
+        for url in [
+            "https://github.com/owner/repo",
+            "https://github.com/owner/repo.git",
+            "https://github.com/OWNER/Repo/",
+            "git@github.com:owner/repo.git",
+            "ssh://git@github.com/owner/repo.git",
+            "ssh://git@github.com:22/owner/repo.git",
+        ] {
+            assert_eq!(normalize_github_remote_url(url), wanted, "{url}");
+        }
+        // Enterprise hosts normalize the same way so https↔ssh match.
+        let ghes = "ghe.corp.example/owner/repo";
+        for url in [
+            "https://ghe.corp.example/owner/repo",
+            "git@ghe.corp.example:owner/repo.git",
+            "ssh://git@ghe.corp.example/owner/repo",
+        ] {
+            assert_eq!(normalize_github_remote_url(url), ghes, "{url}");
+        }
+        // Different hosts never collapse to the same key.
+        assert_ne!(
+            normalize_github_remote_url("git@other.example:owner/repo.git"),
+            wanted
+        );
+        assert_ne!(
+            normalize_github_remote_url("https://github.com/owner/other"),
+            wanted
+        );
+    }
+
+    #[test]
     fn omp_active_assistant_texts_keep_active_message_order_with_both_forms() {
         let dir = tmp("omp-active-texts");
         let path = dir.0.join("session.jsonl");
@@ -8729,11 +8930,11 @@ mod tests {
     fn gh_pr_url_parts_reads_owner_repo_number() {
         assert_eq!(
             gh_pr_url_parts("https://github.com/acme/app/pull/42"),
-            Some(("acme/app".to_string(), 42))
+            Some(("acme/app".to_string(), 42, "github.com".to_string()))
         );
         assert_eq!(
             gh_pr_url_parts("https://ghe.corp.net/acme/app/pull/7?diff=split"),
-            Some(("acme/app".to_string(), 7))
+            Some(("acme/app".to_string(), 7, "ghe.corp.net".to_string()))
         );
         assert_eq!(gh_pr_url_parts("https://github.com/acme/app"), None);
         assert_eq!(gh_pr_url_parts("not a url"), None);
@@ -8779,6 +8980,122 @@ mod tests {
         assert!(checks.iter().all(|c| !c.name.is_empty()));
         assert!(parse_status_rollup("{}").is_empty());
         assert!(parse_status_rollup("not json").is_empty());
+    }
+
+    #[test]
+    fn task_merge_uses_default_or_selected_branch_and_preserves_dirty_files() {
+        let origin = tmp("task-merge-origin");
+        let publisher = tmp("task-merge-publisher");
+        let checkout = tmp("task-merge-checkout");
+        if !init_git_commit(&publisher.0, &[("base.txt", "base\n")]) {
+            return;
+        }
+        assert!(git(&origin.0, &["init", "--bare"]));
+        let url = origin.0.to_string_lossy().into_owned();
+        assert!(git(&publisher.0, &["remote", "add", "origin", &url]));
+        assert!(git(&publisher.0, &["push", "-u", "origin", "main"]));
+        assert!(git(&origin.0, &["symbolic-ref", "HEAD", "refs/heads/main"]));
+        assert!(git(&checkout.0, &["clone", &url, "."]));
+        assert!(git(&checkout.0, &["config", "user.name", "MonoCode"]));
+        assert!(git(&checkout.0, &["config", "user.email", "monocode@test"]));
+        assert!(git(&checkout.0, &["config", "commit.gpgsign", "false"]));
+        assert!(git(&checkout.0, &["checkout", "-b", "feature"]));
+        assert_eq!(
+            resolve_base_branch(&checkout.0, "HEAD").as_deref(),
+            Some("main")
+        );
+        assert!(git(&publisher.0, &["checkout", "-b", "release"]));
+        std::fs::write(publisher.0.join("release.txt"), "release\n").unwrap();
+        assert!(git(&publisher.0, &["add", "."]));
+        assert!(git(&publisher.0, &["commit", "-m", "release"]));
+        assert!(git(&publisher.0, &["push", "origin", "release"]));
+        std::fs::write(checkout.0.join("notes.txt"), "keep\n").unwrap();
+        tauri::async_runtime::block_on(git_merge_from(
+            checkout.0.to_string_lossy().into_owned(),
+            "refs/remotes/origin/release".into(),
+        ))
+        .unwrap();
+        assert_eq!(git_branch(&checkout.0).as_deref(), Some("feature"));
+        assert_eq!(
+            std::fs::read_to_string(checkout.0.join("release.txt")).unwrap(),
+            "release\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.0.join("notes.txt")).unwrap(),
+            "keep\n"
+        );
+        std::fs::write(publisher.0.join("base.txt"), "incoming\n").unwrap();
+        assert!(git(&publisher.0, &["commit", "-am", "incoming"]));
+        assert!(git(&publisher.0, &["push", "origin", "release"]));
+        std::fs::write(checkout.0.join("base.txt"), "dirty\n").unwrap();
+        assert!(tauri::async_runtime::block_on(git_merge_from(
+            checkout.0.to_string_lossy().into_owned(),
+            "refs/remotes/origin/release".into()
+        ))
+        .is_err());
+        assert_eq!(
+            std::fs::read_to_string(checkout.0.join("base.txt")).unwrap(),
+            "dirty\n"
+        );
+    }
+
+    #[test]
+    fn task_merge_falls_back_to_a_local_only_base() {
+        let origin = tmp("task-merge-local-origin");
+        let publisher = tmp("task-merge-local-publisher");
+        let checkout = tmp("task-merge-local-checkout");
+        if !init_git_commit(&publisher.0, &[("base.txt", "base\n")]) {
+            return;
+        }
+        assert!(git(&origin.0, &["init", "--bare"]));
+        let url = origin.0.to_string_lossy().into_owned();
+        assert!(git(&publisher.0, &["remote", "add", "origin", &url]));
+        assert!(git(&publisher.0, &["push", "-u", "origin", "main"]));
+        assert!(git(&origin.0, &["symbolic-ref", "HEAD", "refs/heads/main"]));
+        assert!(git(&checkout.0, &["clone", &url, "."]));
+        assert!(git(&checkout.0, &["config", "user.name", "MonoCode"]));
+        assert!(git(&checkout.0, &["config", "user.email", "monocode@test"]));
+        assert!(git(&checkout.0, &["config", "commit.gpgsign", "false"]));
+        // A base branch that exists only locally — never pushed, so no
+        // origin/local-base tracking ref exists to fetch.
+        assert!(git(&checkout.0, &["checkout", "-b", "local-base"]));
+        std::fs::write(checkout.0.join("local.txt"), "local\n").unwrap();
+        assert!(git(&checkout.0, &["add", "."]));
+        assert!(git(&checkout.0, &["commit", "-m", "local"]));
+        assert!(git(&checkout.0, &["checkout", "main"]));
+        assert!(git(&checkout.0, &["checkout", "-b", "feature"]));
+        tauri::async_runtime::block_on(git_merge_from(
+            checkout.0.to_string_lossy().into_owned(),
+            "local-base".into(),
+        ))
+        .unwrap();
+        assert_eq!(git_branch(&checkout.0).as_deref(), Some("feature"));
+        assert_eq!(
+            std::fs::read_to_string(checkout.0.join("local.txt")).unwrap(),
+            "local\n"
+        );
+    }
+
+    #[test]
+    fn fetch_branch_rejects_a_local_path_pseudo_remote() {
+        let repo = tmp("fetch-branch-pseudo-remote");
+        let neighbor = tmp("fetch-branch-neighbor");
+        if !init_git_commit(&repo.0, &[("base.txt", "base\n")])
+            || !init_git_commit(&neighbor.0, &[("side.txt", "side\n")])
+        {
+            return;
+        }
+        // A colon-free local path is a legal fetch source for git — a review
+        // lane must only come from a configured remote.
+        let error = tauri::async_runtime::block_on(git_fetch_branch(
+            repo.0.to_string_lossy().into_owned(),
+            format!("{}", neighbor.0.display()),
+            "main".into(),
+            "neighbor-main".into(),
+        ))
+        .unwrap_err();
+        assert!(error.contains("not configured"), "{error}");
+        assert!(!git_ref_exists(&repo.0, "refs/heads/neighbor-main"));
     }
 
     #[test]
@@ -9354,14 +9671,26 @@ mod tests {
     #[test]
     fn parse_github_pr_oids_reads_base_and_head() {
         let json = r#"{
-            "baseRefOid": "aaa111",
-            "headRefOid": "bbb222",
+            "baseRefOid": "aaa111aaa111aaa111aaa111aaa111aaa111aaa1",
+            "headRefOid": "bbb222bbb222bbb222bbb222bbb222bbb222bbb2",
             "files": []
         }"#;
         assert_eq!(
             parse_github_pr_oids(json).unwrap(),
-            ("aaa111".into(), "bbb222".into())
+            (
+                "aaa111aaa111aaa111aaa111aaa111aaa111aaa1".into(),
+                "bbb222bbb222bbb222bbb222bbb222bbb222bbb2".into()
+            )
         );
+        // OIDs reach `git fetch`/`git diff` — reject anything that isn't a
+        // plain object id (flags, refspecs, empty values).
+        for bad in ["--output=/tmp/x", "src:dst", "zzz", "", "abc123"] {
+            let json = format!(
+                r#"{{"baseRefOid":"{bad}","headRefOid":"{}","files":[]}}"#,
+                "0".repeat(40)
+            );
+            assert!(parse_github_pr_oids(&json).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -9403,7 +9732,7 @@ mod tests {
 
     #[test]
     fn github_check_details_reads_steps_and_failure_annotations() {
-        let details = github_check_details_with("acme/web", "123", |path| {
+        let details = github_check_details_with("acme/web", "123", "github.com", |path| {
             match path {
                 "repos/acme/web/actions/jobs/123" => Ok(r#"{
                     "id":123, "status":"completed", "conclusion":"failure",
@@ -10110,7 +10439,7 @@ mod tests {
 #[tauri::command]
 pub async fn git_refresh_branches(cwd: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        git_checked(&expand_home(&cwd), &["fetch", "--all"])
+        git_remote_checked(&expand_home(&cwd), &["fetch", "--all"])
     })
     .await
     .map_err(|e| e.to_string())?
@@ -10149,7 +10478,7 @@ fn task_branch_for(
         );
     }
     if action == "update" {
-        git_checked(root, &["pull", "--ff-only"])?;
+        git_remote_checked(root, &["pull", "--ff-only"])?;
         return Ok(expected.to_string());
     }
     if action != "switch" {

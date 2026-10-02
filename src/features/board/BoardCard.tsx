@@ -25,7 +25,7 @@ import {
   X,
   Zap,
 } from "../../shared/ui/icons";
-import type { BoardCard } from "./boardData";
+import type { BoardCard, BoardWorkstreamRow } from "./boardData";
 import {
   attentionScore,
   cardAttentionLines,
@@ -119,6 +119,7 @@ function CardMenu({
 }) {
   const liveSession = card.sessions.find((session) => session.live);
   const anySession = liveSession ?? card.sessions[0];
+  const [removeArmed, setRemoveArmed] = useState(false);
   // Deduped PR urls across lanes + discovered chips — "open all" only
   // earns a row when there's more than one (a single PR opens from its chip).
   const prUrlCount = new Set(
@@ -234,9 +235,16 @@ function CardMenu({
       {card.kind === "local" ? (
         <MenuRow
           icon={Trash2}
-          label="Remove"
+          label={removeArmed ? "Confirm removal" : "Remove"}
           danger
-          onClick={run({ kind: "remove" })}
+          onClick={() => {
+            if (!removeArmed) {
+              setRemoveArmed(true);
+              return;
+            }
+            onAction(card, { kind: "remove" });
+            onClose();
+          }}
         />
       ) : (
         <MenuRow
@@ -284,6 +292,7 @@ export function BoardCardView({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
+  const [removeArmed, setRemoveArmed] = useState(false);
   const lines = cardAttentionLines(card, column);
   const liveSession = card.sessions.find((session) => session.live);
   const anySession = liveSession ?? card.sessions[0];
@@ -483,6 +492,14 @@ export function BoardCardView({
           <ChevronRight className={`size-3 shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`} />
         </button>
       ) : null}
+      {card.kind === "task" && !expanded && <div className="mt-1 space-y-1">
+        {(card.workstreams ?? []).slice(0, 2).map(row => <button key={row.id} type="button" className="flex w-full min-w-0 items-center gap-2 rounded py-0.5 text-left text-[10px] text-content/50 hover:text-content" onClick={() => onAction(card, { kind: "open-task" })}>
+          <span className="min-w-0 flex-1 truncate">{row.projectPath.split(/[\\/]/).filter(Boolean).pop()} <span className="font-mono text-content/35">· {row.branch}</span></span>
+          {row.pr && <span className="shrink-0">{row.pr.provider === "gitlab" ? "MR" : "PR"} #{row.pr.number}</span>}
+          <LaneCiSummary row={row} />
+        </button>)}
+        {(card.workstreams?.length ?? 0) > 2 && <span className="text-[10px] text-content/35">+{card.workstreams!.length - 2} repositories</span>}
+      </div>}
       {card.kind === "task" && card.workstreams?.some((row) => row.probeError) ? (
         <p className="mt-1 text-[10px] text-amber-700 dark:text-amber-300">Worktree needs attention</p>
       ) : null}
@@ -599,11 +616,24 @@ export function BoardCardView({
               </button>
               <button
                 type="button"
-                className="flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] text-content/45 hover:bg-content/10 hover:text-content"
-                onClick={() => onAction(card, { kind: "remove" })}
+                aria-pressed={removeArmed}
+                onMouseLeave={() => setRemoveArmed(false)}
+                onBlur={() => setRemoveArmed(false)}
+                className={`flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium ${
+                  removeArmed
+                    ? "text-red-300 hover:bg-red-400/15"
+                    : "text-content/45 hover:bg-content/10 hover:text-content"
+                }`}
+                onClick={() => {
+                  if (!removeArmed) {
+                    setRemoveArmed(true);
+                    return;
+                  }
+                  onAction(card, { kind: "remove" });
+                }}
               >
                 <X className="size-3" strokeWidth={2} />
-                Remove
+                {removeArmed ? "Confirm removal" : "Remove"}
               </button>
             </>
           ) : null}
@@ -647,6 +677,23 @@ function GroupChips({
         );
       })}
     </>
+  );
+}
+
+/** Keep collapsed and expanded lanes consistent, including unavailable evidence. */
+function LaneCiSummary({ row }: { row: BoardWorkstreamRow }) {
+  const error = row.ciError || row.probeError;
+  if (!row.ciTotal && !error) return null;
+  const label = error
+    ? "CI unavailable"
+    : row.ciSummary ?? (row.ciFailing ? `CI · ${row.ciFailing} failed` : row.ciRunning ? "CI running" : row.ciBlocked ? "CI needs attention" : "CI passed");
+  return (
+    <span
+      title={error}
+      className={`shrink-0 rounded bg-content/5 px-1 text-[10px] ${error || row.ciBlocked || row.ciRunning ? "text-amber-700 dark:text-amber-300" : row.ciFailing ? "text-red-700 dark:text-red-400" : "text-content/50"}`}
+    >
+      {label}
+    </span>
   );
 }
 
@@ -735,19 +782,7 @@ function TaskMeta({
               {row.pr.number}
             </button>
           ) : null}
-          {row.ciFailing ? (
-            <span className="shrink-0 rounded bg-red-400/15 px-1 text-[10px] font-medium text-red-300">
-              CI ×{row.ciFailing}
-            </span>
-          ) : row.ciRunning ? (
-            <span className="shrink-0 rounded bg-emerald-400/10 px-1 text-[10px] font-medium text-emerald-300/90">
-              CI ●
-            </span>
-          ) : row.ciTotal ? (
-            <span className="shrink-0 rounded bg-content/8 px-1 text-[10px] text-content/40">
-              CI ✓
-            </span>
-          ) : null}
+          <LaneCiSummary row={row} />
           {row.probeError ? (
             <span
               className="shrink-0 rounded bg-amber-400/15 px-1 text-[10px] font-medium text-amber-300"

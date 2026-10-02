@@ -26,15 +26,20 @@ export function PlanningFilter({
   selected,
   onChange,
   recents,
+  providers,
 }: {
   selected: PlanningPeriod[];
   onChange: (p: PlanningPeriod[]) => void;
   recents: RecentProject[];
+  providers: InboxProvider[];
 }) {
   const [open, setOpen] = useState(false);
   const [provider, setProvider] = useState<InboxProvider>(
-    selected[0]?.scope.provider ?? "azuredevops",
+    selected[0]?.scope.provider ?? providers[0] ?? "github",
   );
+  const availableProvider = providers.includes(provider)
+    ? provider
+    : providers[0];
   const [cwd, setCwd] = useState(
     selected[0]?.scope.cwd ?? recents[0]?.path ?? "",
   );
@@ -55,13 +60,20 @@ export function PlanningFilter({
     setPeriods([]);
     setScopeNext(null);
     setPeriodNext(null);
-    if (!open || (provider === "github" && !cwd)) {
+    if (
+      !open ||
+      !availableProvider ||
+      (availableProvider === "github" && !cwd)
+    ) {
       setBusy(false);
       return;
     }
     setBusy(true);
     setError("");
-    void planningScopes(provider, provider === "github" ? cwd : "")
+    void planningScopes(
+      availableProvider,
+      availableProvider === "github" ? cwd : "",
+    )
       .then((page) => {
         if (run !== generation.current) return;
         setScopes(page.entries);
@@ -76,7 +88,7 @@ export function PlanningFilter({
     return () => {
       generation.current++;
     };
-  }, [open, provider, cwd]);
+  }, [open, availableProvider, cwd]);
   const loadPeriods = async (selectedScope: PlanningScope, cursor = "") => {
     const run = ++generation.current;
     setScope(selectedScope);
@@ -154,31 +166,41 @@ export function PlanningFilter({
       )}
       {open && (
         <div className="flex flex-col gap-2 px-2 pb-2">
+          {!providers.length ? (
+            <p className="text-content/40">
+              Connect a provider in Settings to choose a sprint or cycle.
+            </p>
+          ) : null}
           <div
-            className="flex items-center gap-1 border-b border-content/8 pb-2"
+            className="flex flex-wrap items-center gap-1 rounded-lg bg-content/4 p-1"
             role="group"
             aria-label="Sprint provider"
           >
-            {Object.entries(INBOX_SOURCE_LABELS).map(([value, label]) => (
-              <button
-                key={value}
-                type="button"
-                aria-label={label}
-                title={label}
-                aria-pressed={provider === value}
-                onClick={() => setProvider(value as InboxProvider)}
-                className={`flex h-7 flex-1 items-center justify-center rounded-md transition-colors focus-visible:outline-accent ${provider === value ? "bg-content/10 text-content" : "text-content/40 hover:bg-content/5 hover:text-content/75"}`}
-              >
-                <InboxProviderMark
-                  provider={value as InboxProvider}
-                  className="size-3.5"
-                />
-              </button>
-            ))}
+            {providers.map((value) => {
+              const label = INBOX_SOURCE_LABELS[value];
+              return (
+                <button
+                  key={value}
+                  type="button"
+                  aria-label={label}
+                  title={label}
+                  aria-pressed={availableProvider === value}
+                  onClick={() => setProvider(value as InboxProvider)}
+                  className={`flex h-7 flex-1 items-center justify-center gap-1.5 rounded-md px-2 transition-colors focus-visible:outline-accent ${availableProvider === value ? "bg-content/10 text-content" : "text-content/40 hover:bg-content/5 hover:text-content/75"}`}
+                >
+                  <InboxProviderMark
+                    provider={value}
+                    colorful
+                    className="size-3.5"
+                  />
+                  <span className="text-[11px]">{label}</span>
+                </button>
+              );
+            })}
           </div>
-          {provider === "github" && (
+          {availableProvider === "github" && (
             <SearchableSelect
-              variant="row"
+              variant="transparent"
               label="GitHub repository"
               value={cwd}
               options={recents.map((r) => ({
@@ -190,7 +212,7 @@ export function PlanningFilter({
             />
           )}
           <SearchableSelect
-            variant="row"
+            variant="transparent"
             label="Planning scope"
             value={scope?.id ?? ""}
             options={scopes.map((s) => ({ value: s.id, label: s.name }))}
@@ -199,9 +221,9 @@ export function PlanningFilter({
               if (s) void loadPeriods(s);
             }}
             placeholder={
-              provider === "jira"
+              availableProvider === "jira"
                 ? "Choose Scrum board…"
-                : provider === "linear"
+                : availableProvider === "linear"
                   ? "Choose team…"
                   : "Choose project…"
             }
@@ -217,8 +239,8 @@ export function PlanningFilter({
                 setError("");
                 try {
                   const page = await planningScopes(
-                    provider,
-                    provider === "github" ? cwd : "",
+                    availableProvider!,
+                    availableProvider === "github" ? cwd : "",
                     scopeNext,
                   );
                   if (run === generation.current) {
@@ -276,8 +298,7 @@ export function PlanningFilter({
               return (
                 <button
                   type="button"
-                  role="menuitemcheckbox"
-                  aria-checked={checked}
+                  aria-pressed={checked}
                   key={periodKey(p)}
                   className="flex w-full items-center gap-2 rounded-md px-1.5 py-2 text-left text-content/75 hover:bg-content/5 focus-visible:outline-accent disabled:opacity-40"
                   disabled={!checked && selected.length >= 20}

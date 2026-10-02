@@ -10,6 +10,7 @@ import {
   type DeliverySnapshot,
 } from "./delivery";
 import { listWorktrees } from "../source-control/model/worktrees";
+import { getSession } from "../sessions/data/sessionStore";
 import type { Session } from "../sessions/model/session";
 import type { TaskWorkstream } from "./boardStore";
 vi.mock("./delivery", async (original) => ({
@@ -106,6 +107,13 @@ beforeEach(() => {
     selected: true,
   });
   vi.mocked(loadComments).mockReset();
+  // The spawn mock doesn't register a real session — but sendHandoff
+  // revalidates a reused session id before retrying, so it must resolve.
+  vi.mocked(getSession)
+    .mockReset()
+    .mockImplementation(async (id: string) =>
+      id === "new" ? session("new", "/repo-wt") : null,
+    );
   host = document.createElement("div");
   document.body.append(host);
   root = createRoot(host);
@@ -145,7 +153,7 @@ it("targets the matching worktree and preserves review on rejection", async () =
   const picker = document.querySelector<HTMLButtonElement>(
     'button[aria-label^="Agent destination:"]',
   )!;
-  expect(picker.textContent).toContain("right · codex");
+  expect(picker.textContent).toContain("New agent · configured default");
   await act(async () => picker.click());
   expect(
     [...document.querySelectorAll('[role="option"]')].map((o) =>

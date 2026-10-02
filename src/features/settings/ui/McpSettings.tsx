@@ -107,6 +107,9 @@ function McpPicker<T extends string>({
           maxHeight={320}
           layer={LAYER.dialogPopover}
           autoFocus
+          // Focusable so the marked surface actually receives focus — Modal's
+          // Escape guard checks event.target's closest[data-dialog-popover].
+          tabIndex={-1}
           onDismiss={() => setOpen(false)}
           role="listbox"
           aria-label={label}

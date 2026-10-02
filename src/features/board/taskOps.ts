@@ -1,4 +1,6 @@
-import { deliveryKey, probeDelivery } from "./delivery";
+import { loadBoard } from "./boardStore";
+import { withTaskGitLock } from "./TaskGitActions";
+import { deliveryKey, probeDelivery, type DeliverySource } from "./delivery";
 import {
   gitBehindBase,
   gitBranches,
@@ -22,6 +24,7 @@ import {
   listWorktrees,
   type Worktree,
 } from "../source-control/model/worktrees";
+import { storedBaseName } from "../source-control/hooks/useProjectBranches";
 import type { BoardTask, TaskWorkstream } from "./boardStore";
 import { escapeRegExp, prIsOpen, type WorkstreamStatus } from "./boardData";
 
@@ -37,7 +40,7 @@ export { prIsOpen };
 /** The PR-create surface for one worktree — Azure when its remote resolves
  * to the configured org, GitHub/`gh` otherwise. An Azure-shaped remote that
  * isn't configured throws a readable error rather than falling to `gh`. */
-async function prOps(cwd: string, provider?: string) {
+async function prOps(cwd: string, provider?: string, source?: DeliverySource) {
   if (provider === "gitlab")
     throw new Error(
       "Create or update this merge request on GitLab; in-app GitLab publishing is not supported.",
@@ -50,7 +53,8 @@ async function prOps(cwd: string, provider?: string) {
         // The probe surface is the one that honours a pinned `prUrl`.
         status: (path: string, prUrl?: string, branch?: string) =>
           azureDevOpsPrProbe(path, prUrl, branch).then((probe) => probe.pr),
-        create: azureDevOpsPrCreate,
+        create: (...args: [string, string, string, string, string, boolean]) =>
+          azureDevOpsPrCreate(...args, source?.repo),
         // Azure PRs carry their id in the web url (`…/pullrequest/42`) —
         // patch that exact PR, not whatever is newest on the branch now.
         updateBody: (path: string, url: string, body: string) =>
@@ -58,11 +62,16 @@ async function prOps(cwd: string, provider?: string) {
             path,
             body,
             Number(/pullrequest\/(\d+)/.exec(url)?.[1]) || undefined,
+            source?.repo,
           ),
       }
     : {
         status: gitPrStatus,
-        create: gitPrCreate,
+        create: (...args: [string, string, string, string, string, boolean]) =>
+          gitPrCreate(
+            ...args,
+            source ? `https://${source.host}/${source.repo}` : undefined,
+          ),
         updateBody: gitPrUpdate,
       };
 }
@@ -82,18 +91,42 @@ export async function probeWorkstream(
   try {
     // A worktree someone checked out onto another branch feeds every
     // checkout-based signal — detect drift before it misreports.
-    const actual = worktree ? (await gitCurrentBranch(cwd) ?? "") : workstream.branch;
+    const actual = worktree
+      ? ((await gitCurrentBranch(cwd)) ?? "")
+      : workstream.branch;
     const drifted = actual !== workstream.branch;
-    if (drifted && !prUrl) throw new Error(`Worktree is on ${actual || "a detached HEAD"}, expected ${workstream.branch}`);
+    if (drifted && !prUrl)
+      throw new Error(
+        `Worktree is on ${actual || "a detached HEAD"}, expected ${workstream.branch}`,
+      );
     const [delivery, merging, behind] = await Promise.all([
-      probeDelivery(workstream),
+      // Only a live, undrifted worktree is the lane's own checkout — pinned
+      // lanes probe via the project root once cleaned, and drifted checkouts
+      // must not satisfy the backend's checkout-branch guard.
+      probeDelivery(workstream, {
+        checkoutBound: !!(worktree && !drifted),
+      }),
       worktree && !drifted ? gitMergeInProgress(cwd).catch(() => false) : false,
-      worktree && !drifted ? gitBehindBase(cwd, workstream.base).catch(() => 0) : 0,
+      worktree && !drifted
+        ? gitBehindBase(cwd, workstream.base).catch(() => 0)
+        : 0,
     ]);
-    return { provider: delivery.source.provider, pr: delivery.pr, checks: delivery.checks, delivery,
-      ciError: delivery.ciError, requestKey: deliveryKey(workstream), fetchedAt: Date.now(), merging, behind,
-      ...(drifted ? { error: `Worktree is on ${actual || "a detached HEAD"}, expected ${workstream.branch}` } : {}) };
-
+    return {
+      provider: delivery.source.provider,
+      pr: delivery.pr,
+      checks: delivery.checks,
+      delivery,
+      ciError: delivery.ciError,
+      requestKey: deliveryKey(workstream),
+      fetchedAt: Date.now(),
+      merging,
+      behind,
+      ...(drifted
+        ? {
+            error: `Worktree is on ${actual || "a detached HEAD"}, expected ${workstream.branch}`,
+          }
+        : {}),
+    };
   } catch (error) {
     // Keep a visible failure — a deleted worktree or missing `gh` must not
     // silently erase the row's PR/CI state.
@@ -134,9 +167,8 @@ export async function worktreeOnBranch(
 ): Promise<Worktree | null> {
   const live = await listWorktrees(projectPath);
   return (
-    live.worktrees.find(
-      (tree) => tree.branch === branch && !tree.missing,
-    ) ?? null
+    live.worktrees.find((tree) => tree.branch === branch && !tree.missing) ??
+    null
   );
 }
 
@@ -151,7 +183,10 @@ export type WorkstreamResult = {
 /** First line of an error's message, stripped of the `Error:` prefix —
  * the shared shape every lane/panel error surface renders. */
 export const shortError = (error: unknown, max = 160) =>
-  String(error).replace(/^Error:\s*/, "").split("\n")[0].slice(0, max);
+  String(error)
+    .replace(/^Error:\s*/, "")
+    .split("\n")[0]
+    .slice(0, max);
 
 const branchMismatch = (workstream: TaskWorkstream, actual: string) =>
   `Worktree is on ${actual || "another branch"}, expected ${workstream.branch}`;
@@ -166,11 +201,29 @@ async function gitContext(cwd: string) {
   return { branch: branches.current ?? "", remotes: new Set(remotes) };
 }
 
+/** The lane snapshot a mutation was requested against must still be the
+ * live one — a removed/re-based/archived lane must not publish. */
+function assertLiveBinding(workstream: TaskWorkstream, isBlocked?: () => boolean) {
+  const live = loadBoard()
+    .tasks.filter((task) => !task.archived)
+    .flatMap((task) => task.workstreams)
+    .find((ws) => ws.id === workstream.id);
+  // deliveryKey covers every push/PR-affecting field — branch, worktree,
+  // project, base, remote, pin and provider choices — so a mid-flight edit
+  // through DeliveryControls is caught too.
+  if (!live || deliveryKey(live) !== deliveryKey(workstream))
+    throw new Error("Working copy binding changed. Refresh before retrying.");
+  if (isBlocked?.())
+    throw new Error("Agent is working in this task or working copy.");
+}
+
 /** Fetch + merge the workstream's base ref into its branch. Runs in the
  * worktree only — and only after proving the worktree is on the task's
  * branch, since the user may have switched it in a terminal. */
 export async function updateWorkstreamFromBase(
   workstream: TaskWorkstream,
+  sourceRef = "HEAD",
+  isBlocked = () => false,
 ): Promise<WorkstreamResult> {
   const cwd = workstream.worktreePath;
   if (!cwd) {
@@ -180,33 +233,41 @@ export async function updateWorkstreamFromBase(
       message: "No worktree yet",
     };
   }
+  let mergeAttempted = false;
   try {
-    const context = await gitContext(cwd);
-    if (context.branch !== workstream.branch) {
+    return await withTaskGitLock(workstream.projectPath, "merge", async () => {
+      const assertBinding = () => assertLiveBinding(workstream, isBlocked);
+      assertBinding();
+      const context = await gitContext(cwd);
+      if (context.branch !== workstream.branch) {
+        return {
+          workstreamId: workstream.id,
+          ok: false,
+          message: branchMismatch(workstream, context.branch),
+        };
+      }
+      assertBinding();
+      mergeAttempted = true;
+      await gitMergeFrom(cwd, sourceRef);
       return {
         workstreamId: workstream.id,
-        ok: false,
-        message: branchMismatch(workstream, context.branch),
+        ok: true,
+        message: `Merged ${sourceRef === "HEAD" ? "default branch" : sourceRef}`,
       };
-    }
-    await gitMergeFrom(cwd, workstream.base);
-    return {
-      workstreamId: workstream.id,
-      ok: true,
-      message: `Merged ${workstream.base}`,
-    };
+    });
   } catch (error) {
     const message = shortError(error);
     // MERGE_HEAD is the authoritative conflict signal — error text alone
     // can't distinguish a real conflict from "uncommitted changes block
     // merge" or a fetch failure.
-    const conflict = await gitMergeInProgress(cwd).catch(() => false);
+    const conflict =
+      mergeAttempted && (await gitMergeInProgress(cwd).catch(() => false));
     return {
       workstreamId: workstream.id,
       ok: false,
       conflict,
       message: conflict
-        ? `Conflict merging ${workstream.base} — resolve in the worktree`
+        ? `Conflict merging ${sourceRef === "HEAD" ? "default branch" : sourceRef} — resolve in the worktree`
         : message,
     };
   }
@@ -219,9 +280,10 @@ export function resolveConflictPrompt(row: {
   branch: string;
   base: string;
 }): string {
+  const base = storedBaseName(row.base);
   return [
-    `Merging \`${row.base}\` into \`${row.branch}\` left conflicts in this worktree.`,
-    `Resolve each conflicted file by combining both sides — keep the current branch's changes and integrate the incoming \`${row.base}\` changes; don't just pick one side.`,
+    `Merging \`${base}\` into \`${row.branch}\` left conflicts in this worktree.`,
+    `Resolve each conflicted file by combining both sides — keep the current branch's changes and integrate the incoming \`${base}\` changes; don't just pick one side.`,
     "Then commit the merge with the default message and run the project's checks if they're quick. Report what you resolved and any judgment calls.",
   ].join(" ");
 }
@@ -293,10 +355,7 @@ export function renderPrBody(
     task: task.title,
     branch: workstream.branch,
     base,
-    tickets: section(
-      "Tickets",
-      task.links.map(ticketLine),
-    ),
+    tickets: section("Tickets", task.links.map(ticketLine)),
     prs: section(
       "Related pull requests",
       siblings.map((s) => `- ${s}`),
@@ -366,7 +425,13 @@ export async function createTaskPrs(
   opts?: PrCreateOptions,
 ): Promise<WorkstreamResult[]> {
   const results: WorkstreamResult[] = [];
-  const created: { ws: TaskWorkstream; url: string; base: string }[] = [];
+  const created: {
+    ws: TaskWorkstream;
+    url: string;
+    base: string;
+    source: DeliverySource;
+    remote?: string;
+  }[] = [];
   // URLs found at submit time (a PR created outside since the last probe) —
   // they join the sibling links so bodies cross-link them too.
   const discovered = new Map<string, string>();
@@ -399,69 +464,94 @@ export async function createTaskPrs(
       continue;
     }
     try {
-      // The worktree must still be on the task's branch — the push sends
-      // whatever is checked out, so verify before pushing anything.
-      const context = await gitContext(cwd);
-      if (context.branch !== ws.branch)
-        throw new Error(branchMismatch(ws, context.branch));
-      if (!context.remotes.size) throw new Error("No git remote");
-      const delivery = await probeDelivery(ws);
-      const ops = await prOps(cwd, delivery.source.provider);
-      // Push-only: a pull mid-submit could leave merge commits (or a
-      // conflicted MERGE_HEAD) nobody asked for. A rejected non-ff push
-      // tells the user to Update the lane first.
-      await gitPush(cwd);
-      const found = await ops.status(cwd, ws.prUrl);
-      if (found && prIsOpen(found.state)) {
-        discovered.set(ws.id, found.url);
+      await withTaskGitLock(ws.projectPath, "push", async () => {
+        assertLiveBinding(ws);
+        // The worktree must still be on the task's branch — the push sends
+        // whatever is checked out, so verify before pushing anything.
+        const context = await gitContext(cwd);
+        if (context.branch !== ws.branch)
+          throw new Error(branchMismatch(ws, context.branch));
+        if (!context.remotes.size) throw new Error("No git remote");
+        const delivery = await probeDelivery(ws);
+        const remote = delivery.remoteName ?? ws.remote;
+        const ops = await prOps(
+          cwd,
+          delivery.source.provider,
+          remote ? delivery.source : undefined,
+        );
+        // Push-only: a pull mid-submit could leave merge commits (or a
+        // conflicted MERGE_HEAD) nobody asked for. A rejected non-ff push
+        // tells the user to Update the lane first.
+        assertLiveBinding(ws);
+        await gitPush(cwd, remote, ws.branch);
+        const found = remote
+          ? (await probeDelivery(ws, { fresh: true })).pr
+          : await ops.status(cwd, ws.prUrl);
+        if (found && prIsOpen(found.state)) {
+          discovered.set(ws.id, found.url);
+          results.push({
+            workstreamId: ws.id,
+            ok: true,
+            message: "PR exists",
+          });
+          return;
+        }
+        // The chosen target may be remote-qualified ("origin/main") or a
+        // plain branch — including branches with slashes ("release/1.2").
+        // Strip only a real remote prefix, never the first path segment.
+        const chosenBase = storedBaseName(opts?.bases?.get(ws.id) ?? ws.base);
+        const base = [...context.remotes].some((remote) =>
+          chosenBase.startsWith(`${remote}/`),
+        )
+          ? chosenBase.slice(chosenBase.indexOf("/") + 1)
+          : chosenBase;
+        if (!base || base === "HEAD")
+          throw new Error("Pick a base branch for the pull request");
+        assertLiveBinding(ws);
+        const siblings = [...knownUrls().entries()]
+          .filter(([id]) => id !== ws.id)
+          .map(([, url]) => url);
+        const url = await ops.create(
+          cwd,
+          opts?.title?.trim() || task.title,
+          composePrBody(task, ws, siblings, base, opts),
+          base,
+          ws.branch,
+          opts?.draft ?? false,
+        );
+        created.push({ ws, url, base, source: delivery.source, remote });
         results.push({
           workstreamId: ws.id,
           ok: true,
-          message: "PR exists",
+          message: opts?.draft ? "Draft PR created" : "PR created",
         });
-        continue;
-      }
-      // The chosen target may be remote-qualified ("origin/main") or a
-      // plain branch — including branches with slashes ("release/1.2").
-      // Strip only a real remote prefix, never the first path segment.
-      const chosenBase = opts?.bases?.get(ws.id) ?? ws.base;
-      const base = [...context.remotes].some((remote) =>
-        chosenBase.startsWith(`${remote}/`),
-      )
-        ? chosenBase.slice(chosenBase.indexOf("/") + 1)
-        : chosenBase;
-      if (!base || base === "HEAD")
-        throw new Error("Pick a base branch for the pull request");
-      const siblings = [...knownUrls().entries()]
-        .filter(([id]) => id !== ws.id)
-        .map(([, url]) => url);
-      const url = await ops.create(
-        cwd,
-        opts?.title?.trim() || task.title,
-        composePrBody(task, ws, siblings, base, opts),
-        base,
-        ws.branch,
-        opts?.draft ?? false,
-      );
-      created.push({ ws, url, base });
-      results.push({
-        workstreamId: ws.id,
-        ok: true,
-        message: opts?.draft ? "Draft PR created" : "PR created",
       });
     } catch (error) {
-      results.push({ workstreamId: ws.id, ok: false, message: shortError(error) });
+      results.push({
+        workstreamId: ws.id,
+        ok: false,
+        message: shortError(error),
+      });
     }
   }
   // Second pass: bodies get the real sibling URLs.
   const urls = knownUrls();
   if (urls.size > 1) {
     for (const entry of created) {
+      try {
+        assertLiveBinding(entry.ws);
+      } catch {
+        continue;
+      }
       const siblings = [...urls.entries()]
         .filter(([id]) => id !== entry.ws.id)
         .map(([, url]) => url);
       const cwd = entry.ws.worktreePath!;
-      const ops = await prOps(cwd, entry.ws.prProvider ?? status.get(entry.ws.id)?.provider).catch(() => null);
+      const ops = await prOps(
+        cwd,
+        entry.source.provider,
+        entry.remote ? entry.source : undefined,
+      ).catch(() => null);
       await ops
         ?.updateBody(
           cwd,

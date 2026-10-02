@@ -1514,17 +1514,29 @@ pub async fn gitlab_relationship_items(
         validate_kind(&kind)?;
         let suffix = relationship_suffix(&config, &kind, &relationship)?;
         let resource = resource_for_kind(&kind);
-        let response = gitlab_get(
-            &config,
-            &format!("/{resource}?per_page=100&order_by=updated_at&sort=desc{suffix}"),
-        )?;
+        // Follow `next` pages so the relationship list doesn't silently
+        // truncate — bounded at five pages to keep the inbox listing sane.
+        let mut rows = Vec::new();
+        for page in 1..=5u32 {
+            let response = gitlab_get(
+                &config,
+                &format!(
+                    "/{resource}?per_page=100&page={page}&order_by=updated_at&sort=desc{suffix}"
+                ),
+            )?;
+            let list = response
+                .value
+                .as_array()
+                .ok_or("GitLab did not return items")?;
+            let empty = list.is_empty();
+            rows.extend(list.iter().cloned());
+            if empty || !response.has_next_page {
+                break;
+            }
+        }
         let mut repos = std::collections::HashMap::new();
         let mut items = Vec::new();
-        for row in response
-            .value
-            .as_array()
-            .ok_or("GitLab did not return items")?
-        {
+        for row in &rows {
             let project = row["project_id"]
                 .as_i64()
                 .ok_or("GitLab item has no project")?;

@@ -131,6 +131,30 @@ describe("delivery evidence", () => {
     await probeDelivery(lane);
     expect(invoke).toHaveBeenCalledTimes(2);
   });
+  it("forwards checkoutBound and bypasses in-flight reuse when fresh", async () => {
+    vi.mocked(invoke).mockResolvedValue(snapshot);
+    await probeDelivery(lane, { checkoutBound: false });
+    expect(invoke).toHaveBeenLastCalledWith(
+      "task_delivery_probe",
+      expect.objectContaining({ checkoutBound: false }),
+    );
+    let resolveStale!: (value: DeliverySnapshot) => void;
+    vi.mocked(invoke).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveStale = resolve;
+      }),
+    );
+    const stale = probeDelivery(lane);
+    const fresh = probeDelivery(lane, { fresh: true });
+    expect(fresh).not.toBe(stale);
+    expect(invoke).toHaveBeenCalledTimes(3);
+    resolveStale(snapshot);
+    await Promise.all([stale, fresh]);
+    // A non-fresh call after the fresh one lands still shares in-flight work.
+    const c = probeDelivery(lane),
+      d = probeDelivery(lane);
+    expect(c).toBe(d);
+  });
   it("sends only selected evidence and preserves source and authority boundaries", () => {
     const evidence = [
       {

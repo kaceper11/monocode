@@ -22,16 +22,26 @@ vi.mock("../source-control/hooks/useProjectBranches", async original => ({
   ] } }),
 }));
 const refresh = vi.fn();
+const treeList = {
+  // `null` models the worktree list still loading — isMain/dirty are unknown.
+  current: [
+    // The lane's own bound copy is live — the common case must not
+    // disable the branch picker.
+    { path: "/dirty-worktree", branch: "main", missing: false, dirty: null, isMain: false },
+    { path: "/existing-copy", branch: "existing", missing: false, dirty: null, isMain: false },
+  ] as
+    | {
+        path: string;
+        branch: string | null;
+        missing: boolean;
+        dirty: boolean | null;
+        isMain: boolean;
+      }[]
+    | null,
+};
 vi.mock("../source-control/hooks/useProjectWorktrees", () => ({
   useProjectWorktrees: () => ({
-    data: {
-      worktrees: [
-        // The lane's own bound copy is live — the common case must not
-        // disable the branch picker.
-        { path: "/dirty-worktree", branch: "main", missing: false },
-        { path: "/existing-copy", branch: "existing", missing: false },
-      ],
-    },
+    data: treeList.current ? { worktrees: treeList.current } : undefined,
     refresh,
   }),
 }));
@@ -48,6 +58,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   prepare.mockResolvedValue("/new-worktree");
   vi.mocked(worktreeOnBranch).mockResolvedValue(null);
+  treeList.current = [
+    { path: "/dirty-worktree", branch: "main", missing: false, dirty: null, isMain: false },
+    { path: "/existing-copy", branch: "existing", missing: false, dirty: null, isMain: false },
+  ];
   taskId = addTask({ title: "Task", links: [], workstreams: [lane] })!;
   host = document.createElement("div"); document.body.append(host); root = createRoot(host);
 });
@@ -69,168 +83,168 @@ function option(text: string | ((t: string) => boolean)) {
     typeof text === "string" ? b.textContent === text : !!b.textContent && text(b.textContent))!;
 }
 async function pickBranch(name = "existing", from = "main") {
-  await act(async () => document.querySelector<HTMLButtonElement>(`[aria-label="Branch: ${from}"]`)!.click());
+  await act(async () => document.querySelector<HTMLButtonElement>(`[aria-label="Checkout branch: ${from}"]`)!.click());
   await act(async () => option(name).click());
 }
-it("stages an existing branch and prepares a separate worktree without switching the dirty copy", async () => {
-  await render(); await pickBranch();
-  expect(prepare).not.toHaveBeenCalled(); expect(gitTaskBranch).not.toHaveBeenCalled(); expect(patch).not.toHaveBeenCalled();
-  await act(async () => button("New worktree").click());
-  expect(prepare).toHaveBeenCalledWith({ projectPath: "/repo", branch: "existing", base: "main" });
-  expect(gitTaskBranch).not.toHaveBeenCalled();
-  expect(patch).toHaveBeenCalledWith({ branch: "existing", worktreePath: "/new-worktree", prUrl: undefined });
-  expect(close).toHaveBeenCalled();
-});
-it("keeps the dirty-checkout error for in-place switching and permits creating separately afterwards", async () => {
+it("surfaces the backend's dirty-checkout refusal for in-place switching", async () => {
   vi.mocked(gitTaskBranch).mockRejectedValueOnce("Commit or stash working copy changes before changing or updating its branch.");
   await render(); await pickBranch();
-  await act(async () => button("Switch in place").click());
+  await act(async () => button("Switch to existing").click());
   expect(document.querySelector('[role="alert"]')?.textContent).toContain("Commit or stash");
   expect(patch).not.toHaveBeenCalled();
-  await act(async () => button("New worktree").click());
-  expect(prepare).toHaveBeenCalledOnce();
-});
-it("uses the exact remote ref when preparing a remote-only branch", async () => {
-  await render(); await pickBranch("origin/remote-only");
-  await act(async () => button("New worktree").click());
-  expect(prepare).toHaveBeenCalledWith({ projectPath: "/repo", branch: "remote-only", base: "refs/remotes/origin/remote-only" });
-});
-it("offers an existing worktree before attaching it", async () => {
-  vi.mocked(worktreeOnBranch).mockResolvedValue({ path: "/existing-copy" } as Awaited<ReturnType<typeof worktreeOnBranch>>);
-  await render(); await pickBranch();
-  await act(async () => button("New worktree").click());
-  expect(prepare).not.toHaveBeenCalled();
-  await act(async () => button("Use it").click());
-  expect(prepare).toHaveBeenCalledWith({ projectPath: "/repo", branch: "existing", base: "main", worktreePath: "/existing-copy" });
 });
 it("rejects a competing task claim that arrives after selection", async () => {
   await render(); await pickBranch();
   addTask({ title: "Owner", links: [], workstreams: [{ ...lane, id: "other", branch: "existing" }] });
-  await act(async () => button("New worktree").click());
-  expect(prepare).not.toHaveBeenCalled(); expect(patch).not.toHaveBeenCalled();
+  await act(async () => button("Switch to existing").click());
+  expect(gitTaskBranch).not.toHaveBeenCalled(); expect(patch).not.toHaveBeenCalled();
   expect(document.querySelector('[role="alert"]')?.textContent).toContain("already tracks existing");
 });
-it("leaves the lane unchanged when preparation fails or another edit wins the race", async () => {
-  prepare.mockRejectedValueOnce(new Error("Cannot prepare"));
+it("leaves the lane unchanged when a bind fails or another edit wins the race", async () => {
+  vi.mocked(worktreeOnBranch).mockResolvedValue({ path: "/existing-copy" } as Awaited<ReturnType<typeof worktreeOnBranch>>);
   await render(); await pickBranch();
-  await act(async () => button("New worktree").click());
+  await act(async () => button("Switch to existing").click());
+  prepare.mockRejectedValueOnce(new Error("Cannot prepare"));
+  await act(async () => button("Use it").click());
   expect(patch).not.toHaveBeenCalled(); expect(loadBoard().tasks[0].workstreams[0]).toMatchObject(lane);
   prepare.mockImplementationOnce(async () => {
     updateTask(taskId, { workstreams: [{ ...lane, branch: "changed" }] });
     return "/kept-worktree";
   });
-  await act(async () => button("New worktree").click());
+  await act(async () => button("Use it").click());
   expect(patch).not.toHaveBeenCalled();
   expect(document.querySelector('[role="alert"]')?.textContent).toContain("Working copy kept at /kept-worktree");
 });
-
-it("creates a named worktree from a chosen starting branch without changing the PR base", async () => {
-  await render();
-  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Worktree:"]')!.click());
-  await act(async () => option("Create new worktree").click());
-  expect(button("Create worktree").disabled).toBe(true);
-  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Branch:"]')!.click());
-  const input = document.querySelector<HTMLInputElement>('[aria-label="Pick or type a branch…"]')!;
-  await act(async () => {
-    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "new-feature");
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-  });
-  await act(async () => button('New branch "new-feature"').click());
-  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label="Base branch: main"]')!.click());
-  await act(async () => option("existing").click());
-  expect(patch).not.toHaveBeenCalled();
-  await act(async () => button("Create worktree").click());
-  expect(prepare).toHaveBeenCalledWith({ projectPath: "/repo", branch: "new-feature", base: "existing" });
-  expect(patch).toHaveBeenCalledWith({ branch: "new-feature", worktreePath: "/new-worktree", prUrl: undefined });
-  expect(gitTaskBranch).not.toHaveBeenCalled();
-});
-
-it("validates a staged working copy before attaching it and clears the previous PR", async () => {
-  prepare.mockRejectedValueOnce(new Error("Worktree is on changed, expected existing"));
-  await render();
-  const selectCopy = async () => {
-    await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Worktree:"]')!.click());
-    await act(async () => option(t => t.startsWith("existing —")).click());
-  };
-  await selectCopy();
-  expect(prepare).not.toHaveBeenCalled();
-  await act(async () => button("Attach working copy").click());
-  expect(prepare).toHaveBeenCalledWith({ projectPath: "/repo", branch: "existing", base: "main", worktreePath: "/existing-copy" });
-  expect(patch).not.toHaveBeenCalled();
-  expect(document.querySelector('[role="alert"]')?.textContent).toContain("Worktree is on changed");
-  prepare.mockResolvedValueOnce("/existing-copy");
-  await selectCopy();
-  await act(async () => button("Attach working copy").click());
-  expect(patch).toHaveBeenCalledWith({ branch: "existing", worktreePath: "/existing-copy", prUrl: undefined });
-  expect(gitTaskBranch).not.toHaveBeenCalled();
-});
-
-it("does not leak a create-mode base into a later branch retarget", async () => {
-  await render();
-  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Worktree:"]')!.click());
-  await act(async () => option("Create new worktree").click());
-  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Base branch:"]')!.click());
-  await act(async () => option("existing").click());
-  // Back to the bound copy — the create-mode base is dropped.
-  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Worktree:"]')!.click());
-  await act(async () => option(t => t.startsWith("main —")).click());
-  await pickBranch();
-  await act(async () => button("New worktree").click());
-  expect(prepare).toHaveBeenCalledWith({ projectPath: "/repo", branch: "existing", base: "main" });
-});
-
 it("detaches the bound copy without touching its branch", async () => {
   await render();
-  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Worktree:"]')!.click());
-  await act(async () => option("No working copy").click());
-  await act(async () => button("Detach working copy").click());
+  await act(async () => button("Detach worktree").click());
   expect(prepare).not.toHaveBeenCalled();
   expect(patch).toHaveBeenCalledWith({ worktreePath: undefined });
   expect(close).toHaveBeenCalled();
 });
-
 it("detaches and retargets in one patch when a branch is staged too", async () => {
-  await render();
-  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Worktree:"]')!.click());
-  await act(async () => option("No working copy").click());
-  await pickBranch();
-  await act(async () => button("Detach working copy").click());
+  await render(); await pickBranch();
+  await act(async () => button("Detach worktree").click());
   expect(patch).toHaveBeenCalledWith({
     worktreePath: undefined,
     branch: "existing",
     prUrl: undefined,
   });
   expect(prepare).not.toHaveBeenCalled();
+  expect(gitTaskBranch).not.toHaveBeenCalled();
 });
-
 it("pins the probed PR when detaching without a retarget", async () => {
   await render({ ...lane, pr: { url: "https://x/pr/1" } } as typeof lane);
-  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Worktree:"]')!.click());
-  await act(async () => option("No working copy").click());
-  await act(async () => button("Detach working copy").click());
+  await act(async () => button("Detach worktree").click());
   expect(patch).toHaveBeenCalledWith({
     worktreePath: undefined,
     prUrl: "https://x/pr/1",
   });
 });
-
-it("retargets a copyless lane with Save branch and no git IO", async () => {
-  const copyless = { id: "lane2", projectPath: "/repo", branch: "old-branch", base: "main" };
-  updateTask(taskId, { workstreams: [lane, copyless] });
-  await render({ ...copyless, prUrl: "old-pr" } as typeof lane, [lane, copyless]);
-  await pickBranch("existing", "old-branch");
-  await act(async () => button("Save branch").click());
-  expect(prepare).not.toHaveBeenCalled();
-  expect(gitTaskBranch).not.toHaveBeenCalled();
-  expect(patch).toHaveBeenCalledWith({ branch: "existing", prUrl: undefined });
-});
-
 it("refuses to detach when the lane changed while the editor was open", async () => {
   await render();
-  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Worktree:"]')!.click());
-  await act(async () => option("No working copy").click());
   updateTask(taskId, { workstreams: [{ ...lane, worktreePath: "/other" }] });
-  await act(async () => button("Detach working copy").click());
+  await act(async () => button("Detach worktree").click());
   expect(patch).not.toHaveBeenCalled();
   expect(document.querySelector('[role="alert"]')?.textContent).toContain("Reopen the editor");
+});
+it("warns about uncommitted changes instead of letting the switch fail", async () => {
+  treeList.current[0] = { ...treeList.current[0], dirty: true };
+  await render();
+  await pickBranch();
+  expect(button("Switch to existing").disabled).toBe(true);
+  expect(document.body.textContent).toContain("Uncommitted changes");
+  expect(gitTaskBranch).not.toHaveBeenCalled();
+});
+it("does not offer an in-place switch on the repository's main checkout", async () => {
+  treeList.current[0] = { ...treeList.current[0], isMain: true };
+  await render();
+  await pickBranch();
+  expect(button("Switch to existing").disabled).toBe(true);
+  expect(document.body.textContent).toContain("main checkout");
+  expect(gitTaskBranch).not.toHaveBeenCalled();
+});
+it("offers the copy that already has the staged branch instead of a doomed switch", async () => {
+  vi.mocked(worktreeOnBranch).mockResolvedValue({ path: "/existing-copy" } as Awaited<ReturnType<typeof worktreeOnBranch>>);
+  await render();
+  await pickBranch();
+  await act(async () => button("Switch to existing").click());
+  // Git can't check a branch out twice — the existing copy is offered.
+  expect(gitTaskBranch).not.toHaveBeenCalled();
+  expect(document.body.textContent).toContain("Worktree exists");
+  prepare.mockResolvedValueOnce("/existing-copy");
+  await act(async () => button("Use it").click());
+  expect(prepare).toHaveBeenCalledWith({ projectPath: "/repo", branch: "existing", base: "main", worktreePath: "/existing-copy" });
+  expect(patch).toHaveBeenCalledWith({ branch: "existing", worktreePath: "/existing-copy", prUrl: undefined });
+});
+it("passes the remote-qualified base when binding the offered copy", async () => {
+  vi.mocked(worktreeOnBranch).mockResolvedValue({ path: "/existing-copy" } as Awaited<ReturnType<typeof worktreeOnBranch>>);
+  await render();
+  await pickBranch("origin/remote-only");
+  await act(async () => button("Switch to remote-only").click());
+  await act(async () => button("Use it").click());
+  expect(prepare).toHaveBeenCalledWith({ projectPath: "/repo", branch: "remote-only", base: "origin/remote-only", worktreePath: "/existing-copy" });
+});
+it("switches the bound copy in place and records the new branch", async () => {
+  vi.mocked(gitTaskBranch).mockResolvedValueOnce("existing");
+  await render();
+  await pickBranch();
+  await act(async () => button("Switch to existing").click());
+  expect(gitTaskBranch).toHaveBeenCalledWith(
+    "/dirty-worktree", "main", "existing", "main", "switch",
+  );
+  expect(patch).toHaveBeenCalledWith({ branch: "existing", prUrl: undefined });
+  expect(prepare).not.toHaveBeenCalled();
+});
+it("keeps the switch unavailable while the worktree list is still loading", async () => {
+  treeList.current = null;
+  await render();
+  await pickBranch();
+  expect(button("Switch to existing").disabled).toBe(true);
+  expect(document.body.textContent).toContain("isn't available yet");
+  expect(gitTaskBranch).not.toHaveBeenCalled();
+});
+it("refuses to hand a switched lane to an agent that started mid-mutation", async () => {
+  let release!: (value: string) => void;
+  vi.mocked(gitTaskBranch).mockImplementationOnce(
+    () => new Promise<string>((resolve) => { release = resolve; }),
+  );
+  await render();
+  await pickBranch();
+  await act(async () => { button("Switch to existing").click(); });
+  // A session started working while the checkout was in flight.
+  await act(async () =>
+    root.render(createElement(WorkstreamEditor, {
+      anchor: host,
+      row: {
+        ...lane,
+        sessions: [{ id: "s1", busy: true }],
+      } as unknown as ComponentProps<typeof WorkstreamEditor>["row"],
+      lanes: [lane] as ComponentProps<typeof WorkstreamEditor>["lanes"],
+      busy: false, onPatch: patch, onPrepareWorktree: prepare,
+      onRemoveWorktree: vi.fn(), onClose: close,
+    })),
+  );
+  await act(async () => { release("existing"); });
+  expect(patch).not.toHaveBeenCalled();
+  expect(document.querySelector('[role="alert"]')?.textContent).toContain("An agent is working");
+});
+it("drops the branch picker entirely when the bound copy is gone from disk", async () => {
+  treeList.current = [
+    { path: "/dirty-worktree", branch: "main", missing: true, dirty: null, isMain: false },
+  ];
+  await render();
+  expect(document.querySelector('[aria-label^="Checkout branch"]')).toBeNull();
+  expect(document.body.textContent).toContain("Nothing on disk to switch");
+  // Detach stays available — it's how the dead binding gets dropped.
+  await act(async () => button("Detach worktree").click());
+  expect(patch).toHaveBeenCalledWith({ worktreePath: undefined });
+});
+it("refuses detach when a stale lane branch resolves to no name", async () => {
+  // Legacy rows can carry `refs/remotes/x` — a single-segment suffix strips
+  // to an empty branch, and the staged retarget must not patch it.
+  await render({ ...lane, branch: "refs/remotes/x" });
+  await act(async () => button("Detach worktree").click());
+  expect(patch).not.toHaveBeenCalled();
+  expect(document.querySelector('[role="alert"]')?.textContent).toContain("Pick a valid branch name");
 });

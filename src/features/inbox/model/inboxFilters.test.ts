@@ -674,7 +674,6 @@ describe("inbox connection cache", () => {
       linear: true,
       jira: true,
       gitlab: false,
-      jira: false,
       azuredevops: false,
     });
     expect(loadInboxConnections()).toEqual({
@@ -682,7 +681,6 @@ describe("inbox connection cache", () => {
       linear: true,
       jira: true,
       gitlab: false,
-      jira: false,
       azuredevops: false,
     });
   });
@@ -693,7 +691,6 @@ describe("inbox connection cache", () => {
       linear: null,
       jira: null,
       gitlab: null,
-      jira: null,
       azuredevops: null,
     });
   });
@@ -705,7 +702,6 @@ describe("inbox connection cache", () => {
       linear: null,
       jira: null,
       gitlab: null,
-      jira: null,
       azuredevops: null,
     });
     localStorage.setItem(KEY, '{"linear":"yes"}');
@@ -714,7 +710,6 @@ describe("inbox connection cache", () => {
       linear: null,
       jira: null,
       gitlab: null,
-      jira: null,
       azuredevops: null,
     });
   });
