@@ -210,7 +210,7 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     resumeByThread.delete(input.sessionId);
   }
 
-  const { path } = await resolveFxBinary(input.cwd);
+  const { path } = await resolveFxBinary();
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(input.sessionId, handlers);
   const liveRef: { current: Live | null } = { current: null };
@@ -264,7 +264,7 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
   await spawnChild(
     input.sessionId,
     path,
-    fxSpawnArgs(input.model, input.cwd),
+    fxSpawnArgs(input.model),
     input.cwd,
     undefined,
     "fx",
@@ -370,7 +370,7 @@ async function applyModelSelection(
   live: Live,
   input: SendTurnInput,
 ): Promise<void> {
-  const base = nativeModelId(input.model, input.cwd).trim();
+  const base = nativeModelId(input.model).trim();
   const settings = input.modelSettings ?? {};
   const modelConfigId =
     live.modelConfigId === "provider" ? "model" : live.modelConfigId;
@@ -441,8 +441,8 @@ async function setConfigOption(
   }
 }
 
-function fxSpawnArgs(model: string, cwd: string): string[] {
-  const native = nativeModelId(model, cwd).trim();
+function fxSpawnArgs(model: string): string[] {
+  const native = nativeModelId(model).trim();
   return native ? ["acp", "--model", native] : ["acp"];
 }
 

@@ -287,7 +287,6 @@ export function devinModelsFromConfig(
 export function devinModelSelectionForUid(
   options: DevinConfigOption[],
   uid: string,
-  cwd?: string,
 ): { id: string; reasoning?: string } {
   const find = (models: AgentModel[]) => {
     for (const model of models) {
@@ -304,7 +303,7 @@ export function devinModelSelectionForUid(
   // The picker catalog (from `devin models list`) is the id space the picker
   // displays — prefer it so a reported uid maps to the same row the user sees.
   return (
-    find(modelsFor("devin", cwd)) ??
+    find(modelsFor("devin")) ??
     find(devinModelsFromConfig(options)) ?? { id: `devin:${uid}` }
   );
 }

@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -37,22 +36,13 @@ fn update_args(provider: &str) -> Option<&'static [&'static str]> {
 /// A download plus, for npm installs, a full dependency install.
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(300);
 
-static LAUNCH_CHECK_CLAIMED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static LAUNCH_CHECK_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// True for the first caller per app process, so a window opened later in the
 /// same run does not repeat the launch check.
 #[tauri::command]
-pub fn harness_update_check_claim(cwd: Option<String>) -> bool {
-    let scope = match cwd.as_deref().map(crate::wsl::location).transpose() {
-        Ok(Some(Some(location))) => format!("wsl:{}", location.distribution.to_lowercase()),
-        Ok(_) => "native".into(),
-        Err(_) => return false,
-    };
-    LAUNCH_CHECK_CLAIMED
-        .get_or_init(Mutex::default)
-        .lock()
-        .map(|mut claimed| claimed.insert(scope))
-        .unwrap_or(false)
+pub fn harness_update_check_claim() -> bool {
+    !LAUNCH_CHECK_CLAIMED.swap(true, Ordering::SeqCst)
 }
 
 #[tauri::command]
@@ -85,7 +75,6 @@ pub async fn harness_update(
     command: String,
     binary_provider: String,
     binary_path: Option<String>,
-    cwd: Option<String>,
 ) -> Result<(), String> {
     let args: Vec<String> = update_args(&binary_provider)
         .ok_or_else(|| format!("No updater for harness: {binary_provider}"))?
@@ -93,22 +82,6 @@ pub async fn harness_update(
         .map(|arg| arg.to_string())
         .collect();
     tauri::async_runtime::spawn_blocking(move || {
-        if let Some(location) = cwd
-            .as_deref()
-            .map(crate::wsl::location)
-            .transpose()?
-            .flatten()
-        {
-            crate::wsl::request_bounded::<String>(
-                &location,
-                "agent_run",
-                serde_json::json!({"provider":binary_provider, "command":command, "args":args, "timeout":UPDATE_TIMEOUT.as_secs()}),
-                UPDATE_TIMEOUT + Duration::from_secs(15),
-            )?;
-            // Refresh the guest login environment and cached binary resolutions after installation.
-            crate::wsl::refresh_agent_environment(&location)?;
-            return Ok(());
-        }
         if !is_resolved_harness_binary(&command, Some(&binary_provider), binary_path.as_deref()) {
             return Err("harness_update: not a resolved harness CLI".to_string());
         }
@@ -147,24 +120,6 @@ fn latest_version(body: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn launch_checks_are_claimed_once_per_execution_host() {
-        assert!(harness_update_check_claim(None));
-        assert!(!harness_update_check_claim(Some("C:/project".into())));
-        assert!(harness_update_check_claim(Some(
-            "//wsl.localhost/UpdateFixture/home/repo".into()
-        )));
-        assert!(!harness_update_check_claim(Some(
-            "//wsl$/updatefixture/other".into()
-        )));
-        assert!(harness_update_check_claim(Some(
-            "//wsl.localhost/OtherUpdateFixture/home/repo".into()
-        )));
-        assert!(!harness_update_check_claim(Some(
-            "//wsl.localhost/-invalid/repo".into()
-        )));
-    }
 
     #[test]
     fn maps_only_npm_published_harnesses() {

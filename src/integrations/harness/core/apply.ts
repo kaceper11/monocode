@@ -7,7 +7,6 @@ import type {
   TaskListItem,
   ToolPreview,
 } from "../../../features/sessions/model/session";
-import { sessionWorkCwd } from "../../../features/sessions/model/session";
 import { mergeContextUsage } from "../../../features/sessions/model/contextUsage";
 import { displayPath } from "../../../shared/lib/paths";
 import {
@@ -450,7 +449,7 @@ function userTurnFields(extra?: UserTurnExtra) {
 }
 
 function turnModelFields(session: Session) {
-  const model = resolveModel(session.harness, session.model, sessionWorkCwd(session));
+  const model = resolveModel(session.harness, session.model);
   return {
     turnModel: {
       harness: session.harness,

@@ -3,8 +3,6 @@ import {
   bindHarnessTiming, currentHarnessTiming, measureHarnessTiming,
   observeHarnessTiming, type HarnessTiming,
 } from "./timing";
-import { wslLocation } from "../../../shared/lib/paths";
-import { wslStatusFor } from "../../../features/sessions/model/wslStatus";
 import type {
   Block,
   HarnessId,
@@ -93,7 +91,7 @@ export type HarnessAdapter = {
   /** Seed provider task state from a restored session's persisted panels. */
   restoreTaskLists?(threadId: string, lists: TaskListMeta[]): void;
   /** Refresh the model catalog overlay when supported. */
-  refreshCatalog?(cwd?: string): Promise<void>;
+  refreshCatalog?(): Promise<void>;
   /** Optional LLM tab title for the first turn. */
   generateTitle?(input: TitleInput): Promise<GeneratedSessionTitle | null>;
   /** Optional LLM commit message from staged changes. */
@@ -451,21 +449,17 @@ export function bindHarnessSession(
 /** `force` re-reads a catalog that already loaded, e.g. after a CLI update. */
 export async function refreshHarnessCatalogs(
   ids: Iterable<HarnessId>,
-  cwdOrOptions?: string | { force?: boolean },
-  force = false,
+  options?: { force?: boolean },
 ): Promise<void> {
-  const cwd = typeof cwdOrOptions === "string" ? cwdOrOptions : undefined;
-  force = cwdOrOptions && typeof cwdOrOptions === "object" ? cwdOrOptions.force === true : force;
-  const distribution = wslLocation(cwd ?? "")?.distribution;
-  if (distribution && wslStatusFor(distribution).state !== "connected") return;
   const wanted = new Set(ids);
   if (wanted.size === 0) return;
   await Promise.all(
     [...adapters.values()]
       .filter((adapter) => wanted.has(adapter.id))
       .map(async (adapter) => {
-        if (!adapter.refreshCatalog || (!force && hasLiveCatalog(adapter.id, cwd))) return;
-        await adapter.refreshCatalog(cwd).catch((error: unknown) => {
+        if (!adapter.refreshCatalog) return;
+        if (!options?.force && hasLiveCatalog(adapter.id)) return;
+        await adapter.refreshCatalog().catch((error: unknown) => {
           console.debug(`[monocode] ${adapter.id} catalog`, error);
         });
       }),

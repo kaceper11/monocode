@@ -241,7 +241,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     resumeByThread.delete(input.sessionId);
   }
 
-  const { path } = await resolveGrokBinary(input.cwd);
+  const { path } = await resolveGrokBinary();
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(input.sessionId, handlers);
   const liveRef: { current: Live | null } = { current: null };
@@ -294,7 +294,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     input.sessionId,
     path,
     grokSpawnArgs({
-      model: nativeModelId(input.model, input.cwd),
+      model: nativeModelId(input.model),
       effort: grokEffort(input.modelSettings),
       fullAccess: wantFullAccess,
       plan: wantPlanning,
@@ -390,7 +390,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       acp,
       acpSessionId,
       cwd: input.cwd,
-      modelId: currentModelId(setup) ?? nativeModelId(input.model, input.cwd),
+      modelId: currentModelId(setup) ?? nativeModelId(input.model),
       contextWindow:
         contextWindowFromSetup(setup) ?? contextWindowFromSetup(init),
       muteUpdates: didLoad,
@@ -427,7 +427,7 @@ async function applyModelSelection(
   live: Live,
   input: HarnessSessionInput,
 ): Promise<void> {
-  const base = nativeModelId(input.model, input.cwd);
+  const base = nativeModelId(input.model);
   if (base && base !== live.modelId) {
     await live.acp
       .request(

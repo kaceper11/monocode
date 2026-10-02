@@ -532,7 +532,7 @@ export async function createBlankSkill(input: {
   }
   const root =
     input.scope === "user" || !isLocalProject(input.cwd)
-      ? await homeDir(input.cwd)
+      ? await homeDir()
       : input.cwd;
   const relative = `.agents/skills/${name}`;
   await createPath(root, relative, true);

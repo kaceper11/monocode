@@ -84,11 +84,8 @@ fn account(token: &str) -> String {
     token.hash(&mut hash);
     format!("{:x}", hash.finish())
 }
-/// Read-only delivery calls use the existing WSL boundary and a bounded native child.
+/// Read-only delivery calls use a bounded native child.
 fn github_read(root: &Path, args: &[&str]) -> Result<String, String> {
-    if let Some(location) = crate::wsl::path_location(root)? {
-        return crate::wsl::request(&location, "gh", json!({"args":args}));
-    }
     let program = crate::harness::resolve_gui_binary("gh").ok_or("Install GitHub CLI (gh)")?;
     let mut command = std::process::Command::new(program);
     command

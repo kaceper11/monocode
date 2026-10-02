@@ -157,11 +157,9 @@ describe.each(providers)("$id offline ACP transport", (provider) => {
 
   it("resolves the model from the session catalog", async () => {
     mock.autoPrompt = true;
-    const cwd = "//wsl.localhost/Ubuntu/home/me/project";
     const model = { id: "antigravity:shared", harness: provider.id, name: "Shared" };
-    setHarnessModels(provider.id, [{ ...model, nativeId: "host-model" }]);
-    setHarnessModels(provider.id, [{ ...model, nativeId: "m2" }], cwd);
-    await provider.send({ ...input, cwd, model: model.id });
+    setHarnessModels(provider.id, [{ ...model, nativeId: "m2" }]);
+    await provider.send({ ...input, model: model.id });
     expect(mock.sent.find((m) => m.method === "session/set_config_option")?.params)
       .toMatchObject({ configId: "model", value: "m2" });
   });
@@ -271,16 +269,6 @@ describe.each(providers)("$id offline ACP transport", (provider) => {
     mock.fail.add("session/new");
     await expect(provider.send(input)).rejects.toThrow(provider.auth);
     expect(mock.kill).toHaveBeenCalledWith(genKey);
-  });
-
-  it("keeps native and WSL catalog probes and wrapper working directories separate", async () => {
-    resetHarnessModelOverlays();
-    const cwd = "//wsl.localhost/Ubuntu/home/me/project";
-    await provider.refresh(cwd);
-    expect(mock.spawn).toHaveBeenCalledWith(expect.stringContaining("monocode-antigravity-probe"), provider.path, provider.args, "//wsl.localhost/Ubuntu/fake", undefined, "antigravity");
-    expect(mock.sent.find(message => message.method === "session/new")?.params?.cwd).toBe(cwd);
-    expect(modelsFor(provider.id, cwd).map(model => model.nativeId)).toEqual(["m1", "m2"]);
-    expect(modelsFor(provider.id).some(model => model.nativeId === "m1")).toBe(false);
   });
 
   it("probes catalogs over ACP once, kills the probe, and preserves models on failure", async () => {

@@ -1,6 +1,5 @@
 import { currentHarnessTiming, markHarnessTiming, measureHarnessTiming, timingWriteKind } from "./timing";
-import { wslLocation } from "../../../shared/lib/paths.ts";
-import type { HarnessId } from "../../../features/sessions/model/session.ts";
+
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -343,14 +342,13 @@ export async function spawnChild(
   cwd: string,
   account?: { provider: "claude" | "codex"; id: string },
   binaryProvider?: ConfigurableBinaryProvider,
-  openCodeServerPassword?: string,
 ): Promise<void> {
   const generation = ++nextGeneration;
   childGeneration.set(sessionId, generation);
   livePid.delete(sessionId);
   pendingExit.delete(sessionId);
   ownedChildren.add(sessionId);
-  const binaryPath = binaryProvider && !wslLocation(cwd)
+  const binaryPath = binaryProvider
     ? runtimeProviderBinaryPath(binaryProvider)
     : undefined;
   lineBuffer.delete(sessionId);
@@ -370,7 +368,6 @@ export async function spawnChild(
       account,
       binaryProvider,
       binaryPath,
-      ...(openCodeServerPassword ? { openCodeServerPassword } : {}),
     }));
   } catch (error) {
     if (childGeneration.get(sessionId) === generation)
@@ -548,87 +545,56 @@ async function resolveHarnessBinary(
   return invoke(command[provider]);
 }
 
-// Availability, model discovery and the first turn can resolve the same CLI
-// concurrently. Share only pending work; never retain stale paths or failures.
-const binaryResolutions = new Map<string, Promise<{ path: string }>>();
-
-function resolveBinary(provider: HarnessId, cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  const guestCwd = cwd && wslLocation(cwd) ? cwd : undefined;
-  const key = JSON.stringify([provider, guestCwd, binaryPath ?? runtimeProviderBinaryPath(provider)]);
-  const existing = binaryResolutions.get(key);
-  if (existing) return existing;
-  const pending = (guestCwd
-    ? invoke<{ path: string }>("wsl_resolve_harness", { cwd: guestCwd, provider })
-    : resolveHarnessBinary(provider, binaryPath)
-  ).finally(() => binaryResolutions.delete(key));
-  binaryResolutions.set(key, pending);
-  return pending;
+export function resolveCursorBinary(binaryPath?: string | null): Promise<{ path: string }> {
+  return resolveHarnessBinary("cursor", binaryPath);
 }
 
-export type WslAgentResolution = {
-  path?: string;
-  authenticated?: boolean;
-  error?: string;
-};
-
-/** One bridged round trip that resolves every provider in the distribution. */
-export function resolveWslAgents(
-  cwd: string,
-): Promise<Partial<Record<HarnessId, WslAgentResolution>>> {
-  return invoke("wsl_resolve_agents", { cwd });
+export function resolveCodexBinary(binaryPath?: string | null): Promise<{ path: string }> {
+  return resolveHarnessBinary("codex", binaryPath);
 }
 
-export function resolveCursorBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  return resolveBinary("cursor", cwd, binaryPath);
+export function resolveOpenCodeBinary(binaryPath?: string | null): Promise<{ path: string }> {
+  return resolveHarnessBinary("opencode", binaryPath);
 }
 
-export function resolveCodexBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  return resolveBinary("codex", cwd, binaryPath);
+export function resolveClaudeBinary(binaryPath?: string | null): Promise<{ path: string }> {
+  return resolveHarnessBinary("claude", binaryPath);
 }
 
-export function resolveOpenCodeBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  return resolveBinary("opencode", cwd, binaryPath);
+export function resolvePiBinary(binaryPath?: string | null): Promise<{ path: string }> {
+  return resolveHarnessBinary("pi", binaryPath);
 }
 
-export function resolveClaudeBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  return resolveBinary("claude", cwd, binaryPath);
+export function resolveOmpBinary(binaryPath?: string | null): Promise<{ path: string }> {
+  return resolveHarnessBinary("omp", binaryPath);
 }
 
-export function resolvePiBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  return resolveBinary("pi", cwd, binaryPath);
+export function resolveFxBinary(binaryPath?: string | null): Promise<{ path: string }> {
+  return resolveHarnessBinary("fx", binaryPath);
 }
 
-export function resolveOmpBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  return resolveBinary("omp", cwd, binaryPath);
+export function resolveHermesBinary(binaryPath?: string | null): Promise<{ path: string }> {
+  return resolveHarnessBinary("hermes", binaryPath);
 }
 
-export function resolveFxBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  return resolveBinary("fx", cwd, binaryPath);
+export function resolveGrokBinary(binaryPath?: string | null): Promise<{ path: string }> {
+  return resolveHarnessBinary("grok", binaryPath);
 }
 
-export function resolveHermesBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  return resolveBinary("hermes", cwd, binaryPath);
+export function resolveDevinBinary(binaryPath?: string | null): Promise<{ path: string }> {
+  return resolveHarnessBinary("devin", binaryPath);
 }
 
-export function resolveGrokBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  return resolveBinary("grok", cwd, binaryPath);
+export function resolveCopilotBinary(binaryPath?: string | null): Promise<{ path: string }> {
+  return resolveHarnessBinary("copilot", binaryPath);
 }
 
-export function resolveDevinBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  return resolveBinary("devin", cwd, binaryPath);
+export function resolveMuseBinary(binaryPath?: string | null): Promise<{ path: string }> {
+  return resolveHarnessBinary("muse", binaryPath);
 }
 
-export function resolveCopilotBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  return resolveBinary("copilot", cwd, binaryPath);
-}
-
-export function resolveMuseBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string }> {
-  return resolveBinary("muse", cwd, binaryPath);
-}
-
-export async function resolveAntigravityBinary(cwd?: string, binaryPath?: string | null): Promise<{ path: string; args: string[] }> {
-  const binary = await resolveBinary("antigravity", cwd, binaryPath);
-  return wslLocation(cwd ?? "") ? { ...binary, args: ["--uid="] } : binary as { path: string; args: string[] };
+export function resolveAntigravityBinary(binaryPath?: string | null): Promise<{ path: string; args: string[] }> {
+  return resolveHarnessBinary("antigravity", binaryPath) as Promise<{ path: string; args: string[] }>;
 }
 
 export function freeHarnessPort(): Promise<number> {
@@ -676,9 +642,8 @@ export type HarnessBinaryInspection = {
 export function inspectHarnessBinary(
   provider: ConfigurableBinaryProvider,
   binaryPath?: string | null,
-  cwd?: string,
 ): Promise<HarnessBinaryInspection> {
-  return resolveBinary(provider, cwd, binaryPath).then(async (resolved) => {
+  return resolveHarnessBinary(provider, binaryPath).then(async (resolved) => {
     if (provider === "antigravity") {
       return { path: resolved.path, version: "ACP server" };
     }
@@ -687,7 +652,7 @@ export function inspectHarnessBinary(
         await execChild(
           resolved.path,
           ["--version"],
-          cwd,
+          undefined,
           provider,
           binaryPath,
         )
@@ -707,14 +672,12 @@ export function inspectHarnessBinary(
 /** Runs the CLI's own self-update against the binary MonoCode uses. */
 export async function updateHarnessCli(
   provider: ConfigurableBinaryProvider,
-  cwd?: string,
 ): Promise<void> {
-  const resolved = await resolveBinary(provider, cwd);
+  const resolved = await resolveHarnessBinary(provider);
   await invoke("harness_update", {
     command: resolved.path,
     binaryProvider: provider,
-    binaryPath: wslLocation(cwd ?? "") ? undefined : runtimeProviderBinaryPath(provider),
-    ...(cwd ? { cwd } : {}),
+    binaryPath: runtimeProviderBinaryPath(provider),
   });
 }
 
@@ -726,10 +689,9 @@ export function execChild(
   binaryPathOverride?: string | null,
 ): Promise<string> {
   const binaryPath =
-    wslLocation(cwd ?? "") ? undefined
-      : binaryPathOverride === undefined && binaryProvider
-        ? runtimeProviderBinaryPath(binaryProvider)
-        : binaryPathOverride;
+    binaryPathOverride === undefined && binaryProvider
+      ? runtimeProviderBinaryPath(binaryProvider)
+      : binaryPathOverride;
   return invoke("harness_exec", {
     command,
     args,

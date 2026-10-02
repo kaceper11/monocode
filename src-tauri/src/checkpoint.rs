@@ -1,11 +1,9 @@
-use crate::wsl;
-use base64::Engine;
-use serde_json::json;
+#[cfg(test)]
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
@@ -14,7 +12,7 @@ use tauri::{AppHandle, Manager, State};
 use crate::fs::GitDiffStats;
 use crate::fs::{
     expand_home, git_checked, git_checkpoint_paths, git_command_output, git_diff_files_for,
-    host_path, path_to_js, resolve_repo_path, GitChangedFile, GitDiffIndex, MAX_TEXT_FILE_BYTES,
+    path_to_js, resolve_repo_path, GitChangedFile, GitDiffIndex, MAX_TEXT_FILE_BYTES,
 };
 
 const MAX_SNAPSHOT_FILES: usize = 500;
@@ -22,51 +20,25 @@ const MAX_SNAPSHOT_FILES: usize = 500;
 #[derive(Clone)]
 pub struct CheckpointStore {
     root: PathBuf,
-    gates: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    gate: Arc<Mutex<()>>,
 }
 
 impl CheckpointStore {
     fn new(root: PathBuf) -> Self {
         Self {
             root,
-            gates: Arc::new(Mutex::new(HashMap::new())),
+            gate: Arc::new(Mutex::new(())),
         }
     }
 
     fn exclusive<T>(
         &self,
-        session_id: &str,
-        cwd: &str,
         operation: impl FnOnce(&Self) -> Result<T, String>,
     ) -> Result<T, String> {
-        // Preserve cross-session ownership ordering on each host. A slow WSL
-        // request must not hold the native host (or another distribution).
-        let host = wsl::location(cwd)?
-            .map(|location| location.distribution.to_lowercase())
-            .unwrap_or_default();
-        let [session_gate, host_gate] = {
-            let mut gates = self.gates.lock().map_err(|_| "Checkpoint gates poisoned")?;
-            gates.retain(|_, gate| gate.strong_count() > 0);
-            let mut gate_for = |key: String| {
-                gates.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
-                    let gate = Arc::new(Mutex::new(()));
-                    gates.insert(key, Arc::downgrade(&gate));
-                    gate
-                })
-            };
-            [
-                gate_for(format!("session:{session_id}")),
-                gate_for(format!("host:{host}")),
-            ]
-        };
-        // A session may change cwd: keep its manifest ordered across hosts too.
-        // Every caller takes session then host, never the inverse.
-        let _session = session_gate
+        let _guard = self
+            .gate
             .lock()
-            .map_err(|_| "Checkpoint session lock poisoned")?;
-        let _host = host_gate
-            .lock()
-            .map_err(|_| "Checkpoint host lock poisoned")?;
+            .map_err(|_| "Checkpoint store lock poisoned".to_string())?;
         operation(self)
     }
 
@@ -90,7 +62,7 @@ impl CheckpointStore {
             .filter_map(|path| resolve_repo_path(&root, &path).ok())
             .take(MAX_SNAPSHOT_FILES)
             .collect();
-        // One HEAD lookup instead of a Git/WSL round trip per dirty file.
+        // One HEAD lookup instead of a Git round trip per dirty file.
         let head = if paths.is_empty() {
             None
         } else {
@@ -257,11 +229,6 @@ impl CheckpointStore {
         from_cwd: &str,
         to_cwd: &str,
     ) -> Result<CheckpointApplyResult, String> {
-        let from_host = wsl::location(from_cwd)?.map(|v| v.distribution.to_lowercase());
-        let to_host = wsl::location(to_cwd)?.map(|v| v.distribution.to_lowercase());
-        if from_host != to_host {
-            return Err("Worker and lead checkouts must use the same execution host".into());
-        }
         let manifest = self
             .load_matching(session_id, from_cwd)?
             .ok_or("This worker has no recoverable change checkpoint")?;
@@ -414,7 +381,7 @@ impl CheckpointStore {
             .map(|stats| stats.status.clone())
             .unwrap_or_else(|| "modified".into());
         Ok(CheckpointFileDiff {
-            path: path_to_js(&host_path(&root, &relative)),
+            path: path_to_js(&root.join(&relative)),
             relative,
             status,
             original,
@@ -661,7 +628,7 @@ pub async fn session_checkpoint_ensure(
     validate_id(&session_id, "session")?;
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(&session_id, &cwd, |store| store.ensure(&session_id, &cwd))
+        store.exclusive(|store| store.ensure(&session_id, &cwd))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -680,9 +647,7 @@ pub async fn session_checkpoint_prepare(
     }
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(&session_id, &cwd, |store| {
-            store.prepare(&session_id, &cwd, &paths)
-        })
+        store.exclusive(|store| store.prepare(&session_id, &cwd, &paths))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -701,9 +666,7 @@ pub async fn session_checkpoint_capture(
     }
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(&session_id, &cwd, |store| {
-            store.capture(&session_id, &cwd, &paths)
-        })
+        store.exclusive(|store| store.capture(&session_id, &cwd, &paths))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -718,7 +681,7 @@ pub async fn session_checkpoint_status(
     validate_id(&session_id, "session")?;
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(&session_id, &cwd, |store| store.status(&session_id, &cwd))
+        store.exclusive(|store| store.status(&session_id, &cwd))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -734,9 +697,7 @@ pub async fn session_checkpoint_apply(
     validate_id(&session_id, "session")?;
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(&session_id, &from_cwd, |store| {
-            store.apply(&session_id, &from_cwd, &to_cwd)
-        })
+        store.exclusive(|store| store.apply(&session_id, &from_cwd, &to_cwd))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -751,9 +712,7 @@ pub async fn session_checkpoint_cleanup_safe(
     validate_id(&session_id, "session")?;
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(&session_id, &cwd, |store| {
-            store.cleanup_safe(&session_id, &cwd)
-        })
+        store.exclusive(|store| store.cleanup_safe(&session_id, &cwd))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -766,11 +725,9 @@ pub async fn session_checkpoint_forget(
 ) -> Result<(), String> {
     validate_id(&session_id, "session")?;
     let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(&session_id, "", |store| store.forget(&session_id))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || store.exclusive(|store| store.forget(&session_id)))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -783,9 +740,7 @@ pub async fn session_checkpoint_file_diff(
     validate_id(&session_id, "session")?;
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(&session_id, &cwd, |store| {
-            store.file_diff(&session_id, &cwd, &relative)
-        })
+        store.exclusive(|store| store.file_diff(&session_id, &cwd, &relative))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -801,9 +756,7 @@ pub async fn session_checkpoint_undo(
     validate_id(&session_id, "session")?;
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(&session_id, &cwd, |store| {
-            store.undo(&session_id, &cwd, relative.as_deref())
-        })
+        store.exclusive(|store| store.undo(&session_id, &cwd, relative.as_deref()))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -819,9 +772,7 @@ pub async fn session_checkpoint_keep(
     validate_id(&session_id, "session")?;
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        store.exclusive(&session_id, &cwd, |store| {
-            store.keep(&session_id, &cwd, relative.as_deref())
-        })
+        store.exclusive(|store| store.keep(&session_id, &cwd, relative.as_deref()))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -947,18 +898,6 @@ fn write_state(
     }
     match state {
         FileState::Contents(bytes) => {
-            if let Some(location) = wsl::path_location(&host_path(root, &relative))? {
-                let root_location =
-                    wsl::path_location(root)?.ok_or("Missing WSL checkpoint root")?;
-                return wsl::request(
-                    &location,
-                    "restore_bytes",
-                    json!({
-                        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-                        "checkpointRoot": root_location.path, "mode": mode,
-                    }),
-                );
-            }
             let path = root.join(relative);
             write_worktree(&path, &bytes)?;
             set_file_mode(&path, mode)
@@ -992,35 +931,17 @@ fn stored_snapshot(
 }
 
 fn worktree_snapshot(root: &Path, relative: &str, modes_known: bool) -> (FileState, Option<u32>) {
-    if !modes_known {
-        return (read_worktree(root, relative), None);
-    }
-    match wsl::path_location(&host_path(root, relative)) {
-        Ok(Some(location)) => {
-            return read_wsl_snapshot(&location).unwrap_or((FileState::Skipped, None))
-        }
-        Err(_) => return (FileState::Skipped, None),
-        Ok(None) => {}
-    }
     (
         read_worktree(root, relative),
-        file_mode(&root.join(relative)),
+        if modes_known {
+            file_mode(&root.join(relative))
+        } else {
+            None
+        },
     )
 }
 
 fn path_contains_symlink(root: &Path, relative: &str) -> bool {
-    match wsl::path_location(root) {
-        Ok(Some(location)) => {
-            return wsl::request(
-                &location,
-                "checkpoint_symlink",
-                json!({"relative": relative}),
-            )
-            .unwrap_or(true)
-        }
-        Err(_) => return true,
-        Ok(None) => {}
-    }
     let mut current = root.to_path_buf();
     for part in relative.split('/') {
         current.push(part);
@@ -1035,13 +956,6 @@ fn path_contains_symlink(root: &Path, relative: &str) -> bool {
 }
 
 fn git_head(root: &Path) -> Result<Vec<u8>, String> {
-    if let Some(location) = wsl::path_location(root)? {
-        let output = wsl::git(&location, &["rev-parse", "--verify", "HEAD"], None)?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-        }
-        return Ok(output.stdout);
-    }
     let mut command = Command::new("git");
     crate::hide_window_console(&mut command);
     let output = command
@@ -1208,7 +1122,7 @@ fn describe_change(
 ) -> CheckpointFile {
     if let Some((status, additions, deletions)) = session_change {
         return CheckpointFile {
-            path: path_to_js(&host_path(root, relative)),
+            path: path_to_js(&root.join(relative)),
             relative: relative.to_string(),
             status,
             additions,
@@ -1228,7 +1142,7 @@ fn describe_change(
             undoable,
         };
     }
-    let abs = host_path(root, relative);
+    let abs = root.join(relative);
     let status = if matches!(read_worktree(root, relative), FileState::Missing) {
         "deleted"
     } else {
@@ -1251,18 +1165,8 @@ fn calculate_session_stats(dir: &Path, manifest: &Manifest, relative: &str) -> O
     if before == SnapshotKind::Skipped || after == SnapshotKind::Skipped {
         return None;
     }
-    let before_path = state_blob_path(
-        &dir.join("files"),
-        relative,
-        wsl::location(&manifest.cwd).ok().flatten().is_some(),
-    )
-    .ok()?;
-    let after_path = state_blob_path(
-        &dir.join("after"),
-        relative,
-        wsl::location(&manifest.cwd).ok().flatten().is_some(),
-    )
-    .ok()?;
+    let before_path = state_blob_path(&dir.join("files"), relative).ok()?;
+    let after_path = state_blob_path(&dir.join("after"), relative).ok()?;
     let (additions, deletions) = diff_numstat(&before_path, &after_path, &manifest.cwd)?;
     let status = match (before, after) {
         (SnapshotKind::Missing, SnapshotKind::Missing) => "modified",
@@ -1277,22 +1181,7 @@ fn calculate_session_stats(dir: &Path, manifest: &Manifest, relative: &str) -> O
     })
 }
 
-fn diff_numstat(before: &Path, after: &Path, cwd: &str) -> Option<(i64, i64)> {
-    if let Some(location) = wsl::location(cwd).ok().flatten() {
-        let encode = |path: &Path| {
-            std::fs::read(path)
-                .ok()
-                .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
-        };
-        let text: String = wsl::request(
-            &location,
-            "diff_numstat",
-            json!({"before":encode(before)?, "after":encode(after)?}),
-        )
-        .ok()?;
-        let mut fields = text.lines().next()?.split('\t');
-        return Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?));
-    }
+fn diff_numstat(before: &Path, after: &Path, _cwd: &str) -> Option<(i64, i64)> {
     let mut cmd = Command::new("git");
     crate::hide_window_console(&mut cmd);
     let output = cmd
@@ -1414,31 +1303,11 @@ fn snapshot_after_file(dir: &Path, root: &Path, relative: &str) -> Result<Snapsh
 }
 
 fn snapshot_file_at(blob_root: &Path, root: &Path, relative: &str) -> Result<SnapshotKind, String> {
-    let abs = host_path(root, relative);
-    if let Some(location) = wsl::path_location(&abs)? {
-        let snapshot = read_wsl_snapshot(&location)?;
-        let mode = snapshot.1;
-        let (kind, bytes) = match snapshot.0 {
-            FileState::Missing => (SnapshotKind::Missing, Vec::new()),
-            FileState::Contents(bytes) => (SnapshotKind::Contents, bytes),
-            FileState::Skipped => return Ok(SnapshotKind::Skipped),
-        };
-        let blob = state_blob_path(blob_root, relative, true)?;
-        if let Some(parent) = blob.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&blob, bytes).map_err(|e| e.to_string())?;
-        std::fs::write(
-            blob.with_extension("mode"),
-            serde_json::to_vec(&mode).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        return Ok(kind);
-    }
+    let abs = root.join(relative);
     let meta = match std::fs::symlink_metadata(&abs) {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let blob = state_blob_path(blob_root, relative, false)?;
+            let blob = state_blob_path(blob_root, relative)?;
             if let Some(parent) = blob.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
@@ -1454,7 +1323,7 @@ fn snapshot_file_at(blob_root: &Path, root: &Path, relative: &str) -> Result<Sna
         return Ok(SnapshotKind::Skipped);
     }
     let bytes = std::fs::read(&abs).map_err(|e| e.to_string())?;
-    let blob = state_blob_path(blob_root, relative, false)?;
+    let blob = state_blob_path(blob_root, relative)?;
     if let Some(parent) = blob.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -1492,19 +1361,11 @@ fn set_file_mode(_path: &Path, _mode: Option<u32>) -> Result<(), String> {
     Ok(())
 }
 
-fn snapshot_mode(blob_root: &Path, relative: &str, kind: SnapshotKind, cwd: &str) -> Option<u32> {
+fn snapshot_mode(blob_root: &Path, relative: &str, kind: SnapshotKind, _cwd: &str) -> Option<u32> {
     if kind != SnapshotKind::Contents {
         return None;
     }
-    if wsl::location(cwd).ok().flatten().is_some() {
-        let path = state_blob_path(blob_root, relative, true).ok()?;
-        return std::fs::read(path.with_extension("mode"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Option<u32>>(&bytes).ok())
-            .flatten()
-            .filter(|mode| *mode <= 0o777);
-    }
-    state_blob_path(blob_root, relative, false)
+    state_blob_path(blob_root, relative)
         .ok()
         .and_then(|path| file_mode(&path))
 }
@@ -1517,17 +1378,13 @@ fn read_after_snapshot(dir: &Path, relative: &str, kind: SnapshotKind, cwd: &str
     read_snapshot_at(&dir.join("after"), relative, kind, cwd)
 }
 
-fn read_snapshot_at(blob_root: &Path, relative: &str, kind: SnapshotKind, cwd: &str) -> FileState {
+fn read_snapshot_at(blob_root: &Path, relative: &str, kind: SnapshotKind, _cwd: &str) -> FileState {
     match kind {
         SnapshotKind::Missing => FileState::Missing,
         SnapshotKind::Skipped => FileState::Skipped,
-        SnapshotKind::Contents => match state_blob_path(
-            blob_root,
-            relative,
-            wsl::location(cwd).ok().flatten().is_some(),
-        )
-        .ok()
-        .and_then(|path| std::fs::read(path).ok())
+        SnapshotKind::Contents => match state_blob_path(blob_root, relative)
+            .ok()
+            .and_then(|path| std::fs::read(path).ok())
         {
             Some(bytes) => FileState::Contents(bytes),
             None => FileState::Skipped,
@@ -1535,43 +1392,8 @@ fn read_snapshot_at(blob_root: &Path, relative: &str, kind: SnapshotKind, cwd: &
     }
 }
 
-fn read_wsl_state(location: &wsl::Location) -> Result<FileState, String> {
-    read_wsl_snapshot(location).map(|value| value.0)
-}
-
-fn read_wsl_snapshot(location: &wsl::Location) -> Result<(FileState, Option<u32>), String> {
-    let value: serde_json::Value = wsl::request(location, "checkpoint_file", json!({}))?;
-    if value["exists"] == false {
-        return Ok((FileState::Missing, None));
-    }
-    if value["isFile"] != true || value["tooLarge"] == true {
-        return Ok((FileState::Skipped, None));
-    }
-    base64::engine::general_purpose::STANDARD
-        .decode(
-            value["data"]
-                .as_str()
-                .ok_or("Missing checkpoint contents")?,
-        )
-        .map(|bytes| {
-            (
-                FileState::Contents(bytes),
-                value["mode"]
-                    .as_u64()
-                    .filter(|mode| *mode <= 0o777)
-                    .map(|mode| mode as u32),
-            )
-        })
-        .map_err(|e| e.to_string())
-}
-
 fn read_worktree(root: &Path, relative: &str) -> FileState {
-    let abs = host_path(root, relative);
-    match wsl::path_location(&abs) {
-        Ok(Some(location)) => return read_wsl_state(&location).unwrap_or(FileState::Skipped),
-        Err(_) => return FileState::Skipped,
-        Ok(None) => {}
-    }
+    let abs = root.join(relative);
     if !abs.exists() {
         return FileState::Missing;
     }
@@ -1601,13 +1423,6 @@ fn state_text(state: FileState) -> String {
 }
 
 fn write_worktree(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Some(location) = wsl::path_location(path)? {
-        return wsl::request(
-            &location,
-            "restore_bytes",
-            json!({"data":base64::engine::general_purpose::STANDARD.encode(bytes)}),
-        );
-    }
     if path.is_dir() {
         return Err(format!("{} is a directory", path.display()));
     }
@@ -1618,10 +1433,7 @@ fn write_worktree(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn remove_worktree(root: &Path, relative: &str) -> Result<(), String> {
-    let abs = host_path(root, relative);
-    if let Some(location) = wsl::path_location(&abs)? {
-        return wsl::request(&location, "remove_checkpoint_file", json!({}));
-    }
+    let abs = root.join(relative);
     if abs.is_file() || abs.is_symlink() {
         std::fs::remove_file(&abs).map_err(|e| e.to_string())?;
         return Ok(());
@@ -1635,7 +1447,7 @@ fn remove_worktree(root: &Path, relative: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn state_blob_path(blob_root: &Path, relative: &str, linux: bool) -> Result<PathBuf, String> {
+fn state_blob_path(blob_root: &Path, relative: &str) -> Result<PathBuf, String> {
     if relative.is_empty()
         || relative.starts_with('/')
         || relative
@@ -1643,16 +1455,6 @@ fn state_blob_path(blob_root: &Path, relative: &str, linux: bool) -> Result<Path
             .any(|part| part.is_empty() || part == "..")
     {
         return Err("Invalid path".into());
-    }
-    if linux {
-        // Linux names may differ only in case or name Windows devices/streams.
-        // Encode bytes with lowercase hex; bounded components work on both hosts.
-        let encoded: String = relative.bytes().map(|byte| format!("{byte:02x}")).collect();
-        let mut path = blob_root.join(".wsl");
-        for chunk in encoded.as_bytes().chunks(100) {
-            path.push(std::str::from_utf8(chunk).map_err(|e| e.to_string())?);
-        }
-        return Ok(path.join("blob"));
     }
     Ok(blob_root.join(relative))
 }
@@ -1680,12 +1482,6 @@ fn project_root(cwd: &str) -> Result<PathBuf, String> {
     if trimmed.is_empty() || trimmed == "~" {
         return Err("cwd is required".into());
     }
-    if let Some(location) = wsl::location(trimmed)? {
-        // Validate on the guest, but retain the chosen cwd as native checkpoints
-        // do. Canonicalizing only this side breaks symlink cwd/tool identities.
-        wsl::path_request(&location, "canonical_directory", json!({}))?;
-        return Ok(PathBuf::from(location.identity()));
-    }
     let root = expand_home(trimmed);
     if !root.is_dir() {
         return Err(format!("{}: Not a directory", root.display()));
@@ -1694,14 +1490,6 @@ fn project_root(cwd: &str) -> Result<PathBuf, String> {
 }
 
 fn same_cwd(saved: &str, cwd: &str) -> bool {
-    match (wsl::location(saved), wsl::location(cwd)) {
-        (Ok(Some(left)), Ok(Some(right))) => {
-            return left.distribution.eq_ignore_ascii_case(&right.distribution)
-                && left.path == right.path
-        }
-        (Ok(None), Ok(None)) => {}
-        _ => return false,
-    }
     let Ok(left) = project_root(saved) else {
         return false;
     };
@@ -1716,20 +1504,7 @@ fn relative_to_root(root: &Path, path: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("Invalid path".into());
     }
-    let expanded = if let Some(host) = wsl::path_location(root)? {
-        if let Some(target) = wsl::location(trimmed)? {
-            if !host.distribution.eq_ignore_ascii_case(&target.distribution) {
-                return Err("Path belongs to another WSL distribution".into());
-            }
-            PathBuf::from(host.with_path(&target.path)?.identity())
-        } else if trimmed.starts_with('/') {
-            PathBuf::from(host.with_path(trimmed)?.identity())
-        } else {
-            expand_home(trimmed)
-        }
-    } else {
-        expand_home(trimmed)
-    };
+    let expanded = expand_home(trimmed);
     if expanded.is_absolute() {
         let relative = expanded
             .strip_prefix(root)
@@ -1753,69 +1528,6 @@ fn validate_id(value: &str, label: &str) -> Result<(), String> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-
-    #[test]
-    fn slow_wsl_checkpoint_does_not_hold_other_hosts_but_ownership_stays_ordered() {
-        use std::sync::mpsc;
-        use std::time::Duration;
-        let store = super::CheckpointStore::new(std::env::temp_dir());
-        let (entered, ready) = mpsc::channel();
-        let (release, released) = mpsc::channel();
-        let (finished, done) = mpsc::channel();
-        let (available, availability) = mpsc::channel();
-        std::thread::scope(|scope| {
-            let store = &store;
-            scope.spawn(move || {
-                store
-                    .exclusive("wsl-session", "//wsl.localhost/Ubuntu/repo", |_| {
-                        entered.send(()).unwrap();
-                        released.recv().unwrap();
-                        Ok(())
-                    })
-                    .unwrap()
-            });
-            ready.recv_timeout(Duration::from_secs(2)).unwrap();
-            for (session, cwd) in [
-                ("other-session", "//wsl$/ubuntu/other"),
-                ("wsl-session", "/native/changed-cwd"),
-            ] {
-                let finished = finished.clone();
-                scope.spawn(move || {
-                    store.exclusive(session, cwd, |_| Ok(())).unwrap();
-                    finished.send(()).unwrap();
-                });
-            }
-            scope.spawn(move || {
-                store
-                    .exclusive("native-session", "/native/repo", |_| Ok(()))
-                    .unwrap();
-                store
-                    .exclusive("debian-session", "//wsl.localhost/Debian/repo", |_| Ok(()))
-                    .unwrap();
-                available.send(()).unwrap();
-            });
-            let independent = availability.recv_timeout(Duration::from_secs(2));
-            let finished_early = done.try_recv().is_ok();
-            release.send(()).unwrap();
-            independent.unwrap();
-            assert!(!finished_early);
-            for _ in 0..2 {
-                done.recv_timeout(Duration::from_secs(2)).unwrap();
-            }
-        });
-        // Completed hosts/sessions do not leave an ever-growing lock cache.
-        for n in 0..100 {
-            store
-                .exclusive(
-                    &format!("session-{n}"),
-                    &format!("//wsl.localhost/Distro{n}/repo"),
-                    |_| Ok(()),
-                )
-                .unwrap();
-        }
-        assert_eq!(store.gates.lock().unwrap().len(), 2);
-    }
-
     use super::*;
     use std::io::ErrorKind;
     use std::process::Command;
@@ -1913,91 +1625,6 @@ pub(crate) mod tests {
                 .insert(relative_to_root(&root, path).unwrap());
         }
         write_manifest(&dir, &manifest).unwrap();
-    }
-
-    #[test]
-    fn linux_checkpoint_names_do_not_collide_on_windows() {
-        let root = Path::new("store");
-        let upper = state_blob_path(root, "Case.txt", true).unwrap();
-        let lower = state_blob_path(root, "case.txt", true).unwrap();
-        assert_ne!(
-            upper.to_string_lossy().to_lowercase(),
-            lower.to_string_lossy().to_lowercase()
-        );
-        assert!(!state_blob_path(root, "CON:stream", true)
-            .unwrap()
-            .to_string_lossy()
-            .contains(':'));
-        assert_eq!(
-            state_blob_path(root, "legacy.txt", false).unwrap(),
-            root.join("legacy.txt")
-        );
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn verify_wsl_round_trip(cwd: &str) {
-        let (_dir, store) = store();
-        let root = project_root(cwd).unwrap();
-        // A chosen symlink cwd must retain its baseline and accept absolute
-        // tool paths in that same namespace, just like native checkpoints.
-        let location = wsl::location(cwd).unwrap().unwrap();
-        let alias = PathBuf::from(&location.path).join("checkpoint-alias");
-        std::os::unix::fs::symlink(&location.path, &alias).unwrap();
-        let alias_cwd = location
-            .with_path(&alias.to_string_lossy())
-            .unwrap()
-            .identity();
-        let alias_file = alias.join("alias-baseline.txt");
-        std::fs::write(&alias_file, "before\n").unwrap();
-        store.ensure("alias", &alias_cwd).unwrap();
-        let tool_path = alias_file.to_string_lossy().into_owned();
-        store
-            .prepare("alias", &alias_cwd, std::slice::from_ref(&tool_path))
-            .unwrap();
-        std::fs::write(&alias_file, "after\n").unwrap();
-        store.capture("alias", &alias_cwd, &[tool_path]).unwrap();
-        store.ensure("alias", &alias_cwd).unwrap();
-        let diff = store
-            .file_diff("alias", &alias_cwd, "alias-baseline.txt")
-            .unwrap();
-        assert_eq!(diff.original, "before\n");
-        assert_eq!(diff.current, "after\n");
-        std::fs::remove_file(alias_file).unwrap();
-        std::fs::remove_file(alias).unwrap();
-        let file = "Renamed ü.txt";
-        write_worktree(&host_path(&root, file), b"user-dirty\n").unwrap();
-        store.ensure("wsl", cwd).unwrap();
-        let location = wsl::location(cwd).unwrap().unwrap();
-        let agent_path = format!("{}/{}", location.path, file);
-        store
-            .prepare("wsl", cwd, std::slice::from_ref(&agent_path))
-            .unwrap();
-        write_worktree(&host_path(&root, file), b"agent-change\n").unwrap();
-        store
-            .capture("wsl", cwd, std::slice::from_ref(&agent_path))
-            .unwrap();
-        let diff = store.file_diff("wsl", cwd, file).unwrap();
-        assert_eq!(diff.original, "user-dirty\n");
-        assert_eq!(diff.current, "agent-change\n");
-        assert!(store
-            .status("wsl", cwd)
-            .unwrap()
-            .files
-            .iter()
-            .any(|row| row.relative == file && row.undoable));
-        store.undo("wsl", cwd, Some(file)).unwrap();
-        assert_eq!(
-            read_worktree(&root, file),
-            FileState::Contents(b"user-dirty\n".to_vec())
-        );
-        let added = "checkpoint new ż.txt";
-        store.prepare("wsl", cwd, &[added.into()]).unwrap();
-        write_worktree(&host_path(&root, added), b"new\n").unwrap();
-        store.capture("wsl", cwd, &[added.into()]).unwrap();
-        store.undo("wsl", cwd, Some(added)).unwrap();
-        assert_eq!(read_worktree(&root, added), FileState::Missing);
-        assert!(same_cwd(cwd, &cwd.replace("wsl.localhost", "wsl$")));
-        assert!(!same_cwd(cwd, &cwd.to_uppercase()));
     }
 
     #[test]
@@ -2498,111 +2125,6 @@ pub(crate) mod tests {
     }
 
     #[cfg(unix)]
-    pub(crate) fn verify_wsl_integration(cwd: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let host = wsl::location(cwd).unwrap().unwrap();
-        let source = PathBuf::from(&host.path).join("checkpoint-apply-source");
-        let target = PathBuf::from(&host.path).join("checkpoint-apply-target");
-        std::fs::create_dir(&source).unwrap();
-        assert!(init_git_commit(
-            &source,
-            &[
-                ("script.sh", "head\n"),
-                ("mode.sh", "same\n"),
-                ("deleted.txt", "head\n")
-            ]
-        ));
-        assert!(git(
-            &source,
-            &["clone", source.to_str().unwrap(), target.to_str().unwrap()]
-        ));
-        std::fs::write(source.join("script.sh"), "baseline\n").unwrap();
-        std::fs::write(target.join("script.sh"), "baseline\n").unwrap();
-        let from = host.with_path(source.to_str().unwrap()).unwrap().identity();
-        let to = host.with_path(target.to_str().unwrap()).unwrap().identity();
-        let (_dir, store) = store();
-        store.ensure("guest-worker", &from).unwrap();
-        assert!(store.cleanup_safe("guest-worker", &from).unwrap());
-        let files = vec!["script.sh".into(), "mode.sh".into(), "deleted.txt".into()];
-        store.prepare("guest-worker", &from, &files).unwrap();
-        std::fs::write(source.join("script.sh"), "worker result\n").unwrap();
-        for file in ["script.sh", "mode.sh"] {
-            std::fs::set_permissions(source.join(file), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
-        std::fs::remove_file(source.join("deleted.txt")).unwrap();
-        store.capture("guest-worker", &from, &files).unwrap();
-        assert!(!store.cleanup_safe("guest-worker", &from).unwrap());
-        assert!(store
-            .status("guest-worker", &from)
-            .unwrap()
-            .files
-            .iter()
-            .any(|file| file.relative == "mode.sh" && file.undoable));
-        assert_eq!(
-            store.apply("guest-worker", &from, &to).unwrap().files.len(),
-            3
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.join("script.sh")).unwrap(),
-            "worker result\n"
-        );
-        assert!(!target.join("deleted.txt").exists());
-        for file in ["script.sh", "mode.sh"] {
-            assert_eq!(
-                std::fs::metadata(target.join(file))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o755
-            );
-        }
-        assert_eq!(
-            store
-                .apply("guest-worker", &from, &to)
-                .unwrap()
-                .already_applied,
-            3
-        );
-        let outside = PathBuf::from(&host.path).join("outside-checkpoint.txt");
-        std::fs::write(&outside, "untouched").unwrap();
-        std::fs::remove_file(target.join("script.sh")).unwrap();
-        std::os::unix::fs::symlink(&outside, target.join("script.sh")).unwrap();
-        assert!(store
-            .apply("guest-worker", &from, &to)
-            .unwrap_err()
-            .contains("symbolic link"));
-        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
-        let other = wsl::Location::new("OtherDistribution", source.to_str().unwrap()).unwrap();
-        assert!(store
-            .apply("guest-worker", &from, &other.identity())
-            .unwrap_err()
-            .contains("same execution host"));
-        crate::worktrees::tests::verify_wsl_seeded(&from);
-        store.undo("guest-worker", &from, Some("mode.sh")).unwrap();
-        assert_eq!(
-            std::fs::metadata(source.join("mode.sh"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o644
-        );
-        std::fs::remove_file(source.join("script.sh")).unwrap();
-        std::os::unix::fs::symlink(&outside, source.join("script.sh")).unwrap();
-        assert!(restore_snapshot(
-            &store.session_dir("guest-worker"),
-            Path::new(&from),
-            "script.sh",
-            SnapshotKind::Contents,
-            true
-        )
-        .is_err());
-        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
-    }
-
-    #[cfg(unix)]
     #[test]
     fn legacy_checkpoint_modes_are_not_inferred_from_blob_permissions() {
         use std::os::unix::fs::PermissionsExt;
@@ -2915,12 +2437,12 @@ pub(crate) mod tests {
                 let (_dir, store) = store();
                 let start = std::time::Instant::now();
                 store
-                    .exclusive("bench", &cwd, |store| store.ensure("bench", &cwd))
+                    .exclusive(|store| store.ensure("bench", &cwd))
                     .unwrap();
                 let initial_ms = start.elapsed().as_secs_f64() * 1000.0;
                 let start = std::time::Instant::now();
                 store
-                    .exclusive("bench", &cwd, |store| store.ensure("bench", &cwd))
+                    .exclusive(|store| store.ensure("bench", &cwd))
                     .unwrap();
                 let warm_ms = start.elapsed().as_secs_f64() * 1000.0;
                 let manifest = read_manifest(&store.session_dir("bench")).unwrap().unwrap();

@@ -29,14 +29,14 @@ const REASONING_LABELS: Record<string, string> = {
   ultra: "Ultra",
 };
 
-export function refreshCodexCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("codex", cwd, discoverCodexModels);
+export function refreshCodexCatalog(): Promise<void> {
+  return refreshModelCatalog("codex", discoverCodexModels);
 }
 
 export async function discoverCodexModels(
   projectCwd?: string,
 ): Promise<AgentModel[]> {
-  const { path } = await resolveCodexBinary(projectCwd);
+  const { path } = await resolveCodexBinary();
   const cwd = projectCwd ?? (await homeDir());
   const probeId = `monocode-codex-probe-${crypto.randomUUID()}`;
   const rpc = new JsonRpcClient(
@@ -55,9 +55,8 @@ export async function discoverCodexModels(
     await killChild(probeId).catch(() => undefined);
   };
 
-  // The probe's stderr carries the real failure on WSL (e.g. "WSL process:
-  // ..." from the guest launcher); keep a short tail so thrown errors show
-  // the cause instead of a bare "probe exited"/timeout.
+  // Keep a short stderr tail so thrown errors show the cause instead of a
+  // bare "probe exited"/timeout.
   const stderrTail: string[] = [];
   watchChild(
     probeId,

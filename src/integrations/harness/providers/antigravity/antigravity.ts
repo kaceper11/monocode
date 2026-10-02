@@ -387,7 +387,7 @@ async function startLive(input: SendTurnInput, life: number): Promise<Live> {
   if (retired()) throw new Error("Antigravity session stopped during startup");
   const childKey = `${input.sessionId}#${childSeq++}`;
 
-  const { path, args } = await resolveAntigravityBinary(input.cwd);
+  const { path, args } = await resolveAntigravityBinary();
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(childKey, handlers);
   const pendingSetup = { acp, childKey };
@@ -609,7 +609,7 @@ async function applyModelSelection(
   live: Live,
   input: SendTurnInput,
 ): Promise<void> {
-  const base = nativeModelId(input.model, input.cwd).trim();
+  const base = nativeModelId(input.model).trim();
   const settings = input.modelSettings ?? {};
   const modelConfigId =
     live.modelConfigId === "provider" ? "model" : live.modelConfigId;

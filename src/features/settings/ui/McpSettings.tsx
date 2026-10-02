@@ -15,7 +15,7 @@ import { SearchableProjectPicker } from "../../projects/ui/SearchableProjectPick
 import type { RecentProject } from "../../projects/model/recents";
 import { Modal } from "../../../shared/ui/Modal";
 import { Popover } from "../../../shared/ui/Popover";
-import { wslLocation } from "../../../shared/lib/paths";
+
 import { LAYER } from "../../../shared/lib/layers";
 import {
   Globe,
@@ -218,7 +218,7 @@ function AddServerModal({
           <McpPicker
             label="Provider"
             value={provider}
-            options={PROVIDERS.filter((option) => !wslLocation(cwd) || option !== "claude_desktop").map((option) => ({
+            options={PROVIDERS.map((option) => ({
               value: option,
               label: MCP_PROVIDER_LABELS[option],
               icon: <ProviderIcon provider={option} />,
@@ -391,8 +391,7 @@ function McpConnections({
     [filter, servers],
   );
   const filterProviders = PROVIDERS.filter((provider) =>
-    (!wslLocation(cwd) || provider !== "claude_desktop") &&
-    (showAllProviders || servers.some((server) => server.provider === provider)),
+    showAllProviders || servers.some((server) => server.provider === provider),
   );
 
   useEffect(() => {

@@ -424,7 +424,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   }
 
   if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
-  const { path } = await resolveDevinBinary(input.cwd);
+  const { path } = await resolveDevinBinary();
   if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(input.sessionId, handlers);
@@ -646,12 +646,12 @@ async function applyModelSelection(
   // `reasoning` setting carries the chosen variant's uid — apply it only when
   // it belongs to the selected model's group.
   const reasoning = input.modelSettings?.reasoning?.trim();
-  const offered = findModel(input.model, input.cwd)
+  const offered = findModel(input.model)
     ?.settings?.find((setting) => setting.id === "reasoning")
     ?.options.some((option) => option.value === reasoning);
   const base = (reasoning && offered
     ? reasoning
-    : nativeModelId(input.model, input.cwd)
+    : nativeModelId(input.model)
   ).trim();
   if (base) await setConfigOption(live, live.modelConfigId, base);
   for (const [settingId, value] of Object.entries(input.modelSettings ?? {})) {
@@ -839,7 +839,7 @@ function handleNotification(live: Live, method: string, params: unknown) {
       mergeConfigOptions(live, incoming);
       const current = devinCurrentModelId(live.configOptions);
       if (current && current !== previous && !live.muteUpdates) {
-        const selection = devinModelSelectionForUid(live.configOptions, current, live.cwd);
+        const selection = devinModelSelectionForUid(live.configOptions, current);
         live.onEvent({
           type: "session.configChanged",
           model: selection.id,

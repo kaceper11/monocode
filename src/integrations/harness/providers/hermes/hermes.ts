@@ -198,7 +198,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   if (resume && resume.cwd !== input.cwd)
     resumeByThread.delete(input.sessionId);
 
-  const { path } = await resolveHermesBinary(input.cwd);
+  const { path } = await resolveHermesBinary();
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(input.sessionId, handlers);
   const liveRef: { current: Live | null } = { current: null };
@@ -349,7 +349,7 @@ async function applyModelSelection(
   live: Live,
   input: HarnessSessionInput,
 ): Promise<void> {
-  const modelId = nativeModelId(input.model, input.cwd).trim();
+  const modelId = nativeModelId(input.model).trim();
   if (!modelId || modelId === "default" || modelId === live.modelId) return;
   await live.acp.request(
     "session/set_model",

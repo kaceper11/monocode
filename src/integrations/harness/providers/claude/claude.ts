@@ -204,7 +204,7 @@ const tasksByThread = new Map<
 const CLAUDE_TASKS_KEY = "claude-tasks";
 const cancelledThreads = new Set<string>();
 
-let resolveClaudeBinaryImpl: (cwd?: string) => Promise<{ path: string }> =
+let resolveClaudeBinaryImpl: (binaryPath?: string | null) => Promise<{ path: string }> =
   resolveClaudeBinary;
 
 /** Test seam. */
@@ -455,7 +455,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     resumeByThread.delete(input.sessionId);
   }
 
-  const { path } = await resolveClaudeBinaryImpl(input.cwd);
+  const { path } = await resolveClaudeBinaryImpl();
   const liveRef: { current: Live | null } = { current: null };
   const claudeSessionId =
     canResume && resume ? resume.sessionId : crypto.randomUUID();
@@ -1762,7 +1762,7 @@ function writeJson(
 
 function settingsKeyFor(input: HarnessSessionInput): string {
   return `${input.providerAccountId ?? "default"}:${claudeSettingsKey({
-    model: nativeModelId(input.model, input.cwd),
+    model: nativeModelId(input.model),
     effort: input.modelSettings?.effort,
     fast: input.modelSettings?.fast,
     thinking: input.modelSettings?.thinking,
@@ -1784,7 +1784,7 @@ function launchOptions(
   sessionId?: string;
   settings?: ClaudeCliSettings;
 } {
-  const native = nativeModelId(input.model, input.cwd);
+  const native = nativeModelId(input.model);
   const effortRaw = input.modelSettings?.effort;
   const context = input.modelSettings?.context;
   const settings: ClaudeCliSettings = {};

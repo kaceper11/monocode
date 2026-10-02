@@ -19,4 +19,4 @@ Keep the fork identifier `com.kaceper11.monocode`, version and updater identity.
 
 Convergence preserves the former fork workspace snapshot once in the existing database before adapting it to upstream layout. Retired feature storage remains untouched. Keep a profile backup before deliberately accepting a migration on real user data; recovery evidence must distinguish saved records from currently supported UI.
 
-Performance requires representative release measurements. Bundle size, debug builds, unit tests and successful packaging are not responsiveness or live Windows/WSL evidence.
+Performance requires representative release measurements. Bundle size, debug builds, unit tests and successful packaging are not responsiveness or live Windows evidence.

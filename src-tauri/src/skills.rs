@@ -1,9 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::wsl;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::dirs_home;
 use crate::fs::expand_home;
@@ -23,17 +21,6 @@ pub struct DiscoveredSkill {
 }
 
 fn read_config_text(path: &Path) -> Option<String> {
-    match wsl::path_location(path) {
-        Ok(Some(location)) => {
-            return wsl::request::<String>(&location, "read_text", json!({}))
-                .ok()
-                .map(|text| strip_bom(&text).to_string());
-        }
-        Ok(None) => {}
-        // A WSL-prefixed path that failed validation must not fall back to
-        // host UNC I/O.
-        Err(_) => return None,
-    }
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
         return None;
@@ -47,41 +34,15 @@ fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct InspectEntry {
-    path: String,
-    #[serde(default)]
-    size: Option<u64>,
-    #[serde(default)]
-    is_dir: bool,
-}
-
-/// Existence + size + isDir for many paths; WSL paths go in one bridge batch.
+/// Existence + size + isDir for many paths.
 fn inspect_all(paths: &[PathBuf]) -> HashMap<String, (u64, bool)> {
     let mut out = HashMap::new();
-    let strings: Vec<String> = paths
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    // A single malformed WSL identity must not poison the whole batch.
-    let valid: Vec<String> = strings
-        .iter()
-        .filter(|s| wsl::location(s).is_ok())
-        .cloned()
-        .collect();
-    if let Ok(entries) = wsl::file_batches::<InspectEntry>(&valid, "inspect") {
-        for entry in entries {
-            out.insert(entry.path, (entry.size.unwrap_or(0), entry.is_dir));
-        }
-    }
-    for (i, path) in paths.iter().enumerate() {
-        let key = &strings[i];
-        if out.contains_key(key) || !matches!(wsl::location(key), Ok(None)) {
-            continue;
-        }
+    for path in paths {
         if let Ok(meta) = std::fs::metadata(path) {
-            out.insert(key.clone(), (meta.len(), meta.is_dir()));
+            out.insert(
+                path.to_string_lossy().into_owned(),
+                (meta.len(), meta.is_dir()),
+            );
         }
     }
     out
@@ -98,14 +59,6 @@ struct DirListEntry {
 
 /// List one directory (names only used); missing/empty → empty vec.
 fn list_dir(path: &Path) -> Vec<DirListEntry> {
-    match wsl::path_location(path) {
-        Ok(Some(location)) => {
-            return wsl::files_request::<Vec<DirListEntry>>(&location, "list", json!({}))
-                .unwrap_or_default();
-        }
-        Ok(None) => {}
-        Err(_) => return Vec::new(),
-    }
     let Ok(reader) = std::fs::read_dir(path) else {
         return Vec::new();
     };
@@ -139,16 +92,9 @@ fn managed_settings_root() -> Option<PathBuf> {
     None
 }
 
-/// The Claude managed-policy root on the project's execution host —
-/// /etc/claude-code inside a WSL guest, the platform folder on the host.
-fn claude_managed_root(location: Option<&wsl::Location>) -> Option<PathBuf> {
-    match location {
-        Some(location) => location
-            .with_path("/etc/claude-code")
-            .ok()
-            .map(|root| PathBuf::from(root.identity())),
-        None => managed_settings_root(),
-    }
+/// The Claude managed-policy root for the platform.
+fn claude_managed_root() -> Option<PathBuf> {
+    managed_settings_root()
 }
 
 struct DisabledFilter {
@@ -166,12 +112,8 @@ impl DisabledFilter {
             .iter()
             .map(|p| normalize_path_for_compare(p))
             .collect();
-        // Canonicalization is a host filesystem call — a WSL identity would
-        // go through the \\wsl.localhost share (slow, and wrong when the
-        // distro is stopped). The normalized compare still covers it.
         let canonical = paths
             .iter()
-            .filter(|p| !is_wsl_identity(p))
             .filter_map(|p| std::fs::canonicalize(expand_home(p)).ok())
             .collect();
         Some(Self {
@@ -185,7 +127,7 @@ impl DisabledFilter {
         if self.normalized.contains(&normalized) {
             return true;
         }
-        if !self.canonical.is_empty() && !is_wsl_identity(path) {
+        if !self.canonical.is_empty() {
             if let Ok(canon) = std::fs::canonicalize(path) {
                 if self.canonical.contains(&canon) {
                     return true;
@@ -196,18 +138,7 @@ impl DisabledFilter {
     }
 }
 
-fn is_wsl_identity(path: &str) -> bool {
-    !matches!(crate::wsl::location(path), Ok(None))
-}
-
 fn normalize_path_for_compare(path: &str) -> String {
-    if let Ok(Some(location)) = wsl::location(path) {
-        return format!(
-            "//wsl.localhost/{}{}",
-            location.distribution.to_lowercase(),
-            location.path
-        );
-    }
     #[cfg(windows)]
     {
         let mut s = path.replace('\\', "/");
@@ -233,25 +164,7 @@ pub fn list_skills(
     disabled_paths: Option<Vec<String>>,
 ) -> Result<Vec<DiscoveredSkill>, String> {
     let project = expand_home(&cwd);
-    let location = crate::wsl::location(&cwd)?;
-    let home = if let Some(location) = &location {
-        Some(PathBuf::from(crate::wsl::path_request(
-            location,
-            "home",
-            serde_json::json!({}),
-        )?))
-    } else {
-        dirs_home().map(PathBuf::from)
-    };
-    if let Some(location) = location {
-        let config = crate::wsl::path_request(&location, "config_home", serde_json::json!({}))?;
-        return Ok(list_skills_with_xdg(
-            &project,
-            home.as_deref(),
-            disabled_paths.as_deref(),
-            Some(std::ffi::OsStr::new(&config)),
-        ));
-    }
+    let home = dirs_home().map(PathBuf::from);
     Ok(list_skills_from(
         &project,
         home.as_deref(),
@@ -272,11 +185,7 @@ pub(crate) fn list_skills_from(
     home: Option<&Path>,
     disabled_paths: Option<&[String]>,
 ) -> Vec<DiscoveredSkill> {
-    // Never use the desktop's XDG_CONFIG_HOME for a guest filesystem.
-    let xdg = match crate::wsl::path_location(project) {
-        Ok(None) => std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()),
-        _ => None,
-    };
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty());
     list_skills_with_xdg(project, home, disabled_paths, xdg.as_deref())
 }
 
@@ -294,16 +203,10 @@ fn list_skills_with_xdg(
         if by_name.len() >= MAX_SKILLS {
             return;
         }
-        // WSL roots dedupe on the canonical identity so a Windows-joined form
-        // of the same guest dir cannot trigger a second bridge scan.
-        let key = match crate::wsl::path_location(&root) {
-            Ok(Some(location)) => location.identity(),
-            Err(_) => return,
-            Ok(None) => std::fs::canonicalize(&root)
-                .unwrap_or_else(|_| root.clone())
-                .to_string_lossy()
-                .into_owned(),
-        };
+        let key = std::fs::canonicalize(&root)
+            .unwrap_or_else(|_| root.clone())
+            .to_string_lossy()
+            .into_owned();
         if !seen_roots.insert(key) {
             return;
         }
@@ -410,7 +313,6 @@ fn add_namespaced_root(
 }
 
 fn claude_plugin_skill_roots(home: &Path, project: &Path) -> Vec<(PathBuf, &'static str, String)> {
-    let location = crate::wsl::path_location(project).ok().flatten();
     let Some(raw) = read_config_text(&home.join(".claude/plugins/installed_plugins.json")) else {
         return Vec::new();
     };
@@ -425,7 +327,7 @@ fn claude_plugin_skill_roots(home: &Path, project: &Path) -> Vec<(PathBuf, &'sta
     }
 
     let mut roots = Vec::new();
-    let plugin_enabled = claude_plugin_policy(home, project, location.as_ref());
+    let plugin_enabled = claude_plugin_policy(home, project);
     for (plugin_id, installed) in plugins {
         if !plugin_enabled(plugin_id) {
             continue;
@@ -454,8 +356,7 @@ fn claude_plugin_skill_roots(home: &Path, project: &Path) -> Vec<(PathBuf, &'sta
                     else {
                         continue;
                     };
-                    let Some(resolved) = resolve_plugin_path(project_path, home, location.as_ref())
-                    else {
+                    let Some(resolved) = resolve_plugin_path(project_path, home) else {
                         continue;
                     };
                     if !path_is_within(project, &resolved) {
@@ -466,8 +367,7 @@ fn claude_plugin_skill_roots(home: &Path, project: &Path) -> Vec<(PathBuf, &'sta
                 Some("user") | None => "user",
                 Some(_) => continue,
             };
-            let Some(install_root) = resolve_plugin_path(install_path, home, location.as_ref())
-            else {
+            let Some(install_root) = resolve_plugin_path(install_path, home) else {
                 continue;
             };
             roots.push((install_root.join("skills"), scope, namespace.to_string()));
@@ -477,28 +377,8 @@ fn claude_plugin_skill_roots(home: &Path, project: &Path) -> Vec<(PathBuf, &'sta
     roots
 }
 
-/// Registry paths live on the project's execution host. Under WSL they are
-/// Linux paths re-qualified into the distribution; joining a bare `/home/...`
-/// onto the `//wsl.localhost` identity would corrupt it.
-fn resolve_plugin_path(
-    raw: &str,
-    home: &Path,
-    location: Option<&crate::wsl::Location>,
-) -> Option<PathBuf> {
-    let Some(location) = location else {
-        return Some(resolve_home_path(raw, home));
-    };
-    let home = crate::wsl::path_location(home).ok().flatten()?;
-    let linux = if raw == "~" {
-        home.path
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        format!("{}/{rest}", home.path)
-    } else if raw.starts_with('/') {
-        raw.to_string()
-    } else {
-        format!("{}/{raw}", home.path)
-    };
-    Some(PathBuf::from(location.with_path(&linux).ok()?.identity()))
+fn resolve_plugin_path(raw: &str, home: &Path) -> Option<PathBuf> {
+    Some(resolve_home_path(raw, home))
 }
 
 fn resolve_home_path(raw: &str, home: &Path) -> PathBuf {
@@ -516,53 +396,17 @@ fn resolve_home_path(raw: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// Nearest project ancestor containing a `.claude` settings file. All probes
-/// go through one batched `inspect_all` so a WSL project never stats the host.
-fn claude_settings_project_root(
-    project: &Path,
-    location: Option<&crate::wsl::Location>,
-) -> PathBuf {
-    const MAX_ANCESTORS: usize = 24;
-    // Each root keeps its own probes — an ancestor that cannot build both
-    // candidates (path over the identity cap) is skipped, never misaligned.
+/// Nearest project ancestor containing a `.claude` settings file.
+fn claude_settings_project_root(project: &Path) -> PathBuf {
     let mut pairs: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
-    if let Some(location) = location {
-        let mut dir = location.path.clone();
-        loop {
-            let base = dir.trim_end_matches('/');
-            let probes: Vec<PathBuf> = ["settings.local.json", "settings.json"]
-                .iter()
-                .filter_map(|file| {
-                    location
-                        .with_path(&format!("{base}/.claude/{file}"))
-                        .ok()
-                        .map(|candidate| PathBuf::from(candidate.identity()))
-                })
-                .collect();
-            if let Ok(root) = location.with_path(&dir) {
-                if probes.len() == 2 {
-                    pairs.push((PathBuf::from(root.identity()), probes));
-                }
-            }
-            if dir == "/" || pairs.len() >= MAX_ANCESTORS {
-                break;
-            }
-            dir = match dir.rsplit_once('/') {
-                Some(("", _)) => "/".to_string(),
-                Some((parent, _)) => parent.to_string(),
-                None => break,
-            };
-        }
-    } else {
-        for candidate in project.ancestors() {
-            pairs.push((
-                candidate.to_path_buf(),
-                vec![
-                    candidate.join(".claude/settings.local.json"),
-                    candidate.join(".claude/settings.json"),
-                ],
-            ));
-        }
+    for candidate in project.ancestors() {
+        pairs.push((
+            candidate.to_path_buf(),
+            vec![
+                candidate.join(".claude/settings.local.json"),
+                candidate.join(".claude/settings.json"),
+            ],
+        ));
     }
     let probes: Vec<PathBuf> = pairs
         .iter()
@@ -602,8 +446,7 @@ fn plugin_setting_map(path: &Path) -> HashMap<String, bool> {
 }
 
 /// Managed policy last-wins across managed-settings.json then sorted
-/// managed-settings.d/*.json. The root comes from `claude_managed_root` —
-/// inside the WSL guest for a WSL project, not the host's ClaudeCode folder.
+/// managed-settings.d/*.json.
 fn managed_plugin_map(root: &Path) -> HashMap<String, bool> {
     let mut out = plugin_setting_map(&root.join("managed-settings.json"));
     let mut files: Vec<PathBuf> = list_dir(&root.join("managed-settings.d"))
@@ -622,15 +465,11 @@ fn managed_plugin_map(root: &Path) -> HashMap<String, bool> {
 
 /// Managed policy forces an answer; otherwise the first settings file in
 /// precedence order with an explicit entry wins. Installed plugins default on.
-fn claude_plugin_policy(
-    home: &Path,
-    project: &Path,
-    location: Option<&crate::wsl::Location>,
-) -> impl Fn(&str) -> bool {
-    let managed = claude_managed_root(location)
+fn claude_plugin_policy(home: &Path, project: &Path) -> impl Fn(&str) -> bool {
+    let managed = claude_managed_root()
         .map(|root| managed_plugin_map(&root))
         .unwrap_or_default();
-    let project_root = claude_settings_project_root(project, location);
+    let project_root = claude_settings_project_root(project);
     let settings: Vec<HashMap<String, bool>> = [
         project_root.join(".claude/settings.local.json"),
         project_root.join(".claude/settings.json"),
@@ -653,59 +492,16 @@ fn claude_plugin_policy(
 }
 
 fn path_is_within(path: &Path, root: &Path) -> bool {
-    match (
-        crate::wsl::path_location(path),
-        crate::wsl::path_location(root),
-    ) {
-        // WSL identities are already normalized (Location::new rejects ".."
-        // and collapses "." components), so containment is lexical.
-        (Ok(Some(path)), Ok(Some(root))) => {
-            path.distribution.eq_ignore_ascii_case(&root.distribution)
-                && (path.path == root.path
-                    || path
-                        .path
-                        .starts_with(&format!("{}/", root.path.trim_end_matches('/'))))
-        }
-        (Ok(None), Ok(None)) => {
-            let Ok(path) = std::fs::canonicalize(path) else {
-                return false;
-            };
-            let Ok(root) = std::fs::canonicalize(root) else {
-                return false;
-            };
-            path == root || path.starts_with(root)
-        }
-        // Host and guest paths never contain one another; a malformed WSL
-        // identity fails closed instead of touching the host filesystem.
-        _ => false,
-    }
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    path == root || path.starts_with(root)
 }
 
 fn scan_root(root: &Path, scope: &str, source: &str) -> Vec<DiscoveredSkill> {
-    match crate::wsl::path_location(root) {
-        Ok(Some(location)) => {
-            let entries: Vec<serde_json::Value> =
-                crate::wsl::files_request(&location, "skill_entries", serde_json::json!({}))
-                    .unwrap_or_default();
-            return entries
-                .into_iter()
-                .filter_map(|entry| {
-                    skill_from_text(
-                        entry["folder"].as_str()?,
-                        entry["text"].as_str()?,
-                        entry["path"].as_str()?.into(),
-                        scope,
-                        source,
-                    )
-                })
-                .collect();
-        }
-        // A path that fails to classify (malformed WSL identity, over-length)
-        // fails closed — probing it with host semantics could silently mix
-        // host and guest filesystems.
-        Err(_) => return Vec::new(),
-        Ok(None) => {}
-    }
     let Ok(reader) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -953,26 +749,16 @@ mod tests {
     }
 
     #[test]
-    fn guest_disabled_skills_match_aliases_without_folding_linux_case() {
-        let filter =
-            DisabledFilter::new(Some(&["\\\\wsl$\\UBUNTU\\repo\\Review\\SKILL.md".into()]))
-                .unwrap();
-        assert!(filter.is_disabled("//wsl.localhost/Ubuntu/repo/Review/SKILL.md"));
-        assert!(!filter.is_disabled("//wsl.localhost/Ubuntu/repo/review/SKILL.md"));
-        assert!(!filter.is_disabled("//wsl.localhost/Debian/repo/Review/SKILL.md"));
-    }
-
-    #[test]
     fn native_registry_paths_keep_upstream_parent_segments() {
         let home = Path::new("/home/me");
         assert_eq!(
-            resolve_plugin_path("../shared/plugin", home, None),
+            resolve_plugin_path("../shared/plugin", home),
             Some(home.join("../shared/plugin"))
         );
     }
 
     #[test]
-    fn config_reads_are_bounded_and_malformed_guest_paths_fail_closed() {
+    fn config_reads_are_bounded() {
         let root = tmp("config-read");
         let path = root.0.join("settings.json");
         std::fs::write(&path, "\u{feff}{}").unwrap();
@@ -982,10 +768,6 @@ mod tests {
             .set_len(MAX_CONFIG_BYTES + 1)
             .unwrap();
         assert!(read_config_text(&path).is_none());
-        let invalid = PathBuf::from("//wsl.localhost/Ubuntu/../etc/settings.json");
-        assert!(read_config_text(&invalid).is_none());
-        assert!(list_dir(&invalid).is_empty());
-        assert!(inspect_all(&[invalid]).is_empty());
     }
 
     fn write_plugin_setting(root: &Path, file: &str, plugin_id: &str, enabled: bool) {
@@ -1444,7 +1226,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         write_plugin_setting(&home.0, "settings.json", "workflow-kit@community", false);
         write_plugin_setting(&project.0, "settings.json", "workflow-kit@community", true);
-        assert!(claude_plugin_policy(&home.0, &nested, None)(
+        assert!(claude_plugin_policy(&home.0, &nested)(
             "workflow-kit@community"
         ));
         write_plugin_setting(
@@ -1453,7 +1235,7 @@ mod tests {
             "workflow-kit@community",
             false,
         );
-        assert!(!claude_plugin_policy(&home.0, &nested, None)(
+        assert!(!claude_plugin_policy(&home.0, &nested)(
             "workflow-kit@community"
         ));
     }
@@ -1618,63 +1400,6 @@ mod tests {
         assert_eq!(fmt.scope, "user");
     }
 
-    #[test]
-    fn wsl_plugin_registry_paths_are_qualified_into_the_distribution() {
-        let location = crate::wsl::Location::new("Ubuntu", "/home/me/repo").unwrap();
-        let home = PathBuf::from("//wsl.localhost/Ubuntu/home/me");
-        let resolve = |raw: &str| resolve_plugin_path(raw, &home, Some(&location));
-
-        assert_eq!(
-            resolve("~/.claude/plugins/cache/community/workflow-kit/1.2.3").unwrap(),
-            PathBuf::from(
-                "//wsl.localhost/Ubuntu/home/me/.claude/plugins/cache/community/workflow-kit/1.2.3"
-            )
-        );
-        // A bare Linux install path must not be joined onto the home identity.
-        assert_eq!(
-            resolve("/opt/plugins/workflow-kit/1.2.3").unwrap(),
-            PathBuf::from("//wsl.localhost/Ubuntu/opt/plugins/workflow-kit/1.2.3")
-        );
-        // Traversal and host separators fail closed.
-        assert!(resolve("/home/me/../../etc").is_none());
-        assert!(resolve("C:\\tools\\kit").is_none());
-    }
-
-    #[test]
-    fn wsl_path_containment_stays_inside_the_distribution() {
-        let id = |distribution: &str, path: &str| {
-            PathBuf::from(
-                crate::wsl::Location::new(distribution, path)
-                    .unwrap()
-                    .identity(),
-            )
-        };
-        assert!(path_is_within(
-            &id("Ubuntu", "/home/me/repo/sub"),
-            &id("Ubuntu", "/home/me/repo")
-        ));
-        assert!(path_is_within(
-            &id("Ubuntu", "/home/me/repo"),
-            &id("Ubuntu", "/home/me/repo")
-        ));
-        assert!(path_is_within(&id("Ubuntu", "/x"), &id("Ubuntu", "/")));
-        // A sibling sharing the string prefix is not contained.
-        assert!(!path_is_within(
-            &id("Ubuntu", "/home/me/repo2"),
-            &id("Ubuntu", "/home/me/repo")
-        ));
-        // Different distributions never contain one another.
-        assert!(!path_is_within(
-            &id("Debian", "/home/me/repo"),
-            &id("Ubuntu", "/home/me/repo")
-        ));
-        // Host and guest namespaces never mix.
-        assert!(!path_is_within(
-            &id("Ubuntu", "/etc"),
-            &PathBuf::from("/etc")
-        ));
-    }
-
     #[cfg(unix)]
     #[test]
     fn disabled_skill_matching_preserves_distinct_unix_paths_with_backslashes() {
@@ -1702,28 +1427,6 @@ mod tests {
         assert!(
             slash_skill.is_some(),
             "distinct backslash path on Unix must not be disabled by colliding slash path"
-        );
-    }
-
-    #[test]
-    fn scan_root_fails_closed_on_a_malformed_wsl_identity() {
-        // ".." makes the identity invalid — the path must not fall through to
-        // host read_dir.
-        let skills = scan_root(
-            &PathBuf::from("//wsl.localhost/Ubuntu/../etc"),
-            "project",
-            "test",
-        );
-        assert!(skills.is_empty());
-    }
-
-    #[test]
-    fn managed_policy_root_stays_inside_the_distribution() {
-        let location = crate::wsl::Location::new("Ubuntu", "/home/me/repo").unwrap();
-        let root = claude_managed_root(Some(&location)).unwrap();
-        assert_eq!(
-            root,
-            PathBuf::from("//wsl.localhost/Ubuntu/etc/claude-code")
         );
     }
 }

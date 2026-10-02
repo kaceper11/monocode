@@ -1,5 +1,4 @@
 import * as registry from "../../../integrations/harness/core/registry";
-import { setWslStatus } from "../model/wslStatus";
 // @vitest-environment happy-dom
 import { act, createElement, type CSSProperties, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -134,54 +133,40 @@ function inputText(input: HTMLInputElement, value: string) {
 }
 
 describe("model picker", () => {
-  it("keeps the upstream model control pills scoped to the selected host", () => {
-    const cwd = "//wsl.localhost/Ubuntu/home/dev/repo";
+  it("shows the model control pills for the selected model", () => {
     const model = { id: "grok:host-control", harness: "grok" as const, name: "Scoped model" };
-    const setting = (label: string) => ({ id: "effort", label: "Reasoning", kind: "select" as const, value: "medium", options: [{ value: "medium", label }] });
-    setHarnessModels("grok", [{ ...model, settings: [setting("Native choice")] }]);
-    setHarnessModels("grok", [{ ...model, settings: [setting("Guest choice")] }], cwd);
-    const render = (cwd: string) => act(() => root.render(createElement(ModelControlPills, {
-      cwd, harness: "grok", model: model.id, values: {}, onSettingsChange: vi.fn(),
+    const setting = { id: "effort", label: "Reasoning", kind: "select" as const, value: "medium", options: [{ value: "medium", label: "Medium" }] };
+    setHarnessModels("grok", [{ ...model, settings: [setting] }]);
+    act(() => root.render(createElement(ModelControlPills, {
+      harness: "grok", model: model.id, values: {}, onSettingsChange: vi.fn(),
     })));
-    render(cwd);
-    expect(container.textContent).toContain("Guest choice");
-    expect(container.textContent).not.toContain("Native choice");
-    render("/native/repo");
-    expect(container.textContent).toContain("Native choice");
-    expect(container.textContent).not.toContain("Guest choice");
+    expect(container.textContent).toContain("Medium");
   });
 
-  it("uses the current host for the recent-model shortcut after switching projects", () => {
-    const cwd = "//wsl.localhost/Ubuntu/home/dev/repo";
+  it("offers the recent-model shortcut in the picker", () => {
     const native = { id: "grok:recent", harness: "grok" as const, name: "Native recent" };
     setHarnessModels("grok", [native]);
-    setHarnessModels("grok", [{ ...native, name: "WSL recent" }], cwd);
     saveRecentModelChoice("grok", native.id);
-    const render = (cwd: string) => act(() => root.render(createElement(ModelPicker, {
-      cwd, harness: "grok", model: native.id, values: {}, hotkeys: true,
+    act(() => root.render(createElement(ModelPicker, {
+      harness: "grok", model: "grok:other", values: {}, hotkeys: true,
       onChange: vi.fn(), onSettingsChange: vi.fn(),
     })));
-    render("/native/repo");
-    render(cwd);
     act(() => window.dispatchEvent(new Event("open_model_picker")));
     const menu = container.querySelector('[aria-label="Recently used models"]');
-    expect(menu?.textContent).toContain("WSL recent");
-    expect(menu?.textContent).not.toContain("Native recent");
-    render("/native/other");
-    expect(container.querySelector('[aria-label="Recently used models"]')).toBeNull();
+    expect(menu?.textContent).toContain("Native recent");
   });
 
-  it.each([undefined, "//wsl.localhost/Ubuntu/home/dev/repo"])("keeps catalog error hints scoped to integrations (%s)", cwd => {
+  it("keeps catalog error hints scoped to integrations", () => {
     vi.spyOn(modelLibrary, "modelsFor").mockReturnValue([]);
-    setCatalogError("codex", "Provider unavailable", cwd);
+    setCatalogError("codex", "Provider unavailable");
     act(() => root.render(createElement(ModelPicker, {
-      cwd, harness: "codex", model: "codex:default", values: {},
+      harness: "codex", model: "codex:default", values: {},
       onChange: vi.fn(), onSettingsChange: vi.fn(),
     })));
     act(() => container.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!.click());
     hover([...container.querySelectorAll('button')].find(button => button.textContent?.startsWith("Model"))!);
     expect(container.querySelector('[role="dialog"][aria-label="Models"]')?.textContent)
-      .toContain(cwd ? "Provider unavailable" : "Default");
+      .toContain("Default");
   });
 
   it("shows the model name and effort in the combined picker", () => {
@@ -1188,44 +1173,28 @@ describe("model picker", () => {
   });
 });
 
-it("shows a failed WSL discovery beside Default and replaces it after Retry without a retry loop", async () => {
-  const cwd = "//wsl.localhost/Ubuntu/retry";
-  setWslStatus("Ubuntu", { state: "connected" });
+it("shows a failed discovery beside Default and replaces it after Retry without a retry loop", async () => {
   act(() => root.render(createElement(ModelPicker, {
-    cwd, harness: "codex", model: "codex:default", values: {}, hideSettings: true,
+    harness: "muse", model: "muse:default", values: {}, hideSettings: true,
     onChange: vi.fn(), onSettingsChange: vi.fn(),
   })));
   await act(async () => container.querySelector<HTMLButtonElement>('button[aria-haspopup="dialog"]')!.click());
-  await act(async () => modelLibrary.refreshModelCatalog("codex", cwd, async () => { throw new Error("Linux Codex probe failed"); }));
+  await act(async () => modelLibrary.refreshModelCatalog("muse", async () => { throw new Error("Muse probe failed"); }));
   const menu = () => container.querySelector('[role="dialog"][aria-label="Models"]')!;
   expect(menu().textContent).toContain("Default");
-  expect(menu().textContent).toContain("Linux Codex probe failed");
+  expect(menu().textContent).toContain("Muse probe failed");
   let finish!: (models: modelLibrary.AgentModel[]) => void;
-  const refresh = vi.spyOn(registry, "refreshHarnessCatalogs").mockImplementation((_ids, cwd) =>
-    modelLibrary.refreshModelCatalog("codex", cwd, () => new Promise(resolve => { finish = resolve; })),
+  const refresh = vi.spyOn(registry, "refreshHarnessCatalogs").mockImplementation((_ids) =>
+    modelLibrary.refreshModelCatalog("muse", () => new Promise(resolve => { finish = resolve; })),
   );
   const retry = [...menu().querySelectorAll('button')].find(button => button.textContent === "Retry models")!;
   await act(async () => retry.click());
-  expect(refresh).toHaveBeenCalledExactlyOnceWith(["codex"], cwd, true);
+  expect(refresh).toHaveBeenCalledExactlyOnceWith(["muse"], { force: true });
   expect(menu().textContent).toContain("Refreshing models");
   expect(retry.disabled).toBe(true);
-  await act(async () => finish([{ id: "codex:linux", harness: "codex", name: "Linux model", nativeId: "linux" }]));
-  expect(menu().textContent).toContain("Linux model");
-  expect(menu().textContent).not.toContain("Linux Codex probe failed");
+  await act(async () => finish([{ id: "muse:live", harness: "muse", name: "Live model", nativeId: "live" }]));
+  expect(menu().textContent).toContain("Live model");
+  expect(menu().textContent).not.toContain("Muse probe failed");
   expect(refresh).toHaveBeenCalledTimes(1);
 });
 
-it("refreshes an already open picker after WSL connects", async () => {
-  const cwd = "//wsl.localhost/PickerReconnect/repo";
-  setWslStatus("PickerReconnect", { state: "connecting" });
-  const refresh = vi.spyOn(registry, "refreshHarnessCatalogs");
-  act(() => root.render(createElement(ModelPicker, {
-    cwd, harness: "codex", model: "codex:default", values: {}, hideSettings: true,
-    onChange: vi.fn(), onSettingsChange: vi.fn(),
-  })));
-  await act(async () => container.querySelector<HTMLButtonElement>('button[aria-haspopup="dialog"]')!.click());
-  expect(container.textContent).toContain("Connecting to WSL");
-  refresh.mockClear();
-  await act(async () => setWslStatus("PickerReconnect", { state: "connected" }));
-  expect(refresh).toHaveBeenCalledWith(["codex"], cwd);
-});

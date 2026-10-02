@@ -19,8 +19,6 @@ export type PtyResource = {
   id: string;
   generation: string | null;
   alive: boolean;
-  host: "native" | "wsl";
-  distro: string | null;
   cpuPct: number | null;
   rssBytes: number | null;
   processes: number | null;

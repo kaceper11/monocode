@@ -161,20 +161,6 @@ afterEach(async () => {
   __openCodeTestReset();
 });
 
-it("starts an owned WSL server on a guest-selected port before sending Linux-scoped requests", async () => {
-  const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
-  const events: HarnessEvent[] = [];
-  const onAccepted = vi.fn();
-  const done = turn(events, { cwd, onAccepted });
-  await waitFor(() => onAccepted.mock.calls.length === 1, "guest turn acceptance");
-  expect(spawnChild).toHaveBeenCalledWith("opencode-live", "/fake/opencode", ["serve", "--hostname=127.0.0.1", "--port=0"], cwd, undefined, "opencode", expect.stringMatching(/^[0-9a-f-]{36}$/));
-  for (const [request] of harnessHttp.mock.calls) {
-    expect(new URL(request.url).searchParams.get("directory")).toBe("/home/me/repo");
-  }
-  idle();
-  await done;
-});
-
 it("reports when OpenCode accepts a turn", async () => {
   const events: HarnessEvent[] = [];
   const onAccepted = vi.fn();

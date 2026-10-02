@@ -1,86 +1,7 @@
-import { setWslStatus } from "../../../features/sessions/model/wslStatus";
 import { expect, it, vi } from "vitest";
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
-
-it("keeps native and distribution probes separate, coalesces requests and refreshes failures", async () => {
-  const { registerBuiltinHarnesses } = await import("./register");
-  registerBuiltinHarnesses();
-  const {
-    probeHarnessAvailability,
-    isHarnessAvailable,
-    hasProbedHarnessAvailability,
-    invalidateHarnessAvailability,
-    harnessUnavailableHint,
-    harnessAuthHint,
-  } = await import("./availability");
-  const cwd = "//wsl.localhost/Ubuntu/home/me/Zażółć repo";
-  const other = "//wsl.localhost/Debian/home/me/repo";
-  invoke.mockImplementation(async (command, args) => {
-    if (command === "wsl_resolve_agents") {
-      if (args.cwd === cwd)
-        return {
-          codex: { path: "/usr/bin/codex", authenticated: true },
-          pi: { path: "/home/me/.local/bin/pi", authenticated: false },
-          opencode: { path: "/usr/bin/opencode" },
-        };
-      return {};
-    }
-    if (command === "wsl_resolve_harness") {
-      if (args.cwd === cwd && args.provider === "codex")
-        return { path: "/usr/bin/codex" };
-      throw new Error("CLI unavailable in distribution");
-    }
-    return { path: "C:/bin/agent.exe" };
-  });
-  await probeHarnessAvailability();
-  expect(isHarnessAvailable("codex")).toBe(true);
-  expect(isHarnessAvailable("codex", cwd)).toBe(false);
-  expect(hasProbedHarnessAvailability(cwd)).toBe(false);
-  const beforeConnect = invoke.mock.calls.length;
-  setWslStatus("Ubuntu", { state: "connecting" });
-  await probeHarnessAvailability({ cwd });
-  expect(invoke).toHaveBeenCalledTimes(beforeConnect);
-  expect(hasProbedHarnessAvailability(cwd)).toBe(false);
-  setWslStatus("Ubuntu", { state: "connected" });
-  setWslStatus("Debian", { state: "connected" });
-  const first = probeHarnessAvailability({ cwd });
-  expect(probeHarnessAvailability({ cwd })).toBe(first);
-  await first;
-  // One batched bridged request resolves the whole distribution.
-  expect(
-    invoke.mock.calls.filter(([command]) => command === "wsl_resolve_agents"),
-  ).toHaveLength(1);
-  expect(isHarnessAvailable("codex", cwd)).toBe(true);
-  expect(isHarnessAvailable("claude", cwd)).toBe(false);
-  expect(isHarnessAvailable("pi", cwd)).toBe(true);
-  expect(isHarnessAvailable("opencode", cwd)).toBe(true);
-  // Auth is reported separately from binary discovery.
-  expect(harnessAuthHint("codex", cwd)).toBeUndefined();
-  expect(harnessAuthHint("pi", cwd)).toContain("not signed in");
-  expect(harnessAuthHint("pi", cwd)).toContain("Ubuntu");
-  expect(harnessAuthHint("grok", cwd)).toBeUndefined();
-  expect(isHarnessAvailable("codex", other)).toBe(false);
-  const count = invoke.mock.calls.length;
-  await probeHarnessAvailability({ cwd: "//wsl$/ubuntu/home/another" });
-  expect(invoke).toHaveBeenCalledTimes(count);
-  await probeHarnessAvailability({ cwd: other });
-  expect(isHarnessAvailable("codex", other)).toBe(false);
-  invoke.mockRejectedValue(new Error("Disconnected"));
-  await probeHarnessAvailability({ cwd, force: true });
-  expect(isHarnessAvailable("codex", cwd)).toBe(false);
-  expect(isHarnessAvailable("codex")).toBe(true);
-  expect(harnessAuthHint("pi", cwd)).toBeUndefined();
-  expect(harnessUnavailableHint("codex", cwd)).toContain("Disconnected");
-  expect(harnessUnavailableHint("codex", cwd)).not.toContain("Install");
-  invalidateHarnessAvailability(cwd);
-  expect(hasProbedHarnessAvailability(cwd)).toBe(false);
-  invoke.mockResolvedValue({ codex: { path: "/home/me/.local/bin/codex" } });
-  await probeHarnessAvailability({ cwd });
-  expect(isHarnessAvailable("codex", cwd)).toBe(true);
-});
-
 
 it("retains upstream native installation hints when a resolver fails", async () => {
   vi.resetModules();
@@ -91,23 +12,4 @@ it("retains upstream native installation hints when a resolver fails", async () 
   await probeHarnessAvailability();
   expect(harnessUnavailableHint("claude")).toBe("Claude Code CLI not found. Install it, or restart MonoCode if it is already installed.");
   expect(harnessUnavailableHint("hermes")).toContain("Install from hermes-agent.nousresearch.com, then run hermes model");
-});
-
-it("does not let busy distribution probes prevent native discovery", async () => {
-  vi.resetModules();
-  const finish: Array<() => void> = [];
-  invoke.mockReset().mockImplementation((command) => command === "wsl_resolve_agents"
-    ? new Promise((resolve) => finish.push(() => resolve({})))
-    : Promise.resolve({ path: "C:/bin/agent.exe" }));
-  const { registerBuiltinHarnesses } = await import("./register");
-  registerBuiltinHarnesses();
-  const { probeHarnessAvailability, isHarnessAvailable } = await import("./availability");
-  const pending = Array.from({ length: 5 }, (_, i) => probeHarnessAvailability({ cwd: `//wsl.localhost/Busy${i}/repo` }));
-  try {
-    await probeHarnessAvailability();
-    expect(isHarnessAvailable("codex")).toBe(true);
-  } finally {
-    finish.forEach((resolve) => resolve());
-    await Promise.all(pending);
-  }
 });

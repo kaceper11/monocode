@@ -13,14 +13,14 @@ import { modelsFromHermesSession } from "./hermesProtocol";
 const DISCOVERY_TIMEOUT_MS = 30_000;
 const REQUEST_TIMEOUT_MS = 20_000;
 
-export function refreshHermesCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("hermes", cwd, discoverHermesModels);
+export function refreshHermesCatalog(): Promise<void> {
+  return refreshModelCatalog("hermes", discoverHermesModels);
 }
 
 export async function discoverHermesModels(
   projectCwd?: string,
 ): Promise<AgentModel[]> {
-  const { path } = await resolveHermesBinary(projectCwd);
+  const { path } = await resolveHermesBinary();
   const cwd = projectCwd ?? (await homeDir());
   const probeId = `monocode-hermes-probe-${crypto.randomUUID()}`;
   const acp = new AcpClient(probeId, {

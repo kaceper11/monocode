@@ -4,7 +4,6 @@ This repository follows [upstream MonoCode](https://github.com/hardbeat920/monoc
 
 ## Retained integrations
 
-- Windows UI with repositories, Git, terminals and agents running inside WSL.
 - Azure Boards tickets, Azure Repos pull requests and Azure Pipelines CI.
 - Jira tickets and Confluence context.
 - Devin, Muse and GitHub Copilot through upstream's harness registry.
@@ -20,9 +19,9 @@ Ticket source, Git remote, PR source, CI source, account and execution host rema
 
 Future upstream GitHub improvements should require bounded adapter changes. Do not duplicate screens, freeze upstream interfaces behind wrappers, or build a universal integration framework. Retain upstream Linear and GitLab behavior.
 
-## WSL and agent boundaries
+## Remote and agent boundaries
 
-Keep host and guest identities explicit. Run Linux Git and agents on the selected distribution; never reinterpret Linux paths as host paths or copy credentials across hosts. Preserve cancellation, approvals, session recovery and attachments. Integrate at existing process/filesystem boundaries and adapt to upstream worktree lifecycle rather than retaining a parallel workspace engine.
+Keep local and remote execution hosts explicit. Never reinterpret remote paths as local paths or copy credentials across hosts. Preserve cancellation, approvals, session recovery and attachments. Integrate at existing process/filesystem boundaries and adapt to upstream worktree lifecycle rather than retaining a parallel workspace engine.
 
 Agent adapters retain their actual provider semantics. Unsupported operations and unknown state remain explicit. Shared changes must preserve upstream harnesses as well as the retained agents.
 
@@ -34,6 +33,6 @@ Use focused branches and review fork differences file by file, including individ
 
 Preserve the distinct fork application/data identity and release safeguards. Never overwrite another installation's sessions or credentials. Removing UI does not authorize deleting stored records, downloaded assets, repositories or worktrees. Any necessary migration must be recoverable and covered by old-data checks.
 
-Run relevant upstream checks, regression tests and visible-interaction checks. Report performance evidence and limitations honestly. Local tests and macOS builds do not establish live Windows/WSL or authenticated service acceptance. Disabled integrations must not create recurring background work.
+Run relevant upstream checks, regression tests and visible-interaction checks. Report performance evidence and limitations honestly. Local tests and macOS builds do not establish live Windows or authenticated service acceptance. Disabled integrations must not create recurring background work.
 
 `origin` is `kaceper11/monocode`; `upstream` is `hardbeat920/monocode`. Use `gh ... -R kaceper11/monocode`. Publication, commits, pushes, PRs, releases and external service writes require the authority given in the active task. Respect upstream CONTRIBUTING.md for upstream submissions.

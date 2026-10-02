@@ -63,48 +63,12 @@ describe("isCurrentChildExit", () => {
   });
 });
 
-describe("concurrent binary discovery", () => {
-  it.each(["Codex", "Claude", "Devin", "Copilot", "Omp", "Muse"] as const)(
-    "shares pending %s discovery, then checks again on the next request",
-    async (name) => {
-      const child = await loadChild();
-      const pending = deferred<{ path: string }>();
-      mocks.invoke.mockReturnValue(pending.promise);
-      const resolve = child[`resolve${name}Binary`];
-      const first = resolve("C:/repo");
-      expect(resolve()).toBe(first);
-      expect(resolve("C:/another-repo")).toBe(first);
-      expect(mocks.invoke).toHaveBeenCalledTimes(1);
-      pending.resolve({ path: "cli.exe" });
-      await first;
-      await resolve();
-      expect(mocks.invoke).toHaveBeenCalledTimes(2);
-    },
-  );
-
-  it.each(["Codex", "Devin"] as const)("keeps %s guest workspaces separate and retries failed lookups", async (provider) => {
+describe("Antigravity resolution", () => {
+  it("resolves the wrapper with POSIX args", async () => {
     const child = await loadChild();
-    mocks.invoke.mockRejectedValue(new Error("missing"));
-    const resolve = child[`resolve${provider}Binary`];
-    const workspaces = ["C:/repo", "//wsl.localhost/Ubuntu/home/me/repo", "//wsl.localhost/Debian/home/me/repo"];
-    const pending = workspaces.map(cwd => resolve(cwd));
-    pending.push(child.resolveClaudeBinary());
-    await Promise.all(pending.map(p => expect(p).rejects.toThrow("missing")));
-    expect(mocks.invoke).toHaveBeenCalledTimes(4);
-    expect(mocks.invoke).toHaveBeenCalledWith("wsl_resolve_harness", { cwd: workspaces[1], provider: provider.toLowerCase() });
-    mocks.invoke.mockResolvedValue({ path: "installed.exe" });
-    await expect(resolve()).resolves.toEqual({ path: "installed.exe" });
-    expect(mocks.invoke).toHaveBeenCalledTimes(5);
-  });
-});
-
-describe("Antigravity guest resolution", () => {
-  it("resolves the guest wrapper with POSIX args and ignores a native override", async () => {
-    const child = await loadChild();
-    mocks.invoke.mockResolvedValue({ path: "/home/me/.local/bin/agy_acp_server.par" });
-    const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
-    await expect(child.resolveAntigravityBinary(cwd, "C:/native/agy.exe")).resolves.toEqual({ path: "/home/me/.local/bin/agy_acp_server.par", args: ["--uid="] });
-    expect(mocks.invoke).toHaveBeenLastCalledWith("wsl_resolve_harness", { cwd, provider: "antigravity" });
+    mocks.invoke.mockResolvedValue({ path: "/opt/antigravity/agy_acp_server.par", args: ["--uid="] });
+    await expect(child.resolveAntigravityBinary("C:/native/agy.exe")).resolves.toEqual({ path: "/opt/antigravity/agy_acp_server.par", args: ["--uid="] });
+    expect(mocks.invoke).toHaveBeenLastCalledWith("harness_resolve_configured", { provider: "antigravity", binaryPath: "C:/native/agy.exe" });
   });
 });
 
@@ -428,13 +392,6 @@ describe("child bridge", () => {
       binaryPath: "/opt/codex/bin/codex",
     });
 
-    const guestCwd = "//wsl.localhost/Ubuntu/work";
-    await child.resolveCodexBinary(guestCwd);
-    expect(mocks.invoke).toHaveBeenLastCalledWith("wsl_resolve_harness", { cwd: guestCwd, provider: "codex" });
-    mocks.invoke.mockResolvedValueOnce(91);
-    await child.spawnChild("guest", "/usr/bin/codex", ["app-server"], guestCwd, undefined, "codex");
-    expect(mocks.invoke).toHaveBeenLastCalledWith("harness_spawn", expect.objectContaining({ cwd: guestCwd, binaryPath: undefined, binaryProvider: "codex" }));
-
     for (const [provider, binaryPath, resolve] of [
       ["claude", "/opt/claude/bin/claude", child.resolveClaudeBinary],
       ["cursor", "/opt/cursor/bin/cursor-agent", child.resolveCursorBinary],
@@ -586,12 +543,11 @@ describe("child bridge", () => {
   });
 });
 
-it("inspects and updates the selected guest CLI without native binary overrides", async () => {
+it("inspects and updates the selected CLI", async () => {
   const child = await loadChild();
-  const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
-  mocks.invoke.mockImplementation(async (command: string) => command === "wsl_resolve_harness" ? { path: "/usr/bin/claude" } : "2.1.285");
-  expect(await child.inspectHarnessBinary("claude", "C:/native/claude.exe", cwd)).toMatchObject({ path: "/usr/bin/claude", version: "2.1.285" });
-  expect(mocks.invoke).toHaveBeenCalledWith("harness_exec", { command: "/usr/bin/claude", args: ["--version"], cwd, binaryProvider: "claude", binaryPath: undefined });
-  await child.updateHarnessCli("claude", cwd);
-  expect(mocks.invoke).toHaveBeenLastCalledWith("harness_update", { command: "/usr/bin/claude", binaryProvider: "claude", binaryPath: undefined, cwd });
+  mocks.invoke.mockImplementation(async (command: string) => command.startsWith("harness_resolve") ? { path: "/usr/bin/claude" } : "2.1.285");
+  expect(await child.inspectHarnessBinary("claude", "C:/native/claude.exe")).toMatchObject({ path: "/usr/bin/claude", version: "2.1.285" });
+  expect(mocks.invoke).toHaveBeenCalledWith("harness_exec", { command: "/usr/bin/claude", args: ["--version"], cwd: undefined, binaryProvider: "claude", binaryPath: "C:/native/claude.exe" });
+  await child.updateHarnessCli("claude");
+  expect(mocks.invoke).toHaveBeenLastCalledWith("harness_update", { command: "/usr/bin/claude", binaryProvider: "claude", binaryPath: null });
 });

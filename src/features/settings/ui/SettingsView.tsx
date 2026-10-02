@@ -1,5 +1,4 @@
-import { useWslStatus } from "../../sessions/model/wslStatus";
-import { wslLocation, wslPath } from "../../../shared/lib/paths";
+
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ConnectionsSettings } from "../../connections/ui/ConnectionsSettings";
@@ -2838,12 +2837,9 @@ function binaryInspectionError(
 
 function ProviderBinaryControl({
   provider,
-  cwd,
 }: {
   provider: ConfigurableBinaryProvider;
-  cwd?: string;
 }) {
-  const guest = wslLocation(cwd ?? "");
   const root = useRef<HTMLSpanElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const editInput = useRef<HTMLInputElement>(null);
@@ -2869,10 +2865,10 @@ function ProviderBinaryControl({
       setError(null);
       setRevealError(null);
       try {
-        const next = await inspectHarnessBinary(provider, guest ? null : binaryPath, cwd);
+        const next = await inspectHarnessBinary(provider, binaryPath);
         setInspection({
           ...next,
-          overridden: !guest && Boolean(binaryPath?.trim()),
+          overridden: Boolean(binaryPath?.trim()),
         });
         setError(binaryInspectionError(provider, next));
         return next;
@@ -2884,7 +2880,7 @@ function ProviderBinaryControl({
         setWorking(false);
       }
     },
-    [provider, cwd],
+    [provider],
   );
 
   useEffect(() => {
@@ -2936,7 +2932,7 @@ function ProviderBinaryControl({
   };
 
   const title = HARNESS_TITLE[provider];
-  const restartRequired = !guest && providerBinaryPathChangePending(provider);
+  const restartRequired = providerBinaryPathChangePending(provider);
 
   return (
     <span ref={root} className="inline-flex align-middle">
@@ -3004,14 +3000,14 @@ function ProviderBinaryControl({
             </span>
             <div className="flex items-center gap-1.5">
               <span className="rounded-full bg-content/10 px-1.5 py-0.5 text-[10px] text-content/50">
-                {guest ? `WSL · ${guest.distribution}` : IS_WIN ? "Windows CLI path" : "Native CLI path"}
+                {IS_WIN ? "Windows CLI path" : "Native CLI path"}
               </span>
               <span className="rounded-full bg-content/10 px-1.5 py-0.5 text-[10px] text-content/50">
                 {error
                   ? "Needs attention"
                   : restartRequired
                     ? "Restart required"
-                    : !guest && overridden
+                    : overridden
                       ? "Configured"
                       : "Auto-detected"}
               </span>
@@ -3100,20 +3096,19 @@ function ProviderBinaryControl({
                    Could not open the CLI location: {revealError}
                  </span>
                ) : null}
-               {guest ? <p className="mt-2 text-[11px] text-content/50">The Linux CLI is discovered from this distro’s login environment. Windows CLI overrides do not apply.</p> : null}
                <div className="mt-3 flex justify-end gap-2">
                 {error ? (
                   <SecondaryButton
                     disabled={working}
                     aria-label={`Retry ${title} ${
-                      !guest && overridden ? "configured path" : "auto-detect"
+                      overridden ? "configured path" : "auto-detect"
                     }`}
                     onClick={() =>
                       void inspect(overridden ? draft.trim() || null : null)
                     }
                   >
                     <RefreshCw className="size-3.5" strokeWidth={1.75} />
-                    {!guest && overridden ? "Retry configured path" : "Retry auto-detect"}
+                    {overridden ? "Retry configured path" : "Retry auto-detect"}
                   </SecondaryButton>
                 ) : null}
                 <SecondaryButton
@@ -3121,7 +3116,7 @@ function ProviderBinaryControl({
                   disabled={!inspection}
                   onClick={() => {
                     if (inspection) {
-                      void revealPath(guest ? wslPath(guest.distribution, inspection.path) : inspection.path).catch((cause) => {
+                      void revealPath(inspection.path).catch((cause) => {
                         setRevealError(
                           cause instanceof Error ? cause.message : String(cause),
                         );
@@ -3132,14 +3127,14 @@ function ProviderBinaryControl({
                   <ExternalLink className="size-3.5" strokeWidth={1.75} />
                   Open location
                 </SecondaryButton>
-                {!guest ? <SecondaryButton
+                <SecondaryButton
                   aria-label={`Edit ${title} CLI path`}
                   disabled={working}
                   onClick={() => setEditing(true)}
                 >
                   <Pencil className="size-3.5" strokeWidth={1.75} />
                   Edit path
-                </SecondaryButton> : null}
+                </SecondaryButton>
               </div>
             </>
           )}
@@ -3156,33 +3151,18 @@ function ProvidersPage({
   cwd: string;
   recents?: RecentProject[];
 }) {
-  const [selection, setSelection] = useState({ project: cwd, location: cwd });
-  const location = wslLocation(cwd)
-    ? selection.project === cwd ? selection.location : cwd
-    : "";
-  return <>
-    {wslLocation(cwd) ? <Select
-      label="Provider execution location"
-      value={location}
-      options={[{ value: "", label: "This computer" }, { value: cwd, label: prettyCwd(cwd) }]}
-      onChange={(location) => setSelection({ project: cwd, location })}
-    /> : null}
-    <ProvidersForLocation key={location} cwd={location || undefined} projectCwd={cwd} recents={recents} />
-  </>;
+  return <ProvidersForLocation projectCwd={cwd} recents={recents} />;
 }
 
 const GLOBAL_PROVIDER_SCOPE = "global";
 
 function ProvidersForLocation({
-  cwd,
   projectCwd,
   recents,
 }: {
-  cwd?: string;
   projectCwd?: string;
   recents?: RecentProject[];
 }) {
-  const wslStatus = useWslStatus(wslLocation(cwd ?? "")?.distribution);
   useSyncExternalStore(subscribeModels, getModelSnapshot, getModelSnapshot);
   useSyncExternalStore(
     subscribeHarnessAvailability,
@@ -3195,8 +3175,8 @@ function ProvidersForLocation({
     projectProvidersRevision,
   );
   void providersRevision;
-  const [choice, setChoice] = useState(() => loadLastModelChoice(cwd));
-  const [defaultModels, setDefaultModels] = useState(() => loadDefaultModels(cwd));
+  const [choice, setChoice] = useState(() => loadLastModelChoice());
+  const [defaultModels, setDefaultModels] = useState(() => loadDefaultModels());
   const [claudeHooks, setClaudeHooks] = useState(loadClaudeHooks);
   const [scope, setScope] = useState<string>(GLOBAL_PROVIDER_SCOPE);
   const [hiddenGlobally, setHiddenGlobally] = useState(
@@ -3243,8 +3223,8 @@ function ProvidersForLocation({
     : (choice?.harness ?? null);
 
   useEffect(() => {
-    void probeHarnessAvailability({ cwd });
-  }, [cwd, wslStatus]);
+    void probeHarnessAvailability();
+  }, []);
 
   useEffect(() => {
     if (!scopeOptions.some((option) => option.value === scope)) {
@@ -3262,10 +3242,10 @@ function ProvidersForLocation({
       setProjectDefaultModel(project, harness, model);
       return;
     }
-    saveDefaultModel(harness, model, cwd);
+    saveDefaultModel(harness, model);
     setDefaultModels((prev) => ({ ...prev, [harness]: model }));
     if (choice?.harness === harness) {
-      saveLastModelChoice(harness, model, cwd);
+      saveLastModelChoice(harness, model);
       setChoice({ harness, model });
     }
   };
@@ -3275,7 +3255,7 @@ function ProvidersForLocation({
       setProjectDefaultProvider(project, harness, model);
       return;
     }
-    saveLastModelChoice(harness, model, cwd);
+    saveLastModelChoice(harness, model);
     setDefaultModels((prev) => ({ ...prev, [harness]: model }));
     setChoice({ harness, model });
   };
@@ -3295,7 +3275,7 @@ function ProvidersForLocation({
 
   return (
     <>
-      {!wslLocation(cwd ?? "") && <ProviderAccountsSettings />}
+      <ProviderAccountsSettings />
 
       <UsageDisplaySettings />
 
@@ -3333,17 +3313,16 @@ function ProvidersForLocation({
               defaultModels[harness] ??
               (choice?.harness === harness
                 ? choice.model
-                : defaultModelId(harness, cwd)))
+                : defaultModelId(harness)))
             : (defaultModels[harness] ??
               (choice?.harness === harness
                 ? choice.model
-                : defaultModelId(harness, cwd)));
+                : defaultModelId(harness)));
           const isDefault = project
             ? effectiveDefaultHarness === harness
             : choice?.harness === harness;
           return (
             <ProviderRow
-              cwd={cwd}
               key={harness}
               harness={harness}
               selectedModel={selectedModel}
@@ -3758,7 +3737,6 @@ function ProjectScopeIcon({ path }: { path: string }) {
 }
 
 function ProviderRow({
-  cwd,
   harness,
   selectedModel,
   isDefault,
@@ -3768,7 +3746,6 @@ function ProviderRow({
   onModelChange,
   onPickerVisible,
 }: {
-  cwd?: string;
   harness: HarnessId;
   selectedModel: string;
   isDefault: boolean;
@@ -3779,21 +3756,18 @@ function ProviderRow({
   onModelChange: (harness: HarnessId, model: string) => void;
   onPickerVisible: (visible: boolean) => void;
 }) {
-  const distribution = wslLocation(cwd ?? "")?.distribution;
-  const wslStatus = useWslStatus(distribution);
-  const ready = !distribution || wslStatus.state === "connected";
-  const models = modelsFor(harness, cwd);
-  const live = hasLiveCatalog(harness, cwd);
-  const refreshing = isModelCatalogRefreshing(harness, cwd);
-  const error = modelCatalogError(harness, cwd);
-  const available = isHarnessAvailable(harness, cwd);
+  const models = modelsFor(harness);
+  const live = hasLiveCatalog(harness);
+  const refreshing = isModelCatalogRefreshing(harness);
+  const error = modelCatalogError(harness);
+  const available = isHarnessAvailable(harness);
   const current =
-    models.length > 0 ? resolveModel(harness, selectedModel, cwd) : null;
+    models.length > 0 ? resolveModel(harness, selectedModel) : null;
 
   useEffect(() => {
-    if (!available || !ready) return;
-    void refreshHarnessCatalogs([harness], cwd);
-  }, [available, ready, harness, cwd, wslStatus]);
+    if (!available) return;
+    void refreshHarnessCatalogs([harness]);
+  }, [available, harness]);
 
   return (
     <Row
@@ -3801,7 +3775,7 @@ function ProviderRow({
         <span className="flex items-center gap-2">
           <HarnessIcon harness={harness} className="size-4 shrink-0" />
           {HARNESS_TITLE[harness]}
-          <ProviderBinaryControl key={`${harness}:${cwd ?? "native"}`} provider={harness} cwd={cwd} />
+          <ProviderBinaryControl provider={harness} />
           {isDefault ? (
             <span className="rounded-full bg-content/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-content/60">
               Default
@@ -3810,19 +3784,17 @@ function ProviderRow({
         </span>
       }
       description={
-        !ready
-          ? wslStatus.error ?? (wslStatus.state === "connecting" ? "Connecting to WSL…" : "Connect WSL to discover models.")
-          : available
-            ? live && !refreshing && !error
-              ? `${models.length} ${models.length === 1 ? "model" : "models"} available.`
-              : modelCatalogStatus(harness, cwd)
-            : harnessUnavailableHint(harness, cwd)
+        available
+          ? live && !refreshing && !error
+            ? `${models.length} ${models.length === 1 ? "model" : "models"} available.`
+            : modelCatalogStatus(harness)
+          : harnessUnavailableHint(harness)
       }
     >
       {available && (!live || error) ? (
         <SecondaryButton
-          disabled={!ready || refreshing}
-          onClick={() => { void refreshHarnessCatalogs([harness], cwd, true); }}
+          disabled={refreshing}
+          onClick={() => { void refreshHarnessCatalogs([harness], { force: true }); }}
         >
           {refreshing ? "Refreshing…" : "Retry models"}
         </SecondaryButton>

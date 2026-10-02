@@ -536,7 +536,7 @@ export function newSession(
   runtimeMode: RuntimeMode = DEFAULT_RUNTIME_MODE,
   modelSettings?: Record<string, string>,
 ): Session {
-  const resolved = resolveModel(harness, model ?? preferredModelId(harness, cwd), cwd);
+  const resolved = resolveModel(harness, model ?? preferredModelId(harness));
   return {
     id: crypto.randomUUID(),
     harness,

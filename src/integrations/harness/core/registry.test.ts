@@ -1,4 +1,3 @@
-import { setWslStatus } from "../../../features/sessions/model/wslStatus";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   resetHarnessModelOverlays,
@@ -497,22 +496,4 @@ describe("harness registry", () => {
   });
 });
 
-it("gates all requested provider catalogs on the selected WSL connection", async () => {
-  const codex = vi.fn(async () => undefined);
-  const claude = vi.fn(async () => undefined);
-  registerHarness(stub("codex", { refreshCatalog: codex }));
-  registerHarness(stub("claude", { refreshCatalog: claude }));
-  const cwd = "//wsl.localhost/Waiting/repo";
-  setWslStatus("Waiting", { state: "connecting" });
-  await refreshHarnessCatalogs(["codex", "claude"], cwd);
-  expect(codex).not.toHaveBeenCalled();
-  expect(claude).not.toHaveBeenCalled();
-  setWslStatus("Waiting", { state: "connected" });
-  await refreshHarnessCatalogs(["codex", "claude"], cwd);
-  expect(codex).toHaveBeenCalledExactlyOnceWith(cwd);
-  expect(claude).toHaveBeenCalledExactlyOnceWith(cwd);
-  await refreshHarnessCatalogs(["codex"], "//wsl.localhost/Other/repo");
-  expect(codex).toHaveBeenCalledTimes(1);
-  await refreshHarnessCatalogs(["codex"]);
-  expect(codex).toHaveBeenCalledTimes(2);
-});
+

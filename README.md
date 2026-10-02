@@ -14,7 +14,7 @@
 
 Works with your subscriptions on Claude Code, Codex, Cursor, Grok Build, OpenCode, Antigravity, Pi, omp, fx, and Hermes Agent. If they’re installed and logged in, MonoCode can run them. Tabs are sessions. The composer is the input. MonoCode does not sell tokens.
 
-This fork follows [upstream MonoCode](https://github.com/hardbeat920/monocode), retaining WSL, Azure DevOps, Jira, Confluence, Devin, Muse and Copilot integrations. See [fork scope](docs/PRODUCT.md) and [local development](docs/LOCAL_DEVELOPMENT.md).
+This fork follows [upstream MonoCode](https://github.com/hardbeat920/monocode), retaining Azure DevOps, Jira, Confluence, Devin, Muse and Copilot integrations. See [fork scope](docs/PRODUCT.md) and [local development](docs/LOCAL_DEVELOPMENT.md).
 
 ## Install
 

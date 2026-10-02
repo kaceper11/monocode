@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { pathKey, wslLocation } from "../../../shared/lib/paths.ts";
+import { pathKey } from "../../../shared/lib/paths.ts";
 import { boundAgentContext, type AgentContext } from "./agentContext";
 import type { Attachment } from "./session";
 
@@ -568,11 +568,10 @@ export function browserAgentContext(
   includeSteps = false,
 ): AgentContext {
   const url = sanitizeCaptureUrl(capture.url);
-  const wsl = wslLocation(cwd);
   const origin = [
     url || null,
     cwd,
-    wsl ? `Browser: native host; repository: WSL ${wsl.distribution}` : "native host",
+    "native host",
     `captured ${new Date().toISOString()}`,
   ]
     .filter(Boolean)

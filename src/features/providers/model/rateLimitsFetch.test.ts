@@ -59,22 +59,21 @@ import {
   fetchAdditionalRateLimits,
 } from "./rateLimitsFetch";
 
-const cwd = "//wsl.localhost/Ubuntu/home/me/worktree";
+const cwd = "/native/home/worktree";
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.lines.clear();
   mocks.requests.length = 0;
 });
 
-it("reads quota and consumes resets on the selected WSL host with isolated children", async () => {
+it("reads quota and consumes resets with isolated children", async () => {
   const [limits, outcome] = await Promise.all([
-    fetchCodexRateLimits("default", cwd),
-    consumeCodexRateLimitResetCredit("credit-1", "default", cwd),
+    fetchCodexRateLimits("default"),
+    consumeCodexRateLimitResetCredit("credit-1", "default"),
   ]);
   expect(limits.session?.usedPercent).toBe(31);
   expect(outcome).toBe("reset");
-  expect(mocks.resolve).toHaveBeenCalledWith(cwd);
-  expect(mocks.home).not.toHaveBeenCalled();
+  expect(mocks.home).toHaveBeenCalled();
   expect(mocks.spawn.mock.calls).toHaveLength(2);
   expect(new Set(mocks.spawn.mock.calls.map((call) => call[0])).size).toBe(2);
   for (const call of mocks.spawn.mock.calls)
@@ -82,7 +81,7 @@ it("reads quota and consumes resets on the selected WSL host with isolated child
       expect.any(String),
       "/cli",
       ["app-server"],
-      cwd,
+      "/native/home",
       { provider: "codex", id: "default" },
       "codex",
     ]);
@@ -92,28 +91,27 @@ it("reads quota and consumes resets on the selected WSL host with isolated child
   expect(mocks.lines.size).toBe(0);
 });
 
-it("passes the distribution to Claude's credential boundary", async () => {
+it("fetches Claude usage for the account", async () => {
   mocks.invoke.mockResolvedValue({
     status: "ok",
     body: JSON.stringify({ five_hour: { utilization: 23 } }),
   });
   expect(
-    (await fetchClaudeRateLimits("default", cwd)).session?.usedPercent,
+    (await fetchClaudeRateLimits("default")).session?.usedPercent,
   ).toBe(23);
   expect(mocks.invoke).toHaveBeenCalledWith("fetch_claude_usage", {
     accountId: "default",
-    cwd,
   });
 });
 
 it("reads Copilot account quota over its SDK transport without creating a session", async () => {
-  const limits = await fetchAdditionalRateLimits("copilot", cwd);
+  const limits = await fetchAdditionalRateLimits("copilot");
   expect(limits.monthly?.usedPercent).toBe(30);
   expect(mocks.spawn).toHaveBeenCalledWith(
     expect.any(String),
     "/cli",
     ["--headless", "--no-auto-update", "--stdio"],
-    cwd,
+    "/native/home",
     undefined,
     "copilot",
   );
@@ -151,21 +149,10 @@ it("uses Muse's live host observation and leaves unsupported Devin usage explici
   });
 });
 
-it("keeps WSL connection failures visible instead of reporting a missing native CLI", async () => {
-  mocks.resolve.mockRejectedValueOnce(new Error("WSL connection interrupted"));
-  expect(await fetchCodexRateLimits("default", cwd)).toMatchObject({
-    status: "error",
-    error: "WSL connection interrupted",
-  });
-  expect(mocks.spawn).not.toHaveBeenCalled();
-});
-
-
-it("routes OpenCode Go usage to the selected guest rather than reporting unsupported", async () => {
+it("routes OpenCode Go usage to the native fetcher", async () => {
   const { fetchOpencodeGoRateLimits } = await import("./rateLimitsFetch");
-  const cwd = "//wsl.localhost/Ubuntu/home/me/worktree";
-  mocks.invoke.mockResolvedValue({ status: "unavailable", error: "Guest Go account not connected" });
-  const limits = await fetchOpencodeGoRateLimits(cwd);
-  expect(mocks.invoke).toHaveBeenCalledWith("fetch_opencode_go_usage", { cwd });
+  mocks.invoke.mockResolvedValue({ status: "unavailable", error: "Go account not connected" });
+  const limits = await fetchOpencodeGoRateLimits();
+  expect(mocks.invoke).toHaveBeenCalledWith("fetch_opencode_go_usage");
   expect(limits.status).toBe("unavailable");
 });

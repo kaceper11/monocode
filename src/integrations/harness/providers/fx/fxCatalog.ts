@@ -7,12 +7,12 @@ import {
   modelsFromFxOutput,
 } from "./fxProtocol";
 
-export function refreshFxCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("fx", cwd, discoverFxModels);
+export function refreshFxCatalog(): Promise<void> {
+  return refreshModelCatalog("fx", discoverFxModels);
 }
 
 export async function discoverFxModels(projectCwd?: string) {
-  const { path } = await resolveFxBinary(projectCwd);
+  const { path } = await resolveFxBinary();
   const cwd = projectCwd ?? (await homeDir());
   const [modelsOutput, statusOutput] = await Promise.all([
     execChild(path, ["models", "--json"], cwd, "fx"),

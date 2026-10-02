@@ -52,8 +52,6 @@ import {
   type ProviderAccountProvider,
 } from "../../features/providers/model/providerAccounts";
 
-import { wslLocation } from "../../shared/lib/paths";
-
 const CLOCK_MS = 30_000;
 
 export type UsageFooterSession = {
@@ -111,7 +109,6 @@ function UsageFooterContent({
   onManageAccounts?: (provider: ProviderAccountProvider) => void;
 }) {
   const cwd = session?.cwd ?? project;
-  const wsl = cwd ? wslLocation(cwd) : undefined;
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -126,7 +123,7 @@ function UsageFooterContent({
     (provider): provider is "copilot" | "muse" | "devin" =>
       provider === "copilot" || provider === "muse" || provider === "devin",
   );
-  const extra = useCachedRateLimits(additional ?? "devin", "default", cwd, session?.id);
+  const extra = useCachedRateLimits(additional ?? "devin", "default", session?.id);
   const [now, setNow] = useState(() => Date.now());
   const [refreshing, setRefreshing] = useState(false);
   const [, setAccountsVersion] = useState(0);
@@ -148,9 +145,9 @@ function UsageFooterContent({
   const codexAccountAvailable = providerAccountExists("codex", codexAccountId);
   const codexAccountRef = useRef(codexAccountId);
   codexAccountRef.current = codexAccountId;
-  const cachedClaude = useCachedRateLimits("claude", claudeAccountId, cwd);
-  const cachedCodex = useCachedRateLimits("codex", codexAccountId, cwd);
-  const opencode = useCachedRateLimits("opencode", "default", cwd);
+  const cachedClaude = useCachedRateLimits("claude", claudeAccountId);
+  const cachedCodex = useCachedRateLimits("codex", codexAccountId);
+  const opencode = useCachedRateLimits("opencode", "default");
   const claude = claudeAccountAvailable
     ? cachedClaude
     : unavailableRateLimits(
@@ -246,7 +243,6 @@ function UsageFooterContent({
           outcome = await consumeCodexRateLimitResetCredit(
             creditId,
             codexAccountId,
-            cwd,
           );
           await loadRateLimits("codex", codexAccountId, true, cwd);
         } catch (error) {
@@ -260,9 +256,8 @@ function UsageFooterContent({
             errorRateLimits(
               "codex",
               message,
-              getCachedRateLimits("codex", codexAccountId, cwd),
+              getCachedRateLimits("codex", codexAccountId),
             ),
-            cwd,
           );
           throw error;
         }
@@ -288,7 +283,7 @@ function UsageFooterContent({
       setRefreshing(true);
       const operation = (async () => {
         try {
-          await loginHarness(provider, accountId, cwd);
+          await loginHarness(provider, accountId);
           const value = await loadRateLimits(provider, accountId, true, cwd);
           if (value.status !== "ok") {
             throw new Error(
@@ -307,9 +302,8 @@ function UsageFooterContent({
             errorRateLimits(
               provider,
               message,
-              getCachedRateLimits(provider, accountId, cwd),
+              getCachedRateLimits(provider, accountId),
             ),
-            cwd,
           );
           throw error;
         }
@@ -377,46 +371,22 @@ function UsageFooterContent({
       aria-label={ariaLabel}
       className="flex h-7 shrink-0 items-center gap-1.5 overflow-x-auto border-t border-stroke px-3 text-[11px] text-content/55"
     >
-      {wsl ? (
-        <span
-          className="shrink-0 text-content/40"
-          title={`Usage and sign-in inside WSL: ${wsl.distribution}`}
-        >
-          {wsl.distribution}
-        </span>
-      ) : null}
       {session?.harness === "pi" ? (
-        <PiUsage key={`${session.id}:${session.model}`} model={session.model} now={now} cwd={cwd} />
+        <PiUsage key={`${session.id}:${session.model}`} model={session.model} now={now} />
       ) : showUsage ? (
         <>
           {wantClaude ? (
             <UsageProviderChip
               limits={claude}
               now={now}
-              accounts={
-                wsl
-                  ? claudeAccounts
-                      .filter((account) => account.id === "default")
-                      .map((account) => ({
-                        ...account,
-                        label: `${wsl.distribution} account`,
-                      }))
-                  : claudeAccounts
-              }
+              accounts={claudeAccounts}
               accountId={claudeAccountId}
-              accountLabel={
-                wsl && claudeAccountId !== "default"
-                  ? "Native account (unavailable in WSL)"
-                  : undefined
-              }
               onSelectAccount={(accountId) =>
                 selectAccount("claude", accountId)
               }
-              onAddAccount={
-                wsl ? undefined : (label) => addAccount("claude", label)
-              }
+              onAddAccount={(label) => addAccount("claude", label)}
               onManageAccounts={
-                !wsl && onManageAccounts
+                onManageAccounts
                   ? () => onManageAccounts("claude")
                   : undefined
               }
@@ -428,29 +398,12 @@ function UsageFooterContent({
               limits={codex}
               now={now}
               project={project}
-              cwd={cwd}
-              accounts={
-                wsl
-                  ? codexAccounts
-                      .filter((account) => account.id === "default")
-                      .map((account) => ({
-                        ...account,
-                        label: `${wsl.distribution} account`,
-                      }))
-                  : codexAccounts
-              }
+              accounts={codexAccounts}
               accountId={codexAccountId}
-              accountLabel={
-                wsl && codexAccountId !== "default"
-                  ? "Native account (unavailable in WSL)"
-                  : undefined
-              }
               onSelectAccount={(accountId) => selectAccount("codex", accountId)}
-              onAddAccount={
-                wsl ? undefined : (label) => addAccount("codex", label)
-              }
+              onAddAccount={(label) => addAccount("codex", label)}
               onManageAccounts={
-                !wsl && onManageAccounts
+                onManageAccounts
                   ? () => onManageAccounts("codex")
                   : undefined
               }
@@ -567,7 +520,6 @@ function SessionChip({ session }: { session: UsageFooterSession }) {
       await loginHarness(
         session.harness,
         session.providerAccountId,
-        session.cwd,
       );
       setOpen(false);
       setLoginState("complete");

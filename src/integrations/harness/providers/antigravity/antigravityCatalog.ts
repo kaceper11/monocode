@@ -15,12 +15,12 @@ import {
 
 const PROBE_ID = "monocode-antigravity-probe";
 const REQUEST_TIMEOUT_MS = 12_000;
-export function refreshAntigravityCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("antigravity", cwd, discoverAntigravityModels);
+export function refreshAntigravityCatalog(): Promise<void> {
+  return refreshModelCatalog("antigravity", discoverAntigravityModels);
 }
 
 export async function discoverAntigravityModels(workingDirectory?: string) {
-  const { path, args } = await resolveAntigravityBinary(workingDirectory);
+  const { path, args } = await resolveAntigravityBinary();
   const cwd = workingDirectory ?? (await homeDir());
   const probeId = `${PROBE_ID}-${crypto.randomUUID()}`;
   const acp = new AcpClient(probeId, {

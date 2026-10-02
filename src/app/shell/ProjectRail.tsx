@@ -1,7 +1,6 @@
 import { SavedProjectsSection } from "../../features/projects/ui/SavedProjectsSection";
 import { useSavedProjects } from "../../features/projects/model/savedProjects";
 import { SidebarTasksSection } from "../../features/board/SidebarTasksSection";
-import { WslBadge } from "../../features/sessions/ui/WslBadge.tsx";
 import {
   BellOff,
   ChartBreakoutSquare,
@@ -298,8 +297,8 @@ export function ProjectRail({
   useEffect(() => {
     // Saving announces the change, which reloads `pinnedPaths`.
     const pinned = loadPinnedProjects();
-    // `allProjects` is keyed by pathKey — match that form or drive-letter,
-    // UNC and WSL-cased pins all look missing and get silently dropped.
+    // `allProjects` is keyed by pathKey — match that form or drive-letter
+    // and UNC-cased pins all look missing and get silently dropped.
     const next = pinned.filter((path) => allProjects.has(pathKey(path)));
     if (next.length !== pinned.length) savePinnedProjects(next);
   }, [allProjects]);
@@ -1051,7 +1050,6 @@ function ProjectCard({
         ) : (
           <span className={labelClassName}>{name}</span>
         )}
-        <WslBadge cwd={item.path} compact />
         {machine ? (
           <span className="min-w-0 flex-1 truncate text-[11px] leading-tight text-content/45">
             {machine.name}

@@ -1,4 +1,3 @@
-import { wslLocation } from "../../../../shared/lib/paths";
 import { homeDir } from "../../../../platform/tauri/fs";
 import {
   refreshModelCatalog,
@@ -216,13 +215,12 @@ const EFFORT_LABELS: Record<string, string> = {
   max: "Max",
 };
 
-export function refreshClaudeCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("claude", cwd, discoverClaudeModels);
+export function refreshClaudeCatalog(): Promise<void> {
+  return refreshModelCatalog("claude", discoverClaudeModels);
 }
 
 export async function discoverClaudeModels(projectCwd?: string): Promise<AgentModel[]> {
   const listed = await discoverViaListModels(projectCwd).catch((error: unknown) => {
-    if (projectCwd && wslLocation(projectCwd)) throw error;
     console.debug("[monocode] claude list_models catalog failed", error);
     return [];
   });
@@ -233,7 +231,7 @@ export async function discoverClaudeModels(projectCwd?: string): Promise<AgentMo
 async function discoverViaListModels(
   projectCwd?: string,
 ): Promise<AgentModel[]> {
-  const { path } = await resolveClaudeBinary(projectCwd);
+  const { path } = await resolveClaudeBinary();
   const cwd = projectCwd ?? (await homeDir());
   const sessionId = crypto.randomUUID();
   const probeId = `monocode-claude-probe-${sessionId}`;
@@ -304,7 +302,7 @@ async function discoverViaListModels(
 async function discoverViaVersion(
   projectCwd?: string,
 ): Promise<AgentModel[]> {
-  const { path } = await resolveClaudeBinary(projectCwd);
+  const { path } = await resolveClaudeBinary();
   const cwd = projectCwd ?? (await homeDir());
   const versionOut = await execChild(path, ["--version"], cwd, "claude");
   const version = parseClaudeVersion(versionOut);

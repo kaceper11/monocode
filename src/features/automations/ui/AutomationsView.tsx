@@ -50,8 +50,6 @@ import {
   applyTriggers,
   automationScheduleLabel,
   automationTriggers,
-  automationWorkCwd,
-  connectAutomationWorkspace,
   createAutomationTrigger,
   createManualAutomationRun,
   deleteAutomation,
@@ -95,9 +93,7 @@ import { JIRA_CHANGE_EVENT, jiraConnected, atlassianCapable } from "../../inbox/
 import { defaultSessionChoice, firstEnabledHarness, modelsFor, preferredModelId, resolveModel, subscribeModels, getModelSnapshot, hasLiveCatalog } from "../../sessions/model/models";
 import { refreshHarnessCatalogs } from "../../../integrations/harness/core/registry";
 import { probeHarnessAvailability } from "../../../integrations/harness/core/availability";
-import { WslBadge } from "../../sessions/ui/WslBadge";
-import { useWslStatus } from "../../sessions/model/wslStatus";
-import { pathKey, projectKey, projectName, wslLocation } from "../../../shared/lib/paths";
+import { projectKey, projectName } from "../../../shared/lib/paths";
 import { IS_MAC } from "../../../platform/tauri/platform";
 import { looksLikeProject, type RecentProject } from "../../projects/model/recents";
 import {
@@ -275,11 +271,10 @@ function AutomationsContent({
       selected?.harness ?? preferred.harness,
     );
     const model =
-      (selected?.harness === harness && pathKey(automationWorkCwd(selected)) === pathKey(project)
-        ? selected.model : undefined) ??
+      (selected?.harness === harness ? selected.model : undefined) ??
       (preferred.harness === harness ? preferred.model : undefined) ??
-      modelsFor(harness, project)[0]?.id ??
-      preferredModelId(harness, project);
+      modelsFor(harness)[0]?.id ??
+      preferredModelId(harness);
     return { project, harness, model };
   };
 
@@ -509,7 +504,7 @@ function AutomationCard({
     ? formatRelativeTime(new Date(automation.lastRunAt).toISOString())
     : null;
   useSyncExternalStore(subscribeModels, getModelSnapshot, getModelSnapshot);
-  const model = resolveModel(automation.harness, automation.model, automationWorkCwd(automation));
+  const model = resolveModel(automation.harness, automation.model);
   return (
     <div
       className={`group relative rounded-md border ${
@@ -827,34 +822,14 @@ function AutomationEditor({
   onOpenSession: (sessionId: string) => void | Promise<void>;
 }) {
   const [tab, setTab] = useState<"settings" | "history">("settings");
-  const modelCwd = automationWorkCwd(draft);
   useSyncExternalStore(subscribeModels, getModelSnapshot, getModelSnapshot);
-  const modelUnavailable = Boolean(wslLocation(modelCwd)) && hasLiveCatalog(draft.harness, modelCwd) &&
+  const modelUnavailable = hasLiveCatalog(draft.harness) &&
     draft.model !== `${draft.harness}:default` &&
-    resolveModel(draft.harness, draft.model, modelCwd).id !== draft.model;
-  const wslStatus = useWslStatus(wslLocation(modelCwd)?.distribution);
-  const [connectionError, setConnectionError] = useState("");
-  const [validatedCwd, setValidatedCwd] = useState<string | null>(null);
-  const [connectionAttempt, setConnectionAttempt] = useState(0);
+    resolveModel(draft.harness, draft.model).id !== draft.model;
   useEffect(() => {
-    const controller = new AbortController();
-    setConnectionError("");
-    setValidatedCwd(null);
-    void connectAutomationWorkspace(modelCwd, controller.signal)
-      .then(() => {
-        if (controller.signal.aborted) return;
-        setValidatedCwd(modelCwd);
-      })
-      .catch((error: unknown) => {
-        if (!controller.signal.aborted) setConnectionError(String(error));
-      });
-    return () => controller.abort();
-  }, [modelCwd, connectionAttempt]);
-  useEffect(() => {
-    if (validatedCwd !== modelCwd || (wslLocation(modelCwd) && wslStatus.state !== "connected")) return;
-    void probeHarnessAvailability({ cwd: modelCwd });
-    void refreshHarnessCatalogs([draft.harness], modelCwd);
-  }, [modelCwd, draft.harness, wslStatus, validatedCwd]);
+    void probeHarnessAvailability();
+    void refreshHarnessCatalogs([draft.harness]);
+  }, [draft.harness]);
   const settingsTabId = useId();
   const historyTabId = useId();
   const tabPanelId = useId();
@@ -1030,7 +1005,7 @@ function AutomationEditor({
                   <button
                     type="button"
                     onClick={onRun}
-                    disabled={running || modelUnavailable || Boolean(connectionError)}
+                    disabled={running || modelUnavailable}
                     className={ACTION_OUTLINE}
                   >
                     {running ? (
@@ -1075,7 +1050,6 @@ function AutomationEditor({
                     workspaceMode: draft.workspaceMode === "existing" ? "current" : draft.workspaceMode })
                 }
               />
-              <WslBadge cwd={modelCwd} compact />
               {onDelete ? (
                 <>
                   <span
@@ -1358,13 +1332,7 @@ function AutomationEditor({
                   The saved model ({draft.model}) is unavailable in this working copy. Choose a model before saving or running.
                 </p>
               )}
-              {connectionError && (
-                <div role="alert" className="mt-2 flex items-center gap-2 text-[12px] text-content/75">
-                  <span>{connectionError}</span>
-                  <button type="button" className="shrink-0 rounded px-2 py-1 hover:bg-content/8"
-                    onClick={() => setConnectionAttempt(value => value + 1)}>Retry</button>
-                </div>
-              )}
+
               <div className="relative mt-3 rounded-md border border-content/10 bg-content/3 backdrop-blur-sm has-focus:border-content/20">
                 <PromptField
                   value={draft.prompt}
@@ -1376,7 +1344,6 @@ function AutomationEditor({
                   <div className="flex min-w-0 flex-1 items-center overflow-x-auto">
                     <div className="flex shrink-0 items-center gap-1">
                       <ModelPicker
-                        cwd={modelCwd}
                         harness={draft.harness}
                         model={draft.model}
                         values={draft.modelSettings}
@@ -1391,7 +1358,6 @@ function AutomationEditor({
                       />
                       {controlsBeside ? (
                         <ModelControlPills
-                          cwd={modelCwd}
                           harness={draft.harness}
                           model={draft.model}
                           values={draft.modelSettings}

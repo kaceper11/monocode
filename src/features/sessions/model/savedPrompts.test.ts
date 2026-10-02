@@ -35,9 +35,6 @@ it("preserves legacy bytes and custom text, requiring an explicit legacy scope c
   );
   expect(localStorage.getItem(legacyKey)).toBe(legacy);
   expect(promptAvailable(readSavedPrompts()[0], "/repo")).toBe(true);
-  expect(
-    promptAvailable(readSavedPrompts()[0], "//wsl.localhost/Ubuntu/repo"),
-  ).toBe(false);
 });
 
 it("adapts only exact old defaults and respects intentionally empty lists", () => {
@@ -103,27 +100,9 @@ it("does not overwrite malformed storage or report failed writes as successful",
   expect(savedPromptsSnapshot()).toBe("");
 });
 
-it("compares Windows scopes while preserving WSL case and host identity", () => {
+it("compares Windows scopes case-insensitively", () => {
   const prompt = { id: "p", name: "P", text: "text", cwd: "C:\\Repo" };
   expect(promptAvailable(prompt, "c:/repo/")).toBe(true);
-  expect(
-    promptAvailable(
-      { ...prompt, cwd: "//wsl.localhost/Ubuntu/home/Repo" },
-      "//wsl$/ubuntu/home/Repo/",
-    ),
-  ).toBe(true);
-  expect(
-    promptAvailable(
-      { ...prompt, cwd: "//wsl.localhost/Ubuntu/home/Repo" },
-      "//wsl.localhost/Ubuntu/home/repo",
-    ),
-  ).toBe(false);
-  expect(
-    promptAvailable(
-      { ...prompt, cwd: "//wsl.localhost/Ubuntu/home/Repo" },
-      "/home/Repo",
-    ),
-  ).toBe(false);
 });
 
 it("rejects malformed legacy scopes instead of making them global", () => {

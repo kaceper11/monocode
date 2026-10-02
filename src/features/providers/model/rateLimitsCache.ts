@@ -1,4 +1,3 @@
-import { wslLocation } from "../../../shared/lib/paths";
 import { useSyncExternalStore } from "react";
 import {
   errorRateLimits,
@@ -20,10 +19,9 @@ const queuedRefreshes = new Map<string, Promise<ProviderRateLimits>>();
 const listeners = new Set<() => void>();
 let allSnapshots: Record<string, ProviderRateLimits> = {};
 
-function keyFor(provider: RateLimitProvider, accountId: string, cwd?: string, sessionId?: string): string {
-  const distribution = wslLocation(cwd ?? "")?.distribution.toLowerCase();
+function keyFor(provider: RateLimitProvider, accountId: string, sessionId?: string): string {
   const session = provider === "muse" ? sessionId : undefined;
-  return `${provider}:${accountId}` + (distribution || session ? `:${JSON.stringify([distribution, session])}` : "");
+  return session ? `${provider}:${accountId}:${JSON.stringify(session)}` : `${provider}:${accountId}`;
 }
 
 function publish(key: string, value: ProviderRateLimits): void {
@@ -44,10 +42,9 @@ export function getAllRateLimits(): Record<string, ProviderRateLimits> {
 export function getCachedRateLimits(
   provider: RateLimitProvider,
   accountId = "default",
-  cwd?: string,
   sessionId?: string,
 ): ProviderRateLimits {
-  return snapshots.get(keyFor(provider, accountId, cwd, sessionId)) ?? idle[provider];
+  return snapshots.get(keyFor(provider, accountId, sessionId)) ?? idle[provider];
 }
 
 const idle: Record<RateLimitProvider, ProviderRateLimits> = {
@@ -62,13 +59,12 @@ const idle: Record<RateLimitProvider, ProviderRateLimits> = {
 export function useCachedRateLimits(
   provider: RateLimitProvider,
   accountId = "default",
-  cwd?: string,
   sessionId?: string,
 ): ProviderRateLimits {
   return useSyncExternalStore(
     subscribeRateLimits,
-    () => getCachedRateLimits(provider, accountId, cwd, sessionId),
-    () => getCachedRateLimits(provider, accountId, cwd, sessionId),
+    () => getCachedRateLimits(provider, accountId, sessionId),
+    () => getCachedRateLimits(provider, accountId, sessionId),
   );
 }
 
@@ -76,10 +72,9 @@ export function setCachedRateLimits(
   provider: RateLimitProvider,
   accountId: string,
   value: ProviderRateLimits,
-  cwd?: string,
   sessionId?: string,
 ): void {
-  publish(keyFor(provider, accountId, cwd, sessionId), value);
+  publish(keyFor(provider, accountId, sessionId), value);
 }
 
 /** Fetch an account once per window lifetime, or again on explicit refresh. */
@@ -90,7 +85,7 @@ export function loadRateLimits(
   cwd?: string,
   sessionId?: string,
 ): Promise<ProviderRateLimits> {
-  const key = keyFor(provider, accountId, cwd, sessionId);
+  const key = keyFor(provider, accountId, sessionId);
   const running = pending.get(key);
   if (running) {
     if (!force) return running;
@@ -111,11 +106,11 @@ export function loadRateLimits(
     try {
       const result =
         provider === "claude"
-          ? await fetchClaudeRateLimits(accountId, cwd)
+          ? await fetchClaudeRateLimits(accountId)
           : provider === "codex"
-            ? await fetchCodexRateLimits(accountId, cwd)
+            ? await fetchCodexRateLimits(accountId)
             : provider === "opencode"
-              ? await fetchOpencodeGoRateLimits(cwd)
+              ? await fetchOpencodeGoRateLimits()
               : await fetchAdditionalRateLimits(provider, cwd, sessionId);
       publish(key, result);
       return result;
@@ -123,7 +118,7 @@ export function loadRateLimits(
       const result = errorRateLimits(
         provider,
         error instanceof Error ? error.message : String(error),
-        getCachedRateLimits(provider, accountId, cwd, sessionId),
+        getCachedRateLimits(provider, accountId, sessionId),
       );
       publish(key, result);
       return result;

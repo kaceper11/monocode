@@ -100,7 +100,7 @@ pub async fn search_project(options: SearchOptions) -> Result<SearchResult, Stri
         });
     }
     let root = expand_home(&options.cwd);
-    if crate::wsl::path_location(&root)?.is_none() && !root.is_dir() {
+    if !root.is_dir() {
         return Err(format!("{}: Not a directory", root.display()));
     }
     let search_id = options.search_id.clone();
@@ -227,7 +227,7 @@ fn git_grep_capped(
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(1);
         let preview = String::from_utf8_lossy(preview_bytes).to_string();
-        let path = crate::fs::path_to_js(&crate::fs::host_path(&root, &relative));
+        let path = crate::fs::path_to_js(&root.join(&relative));
         let column = match_column(
             &preview,
             query,
@@ -276,7 +276,6 @@ fn scan_files(
             truncated: false,
         });
     }
-    let remote = crate::wsl::path_location(root)?.is_some();
     let include = glob_tokens(&options.include);
     let exclude = glob_tokens(&options.exclude);
     let needle = if options.case_sensitive {
@@ -288,78 +287,50 @@ fn scan_files(
     let mut matches = Vec::new();
     let mut truncated = false;
 
-    let files = files
-        .into_iter()
-        .filter(|file| matches_pathspec(&file.relative, &include, &exclude))
-        .collect::<Vec<_>>();
-    'files: for batch in files.chunks(16) {
-        let mut remote_bytes = std::collections::HashMap::new();
-        if remote {
-            use base64::Engine;
-            let paths = batch
-                .iter()
-                .map(|file| file.path.clone())
-                .collect::<Vec<_>>();
-            let results: Vec<serde_json::Value> =
-                crate::wsl::file_batches_cancellable(&paths, "search_read", Some(cancel))?;
-            for result in results {
-                if let (Some(path), Some(data)) = (result["path"].as_str(), result["data"].as_str())
-                {
-                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
-                        remote_bytes.insert(path.to_owned(), bytes);
-                    }
-                }
-            }
+    'files: for file in files {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(SearchResult {
+                matches: Vec::new(),
+                truncated: false,
+            });
         }
-        for file in batch {
-            if cancel.load(Ordering::Acquire) {
-                return Ok(SearchResult {
-                    matches: Vec::new(),
-                    truncated: false,
-                });
-            }
-            let bytes = if remote {
-                let Some(bytes) = remote_bytes.remove(&file.path) else {
-                    continue;
-                };
-                bytes
-            } else {
-                let path = PathBuf::from(&file.path);
-                let Ok(meta) = std::fs::metadata(&path) else {
-                    continue;
-                };
-                if !meta.is_file() || meta.len() > MAX_FILE_BYTES.min(MAX_TEXT_FILE_BYTES) {
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
-                bytes
-            };
-            if bytes.contains(&0) {
-                continue;
-            }
-            let Ok(content) = String::from_utf8(bytes) else {
-                continue;
-            };
+        if !matches_pathspec(&file.relative, &include, &exclude) {
+            continue;
+        }
+        let path = PathBuf::from(&file.path);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > MAX_FILE_BYTES.min(MAX_TEXT_FILE_BYTES) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+        let Ok(content) = String::from_utf8(bytes) else {
+            continue;
+        };
 
-            for (index, line) in content.lines().enumerate() {
-                if let Some(column) = find_on_line(line, &needle, options) {
-                    matches.push(SearchMatch {
-                        path: file.path.clone(),
-                        relative: file.relative.clone(),
-                        line: (index + 1) as u32,
-                        column,
-                        preview: line.to_string(),
-                    });
-                    if matches.len() >= MAX_MATCHES {
-                        truncated = true;
-                        break 'files;
-                    }
+        for (index, line) in content.lines().enumerate() {
+            if let Some(column) = find_on_line(line, &needle, options) {
+                matches.push(SearchMatch {
+                    path: file.path.clone(),
+                    relative: file.relative.clone(),
+                    line: (index + 1) as u32,
+                    column,
+                    preview: line.to_string(),
+                });
+                if matches.len() >= MAX_MATCHES {
+                    truncated = true;
+                    break 'files;
                 }
             }
         }
     }
+
     Ok(SearchResult { matches, truncated })
 }
 

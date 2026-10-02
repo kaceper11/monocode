@@ -787,16 +787,6 @@ it("resolveModel never falls back to another harness's model", () => {
   expect(claude.harness).toBe("claude");
 });
 
-it("keeps Windows-discovered model catalogs out of WSL pickers", () => {
-  const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
-  const builtin = modelsFor("claude", cwd);
-  setHarnessModels("claude", [{ ...opus, id: "claude:windows-only", name: "Windows account model" }]);
-  expect(modelsFor("claude").some((model) => model.id === "claude:windows-only")).toBe(true);
-  expect(modelsFor("claude", cwd)).toEqual(builtin);
-  expect(preferredModelId("claude", cwd)).not.toBe("claude:windows-only");
-  resetHarnessModelOverlays();
-});
-
 it.each(["codex", "devin", "copilot", "muse"] as const)("keeps %s Default semantics after a live catalog replaces placeholders", async (harness) => {
   const { nativeModelId, resetHarnessModelOverlays, setHarnessModels } = await import("./models");
   resetHarnessModelOverlays();

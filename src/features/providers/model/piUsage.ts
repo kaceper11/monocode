@@ -29,12 +29,11 @@ export function piBillingProvider(
 
 export async function fetchPiUsage(
   provider: PiUsageProvider,
-  cwd?: string,
 ): Promise<ProviderRateLimits> {
   const billingProvider = piBillingProvider(provider);
   try {
     const result = asRecord(
-      await invoke<unknown>("fetch_pi_usage", { provider, ...(cwd ? { cwd } : {}) }),
+      await invoke<unknown>("fetch_pi_usage", { provider }),
     );
     if (
       result?.status === "unavailable" &&

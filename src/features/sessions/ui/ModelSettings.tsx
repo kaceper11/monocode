@@ -37,7 +37,7 @@ export function ModelSettings({
   const catalog = useSyncCatalog();
   const settings = useMemo(() => {
     void catalog;
-    const list = (resolveModel(harness, model, cwd).settings ?? []).filter(
+    const list = (resolveModel(harness, model).settings ?? []).filter(
       (setting) => !(harness === "opencode" && setting.id === "agent"),
     );
     const order = [

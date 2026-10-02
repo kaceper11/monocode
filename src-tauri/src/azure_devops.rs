@@ -2118,7 +2118,7 @@ pub(crate) fn encode_segment(value: &str) -> String {
 
 /// The worktree's configured remotes as `(remote.<name>.url, url)` pairs.
 /// `--local` keeps global gitconfig remotes out of non-repo directories, and
-/// `git_command_output` routes through WSL when the worktree lives there.
+/// `git_command_output` runs on the host where the worktree lives.
 pub(crate) fn remote_urls(root: &Path) -> Result<Vec<(String, String)>, String> {
     let output = crate::fs::git_command_output(
         root,

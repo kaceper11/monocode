@@ -1,6 +1,6 @@
 import { invoke as invokeLocal } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { pathKey, slash, wslLocation } from "../../shared/lib/paths";
+import { pathKey, slash } from "../../shared/lib/paths";
 import { REMOTE_PATH_PREFIX } from "../../shared/lib/remotePaths";
 import type { InterjectionMeta } from "../../features/sessions/model/session";
 
@@ -59,11 +59,9 @@ export type OmpInterjectionAnchor = InterjectionMeta & {
 
 export function ompSessionInterjections(
   providerSessionId: string,
-  cwd?: string,
 ): Promise<OmpInterjectionAnchor[]> {
   return invoke<OmpInterjectionAnchor[]>("omp_session_interjections", {
     providerSessionId,
-    cwd,
   });
 }
 
@@ -75,21 +73,19 @@ export interface OmpAssistantText {
   concat: string;
 }
 
-export function ompActiveAssistantTexts(providerSessionId: string, cwd?: string): Promise<OmpAssistantText[]> {
-  return invoke<OmpAssistantText[]>("omp_active_assistant_texts", { providerSessionId, cwd });
+export function ompActiveAssistantTexts(providerSessionId: string): Promise<OmpAssistantText[]> {
+  return invoke<OmpAssistantText[]>("omp_active_assistant_texts", { providerSessionId });
 }
 
 export function claudeShellCommands(
   providerSessionId: string,
   providerAccountId: string | undefined,
   toolIds: string[],
-  cwd?: string,
 ): Promise<Record<string, string>> {
   return invoke<Record<string, string>>("claude_shell_commands", {
     providerSessionId,
     providerAccountId,
     toolIds,
-    ...(cwd ? { cwd } : {}),
   });
 }
 
@@ -120,8 +116,8 @@ export type ExternalEditor = {
   name: string;
 };
 
-export function listExternalEditors(cwd?: string): Promise<ExternalEditor[]> {
-  return invoke<ExternalEditor[]>("list_external_editors", { cwd });
+export function listExternalEditors(): Promise<ExternalEditor[]> {
+  return invoke<ExternalEditor[]>("list_external_editors");
 }
 
 export function openInExternalEditor(
@@ -619,10 +615,8 @@ export function openPathWithDefaultApp(path: string): Promise<void> {
   return invoke<void>("open_path_with_default_app", { path });
 }
 
-export function homeDir(cwd?: string): Promise<string> {
-  return cwd && wslLocation(cwd)
-    ? invoke<string>("home_dir", { cwd })
-    : invoke<string>("home_dir");
+export function homeDir(): Promise<string> {
+  return invoke<string>("home_dir");
 }
 
 /**

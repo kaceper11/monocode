@@ -9,7 +9,6 @@ import {
   startHarnessTiming, markHarnessTiming, finishHarnessTiming, measureHarnessTiming,
   queueHarnessTimingCommit, commitHarnessTiming, type HarnessTiming,
 } from "../integrations/harness/core/timing";
-import { useWslStatus } from "../features/sessions/model/wslStatus";
 import { SavedCommandsControl } from "../features/sessions/ui/SavedCommandsControl";
 import { prepareSavedCommandLaunch, type SavedCommandLaunch } from "../features/sessions/model/savedCommandLaunch";
 import { pruneQueuedSavedCommands } from "../features/sessions/model/savedCommandRun";
@@ -19,10 +18,7 @@ import { newBrowserTab, openBrowserTab, closeBrowserTabs, updateBrowserTab, type
 import { OPEN_BROWSER_EVENT, requestBrowserCommand, isBrowserOpenRequest, normalizeBrowserUrl, rememberedBrowserUrl, browserTabLabel } from "../features/sessions/model/browser";
 import { BROWSER_CONTEXT_ADDED } from "../features/sessions/model/browserContext";
 import { inboxProvider, inboxSessionDescription } from "../features/sessions/model/inboxProvider";
-import { useWslProjects } from "../shared/hooks/useWslProjects";
-import { WslProjectDialog, WslConnectionStatus } from "../features/sessions/ui/WslProjectDialog";
-import { modelCatalogKey, nativeIdFrom } from "../features/sessions/model/models";
-import { wslLocation } from "../shared/lib/paths";
+import { nativeIdFrom } from "../features/sessions/model/models";
 import { acceptQuickLaunch } from "./model/quickLaunchSession";
 import { useWorkspaceNavigation } from "./hooks/useWorkspaceNavigation";
 import { useIdleSessionDetach } from "./hooks/useIdleSessionDetach";
@@ -162,6 +158,7 @@ import { displayAttachments } from "../features/sessions/model/attachments";
 import {
   basename,
   notifyGitChanged,
+  pickFolders,
   type GitFileDiffKind,
   type GitHistoryCommit,
   gitBranches,
@@ -551,8 +548,6 @@ import {
 } from "../features/notes";
 import {
   claimDueAutomations,
-  automationWorkCwd,
-  connectAutomationWorkspace,
   listAutomations,
   recoverAutomationRuns,
   updateAutomationRun,
@@ -1561,40 +1556,14 @@ function Workspace({
     void probeHarnessAvailability();
     // Only the harnesses already in this window. Probing every installed CLI
     // at boot left unused agents (especially Pi) running in the background.
-    // Each WSL session probes inside its own distribution; a WSL session must
-    // not spawn the provider on the Windows host to learn its models.
-    const contexts = new Map<
-      string,
-      { cwd?: string; harnesses: Set<HarnessId> }
-    >();
-    for (const session of sessionsRef.current) {
-      const cwd = sessionWorkCwd(session);
-      const key = modelCatalogKey(cwd);
-      const context = contexts.get(key) ?? {
-        cwd: wslLocation(cwd) ? cwd : undefined,
-        harnesses: new Set<HarnessId>(),
-      };
-      context.harnesses.add(session.harness);
-      contexts.set(key, context);
-    }
-    for (const context of contexts.values()) {
-      if (!context.cwd) continue;
-      void refreshHarnessCatalogs([...context.harnesses], context.cwd);
-    }
-    const harnesses = [...(contexts.get("native")?.harnesses ?? [])];
+    const harnesses = [
+      ...new Set(sessionsRef.current.map((session) => session.harness)),
+    ];
     void refreshHarnessCatalogs(harnesses).then(() => {
       setSessions((prev) =>
         prev.map((session) => {
-          if (
-            !isLiveHarness(session.harness) ||
-            wslLocation(sessionWorkCwd(session))
-          )
-            return session;
-          const resolved = resolveModel(
-            session.harness,
-            session.model,
-            sessionWorkCwd(session),
-          );
+          if (!isLiveHarness(session.harness)) return session;
+          const resolved = resolveModel(session.harness, session.model);
           const modelSettings = mergeModelSettings(
             resolved,
             session.modelSettings,
@@ -1839,12 +1808,10 @@ function Workspace({
    * dedupes via hasLiveCatalog and its inflight map. */
   const activeHarness = active?.harness;
   const activeModelCwd = active ? sessionWorkCwd(active) : undefined;
-  const activeWslStatus = useWslStatus(wslLocation(activeModelCwd ?? "")?.distribution);
   useEffect(() => {
     if (!activeHarness || !isLiveHarness(activeHarness)) return;
-    void probeHarnessAvailability({ cwd: activeModelCwd });
-    void refreshHarnessCatalogs([activeHarness], activeModelCwd);
-  }, [activeHarness, activeModelCwd, activeWslStatus]);
+    void refreshHarnessCatalogs([activeHarness]);
+  }, [activeHarness]);
 
   const usageProviders = useMemo(() => {
     if (
@@ -5761,16 +5728,6 @@ function Workspace({
     [activateTab, insertBeside, onCwdChange, readProjectReturnMemory],
   );
 
-  const selectProjects = openProjects;
-  const {
-    onSelectProject: selectWslProject,
-    pickProject,
-    wslPickerOpen,
-    closePicker,
-    wslOpening,
-    dismissOpening,
-    retryOpening,
-  } = useWslProjects(activeModelCwd ?? projectCwd, selectProjects, active?.id);
   const onSelectProject = useCallback(
     (path: string) => {
       workspaceNavigation.cancel();
@@ -5783,6 +5740,12 @@ function Workspace({
       workspaceNavigation.selectProject,
     ],
   );
+
+  const pickProject = useCallback(async () => {
+    // Several folders can be taken at once; each opens as its own project, and
+    // the last one selected ends up focused.
+    openProjects(await pickFolders());
+  }, [openProjects]);
 
   const onPlaceSessionInFolder = useCallback(
     (sessionId: string, target: SessionFolderTarget) => {
@@ -6267,7 +6230,7 @@ function Workspace({
       const current = sessionsRef.current.find((s) => s.id === sessionId);
       if (!current) return;
       if (isPreparingHandoff(current)) return;
-      const resolved = resolveModel(harness, model, sessionWorkCwd(current));
+      const resolved = resolveModel(harness, model);
       saveRecentModelChoice(resolved.harness, resolved.id);
       if (current.modelSettings) {
         saveLastModelSettings(current.modelSettings, "fill");
@@ -7138,7 +7101,7 @@ function Workspace({
         }
         if (turnGen.current.get(sessionId) !== gen) return;
         if (proposalDraft && proposalId) {
-          const settings = await discoverOrchestrationSettings(workCwd);
+          const settings = await discoverOrchestrationSettings();
           if (turnGen.current.get(sessionId) !== gen) return;
           proposalDraft = { ...proposalDraft, settings };
           const discovering = proposalDraft;
@@ -7616,8 +7579,6 @@ function Workspace({
       };
       try {
         const eventRun = run.trigger === "event";
-        // Background runs cannot depend on the visible session opening WSL.
-        await connectAutomationWorkspace(automationWorkCwd(automation));
         const linkedWorkItem =
           sourceWorkItem ?? linkedWorkItemFromAutomationEvent(run);
         let session =
@@ -7649,12 +7610,7 @@ function Workspace({
               automation.runtimeMode,
               automation.modelSettings,
             ),
-            // Saved selections belong to the execution target, which may be
-            // an existing worktree with a different (or not yet loaded) catalog.
-            ...(wslLocation(automationWorkCwd(automation)) ? {
-              model: automation.model,
-              modelSettings: automation.modelSettings ?? {},
-            } : {}),
+
             title: eventRun
               ? HARNESS_LABEL[automation.harness]
               : formatSessionTitle(automation.harness, automation.name),
@@ -9221,10 +9177,10 @@ function Workspace({
     orchestrator.bind({
       session: (id) => sessionsRef.current.find((session) => session.id === id),
       sessions: () => sessionsRef.current,
-      choices: (cwd) =>
-        HARNESSES.filter((id) => isHarnessAvailable(id, cwd)).map((harness) => ({
+      choices: () =>
+        HARNESSES.filter((id) => isHarnessAvailable(id)).map((harness) => ({
           harness,
-          models: modelsFor(harness, cwd).map(({ id, name }) => ({ id, name })),
+          models: modelsFor(harness).map(({ id, name }) => ({ id, name })),
         })),
       createWorker: async (run, task) => {
         const projectCwd = orchestrationProjectCwd(run);
@@ -9319,7 +9275,7 @@ function Workspace({
           ...(task.modelSettings
             ? {
                 modelSettings: mergeModelSettings(
-                  resolveModel(task.harness, task.model, checkoutCwd),
+                  resolveModel(task.harness, task.model),
                   task.modelSettings,
                 ),
               }
@@ -11543,9 +11499,7 @@ function Workspace({
               onDismissUpdate={() => setUpdateNotice(null)}
             />
 
-            {wslPickerOpen && <WslProjectDialog cwd={projectCwd} onOpen={selectProjects} onClose={closePicker} />}
             <div className="body-glass flex min-h-0 min-w-0 flex-1 flex-col">
-              {wslOpening && <WslConnectionStatus opening={wslOpening} onRetry={retryOpening} onDismiss={dismissOpening} />}
               <div
                 className={
                   searchViewOpen ||
@@ -11922,7 +11876,7 @@ function Workspace({
               automationsViewOpen ||
               settingsOpen ? null : (
                 <UsageFooter
-                  key={JSON.stringify([activeModelCwd, activeWslStatus.state, usageSession?.providerAccountId, active?.harness, active?.id])}
+                  key={JSON.stringify([activeModelCwd, usageSession?.providerAccountId, active?.harness, active?.id])}
                   providers={usageProviders}
                   session={usageSession}
                   project={active?.cwd ?? projectCwd}
@@ -11979,8 +11933,6 @@ function Workspace({
             />
           )}
           <HarnessUpdateNotice
-            key={wslLocation(projectCwd ?? "")?.distribution.toLowerCase() ?? "native"}
-            cwd={projectCwd ?? undefined}
             topOffset={
               12 + (reminderNoticesHeight ? reminderNoticesHeight + 8 : 0)
             }

@@ -994,10 +994,9 @@ describe("Devin upstream compatibility", () => {
     await stopDevinSession("late-asks");
   });
 
-  it("retains cwd-qualified WSL discovery and spawn and advertises no steering", async () => {
-    const cwd = "//wsl.localhost/Ubuntu/home/me/repo space";
+  it("spawns in the session cwd and advertises no steering", async () => {
+    const cwd = "/home/me/repo space";
     const { turn } = await startConfigTurn({ ...baseInput([], "hello", "wsl-config"), cwd });
-    expect(resolveDevinBinary).toHaveBeenCalledWith(cwd);
     expect(spawnChild).toHaveBeenCalledWith("wsl-config", "/fake/devin", ["acp"], cwd, undefined, "devin");
     expect(lastByMethod("session/new").params.cwd).toBe(cwd);
     expect(devinAdapter.canSteer).toBe(false);

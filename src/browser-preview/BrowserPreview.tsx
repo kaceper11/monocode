@@ -15,7 +15,7 @@ export function BrowserPreview() {
   const [address, setAddress] = useState("");
   const [hasPage, setHasPage] = useState(false);
   const [message, setMessage] = useState(
-    "Open a development URL. Preview runs on this computer; WSL networking must be available separately.",
+    "Open a development URL. Preview runs on this computer.",
   );
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);

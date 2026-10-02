@@ -88,29 +88,6 @@ it("rejects duplicate membership, stolen checkouts, stale branches, and disappea
   );
 });
 
-it("does not merge native and WSL checkout identities or distinct WSL distributions", () => {
-  const id = task([
-    checkout({
-      projectPath: "//wsl.localhost/Ubuntu/web",
-      worktreePath: "//wsl.localhost/Ubuntu/web-task",
-    }),
-  ]);
-  attachTaskSession("native", checkout(), id);
-  attachTaskSession(
-    "debian",
-    checkout({
-      id: "debian",
-      projectPath: "//wsl.localhost/Debian/web",
-      worktreePath: "//wsl.localhost/Debian/web-task",
-    }),
-    id,
-  );
-  expect(loadBoard().tasks[0].workstreams).toHaveLength(3);
-  expect(() =>
-    taskSessionPrompt("hello", "native", "//wsl.localhost/Ubuntu/web-task"),
-  ).toThrow("worktree changed");
-});
-
 it("reads current task data on every dispatch, isolates other tasks, and stops enriching after detach", () => {
   const id = task([
     checkout({ sessionIds: ["s"] }),
@@ -249,32 +226,6 @@ it("persists a task-level conversation across working copies without inventing l
   detachTaskSession("lead");
   expect(loadBoard().tasks[0].primarySessionId).toBeUndefined();
   expect(loadBoard().tasks[0].workstreams[0].worktreePath).toBe("/moved");
-});
-
-it("provides Linux paths only for working copies on the primary session's WSL host", () => {
-  addTask({
-    title: "WSL task",
-    links: [],
-    primarySessionId: "lead",
-    workstreams: [
-      checkout({ worktreePath: "//wsl.localhost/Ubuntu/web-task" }),
-      checkout({ id: "api", worktreePath: "//wsl.localhost/Ubuntu/api-task" }),
-      checkout({
-        id: "other",
-        worktreePath: "//wsl.localhost/Debian/other-task",
-      }),
-      checkout({ id: "native", worktreePath: "C:/native-task" }),
-    ],
-  });
-  const prompt = taskSessionPrompt(
-    "Work",
-    "lead",
-    "//wsl.localhost/Ubuntu/web-task",
-  );
-  expect(prompt).toContain('"executionCwd":"/api-task"');
-  expect(prompt).not.toContain('"executionCwd":"/other-task"');
-  expect(prompt).not.toContain('"executionCwd":"C:/native-task"');
-  expect(prompt).toContain("different execution host; not accessible");
 });
 
 it("treats remote:// machines by id and emits guest paths, never URIs", () => {

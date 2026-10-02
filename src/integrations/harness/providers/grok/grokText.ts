@@ -158,7 +158,7 @@ async function startLive(
   modelSettings?: Record<string, string>,
 ): Promise<LiveText> {
   await dropLive();
-  const { path } = await resolveGrokBinary(cwd);
+  const { path } = await resolveGrokBinary();
   const acpRef: { session: LiveText | null } = { session: null };
   const acp = new AcpClient(TEXT_CHILD_ID, {
     onNotification: (method, params) => {

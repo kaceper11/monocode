@@ -26,7 +26,7 @@ export function ProviderSignInDialog({ harness, cwd, accountId, onClose }: Props
   const signIn = useCallback(() => {
     setState("running");
     setError(null);
-    void loginHarness(harness, accountId, cwd).then(
+    void loginHarness(harness, accountId).then(
       () => setState("complete"),
       (reason: unknown) => {
         setState("error");

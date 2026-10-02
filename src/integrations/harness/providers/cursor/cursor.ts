@@ -265,7 +265,7 @@ async function ensureLive(input: SendTurnInput): Promise<Live> {
     resumeByThread.delete(input.sessionId);
   }
 
-  const { path } = await resolveCursorBinary(input.cwd);
+  const { path } = await resolveCursorBinary();
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(input.sessionId, handlers);
   const liveRef: { current: Live | null } = { current: null };
@@ -403,7 +403,7 @@ async function applyModelSelection(
   live: Live,
   input: SendTurnInput,
 ): Promise<void> {
-  const base = nativeModelId(input.model, input.cwd).trim();
+  const base = nativeModelId(input.model).trim();
   const settings = input.modelSettings ?? {};
 
   if (base) {

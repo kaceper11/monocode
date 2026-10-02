@@ -12,13 +12,13 @@ import { buildPiSpawnArgs, modelsFromRpcData } from "./piProtocol";
 
 const DISCOVERY_TIMEOUT_MS = 45_000;
 
-function refreshCatalog(flavor: PiFlavor, cwd?: string): Promise<void> {
-  return refreshModelCatalog(flavor.id, cwd, (projectCwd) => discoverModels(flavor, projectCwd));
+function refreshCatalog(flavor: PiFlavor): Promise<void> {
+  return refreshModelCatalog(flavor.id, () => discoverModels(flavor));
 }
 
-async function discoverModels(flavor: PiFlavor, projectCwd?: string) {
-  const { path } = await flavor.resolveBinary(projectCwd);
-  const cwd = projectCwd ?? (await homeDir());
+async function discoverModels(flavor: PiFlavor, workingDirectory?: string) {
+  const { path } = await flavor.resolveBinary();
+  const cwd = workingDirectory ?? (await homeDir());
   const probeId = `${flavor.probeChildId}-${crypto.randomUUID()}`;
   const rpc = new PiRpc(probeId, () => undefined, flavor.label);
 
@@ -60,12 +60,12 @@ async function discoverModels(flavor: PiFlavor, projectCwd?: string) {
   }
 }
 
-export function refreshPiCatalog(cwd?: string): Promise<void> {
-  return refreshCatalog(PI_FLAVOR, cwd);
+export function refreshPiCatalog(): Promise<void> {
+  return refreshCatalog(PI_FLAVOR);
 }
 
-export function refreshOmpCatalog(cwd?: string): Promise<void> {
-  return refreshCatalog(OMP_FLAVOR, cwd);
+export function refreshOmpCatalog(): Promise<void> {
+  return refreshCatalog(OMP_FLAVOR);
 }
 
 export function discoverPiModels(workingDirectory: string) {

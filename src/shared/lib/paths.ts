@@ -5,45 +5,8 @@ function windowsPath(path: string): boolean {
 }
 
 export function slash(path: string): string {
-  const normalized =
-    windowsPath(path) || (IS_WIN && !path.startsWith("/"))
-      ? path.replace(/\\/g, "/")
-      : path;
-  return normalized
-    .replace(/^\/\/\?\/UNC\//i, "//")
-    .replace(/^\/\/(?:wsl\$|wsl\.localhost)\//i, "//wsl.localhost/");
-}
-
-export function wslLocation(
-  path: string,
-): { distribution: string; path: string } | undefined {
-  const match = /^\/\/wsl\.localhost\/([^/]+)(\/.*)?$/i.exec(slash(path));
-  return match ? { distribution: match[1], path: match[2] || "/" } : undefined;
-}
-
-/** Build an explicit Linux identity; never reinterpret a Windows path as Linux. */
-export function wslPath(distribution: string, path: string): string {
-  if (
-    !distribution ||
-    distribution.length > 128 ||
-    /^-/.test(distribution) ||
-    /[/\\:\x00-\x1f\x7f]/.test(distribution)
-  )
-    throw new Error("Choose a named WSL distribution");
-  if (
-    !path.startsWith("/") ||
-    path.startsWith("//") ||
-    path.length > 4096 ||
-    /[\\\x00-\x1f\x7f]/.test(path) ||
-    path.split("/").includes("..")
-  )
-    throw new Error(
-      "Choose an absolute Linux path without parent traversal or backslashes",
-    );
-  return `//wsl.localhost/${distribution}/${path
-    .split("/")
-    .filter((part) => part && part !== ".")
-    .join("/")}`;
+  return windowsPath(path) || (IS_WIN && !path.startsWith("/"))
+    ? path.replace(/\\/g, "/") : path;
 }
 
 function trimSlash(path: string): string {
@@ -53,9 +16,6 @@ function trimSlash(path: string): string {
 /** Stable comparison key for Windows paths without changing their display case. */
 export function pathKey(path: string): string {
   const normalized = trimSlash(path);
-  const wsl = wslLocation(normalized);
-  if (wsl)
-    return `//wsl.localhost/${wsl.distribution.toLowerCase()}${wsl.path === "/" ? "" : wsl.path}`;
   return /^[A-Za-z]:(?:\/|$)/.test(normalized) || normalized.startsWith("//")
     ? normalized.toLowerCase()
     : normalized;
@@ -63,8 +23,6 @@ export function pathKey(path: string): string {
 
 export function prettyCwd(cwd: string): string {
   const trimmed = trimSlash(cwd);
-  const wsl = wslLocation(trimmed);
-  if (wsl) return `WSL · ${wsl.distribution} · ${wsl.path}`;
   if (trimmed === "~") return "~";
 
   const parts = trimmed.split("/").filter(Boolean);
@@ -231,8 +189,6 @@ function parseWorkspaceFileReference(
     }
   }
 
-  if (cwd && wslLocation(cwd) && value.includes("\\") && !windowsPath(value))
-    return undefined;
   value = slash(value);
   const remoteRoot = cwd ? /^remote:\/\/[^/]+\//.exec(cwd)?.[0] : undefined;
   if (remoteRoot && value.startsWith(remoteRoot))
@@ -268,14 +224,6 @@ function parseWorkspaceFileReference(
   if (remoteRoot && value.startsWith("//"))
     return { path: `${remoteRoot}${value.slice(1)}`, navigation };
   if (value.startsWith("/")) {
-    const wsl = cwd ? wslLocation(cwd) : undefined;
-    if (wsl && !value.startsWith("//") && !/^\/[A-Za-z]:\//.test(value)) {
-      try {
-        return { path: wslPath(wsl.distribution, value), navigation };
-      } catch {
-        return undefined;
-      }
-    }
     return {
       path: remoteRoot
         ? `${remoteRoot}${value.replace(/^\/+/, "")}`

@@ -1,11 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { pickFolder } from "../../../platform/tauri/fs";
-import { IS_WIN } from "../../../platform/tauri/platform";
-import {
-  wslDistributions,
-  wslDistributionsPeek,
-} from "../../sessions/model/wsl";
-import { WslProjectDialog } from "../../sessions/ui/WslProjectDialog";
 import { Modal } from "../../../shared/ui/Modal";
 import { Folder, FolderOpen, Plus, X } from "../../../shared/ui/icons";
 import { Checkbox } from "../../../shared/ui/Checkbox";
@@ -29,7 +23,6 @@ export function SavedProjectDialog({
   const [members, setMembers] = useState(project?.members ?? []);
   const [presets, setPresets] = useState(project?.presets ?? []);
   const [error, setError] = useState("");
-  const [pickerOpen, setPickerOpen] = useState(false);
   const [picking, setPicking] = useState(false);
   const mounted = useRef(true);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -68,16 +61,6 @@ export function SavedProjectDialog({
     setPicking(true);
     setError("");
     try {
-      if (IS_WIN) {
-        const distributions = await wslDistributions().catch(
-          () => wslDistributionsPeek() ?? [],
-        );
-        if (!mounted.current) return;
-        if (distributions.length) {
-          setPickerOpen(true);
-          return;
-        }
-      }
       const paths = await pickFolder();
       if (mounted.current) for (const path of paths ?? []) add(path);
     } catch (reason) {
@@ -87,7 +70,6 @@ export function SavedProjectDialog({
     }
   };
   return (
-    <>
       <Modal
         title={project ? "Edit project" : "New project"}
         description="Group repositories for your tasks and save sets you use together."
@@ -103,7 +85,6 @@ export function SavedProjectDialog({
               disabled={
                 !name.trim() ||
                 picking ||
-                pickerOpen ||
                 !members.length ||
                 presets.some((preset) => !preset.name.trim())
               }
@@ -314,17 +295,5 @@ export function SavedProjectDialog({
           )}
         </div>
       </Modal>
-      {pickerOpen && (
-        <WslProjectDialog
-          cwd={members[0] ?? recents[0]?.path ?? "~"}
-          title="Add repositories"
-          confirmLabel="Add"
-          onOpen={(paths) => {
-            for (const path of paths) add(path);
-          }}
-          onClose={() => setPickerOpen(false)}
-        />
-      )}
-    </>
   );
 }

@@ -48,23 +48,19 @@ beforeEach(() => {
   wire.failSession = false;
 });
 
-it("uses CLI discovery first with the selected guest cwd", async () => {
-  const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
+it("uses CLI discovery first", async () => {
   wire.cli = JSON.stringify({ families: [{ slug: "swe-2", variants: [{ model_uid: "swe-2-high", label: "SWE 2 High" }] }] });
-  await refreshDevinCatalog(cwd);
-  expect(resolveDevinBinary).toHaveBeenCalledWith(cwd);
-  expect(execChild).toHaveBeenCalledWith("/fake/devin", ["models", "list", "--format", "json"], cwd, "devin");
-  expect(modelsFor("devin", cwd).some((model) => model.nativeId === "swe-2-high")).toBe(true);
+  await refreshDevinCatalog();
+  expect(execChild).toHaveBeenCalledWith("/fake/devin", ["models", "list", "--format", "json"], "/home/me", "devin");
+  expect(modelsFor("devin").some((model) => model.nativeId === "swe-2-high")).toBe(true);
   expect(spawnChild).not.toHaveBeenCalled();
 });
 
-it("uses the same compatible ACP handshake for native and isolated WSL probes", async () => {
-  const guests = ["//wsl.localhost/Ubuntu/home/me/repo", "//wsl.localhost/Debian/home/me/repo"];
-  await Promise.all([refreshDevinCatalog(), ...guests.map((cwd) => refreshDevinCatalog(cwd))]);
+it("probes models with the compatible ACP handshake", async () => {
+  await refreshDevinCatalog();
   const starts = vi.mocked(spawnChild).mock.calls;
-  expect(starts).toHaveLength(3);
-  expect(new Set(starts.map(([id]) => id)).size).toBe(3);
-  expect(starts.map((args) => args[3]).sort()).toEqual(["/home/me", ...guests].sort());
+  expect(starts).toHaveLength(1);
+  expect(starts.map((args) => args[3]).sort()).toEqual(["/home/me"]);
   for (const [id, path, args, cwd, , provider] of starts) {
     expect([path, args, provider]).toEqual(["/fake/devin", ["acp"], "devin"]);
     const requests = wire.sent.filter((message) => message.child === id);
@@ -78,19 +74,18 @@ it("uses the same compatible ACP handshake for native and isolated WSL probes", 
     expect(unwatchChild).toHaveBeenCalledWith(id);
     expect(killChild).toHaveBeenCalledWith(id);
   }
-  for (const cwd of [undefined, ...guests]) expect(modelsFor("devin", cwd).some((model) => model.nativeId === "swe-2")).toBe(true);
+  expect(modelsFor("devin").some((model) => model.nativeId === "swe-2")).toBe(true);
 });
 
-it("coalesces a scope's probes and cleans up failures without replacing a catalog", async () => {
-  const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
-  const first = refreshDevinCatalog(cwd);
-  expect(refreshDevinCatalog(cwd)).toBe(first);
+it("coalesces probes and cleans up failures without replacing a catalog", async () => {
+  const first = refreshDevinCatalog();
+  expect(refreshDevinCatalog()).toBe(first);
   await first;
-  const before = modelsFor("devin", cwd);
+  const before = modelsFor("devin");
   wire.failSession = true;
-  await refreshDevinCatalog(cwd);
-  expect(modelsFor("devin", cwd)).toEqual(before);
-  expect(modelCatalogError("devin", cwd)).toMatch(/probe failed/);
+  await refreshDevinCatalog();
+  expect(modelsFor("devin")).toEqual(before);
+  expect(modelCatalogError("devin")).toMatch(/probe failed/);
   expect(wire.listeners.size).toBe(0);
   expect(killChild).toHaveBeenCalledTimes(2);
 });

@@ -17,8 +17,8 @@ import {
 const DISCOVERY_TIMEOUT_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 12_000;
 
-export function refreshCopilotCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("copilot", cwd, discoverCopilotModels);
+export function refreshCopilotCatalog(): Promise<void> {
+  return refreshModelCatalog("copilot", discoverCopilotModels);
 }
 
 /**
@@ -27,7 +27,7 @@ export function refreshCopilotCatalog(cwd?: string): Promise<void> {
  * falling back to the `model` config option).
  */
 async function discoverCopilotModels(projectCwd?: string) {
-  const { path } = await resolveCopilotBinary(projectCwd);
+  const { path } = await resolveCopilotBinary();
   const cwd = projectCwd ?? (await homeDir());
   const PROBE_ID = `monocode-copilot-probe-${crypto.randomUUID()}`;
   const acp = new AcpClient(PROBE_ID, {

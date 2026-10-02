@@ -27,8 +27,6 @@ import {
   museCheckInitialize,
 } from "../../../integrations/harness/providers/muse/museProtocol";
 import { readLiveMuseUsage } from "../../../integrations/harness/providers/muse/muse";
-import { wslLocation } from "../../../shared/lib/paths";
-
 const DISCOVERY_TIMEOUT_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 12_000;
 
@@ -43,12 +41,10 @@ type OpencodeGoUsageFetch = {
  * Fetch OpenCode Go 5h / weekly / monthly usage via the official API.
  * Runs through a Tauri command so the webview CORS policy does not apply.
  */
-export async function fetchOpencodeGoRateLimits(
-  cwd?: string,
-): Promise<ProviderRateLimits> {
+export async function fetchOpencodeGoRateLimits(): Promise<ProviderRateLimits> {
   let result: OpencodeGoUsageFetch;
   try {
-    result = await invoke<OpencodeGoUsageFetch>("fetch_opencode_go_usage", { cwd });
+    result = await invoke<OpencodeGoUsageFetch>("fetch_opencode_go_usage");
   } catch (error) {
     return errorRateLimits(
       "opencode",
@@ -93,12 +89,10 @@ type ClaudeUsageFetch = {
 
 export async function fetchClaudeRateLimits(
   accountId = "default",
-  projectCwd?: string,
 ): Promise<ProviderRateLimits> {
   try {
     const result = await invoke<ClaudeUsageFetch>("fetch_claude_usage", {
       accountId,
-      cwd: projectCwd,
     });
     if (result.status === "ok" && result.body) {
       const parsed = parseClaudeOAuthUsage(result.body);
@@ -128,21 +122,15 @@ export async function fetchClaudeRateLimits(
 
 export async function fetchCodexRateLimits(
   accountId = "default",
-  projectCwd?: string,
 ): Promise<ProviderRateLimits> {
   let path: string;
   try {
-    path = (await resolveCodexBinary(projectCwd)).path;
-  } catch (error) {
-    if (projectCwd && wslLocation(projectCwd))
-      return errorRateLimits(
-        "codex",
-        error instanceof Error ? error.message : String(error),
-      );
+    path = (await resolveCodexBinary()).path;
+  } catch {
     return unavailableRateLimits("codex", "Codex CLI not found");
   }
 
-  const cwd = projectCwd ?? (await homeDir());
+  const cwd = await homeDir();
   try {
     const result = await requestCodexAccount<unknown>(
       path,
@@ -179,10 +167,9 @@ export async function fetchCodexRateLimits(
 export async function consumeCodexRateLimitResetCredit(
   creditId?: string,
   accountId = "default",
-  projectCwd?: string,
 ): Promise<CodexRateLimitResetOutcome> {
-  const path = (await resolveCodexBinary(projectCwd)).path;
-  const cwd = projectCwd ?? (await homeDir());
+  const path = (await resolveCodexBinary()).path;
+  const cwd = await homeDir();
   const result = await requestCodexAccount<unknown>(
     path,
     cwd,
@@ -325,7 +312,7 @@ export async function fetchAdditionalRateLimits(
     if (provider === "muse") {
       const live = readLiveMuseUsage(sessionId, cwd);
       if (live) return parseMuseUsage(await live);
-      const { path } = await resolveMuseBinary(cwd);
+      const { path } = await resolveMuseBinary();
       return parseMuseUsage(
         await usageRpc(
           provider,
@@ -346,7 +333,7 @@ export async function fetchAdditionalRateLimits(
         ),
       );
     }
-    const { path } = await resolveCopilotBinary(cwd);
+    const { path } = await resolveCopilotBinary();
     return parseCopilotQuota(
       await usageRpc(
         provider,

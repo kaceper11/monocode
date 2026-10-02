@@ -68,7 +68,6 @@ import {
 
 import type { BrowserMetaPatch, BrowserTabSource } from "../model/browserWorkspace";
 import type { FilePaneTab } from "../../workspace/model/layout";
-import { wslLocation } from "../../../shared/lib/paths";
 
 type LoadStatus = "idle" | "opening" | "loading" | "ready" | "failed";
 
@@ -962,7 +961,6 @@ export function BrowserView({
     [capturing, label, showNotice, noticeError, changeRecording],
   );
 
-  const wsl = wslLocation(file.cwd);
   const showChrome = !!url;
   // The overflow menu is a native popup: a DOM menu would paint under the
   // native webview and force the overlay watcher to blank the page while
@@ -1069,14 +1067,6 @@ export function BrowserView({
               className="h-6 w-full rounded-md border border-content/10 bg-content/5 px-2 font-mono text-[11.5px] text-content outline-none focus:border-content/25"
             />
           </form>
-          {wsl ? (
-            <span
-              className="shrink-0 rounded-md bg-content/8 px-1.5 py-0.5 text-[10px] font-medium text-content/60"
-              title={`Repository: ${file.cwd}. Browser runs on the native host.`}
-            >
-              WSL · {wsl.distribution}
-            </span>
-          ) : null}
           <ToolbarButton
             title="Send page and screenshot to an agent"
             disabled={!opened || capturing}

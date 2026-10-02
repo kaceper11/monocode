@@ -99,26 +99,9 @@ pub async fn mcp_add(
     config: String,
 ) -> Result<(), String> {
     let (name, server) = server_from_json(&provider, &name, &config)?;
-    let guest = crate::wsl::location(&cwd)?;
-    if guest.is_some() && provider == "claude_desktop" {
-        return Err(
-            "Claude Desktop configuration belongs to the native host; choose a native project"
-                .into(),
-        );
-    }
-    let binary_path = if guest.is_some() {
-        None
-    } else {
-        host.runtime_binary_path(&provider)
-    };
+    let binary_path = host.runtime_binary_path(&provider);
     tauri::async_runtime::spawn_blocking(move || {
-        let home = if let Some(location) = &guest {
-            crate::wsl::config_path(location, None, "")?
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            dirs_home().ok_or("Home directory not found")?
-        };
+        let home = dirs_home().ok_or("Home directory not found")?;
         let project = expand_home(&cwd);
         if !project.is_dir() {
             return Err("Project directory does not exist".into());
@@ -141,11 +124,7 @@ pub async fn mcp_add(
                     return Err("Invalid OpenCode MCP scope".into());
                 }
                 let major = crate::harness::opencode_major_version(&cwd, binary_path.as_deref())?;
-                let override_path = if let Some(location) = &guest {
-                    crate::wsl::config_override(location, "OPENCODE_CONFIG")?
-                } else {
-                    std::env::var_os("OPENCODE_CONFIG").map(PathBuf::from)
-                };
+                let override_path = std::env::var_os("OPENCODE_CONFIG").map(PathBuf::from);
                 let path = opencode_config_path(
                     Path::new(&home),
                     &project,
@@ -454,49 +433,19 @@ pub struct McpConnection {
 
 #[tauri::command]
 pub async fn mcp_discover(cwd: String) -> Result<Vec<McpConnection>, String> {
-    let guest = crate::wsl::location(&cwd)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let home = if let Some(location) = &guest {
-            crate::wsl::config_path(location, None, "")?
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            dirs_home().ok_or("Home directory not found")?
-        };
+        let home = dirs_home().ok_or("Home directory not found")?;
         let project = expand_home(&cwd);
-        let codex_home = if let Some(location) = &guest {
-            Some(crate::wsl::config_path(
-                location,
-                Some("CODEX_HOME"),
-                ".codex",
-            )?)
-        } else {
-            std::env::var_os("CODEX_HOME").map(PathBuf::from)
-        };
-        let desktop_config = if guest.is_some() {
-            PathBuf::new()
-        } else {
-            claude_desktop_config(Path::new(&home))
-        };
-        let opencode_config = if let Some(location) = &guest {
-            crate::wsl::config_override(location, "OPENCODE_CONFIG")?
-        } else {
-            std::env::var_os("OPENCODE_CONFIG").map(PathBuf::from)
-        };
-        let claude_profile = guest
-            .as_ref()
-            .map(|location| {
-                crate::wsl::config_path(location, Some("CLAUDE_CONFIG_DIR"), "")
-                    .map(|directory| directory.join(".claude.json"))
-            })
-            .transpose()?;
+        let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+        let desktop_config = claude_desktop_config(Path::new(&home));
+        let opencode_config = std::env::var_os("OPENCODE_CONFIG").map(PathBuf::from);
         Ok(discover(
             Path::new(&home),
             &project,
             codex_home.as_deref(),
             &desktop_config,
             opencode_config.as_deref(),
-            claude_profile.as_deref(),
+            None,
         ))
     })
     .await
@@ -530,16 +479,7 @@ fn discover(
             &claude,
             config
                 .get("projects")
-                .and_then(|projects| {
-                    projects.get(
-                        crate::wsl::location(&project.to_string_lossy())
-                            .ok()
-                            .flatten()
-                            .map(|location| location.path)
-                            .as_deref()
-                            .unwrap_or(project.to_string_lossy().as_ref()),
-                    )
-                })
+                .and_then(|projects| projects.get(project.to_string_lossy().as_ref()))
                 .and_then(|entry| entry.get("mcpServers")),
         );
     }

@@ -34,7 +34,7 @@ Jira projects never select a Git remote, PR/CI provider or execution host.
 
 The same Atlassian connection continues to support Confluence, including accounts
 with Confluence access only. Choose Confluence pages through the composer context
-picker; credentials stay in the app profile and are not copied to an agent or WSL.
+picker; credentials stay in the app profile and are not copied to an agent or remote host.
 Disconnect removes this shared Jira/Confluence connection.
 
 Saved Jira favorite filters and relationship choices remain available alongside
@@ -44,4 +44,4 @@ Transitions and assignments still use Open in Jira.
 
 Local checks cover migration-compatible credential decoding, provider adapters,
 Board behavior and account changes. Authenticated Jira/Confluence, attachments,
-remote comment posting and Windows/WSL still require live acceptance.
+remote comment posting and Windows still require live acceptance.

@@ -153,11 +153,6 @@ describe("remembered browser URL", () => {
     expect(rememberedBrowserUrl("/repo/c")).toBeUndefined();
   });
 
-  it("keeps host and WSL worktrees apart", () => {
-    rememberBrowserUrl("//wsl.localhost/Ubuntu/home/x", "http://localhost:1/");
-    expect(rememberedBrowserUrl("/home/x")).not.toBe("http://localhost:1/");
-  });
-
   it("ignores non-http values", () => {
     rememberBrowserUrl("/repo/a", "file:///etc/passwd");
     expect(rememberedBrowserUrl("/repo/a")).toBeUndefined();
@@ -550,14 +545,6 @@ describe("browserAgentContext", () => {
     expect(entry.origin).toContain("http://localhost:3000/app");
     expect(entry.origin).toContain("/repo/app");
     expect(entry.origin).toContain("native host");
-  });
-
-  it("marks WSL worktrees in the origin line", () => {
-    const context = browserAgentContext(
-      capture(),
-      "//wsl.localhost/Ubuntu/home/me/app",
-    );
-    expect(context.entries[0].origin).toContain("WSL Ubuntu");
   });
 
   it("sanitizes credentials out of the captured URL", () => {

@@ -36,26 +36,24 @@ const updateEventSource = crypto.randomUUID();
 type HarnessUpdatedEvent = {
   harness: HarnessId;
   source: string;
-  cwd?: string;
 };
 
-export function announceHarnessUpdated(harness: HarnessId, cwd?: string): Promise<void> {
-  return emit(HARNESS_UPDATED_EVENT, { harness, source: updateEventSource, ...(cwd ? { cwd } : {}) });
+export function announceHarnessUpdated(harness: HarnessId): Promise<void> {
+  return emit(HARNESS_UPDATED_EVENT, { harness, source: updateEventSource });
 }
 
 export function onHarnessUpdated(
-  handler: (harness: HarnessId, cwd?: string) => void,
+  handler: (harness: HarnessId) => void,
 ): Promise<UnlistenFn> {
   return listen<HarnessUpdatedEvent>(HARNESS_UPDATED_EVENT, (event) => {
     // The sender awaited its local refresh before announcing the update.
     if (event.payload.source === updateEventSource) return;
-    if (event.payload.cwd) handler(event.payload.harness, event.payload.cwd);
-    else handler(event.payload.harness);
+    handler(event.payload.harness);
   });
 }
 
-export function claimLaunchHarnessUpdateCheck(cwd?: string): Promise<boolean> {
-  return invoke<boolean>("harness_update_check_claim", cwd ? { cwd } : undefined);
+export function claimLaunchHarnessUpdateCheck(): Promise<boolean> {
+  return invoke<boolean>("harness_update_check_claim");
 }
 
 export function fetchLatestHarnessVersion(harness: HarnessId): Promise<string> {

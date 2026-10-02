@@ -16,19 +16,19 @@ const TEXT_HARNESSES: HarnessId[] = [
 ];
 
 /** Pick the harness used for titles, commit messages, and PR text. */
-export function pickTextHarness(preferred?: HarnessId, cwd?: string): HarnessId {
+export function pickTextHarness(preferred?: HarnessId): HarnessId {
   const ordered =
     preferred && TEXT_HARNESSES.includes(preferred)
       ? [preferred, ...TEXT_HARNESSES.filter((id) => id !== preferred)]
       : TEXT_HARNESSES;
   for (const id of ordered) {
-    if (isHarnessAvailable(id, cwd)) return id;
+    if (isHarnessAvailable(id)) return id;
   }
   return preferred && TEXT_HARNESSES.includes(preferred) ? preferred : "cursor";
 }
 
 export function warmupText(cwd: string, preferred?: HarnessId): Promise<void> {
-  return warmupHarnessText(pickTextHarness(preferred, cwd), cwd);
+  return warmupHarnessText(pickTextHarness(preferred), cwd);
 }
 
 export function generateCommitMessage(
@@ -36,12 +36,12 @@ export function generateCommitMessage(
   preferred?: HarnessId,
   signal?: AbortSignal,
 ): Promise<string> {
-  return generateHarnessCommitMessage(pickTextHarness(preferred, cwd), cwd, signal);
+  return generateHarnessCommitMessage(pickTextHarness(preferred), cwd, signal);
 }
 
 export function generatePrContent(
   cwd: string,
   preferred?: HarnessId,
 ): Promise<(PrContent & { base: string; head: string }) | null> {
-  return generateHarnessPrContent(pickTextHarness(preferred, cwd), cwd);
+  return generateHarnessPrContent(pickTextHarness(preferred), cwd);
 }

@@ -16,12 +16,11 @@ export type ProviderAccountIdentity = {
 export async function readProviderAccountIdentity(
   provider: ProviderAccountProvider,
   accountId: string,
-  cwd?: string,
 ): Promise<ProviderAccountIdentity | null> {
   try {
     return await invoke<ProviderAccountIdentity | null>(
       "provider_account_identity",
-      { provider, accountId, ...(cwd ? { cwd } : {}) },
+      { provider, accountId },
     );
   } catch {
     return null;
@@ -48,9 +47,8 @@ export function identityKey(account: ProviderAccount): string {
 export function useProviderAccountIdentities(
   accounts: ProviderAccount[],
   refreshKey?: unknown,
-  cwd?: string,
 ): Record<string, ProviderAccountIdentity | null> {
-  const [state, setState] = useState<{ cwd?: string; identities: Record<string, ProviderAccountIdentity | null> }>({ identities: {} });
+  const [identities, setIdentities] = useState<Record<string, ProviderAccountIdentity | null>>({});
   const key = accounts.map(identityKey).join("|");
 
   useEffect(() => {
@@ -60,17 +58,17 @@ export function useProviderAccountIdentities(
         async (account) =>
           [
             identityKey(account),
-            await readProviderAccountIdentity(account.provider, account.id, cwd),
+            await readProviderAccountIdentity(account.provider, account.id),
           ] as const,
       ),
     ).then((entries) => {
-      if (!cancelled) setState({ cwd, identities: Object.fromEntries(entries) });
+      if (!cancelled) setIdentities(Object.fromEntries(entries));
     });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, refreshKey, cwd]);
+  }, [key, refreshKey]);
 
-  return state.cwd === cwd ? state.identities : {};
+  return identities;
 }

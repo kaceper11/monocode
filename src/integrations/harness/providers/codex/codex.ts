@@ -128,7 +128,7 @@ const liveByThread = new Map<string, Live>();
 const resumeByThread = new Map<string, Resume>();
 const cancelledThreads = new Set<string>();
 
-let resolveCodexBinaryImpl: (cwd?: string) => Promise<{ path: string }> =
+let resolveCodexBinaryImpl: (binaryPath?: string | null) => Promise<{ path: string }> =
   resolveCodexBinary;
 
 /** Test seam. */
@@ -437,7 +437,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     resumeByThread.delete(input.sessionId);
   }
 
-  const { path } = await resolveCodexBinaryImpl(input.cwd);
+  const { path } = await resolveCodexBinaryImpl();
   const liveRef: { current: Live | null } = { current: null };
 
   const rpc = new JsonRpcClient(
@@ -542,7 +542,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     });
     await rpc.notify("initialized", undefined);
 
-    let model = nativeModelId(input.model, input.cwd);
+    let model = nativeModelId(input.model);
     const serviceTier = input.modelSettings?.serviceTier;
     const effort = input.modelSettings?.reasoningEffort;
 
@@ -650,7 +650,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
 
 async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
   // Collaboration settings require a concrete model, even for "Default".
-  const model = nativeModelId(input.model, input.cwd) || live.model;
+  const model = nativeModelId(input.model) || live.model;
   const effort = input.modelSettings?.reasoningEffort;
   const serviceTier = input.modelSettings?.serviceTier;
 

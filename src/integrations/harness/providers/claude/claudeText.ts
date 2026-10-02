@@ -257,7 +257,7 @@ async function startLive(
   model = pickTextModel(),
   settings = textSettings(model),
 ): Promise<LiveText> {
-  const { path } = await resolveClaudeBinary(cwd);
+  const { path } = await resolveClaudeBinary();
   const session: LiveText = {
     cwd,
     providerAccountId,

@@ -1,6 +1,4 @@
 import { refreshHarnessCatalogs } from "../../../integrations/harness/core/registry";
-import { wslLocation } from "../../../shared/lib/paths";
-import { useWslStatus } from "../model/wslStatus";
 import {
   Check,
   ChevronDown,
@@ -32,7 +30,6 @@ import {
   modelCatalogStatus,
   hasLiveCatalog,
   isModelCatalogRefreshing,
-  modelCatalogKey,
   saveFavoriteModels,
   showProviderInModelPicker,
   subscribeModels,
@@ -73,7 +70,6 @@ type Props = {
   /** Limit provider tabs for surfaces that only support one harness. */
   allowedHarnesses?: readonly HarnessId[];
   hotkeys?: boolean;
-  cwd?: string;
   onChange: (harness: HarnessId, model: string) => void;
   onSettingsChange: (settings: Record<string, string>) => void;
   onClose?: () => void;
@@ -279,18 +275,16 @@ export function ModelPicker({
   hideSettings = false,
   allowedHarnesses,
   hotkeys = false,
-  cwd,
   onChange,
   onSettingsChange,
   onClose,
 }: Props) {
-  const source = useModelSource(cwd);
+  const source = useModelSource();
   const catalogVersion = useSyncExternalStore(
     subscribeModels,
     getModelSnapshot,
     getModelSnapshot,
   );
-  const wslStatus = useWslStatus(wslLocation(cwd ?? "")?.distribution);
   const availabilityVersion = useSyncExternalStore(
     subscribeHarnessAvailability,
     getHarnessAvailabilitySnapshot,
@@ -460,14 +454,12 @@ export function ModelPicker({
     setSubmenu(hideSettings ? { kind: "models" } : null);
     setQuery("");
     setFavorites(loadFavoriteModels());
-  }, [open, current.harness, cwd, hideSettings]);
+  }, [open, current.harness, hideSettings]);
 
   useEffect(() => {
     if (!open) return;
     source.refresh([current.harness]);
-  }, [open, current.harness, cwd, wslStatus, source]);
-
-  useEffect(() => { setRecentMenu(null); }, [cwd]);
+  }, [open, current.harness, source]);
 
   useEffect(() => {
     if (visibleTab === tab) return;
@@ -479,7 +471,7 @@ export function ModelPicker({
       return;
     }
     source.refresh([visibleTab]);
-  }, [open, submenu?.kind, visibleTab, source, wslStatus]);
+  }, [open, submenu?.kind, visibleTab, source]);
 
   useEffect(() => {
     if (!open) return;
@@ -584,7 +576,7 @@ export function ModelPicker({
 
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [recentActive, recentMenu, cwd]);
+  }, [recentActive, recentMenu]);
 
   const pickSetting = (setting: ModelSetting, value: string) => {
     setSetting(setting, value);
@@ -733,7 +725,6 @@ export function ModelPicker({
 
       {open && hideSettings ? (
         <ModelFlyout
-          cwd={cwd}
           anchor={button}
           side="top"
           autoFocusSearch
@@ -938,7 +929,6 @@ export function ModelPicker({
             <ModelFlyout
               anchor={activeRow}
               harnesses={pickerHarnesses}
-              cwd={cwd}
               tab={visibleTab}
               models={visibleModels}
               currentId={current.id}
@@ -985,7 +975,7 @@ export function ModelPicker({
                 disabled={disabled}
                 title={
                   disabled
-                    ? harnessUnavailableHint(item.harness, cwd)
+                    ? harnessUnavailableHint(item.harness)
                     : undefined
                 }
                 onMouseDown={(event) => event.preventDefault()}
@@ -1028,7 +1018,6 @@ export function ModelPicker({
 }
 
 export function ModelControlPills({
-  cwd,
   harness,
   model,
   values,
@@ -1036,7 +1025,7 @@ export function ModelControlPills({
   onClose,
 }: Pick<
   Props,
-  "harness" | "model" | "cwd" | "values" | "onSettingsChange" | "onClose"
+  "harness" | "model" | "values" | "onSettingsChange" | "onClose"
 >) {
   const catalogVersion = useSyncExternalStore(
     subscribeModels,
@@ -1044,7 +1033,7 @@ export function ModelControlPills({
     getModelSnapshot,
   );
   void catalogVersion;
-  const current = useModelSource(cwd).resolve(harness, model);
+  const current = useModelSource().resolve(harness, model);
   const pills = pillSettings(current);
   const effort = pills.find(
     (setting) => setting.kind === "select" && isEffortSetting(setting),
@@ -1297,7 +1286,6 @@ function ModelFlyout({
   autoFocusSearch = false,
   onDismiss,
   harnesses,
-  cwd,
   tab,
   models,
   currentId,
@@ -1316,7 +1304,6 @@ function ModelFlyout({
   autoFocusSearch?: boolean;
   onDismiss?: (reason: "outside" | "escape") => void;
   harnesses: HarnessId[];
-  cwd?: string;
   tab: ModelPickerTab;
   models: AgentModel[];
   currentId: string;
@@ -1330,24 +1317,19 @@ function ModelFlyout({
   onPick: (model: AgentModel) => void;
   onToggleFavorite: (id: string) => void;
 }) {
-  const source = useModelSource(cwd);
+  const source = useModelSource();
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const activeRef = useRef<HTMLButtonElement>(null);
   const groups = modelGroups(tab, models);
-  const distribution = wslLocation(cwd ?? "")?.distribution;
-  const wslStatus = useWslStatus(distribution);
-  const ready = !distribution || wslStatus.state === "connected";
-  const refreshing = tab !== "favorites" && isModelCatalogRefreshing(tab, cwd);
-  const catalogHint = tab !== "favorites" && (distribution || ["devin", "copilot", "muse"].includes(tab))
-    ? !ready
-      ? wslStatus.error ?? (wslStatus.state === "connecting" ? "Connecting to WSL…" : "Connect WSL to discover models.")
-      : !hasLiveCatalog(tab, cwd) || refreshing || modelCatalogError(tab, cwd)
-        ? modelCatalogStatus(tab, cwd)
-        : undefined
+  const refreshing = tab !== "favorites" && isModelCatalogRefreshing(tab);
+  const catalogHint = tab !== "favorites" && ["devin", "copilot", "muse"].includes(tab)
+    ? !hasLiveCatalog(tab) || refreshing || modelCatalogError(tab)
+      ? modelCatalogStatus(tab)
+      : undefined
     : undefined;
   const integrationHint = tab !== "favorites" && !query.trim() &&
-    (modelCatalogKey(cwd) !== "native" || ["devin", "copilot", "muse"].includes(tab))
-    ? modelCatalogError(tab, cwd) ?? harnessAuthHint(tab, cwd)
+    ["devin", "copilot", "muse"].includes(tab)
+    ? modelCatalogError(tab) ?? harnessAuthHint(tab)
     : undefined;
 
   useEffect(() => {
@@ -1479,9 +1461,9 @@ function ModelFlyout({
             <span role="status" className="min-w-0 flex-1 break-words">{catalogHint}</span>
             <button
               type="button"
-              disabled={!ready || refreshing}
+              disabled={refreshing}
               className="shrink-0 whitespace-nowrap rounded px-2 py-1 hover:bg-content/10 focus-visible:ring-1 focus-visible:ring-content/30 disabled:opacity-40"
-              onClick={() => { if (source.id) source.refresh([tab]); else void refreshHarnessCatalogs([tab], cwd, true); }}
+              onClick={() => { if (source.id) source.refresh([tab]); else void refreshHarnessCatalogs([tab], { force: true }); }}
             >
               {refreshing ? "Refreshing…" : "Retry models"}
             </button>
@@ -1499,7 +1481,7 @@ function ModelFlyout({
               {tab === "favorites" && !query.trim()
                 ? "No favorite models"
                 : tab !== "favorites" && !source.available(tab)
-                  ? harnessUnavailableHint(tab, cwd)
+                  ? harnessUnavailableHint(tab)
                   : integrationHint
                     ? integrationHint
                     : tab === "codex" && !query.trim()
@@ -1548,7 +1530,7 @@ function ModelFlyout({
                         disabled={disabled}
                         title={
                           disabled
-                            ? harnessUnavailableHint(item.harness, cwd)
+                            ? harnessUnavailableHint(item.harness)
                             : undefined
                         }
                         onMouseDown={(event) => event.preventDefault()}

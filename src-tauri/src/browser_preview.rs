@@ -95,14 +95,23 @@ pub async fn browser_preview_open(owner: tauri::WebviewWindow) -> Result<(), Str
         let download_app = app.clone();
         let download_toolbar = toolbar_label.clone();
         let load_page = page_label.clone();
-        let page = window.add_child(
-            WebviewBuilder::new(&page_label, WebviewUrl::External(Url::parse("about:blank").unwrap()))
+        let page = window
+            .add_child(
+                WebviewBuilder::new(
+                    &page_label,
+                    WebviewUrl::External(Url::parse("about:blank").unwrap()),
+                )
                 .incognito(true)
                 .on_navigation(move |url| {
-                    if url.as_str() == "about:blank" { return true; }
+                    if url.as_str() == "about:blank" {
+                        return true;
+                    }
                     match allowed_url(url, &app_url) {
                         Ok(()) => true,
-                        Err(error) => { notice(&nav_app, &nav_toolbar, None, &error); false }
+                        Err(error) => {
+                            notice(&nav_app, &nav_toolbar, None, &error);
+                            false
+                        }
                     }
                 })
                 .on_page_load(move |_, payload| {
@@ -112,20 +121,32 @@ pub async fn browser_preview_open(owner: tauri::WebviewWindow) -> Result<(), Str
                     }
                     let message = match payload.event() {
                         PageLoadEvent::Started => "Loading…",
-                        PageLoadEvent::Finished => "Preview runs on this computer. WSL localhost access depends on your network setup.",
+                        PageLoadEvent::Finished => "Preview runs on this computer.",
                     };
                     notice(&load_app, &load_toolbar, Some(url.as_str()), message);
                 })
                 .on_new_window(move |_, _| {
-                    notice(&popup_app, &popup_toolbar, None, "Popups are blocked. Use Open externally for this workflow.");
+                    notice(
+                        &popup_app,
+                        &popup_toolbar,
+                        None,
+                        "Popups are blocked. Use Open externally for this workflow.",
+                    );
                     NewWindowResponse::Deny
                 })
                 .on_download(move |_, _| {
-                    notice(&download_app, &download_toolbar, None, "Downloads are blocked. Use Open externally to download.");
+                    notice(
+                        &download_app,
+                        &download_toolbar,
+                        None,
+                        "Downloads are blocked. Use Open externally to download.",
+                    );
                     false
                 }),
-            LogicalPosition::new(0.0, BAR_HEIGHT), LogicalSize::new(size.width, (size.height - BAR_HEIGHT).max(1.0)),
-        ).map_err(|e| e.to_string())?;
+                LogicalPosition::new(0.0, BAR_HEIGHT),
+                LogicalSize::new(size.width, (size.height - BAR_HEIGHT).max(1.0)),
+            )
+            .map_err(|e| e.to_string())?;
         let resize_window = window.clone();
         let closed_page = page_label.clone();
         window.on_window_event(move |event| {

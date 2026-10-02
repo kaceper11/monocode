@@ -1,4 +1,4 @@
-import { pathKey, wslLocation } from "../../shared/lib/paths";
+import { pathKey } from "../../shared/lib/paths";
 import { parseRemotePath } from "../connections/model/remoteProjects";
 import { sessionWorkCwd, type Session } from "../sessions/model/session";
 import { listWorktrees } from "../source-control/model/worktrees";
@@ -36,18 +36,13 @@ export function sessionTaskBindings(
 const remoteMachine = (path?: string) =>
   path ? parseRemotePath(path)?.environmentId : undefined;
 
-/** Same execution host = the same remote machine, or both non-remote with the
- * same WSL distribution (undefined distribution = the native host). */
+/** Same execution host = the same remote machine, or both non-remote. */
 export function sameExecutionHost(
   sessionCwd: string,
   worktreePath?: string,
 ): boolean {
   if (!worktreePath) return false;
-  if (remoteMachine(sessionCwd) !== remoteMachine(worktreePath)) return false;
-  return (
-    wslLocation(worktreePath)?.distribution.toLowerCase() ===
-    wslLocation(sessionCwd)?.distribution.toLowerCase()
-  );
+  return remoteMachine(sessionCwd) === remoteMachine(worktreePath);
 }
 
 /** The path a session on sessionCwd's machine uses for this worktree —
@@ -60,7 +55,7 @@ export function executionCwd(
     return undefined;
   const remote = parseRemotePath(worktreePath);
   if (remote) return remote.hostPath;
-  return wslLocation(worktreePath)?.path ?? worktreePath;
+  return worktreePath;
 }
 
 /** Membership is Board-owned; paths alone never imply task membership. */

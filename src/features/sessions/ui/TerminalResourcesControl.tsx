@@ -227,7 +227,7 @@ export function TerminalResourcesManager({
                     onOpen(terminal.id);
                     onDismiss();
                   }}
-                  title={`${terminal.cwd}${row?.host === "wsl" ? ` · WSL ${row.distro}` : ""}`}
+                  title={terminal.cwd}
                 >
                   <span className="flex items-center justify-between gap-3 text-xs">
                     <span className="truncate font-medium">
@@ -249,7 +249,6 @@ export function TerminalResourcesManager({
                     {row?.alive && !row.error && row.processes != null
                       ? ` · ${row.processes} ${row.processes === 1 ? "process" : "processes"}`
                       : ""}
-                    {row?.host === "wsl" ? ` · WSL ${row.distro}` : ""}
                   </span>
                 </button>
                 <button

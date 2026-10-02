@@ -45,7 +45,7 @@ async function discoverCommands(
   cwd: string,
   command: string,
 ): Promise<unknown> {
-  const { path } = await flavor.resolveBinary(cwd);
+  const { path } = await flavor.resolveBinary();
   const releaseBridge = await acquireHarnessBridge();
   const childId = `monocode-${flavor.id}-skills-${crypto.randomUUID()}`;
   const replyToUi = (record: Record<string, unknown>) => {

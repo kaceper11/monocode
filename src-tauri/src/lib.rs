@@ -5,7 +5,6 @@ pub mod dictation;
 mod keep_awake;
 mod planning;
 mod saved_commands;
-mod wsl;
 use tauri::Manager;
 
 mod account_identity;
@@ -75,14 +74,11 @@ fn default_cwd() -> String {
         .unwrap_or_else(|| "~".into())
 }
 
-#[tauri::command(async)]
-fn home_dir(cwd: Option<String>) -> Result<String, String> {
-    if let Some(location) = cwd.as_deref().map(wsl::location).transpose()?.flatten() {
-        return wsl::path_request(&location, "home", serde_json::json!({}));
-    }
-    Ok(dirs_home()
+#[tauri::command]
+fn home_dir() -> String {
+    dirs_home()
         .map(|home| fs::path_to_js(std::path::Path::new(&home)))
-        .unwrap_or_else(|| "~".into()))
+        .unwrap_or_else(|| "~".into())
 }
 
 pub(crate) struct PasswdIdentity {
@@ -309,12 +305,6 @@ pub fn run() {
             browser::browser_read_clipboard,
             browser_preview::browser_preview_open,
             browser_preview::browser_preview_action,
-            wsl::wsl_distributions,
-            wsl::wsl_home,
-            wsl::wsl_connect,
-            wsl::wsl_resolve_harness,
-            wsl::wsl_resolve_agents,
-            wsl::wsl_connected,
             remote::remote_machines,
             remote::remote_connect,
             remote::remote_disconnect,

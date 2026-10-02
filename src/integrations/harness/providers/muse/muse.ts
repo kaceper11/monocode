@@ -634,7 +634,7 @@ async function startLive(
     resumeByThread.delete(input.sessionId);
   }
 
-  const { path } = await resolveMuseBinary(input.cwd);
+  const { path } = await resolveMuseBinary();
   assertStarting();
   const liveRef: { current: Live | null } = { current: null };
   // session/resume re-issues pending approvals/questions as server requests
@@ -739,7 +739,7 @@ async function startLive(
     void rpc.notify("initialized");
 
     // "muse:default" is the picker placeholder, not a servable model id.
-    const wantedModel = museNativeModel(input.model, input.cwd);
+    const wantedModel = museNativeModel(input.model);
     const mode = museApprovalMode(input.runtimeMode, planning);
 
     let museSessionId: string | undefined;
@@ -867,23 +867,23 @@ async function populateCatalog(live: Live): Promise<void> {
     );
     if (liveByThread.get(live.sessionId) !== live) return;
     const models = museModelsFromList(result);
-    if (models.length > 0) setHarnessModels("muse", models, live.cwd);
+    if (models.length > 0) setHarnessModels("muse", models);
   } catch {
     // Catalog refresh is best-effort; never fail a live session for it.
   }
 }
 
 /** The placeholder row resolves to no model; real rows send their native id. */
-function museNativeModel(model: string, cwd: string): string | undefined {
+function museNativeModel(model: string): string | undefined {
   if (model === "muse:default") return undefined;
-  const native = nativeModelId(model, cwd);
+  const native = nativeModelId(model);
   return native || undefined;
 }
 
 async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
   // Model and approval mode are independent session settings; issue them
   // together so a resumed turn pays one round trip, not two.
-  const native = museNativeModel(input.model, input.cwd);
+  const native = museNativeModel(input.model);
   const controls: Promise<void>[] = [applyApprovalMode(live)];
   if (native && native !== live.appliedModelId) {
     controls.push(

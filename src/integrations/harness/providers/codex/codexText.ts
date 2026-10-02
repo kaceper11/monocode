@@ -280,7 +280,7 @@ async function startLive(
   requestedThreadId?: string,
 ): Promise<LiveText> {
   await dropLive();
-  const { path } = await resolveCodexBinary(cwd);
+  const { path } = await resolveCodexBinary();
   const sessionRef: { session: LiveText | null } = { session: null };
   const rpc = new JsonRpcClient(
     TEXT_CHILD_ID,

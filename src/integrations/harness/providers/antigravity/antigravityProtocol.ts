@@ -1,4 +1,3 @@
-import { wslLocation, wslPath } from "../../../../shared/lib/paths";
 import { promptBlocks, type PromptContentBlock } from "../../../../features/sessions/model/attachments";
 import type { AgentModel, ModelSetting, ModelSettingChoice } from "../../../../features/sessions/model/models";
 import type { Attachment, RuntimeMode, ToolPreview } from "../../../../features/sessions/model/session";
@@ -41,9 +40,7 @@ export function antigravityPromptBlocks(
 /** The raw .par locates sibling resources relative to its process directory. */
 export function antigravitySpawnCwd(binary: string, fallback: string): string {
   const separator = Math.max(binary.lastIndexOf("/"), binary.lastIndexOf("\\"));
-  const parent = separator >= 0 ? binary.slice(0, separator + 1) : fallback;
-  const guest = wslLocation(fallback);
-  return guest && !wslLocation(parent) ? wslPath(guest.distribution, parent) : parent;
+  return separator >= 0 ? binary.slice(0, separator + 1) : fallback;
 }
 
 export function antigravityModeId(

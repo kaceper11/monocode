@@ -624,7 +624,7 @@ const LocalSessionPane = memo(function LocalSessionPane({
       onNewTerminal={() => onNewTerminal(session.id)}
       onModelChange={(harness, model) => {
         onModelChange(session.id, harness, model);
-        const selected = resolveModel(harness, model, workCwd);
+        const selected = resolveModel(harness, model);
         // A new key restarts the animation and its cleanup timer on every pick.
         const kind = isAstraModel(selected)
           ? "astra"

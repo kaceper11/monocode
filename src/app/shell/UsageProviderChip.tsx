@@ -1,4 +1,3 @@
-import { wslLocation } from "../../shared/lib/paths";
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import {
   clampUsedPercent,
@@ -76,7 +75,6 @@ export function UsageProviderChip({
   limits,
   now,
   project,
-  cwd,
   accounts = [],
   accountId,
   accountLabel,
@@ -91,7 +89,6 @@ export function UsageProviderChip({
   now: number;
   presentation?: { harness: HarnessId; label: string; sourceLabel?: string };
   project?: string;
-  cwd?: string;
   accounts?: ProviderAccount[];
   accountId?: string;
   accountLabel?: string;
@@ -140,9 +137,8 @@ export function UsageProviderChip({
   const canManageAccounts = Boolean(onSelectAccount && (onAddAccount || accounts.length));
   const activeAccountLabel = accountLabel ?? activeAccount?.label ?? "Removed account";
   const identities = useProviderAccountIdentities(
-    wslLocation(cwd ?? "") ? accounts.filter(account => account.id === "default") : accounts,
+    accounts,
     `${open}:${limits.updatedAt}:${reconnectState}`,
-    cwd,
   );
   const activeIdentity = activeAccount
     ? identities[identityKey(activeAccount)]
@@ -155,7 +151,7 @@ export function UsageProviderChip({
     accounts.map((account) => account.id).join("|"),
     {
       provider: accountProvider,
-      enabled: open && !wslLocation(cwd ?? "") && Boolean(accountProvider) && otherAccounts.length > 0,
+      enabled: open && Boolean(accountProvider) && otherAccounts.length > 0,
     },
   );
   // The footer's own snapshot is fresher for the active account.

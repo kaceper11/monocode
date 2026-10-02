@@ -1,4 +1,3 @@
-import { wslLocation } from "../../../../shared/lib/paths";
 import { homeDir } from "../../../../platform/tauri/fs";
 import { refreshModelCatalog } from "../../../../features/sessions/model/models";
 import { AcpClient } from "../../core/acp";
@@ -27,8 +26,8 @@ const CLIENT_CAPABILITIES = {
   terminal: false,
 };
 
-export function refreshGrokCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("grok", cwd, discoverGrokModels);
+export function refreshGrokCatalog(): Promise<void> {
+  return refreshModelCatalog("grok", discoverGrokModels);
 }
 
 export async function discoverGrokModels(projectCwd?: string) {
@@ -42,12 +41,11 @@ export async function discoverGrokModels(projectCwd?: string) {
     return [];
   });
   if (fromCli.length > 0) return fromCli;
-  if (projectCwd && wslLocation(projectCwd)) throw new Error("Grok model discovery failed. Check the Linux CLI account and retry.");
   return fallbackGrokModels();
 }
 
 async function discoverViaAcp(projectCwd?: string) {
-  const { path } = await resolveGrokBinary(projectCwd);
+  const { path } = await resolveGrokBinary();
   const cwd = projectCwd ?? (await homeDir());
   const probeId = `monocode-grok-probe-${crypto.randomUUID()}`;
   const acp = new AcpClient(probeId, {
@@ -115,7 +113,7 @@ async function discoverViaAcp(projectCwd?: string) {
 }
 
 async function discoverViaCli(projectCwd?: string) {
-  const { path } = await resolveGrokBinary(projectCwd);
+  const { path } = await resolveGrokBinary();
   const cwd = projectCwd ?? (await homeDir());
   const stdout = await execChild(path, ["models"], cwd, "grok");
   return modelsFromGrokModelsOutput(stdout);

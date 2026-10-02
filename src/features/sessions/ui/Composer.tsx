@@ -3,7 +3,6 @@ import { DictationControl, DictationError } from "./DictationControl";
 import { useDictation } from "./useDictation";
 import { useBrowserContextTarget } from "../model/browserContext";
 import { useConfluenceControl } from "./ConfluenceControl";
-import { WslBadge } from "./WslBadge";
 import { composeAgentContext } from "../model/agentContext";
 import { appendComposerInsert } from "../model/quoteDraft";
 import {
@@ -2651,9 +2650,7 @@ export function Composer({
               }}
             >
               <div className="flex shrink-0 items-center gap-1">
-                <WslBadge cwd={executionCwd} />
                 <ModelPicker
-                  cwd={executionCwd}
                   harness={harness}
                   model={model}
                   values={modelSettings}
@@ -2669,7 +2666,6 @@ export function Composer({
                 />
                 {controlsBeside ? (
                   <ModelControlPills
-                    cwd={executionCwd}
                     harness={harness}
                     model={model}
                     values={modelSettings}

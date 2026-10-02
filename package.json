@@ -9,7 +9,6 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:wsl": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-wsl.ps1",
     "test:watch": "vitest",
     "host:build": "tsc --noEmit -p host/tsconfig.json && node host/build.mjs",
     "host:package": "npm run host:build && node host/package.mjs",

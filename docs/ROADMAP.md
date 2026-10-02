@@ -6,12 +6,12 @@ The owner's 2026-09-18 direction replaces the previous expansion backlog. Existi
 
 1. Compare exact fork and upstream revisions and inventory every changed file. Preserve uncommitted work in other checkouts.
 2. Remove fork-only features outside the retained scope and adopt upstream core UI, persistence and workflows. Review mixed files at hunk level and preserve old data safely.
-3. Adapt Windows-to-WSL execution to upstream filesystem, process and worktree boundaries.
+3. Match upstream filesystem, process and worktree boundaries; WSL execution support has been removed.
 4. Integrate Azure Boards/Repos/Pipelines and Jira through upstream ticket, PR and CI surfaces and minimal shared contracts. Remove dependencies on custom tasks, repairs and automation engines.
 5. Preserve Confluence and Devin/Muse/Copilot through upstream context and harness extension points. Missing optional capabilities are separate follow-up work, not reasons to expand the convergence.
 6. Validate the remaining differences, upstream checks, compatibility fixtures and visible interactions. Record live provider/platform acceptance separately.
 
-These steps describe intended work, not completed acceptance. WSL and existing service behavior must remain usable as their owning slices are integrated.
+These steps describe intended work, not completed acceptance. Existing service behavior must remain usable as its owning slices are integrated.
 
 ## Ongoing policy
 

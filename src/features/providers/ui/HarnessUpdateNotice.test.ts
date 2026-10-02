@@ -2,9 +2,6 @@
 import { act, createElement, StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { setWslStatus } from "../../sessions/model/wslStatus";
-import { invoke } from "@tauri-apps/api/core";
-import { updateHarnessCli, inspectHarnessBinary } from "../../../integrations/harness/core/child";
 import { HarnessUpdateNotice } from "./HarnessUpdateNotice";
 
 let claimed = false;
@@ -89,7 +86,9 @@ describe("HarnessUpdateNotice", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(notice?.textContent).toContain("Updated to 2.1.285");
-    expect(refreshHarnessCatalogs).toHaveBeenCalledWith(["claude"], undefined, true);
+    expect(refreshHarnessCatalogs).toHaveBeenCalledWith(["claude"], {
+      force: true,
+    });
     expect(refreshHarnessCatalogs).toHaveBeenCalledTimes(1);
     expect(emit).toHaveBeenCalledWith("harness-updated", {
       harness: "claude",
@@ -103,29 +102,9 @@ describe("HarnessUpdateNotice", () => {
       });
     });
     expect(refreshHarnessCatalogs).toHaveBeenCalledTimes(2);
-    expect(refreshHarnessCatalogs).toHaveBeenLastCalledWith(["claude"], undefined, true);
+    expect(refreshHarnessCatalogs).toHaveBeenLastCalledWith(["claude"], {
+      force: true,
+    });
     act(() => root.unmount());
   });
-});
-
-it("offers updates for the selected WSL distribution and keeps every action on that host", async () => {
-  installed = "2.1.284 (Claude Code)";
-  claimed = false;
-  const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
-  setWslStatus("Ubuntu", { state: "connected" });
-  const container = document.createElement("div");
-  const root = createRoot(container);
-  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  try {
-    await act(async () => { root.render(createElement(HarnessUpdateNotice, { cwd })); await new Promise((resolve) => setTimeout(resolve, 0)); });
-    const notice = document.body.querySelector('[aria-label="Harness updates"]')!;
-    expect(notice.textContent).toContain("WSL: Ubuntu");
-    expect(invoke).toHaveBeenCalledWith("harness_update_check_claim", { cwd });
-    const update = [...notice.querySelectorAll("button")].find((button) => button.textContent === "Update")!;
-    await act(async () => { update.click(); await new Promise((resolve) => setTimeout(resolve, 0)); });
-    expect(updateHarnessCli).toHaveBeenCalledWith("claude", cwd);
-    expect(inspectHarnessBinary).toHaveBeenCalledWith("claude", undefined, cwd);
-    expect(refreshHarnessCatalogs).toHaveBeenLastCalledWith(["claude"], cwd, true);
-    expect(emit).toHaveBeenCalledWith("harness-updated", expect.objectContaining({ harness: "claude", cwd }));
-  } finally { act(() => root.unmount()); vi.unstubAllGlobals(); }
 });

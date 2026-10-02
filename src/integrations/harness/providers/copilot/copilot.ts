@@ -437,7 +437,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   }
 
   if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
-  const { path } = await resolveCopilotBinary(input.cwd);
+  const { path } = await resolveCopilotBinary();
   if (cancelledThreads.has(input.sessionId)) throw new Error("cancelled");
   const handlers: AcpHandlers = {};
   const acp = new AcpClient(input.sessionId, handlers);
@@ -595,7 +595,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     // length-1 result means the server advertised nothing real.
     const discovered = copilotModelsFromSetup(setup);
     if (discovered.length > 1) {
-      setHarnessModels("copilot", discovered, input.cwd);
+      setHarnessModels("copilot", discovered);
     }
     const live: Live = {
       threadId: input.sessionId,
@@ -679,14 +679,14 @@ async function applyModelSelection(
   live: Live,
   input: HarnessSessionInput,
 ): Promise<void> {
-  const base = nativeModelId(input.model, input.cwd).trim();
+  const base = nativeModelId(input.model).trim();
   if (!base) return;
   // A probed catalog replaces the placeholder list, so an id that no longer
   // resolves (removed, or disabled by plan/org policy) must not degrade into
   // a `set_model` for the stale slug — require an explicit replacement.
   if (
-    hasLiveCatalog("copilot", input.cwd) &&
-    !modelsFor("copilot", input.cwd).some(
+    hasLiveCatalog("copilot") &&
+    !modelsFor("copilot").some(
       (model) => model.id === input.model || model.nativeId === base,
     )
   ) {

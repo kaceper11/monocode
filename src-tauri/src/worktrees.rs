@@ -61,38 +61,17 @@ fn parse_worktrees(text: &str) -> Vec<Worktree> {
 }
 
 pub(crate) fn list(root: &Path) -> Result<Vec<Worktree>, String> {
-    let mut trees = parse_worktrees(&git(root, &["worktree", "list", "--porcelain", "-z"])?);
-    if let Some(location) = crate::wsl::path_location(root)? {
-        for tree in &mut trees {
-            tree.path = location.with_path(&tree.path)?.identity();
-        }
-    }
-    Ok(trees)
-}
-
-/// Guest paths retain Linux case sensitivity, even when the UI runs on Windows.
-fn guest_contains(root: &crate::wsl::Location, cwd: &crate::wsl::Location) -> bool {
-    root.distribution.eq_ignore_ascii_case(&cwd.distribution)
-        && (root.path == cwd.path
-            || cwd
-                .path
-                .starts_with(&format!("{}/", root.path.trim_end_matches('/'))))
+    Ok(parse_worktrees(&git(
+        root,
+        &["worktree", "list", "--porcelain", "-z"],
+    )?))
 }
 
 pub(crate) fn canonical(path: &Path) -> Result<PathBuf, String> {
-    match crate::wsl::path_location(path)? {
-        Some(location) => {
-            crate::wsl::path_request(&location, "canonical_directory", serde_json::json!({}))
-                .map(PathBuf::from)
-        }
-        None => path.canonicalize().map_err(|e| e.to_string()),
-    }
+    path.canonicalize().map_err(|e| e.to_string())
 }
 
 pub(crate) fn path_info(path: &Path) -> Result<(bool, bool), String> {
-    if let Some(location) = crate::wsl::path_location(path)? {
-        return crate::wsl::request(&location, "worktree_path_info", serde_json::json!({}));
-    }
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok((true, path.is_dir())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((false, false)),
@@ -100,29 +79,11 @@ pub(crate) fn path_info(path: &Path) -> Result<(bool, bool), String> {
     }
 }
 
-fn git_path(root: &Path, path: &Path) -> Result<String, String> {
-    match (
-        crate::wsl::path_location(root)?,
-        crate::wsl::path_location(path)?,
-    ) {
-        (Some(root), Some(target))
-            if root.distribution.eq_ignore_ascii_case(&target.distribution) =>
-        {
-            Ok(target.path)
-        }
-        (None, None) => Ok(path_to_js(path)),
-        _ => Err("Repository and worktree must use the same execution host".into()),
-    }
+fn git_path(_root: &Path, path: &Path) -> Result<String, String> {
+    Ok(path_to_js(path))
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
-    match (crate::wsl::path_location(a), crate::wsl::path_location(b)) {
-        (Ok(Some(a)), Ok(Some(b))) => {
-            return a.distribution.eq_ignore_ascii_case(&b.distribution) && a.path == b.path
-        }
-        (Ok(None), Ok(None)) => {}
-        _ => return false,
-    }
     let a = a.canonicalize().unwrap_or_else(|_| a.to_path_buf());
     let b = b.canonicalize().unwrap_or_else(|_| b.to_path_buf());
     if cfg!(windows) {
@@ -134,14 +95,6 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 pub(crate) fn contains_working_dir(root: &Path, cwd: &Path) -> bool {
-    match (
-        crate::wsl::path_location(root),
-        crate::wsl::path_location(cwd),
-    ) {
-        (Ok(Some(root)), Ok(Some(cwd))) => return guest_contains(&root, &cwd),
-        (Ok(None), Ok(None)) => {}
-        _ => return false,
-    }
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     if cfg!(windows) {
@@ -256,9 +209,7 @@ fn create(root: &Path, branch: &str, base: &str, existing: bool) -> Result<Workt
             &format!("{source}^{{commit}}"),
         ],
     )?;
-    if crate::wsl::path_location(root)?.is_none() {
-        std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
-    }
+    std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
     let path_str = git_path(root, &path)?;
     if existing {
         git_checked(root, &["worktree", "add", "--", &path_str, branch])?;
@@ -309,39 +260,7 @@ pub async fn git_worktree_create(
     .map_err(|error| error.to_string())?
 }
 
-fn seed_hosts(
-    source: &Path,
-    target: &Path,
-) -> Result<Option<(crate::wsl::Location, crate::wsl::Location)>, String> {
-    match (
-        crate::wsl::path_location(source)?,
-        crate::wsl::path_location(target)?,
-    ) {
-        (None, None) => Ok(None),
-        (Some(source), Some(target))
-            if source
-                .distribution
-                .eq_ignore_ascii_case(&target.distribution) =>
-        {
-            Ok(Some((source, target)))
-        }
-        _ => Err("Worker and lead checkouts must use the same execution host".into()),
-    }
-}
-
 fn copy_checkout_state(source: &Path, target: &Path) -> Result<(), String> {
-    if let Some((source_host, target_host)) = seed_hosts(source, target)? {
-        let paths = git_diff_files_for(source)
-            .files
-            .into_iter()
-            .map(|file| resolve_repo_path(source, &file.relative))
-            .collect::<Result<Vec<_>, _>>()?;
-        return crate::wsl::request(
-            &source_host,
-            "worktree_seed",
-            serde_json::json!({"target": target_host.path, "paths": paths}),
-        );
-    }
     for file in git_diff_files_for(source).files {
         let relative = resolve_repo_path(source, &file.relative)?;
         let from = source.join(&relative);
@@ -419,18 +338,6 @@ fn checkout_state_matches(source: &Path, target: &Path) -> bool {
         .collect();
     if source_paths != target_paths {
         return false;
-    }
-    match seed_hosts(source, target) {
-        Ok(Some((source_host, target_host))) => {
-            return crate::wsl::request(
-                &source_host,
-                "worktree_seed_matches",
-                serde_json::json!({"target": target_host.path, "paths": source_paths}),
-            )
-            .unwrap_or(false)
-        }
-        Err(_) => return false,
-        Ok(None) => {}
     }
     source_paths.into_iter().all(|relative| {
         if path_contains_symlink(source, relative) || path_contains_symlink(target, relative) {
@@ -769,13 +676,6 @@ pub(crate) fn reconcile_removals(conn: &rusqlite::Connection) -> Result<(), Stri
     for (path, json) in pending {
         // A surviving Git link means removal did not finish. If the link/folder
         // is gone, the already-persisted detached sessions are the final state.
-        // WSL connects after startup. Keep its journal until that host can
-        // answer; an unavailable distribution is never evidence of deletion.
-        if let Some(location) = crate::wsl::location(&path)? {
-            if !crate::wsl::wsl_connected(location.distribution) {
-                continue;
-            }
-        }
         let restore = if path_info(&Path::new(&path).join(".git"))?.0 {
             serde_json::from_str::<Vec<SessionBeforeRemoval>>(&json).map_err(|e| e.to_string())?
         } else {
@@ -903,51 +803,6 @@ pub async fn git_orchestration_branch_remove(cwd: String, branch: String) -> Res
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
-    #[cfg(unix)]
-    pub(crate) fn verify_wsl_removal(root: &str, child: &str) {
-        let root = Path::new(root);
-        let child = Path::new(child);
-        let location = crate::wsl::path_location(child).unwrap().unwrap();
-        let dirty = location
-            .with_path(&format!("{}/keep.txt", location.path))
-            .unwrap();
-        crate::wsl::request::<serde_json::Value>(
-            &dirty,
-            "write_text",
-            serde_json::json!({"content":"keep changes"}),
-        )
-        .unwrap();
-        assert!(check_removal(root, child, false, false).is_err());
-        assert!(check_removal(root, child, true, true).is_err());
-        assert!(path_info(child).unwrap().1);
-        let store = SessionStore::open_in_memory().unwrap();
-        let conn = store.lock_conn().unwrap();
-        let result = remove_with_sessions(&conn, root, child, true, true).unwrap();
-        assert!(result.session_ids.is_empty());
-        assert!(!path_info(child).unwrap().0);
-        assert!(git(root, &["rev-parse", "--verify", "refs/heads/child-branch"]).is_ok());
-    }
-
-    #[test]
-    fn guest_worktrees_keep_host_and_linux_case_boundaries() {
-        let root = Path::new("//wsl.localhost/Ubuntu/home/Repo");
-        assert!(contains_working_dir(
-            root,
-            Path::new("//wsl$/ubuntu/home/Repo/src")
-        ));
-        for cwd in [
-            "//wsl.localhost/Debian/home/Repo",
-            "//wsl.localhost/Ubuntu/home/repo",
-            "//wsl.localhost/Ubuntu/home/Repo-other",
-            "/home/Repo",
-            "//wsl.localhost/Ubuntu/home/Repo/../other",
-        ] {
-            assert!(!contains_working_dir(root, Path::new(cwd)), "{cwd}");
-        }
-        assert!(git_path(root, Path::new("/home/Repo")).is_err());
-        assert!(git_path(root, Path::new("//wsl.localhost/Debian/home/Repo")).is_err());
-    }
 
     struct Repo(PathBuf);
     impl Drop for Repo {
@@ -1131,40 +986,6 @@ pub(crate) mod tests {
             .iter()
             .all(|entry| entry.path != tree.path));
     }
-
-    #[cfg(unix)]
-    pub(crate) fn verify_wsl_seeded(cwd: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let root = Path::new(cwd);
-        let tree = create_seeded(root, "mc/orch-guest-seed").unwrap();
-        let location = crate::wsl::location(&tree.path).unwrap().unwrap();
-        let worker = Path::new(&location.path);
-        assert_eq!(
-            std::fs::read_to_string(worker.join("script.sh")).unwrap(),
-            "worker result\n"
-        );
-        assert!(!worker.join("deleted.txt").exists());
-        assert_eq!(
-            std::fs::metadata(worker.join("mode.sh"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755
-        );
-        assert_eq!(
-            create_seeded(root, "mc/orch-guest-seed").unwrap().path,
-            tree.path
-        );
-        std::fs::write(worker.join("script.sh"), "unexpected edit").unwrap();
-        assert!(create_seeded(root, "mc/orch-guest-seed").is_err());
-        assert_eq!(
-            std::fs::read_to_string(worker.join("script.sh")).unwrap(),
-            "unexpected edit"
-        );
-        remove(root, Path::new(&tree.path), true).unwrap();
-    }
-
     #[test]
     fn orchestration_worktree_starts_from_the_lead_checkout_contents() {
         let repo = repo();

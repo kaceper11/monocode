@@ -1,4 +1,3 @@
-import { wslLocation } from "../../../../shared/lib/paths";
 import { modelContextWindow, nativeModelId } from "../../../../features/sessions/model/models";
 import type { RuntimeMode, TurnMetrics } from "../../../../features/sessions/model/session";
 import { taskListFromToolInput } from "../../../../features/sessions/model/taskList";
@@ -119,7 +118,7 @@ const liveByThread = new Map<string, Live>();
 const resumeByThread = new Map<string, Resume>();
 const cancelledThreads = new Set<string>();
 
-let resolveOpenCodeBinaryImpl: (cwd?: string) => Promise<{ path: string }> =
+let resolveOpenCodeBinaryImpl: (binaryPath?: string | null) => Promise<{ path: string }> =
   resolveOpenCodeBinary;
 
 /** Test seam. */
@@ -169,7 +168,7 @@ export async function compactOpenCodeContext(
   }
   if (cancelledThreads.delete(input.sessionId)) return;
 
-  const model = parseOpenCodeModelSlug(nativeModelId(input.model, input.cwd));
+  const model = parseOpenCodeModelSlug(nativeModelId(input.model));
   if (!model) {
     throw new Error(
       "OpenCode models use provider/model ids. Wait for the catalog to load, then pick a model.",
@@ -252,14 +251,14 @@ export async function steerOpenCodeTurn(input: SteerTurnInput): Promise<void> {
   const live = liveByThread.get(input.sessionId);
   if (!live?.activeTurn) throw new Error("No active turn to steer");
 
-  const parsed = parseOpenCodeModelSlug(nativeModelId(input.model, input.cwd));
+  const parsed = parseOpenCodeModelSlug(nativeModelId(input.model));
   if (!parsed) {
     throw new Error(
       "OpenCode models use provider/model ids. Wait for the catalog to load, then pick a model.",
     );
   }
 
-  const parts = toOpenCodePromptParts(input.text, input.attachments, input.cwd);
+  const parts = toOpenCodePromptParts(input.text, input.attachments);
   if (parts.length === 0) return;
 
   await live.client.promptAsync({
@@ -377,7 +376,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     resumeByThread.delete(input.sessionId);
   }
 
-  const { path } = await resolveOpenCodeBinaryImpl(input.cwd);
+  const { path } = await resolveOpenCodeBinaryImpl();
   await assertOpenCodeVersion(path, input.cwd);
 
   const liveRef: { current: Live | null } = { current: null };
@@ -410,8 +409,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     },
   );
 
-  const serverPassword = wslLocation(input.cwd) ? crypto.randomUUID() : undefined;
-  const port = serverPassword ? 0 : await freeHarnessPort();
+  const port = await freeHarnessPort();
   await spawnChild(
     input.sessionId,
     path,
@@ -419,7 +417,6 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     input.cwd,
     undefined,
     "opencode",
-    ...(serverPassword ? [serverPassword] as const : [] as const),
   );
 
   try {
@@ -428,8 +425,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       () => serverExited,
       SERVER_TIMEOUT_MS,
     );
-    const client = new OpenCodeClient(url, input.cwd, serverPassword);
-    await client.waitUntilReady(() => serverExited === undefined);
+    const client = new OpenCodeClient(url, input.cwd);
     const openCodeSession = await resolveSession(client, {
       resume: canResume ? resume : undefined,
       runtimeMode: input.runtimeMode,
@@ -565,7 +561,7 @@ async function resolveSession(
 }
 
 async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
-  const parsed = parseOpenCodeModelSlug(nativeModelId(input.model, input.cwd));
+  const parsed = parseOpenCodeModelSlug(nativeModelId(input.model));
   if (!parsed) {
     throw new Error(
       "OpenCode models use provider/model ids. Wait for the catalog to load, then pick a model.",

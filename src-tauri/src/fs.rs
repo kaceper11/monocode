@@ -7,7 +7,7 @@ pub struct GitDiffGuard {
     current: String,
 }
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,14 +16,12 @@ use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
 use crate::dirs_home;
-use crate::wsl;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 pub(crate) const MAX_TEXT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) const MAX_ATTACHMENT_EMBED_BYTES: u64 = 20 * 1024 * 1024;
@@ -64,18 +62,6 @@ fn resolve_project_location_sync(
     path: &str,
     identity: Option<&str>,
 ) -> Result<Option<ProjectLocation>, String> {
-    if let Some(location) = wsl::location(path)? {
-        let prefix = format!("wsl:{}:", location.distribution.to_lowercase());
-        let mut result: Option<ProjectLocation> = wsl::files_request(
-            &location,
-            "project_location",
-            json!({"identity": identity.and_then(|value| value.strip_prefix(&prefix))}),
-        )?;
-        if let Some(result) = &mut result {
-            result.identity = format!("{prefix}{}", result.identity);
-        }
-        return Ok(result);
-    }
     let path = expand_home(path);
     if path.is_dir() {
         let identity = directory_identity(&path)?;
@@ -191,9 +177,8 @@ pub struct OmpAssistantText {
 #[tauri::command(async)]
 pub fn omp_session_interjections(
     provider_session_id: String,
-    cwd: Option<String>,
 ) -> Result<Vec<OmpInterjectionAnchor>, String> {
-    let Some(path) = omp_session_path(&provider_session_id, cwd.as_deref())? else {
+    let Some(path) = omp_session_path(&provider_session_id)? else {
         return Ok(Vec::new());
     };
     parse_omp_interjections(&path)
@@ -202,9 +187,8 @@ pub fn omp_session_interjections(
 #[tauri::command(async)]
 pub fn omp_active_assistant_texts(
     provider_session_id: String,
-    cwd: Option<String>,
 ) -> Result<Vec<OmpAssistantText>, String> {
-    let Some(path) = omp_session_path(&provider_session_id, cwd.as_deref())? else {
+    let Some(path) = omp_session_path(&provider_session_id)? else {
         return Ok(Vec::new());
     };
     active_omp_assistant_texts(&path)
@@ -218,7 +202,6 @@ pub fn claude_shell_commands(
     provider_session_id: String,
     provider_account_id: Option<String>,
     tool_ids: Vec<String>,
-    cwd: Option<String>,
 ) -> Result<HashMap<String, String>, String> {
     if provider_session_id.is_empty()
         || !provider_session_id
@@ -230,27 +213,14 @@ pub fn claude_shell_commands(
     if tool_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let guest = cwd.as_deref().map(wsl::location).transpose()?.flatten();
-    if guest.is_some()
-        && provider_account_id
-            .as_deref()
-            .is_some_and(|id| id != "default")
-    {
-        return Err("Named native accounts are unavailable inside WSL".into());
-    }
-    let config_dir = if let Some(location) = guest {
-        wsl::config_path(&location, Some("CLAUDE_CONFIG_DIR"), ".claude")?
-    } else {
-        match provider_account_id.as_deref() {
-            Some(id) if id != "default" => {
-                crate::harness::provider_account_path(&app, "claude", id)?
+    let config_dir = match provider_account_id.as_deref() {
+        Some(id) if id != "default" => crate::harness::provider_account_path(&app, "claude", id)?,
+        _ => match std::env::var_os("CLAUDE_CONFIG_DIR") {
+            Some(path) => PathBuf::from(path),
+            None => {
+                PathBuf::from(dirs_home().ok_or("Home directory is unavailable")?).join(".claude")
             }
-            _ => match std::env::var_os("CLAUDE_CONFIG_DIR") {
-                Some(path) => PathBuf::from(path),
-                None => PathBuf::from(dirs_home().ok_or("Home directory is unavailable")?)
-                    .join(".claude"),
-            },
-        }
+        },
     };
     let transcript_name = format!("{provider_session_id}.jsonl");
     let root = config_dir.join("projects");
@@ -309,10 +279,7 @@ fn claude_shell_commands_from_file(
     Ok(commands)
 }
 
-fn omp_session_path(
-    provider_session_id: &str,
-    cwd: Option<&str>,
-) -> Result<Option<PathBuf>, String> {
+fn omp_session_path(provider_session_id: &str) -> Result<Option<PathBuf>, String> {
     if provider_session_id.is_empty()
         || !provider_session_id
             .bytes()
@@ -320,15 +287,10 @@ fn omp_session_path(
     {
         return Err("Invalid OMP provider session id".into());
     }
-    let guest = cwd.map(wsl::location).transpose()?.flatten();
-    let root = if let Some(location) = guest {
-        wsl::config_path(&location, None, ".omp/agent/sessions")?
-    } else {
-        dirs_home()
-            .map(PathBuf::from)
-            .ok_or("Home directory is unavailable")?
-            .join(".omp/agent/sessions")
-    };
+    let root = dirs_home()
+        .map(PathBuf::from)
+        .ok_or("Home directory is unavailable")?
+        .join(".omp/agent/sessions");
     Ok(find_omp_session_file(&root, provider_session_id))
 }
 
@@ -577,9 +539,6 @@ fn parse_omp_interjections(path: &Path) -> Result<Vec<OmpInterjectionAnchor>, St
 /// Immediate children of `path` (project tree). Folders first, then files.
 #[tauri::command(async)]
 pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
-    if let Some(location) = wsl::location(&path)? {
-        return wsl::files_request(&location, "list", json!({}));
-    }
     list_dir_sync(&expand_home(&path))
 }
 
@@ -708,9 +667,6 @@ pub(crate) fn list_project_files_sync_cancellable(
 ) -> Result<Vec<ProjectFile>, String> {
     if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
         return Ok(Vec::new());
-    }
-    if let Some(location) = wsl::location(cwd)? {
-        return wsl::files_request_cancellable(&location, "files", json!({}), cancel);
     }
     let root = expand_home(cwd);
     if !root.is_dir() {
@@ -869,16 +825,9 @@ pub(crate) fn git_info_for(root: &Path) -> GitInfo {
 }
 
 fn git_info_uncached(root: &Path) -> GitInfo {
-    let location = wsl::path_location(root).ok().flatten();
     let Some(top) = git_stdout(root, &["rev-parse", "--show-toplevel"])
-        .and_then(|path| match &location {
-            Some(host) => host
-                .with_path(&path)
-                .ok()
-                .map(|path| PathBuf::from(path.identity())),
-            None => Some(PathBuf::from(path)),
-        })
-        .filter(|path| location.is_some() || path.is_dir())
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
     else {
         return GitInfo {
             branch: None,
@@ -1325,7 +1274,7 @@ pub struct GitPrCheck {
 /// Check runs on a pull request — `gh pr view --json statusCheckRollup`,
 /// not `gh pr checks`: that command exits non-zero (8 pending, 1 failing)
 /// while still printing results, which reads as "no checks" and loses
-/// stdout entirely through the WSL bridge. `pr_url` targets an exact PR —
+/// stdout entirely. `pr_url` targets an exact PR —
 /// the same pin `git_pr_status` takes.
 #[tauri::command]
 pub async fn git_pr_checks(cwd: String, pr_url: Option<String>) -> Result<Vec<GitPrCheck>, String> {
@@ -2526,7 +2475,7 @@ fn git_diff_index_with(root: &Path, include_sync: bool) -> GitDiffIndex {
             "untracked"
         } else if let Some(status) = statuses.get(&relative) {
             *status
-        } else if wsl::path_location(root).ok().flatten().is_none() && !abs.exists() {
+        } else if !abs.exists() {
             "deleted"
         } else {
             "modified"
@@ -2621,27 +2570,6 @@ fn add_untracked_map(root: &Path, files: &mut HashMap<String, FileAcc>, count_li
     ) else {
         return;
     };
-    let remote_counts: Option<HashMap<String, i64>> = wsl::path_location(root)
-        .ok()
-        .flatten()
-        .filter(|_| count_lines)
-        .map(|_| {
-            let paths: Vec<_> = stdout
-                .split('\0')
-                .filter(|rel| !rel.is_empty())
-                .map(|rel| path_to_js(&host_path(root, rel)))
-                .collect();
-            wsl::file_batches::<serde_json::Value>(&paths, "line_counts")
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|value| {
-                    Some((
-                        value["path"].as_str()?.to_string(),
-                        value["lines"].as_i64().unwrap_or(0),
-                    ))
-                })
-                .collect()
-        });
     for rel in stdout.split('\0') {
         if rel.is_empty() {
             continue;
@@ -2650,10 +2578,7 @@ fn add_untracked_map(root: &Path, files: &mut HashMap<String, FileAcc>, count_li
         let entry = files.entry(relative.clone()).or_default();
         entry.untracked = true;
         if count_lines && entry.additions == 0 {
-            entry.additions = match &remote_counts {
-                Some(counts) => *counts.get(&path_to_js(&host_path(root, rel))).unwrap_or(&0),
-                None => text_line_count(&host_path(root, rel)),
-            };
+            entry.additions = text_line_count(&host_path(root, rel));
         }
     }
 }
@@ -2751,24 +2676,12 @@ fn git_file_diff_for(root: &Path, relative: &str, staged: bool) -> Result<GitFil
             false,
         )
     } else {
-        let (current, large) = if let Some(location) = wsl::path_location(&abs)? {
-            use base64::Engine;
-            let value: serde_json::Value =
-                wsl::request(&location, "diff_file", serde_json::json!({}))?;
-            let data = base64::engine::general_purpose::STANDARD
-                .decode(value["data"].as_str().ok_or("Missing WSL diff contents")?)
-                .map_err(|e| e.to_string())?;
-            let is_file = value["isFile"].as_bool().ok_or("Missing WSL file state")?;
-            (is_file.then_some(data), value["tooLarge"] == true)
+        let current = if abs.is_file() {
+            Some(std::fs::read(&abs).unwrap_or_default())
         } else {
-            let current = if abs.is_file() {
-                Some(std::fs::read(&abs).unwrap_or_default())
-            } else {
-                None
-            };
-            (current, false)
+            None
         };
-        (git_blob(root, &index_spec), current, large)
+        (git_blob(root, &index_spec), current, false)
     };
     let had_original = original.is_some();
     let had_current = current.is_some();
@@ -3155,13 +3068,7 @@ fn git_index_mode(root: &Path, relative: &str) -> Option<String> {
 }
 
 fn git_hash_object(root: &Path, relative: &str, contents: &[u8]) -> Result<String, String> {
-    let output = if let Some(location) = wsl::path_location(root)? {
-        wsl::git(
-            &location,
-            &["hash-object", "-w", "--path", relative, "--stdin"],
-            Some(contents),
-        )?
-    } else {
+    let output = {
         let mut child = git_cmd()
             .arg("--no-pager")
             .arg("-C")
@@ -3211,9 +3118,6 @@ fn git_discard_file_for(root: &Path, relative: &str) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
     let abs = host_path(root, &relative);
     if git_checked(root, &["ls-files", "--error-unmatch", "--", &relative]).is_err() {
-        if wsl::path_location(root)?.is_some() {
-            return git_checked(root, &["clean", "-fd", "--", &relative]);
-        }
         if abs.is_file() {
             std::fs::remove_file(&abs).map_err(|e| e.to_string())?;
         } else if abs.exists() {
@@ -5137,46 +5041,6 @@ pub(crate) fn gh_checked(root: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn gh_run(root: &Path, args: &[&str], allow_empty: bool) -> Result<String, String> {
-    if let Some(location) = wsl::path_location(root)? {
-        let mut linux_args: Vec<String> = args.iter().map(|arg| (*arg).into()).collect();
-        // Existing comment/PR flows prepare a body file in the UI host's temp
-        // directory. Send that explicit body on stdin, never its Windows path.
-        let source = if let Some(index) = args
-            .iter()
-            .position(|arg| *arg == "--body-file" || *arg == "--input")
-        {
-            Some((
-                index + 1,
-                *args.get(index + 1).ok_or("Missing GitHub body file")?,
-                "-",
-            ))
-        } else {
-            args.iter().enumerate().find_map(|(index, arg)| {
-                arg.strip_prefix("body=@")
-                    .map(|path| (index, path, "body=@-"))
-            })
-        };
-        let body = if let Some((index, path, replacement)) = source {
-            let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-            let mut body = String::new();
-            file.take(MAX_TEXT_FILE_BYTES + 1)
-                .read_to_string(&mut body)
-                .map_err(|e| e.to_string())?;
-            if body.len() as u64 > MAX_TEXT_FILE_BYTES {
-                return Err("GitHub body exceeds 8 MiB".into());
-            }
-            linux_args[index] = replacement.into();
-            Some(body)
-        } else {
-            None
-        };
-        let output: String =
-            wsl::request(&location, "gh", json!({"args":linux_args, "body":body}))?;
-        if output.is_empty() && !allow_empty {
-            return Err("gh returned no output".into());
-        }
-        return Ok(output);
-    }
     let program = crate::harness::resolve_gui_binary("gh")
         .ok_or_else(|| "GitHub CLI (`gh`) is not installed.".to_string())?;
     let mut cmd = Command::new(&program);
@@ -5270,11 +5134,8 @@ pub(crate) fn git_checked(root: &Path, args: &[&str]) -> Result<(), String> {
 
 /// Remote-touching git ops (fetch/push/pull) wait on the network — a stalled
 /// remote or a credential prompt must not park the spawn_blocking worker
-/// forever. WSL requests carry their own timeout.
+/// forever.
 fn git_remote_output(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    if let Some(location) = wsl::path_location(root)? {
-        return wsl::git(&location, args, None);
-    }
     let mut command = git_command(root, args);
     crate::bounded_process::output(
         &mut command,
@@ -5333,23 +5194,6 @@ pub(crate) fn git_output_capped(
 ) -> Option<(Vec<u8>, bool)> {
     if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
         return None;
-    }
-    if let Some(location) = wsl::path_location(root).ok().flatten() {
-        let arguments = json!({"args":args,"maxOutput":max_bytes});
-        let result: Value = if let Some(cancel) = cancel {
-            wsl::request_cancellable(&location, "git", arguments, cancel).ok()?
-        } else {
-            wsl::request(&location, "git", arguments).ok()?
-        };
-        if !matches!(result["code"].as_i64(), Some(0 | 1)) {
-            return None;
-        }
-        let mut bytes = base64::engine::general_purpose::STANDARD
-            .decode(result["stdout"].as_str()?)
-            .ok()?;
-        let capped = result["capped"].as_bool().unwrap_or(false);
-        bytes.truncate(max_bytes);
-        return Some((bytes, capped));
     }
     let mut child = git_cmd()
         .arg("--no-pager")
@@ -6023,9 +5867,6 @@ fn already_exists(label: &str) -> String {
 /// nest. Returns the created path.
 #[tauri::command(async)]
 pub fn create_path(parent: String, name: String, is_dir: bool) -> Result<String, String> {
-    if let Some(location) = wsl::location(&parent)? {
-        return wsl::path_request(&location, "create", json!({"name":name,"isDir":is_dir}));
-    }
     let parent_dir = expand_home(&parent);
     let dest = resolve_under(&parent_dir, &name)?;
     let label = file_label(&dest, &name);
@@ -6155,17 +5996,6 @@ fn clone_repo_sync(url: &str, parent: &str) -> Result<String, String> {
         return Err("Enter an https, ssh, or git URL".into());
     }
     let name = repo_name(url)?;
-    if let Some(location) = wsl::location(parent)? {
-        let destination =
-            location.with_path(&format!("{}/{}", location.path.trim_end_matches('/'), name))?;
-        let target = wsl::path_request(&destination, "new_path", json!({}))?;
-        let target_location = wsl::location(&target)?.ok_or("Missing WSL clone destination")?;
-        git_checked(
-            Path::new(parent),
-            &["clone", "--", url, &target_location.path],
-        )?;
-        return wsl::path_request(&target_location, "canonical", json!({}));
-    }
     let dest = expand_home(parent).join(&name);
     if dest.exists() {
         return Err(format!("{} already exists", dest.display()));
@@ -6221,13 +6051,6 @@ pub fn read_file_preview(
     max_lines: usize,
     start_line: Option<usize>,
 ) -> Result<Vec<String>, String> {
-    if let Some(location) = wsl::location(&path)? {
-        return wsl::request(
-            &location,
-            "preview",
-            json!({"start":start_line.unwrap_or(1),"count":max_lines}),
-        );
-    }
     use std::io::{BufRead, BufReader};
 
     let path = expand_home(&path);
@@ -6284,24 +6107,14 @@ pub fn stat_files(paths: Vec<String>) -> Result<Vec<FileMtime>, String> {
     if paths.len() > MAX_STAT_FILES {
         return Err("Too many paths".into());
     }
-    let mut guest: HashMap<String, VecDeque<FileMtime>> = HashMap::new();
-    for item in wsl::file_batches::<FileMtime>(&paths, "stat")? {
-        guest.entry(item.path.clone()).or_default().push_back(item);
-    }
     let mut result = Vec::with_capacity(paths.len());
     for path in paths {
-        if wsl::location(&path)?.is_some() {
-            if let Some(item) = guest.get_mut(&path).and_then(VecDeque::pop_front) {
-                result.push(item);
-            }
-        } else {
-            let expanded = expand_home(&path);
-            let mtime_ms = std::fs::metadata(&expanded)
-                .ok()
-                .filter(|meta| meta.is_file())
-                .and_then(|meta| file_mtime_ms(&meta));
-            result.push(FileMtime { path, mtime_ms });
-        }
+        let expanded = expand_home(&path);
+        let mtime_ms = std::fs::metadata(&expanded)
+            .ok()
+            .filter(|meta| meta.is_file())
+            .and_then(|meta| file_mtime_ms(&meta));
+        result.push(FileMtime { path, mtime_ms });
     }
     Ok(result)
 }
@@ -6318,18 +6131,9 @@ pub struct PathInfo {
 /// Metadata for files the composer is attaching (picker, drop, paste).
 #[tauri::command(async)]
 pub fn inspect_paths(paths: Vec<String>) -> Result<Vec<PathInfo>, String> {
-    let mut guest: HashMap<String, VecDeque<PathInfo>> = HashMap::new();
-    for item in wsl::file_batches::<PathInfo>(&paths, "inspect")? {
-        guest.entry(item.path.clone()).or_default().push_back(item);
-    }
     let mut result = Vec::with_capacity(paths.len());
     for path in paths {
-        let item = if wsl::location(&path)?.is_some() {
-            guest.get_mut(&path).and_then(VecDeque::pop_front)
-        } else {
-            inspect_path_sync(&path)
-        };
-        if let Some(item) = item {
+        if let Some(item) = inspect_path_sync(&path) {
             result.push(item);
         }
     }
@@ -6361,13 +6165,6 @@ pub async fn read_file_base64(path: String) -> Result<String, String> {
 }
 
 fn read_file_base64_sync(path: &str) -> Result<String, String> {
-    if let Some(location) = wsl::location(path)? {
-        return wsl::request(
-            &location,
-            "read",
-            json!({"limit":MAX_ATTACHMENT_EMBED_BYTES}),
-        );
-    }
     let path = expand_home(path);
     let meta = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !meta.is_file() {
@@ -6400,13 +6197,6 @@ pub async fn read_binary_file(path: String) -> Result<tauri::ipc::Response, Stri
 }
 
 fn read_binary_file_sync(path: &str) -> Result<Vec<u8>, String> {
-    if let Some(location) = wsl::location(path)? {
-        use base64::Engine;
-        let encoded: String = wsl::request(&location, "read", json!({"limit":MAX_PREVIEW_BYTES}))?;
-        return base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|e| e.to_string());
-    }
     let path = expand_home(path);
     let meta = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !meta.is_file() {
@@ -6423,23 +6213,10 @@ fn read_binary_file_sync(path: &str) -> Result<Vec<u8>, String> {
 
 /// Persist a pasted blob so non-image attachments have a real path.
 #[tauri::command]
-pub async fn write_attachment(
-    name: String,
-    data: String,
-    cwd: Option<String>,
-) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        if let Some(location) = cwd.as_deref().map(wsl::location).transpose()?.flatten() {
-            return wsl::path_request(
-                &location,
-                "attachment",
-                json!({"name":safe_attachment_name(&name), "data":data}),
-            );
-        }
-        write_attachment_sync(&name, &data)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+pub async fn write_attachment(name: String, data: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || write_attachment_sync(&name, &data))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn write_attachment_sync(name: &str, data: &str) -> Result<String, String> {
@@ -6608,9 +6385,6 @@ pub async fn read_text_file(path: String) -> Result<String, String> {
 }
 
 fn read_text_file_sync(path: &str) -> Result<String, String> {
-    if let Some(location) = wsl::location(path)? {
-        return wsl::request(&location, "read_text", json!({}));
-    }
     let path = expand_home(path);
     let meta = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !meta.is_file() {
@@ -6645,10 +6419,6 @@ fn write_text_file_sync(path: &str, content: &str) -> Result<(), String> {
             MAX_TEXT_FILE_BYTES / 1024 / 1024
         ));
     }
-    if let Some(location) = wsl::location(path)? {
-        return wsl::request(&location, "write_text", json!({"content":content}));
-    }
-
     let requested = expand_home(path);
     let destination = if requested.exists() {
         std::fs::canonicalize(&requested).map_err(|e| format!("{}: {e}", requested.display()))?
@@ -6787,9 +6557,6 @@ fn copy_recursive(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 fn rename_path_sync(path: &str, name: &str) -> Result<String, String> {
-    if let Some(location) = wsl::location(path)? {
-        return wsl::path_request(&location, "rename", json!({"name":name}));
-    }
     let from = expand_home(path);
     if !from.exists() {
         return Err(format!("{}: No such file or directory", from.display()));
@@ -6839,9 +6606,6 @@ pub async fn rename_path(path: String, name: String) -> Result<String, String> {
 }
 
 fn delete_path_sync(path: &str) -> Result<(), String> {
-    if let Some(location) = wsl::location(path)? {
-        return wsl::request(&location, "delete", json!({}));
-    }
     let path = expand_home(path);
     if !path.exists() {
         return Err(format!("{}: No such file or directory", path.display()));
@@ -6868,9 +6632,6 @@ fn dir_contains(dir: &Path, dest_parent: &Path) -> bool {
 }
 
 fn copy_path_sync(from: &str, dest_parent: &str) -> Result<String, String> {
-    if let Some(path) = wsl::transfer_path(from, dest_parent, "copy")? {
-        return Ok(path);
-    }
     let from = expand_home(from);
     if !from.exists() {
         return Err(format!("{}: No such file or directory", from.display()));
@@ -6899,9 +6660,6 @@ pub async fn copy_path(from: String, dest_parent: String) -> Result<String, Stri
 }
 
 fn move_path_sync(from: &str, dest_parent: &str) -> Result<String, String> {
-    if let Some(path) = wsl::transfer_path(from, dest_parent, "move")? {
-        return Ok(path);
-    }
     let from = expand_home(from);
     if !from.exists() {
         return Err(format!("{}: No such file or directory", from.display()));
@@ -6935,12 +6693,7 @@ pub async fn move_path(from: String, dest_parent: String) -> Result<String, Stri
 #[tauri::command]
 pub fn reveal_path(path: String) -> Result<(), String> {
     let path = expand_home(&path);
-    if let Some(location) = wsl::path_location(&path)? {
-        if !cfg!(windows) {
-            return Err("Reveal WSL files from the native Windows app".into());
-        }
-        let _: String = wsl::request(&location, "canonical", json!({}))?;
-    } else if !path.exists() {
+    if !path.exists() {
         return Err(format!("{}: No such file or directory", path.display()));
     }
     #[cfg(target_os = "macos")]
@@ -6988,15 +6741,6 @@ pub fn reveal_path(path: String) -> Result<(), String> {
 }
 
 pub(crate) fn host_path(root: &Path, relative: &str) -> PathBuf {
-    if let Ok(Some(location)) = wsl::path_location(root) {
-        // Build the full identity before Windows parses it; a Linux leaf such
-        // as C:notes must never replace the repository with a Windows drive.
-        return PathBuf::from(format!(
-            "{}/{}",
-            location.identity().trim_end_matches('/'),
-            relative
-        ));
-    }
     root.join(relative)
 }
 
@@ -7016,9 +6760,6 @@ pub(crate) fn git_command_output(
     root: &Path,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
-    if let Some(location) = wsl::path_location(root)? {
-        return wsl::git(&location, args, None);
-    }
     git_command(root, args).output().map_err(|e| e.to_string())
 }
 

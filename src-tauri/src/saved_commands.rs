@@ -35,24 +35,6 @@ pub(crate) fn windows_args(shell: &str, exec: &str) -> Vec<String> {
     }
 }
 
-/// The command stays one positional argument through the WSL bootstrap.
-#[cfg(any(windows, test))]
-pub(crate) fn wsl_shell_args(exec: &str) -> Vec<String> {
-    [
-        "TERM=xterm-256color",
-        "COLORTERM=truecolor",
-        "TERM_PROGRAM=MonoCode",
-        "/bin/sh",
-        "-c",
-        "exec \"${SHELL:-/bin/sh}\" -l -c \"$1\"",
-        "monocode-exec",
-        exec,
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,10 +57,6 @@ mod tests {
     #[test]
     fn shell_arguments_keep_user_text_as_one_argument() {
         let command = "echo 'quoted'; echo \"$HOME\"\nexit 9";
-        assert_eq!(
-            wsl_shell_args(command).last().map(String::as_str),
-            Some(command)
-        );
         assert_eq!(
             windows_args("C:\\Windows\\System32\\cmd.exe", command),
             ["/d", "/s", "/c", command]

@@ -14,7 +14,6 @@ import {
   RUNTIME_MODES,
   type HarnessId,
   type Session,
-  sessionWorkCwd,
 } from "../../sessions/model/session";
 import {
   loadSessionFolders,
@@ -203,17 +202,16 @@ function startLaunch(
   if (!HARNESSES.includes(harness as HarnessId))
     throw new Error("Unknown harness; run models.list for available providers");
   const chosenHarness = harness as HarnessId;
-  if (!isHarnessAvailable(chosenHarness, sessionWorkCwd(source)))
+  if (!isHarnessAvailable(chosenHarness))
     throw new Error(`${chosenHarness} is not available in MonoCode`);
   const requestedModel = optionalString(input.model, "model");
   const model = requestedModel
-    ? modelsFor(chosenHarness, sessionWorkCwd(source)).find((entry) => entry.id === requestedModel)
+    ? modelsFor(chosenHarness).find((entry) => entry.id === requestedModel)
     : resolveModel(
         chosenHarness,
         chosenHarness === source.harness
           ? source.model
-          : preferredModelId(chosenHarness, sessionWorkCwd(source)),
-        sessionWorkCwd(source),
+          : preferredModelId(chosenHarness),
       );
   if (!model || model.harness !== chosenHarness)
     throw new Error("Unknown model; run models.list for exact model IDs");
@@ -301,8 +299,8 @@ export async function handleAgentApp(
         })),
         harnesses: HARNESSES.map((harness) => ({
           id: harness,
-          available: isHarnessAvailable(harness, sessionWorkCwd(source)),
-          models: modelsFor(harness, sessionWorkCwd(source)).map((model) => ({
+          available: isHarnessAvailable(harness),
+          models: modelsFor(harness).map((model) => ({
             id: model.id,
             name: model.name,
             settings: model.settings ?? [],

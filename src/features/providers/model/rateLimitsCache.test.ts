@@ -3,24 +3,18 @@ vi.mock("./rateLimitsFetch", () => ({ fetchClaudeRateLimits: vi.fn(), fetchCodex
 import { clearCachedRateLimits, getCachedRateLimits, setCachedRateLimits } from "./rateLimitsCache";
 import { idleRateLimits } from "./rateLimits";
 afterEach(() => clearCachedRateLimits());
-it("keeps native and WSL account usage separate and clears every host on account removal", () => {
-  const guest = "//wsl.localhost/Ubuntu/work";
-  const native = { ...idleRateLimits("codex"), error: "native" };
-  const wsl = { ...idleRateLimits("codex"), error: "guest" };
-  setCachedRateLimits("codex", "work", native);
-  setCachedRateLimits("codex", "work", wsl, guest);
-  expect(getCachedRateLimits("codex", "work")).toBe(native);
-  expect(getCachedRateLimits("codex", "work", "//wsl.localhost/ubuntu/other")).toBe(wsl);
-  expect(getCachedRateLimits("codex", "work", "//wsl.localhost/Debian/work")).not.toBe(wsl);
+it("clears a removed account's cached usage", () => {
+  const cached = { ...idleRateLimits("codex"), error: "cached" };
+  setCachedRateLimits("codex", "work", cached);
+  expect(getCachedRateLimits("codex", "work")).toBe(cached);
   clearCachedRateLimits("codex", "work");
-  expect(getCachedRateLimits("codex", "work")).not.toBe(native);
-  expect(getCachedRateLimits("codex", "work", guest)).not.toBe(wsl);
+  expect(getCachedRateLimits("codex", "work")).not.toBe(cached);
 });
 it("keeps Muse's session quota snapshots separate", () => {
   const first = { ...idleRateLimits("muse"), error: "first" };
   const second = { ...idleRateLimits("muse"), error: "second" };
-  setCachedRateLimits("muse", "default", first, "/work", "first");
-  setCachedRateLimits("muse", "default", second, "/work", "second");
-  expect(getCachedRateLimits("muse", "default", "/work", "first")).toBe(first);
-  expect(getCachedRateLimits("muse", "default", "/work", "second")).toBe(second);
+  setCachedRateLimits("muse", "default", first, "first");
+  setCachedRateLimits("muse", "default", second, "second");
+  expect(getCachedRateLimits("muse", "default", "first")).toBe(first);
+  expect(getCachedRateLimits("muse", "default", "second")).toBe(second);
 });

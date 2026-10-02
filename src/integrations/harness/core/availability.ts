@@ -1,5 +1,3 @@
-import { wslStatusFor } from "../../../features/sessions/model/wslStatus";
-import { wslLocation } from "../../../shared/lib/paths";
 import type { HarnessId } from "../../../features/sessions/model/session";
 import { HARNESSES } from "../../../features/sessions/model/session";
 import {
@@ -16,7 +14,6 @@ import {
   resolveOmpBinary,
   resolveOpenCodeBinary,
   resolvePiBinary,
-  resolveWslAgents,
 } from "./child";
 import { isLiveHarness } from "./registry";
 import {
@@ -97,12 +94,13 @@ type Probe = {
   probedAt: number;
   inflight: Promise<void> | null;
 };
-const probes = new Map<string, Probe>();
-function hostKey(cwd?: string): string {
-  return cwd && wslLocation(cwd)
-    ? `wsl:${wslLocation(cwd)!.distribution.toLowerCase()}`
-    : "native";
-}
+const probe: Probe = {
+  availability: { ...emptyAvailability },
+  authenticated: {},
+  errors: {},
+  probedAt: 0,
+  inflight: null,
+};
 
 /**
  * A probe stats ~100 paths across the per-provider resolvers. The model picker and the
@@ -112,72 +110,44 @@ function hostKey(cwd?: string): string {
  */
 const PROBE_TTL_MS = 30_000;
 
-export function hasProbedHarnessAvailability(cwd?: string): boolean {
-  return (probes.get(hostKey(cwd))?.probedAt ?? 0) > 0;
+export function hasProbedHarnessAvailability(): boolean {
+  return probe.probedAt > 0;
 }
 
-export function isHarnessAvailable(id: HarnessId, cwd?: string): boolean {
-  return probes.get(hostKey(cwd))?.availability[id] ?? false;
+export function isHarnessAvailable(id: HarnessId): boolean {
+  return probe.availability[id] ?? false;
 }
 
-export function invalidateHarnessAvailability(cwd: string) {
-  probes.delete(hostKey(cwd));
+export function invalidateHarnessAvailability() {
+  probe.probedAt = 0;
   emitHarnessAvailability();
 }
 
-export function harnessProbeError(cwd?: string): string | undefined {
-  return Object.values(probes.get(hostKey(cwd))?.errors ?? {}).find(Boolean);
+export function harnessProbeError(): string | undefined {
+  return Object.values(probe.errors).find(Boolean);
 }
 
-export function harnessUnavailableHint(id: HarnessId, cwd?: string): string {
-  const error = probes.get(hostKey(cwd))?.errors[id];
+export function harnessUnavailableHint(id: HarnessId): string {
+  const error = probe.errors[id];
   if (error) return error;
-  if (cwd && wslLocation(cwd)) {
-    return `${CLI[id].name} is unavailable in ${wslLocation(cwd)!.distribution}. Install its Linux CLI, reconnect WSL and retry.`;
-  }
   const { name, install } = CLI[id];
   const how = install ? ` (\`${install}\`)` : "";
   return `${name} not found${how}. Install it, or restart MonoCode if it is already installed.`;
 }
 
 /** Sign-in guidance when the provider is installed but provably signed out. */
-export function harnessAuthHint(id: HarnessId, cwd?: string): string | undefined {
-  const location = cwd ? wslLocation(cwd) : undefined;
-  if (probes.get(hostKey(cwd))?.authenticated[id] !== false) return undefined;
-  const where = location ? ` in ${location.distribution}` : "";
+export function harnessAuthHint(id: HarnessId): string | undefined {
+  if (probe.authenticated[id] !== false) return undefined;
   const command = SIGN_IN[id];
   const how = command
-    ? `Run \`${command}\`${location ? " inside the distribution" : ""}, then refresh.`
-    : `Sign in to the provider${where}, then refresh.`;
-  return `${CLI[id].name} is installed${where} but not signed in. ${how}`;
+    ? `Run \`${command}\`, then refresh.`
+    : `Sign in to the provider, then refresh.`;
+  return `${CLI[id].name} is installed but not signed in. ${how}`;
 }
 
 export function probeHarnessAvailability(options?: {
   force?: boolean;
-  cwd?: string;
 }): Promise<void> {
-  const distribution = wslLocation(options?.cwd ?? "")?.distribution;
-  if (distribution && wslStatusFor(distribution).state !== "connected") return Promise.resolve();
-  const key = hostKey(options?.cwd);
-  let probe = probes.get(key);
-  if (!probe) {
-    // One native host plus four WSL distributions; discard only cached probes.
-    if (key !== "native" && probes.size - Number(probes.has("native")) >= 4) {
-      const oldest = [...probes]
-        .filter(([host, value]) => host !== "native" && !value.inflight)
-        .sort((a, b) => a[1].probedAt - b[1].probedAt)[0];
-      if (!oldest) return Promise.resolve();
-      probes.delete(oldest[0]);
-    }
-    probe = {
-      availability: { ...emptyAvailability },
-      authenticated: {},
-      errors: {},
-      probedAt: 0,
-      inflight: null,
-    };
-    probes.set(key, probe);
-  }
   if (probe.inflight) return probe.inflight;
   if (
     !options?.force &&
@@ -185,51 +155,9 @@ export function probeHarnessAvailability(options?: {
     Date.now() - probe.probedAt < PROBE_TTL_MS
   )
     return Promise.resolve();
-  const current = probe;
-  current.errors = {};
-  current.authenticated = {};
-  const finish = () => {
-    current.probedAt = Date.now();
-    current.inflight = null;
-    if (key === "native") {
-      // The extracted store backs model-layer reads that are not host-scoped.
-      setHarnessAvailability(current.availability);
-      markHarnessAvailabilityProbed();
-    }
-    emitHarnessAvailability();
-  };
-  const location = options?.cwd ? wslLocation(options.cwd) : undefined;
-  if (options?.cwd && location) {
-    const cwd = options.cwd;
-    // One bridged round trip replaces the serialized resolver requests.
-    current.inflight = resolveWslAgents(cwd)
-      .then((resolved) => {
-        if (probes.get(key) !== current) return;
-        for (const id of HARNESSES) {
-          const entry = resolved[id];
-          current.availability[id] = isLiveHarness(id) && Boolean(entry?.path);
-          if (entry?.path) {
-            if (entry.authenticated != null)
-              current.authenticated[id] = entry.authenticated;
-          } else {
-            current.errors[id] =
-              entry?.error ??
-              `${CLI[id].name} is unavailable in ${location.distribution}.`;
-          }
-        }
-      })
-      .catch((error: unknown) => {
-        if (probes.get(key) !== current) return;
-        const message = String(error);
-        for (const id of HARNESSES) {
-          current.availability[id] = false;
-          current.errors[id] = message;
-        }
-      })
-      .finally(finish);
-    return current.inflight;
-  }
-  const resolvers: Record<HarnessId, (cwd?: string) => Promise<unknown>> = {
+  probe.errors = {};
+  probe.authenticated = {};
+  const resolvers: Record<HarnessId, () => Promise<unknown>> = {
     cursor: resolveCursorBinary,
     claude: resolveClaudeBinary,
     codex: resolveCodexBinary,
@@ -244,12 +172,11 @@ export function probeHarnessAvailability(options?: {
     muse: resolveMuseBinary,
     antigravity: resolveAntigravityBinary,
   };
-  current.inflight = Promise.all(
+  probe.inflight = Promise.all(
     HARNESSES.map(async (id) => {
       if (!isLiveHarness(id)) return [id, false] as const;
       try {
-        if (options?.cwd) await resolvers[id](options.cwd);
-        else await resolvers[id]();
+        await resolvers[id]();
         return [id, true] as const;
       } catch {
         return [id, false] as const;
@@ -257,12 +184,17 @@ export function probeHarnessAvailability(options?: {
     }),
   )
     .then((entries) => {
-      if (probes.get(key) !== current) return;
-      current.availability = {
+      probe.availability = {
         ...emptyAvailability,
         ...Object.fromEntries(entries),
       };
     })
-    .finally(finish);
-  return current.inflight;
+    .finally(() => {
+      probe.probedAt = Date.now();
+      probe.inflight = null;
+      setHarnessAvailability(probe.availability);
+      markHarnessAvailabilityProbed();
+      emitHarnessAvailability();
+    });
+  return probe.inflight;
 }

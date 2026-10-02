@@ -305,7 +305,7 @@ function AgentTranscriptComponent({
     if (lastUserId && !anchorTurn) setAnchorTurn(true);
   }
   const currentModelName = harness
-    ? resolveModel(harness, model, cwd).name
+    ? resolveModel(harness, model).name
     : undefined;
   const waitingForApproval = hasPendingApproval(blocks) || pendingQuestion;
   const preparingHandoff = blocks.some(
@@ -949,7 +949,6 @@ function AgentTranscriptComponent({
                 : null}
               {durationMs != null && settled ? (
                 <TurnDuration
-                  cwd={cwd}
                   elapsedMs={durationMs}
                   metrics={userBlock?.turnMetrics}
                   labelHidden={showFoldLine}
@@ -1064,7 +1063,6 @@ function backgroundLabel(tasks: string[]): string {
  * to the last, so it is not repeated here.
  */
 function TurnDuration({
-  cwd,
   elapsedMs,
   metrics,
   labelHidden = false,
@@ -1078,7 +1076,6 @@ function TurnDuration({
   onSecondOpinion,
   onHandoff,
 }: {
-  cwd?: string;
   elapsedMs: number | null;
   metrics?: TurnMetrics;
   /** True when the fold line above already keeps the time for this turn. */
@@ -1118,11 +1115,10 @@ function TurnDuration({
           <Check className="size-3.5" strokeWidth={1.75} />
         )}
         {fromHarness && onHandoff ? (
-          <HandoffButton cwd={cwd} from={fromHarness} onPick={onHandoff} />
+          <HandoffButton from={fromHarness} onPick={onHandoff} />
         ) : null}
         {fromHarness && onSecondOpinion ? (
           <SecondOpinionButton
-            cwd={cwd}
             from={fromHarness}
             fromModel={fromModel}
             onPick={onSecondOpinion}
@@ -1524,7 +1520,6 @@ const TranscriptBlock = memo(function TranscriptBlock({
     return (
       <div className={embedded ? "py-1" : "px-4 py-1"}>
         <PlanPreview
-          cwd={cwd}
           text={block.text}
           streaming={block.streaming}
           busy={planBusy}

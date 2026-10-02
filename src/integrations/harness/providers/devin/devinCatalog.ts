@@ -22,8 +22,8 @@ import {
 const DISCOVERY_TIMEOUT_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 12_000;
 
-export function refreshDevinCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("devin", cwd, discoverDevinModels);
+export function refreshDevinCatalog(): Promise<void> {
+  return refreshModelCatalog("devin", discoverDevinModels);
 }
 
 /**
@@ -41,14 +41,14 @@ async function discoverDevinModels(projectCwd?: string) {
 }
 
 async function discoverViaCli(projectCwd?: string) {
-  const { path } = await resolveDevinBinary(projectCwd);
+  const { path } = await resolveDevinBinary();
   const cwd = projectCwd ?? (await homeDir());
   const stdout = await execChild(path, ["models", "list", "--format", "json"], cwd, "devin");
   return devinModelsFromOutput(stdout);
 }
 
 async function discoverViaAcp(projectCwd?: string) {
-  const { path } = await resolveDevinBinary(projectCwd);
+  const { path } = await resolveDevinBinary();
   const cwd = projectCwd ?? (await homeDir());
   const PROBE_ID = `monocode-devin-probe-${crypto.randomUUID()}`;
   const acp = new AcpClient(PROBE_ID, {

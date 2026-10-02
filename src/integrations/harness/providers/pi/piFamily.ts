@@ -133,7 +133,7 @@ type FlavorState = {
   liveByThread: Map<string, Live>;
   resumeByThread: Map<string, Resume>;
   cancelledThreads: Set<string>;
-  resolveBinary: (cwd?: string) => Promise<{ path: string }>;
+  resolveBinary: () => Promise<{ path: string }>;
   commandListeners: Map<string, Set<(commands: NativeCommand[]) => void>>;
 };
 
@@ -480,8 +480,8 @@ async function startLive(
 ): Promise<Live> {
   const state = stateFor(flavor);
   const { liveByThread } = state;
-  const { path } = await state.resolveBinary(input.cwd);
-  const native = nativeModelId(input.model, input.cwd);
+  const { path } = await state.resolveBinary();
+  const native = nativeModelId(input.model);
   const modelRef = parsePiModelRef(native);
   const liveRef: { current: Live | null } = { current: null };
 
@@ -1114,7 +1114,7 @@ async function applyModel(
   live: Live,
   input: HarnessSessionInput,
 ): Promise<void> {
-  const native = nativeModelId(input.model, input.cwd);
+  const native = nativeModelId(input.model);
   const ref = parsePiModelRef(native);
   if (ref && native !== live.nativeModel) {
     const result = await live.rpc.request({

@@ -1098,20 +1098,13 @@ pub(crate) fn encode_path_component(value: &str) -> String {
 }
 
 pub(crate) fn gitlab_repo_for(root: &Path, gitlab_url: &str) -> Result<String, String> {
-    let output = if let Some(location) = crate::wsl::path_location(root)? {
-        crate::wsl::git(
-            &location,
-            &["config", "--get-regexp", r"^remote\..*\.url$"],
-            None,
-        )?
-    } else {
-        let mut cmd = Command::new("git");
-        crate::hide_window_console(&mut cmd);
-        cmd.args(["config", "--get-regexp", r"^remote\..*\.url$"])
-            .current_dir(root)
-            .output()
-            .map_err(|_| "Could not run git".to_string())?
-    };
+    let mut cmd = Command::new("git");
+    crate::hide_window_console(&mut cmd);
+    let output = cmd
+        .args(["config", "--get-regexp", r"^remote\..*\.url$"])
+        .current_dir(root)
+        .output()
+        .map_err(|_| "Could not run git".to_string())?;
     if !output.status.success() && output.status.code() != Some(1) {
         return Err("Could not read git remotes".into());
     }

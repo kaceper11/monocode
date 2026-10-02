@@ -1,4 +1,4 @@
-import { createContext, useContext, useMemo } from "react";
+import { createContext, useContext } from "react";
 import {
   findModel,
   modelsFor,
@@ -42,17 +42,4 @@ export const LOCAL_MODEL_SOURCE: ModelSource = {
 export const ModelSourceContext =
   createContext<ModelSource>(LOCAL_MODEL_SOURCE);
 
-export function useModelSource(cwd?: string): ModelSource {
-  const source = useContext(ModelSourceContext);
-  return useMemo(() => source !== LOCAL_MODEL_SOURCE || !cwd ? source : {
-    modelsFor: (harness: HarnessId) => modelsFor(harness, cwd),
-    resolve: (harness: HarnessId, id?: string) => resolveModel(harness, id, cwd),
-    find: (id: string) => findModel(id, cwd),
-    available: (harness: HarnessId) => isHarnessAvailable(harness, cwd),
-    probed: () => hasProbedHarnessAvailability(cwd),
-    refresh: (harnesses: HarnessId[]) => {
-      void probeHarnessAvailability({ cwd });
-      void refreshHarnessCatalogs(harnesses, cwd);
-    },
-  }, [source, cwd]);
-}
+export const useModelSource = () => useContext(ModelSourceContext);

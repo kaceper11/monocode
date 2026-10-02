@@ -19,7 +19,7 @@ import {
   type ExternalEditor,
 } from "../../platform/tauri/fs";
 import { IS_MAC, IS_WIN } from "../../platform/tauri/platform";
-import { projectKey, projectName, wslLocation } from "../../shared/lib/paths";
+import { projectKey, projectName } from "../../shared/lib/paths";
 import {
   loadPinnedProjects,
   sameProjectPath,
@@ -218,10 +218,7 @@ export function useProjectMenu({
     name: string;
   } | null>(null);
   const [menuError, setMenuError] = useState<string | null>(null);
-  const [editorDiscovery, setEditorDiscovery] = useState<{
-    host: "native" | "wsl";
-    editors: ExternalEditor[];
-  } | null>(null);
+  const [externalEditors, setExternalEditors] = useState<ExternalEditor[] | null>(null);
   const trigger = useRef<HTMLElement | null>(null);
   // The menus render straight from storage; re-render when it changes.
   const [, setStorageRevision] = useState(0);
@@ -249,23 +246,20 @@ export function useProjectMenu({
     setMenuError(null);
   }, [menuPath]);
 
-  const editorHost = wslLocation(menuPath ?? "") ? "wsl" : "native";
-  const externalEditors = editorDiscovery?.host === editorHost ? editorDiscovery.editors : null;
   useEffect(() => {
     let active = true;
-    setEditorDiscovery(null);
-    void listExternalEditors(menuPath ?? undefined)
+    setExternalEditors(null);
+    void listExternalEditors()
       .then((installed) => {
-        if (active)
-          setEditorDiscovery({ host: editorHost, editors: Array.isArray(installed) ? installed : [] });
+        if (active) setExternalEditors(Array.isArray(installed) ? installed : []);
       })
       .catch(() => {
-        if (active) setEditorDiscovery({ host: editorHost, editors: [] });
+        if (active) setExternalEditors([]);
       });
     return () => {
       active = false;
     };
-  }, [editorHost]);
+  }, [menuPath]);
 
   const captureTrigger = (element?: HTMLElement | null) => {
     trigger.current =

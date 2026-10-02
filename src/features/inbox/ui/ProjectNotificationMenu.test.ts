@@ -67,7 +67,7 @@ it("opens a project in a detected editor from the project context menu", async (
       }),
     ),
   );
-  act(() =>
+  await act(async () =>
     container
       .querySelector('button[aria-current="true"]')!
       .dispatchEvent(
@@ -80,9 +80,10 @@ it("opens a project in a detected editor from the project context menu", async (
   );
 
   const openInEditor = button("Open in editor");
-  act(() =>
+  await act(async () =>
     openInEditor.dispatchEvent(new MouseEvent("mouseover", { bubbles: true })),
   );
+  await act(async () => Promise.resolve());
   expect(
     document.querySelector('[role="menu"][aria-label="Open in editor"]'),
   ).not.toBeNull();
@@ -91,30 +92,6 @@ it("opens a project in a detected editor from the project context menu", async (
     editorId: "zed",
     cwd: "/work/private",
   });
-});
-
-it("discovers and launches only the supported editors for the selected WSL project", async () => {
-  const cwd = "//wsl.localhost/Ubuntu/home/me/project.v1";
-  const original = vi.mocked(invoke).getMockImplementation();
-  vi.mocked(invoke).mockImplementation(async (command, args) => {
-    if (command === "list_external_editors") return (args as { cwd?: string })?.cwd
-      ? [{ id: "vscode", name: "Visual Studio Code" }]
-      : [{ id: "zed", name: "Zed" }];
-    return undefined;
-  });
-  try {
-    await act(async () => root.render(createElement(ProjectRail, { cwd, recents: [], onSelectProject: vi.fn(), onOpenProject: vi.fn() })));
-    await act(async () => container.querySelector('button[aria-current="true"]')!.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 80 })));
-    expect(vi.mocked(invoke)).toHaveBeenCalledWith("list_external_editors", { cwd });
-    await act(async () => button("Open in editor").dispatchEvent(new MouseEvent("mouseover", { bubbles: true })));
-    const menu = document.querySelector('[role="menu"][aria-label="Open in editor"]')!;
-    expect(menu.textContent).toContain("Visual Studio Code");
-    expect(menu.textContent).not.toContain("Zed");
-    await act(async () => button("Visual Studio Code").click());
-    expect(vi.mocked(invoke)).toHaveBeenCalledWith("open_in_external_editor", { editorId: "vscode", cwd });
-  } finally {
-    vi.mocked(invoke).mockImplementation(original!);
-  }
 });
 
 it("opens path-based project actions immediately without Git discovery", async () => {

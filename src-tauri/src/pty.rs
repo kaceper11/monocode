@@ -141,12 +141,7 @@ pub fn pty_spawn(
     exec: Option<String>,
 ) -> Result<(), String> {
     crate::saved_commands::validate(exec.as_deref())?;
-    let workdir = if crate::wsl::location(&cwd)?.is_some() {
-        if !cfg!(windows) {
-            return Err("WSL terminals require the native Windows app".into());
-        }
-        expand_home(&cwd)
-    } else if exec.is_some() {
+    let workdir = if exec.is_some() {
         crate::saved_commands::working_dir(&cwd)?
     } else {
         working_dir(&cwd)
@@ -414,7 +409,6 @@ fn spawn_windows(
 
     let app = window.app_handle().clone();
     let generation = uuid::Uuid::new_v4().to_string();
-    let location = crate::wsl::path_location(&workdir)?;
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -425,35 +419,20 @@ fn spawn_windows(
         })
         .map_err(|err| format!("Failed to open terminal: {err}"))?;
 
-    let (mut cmd, shell) = if let Some(location) = &location {
-        // ConPTY hosts wsl.exe; WSL supplies the Linux terminal and job control.
-        // Dropping the master closes that terminal, rather than running a
-        // Windows shell or walking UNC metadata here.
-        let command = match exec.as_deref() {
-            Some(exec) => crate::wsl::terminal_exec_command(location, exec, &generation)?,
-            None => crate::wsl::terminal_command(location, &generation)?,
-        };
-        let mut cmd = CommandBuilder::new(command.get_program());
-        cmd.args(command.get_args());
-        cmd.env("WSLENV", "");
-        (cmd, "WSL".to_string())
-    } else {
-        let (shell, args) = default_shell();
-        let args = exec
-            .as_deref()
-            .map(|exec| crate::saved_commands::windows_args(&shell, exec))
-            .unwrap_or(args);
-        let mut cmd = CommandBuilder::new(&shell);
-        cmd.args(&args);
-        cmd.cwd(&workdir);
-        cmd.env("PATH", crate::harness::gui_search_path());
-        if let Some(home) = dirs_home() {
-            cmd.env("HOME", &home);
-            cmd.env("USERPROFILE", &home);
-        }
-        cmd.env("PWD", workdir.to_string_lossy().as_ref());
-        (cmd, shell)
-    };
+    let (shell, args) = default_shell();
+    let args = exec
+        .as_deref()
+        .map(|exec| crate::saved_commands::windows_args(&shell, exec))
+        .unwrap_or(args);
+    let mut cmd = CommandBuilder::new(&shell);
+    cmd.args(&args);
+    cmd.cwd(&workdir);
+    cmd.env("PATH", crate::harness::gui_search_path());
+    if let Some(home) = dirs_home() {
+        cmd.env("HOME", &home);
+        cmd.env("USERPROFILE", &home);
+    }
+    cmd.env("PWD", workdir.to_string_lossy().as_ref());
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("COLORFGBG", "15;0");

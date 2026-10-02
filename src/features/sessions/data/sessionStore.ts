@@ -390,7 +390,6 @@ export async function getSession(sessionId: string): Promise<Session | null> {
           session.providerSessionId,
           session.providerAccountId,
           toolIds,
-          session.worktreeCwd ?? session.cwd,
         );
         const blocks = backfillClaudeShellCommands(session.blocks, commands);
         if (blocks !== session.blocks) {
@@ -418,10 +417,10 @@ export async function getSession(sessionId: string): Promise<Session | null> {
     return recoverCursorSubagents(session);
   }
   try {
-    const anchors = await ompSessionInterjections(session.providerSessionId, session.worktreeCwd ?? session.cwd);
+    const anchors = await ompSessionInterjections(session.providerSessionId);
     // Missing source order must not prevent the existing anchored repair.
     const source = ompStatusSplitTexts(session.blocks).length
-      ? await ompActiveAssistantTexts(session.providerSessionId, session.worktreeCwd ?? session.cwd).catch(() => [])
+      ? await ompActiveAssistantTexts(session.providerSessionId).catch(() => [])
       : [];
     const blocks = backfillOmpInterjections(session.blocks, anchors, source);
     if (blocks !== session.blocks) {

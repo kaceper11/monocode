@@ -48,14 +48,14 @@ export type OpenCodeAgent = {
   hidden: boolean;
 };
 
-export function refreshOpenCodeCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("opencode", cwd, discoverOpenCodeModels);
+export function refreshOpenCodeCatalog(): Promise<void> {
+  return refreshModelCatalog("opencode", discoverOpenCodeModels);
 }
 
 export async function discoverOpenCodeModels(
   projectCwd?: string,
 ): Promise<AgentModel[]> {
-  const { path } = await resolveOpenCodeBinary(projectCwd);
+  const { path } = await resolveOpenCodeBinary();
   const cwd = projectCwd ?? (await homeDir());
   const versionOut = await execChild(path, ["--version"], cwd, "opencode");
   const version = parseOpenCodeVersion(versionOut);

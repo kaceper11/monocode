@@ -24,8 +24,8 @@ const CURSOR_CLIENT_CAPABILITIES = {
   _meta: { parameterizedModelPicker: true },
 };
 
-export function refreshCursorCatalog(cwd?: string): Promise<void> {
-  return refreshModelCatalog("cursor", cwd, discoverCursorModels);
+export function refreshCursorCatalog(): Promise<void> {
+  return refreshModelCatalog("cursor", discoverCursorModels);
 }
 
 export async function discoverCursorModels(projectCwd?: string): Promise<AgentModel[]> {
@@ -41,7 +41,7 @@ export async function discoverCursorModels(projectCwd?: string): Promise<AgentMo
 }
 
 async function discoverViaAcp(projectCwd?: string): Promise<AgentModel[]> {
-  const { path } = await resolveCursorBinary(projectCwd);
+  const { path } = await resolveCursorBinary();
   const cwd = projectCwd ?? (await homeDir());
   const probeId = `monocode-cursor-probe-${crypto.randomUUID()}`;
   const acp = new AcpClient(probeId, {
@@ -100,7 +100,7 @@ async function discoverViaAcp(projectCwd?: string): Promise<AgentModel[]> {
 }
 
 async function discoverViaCli(projectCwd?: string): Promise<AgentModel[]> {
-  const { path } = await resolveCursorBinary(projectCwd);
+  const { path } = await resolveCursorBinary();
   const cwd = projectCwd ?? (await homeDir());
   const stdout = await execChild(path, ["--list-models"], cwd, "cursor");
   return modelsFromListModelsOutput(stdout);

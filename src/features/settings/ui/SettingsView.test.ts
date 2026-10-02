@@ -1,7 +1,6 @@
 import * as availability from "../../../integrations/harness/core/availability";
 import * as registry from "../../../integrations/harness/core/registry";
 import { resetHarnessModelOverlays, refreshModelCatalog } from "../../sessions/model/models";
-import { setWslStatus } from "../../sessions/model/wslStatus";
 // @vitest-environment happy-dom
 import { act, createElement, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -233,18 +232,8 @@ describe("settings pages", () => {
     expect(container.textContent).toContain("Current account");
   });
 
-  it("keeps native provider settings unchanged and follows the selected WSL project", async () => {
+  it("keeps native provider settings unchanged", async () => {
     await render("providers");
-    expect(container.querySelector('button[aria-label^="Provider execution location:"]')).toBeNull();
-    const ubuntu = "//wsl.localhost/Ubuntu/home/dev/repo";
-    const debian = "//wsl.localhost/Debian/home/dev/repo";
-    await render("providers", { cwd: ubuntu });
-    expect(container.querySelector('button[aria-label^="Provider execution location:"]')?.textContent).toContain("Ubuntu");
-    await render("providers", { cwd: debian });
-    expect(container.querySelector('button[aria-label^="Provider execution location:"]')?.textContent).toContain("Debian");
-    expect(container.textContent).not.toContain("Rename Default account");
-    await render("providers");
-    expect(container.querySelector('button[aria-label^="Provider execution location:"]')).toBeNull();
     expect(container.querySelector('[aria-label="Rename Default account"]')).not.toBeNull();
   });
 
@@ -499,26 +488,20 @@ describe("settings pages", () => {
     expect(providerAccounts("codex")).toHaveLength(1);
   });
 
-  it("inspects the selected guest CLI without offering native override editing", async () => {
-    const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
-    localStorage.setItem("monocode.providerBinaryPaths.v1", JSON.stringify({ codex: "C:/custom/codex.exe" }));
-    vi.mocked(invoke).mockImplementation(async (command, args) => {
-      if (command === "wsl_resolve_harness") {
-        expect(args).toEqual({ cwd, provider: "codex" });
-        return { path: "/home/me/.local/bin/codex" };
-      }
+  it("inspects the selected CLI", async () => {
+    vi.spyOn(availability, "isHarnessAvailable").mockImplementation(id => id === "codex");
+    localStorage.setItem("monocode.providerBinaryPaths.v1", JSON.stringify({ codex: "/custom/codex" }));
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command.startsWith("harness_resolve")) return { path: "/custom/codex" };
       if (command === "harness_exec") return "codex 1.0.0";
       return undefined;
     });
-    await render("providers", { cwd });
-    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Show Codex CLI details"]')!.click());
+    await render("providers");
+    const details = container.querySelector<HTMLButtonElement>('[aria-label^="Show Codex CLI details"]')!;
+    await act(async () => details.click());
     const dialog = document.querySelector('[aria-label="Codex CLI details"]')!;
-    expect(dialog.textContent).toContain("WSL · Ubuntu");
-    expect(dialog.textContent).toContain("/home/me/.local/bin/codex");
-    expect(dialog.textContent).toContain("Windows CLI overrides do not apply");
-    expect(dialog.querySelector('[aria-label="Edit Codex CLI path"]')).toBeNull();
-    expect(vi.mocked(invoke)).toHaveBeenCalledWith("harness_exec", expect.objectContaining({ cwd, command: "/home/me/.local/bin/codex", binaryPath: undefined }));
-    expect(localStorage.getItem("monocode.providerBinaryPaths.v1")).toContain("C:/custom/codex.exe");
+    expect(dialog.textContent).toContain("/custom/codex");
+    expect(dialog.querySelector('[aria-label="Edit Codex CLI path"]')).not.toBeNull();
   });
 
   it("validates and stores Codex and OpenCode binary overrides", async () => {
@@ -1209,26 +1192,21 @@ describe("settings search", () => {
   });
 });
 
-it.each(["/native/repo", "//wsl.localhost/SettingsModels/repo"])("discovers bundled-only provider models and reports a failure accurately (%s)", async cwd => {
+it("discovers bundled-only provider models and reports a failure accurately", async () => {
   resetHarnessModelOverlays();
   vi.spyOn(availability, "isHarnessAvailable").mockImplementation(id => id === "codex" || id === "claude");
   vi.spyOn(availability, "probeHarnessAvailability").mockResolvedValue();
   let fail = true;
-  const refresh = vi.spyOn(registry, "refreshHarnessCatalogs").mockImplementation(async (ids, projectCwd) => {
-    await Promise.all([...ids].map(harness => refreshModelCatalog(harness, projectCwd, async () => {
-      if (fail) throw new Error("Linux probe failed");
+  const refresh = vi.spyOn(registry, "refreshHarnessCatalogs").mockImplementation(async (ids) => {
+    await Promise.all([...ids].map(harness => refreshModelCatalog(harness, async () => {
+      if (fail) throw new Error("probe failed");
       return [{ id: `${harness}:discovered`, harness, name: `${harness} discovered`, nativeId: "discovered" }];
     })));
   });
-  setWslStatus("SettingsModels", { state: "connecting" });
   try {
-    await render("providers", { cwd });
-    if (cwd.startsWith("//")) {
-      expect(refresh).not.toHaveBeenCalled();
-      await act(async () => setWslStatus("SettingsModels", { state: "connected" }));
-    }
+    await render("providers");
     expect(refresh).toHaveBeenCalledTimes(2);
-    expect(container.textContent).toContain("Bundled models · Error: Linux probe failed");
+    expect(container.textContent).toContain("Bundled models · Error: probe failed");
     expect(container.textContent).not.toContain("1 model available");
     fail = false;
     const retry = [...container.querySelectorAll('button')].find(button => button.textContent === "Retry models")!;

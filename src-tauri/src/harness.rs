@@ -105,14 +105,10 @@ struct LiveChild {
     pid: u32,
     account: Option<HarnessAccount>,
     generation: u64,
-    linux: Option<crate::wsl::LinuxProcess>,
 }
 
 impl LiveChild {
     fn terminate(&self) -> Result<(), String> {
-        if let Some(linux) = &self.linux {
-            linux.stop()?;
-        }
         terminate(self.pid);
         Ok(())
     }
@@ -350,11 +346,6 @@ impl HarnessHost {
             self.stop_sse(session_id);
         }
         let pids: Vec<u32> = children.iter().map(|(_, child)| child.pid).collect();
-        for (_, child) in &children {
-            if let Some(linux) = &child.linux {
-                let _ = linux.stop();
-            }
-        }
         drop(children);
         terminate_all(&pids);
     }
@@ -366,20 +357,6 @@ impl HarnessHost {
             inner.children.drain().map(|(_, child)| child).collect()
         };
         self.stop_all_sse();
-        // Bound concurrent WSL launchers while avoiding serial shutdown waits.
-        for batch in kids.chunks(4) {
-            thread::scope(|scope| {
-                for live in batch {
-                    if let Some(linux) = &live.linux {
-                        scope.spawn(move || {
-                            if let Err(error) = linux.stop() {
-                                eprintln!("{error}");
-                            }
-                        });
-                    }
-                }
-            });
-        }
         let pids: Vec<u32> = kids.iter().map(|live| live.pid).collect();
         // Drop stdin before signaling so ACP CLIs that watch the pipe can exit.
         drop(kids);
@@ -457,7 +434,6 @@ impl HarnessHost {
                 generation: 0,
                 stdin: Mutex::new(stdin),
                 pid,
-                linux: None,
                 cwd: expand_home(cwd),
             }),
         );
@@ -569,9 +545,6 @@ fn claude_mcp_command(
     timeout: Duration,
     binary_path: Option<&str>,
 ) -> Result<String, String> {
-    if let Some(location) = crate::wsl::location(&cwd)? {
-        return crate::wsl::agent_exec(&location, "claude", &args, timeout);
-    }
     let binary = resolve_mcp_binary("claude", binary_path)?;
     mcp_command(binary, args, cwd, timeout)
 }
@@ -638,29 +611,14 @@ fn configured_ws_mcp_servers(cwd: &Path) -> Vec<String> {
             }
         }
     };
-    let profile = if let Ok(Some(location)) = crate::wsl::location(&cwd.to_string_lossy()) {
-        crate::wsl::config_path(&location, Some("CLAUDE_CONFIG_DIR"), "")
-            .ok()
-            .map(|path| path.join(".claude.json"))
-    } else {
-        dirs_home().map(|home| Path::new(&home).join(".claude.json"))
-    };
+    let profile = dirs_home().map(|home| Path::new(&home).join(".claude.json"));
     if let Some(profile) = profile {
         if let Some(settings) = read(&profile) {
             collect(settings.get("mcpServers"), &mut names);
             collect(
                 settings
                     .get("projects")
-                    .and_then(|projects| {
-                        projects.get(
-                            crate::wsl::location(&cwd.to_string_lossy())
-                                .ok()
-                                .flatten()
-                                .map(|location| location.path)
-                                .as_deref()
-                                .unwrap_or(cwd.to_string_lossy().as_ref()),
-                        )
-                    })
+                    .and_then(|projects| projects.get(cwd.to_string_lossy().as_ref()))
                     .and_then(|project| project.get("mcpServers")),
                 &mut names,
             );
@@ -724,34 +682,19 @@ pub(crate) fn add_mcp_via_cli(
     config: &serde_json::Value,
     binary_path: Option<&str>,
 ) -> Result<(), String> {
-    if let Some(location) = crate::wsl::location(cwd)? {
-        // Build provider-native arguments without resolving any Windows CLI.
-        let (_, args) = mcp_add_args_with_binary(provider, scope, name, config, PathBuf::new())?;
-        crate::wsl::agent_exec(&location, provider, &args, Duration::from_secs(30))?;
-        return Ok(());
-    }
     let (binary, args) = mcp_add_args(provider, scope, name, config, binary_path)?;
     mcp_command(binary, args, cwd.to_owned(), Duration::from_secs(30))?;
     Ok(())
 }
 
 pub(crate) fn opencode_major_version(cwd: &str, binary_path: Option<&str>) -> Result<u32, String> {
-    let version = if let Some(location) = crate::wsl::location(cwd)? {
-        crate::wsl::agent_exec(
-            &location,
-            "opencode",
-            &["--version".into()],
-            Duration::from_secs(10),
-        )?
-    } else {
-        let binary = resolve_mcp_binary("opencode", binary_path)?;
-        mcp_command(
-            binary,
-            vec!["--version".into()],
-            cwd.to_owned(),
-            Duration::from_secs(10),
-        )?
-    };
+    let binary = resolve_mcp_binary("opencode", binary_path)?;
+    let version = mcp_command(
+        binary,
+        vec!["--version".into()],
+        cwd.to_owned(),
+        Duration::from_secs(10),
+    )?;
     version
         .split_whitespace()
         .find_map(|part| {
@@ -1109,12 +1052,8 @@ pub fn harness_spawn(
             return Err("Invalid owned OpenCode server credentials".into());
         }
     }
-    let location = crate::wsl::location(&cwd)?;
-    validate_account_host(account.as_ref(), location.as_ref())?;
     let workdir = expand_home(&cwd);
-    if location.is_none()
-        && !is_resolved_harness_binary(&command, binary_provider.as_deref(), binary_path.as_deref())
-    {
+    if !is_resolved_harness_binary(&command, binary_provider.as_deref(), binary_path.as_deref()) {
         return Err("harness_spawn: not a resolved harness CLI".to_string());
     }
     let _reservation = crate::worktree_lifecycle::reserve_spawn(&workdir)?;
@@ -1126,21 +1065,15 @@ pub fn harness_spawn(
         }
     }
 
-    let (mut cmd, nonce, acknowledgement) = if let Some(location) = &location {
-        let (cmd, nonce, acknowledgement) = crate::wsl::agent_command(location, &command, &args)?;
-        (cmd, Some(nonce), Some(acknowledgement))
-    } else {
-        if !workdir.is_dir() {
-            return Err(format!(
-                "Working directory does not exist: {}",
-                workdir.display()
-            ));
-        }
-        let mut cmd = Command::new(&command);
-        cmd.args(&args).current_dir(&workdir);
-        prepare_child(&mut cmd, &command);
-        (cmd, None, None)
-    };
+    if !workdir.is_dir() {
+        return Err(format!(
+            "Working directory does not exist: {}",
+            workdir.display()
+        ));
+    }
+    let mut cmd = Command::new(&command);
+    cmd.args(&args).current_dir(&workdir);
+    prepare_child(&mut cmd, &command);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1152,10 +1085,6 @@ pub fn harness_spawn(
     }
 
     crate::control::configure_child(&app, &session_id, &mut cmd);
-    let acknowledgement = acknowledgement
-        .map(|message| crate::wsl::agent_acknowledgement(&message, &cmd))
-        .transpose()?;
-
     let mut child =
         spawn_managed(&mut cmd).map_err(|e| format!("Failed to start {command}: {e}"))?;
     let pid = child.id();
@@ -1173,21 +1102,7 @@ pub fn harness_spawn(
         .take()
         .ok_or_else(|| "Failed to open harness stderr".to_string())?;
 
-    let (stdout, linux) = if let (Some(location), Some(nonce)) = (location, nonce.as_deref()) {
-        match crate::wsl::agent_handshake(stdout, location, nonce) {
-            Ok((reader, process)) => (reader, Some(process)),
-            Err(error) => {
-                drop(stdin);
-                terminate(pid);
-                thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                return Err(error);
-            }
-        }
-    } else {
-        (BufReader::new(stdout), None)
-    };
+    let stdout = BufReader::new(stdout);
 
     let live = Arc::new(LiveChild {
         content_length: args.iter().any(|arg| arg == "--headless")
@@ -1196,7 +1111,6 @@ pub fn harness_spawn(
         generation,
         stdin: Mutex::new(stdin),
         pid,
-        linux,
         cwd: workdir,
     });
     if let Some(rejected) = host.install_spawn(session_id.clone(), epoch, kill_all, live.clone()) {
@@ -1209,22 +1123,6 @@ pub fn harness_spawn(
             let _ = child.wait();
         });
         return Err(SPAWN_CANCELLED.to_string());
-    }
-
-    if let Some(acknowledgement) = acknowledgement {
-        let result = live
-            .stdin
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .write_all(format!("{acknowledgement}\n").as_bytes());
-        if let Err(error) = result {
-            let _ = live.terminate();
-            host.remove_if_pid(&session_id, pid);
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
-            return Err(format!("Could not acknowledge Linux startup: {error}"));
-        }
     }
 
     // Readers own the terminal tail. Exit must follow their final emissions.
@@ -1421,18 +1319,6 @@ pub fn provider_account_remove(
     })
 }
 
-fn validate_account_host(
-    account: Option<&HarnessAccount>,
-    location: Option<&crate::wsl::Location>,
-) -> Result<(), String> {
-    if location.is_some()
-        && account.is_some_and(|account| account.id != DEFAULT_PROVIDER_ACCOUNT_ID)
-    {
-        return Err("This account profile belongs to the native app and cannot be used by a WSL agent. Select the default account and sign in inside the chosen WSL distribution; no fallback account was started.".into());
-    }
-    Ok(())
-}
-
 fn apply_provider_account(
     app: &AppHandle,
     cmd: &mut Command,
@@ -1485,11 +1371,7 @@ pub async fn harness_write(
     if live.generation != generation {
         return Err("Harness write cancelled".into());
     }
-    let line = if let Some(linux) = &live.linux {
-        linux.protocol_line(line)?
-    } else {
-        native_agent_cwd(line)?
-    };
+    let line = native_agent_cwd(line)?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut stdin = live.stdin.lock().unwrap_or_else(|e| e.into_inner());
         let frame = if live.content_length {
@@ -1892,18 +1774,6 @@ pub async fn harness_exec(
         return Err("harness_exec: unsupported arguments".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
-        if let Some(location) = cwd
-            .as_deref()
-            .map(crate::wsl::location)
-            .transpose()?
-            .flatten()
-        {
-            return crate::wsl::request(
-                &location,
-                "agent_exec",
-                serde_json::json!({"command":command,"args":args}),
-            );
-        }
         if !is_resolved_harness_binary(&command, binary_provider.as_deref(), binary_path.as_deref())
         {
             return Err("harness_exec: not a resolved harness CLI".to_string());
@@ -3967,24 +3837,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn wsl_accounts_never_silently_fall_back_to_the_linux_default() {
-        let location = crate::wsl::Location::new("Ubuntu", "/home/me/repo").unwrap();
-        for provider in ["codex", "claude"] {
-            let profile = super::HarnessAccount {
-                provider: provider.into(),
-                id: "work".into(),
-            };
-            assert!(super::validate_account_host(Some(&profile), Some(&location)).is_err());
-            assert!(super::validate_account_host(Some(&profile), None).is_ok());
-            let default = super::HarnessAccount {
-                provider: provider.into(),
-                id: "default".into(),
-            };
-            assert!(super::validate_account_host(Some(&default), Some(&location)).is_ok());
-        }
-        assert!(super::validate_account_host(None, Some(&location)).is_ok());
-    }
     use super::*;
     use std::os::unix::process::CommandExt;
 
@@ -4029,7 +3881,6 @@ mod tests {
                 content_length: false,
                 account: None,
                 generation: 0,
-                linux: None,
                 stdin: Mutex::new(stdin),
                 pid,
                 cwd: PathBuf::from("/test"),
@@ -4401,7 +4252,6 @@ mod tests {
             "plain ~ text",
             r#"{"id":1,"result":{"cwd":"~"}}"#,
             r#"{"method":"turn/start","params":{"cwd":"/repo","text":"~"}}"#,
-            r#"{"method":"turn/start","params":{"cwd":"//wsl.localhost/Ubuntu/home/dev","text":"~"}}"#,
         ] {
             assert_eq!(native_agent_cwd(line.into()).unwrap(), line);
         }
@@ -4593,7 +4443,6 @@ mod tests {
                 content_length: false,
                 account: None,
                 generation: 0,
-                linux: None,
                 stdin: Mutex::new(stdin),
                 pid,
                 cwd: PathBuf::from("/test"),

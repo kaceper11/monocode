@@ -117,13 +117,6 @@ afterEach(() => {
 });
 
 describe("worker assignment prompts", () => {
-  it("uses a Linux scratch path in the worker prompt while retaining its host identity", () => {
-    const sent = workerTurnPrompt("Review.", ["src"], "//wsl.localhost/Ubuntu/tmp/Worker-A");
-    expect(sent).toContain('"/tmp/Worker-A"');
-    expect(sent).not.toContain("wsl.localhost");
-    expect(orchestrationPathKey("//wsl.localhost/Ubuntu/tmp/Worker-A"))
-      .not.toBe(orchestrationPathKey("//wsl.localhost/Ubuntu/tmp/worker-a"));
-  });
   it("keeps the task text and wraps it in the assignment envelope", () => {
     const sent = workerTurnPrompt("Review the branch.", ["src/App.tsx"]);
     expect(sent.startsWith("Review the branch.")).toBe(true);
@@ -141,9 +134,9 @@ describe("worker assignment prompts", () => {
 describe("local orchestration", () => {
   it.each([false, true])("uses the lead checkout host for approval, listing, delegation and worker revalidation (worktree=%s)", async worktree => {
     const f = setup();
-    const cwd = "//wsl.localhost/Ubuntu/home/me/repo";
+    const cwd = "/home/me/repo";
     f.lead.cwd = cwd;
-    const checkout = worktree ? "//wsl.localhost/Ubuntu/home/me/repo-worktrees/feature" : cwd;
+    const checkout = worktree ? "/home/me/repo-worktrees/feature" : cwd;
     if (worktree) f.lead.worktreeCwd = checkout;
     f.lead.busy = false;
     f.host.choices = vi.fn((host: string) => host === checkout
@@ -156,11 +149,11 @@ describe("local orchestration", () => {
     const calls = vi.mocked(f.host.choices).mock.calls;
     expect(calls.length).toBeGreaterThanOrEqual(5);
     expect(calls.every(([host]) => host === checkout)).toBe(true);
-    expect(f.manager.prompt("lead", "Continue")).toContain("--input - (stdin)");
+    expect(f.manager.prompt("lead", "Continue")).toContain("monocode control");
     await vi.waitFor(() => expect(f.tasks().some(task => task.status === "running")).toBe(true));
     const task = f.tasks().find(task => task.status === "running")!;
     f.manager.observe(task.sessionId, {
-      type: "tool.started", callId: "wsl-write", title: "Edit",
+      type: "tool.started", callId: "write-1", title: "Edit",
       preview: { kind: "write", path: "/home/me/repo/src/file.ts" },
     });
     await vi.waitFor(() => expect(f.store.resolvePath).toHaveBeenCalledWith(

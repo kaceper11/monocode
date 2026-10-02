@@ -29,8 +29,6 @@ const row = {
   id: "one",
   generation: "spawn-1",
   alive: true,
-  host: "native",
-  distro: null,
   cpuPct: 25,
   rssBytes: 1024 ** 2,
   processes: 2,

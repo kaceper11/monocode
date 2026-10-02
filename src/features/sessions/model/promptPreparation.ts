@@ -29,7 +29,7 @@ export async function prepareTurn(
 ): Promise<{ text: string; attachments: Attachment[] }> {
   const [prepared, prompt] = await Promise.all([
     measureHarnessTiming(options.timing, "attachments", () =>
-      prepareAttachments(attachments, context.cwd),
+      prepareAttachments(attachments),
     ),
     measureHarnessTiming(options.timing, "prompt", () =>
       options.literal ? Promise.resolve(text) : preparePrompt(text, context),

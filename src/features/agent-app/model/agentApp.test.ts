@@ -742,14 +742,12 @@ describe("agent app commands", () => {
   });
 });
 
-it("uses the source worktree's guest availability and model catalog for Operator", async () => {
+it("uses the source worktree's catalog for Operator sessions", async () => {
   const { source, host } = fixture();
-  source.worktreeCwd = "//wsl.localhost/Ubuntu/home/me/repo";
-  setHarnessModels("codex", [{ id: "codex:guest", harness: "codex", name: "Guest model" }], source.worktreeCwd);
-  const result = await handleAgentApp(source, "list-guest", "models.list", {}, host) as { harnesses: { id: string; models: { id: string }[] }[] };
-  expect(result.harnesses.find((entry) => entry.id === "codex")?.models.map((entry) => entry.id)).toEqual(["codex:guest"]);
-  expect(isHarnessAvailable).toHaveBeenCalledWith("codex", source.worktreeCwd);
-  await expect(handleAgentApp(source, "native-model", "sessions.start", { prompt: "Review", model: "codex:test" }, host)).rejects.toThrow("Unknown model");
-  await handleAgentApp(source, "guest-model", "sessions.start", { prompt: "Review", model: "codex:guest" }, host);
-  expect(host.start).toHaveBeenCalledWith(expect.objectContaining({ model: "codex:guest", worktreeCwd: source.worktreeCwd }), expect.any(String));
+  setHarnessModels("codex", [{ id: "codex:host", harness: "codex", name: "Host model" }]);
+  const result = await handleAgentApp(source, "list", "models.list", {}, host) as { harnesses: { id: string; models: { id: string }[] }[] };
+  expect(result.harnesses.find((entry) => entry.id === "codex")?.models.map((entry) => entry.id)).toEqual(["codex:host"]);
+  await expect(handleAgentApp(source, "unknown-model", "sessions.start", { prompt: "Review", model: "codex:test" }, host)).rejects.toThrow("Unknown model");
+  await handleAgentApp(source, "known-model", "sessions.start", { prompt: "Review", model: "codex:host" }, host);
+  expect(host.start).toHaveBeenCalledWith(expect.objectContaining({ model: "codex:host" }), expect.any(String));
 });

@@ -3013,8 +3013,8 @@ mod tests {
     fn upgrades_fork_v14_without_losing_checkout_account_or_transcript() {
         let store = SessionStore::open_in_memory().unwrap();
         let conn = store.conn.lock().unwrap();
-        let mut original = sample("legacy", "//wsl.localhost/Ubuntu/home/repo", "Keep history");
-        original.worktree_cwd = Some("//wsl.localhost/Ubuntu/home/repo-worktrees/feature".into());
+        let mut original = sample("legacy", "/home/ubuntu/repo", "Keep history");
+        original.worktree_cwd = Some("/home/ubuntu/repo-worktrees/feature".into());
         original.provider_account_id = Some("personal".into());
         original.linked_work_item = Some(
             json!({"provider":"azure", "kind":"issue", "number":42, "site":"https://dev.azure.com/team"}),

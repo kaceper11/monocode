@@ -130,10 +130,6 @@ fn paths_overlap(a: &str, b: &str) -> bool {
 /** Windows paths compare case-insensitively; POSIX paths must retain case. */
 fn comparison_path(path: &Path) -> String {
     let value = path.to_string_lossy().replace('\\', "/");
-    if let Ok(Some(mut location)) = crate::wsl::location(&value) {
-        location.distribution.make_ascii_lowercase();
-        return location.identity();
-    }
     if cfg!(windows) {
         value.to_lowercase()
     } else {
@@ -292,12 +288,10 @@ pub fn control_enable(
     session_id: String,
     cwd: String,
 ) -> Result<String, String> {
-    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-    let executable = if let Some(location) = crate::wsl::location(&cwd)? {
-        crate::wsl::request::<String>(&location, "control_cli", json!({"executable": executable}))?
-    } else {
-        executable.to_string_lossy().into_owned()
-    };
+    let executable = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .to_string_lossy()
+        .into_owned();
     let cwd = control_cwd(&cwd)?;
     let mut inner = host
         .inner
@@ -337,19 +331,10 @@ pub fn control_enable(
 }
 
 fn control_cwd(cwd: &str) -> Result<String, String> {
-    let cwd = if let Some(location) = crate::wsl::location(cwd)? {
-        PathBuf::from(crate::wsl::path_request(
-            &location,
-            "canonical_directory",
-            json!({}),
-        )?)
-    } else {
-        let cwd = std::fs::canonicalize(crate::fs::expand_home(cwd)).map_err(|e| e.to_string())?;
-        if !cwd.is_dir() {
-            return Err("Choose a project folder first".into());
-        }
-        cwd
-    };
+    let cwd = std::fs::canonicalize(crate::fs::expand_home(cwd)).map_err(|e| e.to_string())?;
+    if !cwd.is_dir() {
+        return Err("Choose a project folder first".into());
+    }
     Ok(comparison_path(&cwd))
 }
 
@@ -394,52 +379,6 @@ pub fn control_attach_worker(
     {
         return Err("Lead connection is inactive".into());
     }
-    if let Some(location) = crate::wsl::location(&inner.grants[&lead_id].cwd)? {
-        let token = inner.grants[&lead_id].token.clone();
-        let prior = inner.scratch.get(&session_id).cloned();
-        drop(inner);
-        // Guest IO must not hold the control lock or block cancellation.
-        let scratch = match prior {
-            Some(path) => {
-                let guest =
-                    crate::wsl::path_location(&path)?.ok_or("Worker scratch host changed")?;
-                if !guest
-                    .distribution
-                    .eq_ignore_ascii_case(&location.distribution)
-                {
-                    return Err("Worker scratch belongs to a different WSL distribution".into());
-                }
-                PathBuf::from(crate::wsl::path_request(
-                    &guest,
-                    "canonical_directory",
-                    json!({}),
-                )?)
-            }
-            None => PathBuf::from(crate::wsl::path_request(
-                &location,
-                "worker_scratch",
-                json!({}),
-            )?),
-        };
-        let mut inner = host
-            .inner
-            .lock()
-            .map_err(|_| "Control service unavailable")?;
-        if !inner
-            .grants
-            .get(&lead_id)
-            .is_some_and(|grant| grant.token == token && grant.window == window.label())
-        {
-            return Err("Lead connection is inactive".into());
-        }
-        let scratch = inner
-            .scratch
-            .entry(session_id.clone())
-            .or_insert(scratch)
-            .clone();
-        inner.workers.insert(session_id, lead_id);
-        return Ok(comparison_path(&scratch));
-    }
     let scratch = match inner.scratch.get(&session_id) {
         Some(path) if path.is_dir() => path.clone(),
         _ => create_worker_scratch()?,
@@ -467,11 +406,6 @@ fn create_worker_scratch() -> Result<PathBuf, String> {
 fn configure_worker_scratch(cmd: &mut Command, path: &Path) {
     // Native temp-file helpers and shell mktemp use the same private scope
     // that is named in the worker's assignment prompt.
-    let guest = crate::wsl::path_location(path).ok().flatten();
-    let path = guest
-        .as_ref()
-        .map(|location| Path::new(&location.path))
-        .unwrap_or(path);
     cmd.env("TMPDIR", path).env("TMP", path).env("TEMP", path);
 }
 
@@ -558,17 +492,11 @@ pub fn configure_child(app: &AppHandle, session_id: &str, cmd: &mut Command) {
 }
 
 #[tauri::command(async)]
-pub fn app_cli_path(cwd: Option<String>) -> Result<String, String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    if let Some(location) = cwd
-        .as_deref()
-        .map(crate::wsl::location)
-        .transpose()?
-        .flatten()
-    {
-        return crate::wsl::request(&location, "control_cli", json!({"executable":executable}));
-    }
-    Ok(executable.to_string_lossy().into_owned())
+pub fn app_cli_path() -> Result<String, String> {
+    Ok(std::env::current_exe()
+        .map_err(|error| error.to_string())?
+        .to_string_lossy()
+        .into_owned())
 }
 
 #[tauri::command]
@@ -627,10 +555,6 @@ pub fn control_load(
 }
 
 fn resolve_scope(root: &Path, value: &str) -> Result<String, String> {
-    if let Some(location) = crate::wsl::path_location(root)? {
-        let path = crate::wsl::path_request(&location, "control_scope", json!({"scope": value}))?;
-        return Ok(comparison_path(Path::new(&path)));
-    }
     let path = Path::new(value);
     if value.is_empty()
         || path.is_absolute()
@@ -662,27 +586,7 @@ fn resolve_scope(root: &Path, value: &str) -> Result<String, String> {
 /// Resolve reported writes as well as scopes: aliases and symlinks must not
 /// turn a private scratch directory into an exemption for another worker's files.
 #[tauri::command(async)]
-pub fn control_write_path(path: String, cwd: Option<String>) -> Result<String, String> {
-    if let Some(host) = cwd
-        .as_deref()
-        .map(crate::wsl::location)
-        .transpose()?
-        .flatten()
-    {
-        let location = match crate::wsl::location(&path)? {
-            Some(location)
-                if location
-                    .distribution
-                    .eq_ignore_ascii_case(&host.distribution) =>
-            {
-                location
-            }
-            Some(_) => return Err("Reported write belongs to a different WSL distribution".into()),
-            None => host.with_path(&path)?,
-        };
-        let resolved = crate::wsl::path_request(&location, "control_write_path", json!({}))?;
-        return Ok(comparison_path(Path::new(&resolved)));
-    }
+pub fn control_write_path(path: String) -> Result<String, String> {
     let path = Path::new(&path);
     if !path.is_absolute() {
         return Err("Reported write paths must be absolute".into());
@@ -726,37 +630,6 @@ pub fn control_scopes(cwd: String, files: Vec<String>) -> Result<Vec<String>, St
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn wsl_control_keeps_linux_case_and_translates_only_execution_scratch() {
-        let scratch = Path::new("//wsl.localhost/Ubuntu/tmp/Worker-A");
-        assert_eq!(
-            comparison_path(scratch),
-            "//wsl.localhost/ubuntu/tmp/Worker-A"
-        );
-        assert_ne!(
-            comparison_path(scratch),
-            comparison_path(Path::new("//wsl$/UBUNTU/tmp/worker-a"))
-        );
-        let mut cmd = Command::new("unused");
-        configure_worker_scratch(&mut cmd, scratch);
-        for key in ["TMPDIR", "TMP", "TEMP"] {
-            assert!(cmd
-                .get_envs()
-                .any(|(name, value)| name == key
-                    && value == Some(std::ffi::OsStr::new("/tmp/Worker-A"))));
-        }
-        assert!(control_write_path(
-            "//wsl.localhost/Debian/tmp/x".into(),
-            Some("//wsl.localhost/Ubuntu/repo".into())
-        )
-        .unwrap_err()
-        .contains("different WSL"));
-        assert!(control_write_path(
-            "C:/tmp/x".into(),
-            Some("//wsl.localhost/Ubuntu/repo".into())
-        )
-        .is_err());
-    }
     #[test]
     fn app_tokens_are_bound_to_active_turns_and_cannot_control_orchestration() {
         let mut inner = Inner::default();
@@ -857,10 +730,10 @@ mod tests {
         }
         let new_file = first.join("new/helper.py");
         assert_eq!(
-            control_write_path(new_file.to_string_lossy().into_owned(), None).unwrap(),
+            control_write_path(new_file.to_string_lossy().into_owned()).unwrap(),
             new_file.to_string_lossy().replace('\\', "/")
         );
-        assert!(control_write_path("relative.py".into(), None).is_err());
+        assert!(control_write_path("relative.py".into()).is_err());
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&second, first.join("escape")).unwrap();
@@ -869,7 +742,6 @@ mod tests {
                     .join("escape/helper.py")
                     .to_string_lossy()
                     .into_owned(),
-                None,
             )
             .unwrap();
             assert_eq!(resolved, second.join("helper.py").to_string_lossy());
@@ -879,7 +751,6 @@ mod tests {
                     .join("dangling/helper.py")
                     .to_string_lossy()
                     .into_owned(),
-                None,
             )
             .is_err());
         }
