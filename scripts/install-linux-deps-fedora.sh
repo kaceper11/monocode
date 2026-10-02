@@ -85,6 +85,8 @@ fi
   gcc \
   gcc-c++ \
   make \
+  cmake \
+  clang-libs \
   curl \
   wget \
   file \
