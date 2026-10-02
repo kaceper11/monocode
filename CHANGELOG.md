@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A terminal no longer opens blank when its view remounts with the same ID, such as under React StrictMode in development or after moving a terminal between the dock and a file pane. The previous view's late cleanup used to kill the new shell and drop its output listener.
+
 ## [0.3.18] - 2026-09-25
 
 ### Changed
@@ -120,6 +124,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Existing Jira credentials and Board/session links remain usable. Fork identity, WSL, Azure integrations and other retained local features are preserved.
 - Local checks and a fixture browser smoke passed; authenticated Jira/Confluence and Windows/WSL acceptance remain unverified.
+
 ## [0.6.0] - 2026-09-30
 
 ### Added

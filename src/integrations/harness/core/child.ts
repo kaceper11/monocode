@@ -79,6 +79,11 @@ const stderrHandlers = new Map<string, LineHandler>();
 const sseHandlers = new Map<string, SseHandler>();
 const sseEndHandlers = new Map<string, SseEndHandler>();
 const sseBuffer = new Map<string, string[]>();
+// Output is broadcast to every window. Only ids this window spawned or opened
+// may buffer while unwatched; anything else would be held until the bridge
+// is torn down, since nothing here ever watches or unwatches it.
+const ownedChildren = new Set<string>();
+const ownedSse = new Set<string>();
 const livePid = new Map<string, number>();
 const childGeneration = new Map<string, number>();
 const sseGeneration = new Map<string, number>();
@@ -164,7 +169,9 @@ function ensureBridge() {
           handler(line);
           return;
         }
-        pushBounded(lineBuffer, sessionId, line);
+        if (ownedChildren.has(sessionId)) {
+          pushBounded(lineBuffer, sessionId, line);
+        }
       }),
     ),
     register(
@@ -202,7 +209,7 @@ function ensureBridge() {
           handler(data);
           return;
         }
-        pushBounded(sseBuffer, sessionId, data);
+        if (ownedSse.has(sessionId)) pushBounded(sseBuffer, sessionId, data);
       }),
     ),
     register(
@@ -239,6 +246,8 @@ function teardownBridge() {
   childGeneration.clear();
   sseGeneration.clear();
   writes.clear();
+  ownedChildren.clear();
+  ownedSse.clear();
   livePid.clear();
   pendingExit.clear();
   void pending?.then((fns) => fns.forEach((fn) => fn())).catch(() => undefined);
@@ -303,6 +312,7 @@ export function unwatchChild(sessionId: string) {
   lineHandlers.delete(sessionId);
   exitHandlers.delete(sessionId);
   lineBuffer.delete(sessionId);
+  ownedChildren.delete(sessionId);
   stderrHandlers.delete(sessionId);
   pendingExit.delete(sessionId);
 }
@@ -323,6 +333,7 @@ export function unwatchSse(sessionId: string) {
   sseHandlers.delete(sessionId);
   sseEndHandlers.delete(sessionId);
   sseBuffer.delete(sessionId);
+  ownedSse.delete(sessionId);
 }
 
 export async function spawnChild(
@@ -338,6 +349,7 @@ export async function spawnChild(
   childGeneration.set(sessionId, generation);
   livePid.delete(sessionId);
   pendingExit.delete(sessionId);
+  ownedChildren.add(sessionId);
   const binaryPath = binaryProvider && !wslLocation(cwd)
     ? runtimeProviderBinaryPath(binaryProvider)
     : undefined;
@@ -487,6 +499,8 @@ export function killAllChildren(): Promise<void> {
   childGeneration.clear();
   sseGeneration.clear();
   writes.clear();
+  ownedChildren.clear();
+  ownedSse.clear();
   livePid.clear();
   pendingExit.clear();
   const pending = invoke<void>("harness_kill_all", {
@@ -638,6 +652,7 @@ export async function openHarnessSse(
 ): Promise<void> {
   const generation = ++nextGeneration;
   sseGeneration.set(sessionId, generation);
+  ownedSse.add(sessionId);
   await stoppingAll;
   await stopping.get(sessionId);
   if (sseGeneration.get(sessionId) !== generation)

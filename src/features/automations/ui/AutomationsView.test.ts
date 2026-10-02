@@ -4,7 +4,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { AutomationsView } from "./AutomationsView";
-import { newAutomationDraft, type Automation } from "../model/automations";
+import {
+  listAutomations,
+  newAutomationDraft,
+  notifyAutomationsChanged,
+  peekAutomations,
+  type Automation,
+} from "../model/automations";
 import { connectWslProject } from "../../sessions/model/wsl";
 import { setWslStatus } from "../../sessions/model/wslStatus";
 import type { HarnessId } from "../../sessions/model/session";
@@ -13,8 +19,17 @@ import { saveModelControls } from "../../settings/model/settings";
 import { refreshHarnessCatalogs } from "../../../integrations/harness/core/registry";
 import { wslLocation } from "../../../shared/lib/paths";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", async (original) => ({
+  ...(await original<typeof import("@tauri-apps/api/core")>()),
+  invoke: vi.fn(),
+}));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    isMaximized: async () => false,
+    onResized: async () => () => {},
+  }),
+}));
 vi.mock("../../../app/shell/WindowControls", () => ({ WindowControls: () => null }));
 vi.mock("../../../app/shell/TitleBar", () => ({ OverlayNav: () => null }));
 vi.mock("../../sessions/model/wsl", () => ({ connectWslProject: vi.fn() }));
@@ -54,6 +69,7 @@ const launch = vi.fn();
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   localStorage.clear();
+  notifyAutomationsChanged();
   models.resetHarnessModelOverlays();
   models.setHarnessModels("codex", [makeModel("Native")]);
   models.saveLastModelChoice("codex", "codex:default", ubuntu);
@@ -87,9 +103,9 @@ afterEach(async () => {
   localStorage.clear();
   vi.unstubAllGlobals();
 });
-async function render() {
+async function render(cwd = ubuntu) {
   await act(async () => root.render(createElement(AutomationsView, {
-    cwd: ubuntu, recents: [ubuntu, debian, native].map(path => ({ path, openedAt: 1 })),
+    cwd, recents: [ubuntu, debian, native].map(path => ({ path, openedAt: 1 })),
     onClose: vi.fn(), onLaunch: launch, onOpenSession: vi.fn(),
   })));
 }
@@ -174,4 +190,43 @@ it("edits and saves the existing worktree's model and settings without native su
   await act(async () => host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
   expect(saved[0]).toMatchObject({ cwd: native, workspaceMode: "current", model: "codex:Native" });
   expect(saved[0].worktreeCwd).toBeFalsy();
+});
+
+it("shows the cached automation list immediately and refreshes it without a loading screen", async () => {
+  const automation: Automation = {
+    ...newAutomationDraft(ubuntu, "codex", "model"),
+    id: "test-automation",
+    name: "Daily review",
+    nextRunAt: 0,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  invoke.mockImplementation(async () => [automation]);
+  await listAutomations();
+  let finish!: (automations: Automation[]) => void;
+  const refresh = new Promise<Automation[]>((resolve) => {
+    finish = resolve;
+  });
+  invoke.mockImplementation(async () => refresh);
+  await render();
+  expect(
+    host.querySelector('[aria-label="Open Daily review"]'),
+  ).not.toBeNull();
+  expect(host.querySelector(".animate-spin")).toBeNull();
+
+  await act(async () => finish([{ ...automation, name: "Updated review" }]));
+  expect(
+    host.querySelector('[aria-label="Open Updated review"]'),
+  ).not.toBeNull();
+  expect(
+    host.querySelector('[aria-label="Open Daily review"]'),
+  ).toBeNull();
+});
+
+it("invalidates the cached list when an automation changes", async () => {
+  invoke.mockImplementation(async () => []);
+  await listAutomations();
+  expect(peekAutomations()).toEqual([]);
+  notifyAutomationsChanged();
+  expect(peekAutomations()).toBeNull();
 });

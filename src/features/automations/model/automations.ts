@@ -456,8 +456,17 @@ export function draftFromAutomation(automation: Automation): AutomationDraft {
   };
 }
 
+let cachedAutomations: Automation[] | null = null;
+
+/** Last successful list, for an immediate first render while refreshing. */
+export function peekAutomations(): Automation[] | null {
+  return cachedAutomations;
+}
+
 export async function listAutomations(): Promise<Automation[]> {
-  return invoke("automations_list");
+  const next = await invoke<Automation[]>("automations_list");
+  cachedAutomations = next;
+  return next;
 }
 
 export async function saveAutomation(
@@ -579,7 +588,10 @@ export function subscribeAutomations(onChange: () => void): () => void {
   window.addEventListener(LOCAL_CHANGED, onLocal);
   let disposed = false;
   let unlisten: (() => void) | undefined;
-  void listen(AUTOMATIONS_CHANGED, onChange)
+  void listen(AUTOMATIONS_CHANGED, () => {
+    cachedAutomations = null;
+    onChange();
+  })
     .then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
@@ -593,6 +605,7 @@ export function subscribeAutomations(onChange: () => void): () => void {
 }
 
 function emitLocalChange() {
+  cachedAutomations = null;
   window.dispatchEvent(new Event(LOCAL_CHANGED));
 }
 

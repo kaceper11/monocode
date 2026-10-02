@@ -17,6 +17,11 @@ import { useSavedProjects } from "../../features/projects/model/savedProjects";
 import { SearchableSelect } from "../../shared/ui/SearchableSelect";
 import type { GitRepositoryScope } from "../../features/source-control/model/repositoryScope";
 import { NO_BRANCH_LABEL } from "../../features/source-control/model/worktrees";
+import {
+  inWorktreeFocus,
+  useWorktreeFocus,
+} from "../../features/source-control/model/worktreeFocus";
+import { SidebarWorktreeSwitcher } from "../../features/source-control/ui/SidebarWorktreeSwitcher";
 import { OrchestrationSidebarAgents } from "../../features/orchestration/ui/OrchestrationSidebarAgents";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -251,6 +256,8 @@ type Props = {
   onSelectTaskSession?: (id: string) => void;
   /** Branch identity shown for a worktree whose folder has a temporary name. */
   explorerRootLabel?: string;
+  /** Open tabs per worktree path key, for the worktree switcher. */
+  worktreeTabStats?: ReadonlyMap<string, { tabs: number; busy: boolean }>;
   open: boolean;
   sessions: SessionSummary[];
   busySessionIds: Set<string>;
@@ -308,7 +315,9 @@ type Props = {
     pin?: boolean,
     repository?: GitRepositoryScope,
   ) => void;
-  onOpenAllChanges?: (repository?: GitRepositoryScope) => void;
+  onOpenAllChanges?: (
+    kindOrRepository?: GitFileDiffKind | GitRepositoryScope,
+  ) => void;
   onOpenCommit?: (
     commit: GitHistoryCommit,
     pin?: boolean,
@@ -376,6 +385,7 @@ function SidebarComponent({
   onSelectGitRepository,
   onSelectTaskSession,
   explorerRootLabel,
+  worktreeTabStats,
   open,
   sessions,
   busySessionIds,
@@ -748,13 +758,16 @@ function SidebarComponent({
           }))
           .filter((folder) => folder.sessionIds.length > 0)
       : sessionFolders;
+  const worktreeFocus = useWorktreeFocus(cwd);
+  const focusedWorktree = remoteProject ? undefined : worktreeFocus;
   const listedSessions = mergeFolderSessionSummaries(
     projectSessions,
-    remoteProject
-      ? []
-      : openSessions,
+    remoteProject ? [] : openSessions,
     remoteProject ? sessionFolders : displayFolders,
-  ).filter((session) => !session.orchestrationLeadId);
+  ).filter(
+    (session) =>
+      !session.orchestrationLeadId && inWorktreeFocus(session, focusedWorktree),
+  );
   const visibleSessions = [
     ...filterSessionsByQuery(
       filterSessionsByStatus(
@@ -1794,9 +1807,15 @@ function SidebarComponent({
             className="flex h-10 shrink-0 select-none items-center gap-1 border-b border-stroke pl-3 pr-1.5"
             data-tauri-drag-region="deep"
           >
-            <span className="min-w-0 flex-1 truncate text-sm font-medium leading-tight">
-              Workspace
-            </span>
+            <div className="flex min-w-0 flex-1 items-center">
+              {!remoteProject && cwd && cwd !== "~" ? (
+                <SidebarWorktreeSwitcher cwd={cwd} tabStats={worktreeTabStats} />
+              ) : (
+                <span className="min-w-0 flex-1 truncate text-sm font-medium leading-tight">
+                  Workspace
+                </span>
+              )}
+            </div>
             <WorkspaceTitleActions
               onSearch={onGoToFile}
               onNew={onNew}
