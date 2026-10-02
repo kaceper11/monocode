@@ -39,6 +39,9 @@ vi.mock("@xterm/xterm", () => ({
     }
     attachCustomKeyEventHandler() {}
     attachCustomWheelEventHandler() {}
+    registerLinkProvider() {
+      return { dispose() {} };
+    }
   },
 }));
 import { TerminalView } from "./TerminalView";

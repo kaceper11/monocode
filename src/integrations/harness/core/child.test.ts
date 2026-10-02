@@ -539,9 +539,23 @@ describe("child bridge", () => {
     mocks.invoke.mockResolvedValue(42);
 
     await child.spawnChild("mine", "agent", [], "/tmp");
-    emit("harness-stdout", { sessionId: "mine", line: "early" });
+    const childGeneration = mocks.invoke.mock.calls.find(
+      ([name]) => name === "harness_spawn",
+    )![1].generation;
+    emit("harness-stdout", {
+      sessionId: "mine",
+      generation: childGeneration,
+      line: "early",
+    });
     await child.openHarnessSse("mine", "http://127.0.0.1:1/event");
-    emit("harness-sse", { sessionId: "mine", data: "early-event" });
+    const sseGeneration = mocks.invoke.mock.calls.find(
+      ([name]) => name === "harness_sse_open",
+    )![1].generation;
+    emit("harness-sse", {
+      sessionId: "mine",
+      generation: sseGeneration,
+      data: "early-event",
+    });
 
     const lines: string[] = [];
     const events: string[] = [];
