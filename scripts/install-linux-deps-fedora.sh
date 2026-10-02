@@ -89,6 +89,7 @@ fi
   wget \
   file \
   gtk3-devel \
+  alsa-lib-devel \
   webkit2gtk4.1-devel \
   javascriptcoregtk4.1-devel \
   libsoup3-devel \
