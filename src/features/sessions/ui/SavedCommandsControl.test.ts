@@ -49,7 +49,7 @@ const onLaunch = vi.fn();
 const onClose = vi.fn();
 const destination = {
   projectCwd: "/project",
-  worktreeCwd: "//wsl.localhost/Ubuntu/home/dev/repo",
+  worktreeCwd: "/home/dev/repo",
 };
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -153,12 +153,12 @@ it("keeps step text and native-host selection when saving", async () => {
     host.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click(),
   );
   act(() => button("Add step").click());
-  field("Step 2 command", "wsl --shutdown");
+  field("Step 2 command", "echo stop");
   select("Step 2 host", "native");
   await act(async () => button("Save").click());
   expect(readSavedCommands().commands[0].steps).toEqual([
     { command: "npm test" },
-    { command: "wsl --shutdown", host: "native" },
+    { command: "echo stop", host: "native" },
   ]);
 });
 it("blocks legacy commands until explicit rebinding and leaves original bytes intact", async () => {

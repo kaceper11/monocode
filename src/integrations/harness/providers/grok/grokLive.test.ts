@@ -100,7 +100,7 @@ describe("grok live turn sequence", () => {
 
   it.each(["grok:grok-4.6", "grok:shared"])("authenticates, selects the model, and prompts (%s)", async (model) => {
     const events: HarnessEvent[] = [];
-    const cwd = "//wsl.localhost/Ubuntu/home/me/project";
+    const cwd = "/home/me/project";
     const shared = { id: "grok:shared", harness: "grok" as const, name: "Shared" };
     setHarnessModels("grok", [{ ...shared, nativeId: "host-model" }]);
     setHarnessModels("grok", [{ ...shared, nativeId: "grok-4.6" }], cwd);

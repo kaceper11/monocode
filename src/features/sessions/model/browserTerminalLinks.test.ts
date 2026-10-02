@@ -27,7 +27,7 @@ it("opens links only after activation, binding localhost choices to the current 
   const choice = vi.fn();
   window.addEventListener(LINK_CHOICE_EVENT, choice);
   try {
-    cwd = "//wsl.localhost/Ubuntu/home/dev/repo";
+    cwd = "/home/dev/repo";
     links[0].activate(new MouseEvent("click", { clientX: 12, clientY: 34 }), links[0].text);
     expect(choice).toHaveBeenCalledOnce();
     expect((choice.mock.calls[0][0] as CustomEvent).detail).toEqual({ url: links[0].text, cwd, x: 12, y: 34 });

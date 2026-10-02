@@ -133,10 +133,10 @@ it("creates from the actual shared dialog using the current checkout and session
 
 it("displays a Git failure without binding and rejects a checkout change during verification", async () => {
   await click("Add to task");
-  vi.mocked(listWorktrees).mockRejectedValueOnce(new Error("WSL unavailable"));
+  vi.mocked(listWorktrees).mockRejectedValueOnce(new Error("Git unavailable"));
   await click("New task from this session");
   expect(document.querySelector('[role="alert"]')?.textContent).toBe(
-    "WSL unavailable",
+    "Git unavailable",
   );
   let resolve!: (value: Worktrees) => void;
   vi.mocked(listWorktrees).mockReturnValueOnce(

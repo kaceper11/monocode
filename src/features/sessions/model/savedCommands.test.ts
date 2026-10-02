@@ -26,7 +26,7 @@ it("recovers commands/groups with collision-free identities and preserves origin
       repositories: [
         {
           id: "repo",
-          anchor: "//wsl.localhost/Ubuntu/home/dev/repo",
+          anchor: "/home/dev/repo",
           commonDir: "unneeded",
         },
       ],
@@ -39,7 +39,7 @@ it("recovers commands/groups with collision-free identities and preserves origin
           relativeCwd: "apps/web",
           steps: [
             { command: "npm test" },
-            { command: "wsl --shutdown", host: "native" },
+            { command: "echo stop", host: "native" },
           ],
         },
       ],
@@ -54,7 +54,7 @@ it("recovers commands/groups with collision-free identities and preserves origin
   expect(store.commands[0].command).toBe(" npm run dev \n");
   expect(store.commands[0].id).not.toBe(store.commands[1].id);
   expect(store.commands[1].legacy?.suggestedCwd).toBe(
-    "//wsl.localhost/Ubuntu/home/dev/repo",
+    "/home/dev/repo",
   );
   expect(store.groups[0].commandIds).toEqual([store.commands[1].id]);
   expect(() => resolveSavedCommand(store.commands[1], destination)).toThrow(
@@ -83,7 +83,7 @@ it("recovers commands/groups with collision-free identities and preserves origin
       cwd: "/repo-worktree/apps/web",
       steps: [
         { command: "npm test" },
-        { command: "wsl --shutdown", host: "native" },
+        { command: "echo stop", host: "native" },
       ],
     },
   ]);
@@ -122,14 +122,14 @@ it("binds project and host explicitly, with contained relative cwd", () => {
   );
   expect(
     resolveSavedCommand(
-      { ...command, targetCwd: "//wsl.localhost/Ubuntu/home/Repo" },
+      { ...command, targetCwd: "/home/Repo" },
       destination,
     ).cwd,
-  ).toBe("//wsl.localhost/Ubuntu/home/Repo/apps/web");
+  ).toBe("/home/Repo/apps/web");
   expect(() =>
     resolveSavedCommand(command, {
       ...destination,
-      projectCwd: "//wsl.localhost/Ubuntu/repo",
+      projectCwd: "/other/repo",
     }),
   ).toThrow(/another project/);
   for (const relative of [

@@ -104,8 +104,8 @@ describe("background work", () => {
 });
 
 describe("turn duration", () => {
-  it("records the model name from the turn's WSL worktree catalog", () => {
-    const cwd = "//wsl.localhost/Ubuntu/home/me/project";
+  it("records the model name from the turn's worktree catalog", () => {
+    const cwd = "/home/me/project";
     const worktreeCwd = `${cwd}-branch`;
     for (const [host, name] of [[undefined, "Native"], [cwd, "Project"], [worktreeCwd, "Worktree"]]) {
       setHarnessModels("codex", [{ id: "codex:shared", harness: "codex", name: name! }], host);

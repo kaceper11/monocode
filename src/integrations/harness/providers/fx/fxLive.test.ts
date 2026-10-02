@@ -64,7 +64,7 @@ describe("fx live turn sequence", () => {
 
   it.each(["fx:zai/glm-5.2", "", "fx:shared"])("preserves model selection and approvals (%j)", async (model) => {
     const events: HarnessEvent[] = [];
-    const cwd = "//wsl.localhost/Ubuntu/home/me/project";
+    const cwd = "/home/me/project";
     const shared = { id: "fx:shared", harness: "fx" as const, name: "Shared" };
     setHarnessModels("fx", [{ ...shared, nativeId: "host-model" }]);
     setHarnessModels("fx", [{ ...shared, nativeId: "zai/glm-5.2" }], cwd);

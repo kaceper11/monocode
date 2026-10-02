@@ -844,8 +844,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             config_go_api_key_with_lookup(&value, |name| (name == "SELECTED_KEY")
-                .then(|| "guest-only-key".into())),
-            Some("guest-only-key".into())
+                .then(|| "selected-key".into())),
+            Some("selected-key".into())
         );
         assert_eq!(config_go_api_key_with_lookup(&value, |_| None), None);
     }

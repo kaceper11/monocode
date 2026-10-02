@@ -725,9 +725,9 @@ describe("hydrateWorkspaceSnapshot", () => {
   });
 });
 
-it("restores browser tabs, drops retired delivery tabs and preserves WSL sessions", () => {
-  const cwd = "//wsl.localhost/Ubuntu/home/user/project";
-  const session = chat("wsl-session", cwd);
+it("restores browser tabs, drops retired delivery tabs and preserves sessions", () => {
+  const cwd = "/home/user/project";
+  const session = chat("session-1", cwd);
   session.worktreeCwd = `${cwd}-worktree`;
   const file = { ...newFileTab(`${cwd}/README.md`, cwd), id: "file" };
   const tab = { ...newTab(session.id), editorPanes: [{ id: "editor", files: [file], activeFileId: file.id }] };
@@ -743,7 +743,7 @@ it("restores browser tabs, drops retired delivery tabs and preserves WSL session
 });
 
 it("removes a retired delivery-only pane without losing the saved browser and conversation", () => {
-  const cwd = "//wsl.localhost/Ubuntu/home/user/project";
+  const cwd = "/home/user/project";
   const session = chat("saved-chat", cwd);
   const browser = { id: "page", path: "https://example.com", cwd, browser: { url: "https://example.com", title: "Saved page", persist: false, expanded: true } };
   const tab = {

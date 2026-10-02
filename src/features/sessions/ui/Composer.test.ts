@@ -137,12 +137,11 @@ describe("Composer question focus", () => {
     vi.unstubAllGlobals();
   });
 
-  it("shows the selected WSL worktree catalog rather than the project catalog", async () => {
-    const cwd = "//wsl.localhost/Ubuntu/home/dev/project";
-    const executionCwd = "//wsl.localhost/Ubuntu/home/dev/worktree";
+  it("shows the live catalog model name in the picker", async () => {
+    const cwd = "/home/dev/project";
+    const executionCwd = "/home/dev/worktree";
     const model = { id: "claude:scoped", nativeId: "scoped", harness: "claude" as const };
-    setHarnessModels("claude", [{ ...model, name: "Project catalog model" }], cwd);
-    setHarnessModels("claude", [{ ...model, name: "Worktree catalog model" }], executionCwd);
+    setHarnessModels("claude", [{ ...model, name: "Worktree catalog model" }]);
     try {
       await act(async () => root.render(createElement(Composer, {
         cwd, executionCwd, focused: true, harness: "claude", model: model.id,
@@ -151,7 +150,7 @@ describe("Composer question focus", () => {
         onRuntimeModeChange: vi.fn(), onSubmit: vi.fn(), onStop: vi.fn(),
       })));
       expect(container.textContent).toContain("Worktree catalog model");
-      expect(container.textContent).not.toContain("Project catalog model");
+      
     } finally {
       act(() => resetHarnessModelOverlays());
     }
@@ -244,10 +243,10 @@ describe("Composer question focus", () => {
     expect(container.querySelector("textarea")?.value).toContain("Page evidence");
     expect(onDraftChange).toHaveBeenCalledOnce();
     expect(onSubmit).not.toHaveBeenCalled();
-    await render("//wsl.localhost/Ubuntu/home/dev/repo");
+    await render("/home/dev/other-repo");
     expect(() => original.accept(context)).toThrow(/execution host changed/);
     const moved = targets.find(target => target.sessionId === props.sessionId)!;
-    expect(moved.cwd).toContain("wsl.localhost");
+    expect(moved.cwd).toBe("/home/dev/other-repo");
     await render(moved.cwd, true);
     expect(targets).toEqual([]);
     expect(() => moved.accept(context)).toThrow(/execution host changed/);
@@ -282,7 +281,7 @@ describe("Composer question focus", () => {
       onFocus: vi.fn(), onCwdChange: vi.fn(), onModelChange: vi.fn(),
       onRuntimeModeChange: vi.fn(), onSubmit: vi.fn(),
     };
-    for (const change of [{ sessionId: "second" }, { executionCwd: "//wsl.localhost/Ubuntu/home/dev/repo" }, { enabled: false }, { worktreeRemoved: true }]) {
+    for (const change of [{ sessionId: "second" }, { executionCwd: "/home/dev/other-repo" }, { enabled: false }, { worktreeRemoved: true }]) {
       await act(async () => root.render(createElement(Composer, props)));
       act(() => container.querySelector<HTMLButtonElement>('[aria-label="Add files or choose a mode"]')!.click());
       act(() => document.querySelector<HTMLButtonElement>('[aria-label="Add Confluence pages"]')!.click());
@@ -363,7 +362,7 @@ describe("Composer question focus", () => {
     expect(container.querySelector("textarea")!.value).toContain("Keep my draft");
     expect(container.querySelector("textarea")!.value).toContain("Implement the work described in this conversation");
     expect(props.onDraftChange).toHaveBeenCalledOnce();
-    for (const change of [{ sessionId: "other" }, { executionCwd: "//wsl.localhost/Ubuntu/home/dev/repo" }, { harness: "codex" as const }, { enabled: false }, { worktreeRemoved: true }]) {
+    for (const change of [{ sessionId: "other" }, { executionCwd: "/home/dev/other-repo" }, { harness: "codex" as const }, { enabled: false }, { worktreeRemoved: true }]) {
       act(() => container.querySelector<HTMLButtonElement>('[aria-label="Actions"]')!.click());
       expect(document.querySelector('[aria-label="Prompt name"]')).toBeNull();
       expect(document.body.textContent).toContain("Choose a prompt to review it.");

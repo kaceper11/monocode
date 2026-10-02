@@ -76,7 +76,7 @@ it("stops on failure without running a later step", async () => {
   expect(api.invoke).toHaveBeenCalledOnce();
   expect(api.spawn).toHaveBeenCalledOnce();
 });
-it("never substitutes the WSL target when an OS-host directory lookup fails", async () => {
+it("never substitutes another target when an OS-host directory lookup fails", async () => {
   const { id, run } = queued([
     { command: "native", host: "native" } as { command: string },
   ]);

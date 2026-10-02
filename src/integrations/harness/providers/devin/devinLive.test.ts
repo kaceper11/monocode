@@ -996,8 +996,8 @@ describe("Devin upstream compatibility", () => {
 
   it("spawns in the session cwd and advertises no steering", async () => {
     const cwd = "/home/me/repo space";
-    const { turn } = await startConfigTurn({ ...baseInput([], "hello", "wsl-config"), cwd });
-    expect(spawnChild).toHaveBeenCalledWith("wsl-config", "/fake/devin", ["acp"], cwd, undefined, "devin");
+    const { turn } = await startConfigTurn({ ...baseInput([], "hello", "cfg"), cwd });
+    expect(spawnChild).toHaveBeenCalledWith("cfg", "/fake/devin", ["acp"], cwd, undefined, "devin");
     expect(lastByMethod("session/new").params.cwd).toBe(cwd);
     expect(devinAdapter.canSteer).toBe(false);
     expect(devinAdapter.commands).toBeDefined();
@@ -1005,9 +1005,9 @@ describe("Devin upstream compatibility", () => {
     expect(devinAdapter.respondQuestion).toBeDefined();
     await applyRequestedMode();
     await waitFor(() => byMethod("session/prompt").length > 0, "prompt");
-    await finishConfigTurn(turn, "wsl-config");
+    await finishConfigTurn(turn, "cfg");
     sent.length = 0;
-    const resumed = sendDevinTurn({ ...baseInput([], "resume", "wsl-config"), cwd });
+    const resumed = sendDevinTurn({ ...baseInput([], "resume", "cfg"), cwd });
     await waitFor(() => byMethod("initialize").length > 0, "resume initialize");
     reply(lastByMethod("initialize").id, { agentCapabilities: { loadSession: true } });
     await waitFor(() => byMethod("session/load").length > 0, "guest load");
@@ -1016,7 +1016,7 @@ describe("Devin upstream compatibility", () => {
     reply(lastByMethod("session/load").id, CONFIG_SETUP);
     await applyRequestedMode();
     await waitFor(() => byMethod("session/prompt").length > 0, "resumed prompt");
-    await finishConfigTurn(resumed, "wsl-config");
+    await finishConfigTurn(resumed, "cfg");
   });
 
   it("retains provider compaction on the same live session", async () => {

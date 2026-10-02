@@ -49,7 +49,7 @@ it("checks selected project, host and stored revision before creating intent", (
   expect(() =>
     prepareSavedCommandLaunch(request(), {
       ...destination,
-      worktreeCwd: "//wsl.localhost/Ubuntu/worktree",
+      worktreeCwd: "/home/dev/worktree",
     }),
   ).toThrow(/changed/);
   const stale = request();

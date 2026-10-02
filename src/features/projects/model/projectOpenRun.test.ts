@@ -165,9 +165,9 @@ describe("planning a run of folders", () => {
   });
 });
 
-it("does not reuse a native blank session when opening WSL projects", () => {
+it("does not reuse a blank session when blank reuse is disallowed", () => {
   const state = workspace([blank("native", "/native")]);
-  const steps = planProjectOpenRun({ ...state, paths: ["//wsl.localhost/Ubuntu/work"], allowBlankReuse: false });
+  const steps = planProjectOpenRun({ ...state, paths: ["/work/project"], allowBlankReuse: false });
   expect(steps[0].action).toBe("create");
-  expect(creates(steps)[0].session.cwd).toBe("//wsl.localhost/Ubuntu/work");
+  expect(creates(steps)[0].session.cwd).toBe("/work/project");
 });

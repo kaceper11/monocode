@@ -155,7 +155,7 @@ const startupByThread = new Map<string, { cancelled: boolean; rpc?: JsonRpcClien
 /** In-flight cold starts: a prewarm and a send share one spawn. */
 const startingByThread = new Map<string, Promise<Live>>();
 
-/** Read only the active session's host; never borrow another distribution's usage. */
+/** Read only the active session's host; never borrow another environment's usage. */
 export function readLiveMuseUsage(sessionId?: string, cwd?: string): Promise<unknown> | undefined {
   const live = sessionId ? liveByThread.get(sessionId) : undefined;
   if (!live || live.cwd !== cwd || live.stopping) return undefined;

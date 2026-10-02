@@ -258,12 +258,12 @@ it("does not hand remote lanes to a native session as host paths", () => {
     workstreams: [
       checkout({ worktreePath: "/web-task" }),
       checkout({ id: "remote", worktreePath: "remote://box/home/u/repo-task" }),
-      checkout({ id: "wsl", worktreePath: "//wsl.localhost/Ubuntu/wsl-task" }),
+      checkout({ id: "other", worktreePath: "remote://other/home/u/task" }),
     ],
   });
   const prompt = taskSessionPrompt("Work", "lead", "/web-task");
   expect(prompt).not.toContain('"executionCwd":"remote://');
-  expect(prompt).not.toContain('"executionCwd":"/wsl-task"');
+  expect(prompt).not.toContain('"executionCwd":"/home/u/task"');
   expect(prompt).toContain("different execution host; not accessible");
 });
 

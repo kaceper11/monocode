@@ -162,10 +162,10 @@ describe("codex live turn sequence", () => {
     { resume: false, intent: "plan" as const },
     { resume: true, intent: "plan" as const },
   ])(
-    "uses the WSL thread's model for a saved Default selection ($resume, $intent)",
+    "uses the session model for a saved Default selection ($resume, $intent)",
     async ({ resume, intent }) => {
       const { turn } = await startTurn("codex-live", {
-        cwd: "//wsl.localhost/Ubuntu/home/dev/repo",
+        cwd: "/home/dev/repo",
         model: "codex:default",
         threadModel: "linux-account-model",
         resume,
