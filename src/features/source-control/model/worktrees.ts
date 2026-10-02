@@ -1,4 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
 import { appendReadyHandoff, buildDeterministicHandoff } from "../../sessions/model/handoff";
 import { invokeWorkspace, notifyGitChanged } from "../../../platform/tauri/fs";
 import { isFilesystemTab, type FilePaneTab } from "../../workspace/model/layout";
@@ -29,7 +28,7 @@ export async function createWorktree(
   base: string,
   existing: boolean,
 ) {
-  const tree = await invoke<Worktree>("git_worktree_create", {
+  const tree = await invokeWorkspace<Worktree>("git_worktree_create", {
     cwd,
     branch,
     base,
@@ -43,7 +42,7 @@ export async function createOrchestrationWorktree(
   cwd: string,
   branch: string,
 ) {
-  const tree = await invoke<Worktree>("git_orchestration_worktree_create", {
+  const tree = await invokeWorkspace<Worktree>("git_orchestration_worktree_create", {
     cwd,
     branch,
   });
@@ -56,7 +55,7 @@ export async function renameWorktreeBranch(
   path: string,
   branch: string,
 ) {
-  const tree = await invoke<Worktree>("git_worktree_rename_branch", {
+  const tree = await invokeWorkspace<Worktree>("git_worktree_rename_branch", {
     cwd,
     path,
     branch,
@@ -94,7 +93,7 @@ export async function removeWorktree(
   force = false,
   keepSessions = false,
 ) {
-  const result = await invoke<{ sessionIds: string[]; projectCwd: string }>(
+  const result = await invokeWorkspace<{ sessionIds: string[]; projectCwd: string }>(
     "git_worktree_remove",
     { cwd, path, force, keepSessions },
   );
@@ -106,7 +105,7 @@ export async function removeOrchestrationWorktree(
   cwd: string,
   path: string,
 ) {
-  const result = await invoke<{ sessionIds: string[]; projectCwd: string }>(
+  const result = await invokeWorkspace<{ sessionIds: string[]; projectCwd: string }>(
     "git_orchestration_worktree_remove",
     { cwd, path },
   );
@@ -118,13 +117,13 @@ export async function removeOrchestrationBranch(
   cwd: string,
   branch: string,
 ) {
-  await invoke<void>("git_orchestration_branch_remove", { cwd, branch });
+  await invokeWorkspace<void>("git_orchestration_branch_remove", { cwd, branch });
   notifyGitChanged();
 }
 
 /** Read-only preflight; final removal must still recheck for new blockers. */
 export const checkWorktreeRemoval: RemoveWorktree = (cwd, path, force) =>
-  invoke("git_worktree_check_remove", { cwd, path, force });
+  invokeWorkspace("git_worktree_check_remove", { cwd, path, force });
 
 export function assertWorktreeFilesClosed(
   path: string,

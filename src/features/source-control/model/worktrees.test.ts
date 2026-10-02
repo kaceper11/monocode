@@ -1,14 +1,26 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
 import { newFileTab, newTerminalFile } from "../../workspace/model/layout";
 import { newSession, sessionWorkCwd } from "../../sessions/model/session";
+// Registers the remote runner, which rejects commands the host cannot serve.
+import "../../connections/model/remoteCommands";
 import {
   sessionInWorktree,
   detachSessionWorktree,
   assertWorktreeFilesClosed,
   bindableWorktrees,
   worktreeSessionIds,
+  createWorktree,
+  createOrchestrationWorktree,
+  renameWorktreeBranch,
+  removeWorktree,
+  removeOrchestrationWorktree,
+  removeOrchestrationBranch,
+  checkWorktreeRemoval,
   type Worktree,
 } from "./worktrees";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 const tree: Worktree = {
   path: "/repo-worktrees/feature",
@@ -229,4 +241,24 @@ describe("sessions kept after worktree deletion", () => {
       expect(selected.providerSessionId).toBeUndefined();
     },
   );
+});
+
+describe("remote workspaces", () => {
+  it("rejects worktree mutations on another machine instead of handing the path to local Git", async () => {
+    const remote = "remote://machine/repo";
+    const treePath = "remote://machine/repo-wt";
+    for (const action of [
+      () => createWorktree(remote, "feature", "main", false),
+      () => createOrchestrationWorktree(remote, "feature"),
+      () => renameWorktreeBranch(remote, treePath, "feature"),
+      () => removeWorktree(remote, treePath),
+      () => removeOrchestrationWorktree(remote, treePath),
+      () => removeOrchestrationBranch(remote, "mc/x"),
+      () => checkWorktreeRemoval(remote, treePath, false),
+    ]) {
+      await expect(action()).rejects.toThrow("another machine");
+    }
+    // A remote path must never reach the local backend's Git commands.
+    expect(invoke).not.toHaveBeenCalled();
+  });
 });
