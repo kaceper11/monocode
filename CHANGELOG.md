@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-03
+
+### Added
+
+- Task working-copy workspaces with repository-scoped conversations, files, and changes.
+- Working-copy management in task details and Edit task: create, attach, switch, rename, detach, and delete using the built-in worktree controls.
+- Guards for main checkouts, unavailable or locked worktrees, task ownership, and active conversations. Switching or detaching a task preserves conversations in their original checkout; deletion keeps conversation history and Git branches.
+
+### Changed
+
+- Working-copy selections in Edit task wait for Save; explicit Git actions apply immediately and remain applied after Cancel.
+- Compact working-copy management dialog with status badges and keyboard-accessible Switch/Rename tabs.
+- Removed the duplicate add-repository button from task details and kept bottom actions aligned in narrow sidebars.
+
 ## [0.8.0] - 2026-10-03
 
 ### Changed
