@@ -16,16 +16,22 @@ export function CreateWorktreeDialog({
   defaultRoot,
   onCreated,
   onCancel,
+  initialBranch = "",
+  initialBase = "HEAD",
+  onCreate = createWorktree,
 }: {
   cwd: string;
   baseCwd: string;
   defaultRoot?: string;
   onCreated: (tree: Worktree) => void | Promise<void>;
   onCancel: () => void;
+  initialBranch?: string;
+  initialBase?: string;
+  onCreate?: typeof createWorktree;
 }) {
   const { branches } = useProjectBranchesState(baseCwd, true);
-  const [name, setName] = useState("");
-  const [base, setBase] = useState("HEAD");
+  const [name, setName] = useState(initialBranch);
+  const [base, setBase] = useState(initialBase);
   const [existing, setExisting] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
@@ -61,7 +67,7 @@ export function CreateWorktreeDialog({
     setBusy(true);
     setError(undefined);
     try {
-      const tree = await createWorktree(baseCwd, name.trim(), base, existing);
+      const tree = await onCreate(baseCwd, name.trim(), base, existing);
       await onCreated(tree);
     } catch (err) {
       setError(String(err));

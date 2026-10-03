@@ -47,6 +47,7 @@ export function DeleteWorktreeDialog({
   onRemove,
   onClose,
   onDeleted,
+  allowDeleteSessions = true,
 }: {
   cwd: string;
   tree: Worktree;
@@ -59,6 +60,7 @@ export function DeleteWorktreeDialog({
   ) => Promise<void>;
   onClose: () => void;
   onDeleted: () => void;
+  allowDeleteSessions?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
   const [deleteSessions, setDeleteSessions] = useState(false);
@@ -146,7 +148,7 @@ export function DeleteWorktreeDialog({
             )}
           </ul>
         </div>
-        {sessionCount > 0 && (
+        {sessionCount > 0 && allowDeleteSessions && (
           <div className="flex items-center justify-between gap-3 rounded-lg border border-content/10 p-3">
             <span
               id="delete-worktree-sessions-label"

@@ -1,3 +1,5 @@
+import { TaskWorkingCopyPicker } from "./TaskWorktreeControls";
+import type { TaskWorktreeActionHandler, TaskWorktreeResult, TaskWorktreeTarget } from "./taskWorktrees";
 import {
   useSavedProjects,
 } from "../projects/model/savedProjects";
@@ -198,120 +200,6 @@ export function worktreeCopyPicks(
   ];
 }
 
-/** Radio-style pick list for working copies — every option is visible and
- * one click selects it; the mode choice isn't buried in a dropdown. */
-export function CopyPickList({
-  value,
-  options,
-  onPick,
-  disabled,
-}: {
-  value: string;
-  options: CopyPick[];
-  onPick: (value: string) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <div
-      role="radiogroup"
-      aria-label="Working copy"
-      onKeyDown={(event) => {
-        if (
-          ![
-            "ArrowDown",
-            "ArrowUp",
-            "ArrowLeft",
-            "ArrowRight",
-            "Home",
-            "End",
-          ].includes(event.key)
-        )
-          return;
-        const buttons = [
-          ...event.currentTarget.querySelectorAll<HTMLButtonElement>(
-            'button[role="radio"]:not(:disabled)',
-          ),
-        ];
-        if (!buttons.length) return;
-        event.preventDefault();
-        const current = buttons.indexOf(
-          document.activeElement as HTMLButtonElement,
-        );
-        const next =
-          event.key === "Home"
-            ? 0
-            : event.key === "End"
-              ? buttons.length - 1
-              : (current +
-                  (["ArrowUp", "ArrowLeft"].includes(event.key) ? -1 : 1) +
-                  buttons.length) %
-                buttons.length;
-        buttons[next].focus();
-        buttons[next].click();
-      }}
-      className="flex max-h-36 flex-col gap-0.5 overflow-y-auto rounded-lg border border-content/10 bg-content/[0.02] p-1"
-    >
-      {options.map((option, index) => {
-        const selected = option.value === value;
-        return (
-          <button
-            key={option.value || "__new"}
-            type="button"
-            role="radio"
-            aria-checked={selected}
-            tabIndex={
-              (selected && !option.disabled) ||
-              (!options.some(
-                (option) => option.value === value && !option.disabled,
-              ) &&
-                index === options.findIndex((option) => !option.disabled))
-                ? 0
-                : -1
-            }
-            disabled={disabled || option.disabled}
-            onClick={() => onPick(option.value)}
-            className={`flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-accent/50 disabled:opacity-45 ${
-              selected
-                ? "bg-accent/10 text-content ring-1 ring-inset ring-accent/30"
-                : "text-content/75 hover:bg-content/5"
-            }`}
-          >
-            {option.icon === "new" ? (
-              <Plus
-                className="size-3.5 shrink-0 text-content/60"
-                strokeWidth={2}
-              />
-            ) : option.icon === "none" ? (
-              <X
-                className="size-3.5 shrink-0 text-content/60"
-                strokeWidth={2}
-              />
-            ) : (
-              <GitBranch
-                className="size-3.5 shrink-0 text-content/60"
-                strokeWidth={1.75}
-              />
-            )}
-            <span className="min-w-0 flex-1 truncate">
-              <span className={selected ? "font-medium" : ""}>
-                {option.title}
-              </span>
-              {option.detail ? (
-                <span className="text-content/60"> · {option.detail}</span>
-              ) : null}
-            </span>
-            {selected ? (
-              <Check
-                className="size-3.5 shrink-0 text-accent"
-                strokeWidth={2.25}
-              />
-            ) : null}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
 
 type DraftWorkstream = {
   key: number;
@@ -326,14 +214,9 @@ type DraftWorkstream = {
   noWorktree?: boolean;
 };
 
-/** Working-copy pick that binds nothing — real values are absolute paths. */
-export const NO_COPY = "none";
-
 /** Repo + working-copy + branch/base inputs — shared by this dialog and the
- * details panel's add-workstream row. `tail` is the trailing button
- * (remove/add). Every row stays mounted across mode changes — a pick only
- * ever disables or re-labels a field, so choosing a copy never reflows the
- * form. */
+ * details panel's add-workstream row. Copy selections are staged; explicit
+ * creation uses the built-in dialog and keeps the created folder on cancel. */
 export function WorkstreamFields({
   draft,
   onChange,
@@ -342,6 +225,7 @@ export function WorkstreamFields({
   excludeWorktreePaths,
   excludeBranches,
   defaultBranch = "mc/task",
+  management,
 }: {
   draft: {
     projectPath: string;
@@ -363,6 +247,7 @@ export function WorkstreamFields({
   ) => void;
   tail: ReactNode;
   defaultBranch?: string;
+  management?: { target: TaskWorktreeTarget; onAction: TaskWorktreeActionHandler; onApplied: (result: TaskWorktreeResult) => void; onManage: () => void; disabled?: boolean };
   /** Popover layer — pass `LAYER.dialogPopover` when inside a modal. */
   layer?: number;
   /** pathKey'd worktree paths another lane already claims — offering one
@@ -410,39 +295,6 @@ export function WorkstreamFields({
   // Existing worktrees of the chosen repo — a lane can bind one instead of
   // creating a fresh copy. Branch follows the pick (a bound lane's branch
   // is whatever the worktree has checked out).
-  const copyPicks = useMemo(
-    () => [
-      { value: "", title: "Create new worktree", icon: "new" as const },
-      ...worktreeCopyPicks(worktrees?.worktrees ?? [], draft.worktreePath).map(
-        (pick) => {
-          const tree = worktrees?.worktrees.find(
-            (tree) => pathKey(tree.path) === pathKey(pick.value),
-          );
-          const claimed =
-            excludeWorktreePaths?.has(pathKey(pick.value)) ||
-            (!!tree?.branch && excludeBranches?.has(tree.branch));
-          return {
-            ...pick,
-            disabled: claimed,
-            detail: [pick.detail, claimed ? "used by another task" : ""]
-              .filter(Boolean)
-              .join(" · "),
-          };
-        },
-      ),
-      ...(draft.noWorktree
-        ? [
-            {
-              value: NO_COPY,
-              title: "No working copy",
-              detail: "Track the branch only",
-              icon: "none" as const,
-            },
-          ]
-        : []),
-    ],
-    [worktrees, draft.worktreePath, excludeWorktreePaths, excludeBranches],
-  );
   const field = (label: string, control: ReactNode) => (
     <div className="grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-center gap-2 text-[11px] text-content/60">
       <span className="truncate">{label}</span>
@@ -450,33 +302,19 @@ export function WorkstreamFields({
     </div>
   );
   const worktreeSelect = (
-    <CopyPickList
-      value={draft.noWorktree ? NO_COPY : (draft.worktreePath ?? "")}
-      options={copyPicks}
-      disabled={!draft.projectPath || gitBusy}
-      onPick={(path) => {
-        if (path === NO_COPY) {
-          // Track the branch only — task details can prepare a copy later.
-          onChange({ noWorktree: true, worktreePath: undefined });
-          return;
-        }
-        const tree = worktrees?.worktrees.find((entry) => entry.path === path);
-        onChange({
-          noWorktree: false,
-          // `path` may be the stale-bound synthetic option — keep it so the
-          // pick stays visible instead of silently unbinding. Leaving a
-          // bound pick for "new" drops the synced branch (it would collide
-          // with the copy it came from); "none" keeps it — a tracked branch
-          // survives detaching the copy. A stale pick has no live tree to
-          // read from — keep the branch it synced.
-          worktreePath: path || undefined,
-          branch: path
-            ? (tree?.branch ?? draft.branch)
-            : draft.worktreePath
-              ? ""
-              : draft.branch,
-        });
-      }}
+    <TaskWorkingCopyPicker
+      target={management?.target ?? { projectPath: draft.projectPath, path: draft.worktreePath, branch: draft.branch, base: draft.base }}
+      onAction={management?.onAction}
+      onApplied={management?.onApplied}
+      onManage={management?.onManage}
+      disabled={management?.disabled}
+      layer={layer}
+      noWorktree={draft.noWorktree}
+      initialBranch={draft.branch || defaultBranch}
+      excludePaths={excludeWorktreePaths}
+      excludeBranches={excludeBranches}
+      onTrackBranch={() => onChange({ noWorktree: true, worktreePath: undefined })}
+      onPick={tree => onChange({ noWorktree: false, worktreePath: tree.path, branch: tree.branch! })}
     />
   );
   const baseSelect = (
@@ -583,6 +421,7 @@ export function WorkstreamFields({
           field("Origin branch", baseSelect)}
       </div>
       {footer}
+      <p className="mt-1 text-[10px] text-content/45">Create worktree applies immediately. Saving the task attaches your selection.</p>
     </div>
   );
 }

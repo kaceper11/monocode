@@ -416,6 +416,15 @@ pub async fn git_orchestration_worktree_create(
 }
 
 fn rename_branch(root: &Path, path: &Path, branch: &str) -> Result<Worktree, String> {
+    rename_branch_checked(root, path, branch, None)
+}
+
+fn rename_branch_checked(
+    root: &Path,
+    path: &Path,
+    branch: &str,
+    expected: Option<&str>,
+) -> Result<Worktree, String> {
     let branch = branch.trim();
     if branch.starts_with('-') || branch.starts_with('@') || branch.is_empty() {
         return Err("Enter a valid branch name".into());
@@ -429,7 +438,13 @@ fn rename_branch(root: &Path, path: &Path, branch: &str) -> Result<Worktree, Str
         return Err("The main working copy cannot be renamed here".into());
     }
     let current = tree.branch.as_deref().ok_or("The worktree is detached")?;
-    if !current.starts_with("mc/") && !current.starts_with("monocode/") {
+    if expected.is_some_and(|value| value != current) {
+        return Err("The working copy branch changed. Refresh before retrying.".into());
+    }
+    if tree.locked || !path_info(Path::new(&tree.path))?.1 {
+        return Err("The working copy is locked or unavailable".into());
+    }
+    if expected.is_none() && !current.starts_with("mc/") && !current.starts_with("monocode/") {
         return Err("Only automatically created worktree branches can be renamed".into());
     }
     if current == branch {
@@ -450,6 +465,25 @@ pub async fn git_worktree_rename_branch(
 ) -> Result<Worktree, String> {
     tauri::async_runtime::spawn_blocking(move || {
         rename_branch(&expand_home(&cwd), &expand_home(&path), &branch)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command(async)]
+pub async fn git_worktree_rename_branch_explicit(
+    cwd: String,
+    path: String,
+    branch: String,
+    expected_branch: String,
+) -> Result<Worktree, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        rename_branch_checked(
+            &expand_home(&cwd),
+            &expand_home(&path),
+            &branch,
+            Some(&expected_branch),
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1066,6 +1100,36 @@ pub(crate) mod tests {
 
         let regular = create(&root, "feature/manual", "main", false).unwrap();
         assert!(rename_branch(&root, Path::new(&regular.path), "mc/should-not-change").is_err());
+    }
+
+    #[test]
+    fn explicit_rename_checks_identity_and_preserves_the_worktree() {
+        let repo = repo();
+        let root = repo.0.join("repo");
+        let tree = create(&root, "feature/manual", "main", false).unwrap();
+        let path = Path::new(&tree.path);
+        std::fs::write(path.join("keep-me"), "dirty changes").unwrap();
+        assert!(rename_branch_checked(&root, path, "feature/new", Some("stale")).is_err());
+        assert!(rename_branch_checked(&root, path, "main", Some("feature/manual")).is_err());
+        assert!(rename_branch_checked(&root, path, "bad name", Some("feature/manual")).is_err());
+        assert!(rename_branch_checked(&root, &root, "other", Some("main")).is_err());
+        git_checked(&root, &["worktree", "lock", &tree.path]).unwrap();
+        assert!(rename_branch_checked(&root, path, "feature/new", Some("feature/manual")).is_err());
+        git_checked(&root, &["worktree", "unlock", &tree.path]).unwrap();
+        let renamed =
+            rename_branch_checked(&root, path, "feature/new", Some("feature/manual")).unwrap();
+        assert_eq!(renamed.path, tree.path);
+        assert_eq!(renamed.head, tree.head);
+        assert_eq!(renamed.branch.as_deref(), Some("feature/new"));
+        assert_eq!(
+            std::fs::read_to_string(path.join("keep-me")).unwrap(),
+            "dirty changes"
+        );
+        assert!(git(
+            &root,
+            &["rev-parse", "--verify", "refs/heads/feature/manual"]
+        )
+        .is_err());
     }
 
     #[test]

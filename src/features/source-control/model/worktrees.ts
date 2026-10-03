@@ -64,6 +64,20 @@ export async function renameWorktreeBranch(
   return tree;
 }
 
+/** User-requested rename; automatic branch naming retains its restricted command. */
+export async function renameWorktreeBranchExplicit(
+  cwd: string,
+  path: string,
+  expectedBranch: string,
+  branch: string,
+) {
+  const tree = await invokeWorkspace<Worktree>("git_worktree_rename_branch_explicit", {
+    cwd, path, expectedBranch, branch,
+  });
+  notifyGitChanged();
+  return tree;
+}
+
 export function temporaryWorktreeBranchName(
   id: string = crypto.randomUUID(),
 ): string {

@@ -1,3 +1,4 @@
+import { runTaskWorktreeAction, type TaskWorktreeActionHandler } from "../features/board/taskWorktrees";
 import { loadProjectSessionHistory } from "../features/sessions/data/projectSessionHistory";
 import { projectSessionSummaries, scopedSessions, type SessionListScope } from "../features/board/sessionScope";
 import { taskTabWorkspace, taskWorkspaceTabs } from "../features/board/taskWorkspace";
@@ -10430,6 +10431,35 @@ function Workspace({
     [],
   );
 
+  const onTaskWorktreeAction = useCallback<TaskWorktreeActionHandler>(
+    action => runTaskWorktreeAction(action, {
+      sessions: () => sessionsRef.current,
+      remove: onRemoveWorktree,
+      renameSessionBranches: async (ids, branch) => {
+        sessionsRef.current = sessionsRef.current.map(session =>
+          ids.includes(session.id) ? { ...session, branch } : session,
+        );
+        setSessions(sessionsRef.current);
+        const patch = (entry: SessionSummary) => ids.includes(entry.id) ? { ...entry, branch } : entry;
+        setHistory(current => current.map(patch));
+        setStoredLinkedSessions(current => current.map(patch));
+        for (const id of ids) {
+          const session = sessionsRef.current.find(session => session.id === id) ?? await getSession(id);
+          if (session && shouldPersistSession(session)) await upsertSession({ ...session, branch });
+          notifyReviewChanged(id);
+        }
+      },
+      lockSessions: async (ids, path, run) => {
+        if (ids.some(id => switchingWorktrees.current.has(id) || removingSessionIds.current.has(id)))
+          throw new Error("Wait for these conversations to finish changing before changing the working copy.");
+        for (const id of ids) switchingWorktrees.current.set(id, path);
+        try { return await run(); }
+        finally { for (const id of ids) switchingWorktrees.current.delete(id); }
+      },
+    }),
+    [onRemoveWorktree],
+  );
+
   const onBoardSpawnSession = useCallback(
     async (spec: TaskWorkstreamSpec & { title: string; links: LinkedWorkItem[] }) => {
       const worktreePath = await onBoardPrepareWorktree(spec);
@@ -11795,6 +11825,7 @@ function Workspace({
                           onSendToSession={onBoardSendToSession}
                           onSpawnSession={onBoardSpawnSession}
                           onPrepareWorktree={onBoardPrepareWorktree}
+                          onTaskWorktreeAction={onTaskWorktreeAction}
                           onRemoveWorktree={onRemoveWorktree}
                         />
                       ) : null}
@@ -11921,6 +11952,7 @@ function Workspace({
                   onSendToSession={onBoardSendToSession}
                   onSpawnSession={onBoardSpawnSession}
                   onPrepareWorktree={onBoardPrepareWorktree}
+                          onTaskWorktreeAction={onTaskWorktreeAction}
                   onRemoveWorktree={onRemoveWorktree}
                 />
               ) : null}

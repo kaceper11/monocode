@@ -1,11 +1,11 @@
+import { TaskWorktreeManager } from "./TaskWorktreeControls";
+import { assertTaskCopySelection, assertTaskWorktreeAvailable, detachTaskWorkingCopy, type TaskWorktreeActionHandler } from "./taskWorktrees";
 import { UpdateBranchesDialog } from "./UpdateBranchesDialog";
 import { TaskDeliveryPanel } from "./TaskDeliveryPanel";
 import { EditTaskDialog } from "./EditTaskDialog";
 import { TaskActionFeedback } from "./TaskActionFeedback";
 import {
   TaskGitActions,
-  useTaskGitBusy,
-  useTaskGitOperation,
   withTaskGitLock,
 } from "./TaskGitActions";
 import { CiBadge, DeliverySettings } from "./DeliveryControls";
@@ -15,7 +15,7 @@ import {
   snapshotIdentity,
   type SendToSession,
 } from "./delivery";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { InboxProviderMark } from "../inbox/ui/InboxProviderMark";
 import { Popover } from "../../shared/ui/Popover";
@@ -41,7 +41,6 @@ import {
   MoreHorizontal,
   Play,
   Plus,
-  RefreshCw,
   Trash2,
   WandSparkles,
   X,
@@ -52,12 +51,8 @@ import { formatRelativeTime, type InboxItem } from "../inbox/model/githubTasks";
 import { pathKey, prettyCwd, projectName } from "../../shared/lib/paths";
 import { gitTaskBranch, subscribeGitChanged } from "../../platform/tauri/fs";
 import {
-  taskBranchOptions,
-  taskBranchChoice,
   storedBaseName,
-  useProjectBranchesState,
 } from "../source-control/hooks/useProjectBranches";
-import { useProjectWorktrees } from "../source-control/hooks/useProjectWorktrees";
 import { sameProjectPath, type RecentProject } from "../projects/model/recents";
 import type { Session } from "../sessions/model/session";
 import {
@@ -293,6 +288,7 @@ export function TaskDetailsPanel({
   onHandoff,
   onSpawnSession,
   onPrepareWorktree,
+  onTaskWorktreeAction,
   wsStatus,
   onUpdateBranches,
   onUpdateWorkstream,
@@ -330,6 +326,7 @@ export function TaskDetailsPanel({
   onPrepareWorktree: (
     spec: NewTaskSpec["workstreams"][number],
   ) => Promise<string>;
+  onTaskWorktreeAction?: TaskWorktreeActionHandler;
   onSpawnSession: (spec: NewTaskSpec["workstreams"][number]) => Promise<{
     sessionId: string;
     worktreePath: string;
@@ -707,15 +704,6 @@ export function TaskDetailsPanel({
                     </span>
                   )}
                 </div>
-                <button
-                  type="button"
-                  aria-label="Add repository"
-                  title="Add repository"
-                  className="grid size-7 shrink-0 place-items-center rounded-md text-content/55 hover:bg-content/6 hover:text-content"
-                  onClick={() => setEditTask(true)}
-                >
-                  <Plus className="size-3" strokeWidth={2} />
-                </button>
                 <TaskGitActions
                   all
                   disabled={busyAction.size > 0}
@@ -868,7 +856,7 @@ export function TaskDetailsPanel({
               ))}
               {!card.workstreams?.length ? (
                 <p className="px-1.5 py-1 text-[12px] text-content/40">
-                  Add a repository to start work.
+                  Use Edit task to add a repository.
                 </p>
               ) : null}
             </div>
@@ -878,99 +866,103 @@ export function TaskDetailsPanel({
             <RelatedPrs card={card} />
           </div>
 
-          {/* Pinned footer — task-level actions grouped: work actions left,
-           * destructive right. flex-wrap so a narrow panel wraps instead of
-           * clipping. */}
-          <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-t border-stroke px-3 py-2">
-            <button
-              type="button"
-              disabled={
-                busyAction.size > 0 ||
-                !(card.workstreams ?? []).some(
-                  // A closed/merged PR doesn't block a replacement — only an
-                  // open one does.
-                  (row) => !row.pr || !prIsOpen(row.pr.state),
-                )
-              }
-              onClick={() =>
-                setPrDialog(
-                  new Set(
-                    (card.workstreams ?? [])
-                      .filter((row) => !row.pr || !prIsOpen(row.pr.state))
-                      .map((row) => row.id),
-                  ),
-                )
-              }
-              className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-accent/15 bg-accent/10 px-2.5 text-[11px] font-medium text-accent hover:bg-accent/20 focus-visible:outline-accent disabled:opacity-40"
-            >
-              {busyAction.has("prs") ? (
-                <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
-              ) : (
-                <GitPullRequest className="size-3" strokeWidth={2} />
-              )}
-              Create PRs
-            </button>
-            <button
-              type="button"
-              disabled={
-                busyAction.size > 0 ||
-                !task.workstreams.some((ws) => ws.worktreePath && ws.branch)
-              }
-              onClick={() =>
-                setUpdateRows(
-                  task.workstreams.filter((ws) => ws.worktreePath && ws.branch),
-                )
-              }
-              className={SECONDARY_ACTION}
-            >
-              {busyAction.has("merge") ? (
-                <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
-              ) : (
-                <GitMerge className="size-3" strokeWidth={2} />
-              )}
-              Merge into branches…
-            </button>
-            <button
-              type="button"
-              aria-label="Task actions"
-              title="Task actions"
-              aria-haspopup="menu"
-              aria-expanded={!!taskMenu}
-              className={`ml-auto !size-8 !px-0 ${SECONDARY_ACTION}`}
-              onClick={(event) =>
-                setTaskMenu(taskMenu ? null : event.currentTarget)
-              }
-            >
-              <MoreHorizontal className="size-4" />
-            </button>
-            {taskMenu && (
-              <Popover
-                anchor={taskMenu}
-                align="end"
-                width={176}
-                role="menu"
-                aria-label="Task actions"
-                onDismiss={() => setTaskMenu(null)}
-                className="p-1"
+          {/* Keep task actions on one row even in a narrow details panel. */}
+          <div className="@container shrink-0 border-t border-stroke px-3 py-2">
+            <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2rem] items-center gap-1.5">
+              <button
+                type="button"
+                disabled={
+                  busyAction.size > 0 ||
+                  !(card.workstreams ?? []).some(
+                    // A closed/merged PR doesn't block a replacement — only an
+                    // open one does.
+                    (row) => !row.pr || !prIsOpen(row.pr.state),
+                  )
+                }
+                onClick={() =>
+                  setPrDialog(
+                    new Set(
+                      (card.workstreams ?? [])
+                        .filter((row) => !row.pr || !prIsOpen(row.pr.state))
+                        .map((row) => row.id),
+                    ),
+                  )
+                }
+                title="Create PRs"
+                className="inline-flex h-8 min-w-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-accent/15 bg-accent/10 px-2.5 text-[11px] font-medium text-accent hover:bg-accent/20 focus-visible:outline-accent disabled:opacity-40"
               >
-                <button
-                  type="button"
-                  role="menuitem"
-                  className={`flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-[12px] text-red-600 hover:bg-red-500/8 focus-visible:outline-accent dark:text-red-400 ${removeArmed ? "bg-red-500/12" : ""}`}
-                  onClick={() => {
-                    if (!removeArmed) {
-                      setRemoveArmed(true);
-                      return;
-                    }
-                    removeTask(task.id);
-                    onClose();
-                  }}
+                {busyAction.has("prs") ? (
+                  <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
+                ) : (
+                  <GitPullRequest className="size-3" strokeWidth={2} />
+                )}
+                Create PRs
+              </button>
+              <button
+                type="button"
+                disabled={
+                  busyAction.size > 0 ||
+                  !task.workstreams.some((ws) => ws.worktreePath && ws.branch)
+                }
+                onClick={() =>
+                  setUpdateRows(
+                    task.workstreams.filter((ws) => ws.worktreePath && ws.branch),
+                  )
+                }
+                title="Merge into branches…"
+                aria-label="Merge into branches…"
+                className={`${SECONDARY_ACTION} min-w-0 whitespace-nowrap`}
+              >
+                {busyAction.has("merge") ? (
+                  <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
+                ) : (
+                  <GitMerge className="size-3" strokeWidth={2} />
+                )}
+                <span className="@[360px]:hidden">Merge…</span>
+                <span className="hidden @[360px]:inline">Merge into branches…</span>
+              </button>
+              <button
+                type="button"
+                aria-label="Task actions"
+                title="Task actions"
+                aria-haspopup="menu"
+                aria-expanded={!!taskMenu}
+                className={`!size-8 !px-0 ${SECONDARY_ACTION}`}
+                onClick={(event) =>
+                  setTaskMenu(taskMenu ? null : event.currentTarget)
+                }
+              >
+                <MoreHorizontal className="size-4" />
+              </button>
+              {taskMenu && (
+                <Popover
+                  anchor={taskMenu}
+                  align="end"
+                  width={176}
+                  role="menu"
+                  aria-label="Task actions"
+                  onDismiss={() => setTaskMenu(null)}
+                  className="p-1"
                 >
-                  <Trash2 className="size-3.5" />
-                  {removeArmed ? "Confirm removal" : "Remove task"}
-                </button>
-              </Popover>
-            )}
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className={`flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-[12px] text-red-600 hover:bg-red-500/8 focus-visible:outline-accent dark:text-red-400 ${removeArmed ? "bg-red-500/12" : ""}`}
+                    onClick={() => {
+                      if (!removeArmed) {
+                        setRemoveArmed(true);
+                        return;
+                      }
+                      removeTask(task.id);
+                      onClose();
+                    }}
+                  >
+                    <Trash2 className="size-3.5" />
+                    {removeArmed ? "Confirm removal" : "Remove task"}
+                  </button>
+                </Popover>
+              )}
+            </div>
           </div>
         </>
       )}
@@ -993,6 +985,7 @@ export function TaskDetailsPanel({
           items={items}
           sessions={sessions}
           onPrepareWorktree={onPrepareWorktree}
+          onTaskWorktreeAction={onTaskWorktreeAction}
           onClose={() => setEditTask(false)}
         />
       )}
@@ -1041,6 +1034,8 @@ export function TaskDetailsPanel({
                 row={editRow}
                 lanes={lanes}
                 onPrepareWorktree={onPrepareWorktree}
+                onTaskWorktreeAction={onTaskWorktreeAction}
+                sessions={sessions}
                 busy={
                   busyAction.has(`cleanup:${editRow.id}`) ||
                   card.sessions.some((session) => session.busy)
@@ -1899,478 +1894,42 @@ function WorkstreamCard({
   );
 }
 
-/** Bound-copy manager — the operations a field edit can't express:
- * switching the checkout's branch in place, detaching the copy, or deleting
- * it. Which repo/branch/copy a lane tracks is Edit task's job. A successful
- * action closes the popover rather than resetting it in place. */
+/** Task details uses the same picker and management dialog as Edit task. */
 export function WorkstreamEditor({
-  anchor,
-  row,
-  lanes,
-  busy,
-  onPatch,
-  onRemoveWorktree,
-  onPrepareWorktree,
-  onClose,
+  row, lanes, busy, onPatch, onPrepareWorktree, onClose, onTaskWorktreeAction, sessions = [],
 }: {
   anchor: HTMLElement;
   row: BoardWorkstreamRow;
-  /** All board lanes — the editor derives this row's siblings from it. */
   lanes: TaskWorkstream[];
-  /** Lane-level cleanup in flight — the remove button waits on it. */
   busy: boolean;
-  onPatch: (
-    patch: Partial<
-      Pick<TaskWorkstream, "branch" | "base" | "worktreePath" | "prUrl">
-    >,
-  ) => void;
-  onPrepareWorktree: (
-    spec: NewTaskSpec["workstreams"][number],
-  ) => Promise<string>;
+  onPatch: (patch: Partial<Pick<TaskWorkstream, "branch" | "base" | "worktreePath" | "prUrl">>) => void;
+  onPrepareWorktree: (spec: NewTaskSpec["workstreams"][number]) => Promise<string>;
   onRemoveWorktree: () => Promise<unknown>;
   onClose: () => void;
+  onTaskWorktreeAction?: TaskWorktreeActionHandler;
+  sessions?: Session[];
 }) {
-  // Editing which repo/branch/copy a lane tracks lives in the Edit task
-  // dialog — this popover only manages the lane's bound copy: switching its
-  // checkout in place, detaching, or deleting it. Those are the operations a
-  // field edit cannot express.
-  const { branches } = useProjectBranchesState(row.projectPath, true);
-  const {
-    data: worktrees,
-    refresh,
-    error: worktreeError,
-  } = useProjectWorktrees(row.projectPath);
-  const [branchBusy, setBranchBusy] = useState(false);
-  const [targetBranch, setTargetBranch] = useState<string>();
-  const [bindPath, setBindPath] = useState<string>();
-  const inFlight = useRef(false);
-  const gitBusy = useTaskGitBusy([row.projectPath]);
-  // Which op holds the repo lock — shown so a disabled control explains
-  // itself instead of looking dead.
-  const gitOp = useTaskGitOperation([row.projectPath]);
-  const blocked =
-    busy ||
-    branchBusy ||
-    gitBusy ||
-    row.sessions.some((session) => session.busy);
-  const blockedRef = useRef(busy);
-  blockedRef.current =
-    busy || gitBusy || row.sessions.some((session) => session.busy);
-  const [armed, setArmed] = useState(false);
-  const [removing, setRemoving] = useState(false);
-  const [error, setError] = useState("");
-  // Reset staged edits when the lane (or its identity) changes — the same
-  // mounted editor is reused if another lane's row opens mid-edit.
-  useEffect(() => {
-    setTargetBranch(undefined);
-    setBindPath(undefined);
-    setError("");
-  }, [row.id, row.projectPath, row.branch, row.base, row.worktreePath]);
-  // An armed confirm must not survive a rebind — it would remove the new
-  // pick's worktree instead of the one the user armed against.
-  useEffect(() => setArmed(false), [row.id, row.worktreePath]);
-  // Other lanes on the same repo — their branches and bound worktrees are
-  // claimed; a branch lives in one worktree and a worktree serves one lane.
-  const siblings = useMemo(
-    () =>
-      lanes.filter(
-        (ws) =>
-          ws.id !== row.id &&
-          pathKey(ws.projectPath) === pathKey(row.projectPath),
-      ),
-    [lanes, row.id, row.projectPath],
-  );
-  const claimedBranches = useMemo(
-    () => new Set(siblings.map((ws) => ws.branch)),
-    [siblings],
-  );
-  const branchOptions = useMemo(
-    () => taskBranchOptions(branches, claimedBranches),
-    [branches, claimedBranches],
-  );
-  // Siblings are render-time — a claim can land between render and pick.
-  // Re-read the store at patch time so a race can't write a duplicate
-  // branch or worktree binding. Branch claims are repo-scoped (two repos can
-  // share a branch name); worktree paths are globally unique.
-  const storeClaim = (patch: {
-    branch?: string;
-    worktreePath?: string;
-  }): string => {
-    if (patch.branch)
-      for (const entry of loadBoard().tasks)
-        for (const ws of entry.workstreams)
-          if (
-            ws.id !== row.id &&
-            sameProjectPath(ws.projectPath, row.projectPath) &&
-            ws.branch === patch.branch
-          )
-            return `A lane already tracks ${patch.branch}`;
-    if (patch.worktreePath && laneClaimsPath(patch.worktreePath, row.id))
-      return "That worktree already serves another lane";
-    return "";
+  const [original] = useState(() => loadBoard().tasks.find(task => task.workstreams.some(lane => lane.id === row.id)));
+  const target = {
+    taskId: original?.id, laneId: row.id, projectPath: row.projectPath,
+    path: row.worktreePath, branch: row.branch, base: row.base, prUrl: row.pr?.url, expectedTask: original,
   };
-  /** The lane must still look like the row this editor opened with —
-   * otherwise the patch would clobber a fresher update. */
-  const rowDrift = (): string => {
-    const current = loadBoard()
-      .tasks.flatMap((task) => task.workstreams)
-      .find((ws) => ws.id === row.id);
-    return !current ||
-      current.branch !== row.branch ||
-      current.base !== row.base ||
-      current.worktreePath !== row.worktreePath ||
-      !sameProjectPath(current.projectPath, row.projectPath)
-      ? "Working copy settings changed. Reopen the editor before retrying."
-      : "";
-  };
-  /** Switch the bound copy's branch in place ("switch"), or bind the copy a
-   * clash offered ("bind" — always carries that copy's path). A successful
-   * patch closes the popover. */
-  const applyBranch = async (action: "switch" | "bind", existingPath?: string) => {
-    const selectedBranch = targetBranch;
-    if (!selectedBranch || inFlight.current || blocked) return;
-    const choice = taskBranchChoice(selectedBranch);
-    if (!choice.branch) {
-      setError("Pick a valid branch name first.");
-      return;
-    }
-    // "bind" without a path would ask the prepare path to CREATE a copy —
-    // the offer always carries one, so a miss means stale state.
-    if (action === "bind" && !existingPath) return;
-    let preparedPath: string | undefined;
-    const validate = (path?: string) => {
-      const drift = rowDrift();
-      if (drift) throw new Error(drift);
-      const claim = storeClaim({ branch: choice.branch, worktreePath: path });
-      if (claim) throw new Error(claim);
-    };
-    inFlight.current = true;
-    setBranchBusy(true);
-    setError("");
-    try {
-      validate(existingPath);
-      if (action === "switch") {
-        if (!row.worktreePath) throw new Error("Select a working copy first.");
-        // A branch can only be checked out in one copy — a hit elsewhere
-        // means the lane wants that copy bound, not a git error.
-        const clash = await worktreeOnBranch(row.projectPath, choice.branch);
-        validate(clash?.path);
-        if (clash) {
-          if (pathKey(clash.path) === pathKey(row.worktreePath))
-            throw new Error("This working copy is already on that branch.");
-          setBindPath(clash.path);
-          return;
-        }
-        const wtPath = row.worktreePath;
-        const branch = await withTaskGitLock(row.projectPath, "branch switch", () =>
-          gitTaskBranch(wtPath, row.branch, selectedBranch, row.base, "switch"),
-        );
-        validate(wtPath);
-        // A session may have bound to this lane while the checkout ran.
-        if (blockedRef.current)
-          throw new Error(
-            "An agent is working. Reopen the editor after it finishes.",
-          );
-        onPatch({
-          branch,
-          ...(choice.base ? { base: choice.base } : {}),
-          prUrl: undefined,
-        });
-      } else {
-        // Bind the offered copy — the app's prepare path re-validates it
-        // and takes the per-repo git lock itself.
-        preparedPath = await onPrepareWorktree({
-          projectPath: row.projectPath,
-          branch: choice.branch,
-          base: choice.base ?? row.base,
-          worktreePath: existingPath,
-        });
-        validate(preparedPath);
-        // A running agent may have started while preparation was awaiting IO.
-        if (blockedRef.current)
-          throw new Error(
-            "An agent is working. Reopen the editor after it finishes.",
-          );
-        onPatch({
-          branch: choice.branch,
-          ...(choice.base ? { base: choice.base } : {}),
-          worktreePath: preparedPath,
-          prUrl: undefined,
-        });
-      }
-      void refresh();
-      onClose();
-    } catch (cause) {
-      setError(
-        `${String(cause)}${preparedPath ? ` Working copy kept at ${preparedPath}.` : ""}`,
-      );
-    } finally {
-      inFlight.current = false;
-      setBranchBusy(false);
-    }
-  };
-  const stagedChoice = taskBranchChoice(targetBranch || row.branch);
-  const stagedName = stagedChoice.branch;
-  const branchStaged = stagedName !== row.branch;
-  const detach = () => {
-    // Keep the probed PR when detaching its working copy; a branch staged
-    // alongside the detach retargets the lane in the same patch.
-    if (branchStaged && !stagedName) {
-      setError("Pick a valid branch name first.");
-      return;
-    }
-    const drift = rowDrift();
-    const claim =
-      branchStaged && !drift ? storeClaim({ branch: stagedName }) : "";
-    if (drift || claim) {
-      setError(drift || claim);
-      return;
-    }
-    onPatch({
-      worktreePath: undefined,
-      ...(branchStaged
-        ? {
-            branch: stagedName,
-            ...(stagedChoice.base ? { base: stagedChoice.base } : {}),
-            prUrl: undefined,
-          }
-        : { ...(row.pr?.url ? { prUrl: row.pr.url } : {}) }),
-    });
-    onClose();
-  };
-  const boundTree = row.worktreePath
-    ? worktrees?.worktrees.find(
-        (tree) => pathKey(tree.path) === pathKey(row.worktreePath!),
-      )
-    : undefined;
-  // Switching mutates the copy in place — gated before the click on:
-  // uncommitted changes (git refuses), the repo's primary checkout (switching
-  // it retargets the user's main working directory), and an unresolved
-  // worktree list (isMain/dirty are only known once it loads).
-  const mainCopy = !!boundTree?.isMain;
-  const dirtyCopy = boundTree?.dirty === true;
-  // Registered-but-deleted copies can't be switched either — nothing the
-  // refresh button can repoint.
-  const copyMissing = boundTree?.missing === true;
-  const copyUnresolved = !!row.worktreePath && !boundTree;
-  const switchBlocked = mainCopy || dirtyCopy || copyMissing || copyUnresolved;
-  const chip = (text: string, tone: "neutral" | "amber" | "red") => (
-    <span
-      className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${
-        tone === "red"
-          ? "bg-red-400/10 text-red-600 dark:text-red-300/90"
-          : tone === "amber"
-            ? "bg-amber-400/10 text-amber-700 dark:text-amber-300/90"
-            : "bg-content/8 text-content/60"
-      }`}
-    >
-      {text}
-    </span>
-  );
-  return (
-    <Popover
-      anchor={anchor}
-      width={360}
-      onDismiss={() => {
-        if (!inFlight.current && !removing) onClose();
-      }}
-      // SearchableSelect menus portal out of this popover — they aren't
-      // "outside" clicks.
-      ignore="[data-dialog-popover]"
-      role="dialog"
-      className="flex flex-col gap-2 p-3"
-      aria-label="Manage worktree"
-    >
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-[12px] font-medium">Worktree</span>
-        <button
-          type="button"
-          title="Refresh working copies"
-          aria-label="Refresh working copies"
-          disabled={blocked}
-          onClick={() => void refresh()}
-          className="grid size-5 shrink-0 place-items-center rounded text-content/40 hover:bg-content/8 hover:text-content disabled:opacity-40"
-        >
-          <RefreshCw
-            className={`size-3 ${!worktrees && !worktreeError ? "animate-spin" : ""}`}
-            strokeWidth={1.75}
-          />
-        </button>
-      </div>
-      {row.worktreePath ? (
-        <div className="flex min-w-0 items-center gap-1.5">
-          <FolderTree
-            className="size-3 shrink-0 text-content/35"
-            strokeWidth={1.75}
-          />
-          <p
-            className="truncate font-mono text-[10px] text-content/50"
-            title={row.worktreePath}
-          >
-            {prettyCwd(row.worktreePath)}
-          </p>
-          {mainCopy ? chip("Main checkout", "neutral") : null}
-          {dirtyCopy ? chip("Unsaved changes", "amber") : null}
-          {copyMissing ? chip("Missing on disk", "red") : null}
-        </div>
-      ) : null}
-      {copyMissing ? (
-        <p
-          role="status"
-          className="rounded-md bg-red-400/8 px-2 py-1.5 text-[11px] leading-4 text-red-600 dark:text-red-300/90"
-        >
-          Nothing on disk to switch — detach the dead binding, or repoint the
-          lane in Edit task.
-        </p>
-      ) : (
-        <div className="flex flex-col gap-1.5">
-          <span className="text-[11px] text-content/45">Checkout branch</span>
-          <SearchableSelect
-            label="Checkout branch"
-            value={targetBranch ?? row.branch}
-            placeholder="Choose or name a branch…"
-            options={branchOptions}
-            onChange={(value) => {
-              setTargetBranch(value);
-              setBindPath(undefined);
-              setError("");
-            }}
-            searchPlaceholder="Pick or type a branch…"
-            creatable="New branch"
-            exclude={claimedBranches}
-            disabled={blocked}
-            layer={LAYER.submenu}
-            minMenuWidth={220}
-          />
-          {bindPath ? (
-            // The pick is checked out in another copy — bind it rather than
-            // run a switch git would refuse anyway.
-            <BindOfferBar
-              path={bindPath}
-              busy={blocked}
-              onAccept={() => void applyBranch("bind", bindPath)}
-              onDismiss={() => setBindPath(undefined)}
-            />
-          ) : branchStaged ? (
-            <>
-              <button
-                type="button"
-                disabled={blocked || switchBlocked}
-                onClick={() => void applyBranch("switch")}
-                className="flex h-7 min-w-0 items-center justify-center gap-1.5 rounded-md border border-accent/15 bg-accent/10 px-2 text-[11px] font-medium text-accent hover:bg-accent/20 focus-visible:outline-accent disabled:opacity-40"
-              >
-                <GitBranch className="size-3 shrink-0" strokeWidth={1.75} />
-                {branchBusy ? (
-                  "Switching…"
-                ) : (
-                  <span className="truncate">Switch to {stagedName}</span>
-                )}
-              </button>
-              {switchBlocked ? (
-                <p
-                  role="status"
-                  className="leading-4 text-amber-700 dark:text-amber-300"
-                >
-                  {mainCopy
-                    ? "This is the repository's main checkout — switching it would retarget your primary working directory."
-                    : dirtyCopy
-                      ? "Uncommitted changes here — commit or stash, then refresh."
-                      : "Working copy state isn't available yet — refresh before switching."}
-                </p>
-              ) : null}
-            </>
-          ) : (
-            <p className="text-[10.5px] leading-4 text-content/40">
-              Pick a branch to switch this worktree's checkout.
-            </p>
-          )}
-        </div>
-      )}
-      {worktreeError ? (
-        <p role="alert" className="text-[11px] text-red-400">
-          {worktreeError}
-        </p>
-      ) : null}
-      {!worktrees && !worktreeError ? (
-        <p
-          role="status"
-          className="flex items-center gap-1.5 text-[11px] text-content/40"
-        >
-          <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
-          Loading working copies…
-        </p>
-      ) : null}
-      {gitOp ? (
-        <p
-          role="status"
-          className="flex items-center gap-1.5 text-[11px] text-content/45"
-        >
-          <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
-          Git is busy: {gitOp}
-        </p>
-      ) : null}
-      <div className="flex gap-2 border-t border-content/8 pt-2.5">
-        <button
-          type="button"
-          disabled={blocked || !row.worktreePath}
-          title="Unbind this copy — it stays on disk and the lane tracks the branch only"
-          onClick={detach}
-          className="h-7 flex-1 rounded-md border border-content/10 px-2 text-[11px] text-content/70 hover:bg-content/5 disabled:opacity-40"
-        >
-          Detach worktree
-        </button>
-        {row.worktreePath && !boundTree?.isMain ? (
-          <button
-            type="button"
-            disabled={blocked || removing}
-            aria-pressed={armed}
-            title={
-              armed
-                ? "Confirm — removes the worktree directory; live sessions bound to it are detached"
-                : "Remove this lane's worktree"
-            }
-            onClick={() => {
-              if (!armed) {
-                setArmed(true);
-                return;
-              }
-              setRemoving(true);
-              setError("");
-              void withTaskGitLock(row.projectPath, "worktree removal", () => onRemoveWorktree())
-                .then(() => onClose())
-                .catch((cause) => setError(String(cause)))
-                .finally(() => {
-                  setRemoving(false);
-                  setArmed(false);
-                });
-            }}
-            className={`flex h-7 flex-1 items-center justify-center gap-1.5 rounded-md text-[11px] font-medium disabled:opacity-40 ${
-              armed
-                ? "bg-red-400/15 text-red-300 hover:bg-red-400/25"
-                : "text-content/55 hover:bg-content/8 hover:text-content"
-            }`}
-          >
-            {removing ? (
-              <LoaderCircle className="size-3 animate-spin" strokeWidth={2} />
-            ) : (
-              <Trash2 className="size-3" strokeWidth={1.75} />
-            )}
-            {armed
-              ? row.sessions.length
-                ? `Detach ${row.sessions.length} & remove`
-                : "Confirm removal"
-              : "Delete worktree…"}
-          </button>
-        ) : null}
-      </div>
-      {error && (
-        <TaskActionFeedback
-          title="Worktree action failed"
-          message={error}
-          error
-          onDismiss={() => setError("")}
-        />
-      )}
-    </Popover>
-  );
+  const other = lanes.filter(lane => lane.id !== row.id);
+  if (!onTaskWorktreeAction) return null;
+  return <TaskWorktreeManager
+    target={target} onAction={onTaskWorktreeAction} onApplied={() => {}}
+    excludePaths={new Set(other.flatMap(lane => lane.worktreePath ? [pathKey(lane.worktreePath)] : []))}
+    excludeBranches={new Set(other.filter(lane => sameProjectPath(lane.projectPath, row.projectPath)).map(lane => lane.branch))}
+    sessionCount={row.sessions.length} disabled={busy}
+    onPick={async tree => {
+      assertTaskWorktreeAvailable(target, tree.path, tree.branch!);
+      await assertTaskCopySelection(target, tree.path, sessions);
+      const path = await onPrepareWorktree({ projectPath: row.projectPath, branch: tree.branch!, base: row.base, worktreePath: tree.path });
+      assertTaskWorktreeAvailable(target, path, tree.branch!);
+      await assertTaskCopySelection(target, path, sessions);
+      onPatch({ branch: tree.branch!, worktreePath: path, prUrl: undefined });
+    }}
+    onDetach={async () => { await detachTaskWorkingCopy(target, sessions); }}
+    onClose={onClose}
+  />;
 }

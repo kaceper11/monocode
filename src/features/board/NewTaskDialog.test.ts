@@ -3,6 +3,7 @@ import { act, createElement, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { NewTaskDialog } from "./NewTaskDialog";
+import { createWorktree } from "../source-control/model/worktrees";
 import { gitBranches } from "../../platform/tauri/fs";
 import { saveSavedProject, selectSavedProject } from "../projects/model/savedProjects";
 
@@ -19,7 +20,12 @@ vi.mock("../source-control/hooks/useProjectBranches", async (original) => ({
   }),
 }));
 vi.mock("../source-control/hooks/useProjectWorktrees", () => ({
-  useProjectWorktrees: (path: string) => ({ data: { worktrees: [{ path, branch: "main", isMain: true }], defaultRoot: "/" } }),
+  useProjectWorktrees: (path: string) => ({ data: { worktrees: [{ path, branch: "main", isMain: true }], defaultRoot: "/" }, refresh: vi.fn() }),
+}));
+
+vi.mock("../source-control/model/worktrees", async original => ({
+  ...await original<typeof import("../source-control/model/worktrees")>(),
+  createWorktree: vi.fn(async () => ({ path: "/api-copy", branch: "custom", isMain: false })),
 }));
 
 let root: Root;
@@ -119,18 +125,19 @@ it("adds a chosen repository directly and accepts an editable branch", async () 
     document.querySelector<HTMLButtonElement>('[role="option"]')!.click(),
   );
   expect(document.querySelector('[aria-label^="Git actions"]')).toBeNull();
-  await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="radio"]')].find(button => button.textContent?.includes("Create new worktree"))!.click());
-  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label^="Branch:"]')!.click());
-  const input = document.querySelector<HTMLInputElement>('[aria-label="Pick or type a branch…"]')!;
+  await act(async () => document.querySelector<HTMLButtonElement>('[aria-label="Choose working copy"]')!.click());
+  await act(async () => [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === "Create worktree…")!.click());
+  const input = document.querySelector<HTMLInputElement>('[aria-label="New branch name"]')!;
   await act(async () => {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "custom");
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
-  await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find(button => button.textContent === 'New branch "custom"')!.click());
+  await act(async () => [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === "Create worktree")!.click());
+  expect(createWorktree).toHaveBeenCalledWith("/api", "custom", "HEAD", false);
   await submit();
   expect(props.onSubmit).toHaveBeenCalledWith(
     expect.objectContaining({
-      workstreams: [{ projectPath: "/api", branch: "custom", base: "HEAD" }],
+      workstreams: [{ projectPath: "/api", worktreePath: "/api-copy", branch: "custom", base: "HEAD" }],
     }),
   );
 });

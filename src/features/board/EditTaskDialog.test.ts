@@ -16,6 +16,14 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
   convertFileSrc: (value: string) => value,
 }));
+vi.mock("../source-control/hooks/useProjectBranches", async original => ({
+  ...await original<typeof import("../source-control/hooks/useProjectBranches")>(),
+  useProjectBranchesState: () => ({ settled: true, branches: { current: "feature", branches: [{ name: "feature", remote: null }] } }),
+}));
+vi.mock("../source-control/hooks/useProjectWorktrees", () => ({
+  useProjectWorktrees: () => ({ data: { worktrees: [{ path: "/copy", branch: "feature", isMain: false, dirty: false, sessionIds: [] }], defaultRoot: "/copies" }, refresh: vi.fn() }),
+}));
+
 const lane = {
   id: "lane",
   projectPath: "/repo",
@@ -121,7 +129,7 @@ it("stages ticket selection and checkout edits in the same controls as task crea
       ),
     );
     expect(
-      document.querySelector('[role="radiogroup"][aria-label="Working copy"]'),
+      document.querySelector('[aria-label="Choose working copy"]'),
     ).not.toBeNull();
     expect(
       document.querySelector('input[aria-label="Search tickets"]'),
@@ -182,4 +190,44 @@ it("preserves task-wide conversations and blocks checkout changes while they are
       [session, lead, { ...wide, busy: true }],
     ),
   ).rejects.toThrow("agent is working");
+});
+
+it.each(["save", "cancel"])("rebases an immediate rename while preserving unrelated title edits on %s", async outcome => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  HTMLElement.prototype.scrollIntoView = vi.fn();
+  addTask({ title: "Original", links: [], workstreams: [{ ...lane, sessionIds: [] }] });
+  const original = loadBoard().tasks[0];
+  const host = document.createElement("div"); document.body.append(host);
+  const root = createRoot(host);
+  const close = vi.fn();
+  const execute = vi.fn(async () => {
+    updateTask(original.id, { workstreams: [{ ...original.workstreams[0], branch: "renamed", prUrl: undefined }] });
+    return { task: loadBoard().tasks[0], tree: { path: "/copy", branch: "renamed" } };
+  });
+  const change = async (label: string, value: string) => act(async () => {
+    const input = document.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)!;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  try {
+    await act(async () => root.render(createElement(EditTaskDialog, {
+      task: original, items: [], sessions: [], recents: [], onClose: close,
+      onPrepareWorktree: vi.fn(async () => "/copy"), onTaskWorktreeAction: execute,
+    })));
+    await change("Task title", "Draft title");
+    await act(async () => document.querySelector<HTMLButtonElement>('[aria-label="Choose working copy"]')!.click());
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === "Manage worktrees…")!.click());
+    await act(async () => document.querySelector<HTMLButtonElement>('[role="tab"][id="task-copy-rename-tab"]')!.click());
+    await change("Rename branch", "renamed");
+    await act(async () => document.querySelector<HTMLButtonElement>('[role="tabpanel"] button')!.click());
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({ kind: "rename", target: expect.objectContaining({ expectedTask: original }) }));
+    expect(document.querySelector<HTMLInputElement>('input[aria-label="Task title"]')!.value).toBe("Draft title");
+    expect(loadBoard().tasks[0].title).toBe("Original");
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === (outcome === "save" ? "Save task" : "Cancel"))!.click());
+    expect(loadBoard().tasks[0].workstreams[0].branch).toBe("renamed");
+    expect(loadBoard().tasks[0].title).toBe(outcome === "save" ? "Draft title" : "Original");
+    expect(close).toHaveBeenCalled();
+  } finally {
+    await act(async () => root.unmount()); host.remove(); vi.unstubAllGlobals();
+  }
 });

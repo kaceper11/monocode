@@ -1,3 +1,5 @@
+import { TaskWorktreeManager } from "./TaskWorktreeControls";
+import type { TaskWorktreeActionHandler, TaskWorktreeResult } from "./taskWorktrees";
 import { taskWideSessionIds } from "./boardStore";
 import { useRef, useState } from "react";
 import { Modal } from "../../shared/ui/Modal";
@@ -204,6 +206,7 @@ export function EditTaskDialog({
   items,
   sessions,
   onPrepareWorktree,
+  onTaskWorktreeAction,
   onClose,
 }: {
   task: BoardTask;
@@ -211,16 +214,18 @@ export function EditTaskDialog({
   items: InboxItem[];
   sessions: Session[];
   onPrepareWorktree: (spec: TaskWorkstreamSpec) => Promise<string>;
+  onTaskWorktreeAction?: TaskWorktreeActionHandler;
   onClose: () => void;
 }) {
-  const [original] = useState(task);
+  const [original, setOriginal] = useState(task);
+  const [managing, setManaging] = useState<string>();
   const liveSessions = useRef(sessions);
   liveSessions.current = sessions;
   const [title, setTitle] = useState(task.title);
   const [links, setLinks] = useState(task.links);
   const [groups, setGroups] = useState(task.groupIds ?? []);
   const [primary, setPrimary] = useState(task.primarySessionId);
-  const wideIds = taskWideSessionIds(task);
+  const [wideIds, setWideIds] = useState(() => taskWideSessionIds(task));
   const [lanes, setLanes] = useState<EditLane[]>(
     task.workstreams.map((lane) => ({
       ...lane,
@@ -252,6 +257,41 @@ export function EditTaskDialog({
     setLanes((current) =>
       current.map((lane) => (lane.id === id ? { ...lane, ...patch } : lane)),
     );
+  const applied = (laneId: string, result: TaskWorktreeResult) => {
+    // Rebase only the action's lane metadata; title, tickets, groups and other row edits stay staged.
+    if (result.task) {
+      setOriginal(result.task);
+      const removed = new Set(result.removedSessionIds ?? []);
+      setWideIds(current => current.filter(id => !removed.has(id)));
+      setPrimary(current => current && removed.has(current) ? undefined : current);
+      setLanes(current => current.map(lane => {
+        const savedBefore = original.workstreams.find(row => row.id === lane.id);
+        const savedAfter = result.task!.workstreams.find(row => row.id === lane.id);
+        const affected = savedBefore && savedAfter && (
+          savedBefore.branch !== savedAfter.branch || savedBefore.worktreePath !== savedAfter.worktreePath
+        );
+        return {
+          ...lane,
+          ...(affected ? { branch: savedAfter.branch, worktreePath: savedAfter.worktreePath, base: savedAfter.base, prUrl: savedAfter.prUrl, noWorktree: !savedAfter.worktreePath } : {}),
+          ...(lane.id === laneId && result.tree ? { branch: result.tree.branch!, worktreePath: result.tree.path, ...(result.base ? { base: result.base } : {}), prUrl: undefined } : {}),
+          ...(lane.id === laneId && result.removedSessionIds ? { worktreePath: undefined, noWorktree: true } : {}),
+          sessionIds: (lane.sessionIds ?? []).filter(id => !removed.has(id)),
+        };
+      }));
+    }
+  };
+  const managedLane = lanes.find(lane => lane.id === managing);
+  const targetFor = (lane: EditLane) => ({
+    taskId: original.id, laneId: lane.id, projectPath: lane.projectPath,
+    path: lane.worktreePath, branch: lane.branch, base: lane.base, expectedTask: original,
+  });
+  const claimedFor = (lane: EditLane) => {
+    const other = [...loadBoard().tasks.filter(task => task.id !== original.id).flatMap(task => task.workstreams), ...lanes.filter(row => row.id !== lane.id)];
+    return {
+      paths: new Set(other.flatMap(row => row.worktreePath ? [pathKey(row.worktreePath)] : [])),
+      branches: new Set(other.filter(row => sameProjectPath(row.projectPath, lane.projectPath)).map(row => row.branch)),
+    };
+  };
   const save = async () => {
     if (sending.current || gitBusy) return;
     sending.current = true;
@@ -337,6 +377,7 @@ export function EditTaskDialog({
     }
   };
   return (
+    <>
     <Modal
       title="Edit task"
       description="Update the tickets and working copies attached to this task."
@@ -452,6 +493,12 @@ export function EditTaskDialog({
               <div key={lane.id} className="space-y-2">
                 <WorkstreamFields
                   draft={lane}
+                  management={onTaskWorktreeAction ? {
+                    target: targetFor(lane), onAction: onTaskWorktreeAction,
+                    onApplied: result => applied(lane.id, result),
+                    onManage: () => setManaging(lane.id),
+                    disabled: busy || liveSessions.current.some(session => (session.busy || session.worktreePreparing) && (taskWideSessionIds(original).includes(session.id) || lane.sessionIds?.includes(session.id))),
+                  } : undefined}
                   onChange={(patch) => patchLane(lane.id, patch)}
                   layer={LAYER.dialogPopover}
                   excludeBranches={claimedBranches}
@@ -605,5 +652,16 @@ export function EditTaskDialog({
         )}
       </fieldset>
     </Modal>
+    {managedLane && onTaskWorktreeAction && <TaskWorktreeManager
+      key={`${managedLane.id}:${managedLane.worktreePath}:${managedLane.branch}`}
+      target={targetFor(managedLane)} onAction={onTaskWorktreeAction}
+      onApplied={result => applied(managedLane.id, result)}
+      onPick={tree => patchLane(managedLane.id, { worktreePath: tree.path, branch: tree.branch!, noWorktree: false })}
+      onDetach={() => patchLane(managedLane.id, { worktreePath: undefined, noWorktree: true })}
+      excludePaths={claimedFor(managedLane).paths} excludeBranches={claimedFor(managedLane).branches}
+      sessionCount={sessions.filter(session => managedLane.worktreePath && pathKey(sessionWorkCwd(session)) === pathKey(managedLane.worktreePath)).length}
+      disabled={busy || sessions.some(session => (session.busy || session.worktreePreparing) && (taskWideSessionIds(original).includes(session.id) || managedLane.sessionIds?.includes(session.id)))}
+      staged onClose={() => setManaging(undefined)} />}
+    </>
   );
 }

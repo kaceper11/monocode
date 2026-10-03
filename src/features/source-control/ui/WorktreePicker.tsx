@@ -27,6 +27,15 @@ export function WorktreePicker({
   onBranchChange,
   onManage,
   onClose,
+  selectionLabel,
+  optionDisabledReason,
+  onCreate,
+  initialBranch,
+  initialBase,
+  onSwitchBranch,
+  onDetach,
+  layer,
+  allowBranchSwitch = true,
 }: {
   cwd: string;
   executionCwd: string;
@@ -37,6 +46,16 @@ export function WorktreePicker({
   onBranchChange?: () => void;
   onManage?: () => void;
   onClose?: () => void;
+  /** Task drafts can have no bound copy, independently of the project HEAD. */
+  selectionLabel?: string;
+  optionDisabledReason?: (tree: Worktree) => string | undefined;
+  onCreate?: React.ComponentProps<typeof CreateWorktreeDialog>["onCreate"];
+  initialBranch?: string;
+  initialBase?: string;
+  onSwitchBranch?: () => void;
+  onDetach?: () => void;
+  layer?: number;
+  allowBranchSwitch?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [branchPicker, setBranchPicker] = useState(false);
@@ -59,7 +78,7 @@ export function WorktreePicker({
     refresh,
   } = useProjectWorktrees(
     cwd,
-    enabled && (worktreeRemoved || !!branches?.current || inWorktree),
+    enabled && (selectionLabel !== undefined || worktreeRemoved || !!branches?.current || inWorktree),
   );
   useEffect(() => {
     if (!open) return;
@@ -67,12 +86,12 @@ export function WorktreePicker({
     return () => cancelAnimationFrame(frame);
   }, [open]);
   useEffect(() => {
-    if (!enabled) {
+    if (!enabled && (selectionLabel === undefined || !creating)) {
       setOpen(false);
       setCreating(false);
       setBranchPicker(false);
     }
-  }, [enabled]);
+  }, [enabled, creating, selectionLabel]);
   const dismiss = () => {
     setOpen(false);
     setQuery("");
@@ -80,14 +99,16 @@ export function WorktreePicker({
     onClose?.();
   };
   const select = async (tree: Worktree) => {
-    if (busy || tree.missing) return;
+    if (busy || tree.missing || optionDisabledReason?.(tree)) return false;
     setBusy(true);
     setError(undefined);
     try {
       await onSelect(tree);
       dismiss();
+      return true;
     } catch (e) {
       setError(String(e));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -129,7 +150,7 @@ export function WorktreePicker({
     <div ref={anchor} className="relative flex min-w-0 shrink">
       <GitPickerTrigger
         disabled={
-          !enabled || (!worktreeRemoved && !branches?.current && !inWorktree)
+          !enabled || (selectionLabel === undefined && !worktreeRemoved && !branches?.current && !inWorktree)
         }
         title={
           worktreeRemoved
@@ -147,7 +168,7 @@ export function WorktreePicker({
           setOpen(!open);
         }}
         label={
-          worktreeRemoved
+          selectionLabel ?? (worktreeRemoved
             ? NO_BRANCH_LABEL
             : branches?.current
               ? branches.detached
@@ -157,7 +178,7 @@ export function WorktreePicker({
                 ? inWorktree
                   ? "Worktree unavailable"
                   : "No repo"
-                : "Loading…"
+                : "Loading…")
         }
         worktree={!worktreeRemoved && inWorktree}
       />
@@ -167,6 +188,7 @@ export function WorktreePicker({
           side="top"
           width={320}
           maxHeight={400}
+          layer={layer}
           onDismiss={() => {
             if (!busy) dismiss();
           }}
@@ -238,10 +260,10 @@ export function WorktreePicker({
                   !worktreeRemoved &&
                   pathKey(tree.path) === pathKey(executionCwd)
                 }
-                disabled={busy || tree.missing}
+                disabled={busy || tree.missing || !!optionDisabledReason?.(tree)}
                 onMouseEnter={() => setActivePath(tree.path)}
                 onClick={() => void select(tree)}
-                title={tree.path}
+                title={optionDisabledReason?.(tree) || tree.path}
                 className={`flex w-full items-center gap-2 rounded-md px-2 py-2 text-left disabled:opacity-40 ${active === index ? "bg-selection" : "hover:bg-content/5"}`}
               >
                 {tree.isMain ? (
@@ -256,6 +278,7 @@ export function WorktreePicker({
                   <span className="block truncate text-[10px] text-content/40">
                     {tree.isMain ? "Project folder" : prettyCwd(tree.path)}
                     {tree.missing ? " · Missing" : ""}
+                    {optionDisabledReason?.(tree) ? ` · ${optionDisabledReason(tree)}` : ""}
                   </span>
                 </span>
                 {!worktreeRemoved &&
@@ -288,18 +311,21 @@ export function WorktreePicker({
               <Plus className="size-3.5" />
               Create worktree…
             </button>
+            {allowBranchSwitch && (
             <button
               type="button"
               disabled={busy || worktreeRemoved}
               onClick={() => {
-                setOpen(false);
-                setBranchPicker(true);
+                  setOpen(false);
+                  if (onSwitchBranch) onSwitchBranch();
+                  else setBranchPicker(true);
               }}
               className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-content/55 hover:bg-content/8 disabled:opacity-40"
             >
               <GitBranch className="size-3.5" />
               Switch branch in this working copy…
             </button>
+            )}
             {onManage && (
               <button
                 type="button"
@@ -314,6 +340,12 @@ export function WorktreePicker({
                 Manage worktrees…
               </button>
             )}
+            {onDetach && (
+              <button type="button" disabled={busy} onClick={() => { dismiss(); onDetach(); }}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-content/55 hover:bg-content/8">
+                <FolderTree className="size-3.5" /> Track branch without a working copy
+              </button>
+            )}
           </div>
         </Popover>
       )}
@@ -322,10 +354,14 @@ export function WorktreePicker({
           cwd={cwd}
           baseCwd={worktreeRemoved ? cwd : executionCwd}
           defaultRoot={data?.defaultRoot}
+          initialBranch={initialBranch}
+          initialBase={initialBase}
+          onCreate={onCreate}
           onCreated={async (tree) => {
             setCreating(false);
             setOpen(true);
-            await select(tree);
+            if (!(await select(tree)))
+              setError(previous => `${previous || "Selection failed."} Created working copy kept at ${prettyCwd(tree.path)}.`);
           }}
           onCancel={() => {
             setCreating(false);

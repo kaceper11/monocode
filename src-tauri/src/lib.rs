@@ -465,6 +465,7 @@ pub fn run() {
             worktrees::git_worktree_create,
             worktrees::git_orchestration_worktree_create,
             worktrees::git_worktree_rename_branch,
+            worktrees::git_worktree_rename_branch_explicit,
             worktrees::git_worktree_check_remove,
             worktrees::git_worktree_remove,
             worktrees::git_orchestration_worktree_remove,

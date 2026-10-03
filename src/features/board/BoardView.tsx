@@ -1,3 +1,4 @@
+import type { TaskWorktreeActionHandler } from "./taskWorktrees";
 import { taskWideSessionIds } from "./boardStore";
 import { periodKey } from "../inbox/model/planning";
 import { PlanningFilter } from "./PlanningFilter";
@@ -252,6 +253,7 @@ export function BoardView({
   onSendToSession,
   onSpawnSession,
   onPrepareWorktree,
+  onTaskWorktreeAction,
   onRemoveWorktree,
 }: {
   taskRequest?: { id: string } | null;
@@ -273,6 +275,7 @@ export function BoardView({
   onStartItem: (item: InboxItem) => void;
   onSendToSession: SendToSession;
   onPrepareWorktree: (spec: TaskWorkstreamSpec) => Promise<string>;
+  onTaskWorktreeAction?: TaskWorktreeActionHandler;
   /** Create a worktree (when needed) + a bound live session for a workstream. */
   onSpawnSession: (
     spec: TaskWorkstreamSpec & {
@@ -1985,6 +1988,7 @@ export function BoardView({
         onSendToSession={taskOpsHandlers.onSendToSession}
         onSpawnSession={taskOpsHandlers.onSpawnSession}
         onPrepareWorktree={onPrepareWorktree}
+        onTaskWorktreeAction={onTaskWorktreeAction}
         wsStatus={wsStatus}
         onUpdateBranches={taskOpsHandlers.onUpdateBranches}
         onUpdateWorkstream={taskOpsHandlers.onUpdateWorkstream}
