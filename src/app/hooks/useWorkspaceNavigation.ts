@@ -11,16 +11,44 @@ import {
   type WorktreeFocus,
 } from "../../features/source-control/model/worktreeFocus";
 import type { Worktree } from "../../features/source-control/model/worktrees";
-import type { WorkspaceTab } from "../../features/workspace/model/layout";
+import type {
+  WorkspaceTab,
+  TaskWorkspace,
+} from "../../features/workspace/model/layout";
 import {
   filterTabsForProject,
   workspaceTabCwd,
 } from "../../features/workspace/model/workspaceTabGroups";
 import { pathKey } from "../../shared/lib/paths";
 
+import {
+  taskWorkspaceTarget,
+  taskTabWorkspace,
+} from "../../features/board/taskWorkspace";
+import {
+  taskWideSessionIds,
+  type BoardTask,
+} from "../../features/board/boardStore";
+
 type Destination = { project: string; focus?: WorktreeFocus };
-type Request = Destination & { kind: "project" | "workspace" };
+type Request =
+  | (Destination & { kind: "project" | "workspace" })
+  | (TaskWorkspace & { kind: "task"; project?: undefined });
 type Options = {
+  task?: {
+    tasks: readonly BoardTask[];
+    selection?: TaskWorkspace;
+    publish: (scope: TaskWorkspace) => void;
+    verify: (scope: TaskWorkspace) => Promise<void>;
+    openSession: (
+      id: string,
+      isCurrent: () => boolean,
+    ) => Promise<string | undefined>;
+    createTab: (
+      scope: TaskWorkspace,
+      isCurrent: () => boolean,
+    ) => Promise<string>;
+  };
   project: string;
   activeTabId: string;
   tabs: WorkspaceTab[];
@@ -67,9 +95,10 @@ export function useWorkspaceNavigation(options: Options) {
 
   const select = useCallback((next: Request) => {
     if (
-      !next.project ||
-      next.project === "~" ||
-      isRemoteProjectPath(next.project)
+      next.kind !== "task" &&
+      (!next.project ||
+        next.project === "~" ||
+        isRemoteProjectPath(next.project))
     )
       return;
     request.current = next;
@@ -79,6 +108,12 @@ export function useWorkspaceNavigation(options: Options) {
   const selectWorkspace = useCallback(
     (project: string, focus?: WorktreeFocus) => {
       select({ kind: "workspace", project, focus });
+    },
+    [select],
+  );
+  const selectTaskWorkspace = useCallback(
+    (taskId: string, workstreamId?: string) => {
+      select({ kind: "task", taskId, workstreamId });
     },
     [select],
   );
@@ -96,6 +131,68 @@ export function useWorkspaceNavigation(options: Options) {
       while (mounted.current && request.current) {
         const next = request.current;
         const view = latest.current;
+        if (next.kind === "task") {
+          const config = view.task;
+          const isCurrent = () => mounted.current && request.current === next;
+          try {
+            const task = config?.tasks.find(
+              (task) => !task.archived && task.id === next.taskId,
+            );
+            if (!task || !config)
+              throw new Error(
+                "This task is unavailable. Choose another task or an ad hoc session.",
+              );
+            if (next.workstreamId) await config.verify(next);
+            if (!isCurrent()) continue;
+            const key = `task\0${next.taskId}\0${next.workstreamId ?? ""}`;
+            const target = taskWorkspaceTarget(
+              latest.current.tabs,
+              config.tasks,
+              next,
+              memory.current.get(key),
+            );
+            let tabId = target?.id;
+            if (!tabId) {
+              const ids = next.workstreamId
+                ? (task.workstreams.find(
+                    (lane) => lane.id === next.workstreamId,
+                  )?.sessionIds ?? [])
+                : [
+                    ...taskWideSessionIds(task),
+                    ...task.workstreams.flatMap(
+                      (lane) => lane.sessionIds ?? [],
+                    ),
+                  ];
+              for (const id of ids) {
+                if (!isCurrent()) break;
+                tabId = await config.openSession(id, isCurrent);
+                if (tabId) break;
+              }
+            }
+            if (!isCurrent()) continue;
+            if (!tabId) tabId = await config.createTab(next, isCurrent);
+            if (!isCurrent()) continue;
+            memory.current.set(key, tabId);
+            config.publish(next);
+            view.activateTab(tabId);
+          } catch (caught) {
+            if (isCurrent()) {
+              // A stale saved lane remains recoverable from the task-wide view.
+              config?.publish({ taskId: next.taskId });
+              setError({
+                project: next.taskId,
+                message:
+                  caught instanceof Error ? caught.message : String(caught),
+              });
+            }
+          } finally {
+            if (request.current === next) {
+              request.current = null;
+              setPending(null);
+            }
+          }
+          continue;
+        }
         // A project request is recorded in the same event as openProjects.
         // Wait for its landing tab to render before choosing its workspace.
         if (!sameProjectPath(view.project, next.project)) break;
@@ -237,6 +334,16 @@ export function useWorkspaceNavigation(options: Options) {
     const view = latest.current;
     const tab = view.tabs.find((entry) => entry.id === view.activeTabId);
     if (!tab) return;
+    if (view.task?.selection) {
+      const scope = view.task.selection;
+      const owner = taskTabWorkspace(tab, view.task.tasks);
+      if (owner?.taskId === scope.taskId)
+        memory.current.set(
+          `task\0${scope.taskId}\0${scope.workstreamId ?? ""}`,
+          tab.id,
+        );
+      return;
+    }
     const project = workspaceTabCwd(tab, view.sessions);
     if (!project || project === "~" || isRemoteProjectPath(project)) return;
     const path = worktreeFocus(project)?.path ?? project;
@@ -245,7 +352,13 @@ export function useWorkspaceNavigation(options: Options) {
       refreshPins((value) => value + 1);
     }
     memory.current.set(workspaceKey(project, path), tab.id);
-  }, [options.project, options.activeTabId, focusedId]);
+  }, [
+    options.project,
+    options.activeTabId,
+    focusedId,
+    options.task?.selection?.taskId,
+    options.task?.selection?.workstreamId,
+  ]);
 
   useEffect(() => {
     void drain();
@@ -268,16 +381,18 @@ export function useWorkspaceNavigation(options: Options) {
         (tab) =>
           tab.id === view.activeTabId &&
           tab.focusedId === sessionId &&
-          sameProjectPath(
-            workspaceTabCwd(tab, view.sessions) ?? "",
-            next.project,
-          ),
+          (next.kind === "task" ||
+            sameProjectPath(
+              workspaceTabCwd(tab, view.sessions) ?? "",
+              next.project,
+            )),
       )
     );
   }, []);
 
   return {
     selectWorkspace,
+    selectTaskWorkspace,
     selectProject,
     cancel,
     isSwitching,

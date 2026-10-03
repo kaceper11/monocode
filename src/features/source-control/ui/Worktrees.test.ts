@@ -1171,3 +1171,10 @@ it("shows no selected branch after removal even when the old path has a branch a
     expect.objectContaining({ path: "/repo" }),
   );
 });
+
+it("labels the conversation's actual checkout independently of the selected task lane", () => {
+  const markup = renderToStaticMarkup(createElement(WorkspaceIdentity, { worktree: true, cwd: "/repos/api-copy" }));
+  expect(markup).toContain('aria-label="Workspace Worktree · /repos/api-copy"');
+  expect(markup).toContain('/repos/api-copy');
+  expect(markup).not.toContain("<button");
+});

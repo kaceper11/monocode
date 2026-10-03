@@ -395,3 +395,13 @@ it("surfaces the bind offer from a collapsed lane's Prepare worktree", async () 
     "/existing-copy",
   );
 });
+
+it("opens a repository workspace through navigation without preparing or dispatching work", async () => {
+  const id = addTask({ title: "Task", links: [], workstreams: [{ id: "lane", projectPath: "/repo", worktreePath: "/copy", branch: "feature", base: "main" }] })!;
+  const task = loadBoard().tasks.find(task => task.id === id)!;
+  const open = vi.fn();
+  await render(taskCard(task), { onOpenWorkingCopy: open });
+  const button = [...host.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.includes("Open working copy"))!;
+  await act(async () => button.click());
+  expect(open).toHaveBeenCalledExactlyOnceWith(id, "lane");
+});

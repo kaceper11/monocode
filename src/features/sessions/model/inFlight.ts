@@ -15,6 +15,8 @@ export type InFlightRef = {
 };
 
 export type ResumedWorkspace = {
+  taskWorkspace?: import("../../workspace/model/layout").TaskWorkspace;
+  taskRepositoryId?: string;
   sessions: Session[];
   tabs: WorkspaceTab[];
   activeTabId: string;

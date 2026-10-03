@@ -13,6 +13,7 @@ import {
   type PlanTabSource,
   type SessionChangesSource,
   type WorkspaceTab,
+  type TaskWorkspace,
 } from "./layout";
 import type { ReleaseNotesTabSource } from "../../../app/model/releaseNotes";
 import {
@@ -55,6 +56,8 @@ export type WorkspaceSessionStub = {
 };
 
 export type WorkspaceSnapshot = {
+  taskWorkspace?: TaskWorkspace;
+  taskRepositoryId?: string;
   tabs: WorkspaceTab[];
   sessions: WorkspaceSessionStub[];
   activeTabId: string;
@@ -77,6 +80,8 @@ export function collectWorkspaceSnapshot(
   projectTerminals: ProjectTerminalDock[] = [],
   lastDockSide?: DockSide,
   keepTab?: (tab: WorkspaceTab) => boolean,
+  taskWorkspace?: TaskWorkspace,
+  taskRepositoryId?: string,
 ): WorkspaceSnapshot {
   // Tabs left out (another worktree's, say) do not reopen, and neither do
   // sessions that only they showed.
@@ -89,6 +94,8 @@ export function collectWorkspaceSnapshot(
       .filter((id) => !keptIds.has(id)),
   );
   const snapshot = withoutInboxSessions({
+    taskWorkspace,
+    taskRepositoryId,
     tabs: withoutAgentTabs(kept)
       .map(sanitizeTab)
       .filter((tab): tab is WorkspaceTab => tab != null),
@@ -201,6 +208,8 @@ function withoutInboxSessions(snapshot: WorkspaceSnapshot): WorkspaceSnapshot {
 export function parseWorkspaceSnapshot(raw: unknown): WorkspaceSnapshot | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as {
+    taskWorkspace?: unknown;
+    taskRepositoryId?: unknown;
     tabs?: unknown;
     sessions?: unknown;
     activeTabId?: unknown;
@@ -237,6 +246,8 @@ export function parseWorkspaceSnapshot(raw: unknown): WorkspaceSnapshot | null {
     ? value.lastDockSide
     : undefined;
   const snapshot = withoutInboxSessions({
+    taskWorkspace: parseTaskWorkspace(value.taskWorkspace),
+    taskRepositoryId: typeof value.taskRepositoryId === "string" ? value.taskRepositoryId : undefined,
     tabs,
     sessions,
     activeTabId,
@@ -335,6 +346,8 @@ export function hydrateWorkspaceSnapshot(
     sessions: [...sessions.values()],
     activeTabId,
     projectCwd,
+    taskWorkspace: parsed.taskWorkspace,
+    taskRepositoryId: parsed.taskRepositoryId,
     projectTerminals: parsed.projectTerminals,
     projectReturnMemory: reconcileProjectReturn({
       memory: parseProjectReturnTargets(parsed.projectReturnTargets),
@@ -446,6 +459,14 @@ function sanitizeStub(raw: unknown): WorkspaceSessionStub | null {
   };
 }
 
+export function parseTaskWorkspace(raw: unknown): TaskWorkspace | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const value = raw as Record<string, unknown>;
+  if (typeof value.taskId !== "string" || !value.taskId.trim()) return undefined;
+  if (value.workstreamId !== undefined && (typeof value.workstreamId !== "string" || !value.workstreamId.trim())) return undefined;
+  return { taskId: value.taskId, ...(typeof value.workstreamId === "string" ? { workstreamId: value.workstreamId } : {}) };
+}
+
 function sanitizeTab(raw: unknown): WorkspaceTab | null {
   if (!raw || typeof raw !== "object") return null;
   const value = raw as Record<string, unknown>;
@@ -468,6 +489,7 @@ function sanitizeTab(raw: unknown): WorkspaceTab | null {
   if (!focusedId) return null;
   let tab: WorkspaceTab | null = {
     kind: "session",
+    taskWorkspace: parseTaskWorkspace(value.taskWorkspace),
     id: value.id,
     layout,
     focusedId,

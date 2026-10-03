@@ -132,6 +132,19 @@ describe("project choices through lifecycle saves", () => {
     }
   });
 
+  it("keeps task workspace metadata in the final quit save, including changes before autosave", async () => {
+    const state = workspace();
+    const { handleQuitRequested } = await import("./appLifecycle");
+    let lane = "a";
+    const release = setQuitWorkspace(() => state.sessions, () => state.tabs, () => state.activeTabId, () => state.projectCwd, () => [], () => state.memory, vi.fn(), () => null, undefined, () => ({ taskWorkspace: { taskId: "task", workstreamId: lane }, taskRepositoryId: lane }));
+    try {
+      lane = "b";
+      await handleQuitRequested();
+      const call = vi.mocked(invoke).mock.calls.filter(([command]) => command === "workspace_set_snapshot").at(-1);
+      expect(call?.[1]).toMatchObject({ snapshot: { taskWorkspace: { taskId: "task", workstreamId: "b" }, taskRepositoryId: "b" } });
+    } finally { release(); }
+  });
+
   it("reads committed selection from live getters before autosave", async () => {
     const state = workspace();
     const { handleQuitRequested, setQuitWorkspace } =

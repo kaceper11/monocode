@@ -800,3 +800,19 @@ describe("worktree tab cleanup", () => {
     expect(snapshot.sessions.map((stub) => stub.id)).toEqual(["main"]);
   });
 });
+
+it("round-trips task selection and file/diff ownership while retaining actual checkouts", () => {
+  const session = chat("task-chat", "/api"); session.worktreeCwd = "/api-copy";
+  const scope = { taskId: "task", workstreamId: "api" };
+  const chatTab = { ...newTab(session.id), taskWorkspace: { taskId: "task" } };
+  const fileTab = { ...newEditorWorkspaceTab(newFileTab("/web-copy/app.ts", "/web-copy", true, "staged", "/web")), taskWorkspace: { taskId: "task", workstreamId: "web" } };
+  const snapshot = collectWorkspaceSnapshot([chatTab, fileTab], [session], chatTab.id, "/api", new Map(), [], undefined, undefined, scope, "web");
+  const restored = hydrateWorkspaceSnapshot(snapshot, new Map());
+  expect(restored?.taskWorkspace).toEqual(scope);
+  expect(restored?.taskRepositoryId).toBe("web");
+  expect(restored?.sessions[0].worktreeCwd).toBe("/api-copy");
+  expect(restored?.tabs[1]).toMatchObject({ taskWorkspace: fileTab.taskWorkspace, editorPanes: [{ files: [{ cwd: "/web-copy", path: "/web-copy/app.ts", review: true, changeKind: "staged" }] }] });
+  const old = { ...snapshot, taskWorkspace: undefined, taskRepositoryId: undefined, tabs: snapshot.tabs.map(tab => ({ ...tab, taskWorkspace: undefined })) };
+  expect(hydrateWorkspaceSnapshot(old, new Map())?.taskWorkspace).toBeUndefined();
+  expect(parseWorkspaceSnapshot({ ...snapshot, taskWorkspace: { taskId: "task", workstreamId: 2 } })?.taskWorkspace).toBeUndefined();
+});

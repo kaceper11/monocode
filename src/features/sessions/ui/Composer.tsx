@@ -2283,6 +2283,7 @@ export function Composer({
                 <>
                   {onWorktreeChange ? (
                     <WorkspaceIdentity
+                      cwd={executionCwd}
                       worktree={pathKey(cwd) !== pathKey(executionCwd)}
                     />
                   ) : null}

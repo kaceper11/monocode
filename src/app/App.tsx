@@ -1,5 +1,7 @@
 import { loadProjectSessionHistory } from "../features/sessions/data/projectSessionHistory";
 import { projectSessionSummaries, scopedSessions, type SessionListScope } from "../features/board/sessionScope";
+import { taskTabWorkspace, taskWorkspaceTabs } from "../features/board/taskWorkspace";
+import type { TaskWorkspace } from "../features/workspace/model/layout";
 import { taskSessionIds } from "../features/board/boardStore";
 import { useSavedProjects, selectSavedProject, readSavedProjects } from "../features/projects/model/savedProjects";
 import { repositoryScopes, selectedRepository, type GitRepositoryScope } from "../features/source-control/model/repositoryScope";
@@ -1023,7 +1025,6 @@ function Workspace({
   );
   const tabCloseScope = "project" as const;
   const currentProjectDock = findProjectTerminal(projectTerminals, projectCwd);
-  const dockVisible = !!currentProjectDock?.open;
   const [filesSearchOpen, setFilesSearchOpen] = useState(false);
   const [searchFocusToken, setSearchFocusToken] = useState(0);
   const [searchViewOpen, setSearchViewOpen] = useState(false);
@@ -1187,6 +1188,29 @@ function Workspace({
   const activeTabIdRef = useRef(activeTabId);
   activeTabIdRef.current = activeTabId;
 
+  const sessionTasks = useMemo(() => loadBoard().tasks, [boardVersion]);
+  const [sessionListScope, setSessionListScope] = useState<SessionListScope>(() => {
+    const scope = resumed?.taskWorkspace;
+    return scope && loadBoard().tasks.some(task => !task.archived && task.id === scope.taskId)
+      ? { kind: "task", ...scope } : { kind: "all" };
+  });
+  const taskSelection: TaskWorkspace | undefined = sessionListScope.kind === "task"
+    ? { taskId: sessionListScope.taskId, workstreamId: sessionListScope.workstreamId } : undefined;
+  const dockVisible = !taskSelection && !!currentProjectDock?.open;
+  const taskSelectionRef = useRef(taskSelection);
+  taskSelectionRef.current = taskSelection;
+  const taskViewMemory = useRef(new Map<string, TaskWorkspace>());
+  const publishTaskWorkspace = useCallback((scope: TaskWorkspace) => {
+    taskSelectionRef.current = scope;
+    taskViewMemory.current.set(scope.taskId, scope);
+    if (scope.workstreamId) setRepositorySelection({ key: scope.taskId, id: scope.workstreamId });
+    setSessionListScope({ kind: "task", ...scope });
+    setBoardViewOpen(false);
+    setSearchViewOpen(false);
+    setInboxViewOpen(false);
+    setNotesViewOpen(false);
+    setAutomationsViewOpen(false);
+  }, []);
   const projectWorktree = useWorktreeFocus(projectCwd);
   /** Tab or session id -> the workspace it was opened or moved in. A tab
    * belongs to the workspace it was opened in, whatever worktree it runs in:
@@ -1226,6 +1250,7 @@ function Workspace({
    * tabs from other worktrees close with it instead of piling up. */
   const keepWorkspaceTab = useCallback(
     (tab: WorkspaceTab) => {
+      if (taskTabWorkspace(tab, loadBoard().tasks)) return true;
       const project = workspaceTabCwd(tab, sessionsRef.current);
       if (!project || isRemoteProjectPath(project)) return true;
       const workspace = tabWorkspace(tab, sessionsRef.current);
@@ -1241,6 +1266,24 @@ function Workspace({
     sessions,
     pins: workspacePins.current,
     tabWorkspace,
+    task: {
+      tasks: sessionTasks,
+      selection: taskSelection,
+      publish: publishTaskWorkspace,
+      verify: async scope => { await taskConversationCheckout(scope.taskId, [], scope.workstreamId); },
+      openSession: async (id, isCurrent) => {
+        const session = await ensureOpenSession(id);
+        if (!session || !isCurrent()) return undefined;
+        const existing = tabsRef.current.find(tab => leafIds(tab.layout).includes(id));
+        if (existing) return existing.id;
+        const tab = newTab(id);
+        tab.taskWorkspace = taskTabWorkspace(tab, loadBoard().tasks);
+        tabsRef.current = [...tabsRef.current, tab];
+        setTabs(tabsRef.current);
+        return tab.id;
+      },
+      createTab: (scope, isCurrent) => createTaskWorkspaceTab(scope, isCurrent),
+    },
     moveSession: (id, tree, isCurrent) =>
       onWorktreeChange(id, tree, false, isCurrent),
     activateTab: (id) => {
@@ -1259,9 +1302,16 @@ function Workspace({
   const setActiveTabId = useCallback(
     (id: string) => {
       workspaceNavigation.cancel();
+      const tab = tabsRef.current.find(tab => tab.id === id);
+      const owner = tab && taskTabWorkspace(tab, loadBoard().tasks);
+      if (owner) publishTaskWorkspace(owner.workstreamId || owner.taskId !== taskSelectionRef.current?.taskId ? owner : { ...taskSelectionRef.current, taskId: owner.taskId });
+      else if (tab && taskSelectionRef.current) {
+        taskSelectionRef.current = undefined;
+        setSessionListScope({ kind: "adhoc" });
+      }
       setActiveTabIdState(id);
     },
-    [workspaceNavigation.cancel],
+    [workspaceNavigation.cancel, publishTaskWorkspace],
   );
 
   const projectCwdRef = useRef(projectCwd);
@@ -1692,15 +1742,8 @@ function Workspace({
   const gitCwd =
     activeFile?.cwd ?? (active ? sessionWorkCwd(active) : sidebarCwd);
   const { selected: savedProject } = useSavedProjects(sidebarCwd);
-  const sessionTasks = useMemo(() => loadBoard().tasks, [boardVersion]);
-  const activeBindings = active
-    ? sessionTaskBindings(sessionTasks, active.id)
-    : [];
-  const activeTask =
-    activeBindings.length === 1 ? activeBindings[0].task : undefined;
-  const [sessionListScope, setSessionListScope] = useState<SessionListScope>({
-    kind: "all",
-  });
+  const activeBindings = active ? sessionTaskBindings(sessionTasks, active.id) : [];
+  const activeTask = activeBindings.length === 1 ? activeBindings[0].task : undefined;
   const [sessionCreationError, setSessionCreationError] = useState("");
   const sessionCreating = useRef(false);
   const sessionCreationContext = JSON.stringify([
@@ -1715,15 +1758,18 @@ function Workspace({
   useEffect(() => {
     const projectChanged = previousSessionProject.current !== sessionProjectKey;
     previousSessionProject.current = sessionProjectKey;
-    setSessionListScope(
-      activeTask
-        ? { kind: "task", taskId: activeTask.id }
-        : active?.id && !projectChanged
-          ? { kind: "adhoc" }
-          : { kind: "all" },
-    );
+    if (taskSelectionRef.current) {
+      const task = loadBoard().tasks.find(task => !task.archived && task.id === taskSelectionRef.current?.taskId);
+      if (task) return;
+      taskSelectionRef.current = undefined;
+      setSessionListScope({ kind: "all" });
+      setSessionCreationError("The selected task is unavailable. Your saved conversations are still available.");
+      return;
+    }
+    if (activeTask) publishTaskWorkspace({ taskId: activeTask.id });
+    else if (projectChanged) setSessionListScope({ kind: "all" });
     setSessionCreationError("");
-  }, [active?.id, activeTask?.id, sessionProjectKey]);
+  }, [active?.id, activeTask?.id, sessionProjectKey, boardVersion, publishTaskWorkspace]);
   const listTask =
     sessionListScope.kind === "task"
       ? sessionTasks.find((task) => task.id === sessionListScope.taskId)
@@ -1755,20 +1801,27 @@ function Workspace({
   const [sessionHistoryError, setSessionHistoryError] = useState("");
   const [sessionHistoryRetry, setSessionHistoryRetry] = useState(0);
 
-  const gitScope = useMemo(() => repositoryScopes(sessionTasks, active?.id, savedProject), [sessionTasks, active?.id, savedProject]);
-  const [repositorySelection, setRepositorySelection] = useState({ key: "", id: "" });
-  const gitRepository = selectedRepository(gitScope.repositories, gitCwd, repositorySelection.key === gitScope.key ? repositorySelection.id : undefined);
-  const sourceControlCwd = gitRepository?.cwd ?? gitCwd;
+  const gitScope = useMemo(() => listTask ? {
+    key: listTask.id,
+    repositories: listTask.workstreams.map(lane => ({ id: lane.id, projectPath: lane.projectPath, cwd: lane.worktreePath, label: `${projectName(lane.projectPath)} · ${lane.branch}${lane.worktreePath ? "" : " · no checkout"}` })),
+  } : repositoryScopes(sessionTasks, active?.id, savedProject), [listTask, sessionTasks, active?.id, savedProject]);
+  const [repositorySelection, setRepositorySelection] = useState(() => ({ key: resumed?.taskWorkspace?.taskId ?? "", id: resumed?.taskRepositoryId ?? "" }));
+  const gitRepository = selectedRepository(gitScope.repositories, gitCwd, taskSelection?.workstreamId ?? (repositorySelection.key === gitScope.key ? repositorySelection.id : undefined));
+  const taskRepositoryIdRef = useRef<string | undefined>(undefined);
+  taskRepositoryIdRef.current = listTask ? gitRepository?.id : undefined;
+  const selectedTaskLane = listTask?.workstreams.find(lane => lane.id === taskSelection?.workstreamId);
+  const taskFilesCwd = listTask ? (selectedTaskLane?.worktreePath ?? (!taskSelection?.workstreamId ? gitRepository?.cwd : undefined)) : undefined;
+  const sourceControlCwd = listTask ? taskFilesCwd ?? "" : gitRepository?.cwd ?? gitCwd;
   const gitCwdBranches = useProjectBranches(
     gitCwd,
     Boolean(gitCwd) && gitCwd !== "~" && !isRemoteProjectPath(sidebarCwd),
   );
-  const explorerRootLabel =
+  const explorerRootLabel = listTask ? (selectedTaskLane?.branch ?? gitRepository?.label) :
     active?.worktreeCwd && sameProjectPath(gitCwd, sessionWorkCwd(active))
       ? active.branch || gitCwdBranches?.current || undefined
       : undefined;
   const remoteFilesProject = remoteProjectFor(sidebarCwd);
-  const filesCwd = remoteFilesProject
+  const filesCwd = listTask ? taskFilesCwd ?? "" : remoteFilesProject
     ? isRemoteProjectPath(gitCwd)
       ? gitCwd
       : remotePath(
@@ -2019,6 +2072,7 @@ function Workspace({
       flushHarnessEvents,
       () => lastDockSideRef.current,
       keepWorkspaceTab,
+      () => ({ taskWorkspace: taskSelectionRef.current, taskRepositoryId: taskRepositoryIdRef.current }),
     );
     void getCurrentWindow()
       .onCloseRequested((event) => {
@@ -2274,6 +2328,8 @@ function Workspace({
       projectTerminals,
       lastDockSide ?? undefined,
       keepWorkspaceTab,
+      taskSelection,
+      listTask ? gitRepository?.id : undefined,
     );
     const key = workspaceSnapshotKey(snapshot);
     if (workspaceSyncKey.current === key) return;
@@ -2293,6 +2349,8 @@ function Workspace({
     keepWorkspaceTab,
     projectWorktree?.path,
     workspaceNavigation.revision,
+    sessionListScope,
+    gitRepository?.id,
   ]);
 
   useEffect(() => {
@@ -2426,7 +2484,7 @@ function Workspace({
 
   const insertBesideActive = useCallback(
     (prev: WorkspaceTab[], tab: WorkspaceTab, cwd?: string) =>
-      insertBeside(prev, tab, activeTabIdRef.current, cwd),
+      insertBeside(prev, tab.taskWorkspace || !(tab.editorPanes.length || tab.terminalPanes.length) ? tab : { ...tab, taskWorkspace: taskSelectionRef.current ? { ...taskSelectionRef.current, workstreamId: taskSelectionRef.current.workstreamId ?? taskRepositoryIdRef.current } : undefined }, activeTabIdRef.current, cwd),
     [insertBeside],
   );
 
@@ -2436,6 +2494,15 @@ function Workspace({
     },
     [insertBesideActive],
   );
+
+  useEffect(() => {
+    const current = tabs.find(tab => tab.id === activeTabId);
+    if (!current) return;
+    const owner = taskTabWorkspace(current, sessionTasks);
+    if (owner && !current.taskWorkspace) {
+      setTabs(tabs => tabs.map(tab => tab.id === current.id ? { ...tab, taskWorkspace: owner } : tab));
+    }
+  }, [tabs, activeTabId, sessionTasks]);
 
   const onSelectProviderAccount = useCallback(
     (provider: ProviderAccountProvider, accountId: string) => {
@@ -2489,6 +2556,8 @@ function Workspace({
 
   const onNewAdHoc = useCallback(
     (cwdOverride?: string) => {
+      taskSelectionRef.current = undefined;
+      setSessionListScope({ kind: "adhoc" });
       setSessionCreationError("");
       setBoardViewOpen(false);
       setSearchViewOpen(false);
@@ -2520,82 +2589,43 @@ function Workspace({
     ],
   );
 
-  const onNewTaskSession = useCallback(
-    async (repositoryId?: string) => {
-      if (sessionCreating.current) return;
-      sessionCreating.current = true;
-      const context = sessionCreationContextRef.current;
-      setSessionCreationError("");
-      try {
-        const taskId =
-          sessionListScope.kind === "task"
-            ? sessionListScope.taskId
-            : activeTask?.id;
-        const task = loadBoard().tasks.find(
-          (task) => task.id === taskId && !task.archived,
-        );
-        if (!task)
-          throw new Error(
-            "This task is unavailable. Choose another task or create an ad hoc session.",
-          );
-        const preferred =
-          active && taskSessionIds(task).includes(active.id)
-            ? sessionWorkCwd(active)
-            : undefined;
-        const primary = sessionsRef.current.find(
-          (session) => session.id === task.primarySessionId,
-        );
-        const lane = await taskConversationCheckout(
-          task.id,
-          [preferred, primary ? sessionWorkCwd(primary) : undefined].filter(
-            (path): path is string => !!path,
-          ),
-          repositoryId,
-        );
-        if (context !== sessionCreationContextRef.current)
-          throw new Error(
-            "The selected session scope changed. Create the conversation again in the current scope.",
-          );
-        const session = {
-          ...newDefaultSession(lane.projectPath, sessionDefaults?.runtimeMode),
-          worktreeCwd: lane.worktreePath,
-          branch: lane.branch,
-        };
-        attachTaskSession(
-          session.id,
-          lane,
-          task.id,
-          repositoryId ? "repository" : "task",
-        );
-        const tab = newTab(session.id);
-        setSearchViewOpen(false);
-        setInboxViewOpen(false);
-        setNotesViewOpen(false);
-        setAutomationsViewOpen(false);
-        setBoardViewOpen(false);
-        setSessions((current) => [...current, session]);
-        persistSession(session);
-        appendTab(tab, session.cwd);
-        setActiveTabId(tab.id);
-        setComposerFocused(true);
-        return session.id;
-      } catch (error) {
-        setSessionCreationError(
-          error instanceof Error ? error.message : String(error),
-        );
-      } finally {
-        sessionCreating.current = false;
-      }
-    },
-    [
-      sessionListScope,
-      activeTask?.id,
-      active,
-      sessionDefaults?.runtimeMode,
-      appendTab,
-      persistSession,
-    ],
-  );
+  const createTaskWorkspaceTab = useCallback(async (scope: TaskWorkspace, isCurrent: () => boolean = () => true) => {
+    const task = loadBoard().tasks.find(task => !task.archived && task.id === scope.taskId);
+    if (!task) throw new Error("This task is unavailable. Choose another task or an ad hoc session.");
+    const preferred = sessionsRef.current.find(session => session.id === task.primarySessionId);
+    const lane = await taskConversationCheckout(task.id, preferred ? [sessionWorkCwd(preferred)] : [], scope.workstreamId);
+    if (!isCurrent()) throw new Error("The selected workspace changed. Try again in the current view.");
+    const session = { ...newDefaultSession(lane.projectPath, sessionDefaults?.runtimeMode), worktreeCwd: lane.worktreePath, branch: lane.branch };
+    attachTaskSession(session.id, lane, task.id, scope.workstreamId ? "repository" : "task");
+    const tab = { ...newTab(session.id), taskWorkspace: { taskId: scope.taskId, workstreamId: scope.workstreamId } };
+    const next = [...sessionsRef.current, session];
+    sessionsRef.current = next;
+    setSessions(next);
+    const nextTabs = insertBesideActive(tabsRef.current, tab, session.cwd);
+    tabsRef.current = nextTabs;
+    setTabs(nextTabs);
+    persistSession(session);
+    return tab.id;
+  }, [sessionDefaults?.runtimeMode, insertBesideActive, persistSession]);
+
+  const onNewTaskSession = useCallback(async (repositoryId?: string) => {
+    if (sessionCreating.current || workspaceNavigation.pending?.kind === "task") return;
+    const scope: TaskWorkspace | undefined = taskSelectionRef.current ?? (activeTask ? { taskId: activeTask.id } : undefined);
+    if (!scope) return;
+    sessionCreating.current = true;
+    const context = sessionCreationContextRef.current;
+    setSessionCreationError("");
+    try {
+      const selected = { taskId: scope.taskId, workstreamId: repositoryId ?? scope.workstreamId };
+      const tabId = await createTaskWorkspaceTab(selected, () => context === sessionCreationContextRef.current);
+      publishTaskWorkspace(selected);
+      setActiveTabIdState(tabId);
+      setComposerFocused(true);
+      return tabsRef.current.find(tab => tab.id === tabId)?.focusedId;
+    } catch (caught) {
+      setSessionCreationError(caught instanceof Error ? caught.message : String(caught));
+    } finally { sessionCreating.current = false; }
+  }, [activeTask, createTaskWorkspaceTab, publishTaskWorkspace, workspaceNavigation.pending]);
 
   const createWorkspaceTab = useCallback(
     (cwd: string, focus?: WorktreeFocus) => {
@@ -2621,6 +2651,13 @@ function Workspace({
     setSessionCreationError("");
     return onNewAdHoc();
   }, [sessionListScope.kind, onNewTaskSession, onNewAdHoc]);
+
+  const restoredTaskView = useRef(false);
+  useEffect(() => {
+    if (restoredTaskView.current) return;
+    restoredTaskView.current = true;
+    if (resumed?.taskWorkspace) workspaceNavigation.selectTaskWorkspace(resumed.taskWorkspace.taskId, resumed.taskWorkspace.workstreamId);
+  }, [resumed, workspaceNavigation.selectTaskWorkspace]);
 
   const onSelectRemoteSession = useCallback(
     (project: string, remoteSessionId: string) => {
@@ -2881,13 +2918,17 @@ function Workspace({
   const onOpenTerminal = useCallback(
     (cwd: string, asWorkspaceTab = false, occupySessionId?: string) => {
       const workdir = cwd || gitCwd;
-      if (!isLocalProject(projectCwdRef.current) || !isLocalProject(workdir)) return;
-      if (openProjectTerminal(workdir)) return;
+      if ((!taskSelectionRef.current && !isLocalProject(projectCwdRef.current)) || !isLocalProject(workdir)) return;
+      if (!taskSelectionRef.current && openProjectTerminal(workdir)) return;
 
-      if (asWorkspaceTab || !activeTab) {
-        const file = newTerminalFile(workdir, undefined, sidebarCwd);
+      if (taskSelectionRef.current || asWorkspaceTab || !activeTab) {
+        const scope = taskSelectionRef.current;
+        const project = scope
+          ? loadBoard().tasks.find(task => task.id === scope.taskId)?.workstreams.find(lane => lane.id === (scope.workstreamId ?? taskRepositoryIdRef.current))?.projectPath ?? sidebarCwd
+          : sidebarCwd;
+        const file = newTerminalFile(workdir, undefined, project);
         const tab = newTerminalWorkspaceTab(file);
-        appendTab(tab, sidebarCwd);
+        appendTab(tab, project);
         setActiveTabId(tab.id);
         setComposerFocused(false);
         return;
@@ -2924,10 +2965,11 @@ function Workspace({
   );
 
   const onNewTerminal = useCallback(() => {
-    onOpenTerminal(gitCwd);
-  }, [gitCwd, onOpenTerminal]);
+    if (filesCwd) onOpenTerminal(filesCwd);
+  }, [filesCwd, onOpenTerminal]);
 
   const onShowProjectTerminal = useCallback(() => {
+    if (taskSelectionRef.current) { if (filesCwd) onOpenTerminal(filesCwd, true); return; }
     const dock = findProjectTerminal(projectTerminalsRef.current, projectCwd);
     if (dock && dock.pane.files.length > 0) {
       if (!dock.open) {
@@ -2941,7 +2983,7 @@ function Workspace({
       return;
     }
     onOpenTerminal(gitCwd);
-  }, [gitCwd, focusProjectTerminal, onOpenTerminal, projectCwd]);
+  }, [gitCwd, filesCwd, focusProjectTerminal, onOpenTerminal, projectCwd]);
 
   const onNewTerminalInSession = useCallback(
     (sessionId: string) => {
@@ -2959,6 +3001,10 @@ function Workspace({
   );
 
   const onToggleProjectTerminal = useCallback(() => {
+    if (taskSelectionRef.current) {
+      if (filesCwd) onOpenTerminal(filesCwd, true);
+      return;
+    }
     if (!isLocalProject(projectCwd)) return;
     const dock = findProjectTerminal(projectTerminalsRef.current, projectCwd);
     if (!dock) {
@@ -2973,7 +3019,7 @@ function Workspace({
     );
     if (nextOpen) focusProjectTerminal();
     else setProjectTerminalFocused(false);
-  }, [gitCwd, focusProjectTerminal, openProjectTerminal, projectCwd]);
+  }, [gitCwd, filesCwd, onOpenTerminal, focusProjectTerminal, openProjectTerminal, projectCwd]);
 
   const onHideProjectTerminal = useCallback(() => {
     setProjectTerminals((prev) =>
@@ -3163,20 +3209,21 @@ function Workspace({
   }, [projectTerminals, tabs]);
 
   const onNewTerminalTab = useCallback(() => {
-    onOpenTerminal(gitCwd, true);
-  }, [gitCwd, onOpenTerminal]);
+    if (filesCwd) onOpenTerminal(filesCwd, true);
+  }, [filesCwd, onOpenTerminal]);
 
   const onCloseTab = useCallback(
     (id: string, opts?: { confirmedTerminalIds?: string[] }) => {
       const current = tabsRef.current;
       const index = current.findIndex((t) => t.id === id);
       if (index < 0) return;
+      const taskScope = taskSelectionRef.current;
       const closePlan = planWorkspaceTabClose({
-        tabs: current,
+        tabs: taskScope ? taskWorkspaceTabs(current, loadBoard().tasks, taskScope) : current,
         sessions: sessionsRef.current,
         closingTabId: id,
-        scope: tabCloseScope,
-        worktreeOf: tabWorktreeOf,
+        scope: taskScope ? "workspace" : tabCloseScope,
+        worktreeOf: taskScope ? undefined : tabWorktreeOf,
       });
       if (closePlan.action === "keep") return;
       const closing = current[index];
@@ -3212,7 +3259,7 @@ function Workspace({
         });
         setTabs(next);
         if (id === activeTabIdRef.current && nextActiveTabId) {
-          activateTab(nextActiveTabId);
+          activateTab(nextActiveTabId, undefined, taskScope ? "workspace" : "session");
         }
         void refreshHistory(sidebarCwd);
       };
@@ -3845,7 +3892,21 @@ function Workspace({
     }
     return stats;
   }, [tabs, sessions, sidebarCwd, tabWorkspace, workspaceNavigation.revision]);
+  const taskWorkspaceStats = useMemo(() => {
+    const result = new Map<string, { tabs: number; busy: boolean; needsInput: boolean }>();
+    if (!listTask) return result;
+    for (const workstreamId of [undefined, ...listTask.workstreams.map(lane => lane.id)]) {
+      const ids = workstreamId ? listTask.workstreams.find(lane => lane.id === workstreamId)?.sessionIds ?? [] : taskSessionIds(listTask);
+      result.set(workstreamId ?? "", {
+        tabs: taskWorkspaceTabs(tabs, sessionTasks, { taskId: listTask.id, workstreamId }).length,
+        busy: sessions.some(session => ids.includes(session.id) && session.busy),
+        needsInput: sessions.some(session => ids.includes(session.id) && sessionNeedsInput(session)),
+      });
+    }
+    return result;
+  }, [listTask, tabs, sessions, sessionTasks]);
   const deckProjectTabs = useMemo(() => {
+    if (taskSelection) return taskWorkspaceTabs(tabs, sessionTasks, taskSelection);
     // A projectless session belongs to no project, so it stands on its own
     // rather than trailing the last project's tabs.
     const active = tabs.find((tab) => tab.id === activeTabId);
@@ -3865,7 +3926,11 @@ function Workspace({
     projectWorktree?.path,
     tabWorkspace,
     workspaceNavigation.revision,
+    sessionTasks,
+    sessionListScope,
   ]);
+
+  const activeWorkspaceVisible = !taskSelection || deckProjectTabs.some(tab => tab.id === activeTabId);
 
   const onNext = useCallback(() => {
     const index = deckProjectTabs.findIndex((t) => t.id === activeTabId);
@@ -5731,6 +5796,8 @@ function Workspace({
   const onSelectProject = useCallback(
     (path: string) => {
       workspaceNavigation.cancel();
+      taskSelectionRef.current = undefined;
+      setSessionListScope({ kind: "all" });
       openProjects([path]);
       workspaceNavigation.selectProject(path);
     },
@@ -6021,8 +6088,14 @@ function Workspace({
     (path, navigation, options) => {
       void (async () => {
         const fileCwd = gitCwdRef.current;
-        const fileProjectCwd = sidebarCwdRef.current;
+        const targetTabId = activeTabIdRef.current;
+        const taskScope = JSON.stringify(taskSelectionRef.current);
+        if (taskSelectionRef.current && !fileCwd) { setSessionCreationError("Prepare a working copy in task details before opening files."); return; }
+        const fileProjectCwd = taskSelectionRef.current
+          ? loadBoard().tasks.find(task => task.id === taskSelectionRef.current?.taskId)?.workstreams.find(lane => lane.id === (taskSelectionRef.current?.workstreamId ?? taskRepositoryIdRef.current))?.projectPath ?? sidebarCwdRef.current
+          : sidebarCwdRef.current;
         const resolved = await resolveFileOpenRequest(fileCwd, path, options);
+        if (taskScope && (taskScope !== JSON.stringify(taskSelectionRef.current) || fileCwd !== gitCwdRef.current || targetTabId !== activeTabIdRef.current)) return;
         rememberOpenedFile(fileCwd, resolved);
         const tab = tabsRef.current.find(
           (entry) => entry.id === activeTabIdRef.current,
@@ -10243,6 +10316,10 @@ function Workspace({
     };
   }, [onOpenBoard]);
 
+  const onOpenTaskWorkspace = useCallback((taskId: string, workstreamId?: string) => {
+    workspaceNavigation.selectTaskWorkspace(taskId, workstreamId);
+  }, [workspaceNavigation.selectTaskWorkspace]);
+
   const onOpenBoardSession = useCallback(
     (sessionId: string) => {
       const owner = loadBoard().tasks.find(task => taskSessionIds(task).includes(sessionId));
@@ -11374,19 +11451,31 @@ function Workspace({
           <div className="flex min-h-0 min-w-0 flex-1">
             <Sidebar
               cwd={sidebarCwd}
-              gitCwd={gitCwd}
+              gitCwd={listTask ? filesCwd : gitCwd}
               sourceControlCwd={sourceControlCwd}
               gitRepositories={gitScope.repositories}
               gitRepository={gitRepository}
-              onSelectGitRepository={id => setRepositorySelection({ key: gitScope.key, id })}
-              onSelectTaskSession={onOpenBoardSession}
+              onSelectGitRepository={id => {
+                setRepositorySelection({ key: gitScope.key, id });
+                if (taskSelection?.workstreamId) workspaceNavigation.selectTaskWorkspace(taskSelection.taskId, id);
+              }}
+              taskWorkspace={listTask ? {
+                task: listTask, workstreamId: taskSelection?.workstreamId,
+                tabStats: taskWorkspaceStats,
+                onSelect: id => workspaceNavigation.selectTaskWorkspace(listTask.id, id),
+              } : undefined}
+              onSelectTaskSession={(id) => {
+                const task = sessionTasks.find(task => task.primarySessionId === id);
+                if (task) workspaceNavigation.selectTaskWorkspace(task.id, taskViewMemory.current.get(task.id)?.workstreamId);
+                else onOpenBoardSession(id);
+              }}
               worktreeTabStats={worktreeTabStats}
               onSelectWorkspace={onSelectWorkspace}
               workspaceSwitchPending={
-                workspaceNavigation.pending?.project === sidebarCwd
+                workspaceNavigation.pending?.kind === "task" || workspaceNavigation.pending?.project === sidebarCwd
               }
               workspaceSwitchError={
-                workspaceNavigation.error?.project === sidebarCwd
+                workspaceNavigation.error?.project === (taskSelection?.taskId ?? sidebarCwd)
                   ? workspaceNavigation.error.message
                   : undefined
               }
@@ -11401,7 +11490,16 @@ function Workspace({
               sessions={sidebarHistory}
               sessionTasks={sessionTasks}
               sessionScope={sessionListScope}
-              onSessionScopeChange={setSessionListScope}
+              onSessionScopeChange={scope => {
+                if (scope.kind === "task") {
+                  const remembered = taskViewMemory.current.get(scope.taskId);
+                  workspaceNavigation.selectTaskWorkspace(scope.taskId, remembered?.workstreamId);
+                } else {
+                  workspaceNavigation.cancel();
+                  taskSelectionRef.current = undefined;
+                  setSessionListScope(scope);
+                }
+              }}
               sessionProjectPaths={sessionProjectPaths}
               sessionScopeError={sessionCreationError || sessionHistoryError}
               onRetrySessionScope={() => { setSessionCreationError(""); setSessionHistoryRetry(value => value + 1); }}
@@ -11574,7 +11672,7 @@ function Workspace({
                   >
                     {projectTerminals.map((dock) => {
                       const show =
-                        dock.open &&
+                        !taskSelection && dock.open &&
                         sameProjectPath(dock.projectPath, projectCwd);
                       return (
                         <div
@@ -11610,12 +11708,18 @@ function Workspace({
                       style={{ gridArea: "main" }}
                     >
                       <div className="relative min-h-0 min-w-0 flex-1">
+                        {taskSelection && !deckProjectTabs.some(tab => tab.id === activeTabId) && (
+                          <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center text-[13px] text-content/65">
+                            <span>{workspaceNavigation.error?.message ?? "Choose a conversation or prepare a working copy for this task."}</span>
+                            <button className="rounded-md bg-content/8 px-3 py-1.5 hover:bg-content/12" onClick={() => { onOpenBoard(); setBoardTaskRequest({ id: taskSelection.taskId }); }}>Open task details</button>
+                          </div>
+                        )}
                         {tabs.map((tab) => (
                           <div
                             key={tab.id}
-                            aria-hidden={tab.id !== activeTabId}
+                            aria-hidden={tab.id !== activeTabId || (taskSelection && !deckProjectTabs.some(entry => entry.id === tab.id))}
                             className={
-                              tab.id === activeTabId
+                              tab.id === activeTabId && (!taskSelection || deckProjectTabs.some(entry => entry.id === tab.id))
                                 ? "absolute inset-0 flex h-full min-h-0 flex-col"
                                 : "hidden"
                             }
@@ -11624,7 +11728,7 @@ function Workspace({
                               <PaneTree
                                 {...sessionPaneProps}
                                 visible={
-                                  tab.id === activeTabId && !inboxViewOpen
+                                  tab.id === activeTabId && activeWorkspaceVisible && !inboxViewOpen
                                 }
                                 layout={tab.layout}
                                 sessions={sessions}
@@ -11636,6 +11740,7 @@ function Workspace({
                                 fileErrorCounts={fileErrorCounts}
                                 focusedId={
                                   tab.id === activeTabId &&
+                                  activeWorkspaceVisible &&
                                   !inboxViewOpen &&
                                   !tab.diffFocused &&
                                   !projectTerminalFocused
@@ -11643,12 +11748,12 @@ function Workspace({
                                     : ""
                                 }
                                 addToChatSessionId={
-                                  tab.id === activeTabId
+                                  tab.id === activeTabId && activeWorkspaceVisible
                                     ? active?.id
                                     : undefined
                                 }
                                 composerFocused={
-                                  composerFocused && !projectTerminalFocused
+                                  composerFocused && activeWorkspaceVisible && !projectTerminalFocused
                                 }
                                 composerFocusToken={composerFocusToken}
                                 onSelectFile={onSelectFileSurface}
@@ -11685,6 +11790,7 @@ function Workspace({
                           onClose={() => setTaskDockId(null)}
                           onToggleSidebar={onToggleSidebar}
                           onOpenSession={onOpenBoardSession}
+                          onOpenWorkingCopy={onOpenTaskWorkspace}
                           onStartItem={onStartInboxItem}
                           onSendToSession={onBoardSendToSession}
                           onSpawnSession={onBoardSpawnSession}
@@ -11810,6 +11916,7 @@ function Workspace({
                   onClose={onLeaveBoard}
                   onToggleSidebar={onToggleSidebar}
                   onOpenSession={onOpenBoardSession}
+                  onOpenWorkingCopy={onOpenTaskWorkspace}
                   onStartItem={onStartInboxItem}
                   onSendToSession={onBoardSendToSession}
                   onSpawnSession={onBoardSpawnSession}
@@ -11899,7 +12006,7 @@ function Workspace({
                       : undefined
                   }
                   projectTerminalActive={
-                    !!currentProjectDock &&
+                    !taskSelection && !!currentProjectDock &&
                     currentProjectDock.pane.files.length > 0
                   }
                 />

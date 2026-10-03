@@ -62,6 +62,7 @@ let bootPromise: Promise<BootWorkspace> | null = null;
 let quitting = false;
 let quitDialogOpen = false;
 let bootingResumed: ResumedWorkspace | null = null;
+type TaskView = { taskWorkspace?: import("../../features/workspace/model/layout").TaskWorkspace; taskRepositoryId?: string };
 let liveWorkspace: {
   sessions: () => Session[];
   tabs: () => WorkspaceTab[];
@@ -71,6 +72,7 @@ let liveWorkspace: {
   projectReturnMemory: () => ProjectReturnMemory;
   lastDockSide: () => DockSide | null;
   keepTab?: (tab: WorkspaceTab) => boolean;
+  taskView?: () => TaskView;
   flush: () => void;
 } | null = null;
 
@@ -88,6 +90,7 @@ export function setQuitWorkspace(
   flush: () => void,
   lastDockSide: () => DockSide | null = () => null,
   keepTab?: (tab: WorkspaceTab) => boolean,
+  taskView?: () => TaskView,
 ): () => void {
   liveWorkspace = {
     sessions,
@@ -98,6 +101,7 @@ export function setQuitWorkspace(
     projectReturnMemory,
     lastDockSide,
     keepTab,
+    taskView,
     flush,
   };
   bootingResumed = null;
@@ -386,6 +390,7 @@ export async function persistQuitState(
   projectTerminals: ProjectTerminalDock[] = [],
   lastDockSide?: DockSide,
   keepTab?: (tab: WorkspaceTab) => boolean,
+  taskView: TaskView | undefined = liveWorkspace?.taskView?.(),
 ): Promise<void> {
   const refs = inFlightRefs(sessions, tabs);
   const interrupted = new Set(refs.map((ref) => ref.sessionId));
@@ -415,6 +420,8 @@ export async function persistQuitState(
         projectTerminals,
         lastDockSide,
         keepTab,
+        taskView?.taskWorkspace,
+        taskView?.taskRepositoryId,
       ),
     ),
   );
@@ -440,6 +447,9 @@ async function persistBootingResume(workspace: ResumedWorkspace): Promise<void> 
       workspace.projectReturnMemory ?? new Map(),
       workspace.projectTerminals ?? [],
       workspace.lastDockSide,
+      undefined,
+      workspace.taskWorkspace,
+      workspace.taskRepositoryId,
     ),
   ).catch(() => undefined);
   await replaceInFlightSessions(

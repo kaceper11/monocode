@@ -16,7 +16,7 @@ import type { OrchestrationRun } from "../orchestration/model/orchestration";
 import type { SessionSummary } from "../sessions/data/sessionStore";
 
 export type SessionListScope =
-  { kind: "all" } | { kind: "adhoc" } | { kind: "task"; taskId: string };
+  { kind: "all" } | { kind: "adhoc" } | { kind: "task"; taskId: string; workstreamId?: string };
 export function scopedSessions(
   sessions: readonly SessionSummary[],
   tasks: readonly BoardTask[],
@@ -26,7 +26,9 @@ export function scopedSessions(
   const ids = new Set(
     tasks
       .filter((task) => scope.kind !== "task" || task.id === scope.taskId)
-      .flatMap(taskSessionIds),
+      .flatMap(task => scope.kind === "task" && scope.workstreamId
+        ? [...taskWideSessionIds(task), ...(task.workstreams.find(lane => lane.id === scope.workstreamId)?.sessionIds ?? [])]
+        : taskSessionIds(task)),
   );
   return sessions.filter((session) =>
     scope.kind === "task" ? ids.has(session.id) : !ids.has(session.id),

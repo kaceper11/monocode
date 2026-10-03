@@ -287,6 +287,7 @@ export function TaskDetailsPanel({
   onDismissResult,
   onClose,
   onOpenSession,
+  onOpenWorkingCopy,
   onSessionCreated,
   onSendToSession,
   onHandoff,
@@ -316,6 +317,7 @@ export function TaskDetailsPanel({
   onDismissResult: (workstreamId: string) => void;
   onClose: () => void;
   onOpenSession: (sessionId: string) => void;
+  onOpenWorkingCopy?: (taskId: string, workstreamId: string) => void;
   onSessionCreated: (sessionId: string) => void;
   /** Open `sessionId` and submit `text` — used to hand a conflicted lane a
    * resolve prompt in a freshly spawned worktree session. */
@@ -734,6 +736,7 @@ export function TaskDetailsPanel({
                 <WorkstreamCard
                   key={row.id}
                   row={row}
+                  onOpenWorkingCopy={onOpenWorkingCopy ? () => onOpenWorkingCopy(task.id, row.id) : undefined}
                   status={wsStatus.get(row.id)}
                   onHandoff={(kind) => onHandoff(row.id, kind)}
                   onChecks={() => {
@@ -1379,6 +1382,7 @@ function RelatedPrs({ card }: { card: BoardCard }) {
 
 function WorkstreamCard({
   row,
+  onOpenWorkingCopy,
   status,
   onHandoff,
   onChecks,
@@ -1400,6 +1404,7 @@ function WorkstreamCard({
   onCleanup,
 }: {
   row: BoardWorkstreamRow;
+  onOpenWorkingCopy?: () => void;
   status?: WorkstreamStatus;
   onHandoff: (kind: HandoffKind) => void;
   onChecks: () => void;
@@ -1499,6 +1504,9 @@ function WorkstreamCard({
           className={`size-3.5 text-content/35 transition-transform group-hover:text-content/70 ${expanded ? "rotate-90" : ""}`}
         />
       </button>
+      {onOpenWorkingCopy && <button type="button" className={ACTION} disabled={!row.worktreePath} onClick={onOpenWorkingCopy}>
+        <FolderTree className="size-3" /> Open working copy
+      </button>}
       <div
         className="mt-0.5 flex min-w-0 items-center gap-1.5 pl-0.5 text-[11px] text-content/60"
         title={

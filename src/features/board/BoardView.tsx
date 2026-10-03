@@ -247,6 +247,7 @@ export function BoardView({
   onClose,
   onToggleSidebar,
   onOpenSession,
+  onOpenWorkingCopy,
   onStartItem,
   onSendToSession,
   onSpawnSession,
@@ -268,6 +269,7 @@ export function BoardView({
   onClose: () => void;
   onToggleSidebar: () => void;
   onOpenSession: (sessionId: string) => void;
+  onOpenWorkingCopy?: (taskId: string, workstreamId: string) => void;
   onStartItem: (item: InboxItem) => void;
   onSendToSession: SendToSession;
   onPrepareWorktree: (spec: TaskWorkstreamSpec) => Promise<string>;
@@ -1978,6 +1980,7 @@ export function BoardView({
         onDismissResult={onDismissResult}
         onClose={taskOpsHandlers.onClose}
         onOpenSession={taskOpsHandlers.onOpenSession}
+        onOpenWorkingCopy={onOpenWorkingCopy}
         onSessionCreated={setCreatedSessionId}
         onSendToSession={taskOpsHandlers.onSendToSession}
         onSpawnSession={taskOpsHandlers.onSpawnSession}

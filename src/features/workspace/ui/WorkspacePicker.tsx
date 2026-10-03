@@ -132,17 +132,17 @@ export function WorkspacePicker({
 }
 
 /** A started conversation owns its working copy; only its branch stays mutable. */
-export function WorkspaceIdentity({ worktree }: { worktree: boolean }) {
+export function WorkspaceIdentity({ worktree, cwd }: { worktree: boolean; cwd?: string }) {
   const Icon = worktree ? FolderTree : Folder;
   const label = worktree ? "Worktree" : "Current checkout";
   return (
     <div
-      title={`Workspace: ${label}`}
-      aria-label={`Workspace ${label}`}
-      className="-ml-1.5 flex h-6 min-w-0 shrink-0 items-center gap-1.5 px-1.5 text-[12px] text-content/45"
+      title={`Workspace: ${label}${cwd ? `\n${cwd}` : ""}`}
+      aria-label={`Workspace ${label}${cwd ? ` · ${cwd}` : ""}`}
+      className="-ml-1.5 flex h-6 min-w-0 max-w-48 items-center gap-1.5 px-1.5 text-[12px] text-content/45"
     >
       <Icon className="size-3.5 shrink-0" />
-      <span className="truncate">{label}</span>
+      <span className="truncate">{cwd ? prettyCwd(cwd) : label}</span>
     </div>
   );
 }

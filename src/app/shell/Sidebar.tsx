@@ -22,7 +22,7 @@ import {
   inWorktreeFocus,
   useWorktreeFocus,
 } from "../../features/source-control/model/worktreeFocus";
-import { SidebarWorktreeSwitcher } from "../../features/source-control/ui/SidebarWorktreeSwitcher";
+import { SidebarWorktreeSwitcher, type TaskWorkingCopyPicker } from "../../features/source-control/ui/SidebarWorktreeSwitcher";
 import { OrchestrationSidebarAgents } from "../../features/orchestration/ui/OrchestrationSidebarAgents";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -247,6 +247,7 @@ type Props = {
   onRetrySessionScope?: () => void;
   onNewAdHoc?: (cwd?: string) => string | void;
   onNewRepositorySession?: (id: string) => void;
+  taskWorkspace?: TaskWorkingCopyPicker;
   cwd: string;
   /** Working copy for Changes / explorer git. Falls back to `cwd`. */
   gitCwd?: string;
@@ -381,6 +382,7 @@ function SidebarComponent({
   onRetrySessionScope,
   onNewAdHoc,
   onNewRepositorySession,
+  taskWorkspace,
   cwd,
   gitCwd,
   sourceControlCwd,
@@ -478,6 +480,7 @@ function SidebarComponent({
   onDismissUpdate,
 }: Props) {
   const remoteProject = isRemoteProjectPath(cwd);
+  const remoteSessionList = remoteProject && !taskWorkspace;
   const tab: SidebarTabId = requestedTab;
   const remote = useRemoteProjectSessions(cwd, remoteProject);
   const hostProject = remoteProject ? remoteProjectFor(cwd) : undefined;
@@ -531,51 +534,51 @@ function SidebarComponent({
       refreshRemoteProjectSessions();
     }
   };
-  const onSelectSession = remoteProject
+  const onSelectSession = remoteSessionList
     ? (sessionId: string) => onSelectRemoteSession?.(cwd, sessionId)
     : onSelectLocalSession;
-  const onPrefetchSession = remoteProject ? undefined : onPrefetchLocalSession;
-  const onPlaceSessionOnPane = remoteProject
+  const onPrefetchSession = remoteSessionList ? undefined : onPrefetchLocalSession;
+  const onPlaceSessionOnPane = remoteSessionList
     ? undefined
     : onPlaceLocalSessionOnPane;
-  const onRenameSession = remoteProject
+  const onRenameSession = remoteSessionList
     ? (sessionId: string, title: string) => {
         void remoteChange(sessionId, { title });
       }
     : onRenameLocalSession;
-  const onArchiveSession = remoteProject
+  const onArchiveSession = remoteSessionList
     ? (sessionId: string, archived: boolean) => {
         void remoteChange(sessionId, { archived });
       }
     : onArchiveLocalSession;
-  const onArchiveSessions = remoteProject
+  const onArchiveSessions = remoteSessionList
     ? (sessionIds: readonly string[], archived: boolean) => {
         void Promise.all(
           sessionIds.map((id) => remoteChange(id, { archived })),
         );
       }
     : onArchiveLocalSessions;
-  const onPinSession = remoteProject
+  const onPinSession = remoteSessionList
     ? (sessionId: string, pinned: boolean) => {
         void remoteChange(sessionId, { pinned });
       }
     : onPinLocalSession;
-  const onPinSessions = remoteProject
+  const onPinSessions = remoteSessionList
     ? (sessionIds: readonly string[], pinned: boolean) => {
         void Promise.all(sessionIds.map((id) => remoteChange(id, { pinned })));
       }
     : onPinLocalSessions;
-  const onDeleteSession = remoteProject
+  const onDeleteSession = remoteSessionList
     ? (sessionId: string) => {
         void remoteDelete([sessionId]);
       }
     : onDeleteLocalSession;
-  const onDeleteSessions = remoteProject
+  const onDeleteSessions = remoteSessionList
     ? (sessionIds: readonly string[]) => {
         void remoteDelete(sessionIds);
       }
     : onDeleteLocalSessions;
-  const onSetSessionLinkedWorkItem = remoteProject
+  const onSetSessionLinkedWorkItem = remoteSessionList
     ? (sessionId: string, item: LinkedWorkItem | undefined) => {
         void remoteChange(sessionId, { linkedWorkItem: item ?? null });
       }
@@ -583,10 +586,10 @@ function SidebarComponent({
   const activeRemoteId = activeSessionId
     ? remoteSessionFor(activeSessionId)
     : undefined;
-  const activeListedSessionId = remoteProject
+  const activeListedSessionId = remoteSessionList
     ? activeRemoteId
     : activeSessionId;
-  const listedBusySessionIds = remoteProject
+  const listedBusySessionIds = remoteSessionList
     ? new Set(
         remote.sessions
           .filter(
@@ -595,7 +598,7 @@ function SidebarComponent({
           .map((session) => session.id),
       )
     : busySessionIds;
-  const listedApprovalSessionIds = remoteProject
+  const listedApprovalSessionIds = remoteSessionList
     ? new Set(
         remote.sessions
           .filter((session) => session.needsInput)
@@ -604,7 +607,7 @@ function SidebarComponent({
     : approvalSessionIds;
   const projectSessions: SessionSummary[] = useMemo(
     () =>
-      remoteProject
+      remoteSessionList
         ? remote.sessions.map((session) => ({
             id: session.id,
             cwd,
@@ -624,7 +627,7 @@ function SidebarComponent({
             worktreeCwd: session.worktreeCwd,
           }))
         : sessions,
-    [remoteProject, remote.sessions, sessions, cwd],
+    [remoteSessionList, remote.sessions, sessions, cwd],
   );
   const remoteExecutionCwd =
     remote.sessions.find((session) => session.id === activeRemoteId)?.cwd ??
@@ -634,7 +637,7 @@ function SidebarComponent({
       : undefined) ??
     undefined;
   const gitRoot =
-    remoteProject && hostProject
+    taskWorkspace ? gitCwd ?? "" : remoteProject && hostProject
       ? remotePath(
           hostProject.environmentId,
           remoteExecutionCwd ?? hostProject.cwd,
@@ -766,11 +769,11 @@ function SidebarComponent({
           .filter((folder) => folder.sessionIds.length > 0)
       : sessionFolders;
   const worktreeFocus = useWorktreeFocus(cwd);
-  const focusedWorktree = remoteProject ? undefined : worktreeFocus;
+  const focusedWorktree = remoteProject || taskWorkspace ? undefined : worktreeFocus;
   const listedSessions = mergeFolderSessionSummaries(
     projectSessions,
-    remoteProject ? [] : openSessions,
-    remoteProject ? sessionFolders : displayFolders,
+    remoteSessionList ? [] : openSessions,
+    remoteSessionList ? sessionFolders : displayFolders,
   ).filter(
     (session) =>
       !session.orchestrationLeadId && inWorktreeFocus(session, focusedWorktree),
@@ -1815,9 +1818,10 @@ function SidebarComponent({
             data-tauri-drag-region="deep"
           >
             <div className="flex min-w-0 flex-1 items-center">
-              {!remoteProject && cwd && cwd !== "~" ? (
+              {(taskWorkspace || !remoteProject) && cwd && cwd !== "~" ? (
                 <SidebarWorktreeSwitcher
                   cwd={cwd}
+                  taskWorkspace={taskWorkspace}
                   tabStats={worktreeTabStats}
                   onSelect={onSelectWorkspace}
                   pending={workspaceSwitchPending}
@@ -1834,7 +1838,7 @@ function SidebarComponent({
               onNew={onNew}
               newLabel={
                 sessionScope?.kind === "task"
-                  ? "New task session"
+                  ? taskWorkspace?.workstreamId ? "New repository session" : "New task session"
                   : "New ad hoc session"
               }
             />
@@ -1907,6 +1911,11 @@ function SidebarComponent({
             tab === "files" ? "" : "hidden"
           }`}
         >
+          {taskWorkspace && !taskWorkspace.workstreamId && gitRepositories?.length ? (
+            <div className="border-b border-stroke px-2 py-1.5">
+              <SearchableSelect label="Files repository" value={gitRepository?.id ?? ""} options={gitRepositories.map(repo => ({ value: repo.id, label: repo.label, disabled: !repo.cwd }))} onChange={id => onSelectGitRepository?.(id)} />
+            </div>
+          ) : null}
           {filesSearchOpen ? (
             <ProjectSearch
               cwd={gitRoot}
@@ -1914,7 +1923,7 @@ function SidebarComponent({
               onOpenFile={onOpenFile}
               onClose={() => onFilesSearchOpenChange(false)}
             />
-          ) : cwd && cwd !== "~" ? (
+          ) : gitRoot && gitRoot !== "~" ? (
             <div className="flex min-h-0 flex-1 flex-col">
               <FileTree
                 key={gitRoot}
@@ -1937,7 +1946,7 @@ function SidebarComponent({
         {tab === "sessions" &&
           sessionScope &&
           onSessionScopeChange &&
-          !remoteProject && (
+          (!remoteProject || taskWorkspace) && (
             <div className="flex shrink-0 items-center gap-1 border-b border-stroke px-2 py-1.5">
               <div className="min-w-0 flex-1">
                 <SearchableSelect
@@ -2027,7 +2036,7 @@ function SidebarComponent({
                   onNew?.();
                 }}
               >
-                New task session
+                {taskWorkspace?.workstreamId ? "New repository session" : "New task session"}
               </button>
             )}
             <button

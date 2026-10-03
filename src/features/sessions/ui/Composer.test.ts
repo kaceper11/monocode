@@ -1639,7 +1639,7 @@ describe("Composer question focus", () => {
     );
 
     const workspace = container.querySelector(
-      '[aria-label="Workspace Worktree"]',
+      '[aria-label="Workspace Worktree · /repo-worktrees/mc-greeting"]',
     );
     expect(workspace?.tagName).toBe("DIV");
     expect(

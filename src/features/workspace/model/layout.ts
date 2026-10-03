@@ -91,7 +91,11 @@ export type EditorPane = {
 
 export type SurfaceKind = "editor" | "terminal";
 
+export type TaskWorkspace = { taskId: string; workstreamId?: string };
+
 export type WorkspaceTab = {
+  /** Task/lane view where this tab was opened, independent of execution cwd. */
+  taskWorkspace?: TaskWorkspace;
   kind: "session";
   id: string;
   layout: LayoutNode;

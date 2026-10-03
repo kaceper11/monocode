@@ -99,3 +99,65 @@ it("requests fallback from a deleted worktree once and does not retry while pend
   expect(select).toHaveBeenCalledTimes(1);
   expect(worktreeFocus("/picker")?.path).toBe("/deleted");
 });
+
+it("offers task lanes independently of global worktree focus and shows activity with zero tabs", async () => {
+  const pick = vi.fn();
+  const task = {
+    id: "task",
+    title: "Ship checkout",
+    createdAt: 1,
+    links: [],
+    workstreams: [
+      {
+        id: "api",
+        projectPath: "/api",
+        worktreePath: "/api-copy",
+        branch: "feature",
+        base: "main",
+      },
+      { id: "empty", projectPath: "/web", branch: "web", base: "main" },
+    ],
+  };
+  setWorktreeFocus("/picker", { path: "/picker-b", branch: "feature-b" });
+  await act(async () =>
+    root.render(
+      createElement(SidebarWorktreeSwitcher, {
+        cwd: "/picker",
+        onSelect: select,
+        taskWorkspace: {
+          task,
+          tabStats: new Map([
+            ["api", { tabs: 0, busy: false, needsInput: true }],
+          ]),
+          onSelect: pick,
+        },
+      }),
+    ),
+  );
+  expect(select).not.toHaveBeenCalled();
+  expect(trigger().textContent).toContain("Ship checkout · All repositories");
+  await act(async () => trigger().click());
+  expect(option("web · web").disabled).toBe(true);
+  expect(option("api · feature").getAttribute("aria-selected")).toBe("false");
+  expect(
+    option("api · feature")
+      .querySelector("[aria-label]")
+      ?.getAttribute("aria-label"),
+  ).toBe("0 open tabs, needs input");
+  const list = document.querySelector<HTMLElement>('[role="listbox"]')!;
+  await act(async () =>
+    list.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "End", bubbles: true }),
+    ),
+  );
+  expect(document.activeElement).toBe(option("api · feature"));
+  await act(async () =>
+    list.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Home", bubbles: true }),
+    ),
+  );
+  expect(document.activeElement).toBe(option("All repositories"));
+  await act(async () => option("api · feature").click());
+  expect(pick).toHaveBeenCalledExactlyOnceWith("api");
+  expect(worktreeFocus("/picker")?.path).toBe("/picker-b");
+});

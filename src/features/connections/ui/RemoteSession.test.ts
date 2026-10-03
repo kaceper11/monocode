@@ -802,7 +802,7 @@ it("starts a remote session in the worktree chosen before its first message", as
     worktreeCwd: "/home/me/repo-worktrees/dev",
   });
   expect(host?.session.cwd).toBe("/home/me/repo-worktrees/dev");
-  expect(container.querySelector('[aria-label="Workspace Worktree"]')?.tagName)
+  expect(container.querySelector('[aria-label="Workspace Worktree · remote://env/home/me/repo-worktrees/dev"]')?.tagName)
     .toBe("DIV");
   expect(byLabel("Workspace Worktree")).toBeNull();
 });
@@ -930,7 +930,7 @@ it("locks a started remote session to its worktree like a local session", async 
   };
   rememberRemoteSession("shell", "host-session");
   await render();
-  expect(container.querySelector('[aria-label="Workspace Current checkout"]')?.tagName)
+  expect(container.querySelector('[aria-label="Workspace Current checkout · remote://env/home/me/repo"]')?.tagName)
     .toBe("DIV");
   expect(byLabel("Workspace Current checkout")).toBeNull();
   expect(byLabel("Branch main")).not.toBeNull();
