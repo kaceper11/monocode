@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-03
+
+### Changed
+
+- Merged upstream 0.7.0, including the sidebar working-copy switcher, workspace-scoped tabs, inbox/notes/automations preloading, and the bounded markdown highlight cache.
+- Usage meters show used capacity and account emails are visible by default; **Show remaining usage** and **Mask account emails** remain available under Settings → Providers → Usage and privacy.
+
+### Removed
+
+- WSL execution support, the WSL project picker and session badge, the Python bridge, and all WSL validation scripts. Sessions run natively on the host; `remote://` hosts are unaffected.
+
 ## [0.7.0] - 2026-10-02
 
 ### Added
